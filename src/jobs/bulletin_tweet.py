@@ -80,6 +80,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -98,11 +99,14 @@ logger = logging.getLogger("zerogex.bulletin_tweet")
 ET = ZoneInfo("America/New_York")
 
 DEFAULT_SITE_URL = "https://zerogex.io"
-DEFAULT_SYMBOLS = ("SPY", "SPX", "QQQ")
+# SPY only by default (the operator's spec).  Still configurable to a wider
+# set via $BULLETIN_TWEET_SYMBOLS — the admin review page reads this list to
+# populate its per-symbol regenerate dropdown.
+DEFAULT_SYMBOLS = ("SPY",)
 # Fallback symbol to feature when the "cleanest setup" selector can't pick one
 # (e.g. no symbol has both a live spot and a level).  Normally the featured
 # symbol is chosen at runtime by :func:`select_featured_symbol`.
-DEFAULT_LEAD_SYMBOL = "SPX"
+DEFAULT_LEAD_SYMBOL = "SPY"
 # The site link no longer rides in the main post (link-in-body suppresses X
 # reach).  Instead it's posted as a threaded reply under every bulletin tweet.
 # This is the fixed prefix; the URL is appended from ``--site-url``.
@@ -123,6 +127,19 @@ LONG_TWEET_MAX_LEN = 25_000  # X Premium long-form ceiling; classic 280 is the
 
 # Modes ---------------------------------------------------------------------
 MODES = ("premarket", "midday", "close")
+
+# The header label each fire opens with — the operator-approved "…Read — $SPY"
+# format.  Also the "timing" label the admin review page switches on
+# (09:15 ET → Morning, 12:30 ET → Midday, 16:05 ET → Post-Market).
+MODE_READ_LABEL = {
+    "premarket": "Morning Read",
+    "midday": "Midday Read",
+    "close": "Post-Market Read",
+}
+
+
+def _mode_read_label(mode: str) -> str:
+    return MODE_READ_LABEL.get(mode, "Market Read")
 
 
 @dataclass
@@ -174,6 +191,23 @@ MODE_COPY: dict[str, ModeCopy] = {
 
 def _today_et() -> date:
     return datetime.now(tz=ET).date()
+
+
+def resolve_current_mode(now: datetime | None = None) -> str:
+    """The "timing" the /admin review page shows, by wall-clock ET.
+
+    The page switches format at each fire time and holds it until the next:
+      * 09:15 → 12:30  → ``premarket`` (Morning Read)
+      * 12:30 → 16:05  → ``midday``    (Midday Read)
+      * 16:05 → 09:15  → ``close``     (Post-Market Read; incl. overnight)
+    Before the first fire of the day it stays on the prior session's close."""
+    now = now or datetime.now(tz=ET)
+    hm = (now.hour, now.minute)
+    if (9, 15) <= hm < (12, 30):
+        return "premarket"
+    if (12, 30) <= hm < (16, 5):
+        return "midday"
+    return "close"
 
 
 def _is_trading_day(day: date) -> bool:
@@ -256,6 +290,71 @@ def _fmt_dollars(v: float) -> str:
 _CHARM_HEADLINE_MIN_USD = 1_000_000.0
 
 
+def _fmt_level(v: float | None) -> str:
+    """Format a strike/level for the ``Key levels:`` block.
+
+    Matches the operator's examples: whole-dollar walls print with no
+    decimals ("735", "740"), a computed gamma flip keeps two ("747.29"),
+    and index-scale values (>= 1000) get thousands separators."""
+    if v is None:
+        return "—"
+    whole = abs(v - round(v)) < 0.005
+    if abs(v) >= 1000:
+        return f"{v:,.0f}" if whole else f"{v:,.2f}"
+    return f"{int(round(v))}" if whole else f"{v:.2f}"
+
+
+def _derive_regime(
+    net_gex: float | None, spot: float | None, gamma_flip: float | None
+) -> str | None:
+    """A plain-language dealer-gamma regime label for the LLM prompt.
+
+    Primary signal is the sign of Net GEX (at spot); when that's missing we
+    fall back to spot vs the gamma flip (below the flip ≈ short gamma).
+    Returns None when neither is available."""
+    if net_gex is not None:
+        if net_gex < 0:
+            return "negative"
+        if net_gex > 0:
+            return "positive"
+        return "neutral"
+    if spot is not None and gamma_flip is not None:
+        return "negative" if spot < gamma_flip else "positive"
+    return None
+
+
+def _derive_momentum_label(b: "SymbolBulletin") -> str | None:
+    """A cheap, honest momentum cue derived from the session path.
+
+    Combines the day's direction (spot vs prior close) with where spot sits
+    in the session range (pressing highs / lows / mid-range).  Deliberately
+    qualitative — the LLM gets the raw numbers too and does the nuance; this
+    is just a nudge so it doesn't have to infer direction from scratch."""
+    if b.spot is None:
+        return None
+    direction = ""
+    if b.prior_close not in (None, 0):
+        chg = b.spot - b.prior_close  # type: ignore[operator]
+        if chg > 0:
+            direction = "up on the day"
+        elif chg < 0:
+            direction = "down on the day"
+        else:
+            direction = "flat on the day"
+    position = ""
+    if b.session_high is not None and b.session_low is not None and b.session_high > b.session_low:
+        rng = b.session_high - b.session_low
+        pos = (b.spot - b.session_low) / rng
+        if pos >= 0.66:
+            position = "pressing session highs"
+        elif pos <= 0.34:
+            position = "pressing session lows"
+        else:
+            position = "mid-range"
+    parts = [p for p in (direction, position) if p]
+    return ", ".join(parts) if parts else None
+
+
 # ---------------------------------------------------------------------------
 # Bulletin data model — one per symbol
 # ---------------------------------------------------------------------------
@@ -278,6 +377,16 @@ class SymbolBulletin:
     put_wall: float | None = None
     max_pain: float | None = None
     net_gex: float | None = None
+    # Price action fed to the LLM so the narrative can describe the day's path
+    # ("dumped through the 740 put wall, ripped back, stalled short of 745").
+    # All best-effort — populated in :func:`_fetch_bulletins` from the quote /
+    # session-close queries, left None on any miss (the LLM tolerates nulls).
+    prior_close: float | None = None
+    session_open: float | None = None
+    session_high: float | None = None
+    session_low: float | None = None
+    momentum_label: str | None = None
+    regime: str | None = None  # "negative" / "positive" / "neutral"
     # Charm-into-Close headline (Phase 4): dollars of stock dealers must trade by
     # the 4pm bell from time decay ALONE if spot holds. Positive = forced buying.
     charm_close_flow: float | None = None
@@ -489,14 +598,31 @@ def select_featured_symbol(
     return None
 
 
-def _build_reply_text(site_url: str, override: str | None = None) -> str:
-    """The threaded link comment posted under the main tweet.
+_URL_RE = re.compile(r"https?://\S+")
 
-    ``override`` (from ``BULLETIN_TWEET_REPLY_TEXT``) wins verbatim;
-    otherwise it's the fixed prefix + the site URL."""
+
+def _compose_reply(llm_reply: str | None, site_url: str, override: str | None = None) -> str:
+    """The threaded reply posted under the main tweet.
+
+    Precedence:
+      1. ``override`` (``$BULLETIN_TWEET_REPLY_TEXT``) — wins verbatim.
+      2. The LLM-authored reply (plays off the post) + the ZeroGEX link.
+         The model is told NOT to include a URL, but we strip any it added
+         and append the canonical ``site_url`` — on the same line when the
+         reply ends on a call-to-action colon, else as its own paragraph.
+      3. The fixed prefix + link (no-LLM fallback)."""
+    url = site_url.rstrip("/")
     if override and override.strip():
         return override.strip()
-    return f"{DEFAULT_REPLY_PREFIX} {site_url.rstrip('/')}"
+    if llm_reply and llm_reply.strip():
+        body = _URL_RE.sub("", llm_reply).strip()
+        # Tidy a trailing stub the URL removal may have left (" ." / ":" etc.
+        # stay; a dangling "()" or double space gets squeezed).
+        body = re.sub(r"[ \t]{2,}", " ", body).strip()
+        if body.endswith(":"):
+            return f"{body} {url}"
+        return f"{body}\n\n{url}"
+    return f"{DEFAULT_REPLY_PREFIX} {url}"
 
 
 def build_tweet_body(
@@ -506,125 +632,111 @@ def build_tweet_body(
     site_url: str = DEFAULT_SITE_URL,
     lead_symbol: str = DEFAULT_LEAD_SYMBOL,
     reply_text: str | None = None,
+    headlines: list | None = None,
 ) -> TweetBody:
-    """Assemble the full tweet body for one mode, featuring one symbol.
+    """Assemble the "…Read — $SYM" post + threaded reply for one fire.
 
-    Layout:
+    Layout (operator-approved voice):
 
-        $<FEATURED> <label>:
+        <Morning|Midday|Post-Market> Read — $<FEATURED>
 
-        <opening — the level that mattered and how price interacted>
+        <opening — hook + news + price action + dealer-gamma regime>
 
-        Current map:
+        Key levels:
+        • <put wall>  → Put Wall (<note>)
+        • <call wall> → Call Wall (<note>)
+        • <flip>      → Gamma Flip (<note>)
 
-        Spot: ~…
-        Gamma Flip: …
-        Put Wall: …
-        Call Wall: …
-        Max Pain: …
-        Net GEX: …
+        Bottom line: <takeaway>
 
-        <clean read — regime + forward scenarios>
-
-        <closing takeaway (optional cross-refs to the other two)>
-
-    No site link, no hashtags — the featured symbol's cashtag sits in
-    the header and the ``https://zerogex.io`` link goes out as a
-    separate threaded reply (``reply_text``).  If no symbol resolves at
-    all the caller should skip the post before calling this."""
-    copy = MODE_COPY.get(mode)
-    if copy is None:
+    The prose comes from Claude (:func:`_try_llm_post`), fed the day's
+    headlines + the featured symbol's price action + its gamma structure.
+    Python owns every price in the ``Key levels:`` block and the reply's
+    link — the model never invents a level.  No site link / hashtags ride
+    in the main post; the ZeroGEX link goes out in the threaded reply.  On
+    any LLM failure we fall back to a deterministic post in the same shape."""
+    if mode not in MODE_READ_LABEL:
         raise ValueError(f"Unknown mode: {mode!r}")
+    read_label = _mode_read_label(mode)
 
     present = [b for b in bulletins if b.has_any_level() or b.spot is not None]
     symbols_present = [b.symbol for b in present]
-    reply = _build_reply_text(site_url, reply_text)
 
     featured = select_featured_symbol(bulletins, fallback=lead_symbol)
     if featured is None:
-        # Defensive: the runner skips empty days before we get here, but
-        # never emit a broken body — a header-only post is the floor.
+        # Defensive floor — the runner skips empty days before we get here.
         featured_symbol = lead_symbol.upper()
-        header = f"${featured_symbol} {copy.label}:"
+        header = f"{read_label} — ${featured_symbol}"
         return TweetBody(
             text=header,
             fallback=header,
             lead_symbol=featured_symbol,
             symbols_present=symbols_present,
-            reply_text=reply,
+            reply_text=_compose_reply(None, site_url, reply_text),
             featured_symbol=featured_symbol,
         )
 
     featured_symbol = featured.symbol
-    map_block = _symbol_block(featured, include_prefix=False) or ""
 
-    # LLM-generated narrative if ANTHROPIC_API_KEY is set. Any failure
-    # (no key, API down, malformed reply, invented prices) returns None
-    # and we fall back to the static template below — never fail the
-    # tweet just because the LLM path had a bad day.  All present symbols
-    # are handed to the model so it can cross-reference the other two.
-    section = _try_llm_section(mode, day, present, featured_symbol)
-    if section is not None:
-        text = _compose_with_llm_section(
-            section,
-            featured_symbol,
-            copy.label,
-            map_block,
-        )
-        fallback = _build_fallback_tweet(featured, copy.label)
+    # LLM-generated post + reply if ANTHROPIC_API_KEY is set. Any failure
+    # (no key, API down, malformed reply, invented prices) returns None and
+    # we fall back to the deterministic post below — never fail the tweet
+    # just because the LLM path had a bad day.
+    post = _try_llm_post(mode, day, present, featured_symbol, headlines)
+    if post is not None:
         return TweetBody(
-            text=text,
-            fallback=fallback,
+            text=_compose_new_post(post, featured, mode),
+            fallback=_build_fallback_tweet(featured, read_label),
             lead_symbol=featured_symbol,
             symbols_present=symbols_present,
-            reply_text=reply,
+            reply_text=_compose_reply(post.reply, site_url, reply_text),
             featured_symbol=featured_symbol,
         )
 
-    # Static template fallback — rotates the lead sentence off a hash
-    # of (date, mode) so it varies day-to-day but stays deterministic
-    # within a given fire, so a dry-run and the live post match.  Use the
-    # mode's fixed position (not hash(mode), which is PYTHONHASHSEED-salted
-    # per process) so the pick is stable across separate invocations too.
-    day_seed = int(day.strftime("%Y%m%d"))
-    seed = _hash_seed(day_seed, MODES.index(mode))
-    lead = _pick(copy.lead_variants, seed)
-
-    blocks: list[str] = [
-        f"${featured_symbol} {copy.label}:",
-        "",
-        lead,
-        "",
-        "Current map:",
-        "",
-        map_block,
-    ]
-    text = "\n".join(blocks).strip()
-
-    fallback = _build_fallback_tweet(featured, copy.label)
     return TweetBody(
-        text=text,
-        fallback=fallback,
+        text=_build_static_post(mode, featured),
+        fallback=_build_fallback_tweet(featured, read_label),
         lead_symbol=featured_symbol,
         symbols_present=symbols_present,
-        reply_text=reply,
+        reply_text=_compose_reply(None, site_url, reply_text),
         featured_symbol=featured_symbol,
     )
 
 
-def _try_llm_section(
+def _hget(h: Any, name: str, default: Any = None) -> Any:
+    """Read a headline field from either a dict or a NewsItem-like object."""
+    if isinstance(h, dict):
+        return h.get(name, default)
+    return getattr(h, name, default)
+
+
+def _fetch_headlines_safe() -> list:
+    """Scrape CNBC headlines for the LLM — never raises, ``[]`` on any issue."""
+    try:
+        from src.jobs import cnbc_news  # noqa: WPS433 — optional
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: cnbc_news import failed (%s)", exc)
+        return []
+    try:
+        return cnbc_news.fetch_headlines()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: headline scrape failed (%s)", exc)
+        return []
+
+
+def _try_llm_post(
     mode: str,
     day: date,
     present: list[SymbolBulletin],
     featured_symbol: str,
+    headlines: list | None = None,
 ):
-    """Attempt LLM narrative generation. Returns None on any failure.
+    """Attempt LLM post+reply generation. Returns an ``LlmPost`` or None.
 
-    Imports the LLM helper lazily so a broken import (missing env
-    variable dependency, network outage during module import) cannot
-    take down the static-template path.  All ``present`` symbols are
-    passed so the model can cross-reference the other two; the model is
-    told which one is ``featured_symbol`` and writes the post around it."""
+    Imports the LLM helper lazily so a broken import cannot take down the
+    static-template path.  All ``present`` symbols are passed so the model
+    can cross-reference; ``featured_symbol`` is the one the post centers on.
+    ``headlines`` are the scraped CNBC items (NewsItem objects or dicts)."""
     try:
         from src.jobs import bulletin_llm  # noqa: WPS433 — optional
     except Exception as exc:  # noqa: BLE001
@@ -635,72 +747,167 @@ def _try_llm_section(
         bulletin_llm.SymbolInput(
             symbol=b.symbol,
             spot=b.spot,
+            prior_close=b.prior_close,
+            session_open=b.session_open,
+            session_high=b.session_high,
+            session_low=b.session_low,
             gamma_flip=b.gamma_flip,
             call_wall=b.call_wall,
             put_wall=b.put_wall,
             max_pain=b.max_pain,
             net_gex=b.net_gex,
+            regime=b.regime,
+            momentum_label=b.momentum_label,
             spot_is_projected=b.spot_is_projected,
             future_symbol=b.future_symbol,
         )
         for b in present
     ]
+    heads = []
+    for h in headlines or []:
+        title = _hget(h, "title", "")
+        if not title:
+            continue
+        heads.append(
+            bulletin_llm.Headline(
+                title=title,
+                summary=_hget(h, "summary", "") or "",
+                source=_hget(h, "source", "CNBC") or "CNBC",
+                published=_hget(h, "published"),
+            )
+        )
     try:
-        return bulletin_llm.generate_narrative(
+        return bulletin_llm.generate_post(
             mode=mode,
             day=day,
             symbols=inputs,
+            headlines=heads,
             featured_symbol=featured_symbol,
         )
     except Exception as exc:  # noqa: BLE001 — never let the LLM path throw
-        logger.warning("bulletin_tweet: LLM narrative generation failed (%s)", exc)
+        logger.warning("bulletin_tweet: LLM post generation failed (%s)", exc)
         return None
 
 
-def _compose_with_llm_section(
-    section,
-    featured_symbol: str,
-    default_label: str,
-    map_block: str,
-) -> str:
-    """Assemble the tweet body around an LLM-generated ``LlmSection``.
+def _valid_read_label(label: str | None, mode: str) -> str:
+    """Accept the model's header only if it's one of the three read labels."""
+    want = {v.lower(): v for v in MODE_READ_LABEL.values()}
+    return want.get((label or "").strip().lower(), _mode_read_label(mode))
 
-    Layout (single featured symbol, no link, no hashtags):
 
-        ${featured_symbol} {header_label}:
-        <blank line>
+def _append_para(blocks: list[str], value: str) -> None:
+    """Append ``value`` as its own blank-line-separated paragraph (skip empty)."""
+    stripped = (value or "").strip()
+    if not stripped:
+        return
+    if blocks and blocks[-1] != "":
+        blocks.append("")
+    blocks.append(stripped)
+
+
+def _key_levels_block(featured: SymbolBulletin, level_notes: dict[str, str] | None) -> str:
+    """The deterministic ``• <price> → <label>`` block — Python owns the prices.
+
+    Order matches the operator's examples: Put Wall, Call Wall, Gamma Flip.
+    Only levels present in the DB row render; an optional short LLM note is
+    shown in parentheses after the base label."""
+    notes = level_notes or {}
+    specs = (
+        ("put_wall", featured.put_wall, "Put Wall"),
+        ("call_wall", featured.call_wall, "Call Wall"),
+        ("gamma_flip", featured.gamma_flip, "Gamma Flip"),
+    )
+    lines: list[str] = []
+    for key, value, base in specs:
+        if value is None:
+            continue
+        note = (notes.get(key) or "").strip()
+        label = f"{base} ({note})" if note else base
+        lines.append(f"• {_fmt_level(value)} → {label}")
+    return "\n".join(lines)
+
+
+def _compose_new_post(post, featured: SymbolBulletin, mode: str) -> str:
+    """Assemble the post body around an LLM-generated ``LlmPost``.
+
+        <Read label> — $<SYM>
+
         {opening}
-        <blank line>
-        Current map:
-        <blank line>
-        {map_block}
-        <blank line>
-        {clean_read}
-        <blank line>
-        {closing}
-        <blank line>
-        {signoff (optional)}
 
-    Any section coming back empty is elided so the composed body never
-    carries a lonely trailing blank paragraph.  The link rides in the
-    threaded reply, not here."""
+        Key levels:
+        {• … block}
 
-    def _sep(existing: list[str], value: str) -> None:
-        stripped = value.strip()
-        if not stripped:
-            return
-        if existing and existing[-1] != "":
-            existing.append("")
-        existing.append(stripped)
+        Bottom line: {bottom_line}
 
-    header_label = section.header_label.strip() or default_label
-    blocks: list[str] = [f"${featured_symbol} {header_label}:"]
-    _sep(blocks, section.opening)
-    _sep(blocks, "Current map:")
-    _sep(blocks, map_block)
-    _sep(blocks, section.clean_read)
-    _sep(blocks, section.closing)
-    _sep(blocks, section.signoff)
+    Empty sections are elided.  No link / hashtags — the link rides in the
+    threaded reply."""
+    header_label = _valid_read_label(post.header_label, mode)
+    blocks: list[str] = [f"{header_label} — ${featured.symbol}"]
+    _append_para(blocks, post.opening)
+    levels = _key_levels_block(featured, post.level_notes)
+    if levels:
+        _append_para(blocks, "Key levels:\n" + levels)
+    if post.bottom_line.strip():
+        _append_para(blocks, f"Bottom line: {post.bottom_line.strip()}")
+    return "\n".join(blocks).strip()
+
+
+def _static_hook(featured: SymbolBulletin, mode: str) -> str:
+    """A short, factual opener for the no-LLM fallback — no invented color."""
+    parts: list[str] = []
+    if featured.spot is not None:
+        if featured.gamma_flip is not None:
+            rel = "below" if featured.spot < featured.gamma_flip else "above"
+            parts.append(
+                f"{featured.symbol} is trading ~{_fmt_price_spot(featured.spot)}, "
+                f"{rel} the {_fmt_level(featured.gamma_flip)} gamma flip."
+            )
+        else:
+            parts.append(f"{featured.symbol} is trading ~{_fmt_price_spot(featured.spot)}.")
+    if featured.net_gex is not None:
+        regime = featured.regime or _derive_regime(
+            featured.net_gex, featured.spot, featured.gamma_flip
+        )
+        if regime == "negative":
+            parts.append(
+                f"Dealers are net {_fmt_net_gex(featured.net_gex)} — short gamma, so "
+                f"hedging tends to amplify moves rather than dampen them."
+            )
+        elif regime == "positive":
+            parts.append(
+                f"Dealers are net {_fmt_net_gex(featured.net_gex)} — long gamma, so "
+                f"hedging tends to dampen moves."
+            )
+        else:
+            parts.append(f"Dealers are net {_fmt_net_gex(featured.net_gex)}.")
+    return " ".join(parts) if parts else f"{featured.symbol} {_mode_read_label(mode).lower()}."
+
+
+def _static_bottom_line(featured: SymbolBulletin) -> str:
+    if featured.gamma_flip is not None and featured.spot is not None:
+        if featured.spot < featured.gamma_flip:
+            return (
+                f"Structure stays defensive until {featured.symbol} can reclaim the "
+                f"{_fmt_level(featured.gamma_flip)} gamma flip."
+            )
+        return (
+            f"{featured.symbol} is holding above the {_fmt_level(featured.gamma_flip)} "
+            f"gamma flip — constructive as long as that holds."
+        )
+    return "Watch the levels above for where dealer hedging shifts."
+
+
+def _build_static_post(mode: str, featured: SymbolBulletin) -> str:
+    """Deterministic new-voice post for when the LLM is unavailable.
+
+    Same shape as the LLM path (header, hook, Key levels, Bottom line) but
+    built only from the DB numbers — no scraped news, no narrated path."""
+    blocks: list[str] = [f"{_mode_read_label(mode)} — ${featured.symbol}"]
+    _append_para(blocks, _static_hook(featured, mode))
+    levels = _key_levels_block(featured, {})
+    if levels:
+        _append_para(blocks, "Key levels:\n" + levels)
+    _append_para(blocks, f"Bottom line: {_static_bottom_line(featured)}")
     return "\n".join(blocks).strip()
 
 
@@ -756,21 +963,7 @@ def resolve_artifact_dir(explicit: str | None, mode: str, day: date) -> Path:
     First writable path wins. The chosen root gets ``/<mode>/<date>/``
     appended so a day's three fires each land in their own folder and
     successive dry-runs don't smear over each other."""
-    candidates: list[Path] = []
-    if explicit:
-        candidates.append(Path(explicit))
-    env = os.environ.get("BULLETIN_TWEET_ARTIFACT_DIR", "").strip()
-    if env:
-        candidates.append(Path(env))
-    candidates.append(PRIMARY_ARTIFACT_ROOT)
-    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
-    if xdg:
-        candidates.append(Path(xdg) / "zerogex-oa" / "bulletin-tweets")
-    home = os.environ.get("HOME", "").strip()
-    if home:
-        candidates.append(Path(home) / ".local" / "state" / "zerogex-oa" / "bulletin-tweets")
-
-    for root in candidates:
+    for root in _artifact_root_candidates(explicit):
         target = root / mode / day.isoformat()
         try:
             target.mkdir(parents=True, exist_ok=True)
@@ -787,6 +980,192 @@ def resolve_artifact_dir(explicit: str | None, mode: str, day: date) -> Path:
 
     fallback = Path(tempfile.mkdtemp(prefix="zerogex-bulletin-"))
     return fallback
+
+
+def _artifact_root_candidates(explicit: str | None = None) -> list[Path]:
+    """The ordered writable-root ladder shared by the per-fire artifact dir
+    and the ``latest/`` review-page store."""
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env = os.environ.get("BULLETIN_TWEET_ARTIFACT_DIR", "").strip()
+    if env:
+        candidates.append(Path(env))
+    candidates.append(PRIMARY_ARTIFACT_ROOT)
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg:
+        candidates.append(Path(xdg) / "zerogex-oa" / "bulletin-tweets")
+    home = os.environ.get("HOME", "").strip()
+    if home:
+        candidates.append(Path(home) / ".local" / "state" / "zerogex-oa" / "bulletin-tweets")
+    return candidates
+
+
+def resolve_latest_dir() -> Path | None:
+    """The stable ``<root>/latest`` directory the admin review page reads from.
+
+    Unlike :func:`resolve_artifact_dir` this is NOT per-date — each fire
+    overwrites ``<SYMBOL>-<mode>.json`` so the page always shows the last
+    auto-generated post for a given (timing, symbol).  Returns the first
+    writable candidate, or None if none is writable (caller degrades)."""
+    for root in _artifact_root_candidates():
+        target = root / "latest"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            probe = target / ".writable"
+            probe.touch()
+            probe.unlink()
+            return target
+        except OSError:
+            continue
+    return None
+
+
+def _latest_record_path(latest_dir: Path, symbol: str, mode: str) -> Path:
+    return latest_dir / f"{symbol.upper()}-{mode}.json"
+
+
+def build_latest_record(
+    mode: str,
+    day: date,
+    tweet: TweetBody,
+    featured: SymbolBulletin | None,
+    headlines: list | None = None,
+    media: "MediaArtifacts | None" = None,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
+    """The JSON payload the review page renders (post text + reply + meta)."""
+    heads = []
+    for h in (headlines or [])[:8]:
+        heads.append(
+            {
+                "title": _hget(h, "title", ""),
+                "summary": _hget(h, "summary", ""),
+                "source": _hget(h, "source", "CNBC"),
+                "link": _hget(h, "link"),
+                "published": _hget(h, "published"),
+            }
+        )
+    levels = None
+    if featured is not None:
+        levels = {
+            "spot": featured.spot,
+            "prior_close": featured.prior_close,
+            "gamma_flip": featured.gamma_flip,
+            "call_wall": featured.call_wall,
+            "put_wall": featured.put_wall,
+            "max_pain": featured.max_pain,
+            "net_gex": featured.net_gex,
+            "regime": featured.regime,
+        }
+    return {
+        "mode": mode,
+        "timing_label": _mode_read_label(mode),
+        "symbol": tweet.featured_symbol or tweet.lead_symbol,
+        "date": day.isoformat(),
+        "generated_at": generated_at,
+        "post_text": tweet.text,
+        "reply_text": tweet.reply_text,
+        "fallback_text": tweet.fallback,
+        "headlines": heads,
+        "levels": levels,
+        "media": {
+            "png": str(media.png_path) if media and media.png_path else None,
+            "clip": str(media.clip_path) if media and media.clip_path else None,
+        },
+    }
+
+
+def write_latest_record(record: dict[str, Any]) -> Path | None:
+    """Persist one ``latest`` record for the review page. Best-effort."""
+    latest_dir = resolve_latest_dir()
+    if latest_dir is None:
+        logger.warning("bulletin_tweet: no writable latest dir — skipping review record")
+        return None
+    symbol = str(record.get("symbol") or DEFAULT_LEAD_SYMBOL)
+    mode = str(record.get("mode") or "midday")
+    path = _latest_record_path(latest_dir, symbol, mode)
+    try:
+        path.write_text(json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8")
+        return path
+    except OSError as exc:
+        logger.warning("bulletin_tweet: failed to write latest record (%s)", exc)
+        return None
+
+
+def read_latest_record(symbol: str, mode: str) -> dict[str, Any] | None:
+    """Read the last-generated record for (symbol, mode), or None if absent."""
+    latest_dir = resolve_latest_dir()
+    if latest_dir is None:
+        return None
+    path = _latest_record_path(latest_dir, symbol, mode)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("bulletin_tweet: failed to read latest record %s (%s)", path, exc)
+        return None
+
+
+def configured_symbols() -> tuple[list[str], str]:
+    """The ticker list + default for the review page's regenerate dropdown.
+
+    Sourced from ``$BULLETIN_TWEET_SYMBOLS`` (falls back to
+    :data:`DEFAULT_SYMBOLS` = SPY).  The default is
+    ``$BULLETIN_TWEET_LEAD_SYMBOL`` when it's in the list, else the first
+    symbol."""
+    raw = os.environ.get("BULLETIN_TWEET_SYMBOLS", "").strip()
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()] or list(DEFAULT_SYMBOLS)
+    lead = os.environ.get("BULLETIN_TWEET_LEAD_SYMBOL", DEFAULT_LEAD_SYMBOL).strip().upper()
+    default = lead if lead in symbols else symbols[0]
+    return symbols, default
+
+
+async def generate_and_store(
+    db: "DatabaseManager",
+    mode: str,
+    symbol: str,
+    day: date | None = None,
+    site_url: str | None = None,
+) -> dict[str, Any]:
+    """Generate a post+reply for (symbol, mode), persist it, and return the record.
+
+    Backs the /admin review page's Regenerate button.  Reuses an already-
+    connected ``db`` (the API's shared manager) — it never connects/posts and
+    skips media rendering so the page responds fast; the scheduled job remains
+    the one that renders the PNG/clip for the eventual X post."""
+    if mode not in MODE_READ_LABEL:
+        raise ValueError(f"Unknown mode: {mode!r}")
+    day = day or _today_et()
+    symbol = symbol.upper()
+    site = site_url or os.environ.get("ZEROGEX_SITE_URL", "").strip() or DEFAULT_SITE_URL
+
+    bulletins = await _fetch_bulletins(db, [symbol], day)
+    headlines = _fetch_headlines_safe()
+    tweet = build_tweet_body(
+        mode=mode,
+        day=day,
+        bulletins=bulletins,
+        site_url=site,
+        lead_symbol=symbol,
+        reply_text=os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None,
+        headlines=headlines,
+    )
+    featured = next(
+        (b for b in bulletins if b.symbol == tweet.featured_symbol),
+        next((b for b in bulletins if b.symbol == symbol), None),
+    )
+    record = build_latest_record(
+        mode=mode,
+        day=day,
+        tweet=tweet,
+        featured=featured,
+        headlines=headlines,
+        generated_at=datetime.now(tz=ET).isoformat(),
+    )
+    write_latest_record(record)
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -1043,11 +1422,42 @@ def post_tweet_via_x_api(
 # ---------------------------------------------------------------------------
 
 
+async def _attach_price_action(db: DatabaseManager, bulletin: SymbolBulletin, day: date) -> None:
+    """Best-effort: hang the featured symbol's price action off the bulletin.
+
+    Pulls the previous close (position vs prior close) and the day's
+    intraday session range so the LLM can narrate the path, then derives a
+    plain-language regime + momentum cue.  Every query is wrapped — a miss
+    just leaves that field None, and the LLM writes with what resolved."""
+    sym = bulletin.symbol
+    try:
+        closes = await db.get_session_closes(sym)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: get_session_closes(%s) failed (%s)", sym, exc)
+        closes = None
+    if closes:
+        bulletin.prior_close = _to_float(closes.get("prior_session_close"))
+
+    try:
+        ohlc = await db.get_intraday_ohlc(sym, day)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: get_intraday_ohlc(%s) failed (%s)", sym, exc)
+        ohlc = None
+    if ohlc:
+        bulletin.session_open = _to_float(ohlc.get("session_open"))
+        bulletin.session_high = _to_float(ohlc.get("session_high"))
+        bulletin.session_low = _to_float(ohlc.get("session_low"))
+
+    bulletin.regime = _derive_regime(bulletin.net_gex, bulletin.spot, bulletin.gamma_flip)
+    bulletin.momentum_label = _derive_momentum_label(bulletin)
+
+
 async def _fetch_bulletins(
     db: DatabaseManager,
     symbols: list[str],
+    day: date,
 ) -> list[SymbolBulletin]:
-    """Fetch the latest GEX summary for every requested symbol.
+    """Fetch the latest GEX summary + price action for every requested symbol.
 
     Each call is wrapped so a single symbol's DB miss doesn't take
     the whole tweet down — we just render a placeholder block for the
@@ -1105,6 +1515,9 @@ async def _fetch_bulletins(
                 proj.cash_ref_close,
                 proj.gap_points,
             )
+        # Price action (prior close, session range, regime, momentum) — the
+        # inputs the LLM narrates the day's path from.  Best-effort.
+        await _attach_price_action(db, bulletin, day)
         out.append(bulletin)
     return out
 
@@ -1252,7 +1665,7 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        bulletins = await _fetch_bulletins(db, symbols)
+        bulletins = await _fetch_bulletins(db, symbols, day)
     finally:
         try:
             await db.disconnect()
@@ -1266,6 +1679,9 @@ async def _run(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # Scrape the day's CNBC headlines to feed the LLM (best-effort, never fatal).
+    headlines = _fetch_headlines_safe()
+
     tweet = build_tweet_body(
         mode=args.mode,
         day=day,
@@ -1273,6 +1689,7 @@ async def _run(args: argparse.Namespace) -> int:
         site_url=args.site_url,
         lead_symbol=args.lead_symbol.upper(),
         reply_text=os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None,
+        headlines=headlines,
     )
 
     artifact_dir = resolve_artifact_dir(args.artifact_dir, args.mode, day)
@@ -1308,6 +1725,25 @@ async def _run(args: argparse.Namespace) -> int:
         day,
         bulletins,
         state="dry_run",
+    )
+
+    # Persist the "latest" record the /admin review page reads (best-effort,
+    # never fatal).  Overwrites the previous fire for this (timing, symbol) so
+    # the page always shows the last auto-generated post.
+    _featured = next(
+        (b for b in bulletins if b.symbol == tweet.featured_symbol),
+        next((b for b in bulletins if b.symbol == tweet.lead_symbol), None),
+    )
+    write_latest_record(
+        build_latest_record(
+            mode=args.mode,
+            day=day,
+            tweet=tweet,
+            featured=_featured,
+            headlines=headlines,
+            media=media,
+            generated_at=datetime.now(tz=ET).isoformat(),
+        )
     )
 
     bearer = os.environ.get("X_BOT_BEARER_TOKEN", "").strip()

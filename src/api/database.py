@@ -3889,6 +3889,48 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
             raise
 
+    async def get_intraday_ohlc(
+        self, symbol: str = "SPY", session_date: Optional[date] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Regular-session (09:30–16:00 ET) OHLC for one ET date.
+
+        Returns ``{session_open, session_high, session_low, session_last,
+        bar_count}`` aggregated over the cash window of ``session_date``
+        (defaults to today ET), or None when no RTH bars exist yet — e.g. a
+        pre-market fire before 09:30, when the day's path hasn't started.
+
+        Feeds the bulletin tweet's price-action narrative ("dumped down to the
+        735 put wall early, rebounded, pulled back into the bell").  Callers
+        wrap it; it is never on a hot path."""
+        symbol = symbol.upper()
+        query = """
+            WITH day_bars AS (
+                SELECT uq.timestamp, uq.open, uq.high, uq.low, uq.close
+                FROM underlying_quotes uq
+                WHERE uq.symbol = $1
+                    AND (uq.timestamp AT TIME ZONE 'America/New_York')::date
+                        = COALESCE($2::date, (NOW() AT TIME ZONE 'America/New_York')::date)
+                    AND (uq.timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+            )
+            SELECT
+                (SELECT open FROM day_bars ORDER BY timestamp ASC LIMIT 1)  AS session_open,
+                MAX(high) AS session_high,
+                MIN(low)  AS session_low,
+                (SELECT close FROM day_bars ORDER BY timestamp DESC LIMIT 1) AS session_last,
+                COUNT(*)  AS bar_count
+            FROM day_bars
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, session_date)
+        except Exception as e:
+            logger.error(f"Error fetching intraday OHLC: {e!r}", exc_info=True)
+            raise
+        if not row or not row["bar_count"]:
+            return None
+        return dict(row)
+
     async def get_latest_future_quote(
         self, index_symbol: str, session_start: Optional[datetime] = None
     ) -> Optional[Dict[str, Any]]:

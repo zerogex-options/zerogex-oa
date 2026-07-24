@@ -46,6 +46,11 @@ _PINNED_DEFAULTS = {
     "MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS": "SPY,SPX,QQQ",
     "SIGNALS_BREAKOUT_SIZE_MULTIPLIER": "1.50",
     "SIGNALS_TRIGGER_THRESHOLD": "0.50",
+    # src/jobs/cnbc_news.py: the bulletin runner scrapes CNBC RSS via
+    # _fetch_headlines_safe. That is a live network call (slow, and the egress
+    # proxy 403s it) — disable it in the unit suite so headline resolution
+    # returns [] instantly. Tests that exercise the parser call it directly.
+    "BULLETIN_TWEET_NEWS_ENABLED": "0",
 }
 
 for _key, _default in _PINNED_DEFAULTS.items():
