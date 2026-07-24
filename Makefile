@@ -158,7 +158,6 @@ db-tail-$(1): ## Show 20 most recent rows from $(2) (UNDERLYING=X to filter)
 
 endef
 
-$(eval $(call DB_TAIL,symbols,symbols,symbol,created_at))
 $(eval $(call DB_TAIL,underlying-quotes,underlying_quotes,symbol,timestamp))
 $(eval $(call DB_TAIL,option-chains,option_chains,underlying,timestamp))
 $(eval $(call DB_TAIL,gex-summary,gex_summary,underlying,timestamp))
@@ -167,6 +166,14 @@ $(eval $(call DB_TAIL,flow-by-contract,flow_by_contract,symbol,timestamp))
 $(eval $(call DB_TAIL,flow-smart-money,flow_smart_money,symbol,timestamp))
 $(eval $(call DB_TAIL,signal-scores,signal_scores,underlying,timestamp))
 $(eval $(call DB_TAIL,signal-trades,signal_trades,underlying,opened_at))
+
+# symbols is a small registry (not a time-series table), so it gets its own
+# named target rather than a db-tail-* one. Kept behaviorally identical to the
+# old db-tail-symbols (UNDERLYING=X filters the symbol column).
+.PHONY: symbols-list
+symbols-list: ## Show 20 most recent rows from symbols (UNDERLYING=X to filter)
+	@echo "$(BLUE)=== symbols (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM symbols $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY created_at DESC LIMIT 20;"
 
 .PHONY: db-tail-vix-bars
 db-tail-vix-bars: ## Show 20 most recent rows from vix_bars
@@ -1035,7 +1042,7 @@ help: ## Show this help message
 	@echo "  make schema-backup      - Backup current schema to file"
 	@echo ""
 	@echo "$(GREEN)DB Table Tail:$(NC)"
-	@echo "  make db-tail-symbols              - Last 20 rows from symbols"
+	@echo "  make symbols-list                 - Last 20 rows from symbols"
 	@echo "  make db-tail-underlying-quotes    - Last 20 rows from underlying_quotes"
 	@echo "  make db-tail-option-chains        - Last 20 rows from option_chains"
 	@echo "  make db-tail-gex-summary          - Last 20 rows from gex_summary"
