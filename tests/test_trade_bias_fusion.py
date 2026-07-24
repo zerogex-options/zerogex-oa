@@ -17,9 +17,14 @@ from src.signals.trade_bias.fusion import (
     INTRADAY_PROFILE,
     SWING_PROFILE,
     compute_tactical,
+    continuous_bias,
     fuse,
     profile_for,
 )
+
+
+def _cont(eng, ctx, inputs):
+    return continuous_bias(eng.build_directional_signals(ctx, inputs))
 
 
 # --- fixtures --------------------------------------------------------------
@@ -204,7 +209,7 @@ def test_engine_bounce_overrides_negative_gamma_playbook():
     structural = compute_bias(inputs)
     tactical = eng.build_tactical(ctx, inputs)
     fused = fuse(structural, tactical)
-    snap = eng.build_snapshot(ctx, inputs, structural, tactical, fused)
+    snap = eng.build_snapshot(ctx, inputs, structural, tactical, fused, _cont(eng, ctx, inputs))
 
     assert structural.trend == "bearish"  # the playbook we're overruling
     assert snap.state == "override"
@@ -255,9 +260,60 @@ def test_engine_builds_intraday_snapshot():
     structural = compute_bias(inputs)
     tactical = eng.build_tactical(ctx, inputs, INTRADAY_PROFILE)
     fused = fuse(structural, tactical, INTRADAY_PROFILE)
-    snapshot = eng.build_snapshot(ctx, inputs, structural, tactical, fused, tenor="intraday")
+    snapshot = eng.build_snapshot(
+        ctx, inputs, structural, tactical, fused, _cont(eng, ctx, inputs), tenor="intraday"
+    )
     assert snapshot.tenor == "intraday"
     assert snapshot.payload["tenor"] == "intraday"
+
+
+def test_continuous_bias_zero_only_when_perfectly_balanced():
+    # tape_flow and order_flow carry equal weight, so equal-and-opposite cancels.
+    assert continuous_bias({"tape_flow": 0.5, "order_flow": -0.5}).score == 0.0
+    # Tip it one hair and the number leaves zero — no magnet.
+    assert continuous_bias({"tape_flow": 0.5, "order_flow": -0.49}).score > 0
+
+
+def test_continuous_bias_sign_and_breadth():
+    up = continuous_bias({"tape_flow": 0.8, "order_flow": 0.7, "momentum": 0.6})
+    down = continuous_bias({"tape_flow": -0.8, "order_flow": -0.7, "momentum": -0.6})
+    assert 20 < up.score <= 100
+    assert -100 <= down.score < -20
+    assert up.breadth == 1.0  # all three agree
+
+
+def test_continuous_bias_flows_monotonically():
+    # Continuous + sensitive: nudging one input moves the number smoothly, no
+    # bucketing or pinning.
+    a = continuous_bias({"tape_flow": 0.2}).score
+    b = continuous_bias({"tape_flow": 0.4}).score
+    c = continuous_bias({"tape_flow": 0.6}).score
+    assert a < b < c
+    assert a != 0.0
+
+
+def test_engine_bias_score_flows_even_in_chop():
+    # Long gamma + strongly contradicting gradient => structural CHOP (trend
+    # neutral). The OLD sign x confidence logic pinned bias_score to 0 here;
+    # the continuous aggregate keeps flowing.
+    ctx = _ctx(net_gex=1.2e9, recent_closes=_rising(), smart_call=200000.0, smart_put=40000.0)
+    eng = TradeBiasEngine("SPY")
+    inputs = eng.build_inputs(
+        ctx,
+        SimpleNamespace(composite_score=50.0),
+        [],
+        [
+            SimpleNamespace(name="tape_flow_bias", score=0.4),
+            SimpleNamespace(name="gex_gradient", score=-0.6),
+        ],
+    )
+    structural = compute_bias(inputs)
+    tactical = eng.build_tactical(ctx, inputs)
+    fused = fuse(structural, tactical)
+    snap = eng.build_snapshot(ctx, inputs, structural, tactical, fused, _cont(eng, ctx, inputs))
+    assert structural.trend == "neutral"  # CHOP — the old magnet case
+    assert snap.bias_score != 0.0  # but the number still flows
+    assert "aggregate" in snap.payload and "breadth" in snap.payload
 
 
 def test_engine_baseline_when_no_tactical_signal():
@@ -269,6 +325,6 @@ def test_engine_baseline_when_no_tactical_signal():
     structural = compute_bias(inputs)
     tactical = eng.build_tactical(ctx, inputs)
     fused = fuse(structural, tactical)
-    snap = eng.build_snapshot(ctx, inputs, structural, tactical, fused)
+    snap = eng.build_snapshot(ctx, inputs, structural, tactical, fused, _cont(eng, ctx, inputs))
     assert snap.state in ("baseline", "confirmed", "divergent")  # never override on a quiet tape
     assert snap.payload["override"]["active"] is False

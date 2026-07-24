@@ -21,6 +21,7 @@ change.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -113,6 +114,89 @@ def profile_for(tenor: str) -> TenorProfile:
 
 _TREND_SIGN = {"bullish": 1, "bearish": -1, "neutral": 0}
 _SIGN_DIR = {1: "long", -1: "short", 0: "neutral"}
+
+# ---------------------------------------------------------------------------
+# Continuous bias score
+#
+# The signed bias number must FLOW — it should read 0 only when the inputs are
+# genuinely balanced, never pin there because a discrete regime went neutral.
+# So the number is a weighted mean of every *directional* signal (each on
+# [-1, 1]), passed through tanh(gain * x) for a smooth, magnet-free map onto
+# [-100, 100]. gamma sign / MSI are regime-strength, not direction, so they are
+# deliberately excluded from the directional aggregate.
+# ---------------------------------------------------------------------------
+_DIR_WEIGHTS = {
+    "tape_flow": 0.14,
+    "order_flow": 0.14,
+    "momentum": 0.12,
+    "price_action": 0.12,
+    "odte": 0.08,
+    "vanna_charm": 0.08,
+    "positioning_trap": 0.08,
+    "trap_detection": 0.08,
+    "gamma_vwap": 0.08,
+    "gex_gradient": 0.04,
+    "dealer_delta": 0.04,
+}
+# Gain into tanh — higher spreads moderate leans further across the range so
+# the tape uses its full span instead of hugging center. Env-tunable.
+_BIAS_GAIN = float(os.getenv("TRADE_BIAS_SCORE_GAIN", "2.0"))
+
+
+@dataclass
+class ContinuousBias:
+    score: float  # signed [-100, 100], continuous
+    aggregate: float  # signed [-1, 1] weighted mean of the directional signals
+    breadth: float  # [0, 1] weighted share of signals agreeing with the sign
+    confidence: float  # [0, 100]
+    available: int
+
+
+def continuous_bias(
+    signals: dict[str, Optional[float]], gain: float = _BIAS_GAIN
+) -> ContinuousBias:
+    """Continuous signed bias from the directional signals (each on [-1, 1]).
+
+    ``signals`` keys are those in ``_DIR_WEIGHTS``; missing / None values are
+    excluded and the surviving weights renormalize, so the read stays centered
+    only when the *present* signals genuinely cancel.
+    """
+    num = 0.0
+    den = 0.0
+    available = 0
+    for key, weight in _DIR_WEIGHTS.items():
+        value = signals.get(key)
+        if value is None or weight <= 0:
+            continue
+        available += 1
+        num += weight * max(-1.0, min(1.0, float(value)))
+        den += weight
+    aggregate = (num / den) if den > 0 else 0.0
+    score = 100.0 * math.tanh(gain * aggregate)
+
+    # Breadth: weighted share of present signals pointing the aggregate's way.
+    agg_sign = _sign(aggregate)
+    bnum = 0.0
+    bden = 0.0
+    for key, weight in _DIR_WEIGHTS.items():
+        value = signals.get(key)
+        if value is None or weight <= 0:
+            continue
+        bden += weight
+        if agg_sign != 0 and _sign(value) == agg_sign:
+            bnum += weight
+    breadth = (bnum / bden) if bden > 0 else 0.0
+
+    # Conviction = how far off center AND how broad the agreement.
+    confidence = min(100.0, abs(score) * (0.5 + 0.5 * breadth))
+
+    return ContinuousBias(
+        score=round(score, 2),
+        aggregate=round(aggregate, 4),
+        breadth=round(breadth, 4),
+        confidence=round(confidence, 2),
+        available=available,
+    )
 
 
 def _sign(x: float, dead: float = 1e-9) -> int:

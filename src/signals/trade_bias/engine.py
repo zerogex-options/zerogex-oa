@@ -15,10 +15,12 @@ graded override, first-class momentum, swing bounce/reject detector, and the
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import MarketContext
 from src.signals.components.momentum import MomentumComponent
 from src.signals.components.order_flow_imbalance import OrderFlowImbalanceComponent
@@ -26,10 +28,12 @@ from src.signals.components.swing_reversal import SwingReversalComponent
 from src.signals.trade_bias.bias import BiasInput, BiasResult, compute_bias
 from src.signals.trade_bias.fusion import (
     SWING_PROFILE,
+    ContinuousBias,
     FusedBias,
     TacticalRead,
     TenorProfile,
     compute_tactical,
+    continuous_bias,
     fuse,
     profile_for,
 )
@@ -47,6 +51,18 @@ TENOR_INTRADAY = "intraday"
 
 _TREND_TO_DIRECTION = {"bullish": "long", "bearish": "short", "neutral": "neutral"}
 _DIRECTION_TO_TREND = {"long": "bullish", "short": "bearish", "neutral": "neutral"}
+
+# The signed bias number flows continuously; the direction LABEL only needs a
+# hair of dead-band around 0 so it doesn't flicker long/short on noise.
+_DIR_DEADBAND = float(os.getenv("TRADE_BIAS_DIRECTION_DEADBAND", "1.0"))
+
+
+def _direction_from_score(score: float) -> str:
+    if score > _DIR_DEADBAND:
+        return "long"
+    if score < -_DIR_DEADBAND:
+        return "short"
+    return "neutral"
 
 
 @dataclass
@@ -75,6 +91,7 @@ class TradeBiasEngine:
         self._swing = SwingReversalComponent()
         self._momentum = MomentumComponent()
         self._order_flow = OrderFlowImbalanceComponent()
+        self._dealer_delta = DealerDeltaPressureComponent()
 
     # ------------------------------------------------------------------
     # Input assembly
@@ -125,6 +142,36 @@ class TradeBiasEngine:
             gammaVWAP=advanced.get("gamma_vwap_confluence"),
             msi=msi,
         )
+
+    # ------------------------------------------------------------------
+    # Continuous directional aggregate
+    # ------------------------------------------------------------------
+    def build_directional_signals(
+        self, ctx: MarketContext, inputs: BiasInput
+    ) -> dict[str, Optional[float]]:
+        """Every directional signal on [-1, 1] for the continuous bias score.
+
+        Tenor-independent (unlike the tactical ``flow`` pillar): order flow and
+        0DTE positioning are separate entries here. Gamma sign and MSI are
+        excluded — they are regime strength, not direction.
+        """
+
+        def scale(value: Optional[float]) -> Optional[float]:
+            return None if value is None else max(-1.0, min(1.0, value / _TREND_SCALE))
+
+        return {
+            "tape_flow": scale(inputs.tapeFlow),
+            "order_flow": self._order_flow.compute(ctx),
+            "momentum": self._momentum.compute(ctx),
+            "price_action": self._swing.compute(ctx),
+            "odte": scale(inputs.odtePositioning),
+            "vanna_charm": scale(inputs.vannaCharm),
+            "positioning_trap": scale(inputs.positioningTrap),
+            "trap_detection": scale(inputs.trapDetection),
+            "gamma_vwap": scale(inputs.gammaVWAP),
+            "gex_gradient": scale(inputs.gexGradient),
+            "dealer_delta": self._dealer_delta.compute(ctx),
+        }
 
     # ------------------------------------------------------------------
     # Snapshot assembly
@@ -179,12 +226,17 @@ class TradeBiasEngine:
         structural: BiasResult,
         tactical: TacticalRead,
         fused: FusedBias,
+        cont: ContinuousBias,
         tenor: str = TENOR_SWING,
     ) -> TradeBiasSnapshot:
-        # The fused layer owns the signed bias / direction / state / override;
-        # the structural baseline still owns the regime label, checklist, and
-        # the CHOP "watching" chips.
-        bias_trend = _DIRECTION_TO_TREND.get(fused.direction, "neutral")
+        # The signed number (bias_score / confidence / direction) flows from the
+        # CONTINUOUS directional aggregate so it never pins at 0. The fused layer
+        # still owns the regime state / override / playbook; the structural
+        # baseline owns the regime label, checklist, and CHOP "watching" chips.
+        bias_score = cont.score
+        direction = _direction_from_score(bias_score)
+        bias_trend = _DIRECTION_TO_TREND.get(direction, "neutral")
+        confidence = cont.confidence
         pillars = {
             k: (round(v, 4) if isinstance(v, (int, float)) else None)
             for k, v in tactical.pillars.items()
@@ -192,15 +244,20 @@ class TradeBiasEngine:
 
         payload: dict[str, Any] = {
             "tenor": tenor,
-            "bias_score": fused.bias_score,
-            "direction": fused.direction,
+            "bias_score": bias_score,
+            "direction": direction,
             "state": fused.state,
             "override": {
                 "active": fused.override_active,
                 "reason": fused.override_reason,
                 "overruled_posture": fused.overruled_posture,
             },
-            "confidence": fused.confidence,
+            "confidence": confidence,
+            # The continuous directional aggregate behind the number, for
+            # transparency / calibration (weighted mean of all directional
+            # signals on [-1, 1], and the weighted share agreeing with its sign).
+            "aggregate": cont.aggregate,
+            "breadth": cont.breadth,
             "confidence_raw": structural.confidence,
             "max_confidence_raw": structural.maxConfidence,
             "regime": {
@@ -263,12 +320,12 @@ class TradeBiasEngine:
             timestamp=ctx.timestamp,
             underlying=getattr(ctx, "underlying", self.underlying),
             tenor=tenor,
-            bias_score=fused.bias_score,
-            direction=fused.direction,
+            bias_score=bias_score,
+            direction=direction,
             bias_code=fused.bias_code,
             market_state=structural.marketState,
             state=fused.state,
-            confidence=fused.confidence,
+            confidence=confidence,
             override_active=fused.override_active,
             payload=payload,
         )
@@ -334,6 +391,7 @@ class TradeBiasEngine:
         structural = compute_bias(inputs)
         tactical = self.build_tactical(ctx, inputs, profile)
         fused = fuse(structural, tactical, profile)
-        snapshot = self.build_snapshot(ctx, inputs, structural, tactical, fused, tenor=tenor)
+        cont = continuous_bias(self.build_directional_signals(ctx, inputs))
+        snapshot = self.build_snapshot(ctx, inputs, structural, tactical, fused, cont, tenor=tenor)
         self.persist(snapshot, conn=conn)
         return snapshot

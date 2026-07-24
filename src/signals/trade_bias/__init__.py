@@ -22,10 +22,12 @@ from src.signals.trade_bias.engine import TradeBiasEngine, TradeBiasSnapshot
 from src.signals.trade_bias.fusion import (
     INTRADAY_PROFILE,
     SWING_PROFILE,
+    ContinuousBias,
     FusedBias,
     TacticalRead,
     TenorProfile,
     compute_tactical,
+    continuous_bias,
     fuse,
     profile_for,
 )
@@ -40,10 +42,12 @@ __all__ = [
     "TradeBiasSnapshot",
     "TacticalRead",
     "FusedBias",
+    "ContinuousBias",
     "TenorProfile",
     "SWING_PROFILE",
     "INTRADAY_PROFILE",
     "compute_tactical",
+    "continuous_bias",
     "fuse",
     "profile_for",
 ]
