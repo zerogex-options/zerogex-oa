@@ -1060,6 +1060,8 @@ help: ## Show this help message
 	@echo "  make db-size            - Show table sizes"
 	@echo "  make refresh-views      - Refresh materialized views"
 	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
+	@echo "  make db-symbols-audit   - Read-only audit of malformed symbols rows (cascade preview)"
+	@echo "  make db-symbols-cleanup - Delete malformed symbols rows (CONFIRM=yes; INCLUDE_DATA=yes to cascade)"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
@@ -3085,6 +3087,31 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 		"\\gexec" \
 		"SELECT 'legacy artifacts pruned' AS status;" \
 	| $(PSQL)
+
+.PHONY: db-symbols-audit
+db-symbols-audit: ## Read-only audit of malformed symbols rows + the FK-cascade blast radius of deleting them. Nothing is deleted.
+	@echo "$(BLUE)=== symbols cleanup audit (read-only) ===$(NC)"
+	@echo "$(YELLOW)Flags malformed symbols (not 1-6 uppercase letters) and counts$(NC)"
+	@echo "$(YELLOW)the dependent rows a CASCADE delete would remove. Nothing is deleted.$(NC)"
+	@$(PSQL) -f setup/database/diagnostics/symbols_cleanup_audit.sql
+
+.PHONY: db-symbols-cleanup
+db-symbols-cleanup: ## Delete malformed symbols rows. Dry-run unless CONFIRM=yes; INCLUDE_DATA=yes also CASCADE-deletes rows still holding data.
+	@echo "$(BLUE)=== symbols cleanup ===$(NC)"
+	@echo "$(YELLOW)Malformed = symbol not matching 1-6 uppercase letters.$(NC)"
+	@echo "$(YELLOW)Run 'make db-symbols-audit' first to see dependent-row counts.$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)-- DRY RUN -- malformed rows that are cleanup candidates:$(NC)"; \
+		$(PSQL) -c "SELECT symbol, name, asset_type, is_active FROM symbols WHERE symbol !~ '^[A-Z]{1,6}$$' ORDER BY symbol;"; \
+		echo "$(YELLOW)Nothing deleted. Re-run with CONFIRM=yes to delete zero-dependent rows;$(NC)"; \
+		echo "$(YELLOW)add INCLUDE_DATA=yes to also cascade rows that still hold data.$(NC)"; \
+	else \
+		if [ "$${INCLUDE_DATA}" = "yes" ]; then INC=true; else INC=false; fi; \
+		echo "$(YELLOW)Deleting malformed rows (include_data=$${INC})...$(NC)"; \
+		$(PSQL) -v ON_ERROR_STOP=1 -v confirm=yes -v include_data=$${INC} \
+			-f setup/database/diagnostics/symbols_cleanup.sql; \
+		echo "$(GREEN)✓ symbols cleanup complete$(NC)"; \
+	fi
 
 # =============================================================================
 # Interactive
