@@ -145,6 +145,10 @@ The deployment process runs these steps in order:
     clock crosses into the next hour/day, then finalised. Inspect with
     `make system-monitor-show` or `make system-monitor-show-json | jq`.
 - Pre-creates `~ubuntu/monitoring/` for the system-monitor state file
+- Installs a journald disk cap (`/etc/systemd/journald.conf.d/10-zerogex-oa.conf`,
+  `SystemMaxUse=100M` + `SystemMaxFileSize=20M`) and restarts `systemd-journald`,
+  so the journal stays bounded 24/7 between the nightly log vacuums rather than
+  ballooning on the small root volume
 - Enables services + timers to start on boot
 - Starts services and verifies status
 

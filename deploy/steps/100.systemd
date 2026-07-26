@@ -148,6 +148,24 @@ if [ "${#TIMER_INSTALLED[@]}" -gt 0 ]; then
     done
 fi
 
+# -- journald disk cap ------------------------------------------------
+# Keep the systemd journal bounded 24/7 so it can't balloon between the nightly
+# zerogex-oa-logs-clear vacuums on the small root volume.  Drop-in under
+# /etc/systemd/journald.conf.d/ — leaves the distro's journald.conf untouched.
+JOURNALD_DROPIN_SRC="$SYSTEMD_SOURCE/zerogex-oa-journald.conf"
+JOURNALD_DROPIN_DST="/etc/systemd/journald.conf.d/10-zerogex-oa.conf"
+if [ -f "$JOURNALD_DROPIN_SRC" ]; then
+    log "  → Installing journald disk cap ($JOURNALD_DROPIN_DST)..."
+    sudo install -D -m 0644 "$JOURNALD_DROPIN_SRC" "$JOURNALD_DROPIN_DST"
+    if sudo systemctl restart systemd-journald 2>/dev/null; then
+        log "     ✓ journald cap applied (SystemMaxUse=100M); $(journalctl --disk-usage 2>/dev/null)"
+    else
+        log "     ✗ journald restart failed — cap applies on next journald restart"
+    fi
+else
+    log "  ⚠ $JOURNALD_DROPIN_SRC not found — skipping journald cap"
+fi
+
 # Check status of each service
 log ""
 log "  → Service Status Check:"
