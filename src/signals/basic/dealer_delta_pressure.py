@@ -11,14 +11,16 @@ at minimum per-strike ``call_oi``, ``put_oi``, and (optionally)
 When delta-weighted OI isn't available we fall back to call_oi/put_oi
 approximation using linear distance from spot as a delta proxy.
 
-Score convention:
-  * negative score => dealers are net short delta (they *must* buy into
+Score convention (the returned, published score):
+  * positive score => dealers are net short delta (they *must* buy into
     a rally), which amplifies upside -> **bullish** for price.
-  * positive score => dealers are net long delta (they must sell into a
+  * negative score => dealers are net long delta (they must sell into a
     rally), which suppresses upside -> **bearish** for price.
 
-We invert so that the composite-score contribution is aligned with
-"bullish for SPY" semantics downstream.
+The raw dealer net delta (DNI) carries the opposite sign — a short-delta
+book is a *negative* DNI — so ``compute`` returns ``-normalized`` to
+publish the score in "bullish for SPY = positive" terms, consistent with
+every other component.
 """
 
 from __future__ import annotations
