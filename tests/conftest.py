@@ -64,6 +64,10 @@ for _key, _default in _PINNED_DEFAULTS.items():
 # stays green. Blank the keys so those paths take their offline fallback. Tests
 # that deliberately exercise the credentialed path set the var per-test via
 # monkeypatch (which overrides this) and stub the network client.
-_BLANKED_CREDENTIALS = ("ANTHROPIC_API_KEY",)
+# RESEND_API_KEY joins the list: bulletin_tweet's built-in "X-Post Ready"
+# email POSTs to the Resend API when it's set. Blank it so the runner tests
+# that reach the stage/post path take the "not configured" skip instead of a
+# live send; the two email tests set it per-test via monkeypatch + stub urlopen.
+_BLANKED_CREDENTIALS = ("ANTHROPIC_API_KEY", "RESEND_API_KEY")
 for _cred in _BLANKED_CREDENTIALS:
     os.environ[_cred] = ""

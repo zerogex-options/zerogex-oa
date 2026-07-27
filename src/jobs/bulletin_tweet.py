@@ -1108,6 +1108,29 @@ def read_latest_record(symbol: str, mode: str) -> dict[str, Any] | None:
         return None
 
 
+def read_latest_record_any(mode: str) -> dict[str, Any] | None:
+    """The most-recently-generated record for ``mode`` across all symbols.
+
+    Lets the review page pre-fill from the last scheduled run even when that
+    run featured a symbol other than the page's default (e.g. a multi-symbol
+    ``BULLETIN_TWEET_SYMBOLS`` where the 'cleanest setup' wasn't SPY).  Picks
+    the newest by ``generated_at``.  Returns None when nothing exists."""
+    latest_dir = resolve_latest_dir()
+    if latest_dir is None:
+        return None
+    best: dict[str, Any] | None = None
+    best_key = ""
+    for path in latest_dir.glob(f"*-{mode}.json"):
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        key = str(rec.get("generated_at") or "")
+        if best is None or key > best_key:
+            best, best_key = rec, key
+    return best
+
+
 def configured_symbols() -> tuple[list[str], str]:
     """The ticker list + default for the review page's regenerate dropdown.
 
@@ -1756,6 +1779,12 @@ async def _run(args: argparse.Namespace) -> int:
     effective_post = bool(args.post) or (bool(args.stage) and autopilot)
     effective_stage = bool(args.stage) and not effective_post
 
+    # A real scheduled fire (--stage) or an autopilot post emails the operator a
+    # "<Timing> X-Post Ready" notice linking to the /admin/x-post review page.
+    # Manual dry-run previews don't email.  Best-effort — never fatal.
+    if effective_stage or effective_post:
+        _send_xpost_ready_email(args.mode)
+
     if effective_stage:
         _write_manifest_and_text(
             artifact_dir,
@@ -1932,6 +1961,101 @@ def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> N
         mode,
         tweet.text,
     )
+
+
+# Friendly timing word for the email subject — matches the operator's
+# "market open / midday / market close" phrasing.
+_TIMING_WORD = {"premarket": "Market Open", "midday": "Midday", "close": "Market Close"}
+
+
+def _xpost_admin_url() -> str:
+    """The /admin/x-post review-page URL used in the X-Post-Ready email."""
+    explicit = os.environ.get("BULLETIN_TWEET_ADMIN_URL", "").strip()
+    if explicit:
+        return explicit
+    site = os.environ.get("ZEROGEX_SITE_URL", "").strip().rstrip("/") or DEFAULT_SITE_URL
+    return f"{site}/admin/x-post"
+
+
+def _send_xpost_ready_email(mode: str) -> bool:
+    """Email a "<Timing> X-Post Ready" notice with a link to /admin/x-post.
+
+    Built into the job (not a shell hook) so the scheduled fire notifies the
+    operator with no extra wiring — reuses the same RESEND_API_KEY /
+    RESEND_FROM_EMAIL / BULLETIN_TWEET_EMAIL_TO the frontend already uses.
+    Disable with BULLETIN_TWEET_ADMIN_EMAIL_ENABLED=0.  Best-effort: returns
+    False (and logs) on any missing config or send error — never fatal.
+
+    This REPLACES the old "approval needed" email — remove the deprecated
+    BULLETIN_TWEET_NOTIFY_HOOK from .env so the old one stops (a warning is
+    logged if both are active)."""
+    if os.environ.get("BULLETIN_TWEET_ADMIN_EMAIL_ENABLED", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return False
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    from_email = os.environ.get("RESEND_FROM_EMAIL", "").strip()
+    to_email = os.environ.get("BULLETIN_TWEET_EMAIL_TO", "").strip()
+    if not (api_key and from_email and to_email):
+        logger.info(
+            "bulletin_tweet: X-Post-Ready email skipped — RESEND_API_KEY / "
+            "RESEND_FROM_EMAIL / BULLETIN_TWEET_EMAIL_TO not all set",
+        )
+        return False
+
+    timing = _TIMING_WORD.get(mode, mode)
+    url = _xpost_admin_url()
+    html = (
+        f"<h2>{timing} X-Post Ready</h2>"
+        f"<p>The {timing.lower()} X-post has been generated.</p>"
+        f'<p><a href="{url}" style="display:inline-block;padding:10px 18px;'
+        f"background:#111;color:#fff;border-radius:8px;text-decoration:none;"
+        f'font-weight:600">Review &amp; copy the post &rarr;</a></p>'
+        f'<p style="color:#666;font-size:13px">Or open: <a href="{url}">{url}</a>'
+        f"<br>You'll need to be signed in to your Admin account to view it.</p>"
+    )
+    text = f"{timing} X-Post Ready\n\nReview & copy the post: {url}\n" f"(Admin sign-in required.)"
+    body = json.dumps(
+        {
+            "from": from_email,
+            "to": [to_email],
+            "subject": f"{timing} X-Post Ready",
+            "html": html,
+            "text": text,
+        }
+    ).encode("utf-8")
+    req = Request(
+        "https://api.resend.com/emails",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            resp.read()
+    except (HTTPError, URLError) as exc:
+        logger.warning("bulletin_tweet: X-Post-Ready email failed (%s)", exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: X-Post-Ready email error (%s)", exc)
+        return False
+
+    logger.info("bulletin_tweet: X-Post-Ready email sent to %s (%s)", to_email, timing)
+    # Nudge if the deprecated approval hook is ALSO set — that's the old
+    # "approval needed" email; they'll get both until it's removed.
+    if os.environ.get("BULLETIN_TWEET_NOTIFY_HOOK", "").strip():
+        logger.warning(
+            "bulletin_tweet: BULLETIN_TWEET_NOTIFY_HOOK is set alongside the "
+            "built-in X-Post-Ready email — remove it from .env to stop the old "
+            "'approval needed' email.",
+        )
+    return True
 
 
 def _call_notify_hook(

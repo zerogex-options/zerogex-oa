@@ -75,14 +75,24 @@ async def latest(
     """The last auto-generated record for (symbol, timing).
 
     ``symbol`` defaults to the configured default; ``mode`` defaults to the
-    current wall-clock ET timing.  ``record`` is null when nothing has been
-    generated for that slot yet (the page then offers Regenerate)."""
+    current wall-clock ET timing.  On the initial load (no explicit
+    ``symbol``), if the default symbol has no record we fall back to the most
+    recent scheduled run for this timing regardless of which symbol it
+    featured — so the page always pre-fills from the last background run.
+    ``record`` is null only when nothing at all has been generated for that
+    slot (the page then offers Regenerate)."""
     _, default_symbol = bt.configured_symbols()
+    explicit_symbol = bool(symbol)
     sym = (symbol or default_symbol).upper()
     resolved_mode = mode or bt.resolve_current_mode()
     if resolved_mode not in bt.MODES:
         raise HTTPException(status_code=400, detail=f"unknown mode {resolved_mode!r}")
     record = bt.read_latest_record(sym, resolved_mode)
+    if record is None and not explicit_symbol:
+        fallback = bt.read_latest_record_any(resolved_mode)
+        if fallback is not None:
+            fb_symbol = str(fallback.get("symbol") or sym).upper()
+            return _envelope(fb_symbol, resolved_mode, fallback)
     return _envelope(sym, resolved_mode, record)
 
 
