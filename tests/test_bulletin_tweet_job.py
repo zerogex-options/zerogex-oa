@@ -380,6 +380,59 @@ def test_select_featured_symbol_weights_gamma_flip_over_walls():
     assert mod.select_featured_symbol([spy, qqq]).symbol == "QQQ"
 
 
+def test_build_tweet_body_force_featured_pins_lead_symbol(monkeypatch):
+    """force_featured (the scheduled auto-post's lead) pins the featured symbol
+    even when another symbol has a 'cleaner setup'."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mod = _reload_module()
+    # SPX sits right on its flip (cleanest); SPY is far from all its levels.
+    spy = mod._shape_bulletin(
+        _summary_row(
+            "SPY",
+            spot=744.51,
+            gamma_flip=800.0,
+            call_wall=810.0,
+            put_wall=790.0,
+            net_gex=1_000_000_000.0,
+        ),
+        "SPY",
+    )
+    spx = mod._shape_bulletin(
+        _summary_row(
+            "SPX",
+            spot=7448.0,
+            gamma_flip=7448.0,
+            call_wall=7500.0,
+            put_wall=7400.0,
+            net_gex=-2_000_000_000.0,
+        ),
+        "SPX",
+    )
+    # Unforced, the cleanest-setup selector features SPX (spot on its flip).
+    assert mod.select_featured_symbol([spy, spx]).symbol == "SPX"
+    # Forced to SPY → the post features SPY regardless.
+    body = mod.build_tweet_body(
+        "close",
+        date(2026, 7, 3),
+        [spy, spx],
+        site_url="https://zerogex.io",
+        lead_symbol="SPY",
+        force_featured="SPY",
+    )
+    assert body.featured_symbol == "SPY"
+    assert "Post-Market Read — $SPY" in body.text
+    # If the forced symbol has no data this fire, fall through to cleanest.
+    body2 = mod.build_tweet_body(
+        "close",
+        date(2026, 7, 3),
+        [spx],
+        site_url="https://zerogex.io",
+        lead_symbol="SPY",
+        force_featured="SPY",
+    )
+    assert body2.featured_symbol == "SPX"
+
+
 def test_select_featured_symbol_falls_back_when_none_eligible():
     """With no symbol carrying both a spot and a level, selection falls
     back to the configured lead symbol if it has any data."""
@@ -1235,6 +1288,7 @@ def test_xpost_ready_email_posts_to_resend(monkeypatch):
     def _fake_urlopen(req, timeout=15):
         captured["url"] = req.full_url
         captured["auth"] = req.get_header("Authorization")
+        captured["ua"] = req.get_header("User-agent")
         captured["body"] = req.data
         return _Resp()
 
@@ -1242,6 +1296,8 @@ def test_xpost_ready_email_posts_to_resend(monkeypatch):
     assert mod._send_xpost_ready_email("midday") is True
     assert captured["url"] == "https://api.resend.com/emails"
     assert captured["auth"] == "Bearer re_test"
+    # A real product UA — NOT the default Python-urllib one that Cloudflare 403s.
+    assert captured["ua"] and "urllib" not in captured["ua"].lower()
     payload = json.loads(captured["body"])
     assert payload["subject"] == "Midday X-Post Ready"
     assert payload["to"] == ["me@example.com"]

@@ -633,6 +633,7 @@ def build_tweet_body(
     lead_symbol: str = DEFAULT_LEAD_SYMBOL,
     reply_text: str | None = None,
     headlines: list | None = None,
+    force_featured: str | None = None,
 ) -> TweetBody:
     """Assemble the "…Read — $SYM" post + threaded reply for one fire.
 
@@ -662,7 +663,17 @@ def build_tweet_body(
     present = [b for b in bulletins if b.has_any_level() or b.spot is not None]
     symbols_present = [b.symbol for b in present]
 
-    featured = select_featured_symbol(bulletins, fallback=lead_symbol)
+    # ``force_featured`` (the scheduled job passes the lead symbol) pins the
+    # featured symbol so the auto-post is always that symbol — e.g. SPY —
+    # rather than the "cleanest setup" among a multi-symbol dropdown list.
+    # Falls through to the cleanest-setup selector when the forced symbol has
+    # no data this fire.
+    featured = None
+    if force_featured:
+        ff = force_featured.upper()
+        featured = next((b for b in present if b.symbol.upper() == ff), None)
+    if featured is None:
+        featured = select_featured_symbol(bulletins, fallback=lead_symbol)
     if featured is None:
         # Defensive floor — the runner skips empty days before we get here.
         featured_symbol = lead_symbol.upper()
@@ -681,8 +692,10 @@ def build_tweet_body(
     # LLM-generated post + reply if ANTHROPIC_API_KEY is set. Any failure
     # (no key, API down, malformed reply, invented prices) returns None and
     # we fall back to the deterministic post below — never fail the tweet
-    # just because the LLM path had a bad day.
-    post = _try_llm_post(mode, day, present, featured_symbol, headlines)
+    # just because the LLM path had a bad day.  Only the featured symbol is
+    # handed to the model — the posts are single-symbol, so this keeps the
+    # prose clean and the no-invented-price guard scoped to that symbol.
+    post = _try_llm_post(mode, day, [featured], featured_symbol, headlines)
     if post is not None:
         return TweetBody(
             text=_compose_new_post(post, featured, mode),
@@ -1174,6 +1187,7 @@ async def generate_and_store(
         lead_symbol=symbol,
         reply_text=os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None,
         headlines=headlines,
+        force_featured=symbol,
     )
     featured = next(
         (b for b in bulletins if b.symbol == tweet.featured_symbol),
@@ -1713,6 +1727,9 @@ async def _run(args: argparse.Namespace) -> int:
         lead_symbol=args.lead_symbol.upper(),
         reply_text=os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None,
         headlines=headlines,
+        # The scheduled auto-post is always the lead symbol (default SPY), not
+        # the "cleanest setup" among a multi-symbol dropdown list.
+        force_featured=args.lead_symbol.upper(),
     )
 
     artifact_dir = resolve_artifact_dir(args.artifact_dir, args.mode, day)
@@ -2033,6 +2050,12 @@ def _send_xpost_ready_email(mode: str) -> bool:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Resend sits behind Cloudflare, which 403s the default
+            # "Python-urllib/x.y" User-Agent as a bot.  Send a real product UA
+            # so the API call isn't blocked (curl-based hooks worked for the
+            # same reason — curl's UA isn't on the bad-bot list).
+            "User-Agent": "zerogex-bulletin/1.0 (+https://zerogex.io)",
         },
         method="POST",
     )
