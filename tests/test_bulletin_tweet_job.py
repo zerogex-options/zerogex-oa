@@ -1156,6 +1156,119 @@ def test_latest_record_roundtrip(tmp_path, monkeypatch):
     assert mod.read_latest_record("QQQ", "close") is None
 
 
+def test_read_latest_record_any_returns_newest(tmp_path, monkeypatch):
+    """read_latest_record_any picks the newest record for a mode across symbols."""
+    mod = _reload_module()
+    monkeypatch.setenv("BULLETIN_TWEET_ARTIFACT_DIR", str(tmp_path))
+    latest = mod.resolve_latest_dir()
+    assert latest is not None
+    (latest / "SPX-midday.json").write_text(
+        json.dumps(
+            {
+                "symbol": "SPX",
+                "mode": "midday",
+                "generated_at": "2026-07-27T12:30:00-04:00",
+                "post_text": "spx",
+            }
+        )
+    )
+    (latest / "SPY-midday.json").write_text(
+        json.dumps(
+            {
+                "symbol": "SPY",
+                "mode": "midday",
+                "generated_at": "2026-07-27T12:31:30-04:00",
+                "post_text": "spy",
+            }
+        )
+    )
+    (latest / "SPY-close.json").write_text(
+        json.dumps(
+            {
+                "symbol": "SPY",
+                "mode": "close",
+                "generated_at": "2026-07-27T16:05:00-04:00",
+                "post_text": "close",
+            }
+        )
+    )
+    got = mod.read_latest_record_any("midday")
+    assert got["symbol"] == "SPY"  # newer generated_at than the SPX midday row
+    assert got["post_text"] == "spy"
+    # A mode with no records → None, never an error.
+    assert mod.read_latest_record_any("premarket") is None
+
+
+# ---------------------------------------------------------------------------
+# Built-in "<Timing> X-Post Ready" email (replaces the old approval email)
+# ---------------------------------------------------------------------------
+
+
+def test_xpost_ready_email_skips_without_resend_config(monkeypatch):
+    mod = _reload_module()
+    for k in ("RESEND_API_KEY", "RESEND_FROM_EMAIL", "BULLETIN_TWEET_EMAIL_TO"):
+        monkeypatch.delenv(k, raising=False)
+    # Never raises, returns False when unconfigured.
+    assert mod._send_xpost_ready_email("midday") is False
+
+
+def test_xpost_ready_email_posts_to_resend(monkeypatch):
+    mod = _reload_module()
+    monkeypatch.setenv("RESEND_API_KEY", "re_test")
+    monkeypatch.setenv("RESEND_FROM_EMAIL", "alerts@zerogex.io")
+    monkeypatch.setenv("BULLETIN_TWEET_EMAIL_TO", "me@example.com")
+    monkeypatch.setenv("BULLETIN_TWEET_ADMIN_URL", "https://zerogex.io/admin/x-post")
+    monkeypatch.delenv("BULLETIN_TWEET_ADMIN_EMAIL_ENABLED", raising=False)
+
+    captured: dict = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def _fake_urlopen(req, timeout=15):
+        captured["url"] = req.full_url
+        captured["auth"] = req.get_header("Authorization")
+        captured["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(mod, "urlopen", _fake_urlopen)
+    assert mod._send_xpost_ready_email("midday") is True
+    assert captured["url"] == "https://api.resend.com/emails"
+    assert captured["auth"] == "Bearer re_test"
+    payload = json.loads(captured["body"])
+    assert payload["subject"] == "Midday X-Post Ready"
+    assert payload["to"] == ["me@example.com"]
+    assert "https://zerogex.io/admin/x-post" in payload["text"]
+
+
+def test_xpost_ready_email_respects_disable_flag(monkeypatch):
+    mod = _reload_module()
+    monkeypatch.setenv("RESEND_API_KEY", "re_test")
+    monkeypatch.setenv("RESEND_FROM_EMAIL", "alerts@zerogex.io")
+    monkeypatch.setenv("BULLETIN_TWEET_EMAIL_TO", "me@example.com")
+    monkeypatch.setenv("BULLETIN_TWEET_ADMIN_EMAIL_ENABLED", "0")
+
+    def _boom(*a, **k):
+        raise AssertionError("must not send when disabled")
+
+    monkeypatch.setattr(mod, "urlopen", _boom)
+    assert mod._send_xpost_ready_email("midday") is False
+
+
+def test_xpost_admin_url_defaults_to_site_url(monkeypatch):
+    mod = _reload_module()
+    monkeypatch.delenv("BULLETIN_TWEET_ADMIN_URL", raising=False)
+    monkeypatch.setenv("ZEROGEX_SITE_URL", "https://zerogex.io/")
+    assert mod._xpost_admin_url() == "https://zerogex.io/admin/x-post"
+
+
 # ---------------------------------------------------------------------------
 # Approval mechanism — --stage flag + bulletin_approve module
 # ---------------------------------------------------------------------------

@@ -65,6 +65,40 @@ async def test_latest_rejects_unknown_mode():
 
 
 @pytest.mark.asyncio
+async def test_latest_falls_back_to_any_symbol_on_initial_load(monkeypatch):
+    """No explicit symbol → if the default has no record, show the most recent
+    scheduled run for this timing (whatever symbol it featured)."""
+    monkeypatch.setenv("BULLETIN_TWEET_SYMBOLS", "SPY,SPX")
+    monkeypatch.setattr(bt, "read_latest_record", lambda sym, mode: None)
+    monkeypatch.setattr(
+        bt,
+        "read_latest_record_any",
+        lambda mode: {"symbol": "SPX", "mode": mode, "post_text": "spx read"},
+    )
+    out = await ax.latest(symbol=None, mode="midday")
+    assert out["symbol"] == "SPX"
+    assert out["record"]["post_text"] == "spx read"
+
+
+@pytest.mark.asyncio
+async def test_latest_no_fallback_when_symbol_explicit(monkeypatch):
+    """An explicit dropdown selection returns exactly that symbol (or null),
+    never a fallback to a different symbol."""
+    monkeypatch.setattr(bt, "read_latest_record", lambda sym, mode: None)
+    called = {"any": False}
+
+    def _any(mode):
+        called["any"] = True
+        return {"symbol": "SPX"}
+
+    monkeypatch.setattr(bt, "read_latest_record_any", _any)
+    out = await ax.latest(symbol="SPY", mode="midday")
+    assert out["record"] is None
+    assert out["symbol"] == "SPY"
+    assert called["any"] is False
+
+
+@pytest.mark.asyncio
 async def test_regenerate_rejects_unconfigured_symbol(monkeypatch):
     from fastapi import HTTPException
 
