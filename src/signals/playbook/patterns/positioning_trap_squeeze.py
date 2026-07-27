@@ -70,9 +70,13 @@ class PositioningTrapSqueezePattern(PatternBase):
             return None
 
         ptrap = ctx.signal("positioning_trap")
-        # Squeeze direction is OPPOSITE the crowd: long crowd → bearish squeeze.
+        # positioning_trap.score already points in the squeeze-resolution
+        # direction — it fades the crowd. Per src/signals/basic/positioning_trap.py
+        # (and its API contract): +score = short/bearish crowd (heavy puts) at risk
+        # of an upside short-cover squeeze → BULLISH; -score = long/bullish crowd
+        # (heavy calls) at risk of a downside flush/air-pocket → BEARISH.
         assert ptrap is not None
-        squeeze: SqueezeDirection = "bearish" if ptrap.score > 0 else "bullish"
+        squeeze: SqueezeDirection = "bullish" if ptrap.score > 0 else "bearish"
 
         close = ctx.close
         envelope = _envelope(ctx.market.recent_closes) or (close, close)
@@ -177,11 +181,14 @@ class PositioningTrapSqueezePattern(PatternBase):
             if tape is None:
                 missing.append("tape_flow_bias signal unavailable")
             else:
-                # Tape must be turning AGAINST the crowd (opposite sign).
-                if (tape.score * ptrap.score) >= 0:
+                # Tape must be turning WITH the squeeze — i.e. AGAINST the crowd.
+                # positioning_trap.score already points in the squeeze-resolution
+                # direction, so a valid setup needs tape_flow_bias with the SAME
+                # sign (a short crowd, +score, is squeezed once the tape ticks up).
+                if (tape.score * ptrap.score) <= 0:
                     missing.append(
-                        f"tape_flow_bias {tape.score:+.0f} not turning against crowd "
-                        f"positioning {ptrap.score:+.0f} (need opposite sign)"
+                        f"tape_flow_bias {tape.score:+.0f} not turning with the squeeze "
+                        f"vs positioning {ptrap.score:+.0f} (need same sign — tape against crowd)"
                     )
                 elif abs(tape.score) < _TAPE_MAGNITUDE_MIN:
                     missing.append(

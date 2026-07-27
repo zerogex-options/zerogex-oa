@@ -12,14 +12,14 @@ from src.signals.playbook.types import ActionEnum
 def _ctx(
     *,
     ptrap_score: float = 60.0,
-    tape_score: float = -25.0,
+    tape_score: float = 25.0,
     vol_regime_score: float = 0.0,
     timestamp: Optional[datetime] = None,
     close: float = 678.0,
     closes: Optional[list[float]] = None,
     regime: str = "high_risk_reversal",
-    skew_score: float = -25.0,
-    ddp_score: float = -20.0,
+    skew_score: float = 25.0,
+    ddp_score: float = 20.0,
     vcf_score: float = 0.0,
 ) -> PlaybookContext:
     ts = timestamp or datetime(2026, 5, 1, 16, 0, tzinfo=timezone.utc)
@@ -92,25 +92,31 @@ def _ctx(
 # ----------------------------------------------------------------------
 
 
-def test_long_crowd_squeezes_bearish():
-    """Crowd long (ptrap +60) + tape turning bearish → BUY_PUT_SPREAD."""
-    card = PTS.match(_ctx(ptrap_score=60.0, tape_score=-25.0))
+def test_short_crowd_squeezes_bullish():
+    """Crowd short (ptrap +60, heavy puts) + tape turning UP against the crowd
+    → upside short-cover squeeze → BUY_CALL_SPREAD (bullish)."""
+    card = PTS.match(_ctx(ptrap_score=60.0, tape_score=25.0, skew_score=25.0, ddp_score=20.0))
+    assert card is not None
+    assert card.action == ActionEnum.BUY_CALL_SPREAD
+    assert card.direction == "bullish"
+    assert card.tier == "swing"
+    assert card.legs[0].right == "C" and card.legs[0].side == "BUY"
+    assert card.legs[1].right == "C" and card.legs[1].side == "SELL"
+    # Call spread: short above long.
+    assert card.legs[1].strike == card.legs[0].strike + 10.0
+
+
+def test_long_crowd_flushes_bearish():
+    """Crowd long (ptrap -60, heavy calls) + tape turning DOWN against the crowd
+    → downside flush / air-pocket → BUY_PUT_SPREAD (bearish)."""
+    card = PTS.match(_ctx(ptrap_score=-60.0, tape_score=-25.0, skew_score=-25.0, ddp_score=-20.0))
     assert card is not None
     assert card.action == ActionEnum.BUY_PUT_SPREAD
     assert card.direction == "bearish"
-    assert card.tier == "swing"
     assert card.legs[0].right == "P" and card.legs[0].side == "BUY"
     assert card.legs[1].right == "P" and card.legs[1].side == "SELL"
     # Put spread: short below long.
     assert card.legs[1].strike == card.legs[0].strike - 10.0
-
-
-def test_short_crowd_squeezes_bullish():
-    card = PTS.match(_ctx(ptrap_score=-60.0, tape_score=25.0, ddp_score=20.0))
-    assert card is not None
-    assert card.action == ActionEnum.BUY_CALL_SPREAD
-    assert card.direction == "bullish"
-    assert card.legs[1].strike == card.legs[0].strike + 10.0
 
 
 # ----------------------------------------------------------------------
@@ -122,14 +128,15 @@ def test_crowd_not_extreme_skips():
     assert PTS.match(_ctx(ptrap_score=30.0)) is None
 
 
-def test_tape_aligned_with_crowd_skips():
-    # Long crowd + bullish tape → no squeeze.
-    assert PTS.match(_ctx(ptrap_score=60.0, tape_score=25.0)) is None
+def test_tape_running_with_crowd_skips():
+    # Short crowd (ptrap +60 → squeeze up) but tape still DOWN (-25) = running
+    # WITH the crowd, not turning against it → no squeeze yet.
+    assert PTS.match(_ctx(ptrap_score=60.0, tape_score=-25.0)) is None
 
 
 def test_tape_too_weak_skips():
-    # Long crowd, tape only -5 → not enough turn.
-    assert PTS.match(_ctx(ptrap_score=60.0, tape_score=-5.0)) is None
+    # Short crowd, tape turning the right way (+) but only +5 → not enough turn.
+    assert PTS.match(_ctx(ptrap_score=60.0, tape_score=5.0)) is None
 
 
 def test_low_vol_regime_skips():
@@ -142,9 +149,9 @@ def test_low_vol_regime_skips():
 
 
 def test_opposing_vanna_charm_flow_lowers_confidence():
-    # Bearish squeeze + bullish vanna → opposes.
-    base = PTS.match(_ctx(ptrap_score=60.0, tape_score=-25.0, vcf_score=0.0))
-    opposed = PTS.match(_ctx(ptrap_score=60.0, tape_score=-25.0, vcf_score=40.0))
+    # Bullish squeeze (ptrap +60, tape +25) + bearish vanna (-40) → opposes.
+    base = PTS.match(_ctx(ptrap_score=60.0, tape_score=25.0, vcf_score=0.0))
+    opposed = PTS.match(_ctx(ptrap_score=60.0, tape_score=25.0, vcf_score=-40.0))
     assert base is not None and opposed is not None
     assert opposed.confidence < base.confidence
 

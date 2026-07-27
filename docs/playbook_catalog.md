@@ -563,7 +563,7 @@ Mirror of `call_wall_fade` with reversed signs.
 
 **Triggers:**
 - `|positioning_trap.score| >= 50` (crowd heavily positioned)
-- `tape_flow_bias.score` opposite sign to `positioning_trap.score` (tape turning against crowd)
+- `tape_flow_bias.score` **same sign** as `positioning_trap.score` (tape turning *with* the squeeze — i.e. against the crowd; `positioning_trap.score` already points in the squeeze-resolution direction)
 - `volatility_regime.score >= -0.2` (some vol to fuel the squeeze)
 
 **Instrument:** `BUY_CALL_SPREAD` or `BUY_PUT_SPREAD`, 5–7 DTE, debit, opposite the crowd's positioning, +10 strike width.
