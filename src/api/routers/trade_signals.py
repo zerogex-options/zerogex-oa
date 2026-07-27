@@ -588,7 +588,8 @@ async def get_eod_pressure_signal(
 ):
     """End-of-day close pin/drift forecast for the last ~75 minutes of the session.
 
-    Combines (a) dealer charm exposure near spot, (b) gamma-gated pin gravity,
+    Combines (a) modeled dealer charm exposure near spot, (b) a
+    regime-conditional pin/directional house heuristic,
     and (c) an OpEx/quad-witching calendar amplifier into a directional close forecast.
 
     **Active window: 14:30–16:00 ET only.** Outside this window the endpoint returns
@@ -597,7 +598,11 @@ async def get_eod_pressure_signal(
     **Logic highlights** (`src/signals/advanced/eod_pressure.py`):
     - `time_ramp` — 0 before T-90min, 1.0 by T-15min, linear in between.
     - `charm_score = tanh(charm_at_spot / 20M)` over strikes within the ATM band.
-    - `pin_gravity = sign(net_gex) × min(1, pin_distance_pct / 0.3%)`.
+    - Non-negative GEX: `pin_component = clip(pin_distance_pct / 0.3%)`
+      (target attraction heuristic).
+    - Negative GEX: `pin_component = clip(trailing_signed_return / 0.3%)`
+      (amplifies causal recent direction; target distance does not set direction).
+      Missing direction or invalid GEX is neutral. These cutoffs are not calibrated.
     - `score = (0.6·charm + 0.4·pin) × calendar_amp × time_ramp`;
       `calendar_amp` is 1.5× OpEx, 2.0× quad-witching.
 
@@ -1496,11 +1501,9 @@ async def get_dealer_delta_pressure_signal(
 ):
     """Dealer net-delta imbalance (DNI) — intraday leading indicator.
 
-    Answers: *are dealers net-short delta (forced to buy rallies, bullish)
-    or net-long (forced to sell rallies, bearish)?* Delta flow leads gamma
-    exposure by minutes intraday — closest thing to a leading indicator
-    for 0DTE regimes. Gamma tells you *where* dealers will hedge; delta
-    tells you *how much they already are*.
+    Answers: *does the assumed dealer-position model produce net-short or
+    net-long options delta?* This is modeled options-only inventory, not
+    observed dealer ownership or a forecast of executed hedge flow.
 
     **Logic highlights** (`src/signals/basic/dealer_delta_pressure.py`).
     Three data paths in priority order:

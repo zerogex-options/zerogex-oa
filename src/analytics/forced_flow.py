@@ -1,5 +1,5 @@
-"""Forced Flow engine -- the dollars of stock dealers are mechanically compelled
-to buy or sell under a scenario of spot move, elapsed time, and IV shift.
+"""Forced Flow engine -- potential modeled stock-hedge pressure under an
+explicit scenario of spot move, elapsed time, and IV shift.
 
 This is the architectural core of the feature. Everything the product shows --
 the Forced Flow Curve, Charm-into-Close, the Vanna Ladder, the surface, and the
@@ -74,8 +74,9 @@ class ContractLeg:
 class ForcedFlow:
     """Result of one scenario.
 
-    ``total_usd`` is exact (from the full reprice); positive means dealers must
-    BUY stock, negative means SELL. The three components are the first-order
+    ``total_usd`` is exact *within the stated model and scenario* (from the full
+    reprice); positive means an offsetting delta-flat hedge buys stock, negative
+    means it sells. It is not an observed or guaranteed order. The components are the first-order
     attribution (Gamma*dS, Charm*dt, Vanna*dSigma); ``residual`` is
     ``total - sum(components)`` and grows when the scenario is far enough out
     that linear intuition fails -- a useful warning, worth surfacing on extreme
@@ -251,7 +252,7 @@ def dealer_hedge_flow(
     q: float = 0.0,
     min_tte_years: float = 0.0,
 ) -> ForcedFlow:
-    """Dollars of STOCK dealers must BUY (+) or SELL (-) to stay delta-flat.
+    """Potential modeled stock hedge: BUY (+) or SELL (-) to remain delta-flat.
 
     Args:
         legs: the option book (see :class:`ContractLeg`).

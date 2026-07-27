@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from src.signals.components.base import MarketContext
 from src.signals.advanced.eod_pressure import EODPressureSignal, _CHARM_NORM
 
@@ -102,13 +104,50 @@ def test_pin_gravity_positive_gamma_pulls_toward_pin():
     assert comp.compute(ctx) > 0.1
 
 
-def test_pin_gravity_negative_gamma_repels_from_pin():
-    """Pin above spot in negative-gamma regime => bearish EOD lean (amplifies away)."""
-    ctx = _ctx(net_gex=-5.0e8)  # negative gamma
-    ctx.close = 495.0
-    ctx.max_pain = 500.0
-    ctx.extra["max_gamma_strike"] = 500.0
-    assert comp.compute(ctx) < -0.1
+@pytest.mark.parametrize("target", [490.0, 510.0])
+def test_negative_gamma_amplifies_upward_direction_regardless_of_target(target):
+    ctx = _ctx(net_gex=-5.0e8, max_pain=target, recent_closes=[498.0, 499.0, 500.0])
+    assert comp._pin_gravity_score(ctx) > 0.0
+
+
+@pytest.mark.parametrize("target", [490.0, 510.0])
+def test_negative_gamma_amplifies_downward_direction_regardless_of_target(target):
+    ctx = _ctx(net_gex=-5.0e8, max_pain=target, recent_closes=[502.0, 501.0, 500.0])
+    assert comp._pin_gravity_score(ctx) < 0.0
+
+
+@pytest.mark.parametrize("closes", [[], [500.0], [500.0, 500.0]])
+def test_negative_gamma_missing_or_neutral_direction_is_neutral(closes):
+    ctx = _ctx(net_gex=-5.0e8, max_pain=510.0, recent_closes=closes)
+    assert comp._pin_gravity_score(ctx) == 0.0
+
+
+def test_missing_or_nonfinite_net_gex_is_neutral():
+    for value in (None, float("nan"), float("inf")):
+        ctx = _ctx(net_gex=value, max_pain=510.0, recent_closes=[499.0, 500.0])
+        assert comp._pin_gravity_score(ctx) == 0.0
+        assert comp.context_values(ctx)["gamma_regime"] == "unknown"
+
+
+def test_zero_net_gex_preserves_positive_regime_boundary():
+    ctx = _ctx(net_gex=0.0, max_pain=501.0, recent_closes=[501.0, 500.0])
+    assert comp._pin_gravity_score(ctx) > 0.0
+
+
+def test_pin_target_fallback_and_missing_targets():
+    fallback = _ctx(max_pain=None)
+    fallback.extra["max_gamma_strike"] = 501.0
+    assert comp._pin_source(fallback) == "max_gamma_strike"
+    assert comp._pin_gravity_score(fallback) > 0.0
+
+    missing = _ctx(max_pain=None)
+    missing.extra.pop("max_gamma_strike", None)
+    assert comp._pin_target(missing) is None
+    assert comp._pin_gravity_score(missing) == 0.0
+
+
+def test_target_exactly_at_spot_is_neutral_in_positive_gamma():
+    assert comp._pin_gravity_score(_ctx(max_pain=500.0)) == 0.0
 
 
 def test_ramp_grows_into_close():

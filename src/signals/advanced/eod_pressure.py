@@ -29,6 +29,9 @@ _ATM_BAND_VOL_HORIZON = int(os.getenv("SIGNAL_EOD_ATM_BAND_HORIZON", "30"))
 
 # Pin gravity saturates at this percentage distance from spot.
 _PIN_SATURATION_PCT = float(os.getenv("SIGNAL_EOD_PIN_SATURATION_PCT", "0.003"))
+# Negative-gamma directional amplification saturates at this trailing return.
+# This is a transparent house heuristic, not an empirically calibrated cutoff.
+_MOMENTUM_SATURATION_PCT = float(os.getenv("SIGNAL_EOD_MOMENTUM_SATURATION_PCT", "0.003"))
 
 # Score ramps from 0 to full strength linearly across the final window.
 _WINDOW_START_MIN_TO_CLOSE = 90
@@ -156,7 +159,9 @@ class EODPressureSignal:
             "pin_target": self._pin_target(ctx),
             "pin_source": self._pin_source(ctx),
             "pin_distance_pct": self._pin_distance_pct(ctx),
-            "gamma_regime": "positive" if ctx.net_gex >= 0 else "negative",
+            "pin_component": round(self._pin_gravity_score(ctx), 6),
+            "directional_return": self._directional_return(ctx),
+            "gamma_regime": self._gamma_regime(ctx),
             "calendar_amp": round(self._calendar_amplifier(ctx.timestamp), 3),
             "calendar_flags": self._calendar_flags(ctx.timestamp),
         }
@@ -220,12 +225,60 @@ class EODPressureSignal:
         return max(_ATM_BAND_FLOOR_PCT, _ATM_BAND_VOL_K * projected)
 
     def _pin_gravity_score(self, ctx: MarketContext) -> float:
+        """Return the regime-conditional pin/directional house heuristic.
+
+        In non-negative modeled gamma, target distance represents attraction
+        toward Max Pain (or the Max Gamma fallback). In negative gamma, target
+        distance contains no directional information, so the component instead
+        amplifies the signed trailing return already available at this signal's
+        calculation boundary. The trailing series is ordered oldest-to-newest
+        and ends at the current observation; no future bar is consulted.
+
+        Missing/non-finite GEX or fewer than two usable closes is neutral. The
+        saturation cutoffs and weights are hand-selected, not calibrated
+        probabilities.
+        """
+        regime = self._gamma_regime(ctx)
+        if regime == "unknown":
+            return 0.0
+        if regime == "negative":
+            momentum = self._directional_return(ctx)
+            if momentum is None or _MOMENTUM_SATURATION_PCT <= 0:
+                return 0.0
+            return max(-1.0, min(1.0, momentum / _MOMENTUM_SATURATION_PCT))
+
         distance_pct = self._pin_distance_pct(ctx)
-        if distance_pct is None:
+        if distance_pct is None or _PIN_SATURATION_PCT <= 0:
             return 0.0
         normalized = max(-1.0, min(1.0, distance_pct / _PIN_SATURATION_PCT))
-        sign = 1.0 if ctx.net_gex >= 0 else -1.0
-        return sign * normalized
+        return normalized
+
+    @staticmethod
+    def _gamma_regime(ctx: MarketContext) -> str:
+        try:
+            value = float(ctx.net_gex)
+        except (TypeError, ValueError):
+            return "unknown"
+        if not math.isfinite(value):
+            return "unknown"
+        # Preserve the established zero boundary: zero belongs to the
+        # non-negative regime, where any pin term is attraction, not repulsion.
+        return "positive" if value >= 0.0 else "negative"
+
+    @staticmethod
+    def _directional_return(ctx: MarketContext) -> float | None:
+        """Causal return from the oldest to newest supplied trailing close."""
+        usable: list[float] = []
+        for raw in ctx.recent_closes or []:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0.0:
+                usable.append(value)
+        if len(usable) < 2:
+            return None
+        return (usable[-1] - usable[0]) / usable[0]
 
     def _pin_distance_pct(self, ctx: MarketContext) -> float | None:
         pin = self._pin_target(ctx)

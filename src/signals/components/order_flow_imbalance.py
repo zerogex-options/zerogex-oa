@@ -1,16 +1,15 @@
-"""Market State component: smart-money order-flow imbalance.
+"""Market State component: premium-weighted aggressor-classified imbalance.
 
-Premium-weighted call vs put flow leads price by ~30s on liquid names —
-when smart money is paying up to buy calls *now*, dealers are about to
-sell into the rally and price tends to follow.  This is the directional
-analogue of the basic ``tape_flow_bias`` signal but lifted into the MSI
-composite so it contributes to regime / sizing decisions, not just
-displayed as a standalone gauge.
+The legacy ``smart_*`` fields measure premium attributed to the side crossing
+the quoted spread. They do not identify opening versus closing, ultimate owner,
+dealer/customer status, multi-leg intent, or information advantage. This is a
+directional house heuristic lifted into the MSI composite, not proof of
+"smart money" or a calibrated leading relationship.
 
 Score convention:
-  * +1.0 — smart-money call buying dominates (bullish)
+  * +1.0 — aggressor-classified call premium dominates (bullish model output)
   *  0.0 — balanced flow / insufficient activity
-  * -1.0 — smart-money put buying dominates (bearish)
+  * -1.0 — aggressor-classified put premium dominates (bearish model output)
 
 Inputs (from MarketContext):
   * ``smart_call`` — net premium dollars bought on calls in the rolling

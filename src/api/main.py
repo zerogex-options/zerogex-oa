@@ -1005,7 +1005,11 @@ async def get_smart_money_flow(
     session: str = Query(default="current", pattern="^(current|prior)$"),
     limit: int = Query(default=50, ge=1, le=50),
 ):
-    """Get unusual activity / smart money flow — 1-min intervals.
+    """Get legacy ``smart-money`` premium-flow fields — 1-min intervals.
+
+    These backward-compatible fields contain aggressor-classified premium;
+    premium and quote-side classification do not establish opening/closing
+    status, ultimate ownership, strategy, or information advantage.
     Session runs 07:15–16:15 ET. session=current returns today's open session
     (or most recent if closed); session=prior returns the previous full session.
     """
