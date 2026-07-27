@@ -4,13 +4,17 @@ Second-order greeks drive intraday dealer re-hedging in ways that gamma
 alone cannot explain:
 
   * **Vanna** (dVega/dSpot) captures how dealer deltas change when
-    volatility moves. As IV crushes through the session (typical morning
-    into midday behavior), vanna-short dealers must buy underlying —
-    this is the "vol-crush rally" that kills naked put sellers.
+    volatility moves. As IV falls through the session (typical morning
+    into midday behavior), a book modeled short vanna tends to buy
+    underlying to re-hedge — a mechanism behind the "vol-crush rally."
+    Direction and size depend on the composition and ownership of the
+    option book, so treat this as modeled pressure, not a rule.
   * **Charm** (dDelta/dTime) captures the decay of short-dated deltas
-    toward expiry. In the last 2 hours of an expiry session, charm flow
-    accelerates dramatically — dealers short calls above spot are
-    forced to sell into weakness, amplifying afternoon drift.
+    toward expiry. In the last ~2 hours of an expiry session, modeled
+    charm flow can accelerate: where the modeled book is short calls
+    above spot, the decay of those deltas tends to pull hedging toward
+    selling, which can amplify afternoon drift. This is modeled hedge
+    pressure, not a scheduled or guaranteed order.
 
 The analytics layer populates ``dealer_vanna_exposure`` and
 ``dealer_charm_exposure`` per-strike in ``gex_by_strike`` (positive =

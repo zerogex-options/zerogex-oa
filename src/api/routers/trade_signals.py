@@ -1407,15 +1407,17 @@ async def get_vanna_charm_flow_signal(
 ):
     """Second-order greek dealer-hedging pressure (vanna + charm).
 
-    Answers: *which way are dealers being forced to trade right now from IV
-    moves and time decay, independently of spot moves?*
+    Answers: *which way is the modeled dealer book likely being pulled to
+    hedge right now from IV moves and time decay, independently of spot?*
 
-    - **Vanna** (dVega/dSpot) — dealer delta changes when IV moves. Morning
-      IV crush forces vanna-short dealers to buy underlying (the classic
-      "vol-crush rally" that kills naked put sellers).
+    - **Vanna** (dVega/dSpot) — dealer delta changes when IV moves. A
+      morning IV drop tends to make a book modeled short vanna buy
+      underlying (the "vol-crush rally"); direction depends on the book's
+      composition and ownership.
     - **Charm** (dDelta/dTime) — decay of short-dated deltas toward expiry.
-      In the final ~2h, charm-short dealers short calls above spot are
-      forced to sell into weakness — accelerates afternoon drift.
+      In the final ~2h, where the modeled book is short calls above spot,
+      that decay tends to pull hedging toward selling — which can
+      accelerate afternoon drift. Modeled pressure, not a scheduled order.
 
     **Logic highlights** (`src/signals/basic/vanna_charm_flow.py`):
     - Sum `dealer_vanna_exposure` + `dealer_charm_exposure × charm_amplification`

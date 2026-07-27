@@ -64,7 +64,10 @@ class StrikeGamma(BaseModel):
     """One bar of the per-strike gamma profile (dollar GEX per 1% move).
 
     Aggregated across expirations; ``net_gex == call_gex + put_gex`` by
-    construction (calls positive, puts negative).
+    construction. Call exposure is signed positive and put exposure
+    negative under the traditional modeled dealer-positioning convention
+    (dealers modeled net long calls / net short puts). This is a modeled
+    sign convention, not a direct observation of dealer inventory.
     """
 
     strike: float

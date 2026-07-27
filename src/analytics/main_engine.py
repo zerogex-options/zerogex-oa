@@ -1214,9 +1214,15 @@ class AnalyticsEngine:
         ``S × 0.01`` factor converts share-equivalent dealer exposure into
         the notional dollar value of the delta change for a 1% move in spot.
 
-        For dealers (who are typically short options):
-        - Call GEX is POSITIVE (dealers are short gamma on calls)
-        - Put GEX is NEGATIVE (dealers are long gamma on puts)
+        Modeled dealer sign under the traditional SPX positioning
+        convention: call exposure is signed positive, put exposure
+        negative. This corresponds to modeling dealers as net LONG the
+        calls customers sell (overwriting) and net SHORT the puts customers
+        buy (protection) — a long call carries positive gamma and a short
+        put carries negative gamma, so calls contribute (+) and puts
+        contribute (-) to the modeled dealer book. This is a modeled
+        convention, not a direct observation: public open-interest data
+        does not reveal whether dealers are long or short each contract.
 
         Net GEX = Call GEX - Put GEX
         """
@@ -1608,8 +1614,11 @@ class AnalyticsEngine:
                 continue
             gamma = self._calculate_bs_gamma(grid, K, T, r, sigma, self.dividend_yield)
             # Industry-standard dollar GEX per 1% move at the hypothetical
-            # spot: γ(S) × OI × 100 × S² × 0.01. Dealer sign: short calls
-            # (+), long puts (−) — matches _calculate_gex_by_strike.
+            # spot: γ(S) × OI × 100 × S² × 0.01. Modeled dealer sign under
+            # the traditional SPX convention: dealers long calls (+),
+            # dealers short puts (−); actual dealer ownership is not
+            # observable from public open-interest data. Matches
+            # _calculate_gex_by_strike.
             dollar_gamma = gamma * oi * 100.0 * grid * grid * 0.01
             sign = 1.0 if opt["option_type"] == "C" else -1.0
             # Horizon-occupancy ramp min(1, DTE/ref): down-weights
