@@ -1106,19 +1106,35 @@ def write_latest_record(record: dict[str, Any]) -> Path | None:
         return None
 
 
+def _latest_read_dirs() -> list[Path]:
+    """Candidate ``latest/`` dirs to READ records from — no writability needed.
+
+    The scheduled tweet job and the API run under different systemd units:
+    the job can write ``/var/lib/zerogex-oa`` while the API is sandboxed
+    (ProtectSystem=strict, ProtectHome=read-only) and can only WRITE
+    ``/home/ubuntu/zerogex-oa``.  ``resolve_latest_dir`` write-probes, so it
+    returns None for the API even though ``/var/lib`` is perfectly READABLE.
+    Reads therefore search the candidate roots directly by existence, so the
+    API finds whatever the job wrote regardless of its own write access."""
+    return [root / "latest" for root in _artifact_root_candidates()]
+
+
 def read_latest_record(symbol: str, mode: str) -> dict[str, Any] | None:
-    """Read the last-generated record for (symbol, mode), or None if absent."""
-    latest_dir = resolve_latest_dir()
-    if latest_dir is None:
-        return None
-    path = _latest_record_path(latest_dir, symbol, mode)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("bulletin_tweet: failed to read latest record %s (%s)", path, exc)
-        return None
+    """Read the last-generated record for (symbol, mode), or None if absent.
+
+    Searches every candidate ``latest/`` dir (read-only is fine) and returns
+    the first existing record in candidate order."""
+    fname = f"{symbol.upper()}-{mode}.json"
+    for latest_dir in _latest_read_dirs():
+        path = latest_dir / fname
+        try:
+            if not path.exists():
+                continue
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("bulletin_tweet: failed to read latest record %s (%s)", path, exc)
+            # Keep looking in the remaining candidate roots.
+    return None
 
 
 def read_latest_record_any(mode: str) -> dict[str, Any] | None:
@@ -1126,22 +1142,29 @@ def read_latest_record_any(mode: str) -> dict[str, Any] | None:
 
     Lets the review page pre-fill from the last scheduled run even when that
     run featured a symbol other than the page's default (e.g. a multi-symbol
-    ``BULLETIN_TWEET_SYMBOLS`` where the 'cleanest setup' wasn't SPY).  Picks
-    the newest by ``generated_at``.  Returns None when nothing exists."""
-    latest_dir = resolve_latest_dir()
-    if latest_dir is None:
-        return None
-    best: dict[str, Any] | None = None
-    best_key = ""
-    for path in latest_dir.glob(f"*-{mode}.json"):
+    ``BULLETIN_TWEET_SYMBOLS`` where the 'cleanest setup' wasn't SPY).  Reads
+    from the first candidate root that has any matching record and picks the
+    newest by ``generated_at``.  Returns None when nothing exists."""
+    for latest_dir in _latest_read_dirs():
         try:
-            rec = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            if not latest_dir.is_dir():
+                continue
+            matches = sorted(latest_dir.glob(f"*-{mode}.json"))
+        except OSError:
             continue
-        key = str(rec.get("generated_at") or "")
-        if best is None or key > best_key:
-            best, best_key = rec, key
-    return best
+        best: dict[str, Any] | None = None
+        best_key = ""
+        for path in matches:
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            key = str(rec.get("generated_at") or "")
+            if best is None or key > best_key:
+                best, best_key = rec, key
+        if best is not None:
+            return best
+    return None
 
 
 def configured_symbols() -> tuple[list[str], str]:
