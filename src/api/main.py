@@ -63,6 +63,8 @@ from .routers.forecast import router as forecast_router
 from .routers.replay import router as replay_router
 from .routers.forced_flow import router as forced_flow_router
 from .routers.levels import router as levels_router
+from .routers.instruments import router as instruments_router
+from .routers.futures import router as futures_router
 from .routers.admin_api_keys import router as admin_api_keys_router
 from .routers.admin_xpost import router as admin_xpost_router
 
@@ -414,6 +416,10 @@ app.include_router(trade_bias_router, dependencies=[_scope_signals])
 # third-party charting integrations (TradingView widget, NinjaScript
 # indicator) build on. Derived-only, so it rides the GEX/analytics tier.
 app.include_router(levels_router, dependencies=[_scope_gex])
+# Futures: instrument metadata is public-ish (gex scope); contract schedule &
+# reference levels are gex-scoped analytics.  All gated by feature flags inside.
+app.include_router(instruments_router, dependencies=[_scope_gex])
+app.include_router(futures_router, dependencies=[_scope_gex])
 app.include_router(volatility_gauge_router, dependencies=[_scope_gex])
 app.include_router(vol_surface_router, dependencies=[_scope_gex])
 # Options premium (extrinsic-value) surface — Beta. Derived analytics built
@@ -502,10 +508,21 @@ async def health_check(response: Response):
             database_connected=is_healthy,
             last_data_update=last_update,
             data_age_seconds=data_age_seconds,
+            futures=_futures_health_section(),
         )
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=503, detail="Service unavailable")
+
+
+def _futures_health_section():
+    """Best-effort futures health block; never fails the health check."""
+    try:
+        from src.futures.health import futures_health_section
+
+        return futures_health_section()
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 # ============================================================================

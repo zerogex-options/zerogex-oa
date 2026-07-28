@@ -601,6 +601,10 @@ class HealthStatus(BaseModel):
     database_connected: bool
     last_data_update: Optional[datetime] = None
     data_age_seconds: Optional[int] = None
+    # Additive futures readiness section (spec Phase 16). Optional so existing
+    # health consumers are unaffected; populated with per-product availability
+    # and the (pending) real-CME-feed status.
+    futures: Optional[dict] = None
 
     class Config:
         json_encoders = {

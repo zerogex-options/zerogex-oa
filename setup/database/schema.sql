@@ -426,6 +426,115 @@ CREATE INDEX IF NOT EXISTS idx_futures_quotes_index_symbol_timestamp
     ON futures_quotes(index_symbol, timestamp DESC);
 
 -- =============================================================================
+-- CME futures security-definition master (ES/NQ first-class support).
+--
+-- These tables hold the AUTHORITATIVE contract metadata a real CME/vendor
+-- security-definition feed publishes — dated futures, option series, and
+-- option contracts — so live analytics read exact expiration instants,
+-- multipliers, exercise/settlement styles, and the underlying future an
+-- option settles into RATHER than parsing them from display tickers
+-- (spec rule #14).  They are additive and independent of the display-only
+-- futures_quotes table above; populating them requires ENABLE_CME_INGESTION
+-- and a licensed feed (the ingestion adapter is intentionally pending).
+--
+-- Migration/rollback: additive CREATE ... IF NOT EXISTS, matching the rest of
+-- this idempotent schema.  Rollback is DROP TABLE IF EXISTS futures_option_contracts,
+-- futures_option_series, futures_contracts, futures_products CASCADE; (safe —
+-- no existing object references them).
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS futures_products (
+    product_symbol VARCHAR(8) PRIMARY KEY,       -- logical product, e.g. 'ES'
+    name TEXT NOT NULL,
+    exchange VARCHAR(8) NOT NULL DEFAULT 'CME',
+    currency VARCHAR(4) NOT NULL DEFAULT 'USD',
+    multiplier INTEGER NOT NULL,                 -- point value ($50 ES / $20 NQ)
+    tick_size NUMERIC(12, 6) NOT NULL,           -- 0.25 for ES/NQ
+    family VARCHAR(16) NOT NULL,                 -- 'sp500' / 'nasdaq100'
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT check_fp_multiplier_positive CHECK (multiplier > 0),
+    CONSTRAINT check_fp_tick_positive CHECK (tick_size > 0)
+);
+
+CREATE TABLE IF NOT EXISTS futures_contracts (
+    contract_id VARCHAR(24) PRIMARY KEY,         -- stable id, e.g. 'ESZ25'
+    product_symbol VARCHAR(8) NOT NULL REFERENCES futures_products(product_symbol),
+    exchange_symbol VARCHAR(24),
+    vendor_symbol VARCHAR(32),
+    contract_month SMALLINT NOT NULL,            -- 1-12
+    contract_year SMALLINT NOT NULL,
+    expiration TIMESTAMPTZ NOT NULL,             -- EXACT settlement instant
+    first_trade_date TIMESTAMPTZ,
+    last_trade_date TIMESTAMPTZ,
+    settlement_date TIMESTAMPTZ,
+    multiplier INTEGER NOT NULL,
+    tick_size NUMERIC(12, 6) NOT NULL,
+    currency VARCHAR(4) NOT NULL DEFAULT 'USD',
+    status VARCHAR(12) NOT NULL DEFAULT 'active',
+    volume BIGINT,
+    open_interest BIGINT,
+    is_front_contract BOOLEAN NOT NULL DEFAULT FALSE,
+    is_next_contract BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT check_fc_month CHECK (contract_month BETWEEN 1 AND 12)
+);
+CREATE INDEX IF NOT EXISTS idx_futures_contracts_product_exp
+    ON futures_contracts(product_symbol, expiration);
+CREATE INDEX IF NOT EXISTS idx_futures_contracts_vendor_symbol
+    ON futures_contracts(vendor_symbol);
+CREATE INDEX IF NOT EXISTS idx_futures_contracts_front
+    ON futures_contracts(product_symbol, is_front_contract)
+    WHERE is_front_contract;
+
+CREATE TABLE IF NOT EXISTS futures_option_series (
+    series_id VARCHAR(48) PRIMARY KEY,
+    product_symbol VARCHAR(8) NOT NULL REFERENCES futures_products(product_symbol),
+    option_root VARCHAR(16) NOT NULL,            -- daily/weekly/EOM/quarterly root
+    vendor_symbol VARCHAR(48),
+    expiration TIMESTAMPTZ NOT NULL,             -- EXACT expiration instant
+    underlying_contract_id VARCHAR(24) NOT NULL, -- the dated future it settles into
+    multiplier INTEGER NOT NULL,
+    exercise_style VARCHAR(12) NOT NULL DEFAULT 'american',
+    settlement_type VARCHAR(12) NOT NULL DEFAULT 'futures',
+    listing_type VARCHAR(16) NOT NULL DEFAULT 'quarterly',
+    status VARCHAR(12) NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_futures_option_series_product_exp
+    ON futures_option_series(product_symbol, expiration);
+CREATE INDEX IF NOT EXISTS idx_futures_option_series_underlying
+    ON futures_option_series(underlying_contract_id);
+
+CREATE TABLE IF NOT EXISTS futures_option_contracts (
+    vendor_contract_id VARCHAR(64) PRIMARY KEY,  -- authoritative live-lookup key
+    series_id VARCHAR(48) NOT NULL REFERENCES futures_option_series(series_id),
+    product_symbol VARCHAR(8) NOT NULL,
+    strike NUMERIC(14, 4) NOT NULL,
+    put_call CHAR(1) NOT NULL CHECK (put_call IN ('C', 'P')),
+    expiration TIMESTAMPTZ NOT NULL,             -- EXACT expiration instant
+    underlying_contract_id VARCHAR(24) NOT NULL, -- exact underlying future
+    multiplier INTEGER NOT NULL,
+    exercise_style VARCHAR(12) NOT NULL DEFAULT 'american',
+    settlement_type VARCHAR(12) NOT NULL DEFAULT 'futures',
+    status VARCHAR(12) NOT NULL DEFAULT 'active',
+    open_interest BIGINT,
+    volume BIGINT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT check_foc_strike_positive CHECK (strike > 0)
+);
+-- Live-lookup indexes (spec Phase 2): by underlying future, expiration, and
+-- (strike, put_call) for the GEX-by-strike scan.
+CREATE INDEX IF NOT EXISTS idx_futures_option_contracts_series
+    ON futures_option_contracts(series_id);
+CREATE INDEX IF NOT EXISTS idx_futures_option_contracts_underlying
+    ON futures_option_contracts(underlying_contract_id);
+CREATE INDEX IF NOT EXISTS idx_futures_option_contracts_lookup
+    ON futures_option_contracts(product_symbol, expiration, strike, put_call);
+
+-- =============================================================================
 -- TradeStation API call counts per 5-minute UTC window.
 -- Each ingestion process upserts its window count at window rollover; the
 -- ON CONFLICT clause sums counts across processes that share the same window.

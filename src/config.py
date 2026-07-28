@@ -1800,6 +1800,48 @@ NYSE_HOLIDAYS = os.getenv("NYSE_HOLIDAYS", "")
 INGEST_PARITY_GUARD_ENABLED = _getenv_bool("INGEST_PARITY_GUARD_ENABLED", False)
 
 # =============================================================================
+# Futures / CME Configuration (ES / NQ first-class support)
+# =============================================================================
+#
+# These gate first-class CME futures support.  ALL default OFF so deploying
+# this code is a no-op for the existing SPY/SPX/QQQ/NDX product — futures
+# surfaces only light up when an operator explicitly enables them AND a real
+# licensed CME data feed is wired (the ingestion adapter is intentionally
+# pending; see docs/futures-support-architecture.md).  These names are read
+# directly by src/instruments.py (registry availability) and the futures
+# API routers; they are declared here too for the config summary + docs.
+#
+#   ENABLE_CME_INGESTION      master switch for the CME ingestion pipeline.
+#   ENABLE_ES_ANALYTICS       true ES futures-options analytics (needs a feed).
+#   ENABLE_NQ_ANALYTICS       true NQ futures-options analytics (needs a feed).
+#   ENABLE_ES_REFERENCE_MODE  interim SPX-derived ES reference levels.
+#   ENABLE_NQ_REFERENCE_MODE  requested only; stays inert (no NDX source wired,
+#                             naive QQQ->NQ mapping is disallowed).
+ENABLE_CME_INGESTION = _getenv_bool("ENABLE_CME_INGESTION", False)
+ENABLE_ES_ANALYTICS = _getenv_bool("ENABLE_ES_ANALYTICS", False)
+ENABLE_NQ_ANALYTICS = _getenv_bool("ENABLE_NQ_ANALYTICS", False)
+ENABLE_ES_REFERENCE_MODE = _getenv_bool("ENABLE_ES_REFERENCE_MODE", False)
+ENABLE_NQ_REFERENCE_MODE = _getenv_bool("ENABLE_NQ_REFERENCE_MODE", False)
+
+# Black-76 risk-free rate for futures options.  Defaults to the same scalar
+# the equity BSM path uses; overridable independently so the futures curve can
+# diverge without disturbing equity Greeks.
+FUTURES_RISK_FREE_RATE = _getenv_float("FUTURES_RISK_FREE_RATE", RISK_FREE_RATE)
+
+# Dealer-sign policy version for futures GEX (see src/futures/sign_policy.py).
+# Independent from the equity calibration by design (spec Phase 7).
+FUTURES_DEALER_SIGN_POLICY = _getenv_str(
+    "FUTURES_DEALER_SIGN_POLICY", "v1_calls_long_puts_short"
+)
+
+# Max tolerated ES<->SPX quote skew (ms) before the reference-mode basis is
+# rejected as unsynchronized.
+FUTURES_REFERENCE_MAX_SKEW_MS = _getenv_float(
+    "FUTURES_REFERENCE_MAX_SKEW_MS", 2000.0, min=0.0
+)
+
+
+# =============================================================================
 # Helper Functions
 # =============================================================================
 
@@ -1841,6 +1883,16 @@ def get_all_config() -> Dict[str, Any]:
             "ingest_parity_guard_enabled": INGEST_PARITY_GUARD_ENABLED,
             "flow_canonical_only": FLOW_CANONICAL_ONLY,
             "analytics_flow_cache_refresh_enabled": ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
+        },
+        "futures": {
+            "enable_cme_ingestion": ENABLE_CME_INGESTION,
+            "enable_es_analytics": ENABLE_ES_ANALYTICS,
+            "enable_nq_analytics": ENABLE_NQ_ANALYTICS,
+            "enable_es_reference_mode": ENABLE_ES_REFERENCE_MODE,
+            "enable_nq_reference_mode": ENABLE_NQ_REFERENCE_MODE,
+            "risk_free_rate": FUTURES_RISK_FREE_RATE,
+            "dealer_sign_policy": FUTURES_DEALER_SIGN_POLICY,
+            "reference_max_skew_ms": FUTURES_REFERENCE_MAX_SKEW_MS,
         },
         "auth": {
             "refresh_buffer_seconds": TS_REFRESH_BUFFER_SECONDS,
