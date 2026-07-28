@@ -21,6 +21,16 @@ pinning the process-wide default here does not constrain them.
 """
 
 import os
+import tempfile
+
+# Isolate the bulletin-tweet artifact + "latest" review-record store to a
+# throwaway dir so `make test` on a configured server (where .env sets
+# BULLETIN_TWEET_ARTIFACT_DIR=/var/lib/zerogex-oa/bulletin-tweets and the
+# Makefile exports it) never reads or writes the REAL store — which would
+# both pollute production files and leak real records into "record absent"
+# assertions. Tests that exercise the artifact-dir fallback ladder delenv
+# this per-test.
+os.environ["BULLETIN_TWEET_ARTIFACT_DIR"] = tempfile.mkdtemp(prefix="zerogex-test-bulletin-")
 
 # key -> (default, source of the in-code default)
 _PINNED_DEFAULTS = {

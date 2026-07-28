@@ -1176,6 +1176,11 @@ def test_latest_record_roundtrip(tmp_path, monkeypatch):
     """build_latest_record → write_latest_record → read_latest_record."""
     mod = _reload_module()
     monkeypatch.setenv("BULLETIN_TWEET_ARTIFACT_DIR", str(tmp_path))
+    # Neutralize the other candidate roots so the "record absent" check can't
+    # pick up a real /var/lib or ~/.local record on a configured host.
+    monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", tmp_path / "primary-noexist")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     feat = mod._shape_bulletin(
         _summary_row(
             "SPY", spot=744.51, gamma_flip=747.0, put_wall=740.0, call_wall=750.0, net_gex=-1.2e9
@@ -1213,6 +1218,11 @@ def test_read_latest_record_any_returns_newest(tmp_path, monkeypatch):
     """read_latest_record_any picks the newest record for a mode across symbols."""
     mod = _reload_module()
     monkeypatch.setenv("BULLETIN_TWEET_ARTIFACT_DIR", str(tmp_path))
+    # Neutralize the other candidate roots so the "premarket absent" check and
+    # the newest-pick can't be perturbed by real records on a configured host.
+    monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", tmp_path / "primary-noexist")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     latest = mod.resolve_latest_dir()
     assert latest is not None
     (latest / "SPX-midday.json").write_text(
@@ -1250,6 +1260,31 @@ def test_read_latest_record_any_returns_newest(tmp_path, monkeypatch):
     assert got["post_text"] == "spy"
     # A mode with no records → None, never an error.
     assert mod.read_latest_record_any("premarket") is None
+
+
+def test_read_latest_record_when_write_dir_unresolvable(tmp_path, monkeypatch):
+    """The API reads records the tweet job wrote even when its OWN
+    resolve_latest_dir() (write-probe) fails — reads must not require write
+    access.  Mirrors the sandboxed API (ProtectSystem=strict) reading the
+    /var/lib records the tweet job wrote on its own less-restricted unit."""
+    mod = _reload_module()
+    monkeypatch.delenv("BULLETIN_TWEET_ARTIFACT_DIR", raising=False)
+    # A read-only store that already has a record; every writable candidate
+    # is neutralized, and resolve_latest_dir() returns None (no writable dir).
+    store = tmp_path / "readonly-store"
+    (store / "latest").mkdir(parents=True)
+    (store / "latest" / "SPY-premarket.json").write_text(
+        json.dumps({"symbol": "SPY", "mode": "premarket", "post_text": "morning read"})
+    )
+    monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", store)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(mod, "resolve_latest_dir", lambda: None)
+
+    got = mod.read_latest_record("SPY", "premarket")
+    assert got is not None and got["post_text"] == "morning read"
+    got_any = mod.read_latest_record_any("premarket")
+    assert got_any is not None and got_any["symbol"] == "SPY"
 
 
 # ---------------------------------------------------------------------------
