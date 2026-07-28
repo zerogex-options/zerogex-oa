@@ -172,9 +172,10 @@ does not loosen downside control.
 
 ### Level geometry
 
-Define **R = structural_target − entry_spot** — the bot's published
-`target_price` (call wall, max pain, VWAP, …) minus the spot at entry. Every
-ladder level is a fixed fraction of R, **frozen at entry** (a later config
+Define **R = effective_target − entry_spot**, where `effective_target` is the
+bot's published `target_price` (call wall, max pain, VWAP, …) **capped to a
+reachable envelope** `entry_spot × (1 ± LADDER_MAX_MOVE_PCT)` (default 0.8%, §5f).
+Every ladder level is a fixed fraction of R, **frozen at entry** (a later config
 change never moves an open position's levels). Bullish shown; bearish mirrors
 with the sign flipped.
 
@@ -293,6 +294,25 @@ the trailing give-back is always active, a big T2 winner can't quietly bleed to
 theta — it trails out once it surrenders 30% of its peak. This resolves the
 earlier §10 concern (a final tranche stopped only at a distant fixed level)
 without pinning a hard stop that noise would trip.
+
+**(f) Target-distance cap — keep the whole ladder reachable.** The ladder is
+only as useful as the target it anchors to. Some bots target a far gamma wall:
+`VixRegimeBreakout` targets the call wall, which on a live QQQ 0DTE sat at 690
+while spot was ~672 — a 2.7% move. Anchoring T1 to it (`0.90·R` of an 18-point
+move ≈ 688) leaves the ladder **inert**: spot never reaches T1, so a +97%
+premium winner takes no tranche and gets no runner protection, riding to its
+time-stop fully exposed to give-back — exactly the failure the ladder exists to
+prevent. So the geometry uses an **effective target** = `min(structural_target,
+entry × (1 + max_move_pct))` for bullish (mirror for bearish), default
+`max_move_pct = 0.8%`. That pulls the far wall in to a reachable envelope (T1 ≈
+0.72% ≈ 676.8 in the example — already in the money) while leaving a realistic
+target that's already inside the envelope untouched (the 749→750 example, 0.13%,
+is unchanged). The cap only ever pulls the target *toward* entry, so the
+profitable sign is preserved and S2 stays below T1. Per-bot configurable
+(`ladder_max_move_pct`); `0` disables it (use the raw structural target).
+Tuned for 0DTE — a 1DTE/swing bot legitimately targeting a multi-day move should
+widen it. The bot's real `target_price` is still stored on the position for
+audit; only the frozen T1/S2/T2 use the capped value.
 
 **Tranche fractions.** 50% at T1, then 50% of the remainder at T2 (25% of
 original), leaving 25% to ride — configurable (`t1_take_fraction`,
@@ -440,9 +460,10 @@ fraction knobs change mid-session.
 | `realized_pnl_booked` | `NUMERIC(14,4) NOT NULL DEFAULT 0` | Accumulated realized from partial closes |
 | `exit_tranches` | `JSONB NOT NULL DEFAULT '[]'` | Per-tranche audit breakdown |
 
-`target_price` continues to hold the **structural target** (the `R` endpoint —
-call wall, max pain, …), unchanged and still set by the bot; the ladder derives
-T1/S2/T2 from it plus `entry_spot`. `quantity_open` continues to hold the
+`target_price` continues to hold the **structural target** (call wall, max pain,
+…), unchanged and still set by the bot and used by the unarmed single-target
+exit; the ladder derives T1/S2/T2 from its **capped** value (§5f) plus
+`entry_spot`, and the resolved levels are what get frozen. `quantity_open` continues to hold the
 *currently open* count. Existing rows migrate cleanly (all new columns
 nullable/defaulted); `quantity_initial` / `entry_spot` backfill from
 `quantity_open` / a null-safe default for any in-flight position at deploy.
@@ -465,6 +486,7 @@ All read via `config.py` and overridable per-bot through `params[...]`, mirrorin
 | `TRADEWORKZ_T2_TAKE_FRACTION` | `0.5` | Fraction of the *remainder* taken at T2 |
 | `TRADEWORKZ_T2_TARGET_FRACTION` | `1.5` | T2 take-25% level = `entry + this·R` (half an R past the target) |
 | `TRADEWORKZ_RUNNER_TRAIL_GIVEBACK_PCT` | `0.30` | Premium give-back from HWM that stops the runner |
+| `TRADEWORKZ_LADDER_MAX_MOVE_PCT` | `0.008` | Cap the effective target to `entry·(1±this)` so T1/S2/T2 stay reachable; `0` disables |
 
 `TRADEWORKZ_MAX_PREMIUM_LOSS_PCT` default changed `0.40 → 0.25` (§6.1) — done.
 
