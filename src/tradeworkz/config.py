@@ -114,6 +114,17 @@ T2_TAKE_FRACTION: float = _getenv_float("TRADEWORKZ_T2_TAKE_FRACTION", 0.5, min=
 RUNNER_TRAIL_GIVEBACK_PCT: float = _getenv_float(
     "TRADEWORKZ_RUNNER_TRAIL_GIVEBACK_PCT", 0.30, min=0.0, max=1.0
 )
+# Cap the ladder's effective target to a reachable envelope: the geometry uses
+# min(structural_target, entry*(1+this)) for bullish (mirror for bearish). Some
+# bots target a far gamma wall a 0DTE won't reach intraday, which would anchor
+# T1 out of reach and leave the ladder inert on a real premium winner. 0.8%
+# keeps T1/S2/T2 reachable; a target already inside the envelope is unchanged.
+# Set to 0 to disable the cap (use the raw structural target). Tuned for 0DTE —
+# 1DTE/swing bots that legitimately target a multi-day move should raise this
+# via params['ladder_max_move_pct'].
+LADDER_MAX_MOVE_PCT: float = _getenv_float(
+    "TRADEWORKZ_LADDER_MAX_MOVE_PCT", 0.008, min=0.0, max=1.0
+)
 
 # ---------------------------------------------------------------------------
 # Regular-trading-hours (RTH) gate on NEW opens

@@ -298,6 +298,7 @@ def open_position(
             float(cfg.get("t1_frac", 0.90)),
             float(cfg.get("s2_frac", 0.75)),
             float(cfg.get("t2_frac", 1.5)),
+            float(cfg.get("max_move_pct", 0.0)),
         )
     t1_price = levels["t1_trigger_price"] if levels else None
     s2_price = levels["s2_stop_price"] if levels else None

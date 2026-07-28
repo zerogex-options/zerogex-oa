@@ -138,6 +138,46 @@ def test_ladder_levels_unarmable_returns_none(entry_spot, target, direction):
     assert compute_ladder_levels(entry_spot, target, direction, 0.90, 0.75, 1.5) is None
 
 
+# ── Target-distance cap: keep T1/S2/T2 reachable on far-wall targets ──
+
+
+def test_cap_pulls_a_far_target_into_the_envelope():
+    # The live VixRegimeBreakout case: entry 672, call wall 690 (2.68% away).
+    # Capped to 0.8% => T1 ~676.84 (reachable), not ~688 (unreachable on 0DTE).
+    lv = compute_ladder_levels(672.0, 690.0, "bullish", 0.90, 0.75, 1.5, 0.008)
+    assert lv["t1_trigger_price"] == pytest.approx(676.8384)
+    assert lv["s2_stop_price"] == pytest.approx(676.032)
+    assert lv["target2_price"] == pytest.approx(680.064)
+    # Reachable: T1 is far below the raw 690 wall.
+    assert lv["t1_trigger_price"] < 690.0
+
+
+def test_cap_leaves_a_near_target_untouched():
+    # 749->750 is 0.13%, well inside the 0.8% envelope => raw geometry.
+    lv = compute_ladder_levels(749.0, 750.0, "bullish", 0.90, 0.75, 1.5, 0.008)
+    assert lv["t1_trigger_price"] == pytest.approx(749.90)
+    assert lv["s2_stop_price"] == pytest.approx(749.75)
+    assert lv["target2_price"] == pytest.approx(750.50)
+
+
+def test_cap_bearish_mirror():
+    # entry 672, far put wall 655 (2.53% below) capped to -0.8%.
+    lv = compute_ladder_levels(672.0, 655.0, "bearish", 0.90, 0.75, 1.5, 0.008)
+    assert lv["t1_trigger_price"] == pytest.approx(667.1616)
+    assert lv["t1_trigger_price"] > 655.0  # pulled toward entry, above the raw wall
+
+
+def test_cap_disabled_uses_raw_target():
+    lv = compute_ladder_levels(672.0, 690.0, "bullish", 0.90, 0.75, 1.5, 0.0)
+    assert lv["t1_trigger_price"] == pytest.approx(688.2)  # 0.90 * 18-point move
+
+
+def test_scale_config_exposes_max_move_pct_and_honors_override():
+    assert _bot().scale_config()["max_move_pct"] == pytest.approx(0.008)
+    assert _bot(params={"ladder_max_move_pct": 0.02}).scale_config()[
+        "max_move_pct"] == pytest.approx(0.02)
+
+
 # ── T1 take (Stage 0) ─────────────────────────────────────────────────
 
 

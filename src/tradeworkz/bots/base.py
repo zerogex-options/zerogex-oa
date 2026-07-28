@@ -89,22 +89,33 @@ def compute_ladder_levels(
     t1_frac: float,
     s2_frac: float,
     t2_frac: float,
+    max_move_pct: float = 0.0,
 ) -> Optional[Dict[str, float]]:
     """Freeze the scale-out ladder's spot levels at entry, or ``None``.
 
-    ``R = target_price - entry_spot`` is the raw distance to the bot's
-    structural target. The ladder levels are fixed fractions of R:
+    ``R = effective_target - entry_spot`` is the distance the ladder harvests
+    over. The levels are fixed fractions of R:
 
         T1 (take 50%)      = entry_spot + t1_frac * R   (default 0.90·R)
         S2 (runner floor)  = entry_spot + s2_frac * R   (default 0.75·R)
         T2 (take 25% more) = entry_spot + t2_frac * R    (default 1.5·R)
 
-    Returns ``None`` — meaning "don't arm the ladder, use the single-target
-    exit" — unless the position is directional, has both an entry spot and a
-    target, and R has the *profitable* sign for the direction (bullish target
-    above entry, bearish below). The sign guard is defensive: a misconfigured
-    signal whose target sits on the wrong side of entry would otherwise produce
-    a nonsensical ladder, so we fall back to the plain exit instead.
+    ``effective_target`` is the bot's structural ``target_price`` **capped to a
+    reachable envelope** ``entry_spot × (1 ± max_move_pct)`` when
+    ``max_move_pct > 0``. Some bots (e.g. VixRegimeBreakout) target a far gamma
+    wall that a 0DTE will not reach intraday; anchoring T1 to it (T1 ≈ 0.90·R of
+    an 18-point move) leaves the ladder inert and a big premium winner
+    unprotected. Capping the target to, say, 0.8% keeps T1/S2/T2 reachable so
+    the ladder actually harvests. The cap only ever pulls the target *toward*
+    entry, so a realistic target already inside the envelope is unchanged, and
+    the profitable sign is preserved. ``max_move_pct <= 0`` disables the cap.
+
+    Returns ``None`` — "don't arm the ladder, use the single-target exit" —
+    unless the position is directional, has both an entry spot and a target, and
+    the RAW target has the *profitable* sign for the direction (bullish target
+    above entry, bearish below). The sign guard runs before the cap: a
+    misconfigured signal whose target sits on the wrong side of entry falls back
+    to the plain exit instead.
     """
     if entry_spot is None or target_price is None:
         return None
@@ -115,6 +126,12 @@ def compute_ladder_levels(
         return None
     if direction == "bearish" and r >= 0:
         return None
+    if max_move_pct and max_move_pct > 0 and entry_spot > 0:
+        if direction == "bullish":
+            effective_target = min(target_price, entry_spot * (1.0 + max_move_pct))
+        else:
+            effective_target = max(target_price, entry_spot * (1.0 - max_move_pct))
+        r = effective_target - entry_spot
     return {
         "t1_trigger_price": entry_spot + t1_frac * r,
         "s2_stop_price": entry_spot + s2_frac * r,
@@ -249,12 +266,20 @@ class BaseBot:
             "runner_trail_giveback_pct", tw_config.RUNNER_TRAIL_GIVEBACK_PCT, 0.0, 1.0
         )
 
+    def _ladder_max_move_pct(self) -> float:
+        from src.tradeworkz import config as tw_config
+
+        return self._resolve_ladder_frac(
+            "ladder_max_move_pct", tw_config.LADDER_MAX_MOVE_PCT, 0.0, 1.0
+        )
+
     def scale_config(self) -> Dict[str, Any]:
         """Resolved scale-out knobs, for ``open_position`` to freeze the ladder.
 
         The take fractions and the give-back are NOT frozen here — they are read
         live from the bot at exit time — so only the geometry inputs (enable
-        flag, min-contract floor, and the T1/S2/T2 fractions) are returned.
+        flag, min-contract floor, the T1/S2/T2 fractions, and the target cap)
+        are returned.
         """
         return {
             "enabled": self._scale_out_enabled(),
@@ -262,6 +287,7 @@ class BaseBot:
             "t1_frac": self._t1_trigger_fraction(),
             "s2_frac": self._s2_stop_fraction(),
             "t2_frac": self._t2_target_fraction(),
+            "max_move_pct": self._ladder_max_move_pct(),
         }
 
     # -- Subclass overrides ---------------------------------------------
