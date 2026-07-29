@@ -124,13 +124,19 @@ MATCH THE MODE:
   levels, then the standing structure into tomorrow.
 
 REPLY:
-Also write a short threaded reply that plays off the post's theme.  It should
-teach one idea about how levels or dealer positioning actually behave (e.g.
-"levels are zones of influence, not guarantees" or "in a short-gamma market,
-how price reacts at a level matters more than the first touch"), then end with
-a call-to-action phrase ending in a colon — for example "Follow the live dealer
-positioning and key levels:" or "More live positioning and dealer gamma
-analytics:".  Do NOT put a URL in the reply — the link is appended for you.
+Also write a threaded reply that is exactly ONE sentence — a sharp, specific
+add-on that builds on THIS post, not a generic lesson or a restatement of it.
+Make it particular to today's setup (the level that mattered, the news, the
+regime) so it reads fresh every time and never falls back on stock phrases.
+Think "one more incisive beat" — a nuance, an implication, or the tell to
+watch next — the kind of line that makes the reader smarter.  Examples of the
+SHAPE (do not reuse the wording):
+* "The tell wasn't 740 breaking — it was how fast it reclaimed once the
+  headline hit; that's short gamma doing the work in both directions."
+* "Flat on the close, violent underneath — that gap between the print and the
+  path is the whole story when dealers are this short."
+Do NOT restate the bottom line.  Do NOT end with a call-to-action or a colon.
+Do NOT include a URL or any hashtags — the zerogex.io link is appended for you.
 
 STRICT RULES:
 * Every dollar figure or strike price you write — in the post OR the reply, for
@@ -165,7 +171,8 @@ OUTPUT — reply with a single JSON object and NOTHING else:
   "bottom_line":  the takeaway — 1-3 sentences.  Opinionated but no trade
                   calls.  Do NOT include the words "Bottom line:" — that label
                   is added for you.
-  "reply":        the threaded reply described above, ending in a colon, no URL.
+  "reply":        the ONE-sentence sharp add-on described above.  No URL, no
+                  hashtags, no call-to-action, no colon ending.
 }
 """
 
