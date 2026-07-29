@@ -896,10 +896,7 @@ def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
             bottom_line=(
                 "With the market closed tomorrow, this is a fitting place " "to leave it."
             ),
-            reply=(
-                "Levels are zones of influence, not guarantees.\n\n"
-                "More live positioning and dealer gamma analytics:"
-            ),
+            reply="The tell was how fast 740 reclaimed once the headline hit.",
             level_notes={"put_wall": "held", "gamma_flip": "the pivot"},
         )
 
@@ -939,10 +936,9 @@ def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
     # No hashtag row / link in the main post; the link rides in the reply.
     assert "#Gamma" not in body.text
     assert "zerogex.io" not in body.text
-    # The reply is the LLM copy + the appended ZeroGEX link on the CTA line.
-    assert "Levels are zones of influence" in body.reply_text
-    assert body.reply_text.endswith(
-        "More live positioning and dealer gamma analytics: https://zerogex.io"
+    # The reply is the one-sentence add-on + the ZeroGEX link on its own line.
+    assert body.reply_text == (
+        "The tell was how fast 740 reclaimed once the headline hit.\n\n" "https://zerogex.io"
     )
 
 
