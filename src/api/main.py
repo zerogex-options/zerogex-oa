@@ -34,6 +34,7 @@ from .models import (
     FlowPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
+    MarketTideResponse,
     SmartMoneyFlowPoint,
     MomentumDivergencePoint,
     FlowBuyingPressurePoint,
@@ -894,6 +895,28 @@ def _format_flow_series_row(row: dict) -> dict:
         "contract_count": _to_int(row.get("contract_count")),
         "is_synthetic": bool(row.get("is_synthetic")),
     }
+
+
+@app.get(
+    "/api/market-tide",
+    response_model=MarketTideResponse,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/market-tide")
+async def get_market_tide(
+    window: Literal[5, 15, 30, 60] = Query(
+        default=15,
+        description="Directional premium lookback in minutes.",
+    ),
+):
+    """Market-wide directional options flow adjusted by dealer gamma.
+
+    The score is withheld when fewer than 60% of active symbols have fresh
+    gamma and flow inputs. Component leaders/laggards explain which names are
+    driving the reading.
+    """
+    return await _db().get_market_tide(window_minutes=window)
 
 
 @app.get(

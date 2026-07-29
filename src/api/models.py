@@ -342,6 +342,35 @@ class FlowSeriesPoint(BaseModel):
     is_synthetic: bool
 
 
+class MarketTideComponent(BaseModel):
+    symbol: str
+    flow_score: float
+    gamma_score: float
+    amplifier: float
+    weight: float
+    contribution: float
+
+
+class MarketTideResponse(BaseModel):
+    """Cross-symbol directional options pressure adjusted by dealer gamma."""
+
+    timestamp: datetime
+    score: Optional[float] = None
+    label: str
+    flow_direction: float
+    gamma_regime: float
+    gamma_label: str
+    bullish_breadth_pct: float
+    bearish_breadth_pct: float
+    neutral_breadth_pct: float
+    participation_pct: float
+    eligible_symbols: int
+    configured_symbols: int
+    stale_symbols: List[str]
+    leaders: List[MarketTideComponent]
+    laggards: List[MarketTideComponent]
+
+
 class FlowContractsResponse(BaseModel):
     """Distinct strikes and expirations that traded in the resolved session."""
 

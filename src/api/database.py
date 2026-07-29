@@ -27,6 +27,7 @@ from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
+from src.api.market_tide import calculate_market_tide
 
 logger = logging.getLogger(__name__)
 
@@ -3351,6 +3352,126 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except asyncio.TimeoutError:
             logger.warning(f"Flow query timed out for {symbol}, returning empty")
             return []
+
+    async def get_market_tide(self, window_minutes: int = 15) -> Dict[str, Any]:
+        """Return the normalized cross-symbol options-flow/gamma composite.
+
+        The query intentionally returns one row for every active symbol so the
+        calculator can report stale names and participation rather than
+        silently presenting a thin universe as a broad market reading.
+        Historical p95 values make unlike underlyings comparable; liquidity
+        weighting and concentration caps are applied by ``calculate_market_tide``.
+        """
+        cache_key = f"market_tide:{window_minutes}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        async with self._acquire_connection() as conn:
+            anchor = await conn.fetchval("""
+                SELECT LEAST(
+                    (SELECT MAX(timestamp) FROM gex_summary),
+                    (SELECT MAX(timestamp) FROM flow_contract_facts)
+                )
+                """)
+            if anchor is None:
+                result = calculate_market_tide([], anchor=datetime.now(timezone.utc))
+                self._cache_set(cache_key, result, 30.0)
+                return result
+
+            rows = await conn.fetch(
+                """
+                WITH active AS (
+                    SELECT symbol
+                    FROM symbols
+                    WHERE COALESCE(is_active, TRUE) = TRUE
+                ),
+                latest_gex AS (
+                    SELECT DISTINCT ON (gs.underlying)
+                        gs.underlying AS symbol,
+                        gs.timestamp AS gex_timestamp,
+                        gs.net_gex_at_spot
+                    FROM gex_summary gs
+                    JOIN active a ON a.symbol = gs.underlying
+                    WHERE gs.timestamp <= $1
+                    ORDER BY gs.underlying, gs.timestamp DESC
+                ),
+                current_flow AS (
+                    SELECT
+                        f.symbol,
+                        MAX(f.timestamp) AS flow_timestamp,
+                        SUM(
+                            CASE WHEN f.option_type = 'C'
+                                 THEN COALESCE(f.buy_premium, 0) - COALESCE(f.sell_premium, 0)
+                                 ELSE COALESCE(f.sell_premium, 0) - COALESCE(f.buy_premium, 0)
+                            END
+                        )::double precision AS signed_premium,
+                        SUM(COALESCE(f.premium_delta, 0))::double precision AS gross_premium
+                    FROM flow_contract_facts f
+                    JOIN active a USING (symbol)
+                    WHERE f.timestamp > $1 - ($2::text || ' minutes')::interval
+                      AND f.timestamp <= $1
+                    GROUP BY f.symbol
+                ),
+                historical_flow_buckets AS (
+                    SELECT
+                        f.symbol,
+                        DATE_TRUNC('hour', f.timestamp)
+                          + FLOOR(EXTRACT(MINUTE FROM f.timestamp) / $2) * ($2::text || ' minutes')::interval AS bucket,
+                        SUM(
+                            CASE WHEN f.option_type = 'C'
+                                 THEN COALESCE(f.buy_premium, 0) - COALESCE(f.sell_premium, 0)
+                                 ELSE COALESCE(f.sell_premium, 0) - COALESCE(f.buy_premium, 0)
+                            END
+                        )::double precision AS signed_premium
+                    FROM flow_contract_facts f
+                    JOIN active a USING (symbol)
+                    WHERE f.timestamp >= $1 - INTERVAL '30 days'
+                      AND f.timestamp < $1 - ($2::text || ' minutes')::interval
+                    GROUP BY f.symbol, bucket
+                ),
+                flow_norm AS (
+                    SELECT symbol,
+                           PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ABS(signed_premium)) AS flow_p95
+                    FROM historical_flow_buckets
+                    GROUP BY symbol
+                ),
+                gamma_norm AS (
+                    SELECT underlying AS symbol,
+                           PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ABS(net_gex_at_spot)) AS gamma_p95
+                    FROM gex_summary
+                    WHERE timestamp >= $1 - INTERVAL '30 days'
+                      AND timestamp < $1
+                      AND net_gex_at_spot IS NOT NULL
+                    GROUP BY underlying
+                )
+                SELECT
+                    a.symbol,
+                    lg.gex_timestamp,
+                    cf.flow_timestamp,
+                    lg.net_gex_at_spot,
+                    cf.signed_premium,
+                    cf.gross_premium,
+                    fn.flow_p95,
+                    gn.gamma_p95
+                FROM active a
+                LEFT JOIN latest_gex lg USING (symbol)
+                LEFT JOIN current_flow cf USING (symbol)
+                LEFT JOIN flow_norm fn USING (symbol)
+                LEFT JOIN gamma_norm gn USING (symbol)
+                ORDER BY a.symbol
+                """,
+                anchor,
+                window_minutes,
+            )
+
+        result = calculate_market_tide(
+            [dict(row) for row in rows],
+            anchor=anchor,
+            freshness_minutes=10,
+        )
+        self._cache_set(cache_key, result, 30.0)
+        return result
 
     async def _resolve_flow_series_session(
         self,
