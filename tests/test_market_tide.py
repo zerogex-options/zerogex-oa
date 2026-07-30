@@ -141,4 +141,8 @@ def test_database_query_binds_window_as_integer_interval():
 
     assert "$2::text" not in connection.query
     assert "make_interval(mins => $2::integer)" in connection.query
+    assert connection.query.count("FROM flow_contract_facts") == 1
+    assert "FROM component_normalizer_cache" in connection.query
+    assert "FROM gex_historical_stats" in connection.query
+    assert "PERCENTILE_CONT" not in connection.query
     assert connection.args == (ANCHOR, 15)

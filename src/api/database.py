@@ -3424,38 +3424,30 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                       AND f.timestamp <= $1
                     GROUP BY f.symbol
                 ),
-                historical_flow_buckets AS (
-                    SELECT
-                        f.symbol,
-                        DATE_TRUNC('hour', f.timestamp)
-                          + FLOOR(EXTRACT(MINUTE FROM f.timestamp) / $2::integer)
-                            * make_interval(mins => $2::integer) AS bucket,
-                        SUM(
-                            CASE WHEN f.option_type = 'C'
-                                 THEN COALESCE(f.buy_premium, 0) - COALESCE(f.sell_premium, 0)
-                                 ELSE COALESCE(f.sell_premium, 0) - COALESCE(f.buy_premium, 0)
-                            END
-                        )::double precision AS signed_premium
-                    FROM flow_contract_facts f
-                    JOIN active a USING (symbol)
-                    WHERE f.timestamp >= $1 - INTERVAL '30 days'
-                      AND f.timestamp < $1 - make_interval(mins => $2::integer)
-                    GROUP BY f.symbol, bucket
-                ),
                 flow_norm AS (
-                    SELECT symbol,
-                           PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ABS(signed_premium)) AS flow_p95
-                    FROM historical_flow_buckets
-                    GROUP BY symbol
+                    -- Nightly cache: keep the 30-day percentile scan off this
+                    -- latency-sensitive request path.  The sum is a
+                    -- conservative scale for call-minus-put directional flow.
+                    SELECT cnc.underlying AS symbol,
+                           SUM(ABS(cnc.p95))::double precision AS flow_p95
+                    FROM component_normalizer_cache cnc
+                    JOIN active a ON a.symbol = cnc.underlying
+                    WHERE cnc.field_name IN ('call_flow_delta', 'put_flow_delta')
+                      AND cnc.p95 IS NOT NULL
+                    GROUP BY cnc.underlying
                 ),
                 gamma_norm AS (
-                    SELECT underlying AS symbol,
-                           PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ABS(net_gex_at_spot)) AS gamma_p95
-                    FROM gex_summary
-                    WHERE timestamp >= $1 - INTERVAL '30 days'
-                      AND timestamp < $1
-                      AND net_gex_at_spot IS NOT NULL
-                    GROUP BY underlying
+                    -- Flat 30-day distribution is refreshed off-path by
+                    -- gex_historical_stats_refresh.  Use the larger tail
+                    -- magnitude because a signed distribution can have a
+                    -- negative p95.
+                    SELECT ghs.underlying AS symbol,
+                           GREATEST(ABS(ghs.p05), ABS(ghs.p95))::double precision AS gamma_p95
+                    FROM gex_historical_stats ghs
+                    JOIN active a ON a.symbol = ghs.underlying
+                    WHERE ghs.metric = 'net_gex_at_spot'
+                      AND ghs.window_label = '30d'
+                      AND ghs.tod_bucket = -1
                 )
                 SELECT
                     a.symbol,
