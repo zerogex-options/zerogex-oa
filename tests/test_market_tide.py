@@ -100,7 +100,7 @@ def test_market_tide_endpoint_is_registered_with_response_contract():
     from src.api.main import MarketTideWindow, app
 
     route = next(
-        route for route in app.routes if getattr(route, "path", None) == "/api/market-tide"
+        route for route in app.routes if getattr(route, "path", None) == "/api/flow/market-tide"
     )
     assert route.methods == {"GET"}
     assert route.response_model is MarketTideResponse

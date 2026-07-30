@@ -45,7 +45,7 @@ existing **Metrics** section of the navigation menu.
 Request:
 
 ```http
-GET /api/market-tide?window=15
+GET /api/flow/market-tide?window=15
 ```
 
 Supported `window` values are `5`, `15`, `30`, and `60`. Default to `15`.

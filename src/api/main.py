@@ -909,12 +909,12 @@ def _format_flow_series_row(row: dict) -> dict:
 
 
 @app.get(
-    "/api/market-tide",
+    "/api/flow/market-tide",
     response_model=MarketTideResponse,
     tags=["Options Flow"],
     dependencies=[_scope_flow],
 )
-@handle_api_errors("GET /api/market-tide")
+@handle_api_errors("GET /api/flow/market-tide")
 async def get_market_tide(
     window: MarketTideWindow = Query(
         default=MarketTideWindow.FIFTEEN_MINUTES,

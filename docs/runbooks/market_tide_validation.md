@@ -18,7 +18,7 @@ Test the backend before debugging the web page:
 ```bash
 curl -sS \
   -H "X-API-Key: $API_KEY" \
-  "https://YOUR_API_HOST/api/market-tide?window=15" | python -m json.tool
+  "https://YOUR_API_HOST/api/flow/market-tide?window=15" | python -m json.tool
 ```
 
 Interpret the result:
@@ -30,14 +30,17 @@ Interpret the result:
 - HTTP 401/403: the key is absent or lacks the options-flow scope.
 - HTTP 500: inspect the API log and run the database healthcheck below.
 - HTTP 404: the deployed API version does not contain the Market Tide route or
-  the frontend is pointed at the wrong backend.
+  the frontend is pointed at the wrong backend. Note the route lives under the
+  `/api/flow/` prefix so it is proxied by the web BFF's `/api/flow/[...rest]`
+  handler; a top-level `/api/market-tide` path has no BFF route and 404s at the
+  Next.js layer before ever reaching this backend.
 
 Also verify every supported window:
 
 ```bash
 for window in 5 15 30 60; do
   curl -fsS -H "X-API-Key: $API_KEY" \
-    "https://YOUR_API_HOST/api/market-tide?window=$window" \
+    "https://YOUR_API_HOST/api/flow/market-tide?window=$window" \
     | python -c 'import json,sys; d=json.load(sys.stdin); print(d["score"], d["label"], d["participation_pct"])'
 done
 ```
