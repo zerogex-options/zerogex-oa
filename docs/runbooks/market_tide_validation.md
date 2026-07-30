@@ -2,9 +2,14 @@
 
 Market Tide is calculated on demand from `gex_summary`,
 `option_chains_latest`, and `flow_contract_facts`. It does not have its own
-table, job, or backfill. A current score becomes publishable when at least 60%
-of active symbols have a GEX snapshot and option-chain heartbeat within ten
-minutes of the common data anchor.
+table, job, or backfill. The universe contains active symbols that actually
+have both chain and GEX data (contract-root aliases are excluded). During RTH,
+a score becomes publishable when at least 60% have a GEX snapshot and
+option-chain heartbeat within ten minutes of the common data anchor. After the
+cash session, aligned snapshots from the same ET trading date remain eligible
+so index closes can coexist with later ETF chain updates. The API freezes its
+data anchor at 16:00 ET when source snapshots continue after the cash close;
+this keeps the GEX and flow windows on one comparable session timestamp.
 
 ## 1. Call the API directly
 
@@ -57,8 +62,8 @@ The command reports the common anchor and, for every active symbol:
 - latest GEX timestamp;
 - latest sparse flow fact;
 - 30-day flow and gamma normalization sample counts; and
-- a readiness status such as `ready`, `missing_chain`, `stale_chain`,
-  `missing_gex`, or `stale_gex`.
+- a readiness status such as `ready`, `missing_chain`, `missing_gex`, or
+  `stale_or_misaligned`.
 
 Exit code 0 means participation is at least 60%, exit code 1 means the metric
 is not publishable, and exit code 2 means the database query failed.

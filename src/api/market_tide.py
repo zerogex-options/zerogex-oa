@@ -3,8 +3,38 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _inputs_are_fresh(
+    gex_timestamp: datetime | None,
+    flow_timestamp: datetime | None,
+    anchor: datetime,
+    freshness: timedelta,
+) -> bool:
+    """Validate aligned inputs while preserving the last completed session.
+
+    During RTH every symbol must track the market-wide anchor. After the cash
+    session, index chains legitimately stop while ETF chains can keep updating;
+    same-session, mutually aligned snapshots remain publishable.
+    """
+    if gex_timestamp is None or flow_timestamp is None:
+        return False
+    anchor_et = anchor.astimezone(_ET)
+    gex_et = gex_timestamp.astimezone(_ET)
+    flow_et = flow_timestamp.astimezone(_ET)
+    if gex_et.date() != anchor_et.date() or flow_et.date() != anchor_et.date():
+        return False
+    if abs(gex_timestamp - flow_timestamp) > freshness:
+        return False
+    if time(9, 30) <= anchor_et.time() <= time(16, 15):
+        cutoff = anchor - freshness
+        return gex_timestamp >= cutoff and flow_timestamp >= cutoff
+    return True
 
 
 def _bounded_ratio(value: float, scale: float) -> float:
@@ -66,7 +96,7 @@ def calculate_market_tide(
     """
     if anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=timezone.utc)
-    cutoff = anchor - timedelta(minutes=freshness_minutes)
+    freshness = timedelta(minutes=freshness_minutes)
     supplied = list(rows)
     components: list[dict[str, Any]] = []
     stale_symbols: list[str] = []
@@ -75,7 +105,7 @@ def calculate_market_tide(
         symbol = str(row["symbol"])
         gex_ts = row.get("gex_timestamp")
         flow_ts = row.get("flow_timestamp")
-        if not gex_ts or not flow_ts or gex_ts < cutoff or flow_ts < cutoff:
+        if not _inputs_are_fresh(gex_ts, flow_ts, anchor, freshness):
             stale_symbols.append(symbol)
             continue
 

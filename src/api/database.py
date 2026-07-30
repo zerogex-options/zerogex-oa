@@ -3369,10 +3369,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         async with self._acquire_connection() as conn:
             anchor = await conn.fetchval("""
-                SELECT LEAST(
-                    (SELECT MAX(timestamp) FROM gex_summary),
-                    (SELECT MAX(timestamp) FROM option_chains_latest)
+                WITH raw AS (
+                    SELECT LEAST(
+                        (SELECT MAX(timestamp) FROM gex_summary),
+                        (SELECT MAX(timestamp) FROM option_chains_latest)
+                    ) AS ts
                 )
+                SELECT CASE
+                    -- ETF chains can keep updating after index options stop.
+                    -- Freeze the composite at the cash close so every symbol
+                    -- and its flow window describe the same market session.
+                    WHEN (ts AT TIME ZONE 'America/New_York')::time > TIME '16:00'
+                    THEN (
+                        (ts AT TIME ZONE 'America/New_York')::date + TIME '16:00'
+                    ) AT TIME ZONE 'America/New_York'
+                    ELSE ts
+                END
+                FROM raw
                 """)
             if anchor is None:
                 result = calculate_market_tide([], anchor=datetime.now(timezone.utc))
@@ -3382,9 +3395,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             rows = await conn.fetch(
                 """
                 WITH active AS (
-                    SELECT symbol
-                    FROM symbols
-                    WHERE COALESCE(is_active, TRUE) = TRUE
+                    -- Registry aliases such as SPXW/NDXW are active for
+                    -- contract resolution but are not independently ingested
+                    -- underlyings. Keep the Tide universe to active symbols
+                    -- that actually have both source streams.
+                    SELECT s.symbol
+                    FROM symbols s
+                    WHERE COALESCE(s.is_active, TRUE) = TRUE
+                      AND EXISTS (
+                          SELECT 1 FROM option_chains_latest ocl
+                          WHERE ocl.underlying = s.symbol
+                      )
+                      AND EXISTS (
+                          SELECT 1 FROM gex_summary gs
+                          WHERE gs.underlying = s.symbol
+                      )
                 ),
                 latest_gex AS (
                     SELECT DISTINCT ON (gs.underlying)
@@ -3408,6 +3433,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     WHERE ocl.timestamp <= $1
                     GROUP BY ocl.underlying
                 ),
+                symbol_anchors AS (
+                    SELECT lg.symbol,
+                           LEAST(lg.gex_timestamp, ch.flow_timestamp) AS symbol_anchor
+                    FROM latest_gex lg
+                    JOIN chain_freshness ch USING (symbol)
+                ),
                 current_flow AS (
                     SELECT
                         f.symbol,
@@ -3419,9 +3450,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         )::double precision AS signed_premium,
                         SUM(COALESCE(f.premium_delta, 0))::double precision AS gross_premium
                     FROM flow_contract_facts f
-                    JOIN active a USING (symbol)
-                    WHERE f.timestamp > $1 - make_interval(mins => $2::integer)
-                      AND f.timestamp <= $1
+                    JOIN symbol_anchors sa USING (symbol)
+                    WHERE f.timestamp > sa.symbol_anchor - make_interval(mins => $2::integer)
+                      AND f.timestamp <= sa.symbol_anchor
                     GROUP BY f.symbol
                 ),
                 flow_norm AS (
