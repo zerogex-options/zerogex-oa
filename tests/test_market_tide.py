@@ -1,8 +1,10 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from src.api.market_tide import _capped_weights, calculate_market_tide
+from src.api.database import DatabaseManager
 from src.api.models import MarketTideResponse
 from src.tools.market_tide_healthcheck import _evaluate
 
@@ -106,3 +108,37 @@ def test_healthcheck_identifies_missing_and_stale_upstreams():
     statuses = _evaluate(rows, ANCHOR, timedelta(minutes=10))
 
     assert [item.status for item in statuses] == ["ready", "missing_chain", "stale_gex"]
+
+
+def test_database_query_binds_window_as_integer_interval():
+    class FakeConnection:
+        query = ""
+        args = ()
+
+        async def fetchval(self, query):
+            return ANCHOR
+
+        async def fetch(self, query, *args):
+            self.query = query
+            self.args = args
+            return []
+
+    class FakeAcquire:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    connection = FakeConnection()
+    database = DatabaseManager()
+    database._acquire_connection = lambda: FakeAcquire(connection)
+
+    asyncio.run(database.get_market_tide(window_minutes=15))
+
+    assert "$2::text" not in connection.query
+    assert "make_interval(mins => $2::integer)" in connection.query
+    assert connection.args == (ANCHOR, 15)

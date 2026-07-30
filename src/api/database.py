@@ -3420,7 +3420,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         SUM(COALESCE(f.premium_delta, 0))::double precision AS gross_premium
                     FROM flow_contract_facts f
                     JOIN active a USING (symbol)
-                    WHERE f.timestamp > $1 - ($2::text || ' minutes')::interval
+                    WHERE f.timestamp > $1 - make_interval(mins => $2::integer)
                       AND f.timestamp <= $1
                     GROUP BY f.symbol
                 ),
@@ -3428,7 +3428,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     SELECT
                         f.symbol,
                         DATE_TRUNC('hour', f.timestamp)
-                          + FLOOR(EXTRACT(MINUTE FROM f.timestamp) / $2) * ($2::text || ' minutes')::interval AS bucket,
+                          + FLOOR(EXTRACT(MINUTE FROM f.timestamp) / $2::integer)
+                            * make_interval(mins => $2::integer) AS bucket,
                         SUM(
                             CASE WHEN f.option_type = 'C'
                                  THEN COALESCE(f.buy_premium, 0) - COALESCE(f.sell_premium, 0)
@@ -3438,7 +3439,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     FROM flow_contract_facts f
                     JOIN active a USING (symbol)
                     WHERE f.timestamp >= $1 - INTERVAL '30 days'
-                      AND f.timestamp < $1 - ($2::text || ' minutes')::interval
+                      AND f.timestamp < $1 - make_interval(mins => $2::integer)
                     GROUP BY f.symbol, bucket
                 ),
                 flow_norm AS (
