@@ -1393,8 +1393,10 @@ SELECT
         END
     ) AS net_gex,
     SUM(ABS(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01)) AS total_gex,
+    -- Split columns carry the same signs as net_gex above: call_gex ≥ 0,
+    -- put_gex ≤ 0, so call_gex + put_gex == net_gex.
     SUM(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'C') AS call_gex,
-    SUM(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'P') AS put_gex,
+    SUM(-o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'P') AS put_gex,
     COUNT(*) AS num_contracts,
     SUM(o.open_interest) AS total_oi,
     -- Per-symbol threshold: 0.1% of spot's notional × 1M-share scale.
