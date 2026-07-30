@@ -116,4 +116,3 @@ ORDER BY symbol;
 An active registry entry with no corresponding chain/GEX feed reduces
 participation. Mark unsupported symbols inactive or restore their ingestion;
 do not lower the 60% threshold merely to hide a broken universe.
-

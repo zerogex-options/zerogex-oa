@@ -378,4 +378,3 @@ production build, and relevant E2E tests. In the final response:
 - Report the commit hash and pull-request title.
 
 ## PROMPT END
-
