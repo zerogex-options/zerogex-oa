@@ -2119,6 +2119,52 @@ CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_exp_symbol_exp
     ON max_pain_oi_snapshot_expiration(symbol, as_of_date DESC, expiration);
 
 -- =============================================================================
+-- Market Tide intraday snapshots (derived cache)
+-- =============================================================================
+-- /api/flow/market-tide serves the cross-symbol options-flow/gamma composite
+-- from this table instead of recomputing it inline on every request.  The
+-- off-process refresher (src/tools/market_tide_refresh.py ->
+-- DatabaseManager.write_market_tide_snapshots) upserts one row per
+-- (window_minutes, snapshot_ts) every 5 minutes through the cash session and
+-- freezes the final row at the 16:00 ET close; the backfill tool
+-- (src/tools/market_tide_backfill.py) seeds previous sessions the same way.
+-- The endpoint then reads the most recent row per window as a pure cache hit,
+-- so the metric stays populated (never "insufficient_data") after the cash
+-- close — users keep seeing the previous session frozen at its close.  100%
+-- derived state: safe to TRUNCATE, the next refresh/backfill rebuilds it.
+--
+-- Only PUBLISHABLE readings are stored (participation >= 60%, score NOT NULL),
+-- so the endpoint's "latest row" is always a real reading rather than a
+-- withheld one.  ``snapshot_ts`` is the compute anchor floored to the 5-minute
+-- bucket (frozen at the 16:00 ET close after the session ends), which makes a
+-- re-run at the same bucket an idempotent upsert.  ``session_date`` is the ET
+-- cash-session date of the anchor (session grouping / freeze).  ``source_ts``
+-- is the true (un-floored) anchor for provenance.  ``payload`` is the full
+-- MarketTideResponse JSON the endpoint returns verbatim.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_tide_snapshots (
+    snapshot_ts       TIMESTAMPTZ      NOT NULL,
+    window_minutes    SMALLINT         NOT NULL,
+    session_date      DATE             NOT NULL,
+    score             DOUBLE PRECISION,
+    label             VARCHAR(32)      NOT NULL,
+    participation_pct DOUBLE PRECISION NOT NULL,
+    source_ts         TIMESTAMPTZ      NOT NULL,
+    payload           JSONB            NOT NULL,
+    created_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (window_minutes, snapshot_ts)
+);
+
+-- Endpoint read: ``WHERE window_minutes = $1 ORDER BY snapshot_ts DESC
+-- LIMIT 1`` is served directly by the primary key (equality on the leading
+-- column + backward scan).  The session index backs per-session lookups
+-- (e.g. "the close row for a given trading day") used by the backfill and
+-- any future history view.
+CREATE INDEX IF NOT EXISTS idx_market_tide_snapshots_session
+    ON market_tide_snapshots(session_date, window_minutes, snapshot_ts DESC);
+
+-- =============================================================================
 -- Per-user API keys
 -- =============================================================================
 -- Long-lived API keys for individual users.  Keys are stored as SHA-256

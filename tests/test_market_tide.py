@@ -134,6 +134,13 @@ def test_database_query_binds_window_as_integer_interval():
         anchor_query = ""
         query = ""
         args = ()
+        snapshot_query = ""
+
+        async def fetchrow(self, query, *args):
+            # No persisted snapshot → get_market_tide falls back to the live
+            # compute path this test validates.
+            self.snapshot_query = query
+            return None
 
         async def fetchval(self, query):
             self.anchor_query = query
@@ -172,3 +179,177 @@ def test_database_query_binds_window_as_integer_interval():
     assert "FROM gex_historical_stats" in connection.query
     assert "PERCENTILE_CONT" not in connection.query
     assert connection.args == (ANCHOR, 15)
+    # The persisted snapshot is consulted first (frozen-at-close read).
+    assert "FROM market_tide_snapshots" in connection.snapshot_query
+
+
+class _AcquireCtx:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+def test_get_market_tide_prefers_persisted_snapshot_over_live_compute():
+    """When a snapshot exists the endpoint returns it and never computes live."""
+
+    payload = {
+        "timestamp": "2026-07-24T16:00:00+00:00",
+        "score": 42.5,
+        "label": "bullish",
+        "flow_direction": 0.3,
+        "gamma_regime": -0.2,
+        "gamma_label": "amplifying",
+        "bullish_breadth_pct": 60.0,
+        "bearish_breadth_pct": 20.0,
+        "neutral_breadth_pct": 20.0,
+        "participation_pct": 88.0,
+        "eligible_symbols": 8,
+        "configured_symbols": 9,
+        "stale_symbols": [],
+        "leaders": [],
+        "laggards": [],
+    }
+
+    class FakeConnection:
+        computed = False
+
+        async def fetchrow(self, query, *args):
+            return {"payload": payload}
+
+        async def fetchval(self, query):  # live-compute anchor — must not run
+            self.computed = True
+            return ANCHOR
+
+        async def fetch(self, query, *args):  # live-compute rows — must not run
+            self.computed = True
+            return []
+
+    connection = FakeConnection()
+    database = DatabaseManager()
+    database._acquire_connection = lambda: _AcquireCtx(connection)
+
+    result = asyncio.run(database.get_market_tide(window_minutes=15))
+
+    assert result == payload
+    assert connection.computed is False
+    # And it validates against the response contract the endpoint serves.
+    assert MarketTideResponse(**result).score == 42.5
+
+
+def test_market_tide_bucket_floors_to_five_minute_utc():
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    # 16:00 ET cash close lands on a clean 5-minute UTC boundary.
+    close = datetime(2026, 7, 24, 16, 0, tzinfo=et)
+    close_bucket = DatabaseManager._market_tide_bucket(close)
+    assert int(close_bucket.timestamp()) % 300 == 0
+    assert close_bucket == close  # already on a boundary → unchanged
+
+    # An arbitrary intraday anchor floors down to its 5-minute bucket.
+    mid = datetime(2026, 7, 24, 13, 7, 47, tzinfo=et)
+    mid_bucket = DatabaseManager._market_tide_bucket(mid)
+    assert int(mid_bucket.timestamp()) % 300 == 0
+    assert mid_bucket.astimezone(et).strftime("%H:%M:%S") == "13:05:00"
+
+
+def test_snapshot_payload_roundtrips_through_response_model():
+    """The JSON persisted by the writer parses back into MarketTideResponse."""
+    import json
+
+    result = calculate_market_tide(
+        [_row(f"S{i}", 100 if i < 5 else -50, -25) for i in range(10)],
+        anchor=ANCHOR,
+    )
+    # Mirror _upsert_market_tide_snapshot's serialization.
+    payload_obj = dict(result)
+    payload_obj["timestamp"] = result["timestamp"].isoformat()
+    payload = json.dumps(payload_obj, default=str)
+
+    restored = json.loads(payload)
+    model = MarketTideResponse(**restored)
+    assert model.score == result["score"]
+    assert model.timestamp == ANCHOR
+
+
+def test_write_market_tide_snapshots_stores_only_publishable_windows():
+    publishable = {"score": 30.0, "label": "bullish", "participation_pct": 80.0}
+    withheld = {"score": None, "label": "insufficient_data", "participation_pct": 40.0}
+    by_window = {5: publishable, 15: withheld, 30: publishable}
+
+    upserted: list[int] = []
+
+    async def fake_compute(conn, anchor, window_minutes):
+        return by_window[window_minutes]
+
+    async def fake_upsert(conn, anchor, window_minutes, result):
+        upserted.append(window_minutes)
+
+    database = DatabaseManager()
+    database._acquire_connection = lambda: _AcquireCtx(object())
+    database._compute_market_tide = fake_compute
+    database._upsert_market_tide_snapshot = fake_upsert
+
+    summary = asyncio.run(database.write_market_tide_snapshots(windows=[5, 15, 30], anchor=ANCHOR))
+
+    assert summary["written"] == [5, 30]
+    assert summary["skipped"] == [15]
+    assert upserted == [5, 30]  # the withheld window is never persisted
+    assert summary["anchor"] == ANCHOR
+
+
+def test_write_market_tide_snapshots_dry_run_writes_nothing():
+    async def fake_compute(conn, anchor, window_minutes):
+        return {"score": 12.0, "label": "bullish", "participation_pct": 90.0}
+
+    async def fail_upsert(conn, anchor, window_minutes, result):
+        raise AssertionError("dry_run must not upsert")
+
+    database = DatabaseManager()
+    database._acquire_connection = lambda: _AcquireCtx(object())
+    database._compute_market_tide = fake_compute
+    database._upsert_market_tide_snapshot = fail_upsert
+
+    summary = asyncio.run(
+        database.write_market_tide_snapshots(windows=[5], anchor=ANCHOR, dry_run=True)
+    )
+    assert summary["written"] == [5]  # would-write, but nothing persisted
+
+
+def test_refresh_tool_gates_to_cash_session():
+    from src.tools import market_tide_refresh as refresh
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    friday = lambda h, m: datetime(2026, 7, 24, h, m, tzinfo=et)  # noqa: E731 (2026-07-24 is a Fri)
+    assert refresh._within_refresh_window(friday(10, 0)) is True
+    assert refresh._within_refresh_window(friday(9, 29)) is False  # before the open
+    assert refresh._within_refresh_window(friday(16, 10)) is True  # close grace
+    assert refresh._within_refresh_window(friday(16, 11)) is False  # past the grace
+    assert refresh._within_refresh_window(datetime(2026, 7, 25, 10, 0, tzinfo=et)) is False  # Sat
+
+
+def test_backfill_anchors_and_trading_days():
+    from datetime import date
+
+    from src.tools import market_tide_backfill as backfill
+
+    # Close-only default → exactly one 16:00 ET anchor.
+    closes = backfill._session_anchors(date(2026, 7, 24), 0)
+    assert len(closes) == 1
+    assert closes[0].astimezone(closes[0].tzinfo).strftime("%H:%M") == "16:00"
+
+    # Intraday cadence includes the 09:30 open and always ends on the close.
+    hourly = backfill._session_anchors(date(2026, 7, 24), 60)
+    labels = [a.strftime("%H:%M") for a in (a.astimezone(closes[0].tzinfo) for a in hourly)]
+    assert labels[0] == "09:30"
+    assert labels[-1] == "16:00"
+
+    # Weekends are skipped: Fri 2026-07-24 .. Mon 2026-07-27 → just Fri + Mon.
+    days = list(backfill._trading_days(date(2026, 7, 24), date(2026, 7, 27)))
+    assert days == [date(2026, 7, 24), date(2026, 7, 27)]

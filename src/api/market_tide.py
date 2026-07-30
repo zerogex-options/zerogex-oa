@@ -9,6 +9,12 @@ from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
 
+# Directional-premium lookback windows (minutes) the Market Tide endpoint,
+# refresher, and backfill all support. Kept here (a dependency-light module)
+# so the API layer, the DatabaseManager, and the off-process tools share one
+# definition without importing the FastAPI app.
+SUPPORTED_WINDOWS: tuple[int, ...] = (5, 15, 30, 60)
+
 
 def _inputs_are_fresh(
     gex_timestamp: datetime | None,

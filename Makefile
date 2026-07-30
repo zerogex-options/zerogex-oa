@@ -3627,6 +3627,59 @@ max-pain-refresh-status: ## Show max-pain refresh timer status + last/next fire 
 	@sudo journalctl -u zerogex-oa-max-pain-refresh -n 30 --no-pager || true
 
 # =============================================================================
+# Market Tide snapshots (every 5 min cash session + historical backfill)
+# =============================================================================
+# /api/flow/market-tide is a pure cache read over market_tide_snapshots. The
+# refresh timer writes the live reading every 5 min through the session and
+# freezes it at the 16:00 ET close; the backfill seeds prior sessions from
+# retained history so the metric is populated immediately after a deploy.
+# Override the window set with: make market-tide-refresh MARKET_TIDE_WINDOWS="5 15"
+.PHONY: market-tide-refresh
+market-tide-refresh: ## Write the current Market Tide snapshot (every 5 min via timer; RTH-gated)
+	@echo "$(BLUE)=== Refreshing Market Tide snapshot ===$(NC)"
+	@$(PY) -m src.tools.market_tide_refresh \
+		$(if $(MARKET_TIDE_WINDOWS),--windows $(MARKET_TIDE_WINDOWS))
+
+# Seed / repair the snapshot history. Override range + granularity with
+# MARKET_TIDE_DAYS / MARKET_TIDE_START / MARKET_TIDE_END / MARKET_TIDE_CADENCE.
+.PHONY: market-tide-backfill
+market-tide-backfill: ## Seed market_tide_snapshots from history (default: last 90 days, closes)
+	@echo "$(BLUE)=== Backfilling Market Tide snapshots ===$(NC)"
+	@$(PY) -m src.tools.market_tide_backfill \
+		$(if $(MARKET_TIDE_DAYS),--days $(MARKET_TIDE_DAYS)) \
+		$(if $(MARKET_TIDE_START),--start $(MARKET_TIDE_START)) \
+		$(if $(MARKET_TIDE_END),--end $(MARKET_TIDE_END)) \
+		$(if $(MARKET_TIDE_CADENCE),--cadence-minutes $(MARKET_TIDE_CADENCE)) \
+		$(if $(MARKET_TIDE_WINDOWS),--windows $(MARKET_TIDE_WINDOWS))
+
+.PHONY: market-tide-snapshot-healthcheck
+market-tide-snapshot-healthcheck: ## Verify each window has a Market Tide snapshot (0=ok,1=missing,2=db err)
+	@$(PY) -m src.tools.market_tide_snapshot_healthcheck \
+		$(if $(MARKET_TIDE_WINDOWS),--windows $(MARKET_TIDE_WINDOWS))
+
+.PHONY: market-tide-refresh-install
+market-tide-refresh-install: ## Install the 5-min Market Tide refresh timer (cash session)
+	@echo "$(BLUE)=== Installing Market Tide Refresh Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-market-tide-refresh.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-market-tide-refresh.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-market-tide-refresh.timer
+	@echo "$(GREEN)✅ Market-tide-refresh timer (every 5 min, cash session) installed and started$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-market-tide-refresh.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-market-tide-refresh$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-market-tide-refresh.service$(NC)"
+	@echo "$(YELLOW)Backfill:    make market-tide-backfill$(NC)"
+
+.PHONY: market-tide-refresh-status
+market-tide-refresh-status: ## Show Market Tide refresh timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Market Tide Refresh Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-market-tide-refresh.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-market-tide-refresh.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-market-tide-refresh -n 30 --no-pager || true
+
+# =============================================================================
 # Yesterday's Scorecard auto-tweet (16:15 ET weekdays)
 # =============================================================================
 # Daily one-line recap of Action Cards emitted + per-signal flip P&L, posted to

@@ -1,0 +1,24 @@
+[Unit]
+Description=Recurring trigger for ZeroGEX Market Tide snapshot refresh (every 5 min, cash session)
+
+[Timer]
+# Server timezone is America/New_York (deploy/steps/010.setup), so these
+# calendar expressions are ET.
+#
+# Every 5 minutes across the 09:00-16:55 ET hours on weekdays.  The refresh
+# tool self-gates to 09:30-16:10 ET (weekends/holidays are skipped in-process
+# via NYSE_HOLIDAYS), so the pre-open and post-close fires are cheap no-ops;
+# firing a few minutes past 16:00 lets the frozen close snapshot land even if
+# the final cash-session bar is slightly late.  Mirrors the every-5-min shape
+# of the session-levels timer.
+OnCalendar=Mon..Fri *-*-* 09..16:00/5:00
+# Small jitter only — intraday snapshots should land close to their slot so
+# the series stays evenly spaced.
+RandomizedDelaySec=20
+# Do NOT replay missed intraday slots after downtime: a late catch-up run
+# would only re-derive the same frozen-close/last-bucket anchor, and the
+# backfill tool is the right way to fill a gap of whole sessions.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
