@@ -3422,10 +3422,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ORDER BY gs.underlying, gs.timestamp DESC
                 ),
                 chain_freshness AS (
-                    -- flow_contract_facts is deliberately sparse: a quiet
-                    -- symbol has no row until volume changes.  Freshness must
-                    -- therefore follow the source chain heartbeat, not the
-                    -- timestamp of the last trade-derived fact.
+                    -- flow_contract_facts is deliberately sparse, so the
+                    -- source-chain timestamp remains the fallback heartbeat
+                    -- for quiet symbols.
                     SELECT ocl.underlying AS symbol,
                            MAX(ocl.timestamp) AS flow_timestamp
                     FROM option_chains_latest ocl
@@ -3433,11 +3432,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     WHERE ocl.timestamp <= $1
                     GROUP BY ocl.underlying
                 ),
+                flow_fact_freshness AS (
+                    -- A recent classified fact is also positive proof that
+                    -- the flow feed is alive. This matters near the close,
+                    -- when the latest-chain cache can pause before its final
+                    -- after-hours refresh.
+                    SELECT f.symbol, MAX(f.timestamp) AS fact_timestamp
+                    FROM flow_contract_facts f
+                    JOIN active a USING (symbol)
+                    WHERE f.timestamp > $1 - INTERVAL '10 minutes'
+                      AND f.timestamp <= $1
+                    GROUP BY f.symbol
+                ),
+                input_freshness AS (
+                    SELECT ch.symbol,
+                           GREATEST(ch.flow_timestamp, ff.fact_timestamp) AS flow_timestamp
+                    FROM chain_freshness ch
+                    LEFT JOIN flow_fact_freshness ff USING (symbol)
+                ),
                 symbol_anchors AS (
                     SELECT lg.symbol,
-                           LEAST(lg.gex_timestamp, ch.flow_timestamp) AS symbol_anchor
+                           LEAST(lg.gex_timestamp, inf.flow_timestamp) AS symbol_anchor
                     FROM latest_gex lg
-                    JOIN chain_freshness ch USING (symbol)
+                    JOIN input_freshness inf USING (symbol)
                 ),
                 current_flow AS (
                     SELECT
@@ -3483,7 +3500,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     a.symbol,
                     lg.gex_timestamp,
-                    ch.flow_timestamp,
+                    inf.flow_timestamp,
                     lg.net_gex_at_spot,
                     COALESCE(cf.signed_premium, 0) AS signed_premium,
                     COALESCE(cf.gross_premium, 0) AS gross_premium,
@@ -3491,7 +3508,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gn.gamma_p95
                 FROM active a
                 LEFT JOIN latest_gex lg USING (symbol)
-                LEFT JOIN chain_freshness ch USING (symbol)
+                LEFT JOIN input_freshness inf USING (symbol)
                 LEFT JOIN current_flow cf USING (symbol)
                 LEFT JOIN flow_norm fn USING (symbol)
                 LEFT JOIN gamma_norm gn USING (symbol)

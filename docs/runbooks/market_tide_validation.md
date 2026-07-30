@@ -62,7 +62,7 @@ The command reports the common anchor and, for every active symbol:
 - latest GEX timestamp;
 - latest sparse flow fact;
 - 30-day flow and gamma normalization sample counts; and
-- a readiness status such as `ready`, `missing_chain`, `missing_gex`, or
+- a readiness status such as `ready`, `missing_flow_input`, `missing_gex`, or
   `stale_or_misaligned`.
 
 Exit code 0 means participation is at least 60%, exit code 1 means the metric
@@ -71,10 +71,10 @@ is not publishable, and exit code 2 means the database query failed.
 ## 3. Understand quiet symbols
 
 `flow_contract_facts` is sparse and only receives a row when option volume
-changes. The absence of a recent fact can legitimately mean zero flow. Market
-Tide therefore uses `option_chains_latest.timestamp` as the flow-feed heartbeat
-and treats a fresh, quiet symbol as zero current flow. Do not use the timestamp
-of the last flow fact as a feed-health test.
+changes. Market Tide uses the newest of the latest chain snapshot and latest
+classified flow fact as proof that the flow input is alive. This lets a recent
+fact cover an ETF latest-cache pause near the close, while the chain timestamp
+still keeps a fresh, quiet symbol eligible with zero current flow.
 
 ## 4. Can Market Tide be backfilled?
 
