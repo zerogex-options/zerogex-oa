@@ -75,7 +75,7 @@ class FlipSurfaceResponse(BaseModel):
     # 2D array: profiles[h_idx][grid_idx] = signed dealer dollar GEX
     # per 1% spot move at the hypothetical price grid[grid_idx], with
     # weight min(1, DTE / horizons_days[h_idx]) applied per contract.
-    # Sign convention: calls +, puts − (dealer short calls / long puts).
+    # Sign convention: calls +, puts − (modeled dealer-long calls / short puts).
     # Units: $ per 1% move. Magnitude ≈ 1e8–1e10 for SPX.
     profiles: List[List[float]]
 
@@ -127,8 +127,8 @@ class FlipSurfaceResponse(BaseModel):
 - All prices and walls in **USD** (the underlying's quote unit).
 - Profile values are **dollar GEX per 1% move**, same convention as the
   persisted `gex_summary.net_gex_at_spot` and `gex_by_strike.net_gex`.
-- Sign: **calls positive, puts negative** (dealer short calls / long
-  puts). The flip is where `profiles[h]` crosses zero.
+- Sign: **calls positive, puts negative** (modeled dealer-long calls /
+  short puts). The flip is where `profiles[h]` crosses zero.
 - `len(grid) ≥ 2` always; bounded `[~80, ~800]` at the parameter limits.
 - `len(profiles) == len(horizons_days) == len(flips)`.
 - `len(profiles[i]) == len(grid)` for every `i` — server enforces.

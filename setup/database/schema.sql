@@ -1383,8 +1383,9 @@ SELECT
     o.underlying,
     o.strike,
     -- Canonical formula: γ × OI × 100 × S² × 0.01.  Calls contribute
-    -- positively, puts contribute negatively (dealer convention: dealers
-    -- are short calls, long puts).
+    -- positively, puts contribute negatively (modeled dealer convention:
+    -- dealers net long calls, net short puts — a sign convention, not
+    -- observed inventory).
     SUM(
         CASE
             WHEN o.option_type = 'C' THEN o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
