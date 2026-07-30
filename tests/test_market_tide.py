@@ -63,6 +63,19 @@ def test_quiet_symbol_with_fresh_chain_heartbeat_remains_eligible():
     assert result["stale_symbols"] == []
 
 
+def test_same_session_index_close_remains_eligible_after_hours():
+    after_hours_anchor = datetime(2026, 7, 30, 1, 49, tzinfo=timezone.utc)
+    index_close = datetime(2026, 7, 29, 19, 59, tzinfo=timezone.utc)
+    row = _row("SPX", 50, -25)
+    row["gex_timestamp"] = index_close
+    row["flow_timestamp"] = index_close
+
+    result = calculate_market_tide([row], anchor=after_hours_anchor)
+
+    assert result["score"] is not None
+    assert result["eligible_symbols"] == 1
+
+
 def test_liquidity_weights_are_capped_with_sufficient_breadth():
     weights = _capped_weights([10_000.0] + [1.0] * 9)
 
@@ -107,15 +120,21 @@ def test_healthcheck_identifies_missing_and_stale_upstreams():
 
     statuses = _evaluate(rows, ANCHOR, timedelta(minutes=10))
 
-    assert [item.status for item in statuses] == ["ready", "missing_chain", "stale_gex"]
+    assert [item.status for item in statuses] == [
+        "ready",
+        "missing_chain",
+        "stale_or_misaligned",
+    ]
 
 
 def test_database_query_binds_window_as_integer_interval():
     class FakeConnection:
+        anchor_query = ""
         query = ""
         args = ()
 
         async def fetchval(self, query):
+            self.anchor_query = query
             return ANCHOR
 
         async def fetch(self, query, *args):
@@ -140,8 +159,12 @@ def test_database_query_binds_window_as_integer_interval():
     asyncio.run(database.get_market_tide(window_minutes=15))
 
     assert "$2::text" not in connection.query
+    assert "TIME '16:00'" in connection.anchor_query
+    assert "AT TIME ZONE 'America/New_York'" in connection.anchor_query
     assert "make_interval(mins => $2::integer)" in connection.query
     assert connection.query.count("FROM flow_contract_facts") == 1
+    assert "symbol_anchors" in connection.query
+    assert "f.timestamp > sa.symbol_anchor" in connection.query
     assert "FROM component_normalizer_cache" in connection.query
     assert "FROM gex_historical_stats" in connection.query
     assert "PERCENTILE_CONT" not in connection.query

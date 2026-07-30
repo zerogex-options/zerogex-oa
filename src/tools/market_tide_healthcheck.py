@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, Sequence
 
+from src.api.market_tide import _inputs_are_fresh
 from src.database.connection import db_connection
 
 logger = logging.getLogger(__name__)
@@ -43,18 +44,15 @@ class SymbolStatus:
 
 
 def _evaluate(rows: Iterable[tuple], anchor: datetime, freshness: timedelta) -> list[SymbolStatus]:
-    cutoff = anchor - freshness
     statuses: list[SymbolStatus] = []
     for row in rows:
         symbol, gex_ts, chain_ts, flow_ts, flow_samples, gamma_samples = row
         if chain_ts is None:
             status = "missing_chain"
-        elif chain_ts < cutoff:
-            status = "stale_chain"
         elif gex_ts is None:
             status = "missing_gex"
-        elif gex_ts < cutoff:
-            status = "stale_gex"
+        elif not _inputs_are_fresh(gex_ts, chain_ts, anchor, freshness):
+            status = "stale_or_misaligned"
         else:
             status = "ready"
         statuses.append(
@@ -73,10 +71,20 @@ def _evaluate(rows: Iterable[tuple], anchor: datetime, freshness: timedelta) -> 
 
 def _fetch(cur, window_minutes: int) -> tuple[datetime | None, list[tuple]]:
     cur.execute("""
-        SELECT LEAST(
-            (SELECT MAX(timestamp) FROM gex_summary),
-            (SELECT MAX(timestamp) FROM option_chains_latest)
+        WITH raw AS (
+            SELECT LEAST(
+                (SELECT MAX(timestamp) FROM gex_summary),
+                (SELECT MAX(timestamp) FROM option_chains_latest)
+            ) AS ts
         )
+        SELECT CASE
+            WHEN (ts AT TIME ZONE 'America/New_York')::time > TIME '16:00'
+            THEN (
+                (ts AT TIME ZONE 'America/New_York')::date + TIME '16:00'
+            ) AT TIME ZONE 'America/New_York'
+            ELSE ts
+        END
+        FROM raw
         """)
     anchor = cur.fetchone()[0]
     if anchor is None:
@@ -85,7 +93,17 @@ def _fetch(cur, window_minutes: int) -> tuple[datetime | None, list[tuple]]:
     cur.execute(
         """
         WITH active AS (
-            SELECT symbol FROM symbols WHERE COALESCE(is_active, TRUE) = TRUE
+            SELECT s.symbol
+            FROM symbols s
+            WHERE COALESCE(s.is_active, TRUE) = TRUE
+              AND EXISTS (
+                  SELECT 1 FROM option_chains_latest ocl
+                  WHERE ocl.underlying = s.symbol
+              )
+              AND EXISTS (
+                  SELECT 1 FROM gex_summary gs
+                  WHERE gs.underlying = s.symbol
+              )
         ),
         flow_buckets AS (
             SELECT
