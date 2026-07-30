@@ -82,13 +82,18 @@ def test_response_contract_accepts_calculator_output():
 
 
 def test_market_tide_endpoint_is_registered_with_response_contract():
-    from src.api.main import app
+    from src.api.main import MarketTideWindow, app
 
     route = next(
         route for route in app.routes if getattr(route, "path", None) == "/api/market-tide"
     )
     assert route.methods == {"GET"}
     assert route.response_model is MarketTideResponse
+
+    window_param = next(param for param in route.dependant.query_params if param.name == "window")
+    parsed, errors = window_param.validate("15", {}, loc=("query", "window"))
+    assert errors == []
+    assert parsed is MarketTideWindow.FIFTEEN_MINUTES
 
 
 def test_healthcheck_identifies_missing_and_stale_upstreams():

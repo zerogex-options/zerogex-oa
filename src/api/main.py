@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type
+from enum import IntEnum
 import os
 from src.config import _getenv_str
 import re
@@ -75,6 +76,16 @@ from .routers.admin_xpost import router as admin_xpost_router
 from src.utils import get_logger  # noqa: E402
 
 logger = get_logger(__name__)
+
+
+class MarketTideWindow(IntEnum):
+    """Supported Market Tide lookbacks, parsed from HTTP query strings."""
+
+    FIVE_MINUTES = 5
+    FIFTEEN_MINUTES = 15
+    THIRTY_MINUTES = 30
+    SIXTY_MINUTES = 60
+
 
 # Database manager
 db_manager: Optional[DatabaseManager] = None
@@ -905,8 +916,8 @@ def _format_flow_series_row(row: dict) -> dict:
 )
 @handle_api_errors("GET /api/market-tide")
 async def get_market_tide(
-    window: Literal[5, 15, 30, 60] = Query(
-        default=15,
+    window: MarketTideWindow = Query(
+        default=MarketTideWindow.FIFTEEN_MINUTES,
         description="Directional premium lookback in minutes.",
     ),
 ):
@@ -916,7 +927,7 @@ async def get_market_tide(
     gamma and flow inputs. Component leaders/laggards explain which names are
     driving the reading.
     """
-    return await _db().get_market_tide(window_minutes=window)
+    return await _db().get_market_tide(window_minutes=int(window))
 
 
 @app.get(
