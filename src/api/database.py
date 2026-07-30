@@ -3692,6 +3692,80 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             "skipped": skipped,
         }
 
+    async def get_market_tide_history(
+        self, window_minutes: int = 15, mode: str = "intraday", days: int = 30
+    ) -> Dict[str, Any]:
+        """Return the persisted Market Tide series for charting.
+
+        ``mode='intraday'`` returns every snapshot for the most recent session
+        present for the window, oldest→newest — today's live 5-minute series
+        (or a single close point for a day that was only backfilled).
+        ``mode='daily'`` returns one point per session (that day's last/close
+        snapshot) for the most recent ``days`` sessions, oldest→newest — the
+        macro trend built from the daily closes.
+
+        Each point carries the score, label, and participation columns plus
+        ``flow_direction`` / ``gamma_regime`` read from the stored payload.
+        Pure read over ``market_tide_snapshots`` — no compute.
+        """
+        cache_key = f"market_tide_hist:{window_minutes}:{mode}:{days}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        def _point(row) -> Dict[str, Any]:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return {
+                "timestamp": row["snapshot_ts"],
+                "session_date": row["session_date"],
+                "score": float(row["score"]) if row["score"] is not None else None,
+                "label": row["label"],
+                "participation_pct": float(row["participation_pct"]),
+                "flow_direction": payload.get("flow_direction"),
+                "gamma_regime": payload.get("gamma_regime"),
+            }
+
+        async with self._acquire_connection() as conn:
+            if mode == "daily":
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT ON (session_date)
+                        session_date, snapshot_ts, score, label, participation_pct, payload
+                    FROM market_tide_snapshots
+                    WHERE window_minutes = $1
+                    ORDER BY session_date DESC, snapshot_ts DESC
+                    LIMIT $2
+                    """,
+                    window_minutes,
+                    days,
+                )
+                points = [_point(r) for r in reversed(rows)]
+            else:
+                latest_date = await conn.fetchval(
+                    "SELECT MAX(session_date) FROM market_tide_snapshots WHERE window_minutes = $1",
+                    window_minutes,
+                )
+                if latest_date is None:
+                    points = []
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT session_date, snapshot_ts, score, label, participation_pct, payload
+                        FROM market_tide_snapshots
+                        WHERE window_minutes = $1 AND session_date = $2
+                        ORDER BY snapshot_ts ASC
+                        """,
+                        window_minutes,
+                        latest_date,
+                    )
+                    points = [_point(r) for r in rows]
+
+        result = {"window_minutes": window_minutes, "mode": mode, "points": points}
+        self._cache_set(cache_key, result, 30.0)
+        return result
+
     async def _resolve_flow_series_session(
         self,
         conn: asyncpg.Connection,

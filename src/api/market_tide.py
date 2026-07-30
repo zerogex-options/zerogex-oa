@@ -185,6 +185,10 @@ def calculate_market_tide(
         "eligible_symbols": eligible,
         "configured_symbols": configured,
         "stale_symbols": sorted(stale_symbols),
+        # Every eligible symbol (ranked by contribution) so the client can plot
+        # the full flow-vs-gamma map, not just the top/bottom movers. leaders /
+        # laggards remain the pre-sliced highlights for compact summaries.
+        "components": [public(item) for item in ranked],
         "leaders": [public(item) for item in ranked[:5] if item["contribution"] > 0],
         "laggards": [public(item) for item in reversed(ranked[-5:]) if item["contribution"] < 0],
     }

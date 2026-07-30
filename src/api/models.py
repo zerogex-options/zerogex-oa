@@ -367,8 +367,34 @@ class MarketTideResponse(BaseModel):
     eligible_symbols: int
     configured_symbols: int
     stale_symbols: List[str]
+    # Full per-symbol breakdown (all eligible names, ranked by contribution) for
+    # the flow-vs-gamma map. Defaults empty so snapshots persisted before this
+    # field existed still validate on read-back.
+    components: List[MarketTideComponent] = []
     leaders: List[MarketTideComponent]
     laggards: List[MarketTideComponent]
+
+
+class MarketTideHistoryPoint(BaseModel):
+    """One point on the persisted Market Tide series (a 5-min bucket, or a
+    session close in daily mode)."""
+
+    timestamp: datetime
+    session_date: date
+    score: Optional[float] = None
+    label: str
+    participation_pct: float
+    flow_direction: Optional[float] = None
+    gamma_regime: Optional[float] = None
+
+
+class MarketTideHistoryResponse(BaseModel):
+    """Market Tide over time for a window — intraday (today's 5-min series) or
+    daily (one close per session)."""
+
+    window_minutes: int
+    mode: str
+    points: List[MarketTideHistoryPoint]
 
 
 class FlowContractsResponse(BaseModel):

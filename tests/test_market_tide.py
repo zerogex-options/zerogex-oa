@@ -5,7 +5,7 @@ import pytest
 
 from src.api.market_tide import _capped_weights, calculate_market_tide
 from src.api.database import DatabaseManager
-from src.api.models import MarketTideResponse
+from src.api.models import MarketTideResponse, MarketTideHistoryResponse
 from src.tools.market_tide_healthcheck import _evaluate
 
 ANCHOR = datetime(2026, 7, 29, 15, 30, tzinfo=timezone.utc)
@@ -353,3 +353,67 @@ def test_backfill_anchors_and_trading_days():
     # Weekends are skipped: Fri 2026-07-24 .. Mon 2026-07-27 → just Fri + Mon.
     days = list(backfill._trading_days(date(2026, 7, 24), date(2026, 7, 27)))
     assert days == [date(2026, 7, 24), date(2026, 7, 27)]
+
+
+def test_components_include_every_eligible_symbol():
+    """The full flow-vs-gamma map needs all eligible names, not just top/bottom 5."""
+    result = calculate_market_tide(
+        [_row(f"S{i}", 100 if i < 3 else -100, -25) for i in range(6)],
+        anchor=ANCHOR,
+    )
+    assert {c["symbol"] for c in result["components"]} == {f"S{i}" for i in range(6)}
+    assert len(result["components"]) == 6  # leaders/laggards still cap at 5 each
+    assert MarketTideResponse(**result).components[0].symbol
+
+
+def test_market_tide_history_route_is_registered():
+    from src.api.main import app
+
+    route = next(
+        r for r in app.routes if getattr(r, "path", None) == "/api/flow/market-tide/history"
+    )
+    assert route.methods == {"GET"}
+    assert route.response_model is MarketTideHistoryResponse
+
+
+def test_get_market_tide_history_intraday_reads_snapshots():
+    from datetime import date
+
+    day = date(2026, 7, 29)
+    ts0 = datetime(2026, 7, 29, 19, 30, tzinfo=timezone.utc)
+    rows = [
+        {  # payload persisted as a JSON string (asyncpg default)
+            "session_date": day,
+            "snapshot_ts": ts0,
+            "score": 5.0,
+            "label": "bullish",
+            "participation_pct": 100.0,
+            "payload": '{"flow_direction":0.1,"gamma_regime":-0.8}',
+        },
+        {  # payload already decoded to a dict
+            "session_date": day,
+            "snapshot_ts": ts0 + timedelta(minutes=5),
+            "score": 8.0,
+            "label": "bullish",
+            "participation_pct": 100.0,
+            "payload": {"flow_direction": 0.2, "gamma_regime": -0.7},
+        },
+    ]
+
+    class FakeConn:
+        async def fetchval(self, query, *args):
+            return day
+
+        async def fetch(self, query, *args):
+            return rows
+
+    database = DatabaseManager()
+    database._acquire_connection = lambda: _AcquireCtx(FakeConn())
+
+    out = asyncio.run(database.get_market_tide_history(window_minutes=15, mode="intraday"))
+
+    assert out["window_minutes"] == 15 and out["mode"] == "intraday"
+    assert [p["score"] for p in out["points"]] == [5.0, 8.0]
+    assert out["points"][0]["flow_direction"] == 0.1  # parsed from JSON string
+    assert out["points"][1]["gamma_regime"] == -0.7  # read from dict
+    assert MarketTideHistoryResponse(**out).points[0].label == "bullish"
