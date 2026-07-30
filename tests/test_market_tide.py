@@ -115,6 +115,7 @@ def test_healthcheck_identifies_missing_and_stale_upstreams():
     rows = [
         ("READY", ANCHOR, ANCHOR, None, 0, 10),
         ("NOCHAIN", ANCHOR, None, None, 0, 10),
+        ("FLOWCOVERS", ANCHOR, ANCHOR - timedelta(minutes=20), ANCHOR, 1, 10),
         ("STALEGEX", ANCHOR - timedelta(minutes=11), ANCHOR, ANCHOR, 5, 10),
     ]
 
@@ -122,7 +123,8 @@ def test_healthcheck_identifies_missing_and_stale_upstreams():
 
     assert [item.status for item in statuses] == [
         "ready",
-        "missing_chain",
+        "missing_flow_input",
+        "ready",
         "stale_or_misaligned",
     ]
 
@@ -162,7 +164,8 @@ def test_database_query_binds_window_as_integer_interval():
     assert "TIME '16:00'" in connection.anchor_query
     assert "AT TIME ZONE 'America/New_York'" in connection.anchor_query
     assert "make_interval(mins => $2::integer)" in connection.query
-    assert connection.query.count("FROM flow_contract_facts") == 1
+    assert connection.query.count("FROM flow_contract_facts") == 2
+    assert "GREATEST(ch.flow_timestamp, ff.fact_timestamp)" in connection.query
     assert "symbol_anchors" in connection.query
     assert "f.timestamp > sa.symbol_anchor" in connection.query
     assert "FROM component_normalizer_cache" in connection.query

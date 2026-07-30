@@ -47,11 +47,15 @@ def _evaluate(rows: Iterable[tuple], anchor: datetime, freshness: timedelta) -> 
     statuses: list[SymbolStatus] = []
     for row in rows:
         symbol, gex_ts, chain_ts, flow_ts, flow_samples, gamma_samples = row
-        if chain_ts is None:
-            status = "missing_chain"
+        flow_input_ts = max(
+            (timestamp for timestamp in (chain_ts, flow_ts) if timestamp is not None),
+            default=None,
+        )
+        if flow_input_ts is None:
+            status = "missing_flow_input"
         elif gex_ts is None:
             status = "missing_gex"
-        elif not _inputs_are_fresh(gex_ts, chain_ts, anchor, freshness):
+        elif not _inputs_are_fresh(gex_ts, flow_input_ts, anchor, freshness):
             status = "stale_or_misaligned"
         else:
             status = "ready"
