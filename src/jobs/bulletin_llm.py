@@ -540,16 +540,27 @@ def _validate_no_invented_prices(
     post: LlmPost,
     symbols: list[SymbolInput],
 ) -> bool:
-    """Best-effort check that the model didn't quote a price we didn't provide.
+    """Best-effort check that the model didn't quote a fake LEVEL for the symbol.
 
-    Scans every 3-6 digit number in the narrative (post + reply + notes) and
-    confirms it appears (as an integer or a rounded form) in the input's
-    ``levels`` block.  Not a strict guarantee, but catches the obvious
-    fabricated-strike case and lets us fall back to the template on any hit."""
+    Scans the narrative (post + reply + notes) for numbers that fall inside the
+    symbol's plausible PRICE BAND — i.e. numbers that could be mistaken for a
+    (fabricated) level — and confirms each appears in the input's ``levels``
+    block.  Numbers OUTSIDE the band are left alone: with the post now
+    single-symbol, the "known" set is just SPY's handful of ~744 levels, and a
+    real market post naturally cites news figures ("the S&P 500", "the Dow rose
+    300", a year, dollar amounts) that are nowhere near spot.  The old check
+    flagged those as invented prices and threw the whole (good) post away,
+    which is exactly what forced the bland static fallback.  Anchoring the
+    check on the price band keeps the anti-hallucination guard for actual level
+    claims while letting the story breathe."""
     import re
 
+    raw_values: list[float] = []
+    spots: list[float] = []
     known_values: set[int] = set()
     for s in symbols:
+        if s.spot:
+            spots.append(s.spot)
         for v in (
             s.spot,
             s.prior_close,
@@ -564,9 +575,22 @@ def _validate_no_invented_prices(
         ):
             if v is None:
                 continue
+            raw_values.append(v)
             for candidate in (int(round(v)), int(round(v / 5) * 5)):
                 if candidate > 0:
                     known_values.add(candidate)
+
+    if not raw_values:
+        # No prices were provided → nothing to validate against; don't reject
+        # (the model has no levels to quote anyway).
+        return True
+
+    # The band where a number would read as a level for THIS symbol.  Anchor on
+    # spot when we have it, else the centre of the provided levels.  ±15% is
+    # wide enough to cover the walls / flip / session range and tight enough to
+    # exclude typical macro news figures.
+    anchor = (sum(spots) / len(spots)) if spots else (sum(raw_values) / len(raw_values))
+    lo, hi = anchor * 0.85, anchor * 1.15
 
     combined = "\n".join(
         [
@@ -583,14 +607,18 @@ def _validate_no_invented_prices(
     invented: list[str] = []
     for h in hits:
         n = int(h)
+        if not (lo <= n <= hi):
+            # Outside the symbol's price band → a news/other figure, not a
+            # level claim.  Leave it alone.
+            continue
         # Tolerate ±2 to handle the model quoting "7,483" for spot 7482.71.
         if not any(abs(n - k) <= 2 for k in known_values):
             invented.append(h)
 
     if invented:
         logger.warning(
-            "bulletin_llm: model mentioned prices not in input levels: %s — "
-            "falling back to template",
+            "bulletin_llm: model quoted in-band prices not in input levels: %s "
+            "— falling back to template",
             sorted(set(invented))[:8],
         )
         return False
