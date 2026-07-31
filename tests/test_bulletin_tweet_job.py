@@ -969,9 +969,11 @@ def test_llm_invented_price_guard():
 
     post = bulletin_llm.LlmPost(
         header_label="Midday Read",
-        opening="SPY looks pinned to $999.99.",  # invented — not in inputs
+        # 762 is in SPY's price band but is not a provided level — a fabricated
+        # level near spot is exactly what the guard must catch.
+        opening="SPY looks pinned to a hidden 762 shelf.",
         bottom_line="Nothing to see here.",
-        reply="Watch the levels:",
+        reply="Watch the levels.",
         level_notes={},
     )
     inputs = [
@@ -981,20 +983,53 @@ def test_llm_invented_price_guard():
 
 
 def test_llm_invented_price_guard_scans_reply():
-    """A fabricated price hidden in the reply is caught too, not just the post."""
+    """A fabricated in-band price hidden in the reply is caught too."""
     from src.jobs import bulletin_llm
 
     post = bulletin_llm.LlmPost(
         header_label="Midday Read",
         opening="SPY held its structure.",
         bottom_line="Still short gamma.",
-        reply="Watch 6,123 into the close:",  # invented — not in inputs
+        reply="Real risk is a fade to 812.",  # in-band, not a provided level
         level_notes={},
     )
     inputs = [
         bulletin_llm.SymbolInput(symbol="SPY", spot=744.51, gamma_flip=744.51),
     ]
     assert bulletin_llm._validate_no_invented_prices(post, inputs) is False
+
+
+def test_llm_validator_allows_news_figures_out_of_band():
+    """News figures far from the symbol's price ("the S&P 500", "the Dow rose
+    300", a year, a dollar amount) must NOT be treated as invented levels — the
+    old check flagged them and forced the bland static fallback."""
+    from src.jobs import bulletin_llm
+
+    inputs = [
+        bulletin_llm.SymbolInput(
+            symbol="SPY",
+            spot=744.70,
+            prior_close=744.0,
+            gamma_flip=744.60,
+            call_wall=745.0,
+            put_wall=743.0,
+            net_gex=-115_800_000.0,
+        ),
+    ]
+    for opening in (
+        "SPY, the S&P 500 ETF, held above the 744.60 flip after the dip.",
+        "With the Dow up 300 and yields easing, SPY reclaimed 744.60.",
+        "Heading into the back half of 2026, SPY sits on its 744.60 flip.",
+        "A $500 billion buyback wave has SPY pinned near 744.60.",
+    ):
+        post = bulletin_llm.LlmPost(
+            header_label="Midday Read",
+            opening=opening,
+            bottom_line="Constructive while it holds.",
+            reply="The tell was the reclaim.",
+            level_notes={},
+        )
+        assert bulletin_llm._validate_no_invented_prices(post, inputs) is True, opening
 
 
 def test_llm_validator_accepts_input_prices():
