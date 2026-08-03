@@ -209,7 +209,11 @@ async def get_latest_score(
     Aggregates 6 option-structure components into one reading of "what kind
     of market are we in right now?" Each component returns a raw score in
     [-1, +1], multiplied by its weight (points) to form a signed contribution.
-    All contributions are summed onto a 50-point baseline then clamped to [0, 100].
+    The contributions are summed into a single signed offset, which is squashed
+    onto the final scale: `MSI = 50 + 50 * tanh(sum_offset / 50)`, clamped to
+    [0, 100]. This is a **directionless** regime gauge: a high MSI means trends
+    can run (NOT bullish) and a low MSI means the tape is choppy / fragile (NOT
+    bearish). Read direction from the Trade Bias panel, never from this number.
 
     **Params:** `underlying` (default `SPY`). Returns 404 when no rows exist.
 
@@ -257,7 +261,7 @@ async def get_latest_score(
 
     - `composite_score` — float [0, 100]; `50` is the neutral/fallback value.
     - `components[*].max_points` — the component's weight ceiling.
-    - `components[*].contribution` — signed points added to the baseline, rounded to 4 decimals.
+    - `components[*].contribution` — signed points fed into the pre-squash sum (`sum_offset`), rounded to 4 decimals.
     - `components[*].score` — raw component score [-1, +1], 6-decimal precision.
     - `components[*].context` — optional, present when the component emits diagnostic
       sub-fields (e.g. `gamma_anchor` exposes its three subscores here).
