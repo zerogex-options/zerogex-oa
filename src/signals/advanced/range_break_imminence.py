@@ -19,7 +19,7 @@ Output convention on :class:`AdvancedSignalResult`:
     ``imminence`` scaled to unit range.
   * ``context['imminence']`` ∈ [0, 100] — absolute break-risk score
     matching the dashboard's intended display.
-  * ``context['label']`` — one of ``Range Fade`` / ``Weak Range`` /
+  * ``context['label']`` — one of ``Range-Bound`` / ``Weak Range`` /
     ``Break Watch`` / ``Breakout Mode`` so the playbook flip is direct.
 """
 
@@ -61,7 +61,7 @@ _COMPRESSION_FULL = float(os.getenv("SIGNAL_RBI_COMPRESSION_FULL", "0.5"))
 _COMPRESSION_NONE = float(os.getenv("SIGNAL_RBI_COMPRESSION_NONE", "1.0"))
 
 # Label thresholds per the published playbook map.
-_LABEL_FADE_MAX = 40.0  # 0–39: Range Fade
+_LABEL_FADE_MAX = 40.0  # 0–39: Range-Bound
 _LABEL_WEAK_MAX = 65.0  # 40–64: Weak Range
 _LABEL_WATCH_MAX = 80.0  # 65–79: Break Watch
 # 80–100: Breakout Mode
@@ -339,7 +339,7 @@ class RangeBreakImminenceSignal:
     def _label_and_playbook(imminence: float, direction: float) -> tuple[str, str]:
         if imminence < _LABEL_FADE_MAX:
             return (
-                "Range Fade",
+                "Range-Bound",
                 "Fade range extremes. Buy low end, short high end, avoid mid-range.",
             )
         if imminence < _LABEL_WEAK_MAX:
