@@ -325,6 +325,32 @@ class BaseBot:
             return True  # strong down-move — don't fade it long
         return False
 
+    def _bias_veto(self, snap: MarketSnapshot, direction: str) -> bool:
+        """True when the fused trade-bias confidently OPPOSES ``direction``.
+
+        Reads ``snap.trade_bias_trend`` (bullish/bearish/neutral) and
+        ``snap.trade_bias_confidence`` (0-100), populated from the latest
+        ``trade_bias_scores`` row. Vetoes a bullish signal against a confident
+        bearish bias and vice versa — the fleet-wide "don't fight our own
+        directional read" gate the engine applies to every signal. No veto when
+        the bias is unavailable, neutral, aligned, or below the confidence floor,
+        or when disabled. Per-bot override via ``params['bias_veto_enabled']``.
+        See :data:`BIAS_VETO_ENABLED`.
+        """
+        from src.tradeworkz import config as tw_config
+
+        override = self.params.get("bias_veto_enabled")
+        enabled = bool(override) if override is not None else bool(tw_config.BIAS_VETO_ENABLED)
+        if not enabled or direction not in ("bullish", "bearish"):
+            return False
+        trend = snap.trade_bias_trend
+        if trend not in ("bullish", "bearish") or trend == direction:
+            return False
+        conf = snap.trade_bias_confidence
+        if conf is None or conf < float(tw_config.BIAS_VETO_MIN_CONFIDENCE):
+            return False
+        return True
+
     # -- Subclass overrides ---------------------------------------------
 
     def open_criteria(self, snap: MarketSnapshot) -> Optional[TradeSignal]:

@@ -177,6 +177,24 @@ TREND_VETO_LOOKBACK_BARS: int = _getenv_int(
 )
 
 # ---------------------------------------------------------------------------
+# Fused trade-bias gate (don't fight the fleet's synthesized directional read)
+# ---------------------------------------------------------------------------
+# The Signals Engine already computes a directional bias per underlying and
+# persists it to trade_bias_scores (long / short / neutral + confidence). The
+# TradeWorkz bots historically ignored it and each computed their own direction
+# — so on a day the bias called long/buy-dips, the reversion bots still went
+# short and got run over. This gate vetoes ANY bot signal whose direction
+# OPPOSES a confident (>= BIAS_VETO_MIN_CONFIDENCE, 0-100) fused bias. Applied
+# centrally in the engine, so a momentum bot aligned with the bias passes
+# through while a counter-trend fade is dropped. No veto when the bias is
+# unavailable / neutral / low-confidence. Per-bot override via
+# params['bias_veto_enabled']; BIAS_VETO_ENABLED=false disables it fleet-wide.
+BIAS_VETO_ENABLED: bool = _getenv_bool("TRADEWORKZ_BIAS_VETO_ENABLED", True)
+BIAS_VETO_MIN_CONFIDENCE: float = _getenv_float(
+    "TRADEWORKZ_BIAS_VETO_MIN_CONFIDENCE", 50.0, min=0.0, max=100.0
+)
+
+# ---------------------------------------------------------------------------
 # Regular-trading-hours (RTH) gate on NEW opens
 # ---------------------------------------------------------------------------
 # Every fleet bot trades same-day (0DTE) debits, and the reconciler
