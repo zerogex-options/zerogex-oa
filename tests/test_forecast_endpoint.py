@@ -282,3 +282,50 @@ def test_rolling_stats_regime_rate_null_when_no_corrected_rows(monkeypatch):
     assert body["regime_n_scored"] == 0
     # Range/pin are unaffected by the regime cutoff.
     assert body["range_respected_rate"] == pytest.approx(1.0, abs=1e-4)
+
+
+def _vol_row(d: str, correct, ratio):
+    """A receipted row carrying the v1.4 vol verdict + realized ratio."""
+    return {
+        "date": date.fromisoformat(d),
+        "receipt_ts": datetime(2026, 8, 3, 20, 5, tzinfo=timezone.utc),
+        "range_respected": True,
+        "pin_hit": True,
+        "regime_correct": True,
+        "vol_state_correct": correct,
+        "realized_vol_ratio": ratio,
+    }
+
+
+def test_rolling_stats_vol_gated_baselined_and_ci(monkeypatch):
+    """The vol track record excludes pre-scale-fix rows, reports a Wilson CI,
+    and carries the majority-realized-bucket strawman as its baseline."""
+    app, dbmod = _build_app(monkeypatch)
+    monkeypatch.setenv("FORECAST_REGIME_FIX_DATE", "2026-01-01")
+    monkeypatch.setenv("FORECAST_VOL_SCALE_FIX_DATE", "2026-08-01")
+    dbmod.DatabaseManager.get_daily_forecast_history = AsyncMock(
+        return_value=[
+            # Pre-fix, old-scale row — must be excluded from the vol stats.
+            _vol_row("2026-07-30", True, 1.60),
+            # Corrected era: 2 of 3 correct; realized buckets normal/normal/expansion.
+            _vol_row("2026-08-01", True, 1.00),
+            _vol_row("2026-08-02", True, 0.95),
+            _vol_row("2026-08-03", False, 1.40),
+        ]
+    )
+    with TestClient(app) as client:
+        r = client.get("/api/forecast/stats/rolling?symbol=SPY&window=30")
+    body = r.json()
+    assert body["vol_stats_from"] == "2026-08-01"
+    assert body["vol_n_scored"] == 3  # pre-fix row excluded
+    assert body["vol_state_correct_rate"] == pytest.approx(2 / 3, abs=1e-4)
+    ci = body["vol_state_correct_ci"]
+    assert isinstance(ci, list) and len(ci) == 2
+    lo, hi = ci
+    assert 0.0 <= lo <= body["vol_state_correct_rate"] <= hi <= 1.0
+    # Majority realized bucket over the corrected rows is "normal" (2 of 3).
+    assert body["vol_baseline_label"] == "normal"
+    assert body["vol_baseline"] == pytest.approx(2 / 3, abs=1e-4)
+    # Range gets a CI + published-coverage baseline too.
+    assert isinstance(body["range_respected_ci"], list)
+    assert body["range_baseline"] == pytest.approx(0.80)

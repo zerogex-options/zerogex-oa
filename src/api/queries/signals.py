@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, date, time
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from src.jobs.forecast_range_model import grade_realized_claims
+from src.jobs.forecast_range_model import RANGE_OVER_SIGMA, grade_realized_claims
 
 if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
@@ -1723,7 +1723,8 @@ class SignalsQueriesMixin:
                     SELECT projected_low, projected_high, pin_strike, regime,
                            open_spot, receipt_ts,
                            implied_move, expected_vol_state, flip_cross_prob,
-                           level_touch_probs, gamma_flip, call_wall, put_wall
+                           level_touch_probs, gamma_flip, call_wall, put_wall,
+                           forecast_inputs
                     FROM daily_forecast
                     WHERE symbol = $1 AND date = $2
                     """,
@@ -1825,6 +1826,28 @@ class SignalsQueriesMixin:
                     v = row.get(key)
                     return float(v) if v is not None else None
 
+                # Grade the vol call against the expected-RANGE denominator the
+                # writer committed this morning.  The per-symbol basis lives in
+                # the immutable forecast_inputs.calibration_applied blob (folded
+                # into content_hash), so a later calibration drift can't rewrite
+                # a past verdict.  Legacy rows (no basis captured) fall back to
+                # the pure Parkinson constant.
+                committed_inputs = row.get("forecast_inputs")
+                if isinstance(committed_inputs, str):
+                    try:
+                        committed_inputs = json.loads(committed_inputs)
+                    except (json.JSONDecodeError, TypeError):
+                        committed_inputs = None
+                vol_basis_mult = 1.0
+                if isinstance(committed_inputs, dict):
+                    applied = committed_inputs.get("calibration_applied") or {}
+                    try:
+                        vol_basis_mult = float(applied.get("vol_range_basis_mult", 1.0))
+                    except (TypeError, ValueError):
+                        vol_basis_mult = 1.0
+                if not vol_basis_mult > 0:
+                    vol_basis_mult = 1.0
+
                 v14 = grade_realized_claims(
                     open_spot=open_spot,
                     actual_low=actual_low,
@@ -1836,6 +1859,7 @@ class SignalsQueriesMixin:
                     gamma_flip=_rf("gamma_flip"),
                     level_touch_probs=committed_probs,
                     flip_cross_prob=_rf("flip_cross_prob"),
+                    range_over_sigma=RANGE_OVER_SIGMA * vol_basis_mult,
                 )
                 realized_vol_ratio = v14["realized_vol_ratio"]
                 vol_state_correct = v14["vol_state_correct"]
@@ -2228,6 +2252,7 @@ class SignalsQueriesMixin:
             "pin_tolerance_mult": 1.0,
             "upside_lean": 0.0,
             "downside_lean": 0.0,
+            "vol_range_basis_mult": 1.0,
             "n_receipts_used": 0,
             "last_calibrated_ts": None,
         }
@@ -2236,8 +2261,8 @@ class SignalsQueriesMixin:
                 row = await conn.fetchrow(
                     """
                     SELECT symbol, band_width_mult, pin_tolerance_mult,
-                           upside_lean, downside_lean, n_receipts_used,
-                           last_calibrated_ts
+                           upside_lean, downside_lean, vol_range_basis_mult,
+                           n_receipts_used, last_calibrated_ts
                     FROM forecast_calibration_state
                     WHERE symbol = $1
                     """,
@@ -2247,7 +2272,7 @@ class SignalsQueriesMixin:
                     return neutral
                 out = dict(row)
                 for f in ("band_width_mult", "pin_tolerance_mult",
-                          "upside_lean", "downside_lean"):
+                          "upside_lean", "downside_lean", "vol_range_basis_mult"):
                     out[f] = float(out[f]) if out.get(f) is not None else 1.0 if "mult" in f else 0.0
                 out["n_receipts_used"] = int(out.get("n_receipts_used") or 0)
                 return out
@@ -2264,6 +2289,7 @@ class SignalsQueriesMixin:
         downside_lean: float,
         n_receipts_used: int,
         summary: Dict[str, Any],
+        vol_range_basis_mult: float = 1.0,
     ) -> bool:
         """Write the calibration state for a symbol.  Nightly job caller.
         Bounds enforcement is the caller's responsibility — this method
@@ -2274,14 +2300,16 @@ class SignalsQueriesMixin:
                     """
                     INSERT INTO forecast_calibration_state
                         (symbol, band_width_mult, pin_tolerance_mult,
-                         upside_lean, downside_lean, n_receipts_used,
+                         upside_lean, downside_lean, vol_range_basis_mult,
+                         n_receipts_used,
                          last_calibrated_ts, last_calibrated_summary)
-                    VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8::jsonb)
                     ON CONFLICT (symbol) DO UPDATE
                     SET band_width_mult = EXCLUDED.band_width_mult,
                         pin_tolerance_mult = EXCLUDED.pin_tolerance_mult,
                         upside_lean = EXCLUDED.upside_lean,
                         downside_lean = EXCLUDED.downside_lean,
+                        vol_range_basis_mult = EXCLUDED.vol_range_basis_mult,
                         n_receipts_used = EXCLUDED.n_receipts_used,
                         last_calibrated_ts = EXCLUDED.last_calibrated_ts,
                         last_calibrated_summary = EXCLUDED.last_calibrated_summary
@@ -2291,6 +2319,7 @@ class SignalsQueriesMixin:
                     float(pin_tolerance_mult),
                     float(upside_lean),
                     float(downside_lean),
+                    float(vol_range_basis_mult),
                     int(n_receipts_used),
                     json.dumps(summary),
                 )

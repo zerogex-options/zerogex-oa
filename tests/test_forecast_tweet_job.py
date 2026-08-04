@@ -36,15 +36,22 @@ def _morning_row(**overrides):
         "projected_close": 744.00,
         "pin_strike": 744.00,
         "flagship_setup": None,
-        "range_model": "heuristic_v1",
+        "range_model": "heuristic_v1_4",
         "content_hash": "a" * 64,
+        # v1.4 headline claims (what the site + tweet now grade).
+        "expected_vol_state": "compression",
+        "expected_vol_ratio": 0.80,
+        "implied_move": 5.20,
+        "flip_cross_prob": 0.30,
+        "level_touch_probs": {"call_wall": 0.40, "put_wall": 0.50},
+        "gravity_center": 744.00,
         "receipt_ts": None,
         "actual_low": None,
         "actual_high": None,
         "actual_close": None,
         "range_respected": None,
-        "pin_hit": None,
-        "regime_correct": None,
+        "vol_state_correct": None,
+        "realized_vol_ratio": None,
     }
     base.update(overrides)
     return base
@@ -57,8 +64,8 @@ def _receipt_row(**overrides):
         actual_high=748.20,
         actual_close=746.90,
         range_respected=True,
-        pin_hit=False,
-        regime_correct=True,
+        vol_state_correct=True,
+        realized_vol_ratio=0.72,
     )
     row.update(overrides)
     return row
@@ -74,8 +81,12 @@ def test_morning_tweet_shape():
     text = mod.build_morning_tweet(_morning_row(), "https://zerogex.io")
     assert text.startswith("SPY · 2026-07-01 morning forecast")
     assert "Range: $744.82 – $748.76" in text
-    assert "Pin: $744.00" in text
-    assert "Regime: Long Gamma" in text
+    # v1.4 headline claims: range + the expected-vol call (+ flip-cross odds).
+    # Pin/regime were retired — they must not resurface in the tweet.
+    assert "Expected vol: Compression" in text
+    assert "Flip-cross 30%" in text
+    assert "Pin:" not in text
+    assert "Regime:" not in text
     assert text.endswith("https://zerogex.io/forecast/SPY/2026-07-01")
     assert len(text) <= mod.TWEET_MAX_LEN
 
@@ -84,22 +95,25 @@ def test_receipt_tweet_uses_verdict_pills():
     mod = _reload_module()
     text = mod.build_receipt_tweet(_receipt_row(), "https://zerogex.io")
     assert text.startswith("SPY · 2026-07-01 receipt")
-    # Held / missed / correct verdicts must be individually visible.
+    # The two graded claims — range coverage + the vol call — must be visible,
+    # with the realized ratio on the "× a normal day's range" scale.
     assert "Range ✓ held" in text
-    assert "Pin ✗ missed" in text
-    assert "Regime ✓ correct" in text
+    assert "Vol ✓ Compression" in text
+    assert "0.72× normal" in text
+    assert "Pin" not in text
+    assert "Regime" not in text
     assert "Close: $746.90" in text
     assert text.endswith("https://zerogex.io/forecast/SPY/2026-07-01")
 
 
-def test_receipt_tweet_handles_transition_regime_gracefully():
-    """regime_correct is NULL when the morning regime was 'transition' —
-    the tweet should surface a neutral 'n/a' rather than pretend it graded."""
+def test_receipt_tweet_handles_ungraded_vol_gracefully():
+    """vol_state_correct is NULL when no implied move was on file — the tweet
+    should surface a neutral 'n/a' rather than pretend it graded the call."""
     mod = _reload_module()
-    row = _receipt_row(regime="transition", regime_correct=None)
+    row = _receipt_row(vol_state_correct=None, realized_vol_ratio=None)
     text = mod.build_receipt_tweet(row, "https://zerogex.io")
-    assert "Regime — n/a" in text
-    assert "Regime ✗" not in text
+    assert "Vol — n/a" in text
+    assert "Vol ✓" not in text
 
 
 def test_morning_tweet_truncates_to_280():
