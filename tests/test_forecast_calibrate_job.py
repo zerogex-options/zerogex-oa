@@ -28,6 +28,7 @@ def _receipt(
     actual_close: float,
     raw_pin_hit: bool | None = None,
     day: date = date(2026, 6, 29),
+    implied_move: float | None = None,
 ) -> dict:
     return {
         "date": day,
@@ -39,6 +40,7 @@ def _receipt(
         "actual_high": actual_high,
         "actual_close": actual_close,
         "raw_pin_hit": raw_pin_hit,
+        "implied_move": implied_move,
         "receipt_ts": datetime(day.year, day.month, day.day, 20, 5, tzinfo=timezone.utc),
     }
 
@@ -50,6 +52,7 @@ def _neutral_state() -> dict:
         "pin_tolerance_mult": 1.0,
         "upside_lean": 0.0,
         "downside_lean": 0.0,
+        "vol_range_basis_mult": 1.0,
         "n_receipts_used": 0,
         "last_calibrated_ts": None,
     }
@@ -139,6 +142,54 @@ def test_bounds_never_exceeded_even_on_persistent_signal():
     assert lo <= state["band_width_mult"] <= hi
     lo, hi = mod.BOUNDS["pin_tolerance_mult"]
     assert lo <= state["pin_tolerance_mult"] <= hi
+
+
+def test_learns_vol_basis_from_realized_median():
+    """When the symbol's realized ranges cluster below the Parkinson expectation
+    (the variance-risk premium), the cron drifts vol_range_basis_mult toward the
+    median so a typical day re-centers at ratio 1.0 instead of reading
+    'compression' forever."""
+    mod = _reload_module()
+    implied = 50.0
+    # Each day realizes 0.85× a normal day's range → median raw ratio 0.85.
+    day_range = 0.85 * mod.RANGE_OVER_SIGMA * implied
+    receipts = [
+        _receipt(
+            590, 610, 592, 608,
+            actual_low=600 - day_range / 2, actual_high=600 + day_range / 2,
+            actual_close=600, implied_move=implied,
+        )
+        for _ in range(15)
+    ]
+    updates = mod._compute_updates(receipts, _neutral_state())
+    # Nudged down from 1.0 toward the 0.85 target, bounded, and reported.
+    assert 0.85 <= updates["vol_range_basis_mult"] < 1.0
+    lo, hi = mod.BOUNDS["vol_range_basis_mult"]
+    assert lo <= updates["vol_range_basis_mult"] <= hi
+    assert updates["summary"]["vol_basis_target"] == pytest.approx(0.85, abs=1e-3)
+
+
+def test_vol_basis_converges_and_stays_bounded():
+    """Repeated rounds converge the basis toward the realized median and never
+    escape the bounds — the grading goalposts can drift but not run away."""
+    mod = _reload_module()
+    implied = 50.0
+    day_range = 0.70 * mod.RANGE_OVER_SIGMA * implied  # persistent low-vol regime
+    receipts = [
+        _receipt(
+            590, 610, 592, 608,
+            actual_low=600 - day_range / 2, actual_high=600 + day_range / 2,
+            actual_close=600, implied_move=implied,
+        )
+        for _ in range(15)
+    ]
+    state = _neutral_state()
+    for _ in range(100):
+        updates = mod._compute_updates(receipts, state)
+        state["vol_range_basis_mult"] = updates["vol_range_basis_mult"]
+    lo, hi = mod.BOUNDS["vol_range_basis_mult"]
+    assert lo <= state["vol_range_basis_mult"] <= hi
+    assert state["vol_range_basis_mult"] == pytest.approx(0.70, abs=1e-2)
 
 
 def test_ignores_legacy_receipts_without_raw_fields():

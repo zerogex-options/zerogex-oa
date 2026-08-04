@@ -436,6 +436,7 @@ def test_deterministic_for_same_inputs():
 from src.jobs.forecast_range_model import (  # noqa: E402
     LEVEL_TOUCH_MAX,
     LEVEL_TOUCH_MIN,
+    RANGE_OVER_SIGMA,
     VOL_NORMAL_HIGH,
     VOL_NORMAL_LOW,
     _barrier_touch_prob,
@@ -552,27 +553,52 @@ def test_classify_vol_state_band_edges():
 from src.jobs.forecast_range_model import grade_realized_claims  # noqa: E402
 
 
+def test_grade_normal_day_reads_normal_not_expansion():
+    # THE regression test for the range/σ scale fix: a statistically ORDINARY
+    # day realizes a high-low range of √(8/π)·implied ≈ 1.6× the 1-σ implied
+    # move.  It must grade "normal" (ratio ≈ 1.0), NOT "expansion".  Before the
+    # fix this exact day scored expansion at every VIX level.
+    implied = 50.0
+    normal_range = RANGE_OVER_SIGMA * implied  # ≈ 79.79
+    g = grade_realized_claims(
+        open_spot=600.0,
+        actual_low=600.0 - normal_range / 2,
+        actual_high=600.0 + normal_range / 2,
+        implied_move=implied, expected_vol_state="normal",
+        call_wall=None, put_wall=None, gamma_flip=None,
+        level_touch_probs=None, flip_cross_prob=None,
+    )
+    assert g["realized_vol_ratio"] == pytest.approx(1.0, abs=1e-3)
+    assert g["vol_state_correct"] is True
+
+
 def test_grade_vol_compression_hit():
+    # A genuinely quiet day: a $30 range against a $50 1-σ move is only ~0.38×
+    # a normal day's range (√(8/π)·50 ≈ 80), well inside compression.
     g = grade_realized_claims(
         open_spot=600.0, actual_low=585.0, actual_high=615.0,  # range 30
         implied_move=50.0, expected_vol_state="compression",
         call_wall=None, put_wall=None, gamma_flip=None,
         level_touch_probs=None, flip_cross_prob=None,
     )
-    assert g["realized_vol_ratio"] == pytest.approx(0.6)
+    assert g["realized_vol_ratio"] == pytest.approx(30.0 / (RANGE_OVER_SIGMA * 50.0), abs=1e-3)
+    assert g["realized_vol_ratio"] < VOL_NORMAL_LOW
     assert g["vol_state_correct"] is True
 
 
 def test_grade_expansion_is_path_independent():
-    # A violent two-way day (range 60) that closes right back at the open is
-    # still graded EXPANSION — the whole point of the reframe.
+    # A genuinely violent two-way day (range 120 ≈ 1.5× a normal day's range)
+    # that closes right back at the open is still graded EXPANSION — the whole
+    # point of the reframe. (Under the corrected scale a "violent" day is one
+    # whose RANGE clears ~1.15× the ~1.6·σ normal range, not merely 1.15·σ.)
     g = grade_realized_claims(
-        open_spot=600.0, actual_low=570.0, actual_high=630.0,  # range 60
+        open_spot=600.0, actual_low=540.0, actual_high=660.0,  # range 120
         implied_move=50.0, expected_vol_state="expansion",
         call_wall=None, put_wall=None, gamma_flip=None,
         level_touch_probs=None, flip_cross_prob=None,
     )
-    assert g["realized_vol_ratio"] == pytest.approx(1.2)
+    assert g["realized_vol_ratio"] == pytest.approx(120.0 / (RANGE_OVER_SIGMA * 50.0), abs=1e-3)
+    assert g["realized_vol_ratio"] > VOL_NORMAL_HIGH
     assert g["vol_state_correct"] is True
 
 

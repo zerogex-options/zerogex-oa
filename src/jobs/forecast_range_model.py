@@ -8,7 +8,8 @@ gamma structure genuinely conditions and that grade objectively on the day's
 OHLC magnitude, never on direction:
 
   * ``expected_vol_state`` / ``expected_vol_ratio`` — realized daily range as a
-    fraction of the VIX-implied move (long gamma damps, short gamma amplifies).
+    multiple of a NORMAL day's range (√(8/π)·implied, per-symbol calibrated;
+    long gamma damps, short gamma amplifies).
   * ``level_touch_probs`` / ``flip_cross_prob`` — reflection-principle odds that
     price reaches each structural wall / crosses the gamma flip today.
 
@@ -124,16 +125,34 @@ DEFAULT_STRIKE_STEP = 1.0
 # conditions and that can be scored objectively against the day's OHLC —
 # without ever claiming price *direction*:
 #
-#   * Expected volatility: realized daily range as a fraction of the
-#     VIX-implied 1-day move.  Long gamma damps (ratio < 1), short gamma
-#     amplifies (ratio > 1).  Graded on realized ÷ implied — path-agnostic,
-#     so a round-trip trend day that closes flat still scores as expansion.
+#   * Expected volatility: realized daily range as a multiple of a NORMAL day's
+#     range (√(8/π)·implied — an intraday range is ~1.6× the 1-σ implied move,
+#     not 1×, so this is the denominator that makes the buckets mean anything).
+#     Long gamma damps (ratio < 1), short gamma amplifies (ratio > 1).  Graded
+#     path-agnostically, so a round-trip trend day that closes flat still
+#     scores as expansion because the *range* was large.
 #   * Level touch odds: reflection-principle P(price reaches each structural
 #     level today) + P(the gamma flip is crossed).  Graded by Brier score.
 #
 # Every weight below is a PRIOR (intuition), to be replaced by the nightly
 # calibration loop once enough receipts accrue — nothing here claims measured
 # edge.  See docs/design/quantile-regression-range-model.md for the v2 plan.
+
+# Range-vs-sigma unit bridge.  ``implied_move`` is a 1-SIGMA close-to-close
+# quantity (spot·VIX/100/√252), but the thing we grade — the day's realized
+# high-low RANGE — is not a 1-sigma quantity: for a driftless diffusion the
+# expected daily range is E[high-low] = √(8/π)·σ ≈ 1.596·σ (Parkinson).  So a
+# perfectly ordinary day realizes a range ≈ 1.6× the implied 1-day move.  The
+# original grader divided range by the bare 1-sigma implied move and bucketed
+# on edges centered at 1.0, which stamped essentially every normal day
+# "expansion" (see the demo in the design notes).  We divide by an EXPECTED
+# RANGE (√(8/π)·implied) instead, so a normal day re-centers at ≈1.0 and the
+# 0.85/1.15 edges below finally mean compression / normal / expansion.  The
+# per-symbol ``vol_range_basis_mult`` calibration scalar (learned nightly from
+# the trailing realized-range distribution) fine-tunes this center so the
+# variance-risk premium — realized vol runs structurally below implied — is
+# absorbed empirically rather than assumed.
+RANGE_OVER_SIGMA = math.sqrt(8.0 / math.pi)  # ≈ 1.5958 — Parkinson E[range]/σ
 
 VOL_BASE_RATIO = 1.0
 VOL_GAMMA_WEIGHT = 0.35          # dealer-gamma sign is the dominant driver
@@ -145,8 +164,13 @@ VOL_LOCAL_GAMMA_WEIGHT = 0.08   # dense local gamma adds pinning — long-gamma 
 VOL_LOCAL_GEX_SATURATION = 5.0e8
 VOL_RATIO_MIN = 0.45
 VOL_RATIO_MAX = 1.90
-# Grading band, shared with the receipt grader (kept in sync there):
-#   realized ratio <= LOW  -> compression | >= HIGH -> expansion | else normal
+# Grading band, shared with the receipt grader (kept in sync there).  The
+# ratio is realized-range ÷ EXPECTED-range (√(8/π)·implied, per-symbol
+# calibrated), so 1.0 == "a statistically normal day" and the edges read:
+#   ratio <= LOW  -> compression | >= HIGH -> expansion | else normal
+# The SAME classifier grades the model's prediction, which is likewise
+# expressed as a multiple of a normal day's range (VOL_BASE_RATIO = 1.0), so
+# prediction and outcome are finally measured on one scale.
 VOL_NORMAL_LOW = 0.85
 VOL_NORMAL_HIGH = 1.15
 
@@ -435,13 +459,17 @@ def _classify_vol_state(ratio: float) -> str:
 
 
 def _compute_expected_vol(inp: ForecastInputs, rationale: list[str]) -> tuple[str, float]:
-    """Predict realized daily range as a fraction of the implied 1-day move.
+    """Predict realized daily range as a multiple of a NORMAL day's range.
 
-    Dealer-gamma sign is the dominant driver: long gamma suppresses realized
-    volatility (ratio < 1), short gamma amplifies it (ratio > 1).  Dense local
-    gamma adds pinning (long-gamma only), a stretched VIX z-score lifts the
-    whole tape, and proximity to the flip raises expansion odds because the
-    regime itself is unstable there.  Makes NO claim about direction.
+    A ratio of 1.0 means "expect a statistically ordinary day"; dealer-gamma
+    sign is the dominant driver — long gamma suppresses realized volatility
+    (ratio < 1, compression), short gamma amplifies it (ratio > 1, expansion).
+    Dense local gamma adds pinning (long-gamma only), a stretched VIX z-score
+    lifts the whole tape, and proximity to the flip raises expansion odds
+    because the regime itself is unstable there.  The prediction is on the same
+    "× a normal day's range" scale the receipt grades against (a normal day's
+    range being √(8/π)·implied, per-symbol calibrated).  Makes NO claim about
+    direction.
     """
     ratio = VOL_BASE_RATIO
     if inp.gex_surface_fresh and inp.net_gex is not None:
@@ -459,7 +487,7 @@ def _compute_expected_vol(inp: ForecastInputs, rationale: list[str]) -> tuple[st
             ratio *= 1.0 + VOL_FLIP_PROX_WEIGHT * prox
     ratio = _clamp(ratio, VOL_RATIO_MIN, VOL_RATIO_MAX)
     state = _classify_vol_state(ratio)
-    rationale.append(f"Expected vol={state} (realized≈{ratio:.2f}× implied)")
+    rationale.append(f"Expected vol={state} (realized≈{ratio:.2f}× a normal day's range)")
     return state, round(ratio, 4)
 
 
@@ -527,6 +555,7 @@ def grade_realized_claims(
     gamma_flip: Optional[float],
     level_touch_probs: Optional[dict],
     flip_cross_prob: Optional[float],
+    range_over_sigma: float = RANGE_OVER_SIGMA,
 ) -> dict[str, Any]:
     """Grade the v1.4 claims against the day's cash-session OHLC.
 
@@ -536,6 +565,16 @@ def grade_realized_claims(
     flip was crossed — never a direction call.  A round-trip trend day that
     closes flat still reads as expansion because the *range* was large.
 
+    ``realized_vol_ratio`` is the day's high-low range as a multiple of a
+    NORMAL day's range, where a normal day's range is
+    ``range_over_sigma × implied_move`` — ``range_over_sigma`` defaults to the
+    Parkinson constant √(8/π) ≈ 1.6 and the receipt grader multiplies in the
+    per-symbol ``vol_range_basis_mult`` calibration scalar committed that
+    morning.  Dividing by the expected RANGE (not the bare 1-σ implied move) is
+    what re-centers an ordinary day at ≈1.0 so the compression/normal/expansion
+    buckets are meaningful; grading against the *committed* basis keeps the
+    verdict deterministic and immutable per the morning commitment.
+
     Returns ``{realized_vol_ratio, vol_state_correct, flip_crossed,
     level_touch_outcomes, levels_brier}`` with ``None`` for any verdict whose
     inputs weren't committed (e.g. no implied move, no walls).
@@ -543,8 +582,9 @@ def grade_realized_claims(
     realized_range = actual_high - actual_low
     realized_vol_ratio: Optional[float] = None
     vol_state_correct: Optional[bool] = None
-    if implied_move is not None and implied_move > 0:
-        realized_vol_ratio = round(realized_range / implied_move, 4)
+    if implied_move is not None and implied_move > 0 and range_over_sigma > 0:
+        expected_range = range_over_sigma * implied_move
+        realized_vol_ratio = round(realized_range / expected_range, 4)
         realized_bucket = _classify_vol_state(realized_vol_ratio)
         if expected_vol_state is not None:
             vol_state_correct = realized_bucket == expected_vol_state
@@ -861,6 +901,13 @@ NEUTRAL_CALIBRATION: dict[str, float] = {
     "pin_tolerance_mult": 1.0,
     "upside_lean": 0.0,
     "downside_lean": 0.0,
+    # Per-symbol re-centering of the expected-range denominator used to grade
+    # the vol call.  1.0 == "a normal day's range is exactly √(8/π)·implied";
+    # the nightly calibrator lowers it toward the symbol's empirical median
+    # range (variance-risk premium ⇒ typically < 1.0).  Captured into
+    # forecast_inputs.calibration_applied so the receipt grades against the
+    # basis committed that morning, never a later-drifted one.
+    "vol_range_basis_mult": 1.0,
 }
 
 

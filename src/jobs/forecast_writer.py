@@ -281,6 +281,12 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
             "pin_tolerance_mult": float(calibration_row["pin_tolerance_mult"]),
             "upside_lean": float(calibration_row["upside_lean"]),
             "downside_lean": float(calibration_row["downside_lean"]),
+            # Per-symbol expected-range center for the vol grade.  Carried into
+            # forecast_inputs.calibration_applied by compute_forecast so the
+            # receipt grades against the basis committed this morning.
+            "vol_range_basis_mult": float(
+                calibration_row.get("vol_range_basis_mult", 1.0) or 1.0
+            ),
             "n_receipts_used": int(calibration_row.get("n_receipts_used") or 0),
         }
 

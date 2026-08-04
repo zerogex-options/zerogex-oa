@@ -2843,6 +2843,11 @@ CREATE TRIGGER daily_forecast_immutable
 --   * upside_lean:       additive tilt of the upper band; positive
 --                        widens upside, negative tightens (range ±0.20)
 --   * downside_lean:     additive tilt of the lower band, same range
+--   * vol_range_basis_mult: re-centers the expected-range denominator used to
+--                        grade the vol call.  A normal day's range is
+--                        √(8/π)·implied × this scalar; the cron drifts it
+--                        toward the symbol's trailing median realized range so
+--                        the variance-risk premium is learned, not assumed.
 --
 -- Bounds are enforced in Python (calibration cron clamps before writing);
 -- the schema just provides the storage + audit trail.
@@ -2854,6 +2859,7 @@ CREATE TABLE IF NOT EXISTS forecast_calibration_state (
     pin_tolerance_mult      NUMERIC(6,4) NOT NULL DEFAULT 1.0,
     upside_lean             NUMERIC(6,4) NOT NULL DEFAULT 0.0,
     downside_lean           NUMERIC(6,4) NOT NULL DEFAULT 0.0,
+    vol_range_basis_mult    NUMERIC(6,4) NOT NULL DEFAULT 1.0,
     -- Bookkeeping so we know how much data backed the current scalars
     -- and can trace the last update.  n_receipts_used tells the writer
     -- whether the corrections are "cold" (too few labels; apply
@@ -2864,6 +2870,13 @@ CREATE TABLE IF NOT EXISTS forecast_calibration_state (
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Additive migration for pre-existing calibration tables: the vol-range basis
+-- scalar was introduced with the range/σ grading fix.  DEFAULT 1.0 means an
+-- un-migrated symbol grades on the pure Parkinson constant until the cron
+-- learns its empirical center — a safe no-op, not a behavior change.
+ALTER TABLE forecast_calibration_state
+    ADD COLUMN IF NOT EXISTS vol_range_basis_mult NUMERIC(6,4) NOT NULL DEFAULT 1.0;
 
 CREATE OR REPLACE FUNCTION touch_forecast_calibration_state()
 RETURNS TRIGGER AS $$

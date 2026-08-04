@@ -9,12 +9,16 @@ is the canonical consumer.
 
 from __future__ import annotations
 
+import math
 import os
+from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from zoneinfo import ZoneInfo
+
+from src.jobs.forecast_range_model import _classify_vol_state
 
 from ..database import DatabaseManager
 from .trade_signals import get_db
@@ -41,6 +45,45 @@ def _regime_fix_date() -> date:
         return date.fromisoformat(raw)
     except ValueError:
         return _DEFAULT_REGIME_FIX_DATE
+
+
+# The vol-grade scale fix went live on this date.  Before it, realized_vol_ratio
+# was (high-low)/implied graded on buckets centered at 1.0, so an ordinary day
+# (range ≈ 1.6× the 1-σ implied move) was mislabeled "expansion" and
+# vol_state_correct measured the scale bug, not the call.  The rolling vol
+# accuracy + its baseline exclude pre-fix rows for the same reason the regime
+# rate excludes the units-bug era; the cutoff self-expires once the window is
+# all corrected rows.  Override with FORECAST_VOL_SCALE_FIX_DATE.
+_DEFAULT_VOL_SCALE_FIX_DATE = date(2026, 8, 4)
+
+# What fraction of days a well-calibrated containment band should cover — the
+# reference line the range track record is judged against (the writer's
+# calibration loop targets ~0.90; 0.80 is the floor of the published band goal).
+_RANGE_COVERAGE_BASELINE = 0.80
+
+
+def _vol_scale_fix_date() -> date:
+    raw = os.environ.get("FORECAST_VOL_SCALE_FIX_DATE", "").strip()
+    if not raw:
+        return _DEFAULT_VOL_SCALE_FIX_DATE
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return _DEFAULT_VOL_SCALE_FIX_DATE
+
+
+def _wilson_ci(wins: int, n: int, z: float = 1.96) -> list[float] | None:
+    """95% Wilson score interval for a binomial proportion.
+
+    Small-n honest: with n=6 a 5/6 hit rate reads 0.42–0.99, not "83% ± nothing".
+    Returns ``[low, high]`` clamped to [0, 1], or None when there's no data."""
+    if n <= 0:
+        return None
+    p = wins / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = (z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
+    return [round(max(0.0, center - margin), 4), round(min(1.0, center + margin), 4)]
 
 
 def _as_date(value: Any) -> date | None:
@@ -274,12 +317,21 @@ async def get_rolling_stats(
     scored = [r for r in rows if r.get("receipt_ts") is not None]
     n = len(scored)
 
-    def _rate(row_set, predicate) -> float | None:
-        eligible = [r for r in row_set if predicate(r) is not None]
+    def _rate(row_set, key) -> float | None:
+        eligible = [r for r in row_set if r.get(key) is not None]
         if not eligible:
             return None
-        wins = sum(1 for r in eligible if predicate(r))
+        wins = sum(1 for r in eligible if r.get(key))
         return round(wins / len(eligible), 4)
+
+    def _rate_ci(row_set, key):
+        """(rate, wilson_ci, n_eligible) for a boolean verdict column."""
+        eligible = [r for r in row_set if r.get(key) is not None]
+        m = len(eligible)
+        if m == 0:
+            return None, None, 0
+        wins = sum(1 for r in eligible if r.get(key))
+        return round(wins / m, 4), _wilson_ci(wins, m), m
 
     # Regime accuracy only counts forecasts made under the corrected
     # dealer-gamma logic; pre-fix rows are the all-``long_gamma`` units bug and
@@ -291,10 +343,36 @@ async def get_rolling_stats(
     ]
     regime_n = sum(1 for r in regime_scored if r.get("regime_correct") is not None)
 
-    # v1.4 claim stats. Expected-volatility accuracy is the hit rate of the
-    # committed compression/normal/expansion call; levels_brier is the mean
-    # Brier score across touch/flip probabilities (lower is better, 0 = perfect).
-    vol_scored = [r for r in scored if r.get("vol_state_correct") is not None]
+    # Range coverage — a scale-free price-vs-price claim, so every scored row
+    # counts.  Judged against the published coverage target, with a Wilson CI so
+    # a short window can't masquerade as precision.
+    range_rate, range_ci, _range_n = _rate_ci(scored, "range_respected")
+
+    # Vol call — gated to the corrected-scale era (see _vol_scale_fix_date) so a
+    # pre-fix mislabeled receipt can't drag the number either way.  The baseline
+    # is the honest strawman: "always guess the most common realized bucket."  A
+    # skilled call has to beat that majority-class base rate, not just 50%.
+    vol_fix_date = _vol_scale_fix_date()
+    vol_scored = [
+        r for r in scored
+        if r.get("vol_state_correct") is not None
+        and (d := _as_date(r.get("date"))) is not None and d >= vol_fix_date
+    ]
+    vol_rate, vol_ci, vol_n = _rate_ci(vol_scored, "vol_state_correct")
+    realized_buckets = [
+        _classify_vol_state(float(r["realized_vol_ratio"]))
+        for r in vol_scored
+        if r.get("realized_vol_ratio") is not None
+    ]
+    vol_baseline: float | None = None
+    vol_baseline_label: str | None = None
+    if realized_buckets:
+        label, cnt = Counter(realized_buckets).most_common(1)[0]
+        vol_baseline = round(cnt / len(realized_buckets), 4)
+        vol_baseline_label = label
+
+    # levels_brier is the mean Brier score across touch/flip probabilities
+    # (lower is better, 0 = perfect, 0.25 = a coin flip).
     brier_vals = [
         float(r["levels_brier"]) for r in scored if r.get("levels_brier") is not None
     ]
@@ -304,15 +382,23 @@ async def get_rolling_stats(
         "symbol": symbol.upper(),
         "window": window,
         "n_scored": n,
-        "range_respected_rate": _rate(scored, lambda r: r.get("range_respected")),
-        "pin_hit_rate": _rate(scored, lambda r: r.get("pin_hit")),
-        "regime_correct_rate": _rate(regime_scored, lambda r: r.get("regime_correct")),
+        # Range coverage track record.
+        "range_respected_rate": range_rate,
+        "range_respected_ci": range_ci,
+        "range_baseline": _RANGE_COVERAGE_BASELINE,
+        "pin_hit_rate": _rate(scored, "pin_hit"),
+        "regime_correct_rate": _rate(regime_scored, "regime_correct"),
         # Transparency: regime accuracy is scoped to the corrected-logic era.
         "regime_stats_from": fix_date.isoformat(),
         "regime_n_scored": regime_n,
-        # v1.4 gradeable claims.
-        "vol_state_correct_rate": _rate(vol_scored, lambda r: r.get("vol_state_correct")),
-        "vol_n_scored": len(vol_scored),
+        # Vol-call track record — independent of range; corrected-scale only.
+        "vol_state_correct_rate": vol_rate,
+        "vol_state_correct_ci": vol_ci,
+        "vol_baseline": vol_baseline,
+        "vol_baseline_label": vol_baseline_label,
+        "vol_stats_from": vol_fix_date.isoformat(),
+        "vol_n_scored": vol_n,
+        # Levels calibration.
         "levels_brier_avg": levels_brier_avg,
         "levels_n_scored": len(brier_vals),
     }
