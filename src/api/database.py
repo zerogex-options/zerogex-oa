@@ -492,6 +492,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._max_pain_current_cache_ttl_seconds: float = _getenv_float(
             "MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", 120.0
         )
+        # ── TradeWorkz-adjacent slow reads that previously had NO cache ──
+        # dealer-hedging / volume-spikes / session-closes were the three
+        # tiny-payload endpoints measured at 4–12s: each ran a heavy scan and
+        # held one of only ~3–4 asyncpg pool slots for the query's full
+        # duration, starving unrelated requests (the documented "H2" pool
+        # starvation; see _fetch_timed). They are all coarse-grained reads, so
+        # a short process-local TTL collapses the repeat cost and — combined
+        # with the larger API pool below — stops a single slow read from
+        # wedging the whole worker.
+        #
+        # dealer_hedging_pressure aggregates the last 10 min of option_chains
+        # into a single coarse gauge; the TTL is generous because this is the
+        # most expensive read (~12s) and must comfortably exceed the frontend
+        # poll cadence to actually absorb it.
+        self._dealer_hedging_cache_ttl_seconds: float = _getenv_float(
+            "DEALER_HEDGING_CACHE_TTL_SECONDS", 30.0
+        )
+        # A fresh ≥3σ volume bar can appear at most once per 1-min bar, so a
+        # short TTL keeps the feed responsive while collapsing bursts/re-polls.
+        self._volume_spikes_cache_ttl_seconds: float = _getenv_float(
+            "VOLUME_SPIKES_CACHE_TTL_SECONDS", 15.0
+        )
+        # Session closes change once per day at 16:00 ET. The frontend
+        # force-refetches on the session-label flip to surface the new close
+        # promptly, and this server cache would blunt that by up to its TTL, so
+        # it is kept short — just enough to absorb concurrent/burst reads
+        # without meaningfully delaying the 16:00 boundary.
+        self._session_closes_cache_ttl_seconds: float = _getenv_float(
+            "SESSION_CLOSES_CACHE_TTL_SECONDS", 15.0
+        )
         # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
         # effectively unbounded keyspace (per strike-set/expiration-set query
         # string); a plain dict only evicted a key when that exact key was
@@ -535,10 +565,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
         connect_timeout = _getenv_float("DB_CONNECT_TIMEOUT_SECONDS", 20)
-        # Keep defaults conservative to avoid exhausting RDS connections when
-        # multiple services/workers run at once.
-        min_size = _getenv_int("DB_POOL_MIN", 1)
-        max_size = _getenv_int("DB_POOL_MAX", 3)
+        # Size the API async pool INDEPENDENTLY of the shared DB_POOL_* knobs.
+        #
+        # DB_POOL_MAX also governs every forked psycopg2 background pool
+        # (ingestion/analytics/signals, ~12+ processes), so raising the request
+        # path's concurrency through it would multiply the background footprint
+        # against RDS. API_DB_POOL_MAX decouples the request path: only this
+        # asyncpg pool reads it. The previous default of 3–4 slots per worker
+        # was the documented pool-starvation surface — a couple of slow reads
+        # (dealer-hedging ~12s, by-strike ~6s) held those few slots and every
+        # other request, including /api/health's `SELECT 1`, queued behind
+        # them. RDS (db.r6g.large, max_connections ~1600) has ample headroom:
+        # even at 2 workers × this pool + all background pools the ceiling is
+        # well under a hundred connections.
+        #
+        # Resolution order: API_DB_POOL_MAX → max(DB_POOL_MAX, 12) so an
+        # operator who already tuned DB_POOL_MAX higher keeps it, but the
+        # request pool is never floored back down to the tiny background size.
+        min_size = _getenv_int("API_DB_POOL_MIN", _getenv_int("DB_POOL_MIN", 1))
+        max_size = _getenv_int(
+            "API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12)
+        )
         statement_timeout_ms = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
@@ -4548,6 +4595,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         extended-hours ticker, the GEX live spot, and chart tip-close
         merge all see real-time prints.
         """
+        symbol = symbol.upper()
+        cache_key = f"session_closes:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
         query = """
             WITH session_closes AS (
                 SELECT DISTINCT ON ((uq.timestamp AT TIME ZONE 'America/New_York')::date)
@@ -4563,6 +4616,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 FROM underlying_quotes uq
                 LEFT JOIN symbols s ON s.symbol = uq.symbol
                 WHERE uq.symbol = $1
+                    -- Sargable lower bound: this uses idx(symbol, timestamp
+                    -- DESC) as a range scan instead of TZ-converting and
+                    -- sorting the symbol's ENTIRE quote history (the cause of
+                    -- the ~4s wall time for a 2-row result). We only ever need
+                    -- the two most recent sessions; 30 days covers any
+                    -- weekend / holiday / ingestion-gap, and if data really is
+                    -- staler than that the latest-quote fallback below still
+                    -- returns a price. Every predicate below is preserved.
+                    AND uq.timestamp >= NOW() - INTERVAL '30 days'
                     AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
                     AND (uq.timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
                     AND uq.timestamp <= NOW()
@@ -4625,13 +4687,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 if current_close is None:
                     return None
 
-                return {
+                result = {
                     "symbol": symbol,
                     "current_session_close": current_close,
                     "current_session_close_ts": current_ts,
                     "prior_session_close": prior_close,
                     "prior_session_close_ts": prior_ts,
                 }
+                self._cache_set(
+                    cache_key, result, self._session_closes_cache_ttl_seconds
+                )
+                return result
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}", exc_info=True)
             raise

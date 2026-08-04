@@ -39,6 +39,8 @@ class TechnicalsQueriesMixin:
         _cache_get: Callable[[str], Optional[Any]]
         _cache_set: Callable[[str, Any, float], None]
         _analytics_cache_ttl_seconds: float
+        _dealer_hedging_cache_ttl_seconds: float
+        _volume_spikes_cache_ttl_seconds: float
 
     async def get_vwap_deviation(
         self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
@@ -350,7 +352,21 @@ class TechnicalsQueriesMixin:
         The ``dealer_hedging_pressure`` view emits exactly one row per
         symbol — the current state aggregated across all option contracts —
         so this is intentionally not a timeseries.
+
+        Cached (short TTL): the view's ``latest_delta`` CTE re-aggregates the
+        last 10 minutes of ``option_chains`` across the whole option universe
+        on every call (a ``LEFT JOIN`` prevents the ``symbol`` filter from
+        pruning it), which is why this was the slowest measured endpoint
+        (~12s). The gauge is coarse and barely moves within the TTL, so the
+        cache both collapses the repeat cost and stops the query from
+        monopolising a pool slot on every poll.
         """
+        symbol = symbol.upper()
+        cache_key = f"dealer_hedging:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
         query = """
             SELECT
                 time_et,
@@ -367,7 +383,11 @@ class TechnicalsQueriesMixin:
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol)
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(
+                    cache_key, result, self._dealer_hedging_cache_ttl_seconds
+                )
+                return result
         except Exception as e:
             logger.error(f"Error fetching dealer hedging: {e}", exc_info=True)
             raise
@@ -391,10 +411,29 @@ class TechnicalsQueriesMixin:
         through ``_get_unusual_volume_spikes_with_proxy`` which applies
         the ETF's per-bar volume profile to the index's prices.
         Equities/ETFs continue to use the canonical view.
+
+        Cached (short TTL): the ``unusual_volume_spikes`` view recomputes a
+        rolling AVG/STDDEV window over the symbol's full quote history on every
+        call, so even the common empty result (no ≥3σ bar right now) cost ~5s.
+        Caching — including the empty result — collapses that repeat scan; a
+        fresh extreme bar can appear at most once per 1-minute bar, so the
+        short TTL keeps the feed responsive.
         """
+        symbol = symbol.upper()
+        cache_key = f"volume_spikes:{symbol}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
         proxy = resolve_volume_proxy(symbol)
         if proxy:
-            return await self._get_unusual_volume_spikes_with_proxy(symbol, proxy, limit)
+            result = await self._get_unusual_volume_spikes_with_proxy(
+                symbol, proxy, limit
+            )
+            self._cache_set(
+                cache_key, result, self._volume_spikes_cache_ttl_seconds
+            )
+            return result
 
         query = """
             SELECT
@@ -420,7 +459,11 @@ class TechnicalsQueriesMixin:
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, limit)
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(
+                    cache_key, result, self._volume_spikes_cache_ttl_seconds
+                )
+                return result
         except Exception as e:
             logger.error(f"Error fetching volume spikes: {e}", exc_info=True)
             raise
