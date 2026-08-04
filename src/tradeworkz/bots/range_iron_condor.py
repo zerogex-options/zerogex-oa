@@ -38,6 +38,17 @@ class RangeIronCondor(BaseBot):
     )
 
     def open_criteria(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
+        # TEMPORARY SAFETY GUARD — do not open new condors until defined-risk
+        # sizing lands. This structure enters at a near-zero NET debit (~$0.06),
+        # and sizing.compute_contracts divides the risk budget by
+        # entry_price*100 (~$6/contract) instead of the condor's true max loss
+        # (wing width ≈ $200/contract). That over-sized a live position ~34x
+        # (309 contracts), turning a $0.22 move into -$6.8K and risking ~-$60K
+        # at a full short-strike breach. The bot stays ENABLED so the reconciler
+        # still closes any position it already holds; it just stops opening new
+        # ones. Removed by the max-loss sizing fix.
+        return None
+
         # Regime gate — need positive gamma so dealers PIN price rather
         # than chase it. In negative γ, dealers reinforce moves and an
         # iron condor gets steamrolled.

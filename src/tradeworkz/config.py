@@ -72,8 +72,14 @@ EXECUTION_SLIPPAGE_PCT: float = _getenv_float(
 # the reconciler closes the position on the next tick with
 # reason='premium_stop'. Set to 0 to disable. Per-bot override via
 # params['max_premium_loss_pct'] takes precedence over this default.
+# Reverted 0.25 -> 0.40 after live data showed the tighter cap stopping cheap
+# 0DTE structures on the entry-tick bid/ask + slippage gap alone: a $0.62 debit
+# spread marks ~$0.42 the instant it opens (~-32%), tripping a 25% stop at 0.0
+# min before any thesis can play out. 0.40 clears that microstructure noise; the
+# proper fix (min-premium floor + a premium-stop grace window) is tracked
+# separately so the stop protects against real adverse moves, not the spread.
 MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
-    "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.25, min=0.0, max=1.0
+    "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.40, min=0.0, max=1.0
 )
 
 # ---------------------------------------------------------------------------
