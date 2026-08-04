@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from src.api.queries._sql_helpers import (
     _bucket_expr,
     _bucket_floor_subquery,
+    _normalize_timeframe,
 )
 from src.symbols import resolve_volume_proxy
 
@@ -25,6 +26,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
+
+# Calendar-day lookback that safely covers up to window_units=90 buckets of
+# each timeframe (weekend/holiday/data-gap margin included). The vwap-deviation
+# and opening-range queries bound their source scan to this window instead of
+# scanning the symbol's entire quote history; because every stat in those views
+# partitions by ET trading day, restricting the input to whole recent days
+# never changes a returned bucket's value (older boundary days fall outside the
+# requested window). Unknown timeframes fall back to the widest bound.
+_TIMESERIES_LOOKBACK_DAYS: dict[str, int] = {
+    "1min": 16,
+    "5min": 16,
+    "15min": 16,
+    "1hr": 40,
+    "1day": 200,
+}
+_DEFAULT_TIMESERIES_LOOKBACK_DAYS = 200
 
 
 class TechnicalsQueriesMixin:
@@ -41,6 +58,7 @@ class TechnicalsQueriesMixin:
         _analytics_cache_ttl_seconds: float
         _dealer_hedging_cache_ttl_seconds: float
         _volume_spikes_cache_ttl_seconds: float
+        _technicals_timeseries_cache_ttl_seconds: float
 
     async def get_vwap_deviation(
         self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
@@ -55,24 +73,86 @@ class TechnicalsQueriesMixin:
         prices.  Equities/ETFs continue to use the canonical view.
         """
         window_units = max(1, min(window_units, 90))
+        symbol = symbol.upper()
+        tf = _normalize_timeframe(timeframe)
+        cache_key = f"vwap_dev:{symbol}:{tf}:{window_units}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
         proxy = resolve_volume_proxy(symbol)
         if proxy:
-            return await self._get_vwap_deviation_with_proxy(symbol, proxy, timeframe, window_units)
+            result = await self._get_vwap_deviation_with_proxy(
+                symbol, proxy, timeframe, window_units
+            )
+            self._cache_set(
+                cache_key, result, self._technicals_timeseries_cache_ttl_seconds
+            )
+            return result
+
         bucket = _bucket_expr(timeframe)
+        lookback_days = _TIMESERIES_LOOKBACK_DAYS.get(
+            tf, _DEFAULT_TIMESERIES_LOOKBACK_DAYS
+        )
         # Bucket-aware window floor — see get_historical_quotes for the
         # rationale.  ``window_units`` means "N buckets that have data".
         bucket_floor = _bucket_floor_subquery(
-            table="underlying_vwap_deviation",
+            table="src",
             bucket_expr=bucket,
             symbol_predicate="symbol = $1",
             end_expr="(SELECT max_ts FROM latest)",
             limit_param="$2",
         )
+        # ``src`` inlines the underlying_vwap_deviation view body, bounded to
+        # the symbol and a recency window ($3 days). The view is unbounded over
+        # ALL symbols' full quote history; scoping the cumulative-VWAP scan here
+        # is the fix for the cold cost. Its cumulative window is per ET trading
+        # day, so bounding the input to whole recent days is exact for every
+        # returned bucket. Columns mirror the view; see
+        # setup/database/schema.sql:underlying_vwap_deviation.
         query = f"""
-            WITH latest AS (
+            WITH src AS MATERIALIZED (
+                SELECT
+                    timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                    timestamp,
+                    symbol,
+                    price,
+                    (cum_pv / NULLIF(cum_vol, 0))::numeric(12,4) AS vwap,
+                    ROUND(((price - (cum_pv / NULLIF(cum_vol, 0)))
+                        / NULLIF((cum_pv / NULLIF(cum_vol, 0)), 0) * 100)::numeric, 3)
+                        AS vwap_deviation_pct,
+                    volume,
+                    CASE
+                        WHEN cum_vol IS NULL OR cum_vol = 0 THEN '⚪ No Volume'
+                        WHEN price > (cum_pv / NULLIF(cum_vol, 0)) * 1.002 THEN '🔥 Extended Above VWAP'
+                        WHEN price > (cum_pv / NULLIF(cum_vol, 0)) THEN '✅ Above VWAP'
+                        WHEN price < (cum_pv / NULLIF(cum_vol, 0)) * 0.998 THEN '🔥 Extended Below VWAP'
+                        ELSE '❌ Below VWAP'
+                    END AS vwap_position
+                FROM (
+                    SELECT
+                        symbol,
+                        timestamp,
+                        close AS price,
+                        (up_volume + down_volume) AS volume,
+                        SUM(close * (up_volume + down_volume)) OVER (
+                            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                            ORDER BY timestamp
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS cum_pv,
+                        SUM(up_volume + down_volume) OVER (
+                            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                            ORDER BY timestamp
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS cum_vol
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                      AND timestamp >= NOW() - ($3 || ' days')::interval
+                ) b
+            ),
+            latest AS (
                 SELECT timestamp AS max_ts
-                FROM underlying_vwap_deviation
-                WHERE symbol = $1
+                FROM src
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -94,9 +174,8 @@ class TechnicalsQueriesMixin:
                     vwap_position,
                     {bucket} AS bucket_ts,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
-                FROM underlying_vwap_deviation
-                WHERE symbol = $1
-                  AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                FROM src
+                WHERE timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             )
             SELECT
                 time_et,
@@ -115,8 +194,12 @@ class TechnicalsQueriesMixin:
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, window_units)
-                return [dict(row) for row in rows]
+                rows = await conn.fetch(query, symbol, window_units, str(lookback_days))
+                result = [dict(row) for row in rows]
+                self._cache_set(
+                    cache_key, result, self._technicals_timeseries_cache_ttl_seconds
+                )
+                return result
         except Exception as e:
             logger.error(f"Error fetching VWAP deviation: {e}", exc_info=True)
             raise
@@ -275,21 +358,79 @@ class TechnicalsQueriesMixin:
     ) -> List[Dict[str, Any]]:
         """Get opening range breakout status by interval/window."""
         window_units = max(1, min(window_units, 90))
+        symbol = symbol.upper()
+        tf = _normalize_timeframe(timeframe)
+        cache_key = f"opening_range:{symbol}:{tf}:{window_units}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
         bucket = _bucket_expr(timeframe)
+        lookback_days = _TIMESERIES_LOOKBACK_DAYS.get(
+            tf, _DEFAULT_TIMESERIES_LOOKBACK_DAYS
+        )
         # Bucket-aware window floor — see get_historical_quotes for the
         # rationale.  ``window_units`` means "N buckets that have data".
         bucket_floor = _bucket_floor_subquery(
-            table="opening_range_breakout",
+            table="src",
             bucket_expr=bucket,
             symbol_predicate="symbol = $1",
             end_expr="(SELECT max_ts FROM latest)",
             limit_param="$2",
         )
+        # ``src`` inlines the opening_range_breakout view body, bounded to the
+        # symbol and a recency window ($3 days). The view's first_30min CTE has
+        # no symbol filter and no time bound, so it recomputes the opening range
+        # for EVERY symbol across ALL history on each call — the cold cost.
+        # Both the ORB aggregation and the outer join are per ET trading day, so
+        # bounding the input to whole recent days is exact for every returned
+        # bucket. Columns mirror the view; see
+        # setup/database/schema.sql:opening_range_breakout.
         query = f"""
-            WITH latest AS (
+            WITH src AS MATERIALIZED (
+                WITH first_30min AS (
+                    SELECT
+                        symbol,
+                        DATE(timestamp AT TIME ZONE 'America/New_York') AS trade_date,
+                        MAX(high) AS orb_high,
+                        MIN(low) AS orb_low,
+                        MAX(high) - MIN(low) AS orb_range
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                      AND timestamp >= NOW() - ($3 || ' days')::interval
+                      AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 9
+                      AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 30 AND 59
+                    GROUP BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                )
+                SELECT
+                    q.timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                    q.timestamp,
+                    q.symbol,
+                    q.close AS current_price,
+                    orb.orb_high,
+                    orb.orb_low,
+                    orb.orb_range,
+                    ROUND(q.close - orb.orb_high, 2) AS distance_above_orb_high,
+                    ROUND(orb.orb_low - q.close, 2) AS distance_below_orb_low,
+                    ROUND((q.close - orb.orb_low) / NULLIF(orb.orb_range, 0) * 100, 1) AS orb_pct,
+                    CASE
+                        WHEN q.close > orb.orb_high THEN '🚀 ORB Breakout (Long)'
+                        WHEN q.close < orb.orb_low THEN '💥 ORB Breakdown (Short)'
+                        WHEN q.close >= orb.orb_high * 0.998 THEN '⚡ Near ORB High'
+                        WHEN q.close <= orb.orb_low * 1.002 THEN '⚡ Near ORB Low'
+                        ELSE '⏸️ Inside ORB'
+                    END AS orb_status,
+                    (q.up_volume + q.down_volume) AS volume
+                FROM underlying_quotes q
+                JOIN first_30min orb
+                  ON q.symbol = orb.symbol
+                 AND DATE(q.timestamp AT TIME ZONE 'America/New_York') = orb.trade_date
+                WHERE q.symbol = $1
+                  AND q.timestamp >= NOW() - ($3 || ' days')::interval
+            ),
+            latest AS (
                 SELECT timestamp AS max_ts
-                FROM opening_range_breakout
-                WHERE symbol = $1
+                FROM src
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -315,9 +456,8 @@ class TechnicalsQueriesMixin:
                     volume,
                     {bucket} AS bucket_ts,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
-                FROM opening_range_breakout
-                WHERE symbol = $1
-                  AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                FROM src
+                WHERE timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             )
             SELECT
                 time_et,
@@ -340,8 +480,12 @@ class TechnicalsQueriesMixin:
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, window_units)
-                return [dict(row) for row in rows]
+                rows = await conn.fetch(query, symbol, window_units, str(lookback_days))
+                result = [dict(row) for row in rows]
+                self._cache_set(
+                    cache_key, result, self._technicals_timeseries_cache_ttl_seconds
+                )
+                return result
         except Exception as e:
             logger.error(f"Error fetching ORB: {e}", exc_info=True)
             raise
@@ -721,8 +865,22 @@ class TechnicalsQueriesMixin:
     async def get_momentum_divergence(
         self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get momentum divergence signals matching Makefile divergence shortcut semantics."""
+        """Get momentum divergence signals matching Makefile divergence shortcut semantics.
+
+        Cached (short TTL): already recency-bounded to the last 2 days, but the
+        flow_contract_facts aggregation is non-trivial and this was the last
+        uncached read in the technicals family. The ``timeframe`` arg does not
+        affect the result (kept in the cache key for symmetry with the sibling
+        endpoints).
+        """
         window_units = max(1, min(window_units, 90))
+        symbol = symbol.upper()
+        tf = _normalize_timeframe(timeframe)
+        cache_key = f"momentum_div:{symbol}:{tf}:{window_units}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
         query = """
             WITH option_flow AS (
                 SELECT
@@ -771,7 +929,11 @@ class TechnicalsQueriesMixin:
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, window_units)
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(
+                    cache_key, result, self._technicals_timeseries_cache_ttl_seconds
+                )
+                return result
         except Exception as e:
             logger.error(f"Error fetching momentum divergence: {e}", exc_info=True)
             raise

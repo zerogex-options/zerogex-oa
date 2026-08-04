@@ -522,6 +522,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._session_closes_cache_ttl_seconds: float = _getenv_float(
             "SESSION_CLOSES_CACHE_TTL_SECONDS", 15.0
         )
+        # Bucketed technicals timeseries (vwap-deviation, opening-range,
+        # momentum-divergence). These were the last uncached read family and,
+        # for the two view-backed ones, also scanned full quote history; the
+        # queries are now recency-bounded (see technicals.py) and this short
+        # TTL collapses the chart-poll load on top. Per-minute-bar data, so the
+        # live bucket lags at most this TTL.
+        self._technicals_timeseries_cache_ttl_seconds: float = _getenv_float(
+            "TECHNICALS_TIMESERIES_CACHE_TTL_SECONDS", 10.0
+        )
         # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
         # effectively unbounded keyspace (per strike-set/expiration-set query
         # string); a plain dict only evicted a key when that exact key was
