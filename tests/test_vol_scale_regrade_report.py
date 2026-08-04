@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from src.jobs.forecast_range_model import RANGE_OVER_SIGMA
 from src.tools.vol_scale_regrade_report import analyze
@@ -35,11 +35,11 @@ class _FakeConn:
 
 # Row tuple order matches the tool's SELECT:
 # (symbol, date, open_spot, actual_low, actual_high, implied_move,
-#  expected_vol_state, vol_state_correct)
+#  expected_vol_state, vol_state_correct, forecast_inputs)
 def _row(symbol, actual_low, actual_high, implied_move,
-         expected_vol_state, committed_correct):
-    return (symbol, date(2026, 8, 1), 600.0, actual_low, actual_high,
-            implied_move, expected_vol_state, committed_correct)
+         expected_vol_state, committed_correct, day=date(2026, 8, 1), fi=None):
+    return (symbol, day, 600.0, actual_low, actual_high,
+            implied_move, expected_vol_state, committed_correct, fi)
 
 
 def _normal_range(implied: float) -> float:
@@ -100,6 +100,44 @@ def test_rows_without_implied_move_are_not_vol_gradeable():
     assert s.fixed_rate is None
     assert s.committed_scored == 1
     assert s.committed_rate == 1.0
+
+
+def test_reworked_prediction_beats_static_normal_via_persistence():
+    # A regime that CLUSTERS: 8 quiet days then 8 active days. The committed v1.4
+    # model called "normal" every day. On the calibrated scale the window splits
+    # into compression + expansion (0 normal), so the static "normal" call never
+    # hits — but the causal persistence anchor tracks each cluster and recovers a
+    # chunk of them, i.e. the rework strictly beats the shipped model here.
+    implied = 5.0
+    rows = []
+    for i in range(16):
+        raw = 0.40 if i < 8 else 0.90  # low-vol cluster, then high-vol cluster
+        rng = raw * RANGE_OVER_SIGMA * implied
+        rows.append(_row(
+            "SPY", 600 - rng / 2, 600 + rng / 2, implied,
+            expected_vol_state="normal", committed_correct=False,
+            day=date(2026, 8, 1) + timedelta(days=i),
+        ))
+    s = analyze(_FakeConn(rows), None)["SPY"]
+    assert s.calib_rate == 0.0                       # static "normal" hits nothing
+    assert s.reworked_rate is not None
+    assert s.reworked_rate > s.calib_rate            # persistence recovers days
+    assert s.baseline_rate == 0.5                    # 8 comp / 8 exp
+    assert s.reworked_scored == 16
+
+
+def test_atr_over_implied_diagnostic_collected():
+    # The implied_move sanity ratio is surfaced from the forecast_inputs blob.
+    implied = 5.0
+    rng = RANGE_OVER_SIGMA * implied
+    rows = [
+        _row("SPY", 600 - rng / 2, 600 + rng / 2, implied,
+             expected_vol_state="normal", committed_correct=True,
+             day=date(2026, 8, 1) + timedelta(days=i), fi={"atr_5d": 6.5})
+        for i in range(3)
+    ]
+    s = analyze(_FakeConn(rows), None)["SPY"]
+    assert s.median_atr_over_implied == 1.3          # 6.5 / 5.0
 
 
 def test_analyze_empty():
