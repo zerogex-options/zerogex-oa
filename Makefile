@@ -1121,6 +1121,29 @@ type-check: ## Run mypy on src
 	$(PY) -m mypy src
 
 # =============================================================================
+# =============================================================================
+# Trade Bias / MSI calibration sweeps (read-only; run against the live DB)
+# Horizons use assigned vars so commas survive $(or): TB_HORIZONS / TB_MSI_HORIZONS
+# =============================================================================
+TB_HORIZONS ?= 15,30,60
+TB_MSI_HORIZONS ?= 30,60
+
+.PHONY: trade-bias-direction
+trade-bias-direction: ## Trade Bias signed-direction hit-rate by confidence bucket. Vars: SYMBOL=SPY TENOR=swing DAYS=30 TB_HORIZONS=15,30,60
+	$(PY) -m src.backtesting.trade_bias_direction_sweep --symbol $(or $(SYMBOL),SPY) --tenor $(or $(TENOR),swing) --days $(or $(DAYS),30) --horizons $(TB_HORIZONS)
+
+.PHONY: trade-bias-override
+trade-bias-override: ## Trade Bias override-threshold sweep. Vars: SYMBOL=SPY TENOR=swing DAYS=30 TB_HORIZONS=15,30,60
+	$(PY) -m src.backtesting.trade_bias_override_sweep --symbol $(or $(SYMBOL),SPY) --tenor $(or $(TENOR),swing) --days $(or $(DAYS),30) --horizons $(TB_HORIZONS)
+
+.PHONY: msi-regime
+msi-regime: ## MSI regime-validity sweep (continuation vs reversal by MSI band). Vars: SYMBOL=SPY DAYS=30 TB_MSI_HORIZONS=30,60
+	$(PY) -m src.backtesting.msi_regime_sweep --symbol $(or $(SYMBOL),SPY) --tenor $(or $(TENOR),swing) --days $(or $(DAYS),30) --horizons $(TB_MSI_HORIZONS)
+
+.PHONY: trade-bias-report
+trade-bias-report: ## All Trade Bias + MSI sweeps across SPY/SPX/QQQ over a longer window. Vars: SYMBOLS="SPY SPX QQQ" DAYS=90
+	@for sym in $(or $(SYMBOLS),SPY SPX QQQ); do echo ""; echo "===== $$sym (last $(or $(DAYS),90)d) ====="; $(PY) -m src.backtesting.trade_bias_direction_sweep --symbol $$sym --tenor swing --days $(or $(DAYS),90) --horizons $(TB_HORIZONS); $(PY) -m src.backtesting.trade_bias_direction_sweep --symbol $$sym --tenor intraday --days $(or $(DAYS),90) --horizons $(TB_HORIZONS); $(PY) -m src.backtesting.trade_bias_override_sweep --symbol $$sym --tenor swing --days $(or $(DAYS),90) --horizons $(TB_HORIZONS); $(PY) -m src.backtesting.msi_regime_sweep --symbol $$sym --days $(or $(DAYS),90) --horizons $(TB_MSI_HORIZONS); done
+
 # TradeWorkz thesis backtests (run against the live/analytics DB)
 # =============================================================================
 .PHONY: tw-magnet-backtest
