@@ -32,6 +32,10 @@ class MaxPainGravitator(BaseBot):
         if abs(drift) < min_drift:
             return None
         direction = "bullish" if drift > 0 else "bearish"
+        # Don't fade a strongly trending tape (reversion into a trend gets run
+        # over — the live -50%/-70% put losses on an up-day).
+        if self._trend_veto(snap, direction):
+            return None
 
         quality = min(1.0, abs(drift) / 0.012) * 0.8 + 0.2
         conviction = self.compute_conviction(snap, quality)
@@ -54,7 +58,8 @@ class MaxPainGravitator(BaseBot):
             conviction=conviction,
             target_price=snap.max_pain,
             stop_price=stop,
-            time_stop_at=_utcnow() + timedelta(minutes=int(self.params.get("max_hold_minutes", 24 * 60))),
+            time_stop_at=_utcnow()
+            + timedelta(minutes=int(self.params.get("max_hold_minutes", 24 * 60))),
             rationale=f"max_pain {snap.max_pain:.2f}, drift {drift*100:+.2f}%",
             components_at_entry={
                 "max_pain": snap.max_pain,

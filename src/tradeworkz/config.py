@@ -72,9 +72,32 @@ EXECUTION_SLIPPAGE_PCT: float = _getenv_float(
 # the reconciler closes the position on the next tick with
 # reason='premium_stop'. Set to 0 to disable. Per-bot override via
 # params['max_premium_loss_pct'] takes precedence over this default.
+# Reverted 0.25 -> 0.40 after live data showed the tighter cap stopping cheap
+# 0DTE structures on the entry-tick bid/ask + slippage gap alone: a $0.62 debit
+# spread marks ~$0.42 the instant it opens (~-32%), tripping a 25% stop at 0.0
+# min before any thesis can play out. 0.40 clears that microstructure noise; the
+# proper fix (min-premium floor + a premium-stop grace window) is tracked
+# separately so the stop protects against real adverse moves, not the spread.
 MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
-    "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.25, min=0.0, max=1.0
+    "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.40, min=0.0, max=1.0
 )
+# Grace window (seconds after open) during which the premium stop does NOT
+# fire. A freshly opened position is first marked at the CLOSE side (bid −
+# slippage), so on a wide-market 0DTE structure the very first mark can show a
+# large phantom loss from the bid/ask + slippage round-trip alone (a $0.62
+# spread marking ~$0.42, ~-32%) — not a real adverse move. This lets that
+# entry-tick gap settle before the premium stop can act; a genuine adverse move
+# persists past the window and still stops. Set 0 to disable. Kept well under
+# MIN_HOLD_SECONDS so it never delays a real risk exit by much.
+PREMIUM_STOP_GRACE_SECONDS: int = _getenv_int(
+    "TRADEWORKZ_PREMIUM_STOP_GRACE_SECONDS", 45, min=0, max=3600
+)
+# Minimum per-share entry premium to open a position. Below this, the bid/ask
+# width tends to dominate the premium and every trade round-trips at a loss.
+# A coarse proxy for "spread too wide relative to premium." Default 0 = no
+# floor (unchanged); raise it (e.g. 0.30) per fleet or per-bot after reviewing
+# tradeworkz-review, since it will filter otherwise-valid cheap 0DTE structures.
+MIN_ENTRY_PREMIUM: float = _getenv_float("TRADEWORKZ_MIN_ENTRY_PREMIUM", 0.0, min=0.0, max=1000.0)
 
 # ---------------------------------------------------------------------------
 # Scale-out ladder (profit-harvesting on positions in profit)
@@ -124,6 +147,24 @@ RUNNER_TRAIL_GIVEBACK_PCT: float = _getenv_float(
 # via params['ladder_max_move_pct'].
 LADDER_MAX_MOVE_PCT: float = _getenv_float(
     "TRADEWORKZ_LADDER_MAX_MOVE_PCT", 0.008, min=0.0, max=1.0
+)
+
+# ---------------------------------------------------------------------------
+# Reversion trend filter (don't fade a strong directional tape)
+# ---------------------------------------------------------------------------
+# Mean-reversion bots (max_pain / wall-bouncer / VWAP scalper) fade extension —
+# they go short when price is stretched above a level and long when below.
+# That is the WRONG side of a strongly trending day: on a gamma-positive but
+# up-TRENDING session the fleet went net-short and got run over (puts -50% to
+# -70%). This filter vetoes a fade whose direction opposes a strong recent move
+# in snap.recent_closes (1-minute closes): a bearish fade is blocked when the
+# last TREND_VETO_LOOKBACK_BARS closes are up >= TREND_VETO_PCT, a bullish fade
+# when they are down that much. Momentum/breakout bots do NOT apply it (they
+# trade WITH the trend). Per-bot overridable; set TREND_VETO_PCT=0 to disable.
+# NOTE: defaults are a reasonable first cut — tune against tradeworkz-review.
+TREND_VETO_PCT: float = _getenv_float("TRADEWORKZ_TREND_VETO_PCT", 0.002, min=0.0, max=1.0)
+TREND_VETO_LOOKBACK_BARS: int = _getenv_int(
+    "TRADEWORKZ_TREND_VETO_LOOKBACK_BARS", 10, min=2, max=390
 )
 
 # ---------------------------------------------------------------------------

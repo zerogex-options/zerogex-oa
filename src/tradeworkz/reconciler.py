@@ -20,7 +20,7 @@ from src.tradeworkz import ml as ml_mod
 from src.tradeworkz import notifications
 from src.tradeworkz.models import BotCapital, ExitDecision, OpenPosition, TradeSignal
 from src.tradeworkz.pricing import spread_price
-from src.tradeworkz.sizing import compute_contracts
+from src.tradeworkz.sizing import compute_contracts, structure_max_loss_per_share
 
 logger = logging.getLogger(__name__)
 
@@ -246,7 +246,21 @@ def open_position(
     if entry_price is None or entry_price <= 0:
         logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
         return None
+    # Minimum-premium floor: below this, the bid/ask width dominates the premium
+    # and the position round-trips at a loss on the spread alone. Default 0 (no
+    # floor). See MIN_ENTRY_PREMIUM.
+    min_prem = float(tw_config.MIN_ENTRY_PREMIUM)
+    if min_prem > 0 and entry_price < min_prem:
+        logger.debug(
+            "entry premium %.4f below floor %.4f for bot=%s", entry_price, min_prem, signal.bot_id
+        )
+        return None
 
+    # Size on the structure's TRUE per-contract max loss, not the net premium.
+    # Identical to entry_price for long-debit structures; for a defined-risk
+    # credit structure (iron condor) it's the wing width, which prevents the
+    # ~34x over-sizing that a near-zero net debit would otherwise produce.
+    max_loss = structure_max_loss_per_share(legs_dicts, entry_price)
     contracts = compute_contracts(
         capital=capital,
         entry_price=entry_price,
@@ -254,6 +268,7 @@ def open_position(
         size_multiplier=size_multiplier,
         wall_strength=wall_strength,
         daily_realized_pnl=daily_realized_pnl,
+        max_loss_per_share=max_loss,
     )
     if contracts <= 0:
         return None

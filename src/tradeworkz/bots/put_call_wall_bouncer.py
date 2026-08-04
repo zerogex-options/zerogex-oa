@@ -70,6 +70,11 @@ class PutCallWallBouncer(BaseBot):
         else:
             return None
 
+        # Don't fade a strongly trending tape — a wall fade into a strong move
+        # is fighting the trend (the live incident's short-into-an-up-day).
+        if self._trend_veto(snap, direction):
+            return None
+
         quality = self._quality(snap, wall_side)
         # Feature blob for the ML overlay in compute_conviction — the same
         # keys logged in components_at_entry below, so the online classifier
