@@ -36,6 +36,9 @@ class VwapReversionScalper(BaseBot):
         if abs(stretch) < min_stretch:
             return None
         direction = "bearish" if stretch > 0 else "bullish"
+        # Don't fade a strongly trending tape (reversion into a trend loses).
+        if self._trend_veto(snap, direction):
+            return None
         quality = min(1.0, abs(stretch) / 0.005) * 0.8 + 0.2
         conviction = self.compute_conviction(snap, quality)
         if conviction < self.confidence_threshold():
@@ -55,7 +58,8 @@ class VwapReversionScalper(BaseBot):
             conviction=conviction,
             target_price=snap.vwap,
             stop_price=stop,
-            time_stop_at=_utcnow() + timedelta(minutes=int(self.params.get("max_hold_minutes", 30))),
+            time_stop_at=_utcnow()
+            + timedelta(minutes=int(self.params.get("max_hold_minutes", 30))),
             rationale=f"VWAP stretch {stretch*100:+.2f}% in {snap.gex_regime()} gamma",
             components_at_entry={
                 "vwap": snap.vwap,

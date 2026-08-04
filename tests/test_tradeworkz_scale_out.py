@@ -278,8 +278,9 @@ def test_stage2_rides_to_time_stop():
 
 
 def test_premium_stop_still_fires_when_armed():
-    # Catastrophic floor beats the ladder: 25% premium loss closes everything.
-    pos = _armed_pos(scale_stage=1, quantity_open=4, current_price=0.70)
+    # Catastrophic floor beats the ladder: a >=40% premium loss closes
+    # everything (entry 1.00, mark 0.55 -> -45%) before the runner logic runs.
+    pos = _armed_pos(scale_stage=1, quantity_open=4, current_price=0.55)
     d = _bot().exit_criteria(_snap(750.20), pos)
     assert d.should_close is True
     assert d.reason == "premium_stop"

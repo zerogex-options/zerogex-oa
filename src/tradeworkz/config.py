@@ -133,6 +133,24 @@ LADDER_MAX_MOVE_PCT: float = _getenv_float(
 )
 
 # ---------------------------------------------------------------------------
+# Reversion trend filter (don't fade a strong directional tape)
+# ---------------------------------------------------------------------------
+# Mean-reversion bots (max_pain / wall-bouncer / VWAP scalper) fade extension —
+# they go short when price is stretched above a level and long when below.
+# That is the WRONG side of a strongly trending day: on a gamma-positive but
+# up-TRENDING session the fleet went net-short and got run over (puts -50% to
+# -70%). This filter vetoes a fade whose direction opposes a strong recent move
+# in snap.recent_closes (1-minute closes): a bearish fade is blocked when the
+# last TREND_VETO_LOOKBACK_BARS closes are up >= TREND_VETO_PCT, a bullish fade
+# when they are down that much. Momentum/breakout bots do NOT apply it (they
+# trade WITH the trend). Per-bot overridable; set TREND_VETO_PCT=0 to disable.
+# NOTE: defaults are a reasonable first cut — tune against tradeworkz-review.
+TREND_VETO_PCT: float = _getenv_float("TRADEWORKZ_TREND_VETO_PCT", 0.002, min=0.0, max=1.0)
+TREND_VETO_LOOKBACK_BARS: int = _getenv_int(
+    "TRADEWORKZ_TREND_VETO_LOOKBACK_BARS", 10, min=2, max=390
+)
+
+# ---------------------------------------------------------------------------
 # Regular-trading-hours (RTH) gate on NEW opens
 # ---------------------------------------------------------------------------
 # Every fleet bot trades same-day (0DTE) debits, and the reconciler

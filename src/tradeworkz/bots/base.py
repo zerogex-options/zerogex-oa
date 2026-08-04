@@ -290,6 +290,41 @@ class BaseBot:
             "max_move_pct": self._ladder_max_move_pct(),
         }
 
+    def _trend_veto(self, snap: MarketSnapshot, direction: str) -> bool:
+        """True when a strong recent trend runs AGAINST a mean-reversion entry.
+
+        Reversion bots fade extension; on a strongly trending tape that means
+        fighting the trend (the live incident: the fleet shorting an up-day and
+        the puts getting run over). A bearish fade is vetoed when the last
+        ``trend_veto_lookback_bars`` one-minute closes are up by at least
+        ``trend_veto_pct``; a bullish fade when they are down that much.
+        Momentum / breakout bots do NOT call this — they want the trend. Per-bot
+        overridable; a ``trend_veto_pct`` of 0 disables it. See
+        :data:`TREND_VETO_PCT`.
+        """
+        from src.tradeworkz import config as tw_config
+
+        pct = self._resolve_ladder_frac("trend_veto_pct", tw_config.TREND_VETO_PCT, 0.0, 1.0)
+        if pct <= 0.0 or direction not in ("bullish", "bearish"):
+            return False
+        try:
+            n = int(self.params.get("trend_veto_lookback_bars", tw_config.TREND_VETO_LOOKBACK_BARS))
+        except (TypeError, ValueError):
+            n = int(tw_config.TREND_VETO_LOOKBACK_BARS)
+        n = max(2, n)
+        closes = [float(c) for c in (snap.recent_closes or []) if c is not None and c > 0]
+        if len(closes) < n:
+            return False
+        window = closes[-n:]
+        if window[0] <= 0:
+            return False
+        move = (window[-1] - window[0]) / window[0]
+        if direction == "bearish" and move >= pct:
+            return True  # strong up-move — don't fade it short
+        if direction == "bullish" and move <= -pct:
+            return True  # strong down-move — don't fade it long
+        return False
+
     # -- Subclass overrides ---------------------------------------------
 
     def open_criteria(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
