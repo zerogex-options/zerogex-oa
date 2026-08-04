@@ -81,6 +81,23 @@ EXECUTION_SLIPPAGE_PCT: float = _getenv_float(
 MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
     "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.40, min=0.0, max=1.0
 )
+# Grace window (seconds after open) during which the premium stop does NOT
+# fire. A freshly opened position is first marked at the CLOSE side (bid −
+# slippage), so on a wide-market 0DTE structure the very first mark can show a
+# large phantom loss from the bid/ask + slippage round-trip alone (a $0.62
+# spread marking ~$0.42, ~-32%) — not a real adverse move. This lets that
+# entry-tick gap settle before the premium stop can act; a genuine adverse move
+# persists past the window and still stops. Set 0 to disable. Kept well under
+# MIN_HOLD_SECONDS so it never delays a real risk exit by much.
+PREMIUM_STOP_GRACE_SECONDS: int = _getenv_int(
+    "TRADEWORKZ_PREMIUM_STOP_GRACE_SECONDS", 45, min=0, max=3600
+)
+# Minimum per-share entry premium to open a position. Below this, the bid/ask
+# width tends to dominate the premium and every trade round-trips at a loss.
+# A coarse proxy for "spread too wide relative to premium." Default 0 = no
+# floor (unchanged); raise it (e.g. 0.30) per fleet or per-bot after reviewing
+# tradeworkz-review, since it will filter otherwise-valid cheap 0DTE structures.
+MIN_ENTRY_PREMIUM: float = _getenv_float("TRADEWORKZ_MIN_ENTRY_PREMIUM", 0.0, min=0.0, max=1000.0)
 
 # ---------------------------------------------------------------------------
 # Scale-out ladder (profit-harvesting on positions in profit)

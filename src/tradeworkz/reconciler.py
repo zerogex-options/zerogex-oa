@@ -246,6 +246,15 @@ def open_position(
     if entry_price is None or entry_price <= 0:
         logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
         return None
+    # Minimum-premium floor: below this, the bid/ask width dominates the premium
+    # and the position round-trips at a loss on the spread alone. Default 0 (no
+    # floor). See MIN_ENTRY_PREMIUM.
+    min_prem = float(tw_config.MIN_ENTRY_PREMIUM)
+    if min_prem > 0 and entry_price < min_prem:
+        logger.debug(
+            "entry premium %.4f below floor %.4f for bot=%s", entry_price, min_prem, signal.bot_id
+        )
+        return None
 
     # Size on the structure's TRUE per-contract max loss, not the net premium.
     # Identical to entry_price for long-debit structures; for a defined-risk

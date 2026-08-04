@@ -375,9 +375,23 @@ class BaseBot:
         # need a wider profit-loss check the reconciler can grow into
         # later. For now only long-debit structures (entry_price > 0)
         # get the check, which covers every current bot.
+        from src.tradeworkz import config as tw_config
+
         pct = self._max_premium_loss_pct()
+        # Grace window: a freshly opened position is first marked at the close
+        # side (bid − slippage), so the entry-tick bid/ask + slippage gap can
+        # look like a large loss that is not a real adverse move. Suppress the
+        # premium stop until the grace elapses so it fires on moves, not the
+        # spread. See PREMIUM_STOP_GRACE_SECONDS.
+        grace = int(tw_config.PREMIUM_STOP_GRACE_SECONDS)
+        in_premium_grace = (
+            grace > 0
+            and position.opened_at is not None
+            and (now - position.opened_at).total_seconds() < grace
+        )
         if (
             pct > 0
+            and not in_premium_grace
             and position.entry_price
             and position.entry_price > 0
             and position.current_price is not None
