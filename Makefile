@@ -2961,6 +2961,13 @@ gamma-flip-revalidate: ## Re-validate relative gamma-flip thresholds vs post-dep
 		--window-days $(GAMMA_FLIP_WINDOW_DAYS) \
 		$(if $(GAMMA_FLIP_STABLE_SINCE),--stable-since $(GAMMA_FLIP_STABLE_SINCE))
 
+.PHONY: vol-scale-regrade-report
+vol-scale-regrade-report: ## Backtest the corrected vol-grade range/σ scale vs stored history (read-only). Vars: VOL_SYMBOL (optional), VOL_JSON (optional out path)
+	@echo "$(BLUE)=== Vol-scale regrade backtest (read-only) ===$(NC)"
+	@$(PY) -m src.tools.vol_scale_regrade_report \
+		$(if $(VOL_SYMBOL),--symbol $(VOL_SYMBOL)) \
+		$(if $(VOL_JSON),--json $(VOL_JSON))
+
 .PHONY: regime-regrade-report
 regime-regrade-report: ## Backtest the corrected dealer-gamma regime vs stored history (read-only). Vars: REGIME_SYMBOL (optional), REGIME_JSON (optional out path)
 	@echo "$(BLUE)=== Regime regrade backtest (read-only) ===$(NC)"
