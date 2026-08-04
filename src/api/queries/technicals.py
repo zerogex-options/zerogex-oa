@@ -349,17 +349,18 @@ class TechnicalsQueriesMixin:
     async def get_dealer_hedging_pressure(self, symbol: str = "SPY") -> List[Dict[str, Any]]:
         """Get dealer hedging pressure (point-in-time snapshot).
 
-        The ``dealer_hedging_pressure`` view emits exactly one row per
-        symbol — the current state aggregated across all option contracts —
-        so this is intentionally not a timeseries.
+        Emits exactly one row (the current state aggregated across the
+        symbol's option contracts) — intentionally not a timeseries.
 
-        Cached (short TTL): the view's ``latest_delta`` CTE re-aggregates the
-        last 10 minutes of ``option_chains`` across the whole option universe
-        on every call (a ``LEFT JOIN`` prevents the ``symbol`` filter from
-        pruning it), which is why this was the slowest measured endpoint
-        (~12s). The gauge is coarse and barely moves within the TTL, so the
-        cache both collapses the repeat cost and stops the query from
-        monopolising a pool slot on every poll.
+        Reads ``option_chains`` / ``underlying_quotes`` scoped to the requested
+        symbol directly, rather than selecting from the whole-universe
+        ``dealer_hedging_pressure`` view. That view aggregates the last 10
+        minutes of ``option_chains`` across EVERY underlying and only filters
+        to the symbol afterward — a ``LEFT JOIN`` blocks the filter from
+        pruning the scan — which was the ~12s cold cost. Scoping the delta
+        aggregation to one ``underlying`` (idx(underlying, timestamp)) makes it
+        a small single-symbol read; the output columns are identical to the
+        view. Still cached (short TTL) to collapse repeat polls.
         """
         symbol = symbol.upper()
         cache_key = f"dealer_hedging:{symbol}"
@@ -367,17 +368,73 @@ class TechnicalsQueriesMixin:
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
+        # Single-symbol equivalent of the dealer_hedging_pressure view.
+        # Both scans are bounded to $1 (and a short recency window) so they
+        # use idx(symbol/underlying, timestamp) instead of the view's
+        # universe-wide DISTINCT ON. Column list + semantics mirror the view
+        # exactly; see setup/database/schema.sql:dealer_hedging_pressure.
         query = """
+            WITH recent AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    close AS current_price,
+                    -- Intraday LAG (partition by ET trading day) so the first
+                    -- bar of a session yields NULL rather than an overnight gap.
+                    close - LAG(close) OVER (
+                        PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
+                        ORDER BY timestamp
+                    ) AS price_change
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  -- Bounded range scan; a few days is ample to resolve the
+                  -- latest bar and its same-day predecessor for the LAG.
+                  AND timestamp >= NOW() - INTERVAL '7 days'
+            ),
+            latest_price AS (
+                SELECT timestamp, symbol, current_price, price_change
+                FROM recent
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            latest_delta AS (
+                -- SUM(delta * OI * 100) over each option's most recent tick in
+                -- the last 10 min, scoped to THIS underlying so it prunes to
+                -- idx(underlying, timestamp) instead of the whole option chain.
+                SELECT SUM(delta * open_interest::numeric * 100) AS expected_hedge_shares
+                FROM (
+                    SELECT DISTINCT ON (option_symbol)
+                        option_symbol, delta, open_interest
+                    FROM option_chains
+                    WHERE underlying = $1
+                      AND timestamp >= NOW() - INTERVAL '10 minutes'
+                      AND delta IS NOT NULL
+                      AND open_interest > 0
+                    ORDER BY option_symbol, timestamp DESC
+                ) t
+            )
             SELECT
-                time_et,
-                timestamp,
-                symbol,
-                current_price,
-                price_change,
-                expected_hedge_shares,
-                hedge_pressure
-            FROM dealer_hedging_pressure
-            WHERE symbol = $1
+                p.timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                p.timestamp,
+                p.symbol,
+                p.current_price,
+                p.price_change,
+                COALESCE(d.expected_hedge_shares, 0) AS expected_hedge_shares,
+                -- Symbol-aware threshold, identical to the view's
+                -- notional_scale: (current_price*100*10000)/current_price.
+                -- Kept in expression form (not the reduced 1e6) so the
+                -- NULL/zero-price edge case matches the view exactly.
+                CASE
+                    WHEN COALESCE(d.expected_hedge_shares, 0)
+                         > (p.current_price * 100 * 10000) / NULLIF(p.current_price, 0)
+                        THEN '🟢 Dealer Long Hedge'
+                    WHEN COALESCE(d.expected_hedge_shares, 0)
+                         < -(p.current_price * 100 * 10000) / NULLIF(p.current_price, 0)
+                        THEN '🔴 Dealer Short Hedge'
+                    ELSE '⚪ Dealer Balanced Hedge'
+                END AS hedge_pressure
+            FROM latest_price p
+            LEFT JOIN latest_delta d ON TRUE
         """
 
         try:
@@ -412,12 +469,14 @@ class TechnicalsQueriesMixin:
         the ETF's per-bar volume profile to the index's prices.
         Equities/ETFs continue to use the canonical view.
 
-        Cached (short TTL): the ``unusual_volume_spikes`` view recomputes a
-        rolling AVG/STDDEV window over the symbol's full quote history on every
-        call, so even the common empty result (no ≥3σ bar right now) cost ~5s.
-        Caching — including the empty result — collapses that repeat scan; a
-        fresh extreme bar can appear at most once per 1-minute bar, so the
-        short TTL keeps the feed responsive.
+        The rolling AVG/STDDEV window is computed over a bounded recent slice
+        of ``underlying_quotes`` (scoped to the symbol) instead of the
+        ``unusual_volume_spikes`` view's full-history scan — the ~5s cold cost.
+        The window is per-ET-day, so a 30-day input is far more than enough to
+        surface the latest ≥3σ bars this endpoint returns; output columns are
+        identical to the view. Also cached (short TTL) — including the common
+        empty result — since a fresh extreme bar appears at most once per
+        1-minute bar.
         """
         symbol = symbol.upper()
         cache_key = f"volume_spikes:{symbol}:{limit}"
@@ -435,7 +494,78 @@ class TechnicalsQueriesMixin:
             )
             return result
 
+        # Bounded single-symbol equivalent of the unusual_volume_spikes view.
+        # The WHERE bounds the window input to recent history so it range-scans
+        # idx(symbol, timestamp) instead of windowing the symbol's entire quote
+        # history. Column list + sigma/label semantics mirror the view exactly;
+        # see setup/database/schema.sql:unusual_volume_spikes.
         query = """
+            WITH base AS (
+                SELECT
+                    timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                    timestamp,
+                    symbol,
+                    close AS price,
+                    up_volume,
+                    down_volume,
+                    (up_volume + down_volume) AS current_volume,
+                    -- Rolling baseline partitioned by ET trading day so the
+                    -- open's structurally-high volume isn't measured against
+                    -- the prior session's tail.
+                    AVG(up_volume + down_volume) OVER (
+                        PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                        ORDER BY timestamp
+                        ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+                    ) AS avg_volume,
+                    STDDEV_SAMP(up_volume + down_volume) OVER (
+                        PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                        ORDER BY timestamp
+                        ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+                    ) AS volume_stddev,
+                    ROUND(
+                        COALESCE(
+                            up_volume::numeric / NULLIF((up_volume + down_volume)::numeric, 0) * 100,
+                            50
+                        ),
+                        2
+                    ) AS buying_pressure_pct
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  -- Bound the window input to recent history (idx range scan)
+                  -- rather than the whole quote history; 30 days >> the LIMIT
+                  -- of latest extreme bars this endpoint returns.
+                  AND timestamp >= NOW() - INTERVAL '30 days'
+            ),
+            computed AS (
+                SELECT
+                    time_et,
+                    timestamp,
+                    symbol,
+                    price,
+                    up_volume,
+                    down_volume,
+                    current_volume,
+                    COALESCE(avg_volume, 0)::numeric(18,2) AS avg_volume,
+                    ROUND(
+                        COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0),
+                        2
+                    ) AS volume_sigma,
+                    ROUND(
+                        COALESCE(current_volume::numeric / NULLIF(avg_volume, 0), 1),
+                        2
+                    ) AS volume_ratio,
+                    buying_pressure_pct,
+                    CASE
+                        WHEN COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 3
+                            THEN '🚨 Extreme Spike'
+                        WHEN COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 2
+                            THEN '⚡ High Spike'
+                        WHEN COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 1
+                            THEN '📈 Moderate Spike'
+                        ELSE '⚪ Normal'
+                    END AS volume_class
+                FROM base
+            )
             SELECT
                 time_et,
                 timestamp,
@@ -449,9 +579,8 @@ class TechnicalsQueriesMixin:
                 volume_ratio,
                 buying_pressure_pct,
                 volume_class
-            FROM unusual_volume_spikes
-            WHERE symbol = $1
-              AND volume_sigma >= 3.0
+            FROM computed
+            WHERE volume_sigma >= 3.0
             ORDER BY timestamp DESC
             LIMIT $2
         """
