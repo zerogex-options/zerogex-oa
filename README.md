@@ -537,8 +537,8 @@ make analytics-health
 **What it calculates:**
 
 1. **Gamma Exposure (GEX)** by strike and in aggregate
-   - Call GEX (positive for dealers who are short)
-   - Put GEX (negative for dealers who are long)
+   - Call GEX (calls assigned positive exposure — dealers modeled net long calls)
+   - Put GEX (puts assigned negative exposure — dealers modeled net short puts)
    - Net GEX (call - put from dealer perspective)
 
 2. **Gamma Flip Point** - The "zero gamma" price level (SpotGamma /

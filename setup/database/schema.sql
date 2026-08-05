@@ -1383,8 +1383,9 @@ SELECT
     o.underlying,
     o.strike,
     -- Canonical formula: γ × OI × 100 × S² × 0.01.  Calls contribute
-    -- positively, puts contribute negatively (dealer convention: dealers
-    -- are short calls, long puts).
+    -- positively, puts contribute negatively (modeled dealer convention:
+    -- dealers net long calls, net short puts — a sign convention, not
+    -- observed inventory).
     SUM(
         CASE
             WHEN o.option_type = 'C' THEN o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
@@ -1392,8 +1393,10 @@ SELECT
         END
     ) AS net_gex,
     SUM(ABS(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01)) AS total_gex,
+    -- Split columns carry the same signs as net_gex above: call_gex ≥ 0,
+    -- put_gex ≤ 0, so call_gex + put_gex == net_gex.
     SUM(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'C') AS call_gex,
-    SUM(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'P') AS put_gex,
+    SUM(-o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'P') AS put_gex,
     COUNT(*) AS num_contracts,
     SUM(o.open_interest) AS total_oi,
     -- Per-symbol threshold: 0.1% of spot's notional × 1M-share scale.
@@ -2119,6 +2122,52 @@ CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_exp_symbol_exp
     ON max_pain_oi_snapshot_expiration(symbol, as_of_date DESC, expiration);
 
 -- =============================================================================
+-- Market Tide intraday snapshots (derived cache)
+-- =============================================================================
+-- /api/flow/market-tide serves the cross-symbol options-flow/gamma composite
+-- from this table instead of recomputing it inline on every request.  The
+-- off-process refresher (src/tools/market_tide_refresh.py ->
+-- DatabaseManager.write_market_tide_snapshots) upserts one row per
+-- (window_minutes, snapshot_ts) every 5 minutes through the cash session and
+-- freezes the final row at the 16:00 ET close; the backfill tool
+-- (src/tools/market_tide_backfill.py) seeds previous sessions the same way.
+-- The endpoint then reads the most recent row per window as a pure cache hit,
+-- so the metric stays populated (never "insufficient_data") after the cash
+-- close — users keep seeing the previous session frozen at its close.  100%
+-- derived state: safe to TRUNCATE, the next refresh/backfill rebuilds it.
+--
+-- Only PUBLISHABLE readings are stored (participation >= 60%, score NOT NULL),
+-- so the endpoint's "latest row" is always a real reading rather than a
+-- withheld one.  ``snapshot_ts`` is the compute anchor floored to the 5-minute
+-- bucket (frozen at the 16:00 ET close after the session ends), which makes a
+-- re-run at the same bucket an idempotent upsert.  ``session_date`` is the ET
+-- cash-session date of the anchor (session grouping / freeze).  ``source_ts``
+-- is the true (un-floored) anchor for provenance.  ``payload`` is the full
+-- MarketTideResponse JSON the endpoint returns verbatim.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_tide_snapshots (
+    snapshot_ts       TIMESTAMPTZ      NOT NULL,
+    window_minutes    SMALLINT         NOT NULL,
+    session_date      DATE             NOT NULL,
+    score             DOUBLE PRECISION,
+    label             VARCHAR(32)      NOT NULL,
+    participation_pct DOUBLE PRECISION NOT NULL,
+    source_ts         TIMESTAMPTZ      NOT NULL,
+    payload           JSONB            NOT NULL,
+    created_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (window_minutes, snapshot_ts)
+);
+
+-- Endpoint read: ``WHERE window_minutes = $1 ORDER BY snapshot_ts DESC
+-- LIMIT 1`` is served directly by the primary key (equality on the leading
+-- column + backward scan).  The session index backs per-session lookups
+-- (e.g. "the close row for a given trading day") used by the backfill and
+-- any future history view.
+CREATE INDEX IF NOT EXISTS idx_market_tide_snapshots_session
+    ON market_tide_snapshots(session_date, window_minutes, snapshot_ts DESC);
+
+-- =============================================================================
 -- Per-user API keys
 -- =============================================================================
 -- Long-lived API keys for individual users.  Keys are stored as SHA-256
@@ -2794,6 +2843,11 @@ CREATE TRIGGER daily_forecast_immutable
 --   * upside_lean:       additive tilt of the upper band; positive
 --                        widens upside, negative tightens (range ±0.20)
 --   * downside_lean:     additive tilt of the lower band, same range
+--   * vol_range_basis_mult: re-centers the expected-range denominator used to
+--                        grade the vol call.  A normal day's range is
+--                        √(8/π)·implied × this scalar; the cron drifts it
+--                        toward the symbol's trailing median realized range so
+--                        the variance-risk premium is learned, not assumed.
 --
 -- Bounds are enforced in Python (calibration cron clamps before writing);
 -- the schema just provides the storage + audit trail.
@@ -2805,6 +2859,7 @@ CREATE TABLE IF NOT EXISTS forecast_calibration_state (
     pin_tolerance_mult      NUMERIC(6,4) NOT NULL DEFAULT 1.0,
     upside_lean             NUMERIC(6,4) NOT NULL DEFAULT 0.0,
     downside_lean           NUMERIC(6,4) NOT NULL DEFAULT 0.0,
+    vol_range_basis_mult    NUMERIC(6,4) NOT NULL DEFAULT 1.0,
     -- Bookkeeping so we know how much data backed the current scalars
     -- and can trace the last update.  n_receipts_used tells the writer
     -- whether the corrections are "cold" (too few labels; apply
@@ -2815,6 +2870,13 @@ CREATE TABLE IF NOT EXISTS forecast_calibration_state (
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Additive migration for pre-existing calibration tables: the vol-range basis
+-- scalar was introduced with the range/σ grading fix.  DEFAULT 1.0 means an
+-- un-migrated symbol grades on the pure Parkinson constant until the cron
+-- learns its empirical center — a safe no-op, not a behavior change.
+ALTER TABLE forecast_calibration_state
+    ADD COLUMN IF NOT EXISTS vol_range_basis_mult NUMERIC(6,4) NOT NULL DEFAULT 1.0;
 
 CREATE OR REPLACE FUNCTION touch_forecast_calibration_state()
 RETURNS TRIGGER AS $$

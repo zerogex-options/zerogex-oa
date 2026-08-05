@@ -80,10 +80,10 @@ def test_registered_in_advanced_engine():
     assert "range_break_imminence" in results
 
 
-def test_neutral_chop_is_range_fade():
+def test_neutral_chop_is_range_bound():
     signal = RangeBreakImminenceSignal()
     result = signal.evaluate(_ctx())
-    assert result.context["label"] == "Range Fade"
+    assert result.context["label"] == "Range-Bound"
     assert result.context["triggered"] is False
     assert result.context["signal"] == "range_fade"
     assert abs(result.score) < 0.4
@@ -272,7 +272,7 @@ def test_weak_range_label_between_fade_and_break_watch():
     imminence = result.context["imminence"]
     # Compression alone contributes up to 20; mild skew adds a bit more.
     assert 15.0 <= imminence < 65.0, imminence
-    assert result.context["label"] in ("Range Fade", "Weak Range")
+    assert result.context["label"] in ("Range-Bound", "Weak Range")
 
 
 def test_playbook_mentions_follow_the_break_when_imminence_is_high():

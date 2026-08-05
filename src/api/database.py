@@ -9,7 +9,7 @@ import os
 import time as time_module
 import traceback
 from collections import OrderedDict
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Iterable
 from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
+from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +492,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._max_pain_current_cache_ttl_seconds: float = _getenv_float(
             "MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", 120.0
         )
+        # ── TradeWorkz-adjacent slow reads that previously had NO cache ──
+        # dealer-hedging / volume-spikes / session-closes were the three
+        # tiny-payload endpoints measured at 4–12s: each ran a heavy scan and
+        # held one of only ~3–4 asyncpg pool slots for the query's full
+        # duration, starving unrelated requests (the documented "H2" pool
+        # starvation; see _fetch_timed). They are all coarse-grained reads, so
+        # a short process-local TTL collapses the repeat cost and — combined
+        # with the larger API pool below — stops a single slow read from
+        # wedging the whole worker.
+        #
+        # dealer_hedging_pressure aggregates the last 10 min of option_chains
+        # into a single coarse gauge; the TTL is generous because this is the
+        # most expensive read (~12s) and must comfortably exceed the frontend
+        # poll cadence to actually absorb it.
+        self._dealer_hedging_cache_ttl_seconds: float = _getenv_float(
+            "DEALER_HEDGING_CACHE_TTL_SECONDS", 30.0
+        )
+        # A fresh ≥3σ volume bar can appear at most once per 1-min bar, so a
+        # short TTL keeps the feed responsive while collapsing bursts/re-polls.
+        self._volume_spikes_cache_ttl_seconds: float = _getenv_float(
+            "VOLUME_SPIKES_CACHE_TTL_SECONDS", 15.0
+        )
+        # Session closes change once per day at 16:00 ET. The frontend
+        # force-refetches on the session-label flip to surface the new close
+        # promptly, and this server cache would blunt that by up to its TTL, so
+        # it is kept short — just enough to absorb concurrent/burst reads
+        # without meaningfully delaying the 16:00 boundary.
+        self._session_closes_cache_ttl_seconds: float = _getenv_float(
+            "SESSION_CLOSES_CACHE_TTL_SECONDS", 15.0
+        )
         # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
         # effectively unbounded keyspace (per strike-set/expiration-set query
         # string); a plain dict only evicted a key when that exact key was
@@ -534,10 +565,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
         connect_timeout = _getenv_float("DB_CONNECT_TIMEOUT_SECONDS", 20)
-        # Keep defaults conservative to avoid exhausting RDS connections when
-        # multiple services/workers run at once.
-        min_size = _getenv_int("DB_POOL_MIN", 1)
-        max_size = _getenv_int("DB_POOL_MAX", 3)
+        # Size the API async pool INDEPENDENTLY of the shared DB_POOL_* knobs.
+        #
+        # DB_POOL_MAX also governs every forked psycopg2 background pool
+        # (ingestion/analytics/signals, ~12+ processes), so raising the request
+        # path's concurrency through it would multiply the background footprint
+        # against RDS. API_DB_POOL_MAX decouples the request path: only this
+        # asyncpg pool reads it. The previous default of 3–4 slots per worker
+        # was the documented pool-starvation surface — a couple of slow reads
+        # (dealer-hedging ~12s, by-strike ~6s) held those few slots and every
+        # other request, including /api/health's `SELECT 1`, queued behind
+        # them. RDS (db.r6g.large, max_connections ~1600) has ample headroom:
+        # even at 2 workers × this pool + all background pools the ceiling is
+        # well under a hundred connections.
+        #
+        # Resolution order: API_DB_POOL_MAX → max(DB_POOL_MAX, 12) so an
+        # operator who already tuned DB_POOL_MAX higher keeps it, but the
+        # request pool is never floored back down to the tiny background size.
+        min_size = _getenv_int("API_DB_POOL_MIN", _getenv_int("DB_POOL_MIN", 1))
+        max_size = _getenv_int(
+            "API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12)
+        )
         statement_timeout_ms = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
@@ -3352,6 +3400,419 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Flow query timed out for {symbol}, returning empty")
             return []
 
+    async def _market_tide_anchor(self, conn) -> Optional[datetime]:
+        """Resolve the data-driven Market Tide anchor for a *live* compute.
+
+        The anchor is the most recent instant both source streams cover
+        (``LEAST`` of the gex-summary / option-chain heartbeats), frozen at
+        the 16:00 ET cash close once the session ends so every symbol and its
+        flow window describe the same session. Returns ``None`` on an empty
+        database. Backfill passes an explicit historical anchor instead.
+        """
+        return await conn.fetchval("""
+            WITH raw AS (
+                SELECT LEAST(
+                    (SELECT MAX(timestamp) FROM gex_summary),
+                    (SELECT MAX(timestamp) FROM option_chains_latest)
+                ) AS ts
+            )
+            SELECT CASE
+                -- ETF chains can keep updating after index options stop.
+                -- Freeze the composite at the cash close so every symbol
+                -- and its flow window describe the same market session.
+                WHEN (ts AT TIME ZONE 'America/New_York')::time > TIME '16:00'
+                THEN (
+                    (ts AT TIME ZONE 'America/New_York')::date + TIME '16:00'
+                ) AT TIME ZONE 'America/New_York'
+                ELSE ts
+            END
+            FROM raw
+            """)
+
+    async def _market_tide_rows(
+        self, conn, anchor: datetime, window_minutes: int
+    ) -> List[Dict[str, Any]]:
+        """Assemble one calculator input row per active symbol as of ``anchor``.
+
+        Generalized from the original live query so it works for ANY anchor —
+        the live "now" (frozen at the close) or a historical backfill instant.
+        The freshness heartbeat is sourced from bounded ``option_chains``
+        history rather than the latest-only ``option_chains_latest`` cache
+        (which holds just the current snapshot and therefore cannot answer
+        "what was fresh at 14:05 last Tuesday"). The 30-minute probe is ample:
+        the downstream RTH freshness gate only accepts prints within 10 minutes
+        of the anchor, and the bound keeps the scan on the
+        ``(underlying, timestamp)`` index.
+
+        The normalizers (flow_p95 / gamma_p95) come from the current nightly
+        caches. They are slowly-varying 30-day scales, so using the as-of-now
+        scale for a backfilled reading is an accepted approximation (the live
+        path and the healthcheck use the same current caches).
+        """
+        rows = await conn.fetch(
+            """
+            WITH active AS (
+                -- Registry aliases such as SPXW/NDXW are active for
+                -- contract resolution but are not independently ingested
+                -- underlyings. Keep the Tide universe to active symbols
+                -- that actually have both source streams in retained history.
+                SELECT s.symbol
+                FROM symbols s
+                WHERE COALESCE(s.is_active, TRUE) = TRUE
+                  AND EXISTS (
+                      SELECT 1 FROM option_chains oc
+                      WHERE oc.underlying = s.symbol
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM gex_summary gs
+                      WHERE gs.underlying = s.symbol
+                  )
+            ),
+            latest_gex AS (
+                SELECT DISTINCT ON (gs.underlying)
+                    gs.underlying AS symbol,
+                    gs.timestamp AS gex_timestamp,
+                    gs.net_gex_at_spot
+                FROM gex_summary gs
+                JOIN active a ON a.symbol = gs.underlying
+                WHERE gs.timestamp <= $1
+                  AND gs.timestamp > $1 - INTERVAL '1 day'
+                ORDER BY gs.underlying, gs.timestamp DESC
+            ),
+            chain_freshness AS (
+                -- Chain heartbeat from bounded option_chains history. Quiet
+                -- symbols lean on this when flow_contract_facts (sparse) has
+                -- no recent row. Bounded to the last 30 min before the anchor
+                -- so the scan stays on the (underlying, timestamp) index.
+                SELECT oc.underlying AS symbol,
+                       MAX(oc.timestamp) AS flow_timestamp
+                FROM option_chains oc
+                JOIN active a ON a.symbol = oc.underlying
+                WHERE oc.timestamp <= $1
+                  AND oc.timestamp > $1 - INTERVAL '30 minutes'
+                GROUP BY oc.underlying
+            ),
+            flow_fact_freshness AS (
+                -- A recent classified fact is also positive proof that
+                -- the flow feed is alive. This matters near the close,
+                -- when the latest-chain cache can pause before its final
+                -- after-hours refresh.
+                SELECT f.symbol, MAX(f.timestamp) AS fact_timestamp
+                FROM flow_contract_facts f
+                JOIN active a USING (symbol)
+                WHERE f.timestamp > $1 - INTERVAL '10 minutes'
+                  AND f.timestamp <= $1
+                GROUP BY f.symbol
+            ),
+            input_freshness AS (
+                SELECT ch.symbol,
+                       GREATEST(ch.flow_timestamp, ff.fact_timestamp) AS flow_timestamp
+                FROM chain_freshness ch
+                LEFT JOIN flow_fact_freshness ff USING (symbol)
+            ),
+            symbol_anchors AS (
+                SELECT lg.symbol,
+                       LEAST(lg.gex_timestamp, inf.flow_timestamp) AS symbol_anchor
+                FROM latest_gex lg
+                JOIN input_freshness inf USING (symbol)
+            ),
+            current_flow AS (
+                SELECT
+                    f.symbol,
+                    SUM(
+                        CASE WHEN f.option_type = 'C'
+                             THEN COALESCE(f.buy_premium, 0) - COALESCE(f.sell_premium, 0)
+                             ELSE COALESCE(f.sell_premium, 0) - COALESCE(f.buy_premium, 0)
+                        END
+                    )::double precision AS signed_premium,
+                    SUM(COALESCE(f.premium_delta, 0))::double precision AS gross_premium
+                FROM flow_contract_facts f
+                JOIN symbol_anchors sa USING (symbol)
+                WHERE f.timestamp > sa.symbol_anchor - make_interval(mins => $2::integer)
+                  AND f.timestamp <= sa.symbol_anchor
+                GROUP BY f.symbol
+            ),
+            flow_norm AS (
+                -- Nightly cache: keep the 30-day percentile scan off this
+                -- latency-sensitive request path.  The sum is a
+                -- conservative scale for call-minus-put directional flow.
+                SELECT cnc.underlying AS symbol,
+                       SUM(ABS(cnc.p95))::double precision AS flow_p95
+                FROM component_normalizer_cache cnc
+                JOIN active a ON a.symbol = cnc.underlying
+                WHERE cnc.field_name IN ('call_flow_delta', 'put_flow_delta')
+                  AND cnc.p95 IS NOT NULL
+                GROUP BY cnc.underlying
+            ),
+            gamma_norm AS (
+                -- Flat 30-day distribution is refreshed off-path by
+                -- gex_historical_stats_refresh.  Use the larger tail
+                -- magnitude because a signed distribution can have a
+                -- negative p95.
+                SELECT ghs.underlying AS symbol,
+                       GREATEST(ABS(ghs.p05), ABS(ghs.p95))::double precision AS gamma_p95
+                FROM gex_historical_stats ghs
+                JOIN active a ON a.symbol = ghs.underlying
+                WHERE ghs.metric = 'net_gex_at_spot'
+                  AND ghs.window_label = '30d'
+                  AND ghs.tod_bucket = -1
+            )
+            SELECT
+                a.symbol,
+                lg.gex_timestamp,
+                inf.flow_timestamp,
+                lg.net_gex_at_spot,
+                COALESCE(cf.signed_premium, 0) AS signed_premium,
+                COALESCE(cf.gross_premium, 0) AS gross_premium,
+                fn.flow_p95,
+                gn.gamma_p95
+            FROM active a
+            LEFT JOIN latest_gex lg USING (symbol)
+            LEFT JOIN input_freshness inf USING (symbol)
+            LEFT JOIN current_flow cf USING (symbol)
+            LEFT JOIN flow_norm fn USING (symbol)
+            LEFT JOIN gamma_norm gn USING (symbol)
+            ORDER BY a.symbol
+            """,
+            anchor,
+            window_minutes,
+        )
+        return [dict(row) for row in rows]
+
+    async def _compute_market_tide(
+        self, conn, anchor: datetime, window_minutes: int
+    ) -> Dict[str, Any]:
+        """Compute a Market Tide reading for ``anchor`` (no persistence)."""
+        rows = await self._market_tide_rows(conn, anchor, window_minutes)
+        return calculate_market_tide(rows, anchor=anchor, freshness_minutes=10)
+
+    async def _get_latest_market_tide_snapshot(
+        self, conn, window_minutes: int
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent persisted snapshot payload for a window.
+
+        This is the "frozen at the last cash close, never insufficient" read:
+        the latest publishable row rolls forward through the session and then
+        holds after the close until the next session writes a newer one.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT payload
+            FROM market_tide_snapshots
+            WHERE window_minutes = $1
+            ORDER BY snapshot_ts DESC
+            LIMIT 1
+            """,
+            window_minutes,
+        )
+        if row is None:
+            return None
+        payload = row["payload"]
+        # asyncpg returns JSONB as a str unless a codec is registered.
+        return json.loads(payload) if isinstance(payload, str) else payload
+
+    async def get_market_tide(self, window_minutes: int = 15) -> Dict[str, Any]:
+        """Serve the cross-symbol options-flow/gamma composite for a window.
+
+        Reads the most recent persisted snapshot — written every 5 minutes
+        through the cash session by ``market_tide_refresh`` and frozen at the
+        16:00 ET close — so the metric stays populated after hours and over
+        weekends (users keep seeing the previous session) instead of
+        collapsing to ``insufficient_data``. Falls back to a live compute only
+        when the snapshot table is empty (a fresh install before the first
+        refresh/backfill has run).
+        """
+        cache_key = f"market_tide:{window_minutes}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        async with self._acquire_connection() as conn:
+            snapshot = await self._get_latest_market_tide_snapshot(conn, window_minutes)
+            if snapshot is not None:
+                self._cache_set(cache_key, snapshot, 30.0)
+                return snapshot
+
+            # Fallback: no snapshot yet — compute live so the endpoint still
+            # answers (may be insufficient_data until the backfill has run).
+            anchor = await self._market_tide_anchor(conn)
+            if anchor is None:
+                result = calculate_market_tide([], anchor=datetime.now(timezone.utc))
+            else:
+                result = await self._compute_market_tide(conn, anchor, window_minutes)
+
+        self._cache_set(cache_key, result, 30.0)
+        return result
+
+    @staticmethod
+    def _market_tide_bucket(anchor: datetime) -> datetime:
+        """Floor ``anchor`` to the 5-minute UTC bucket used as the row key.
+
+        Flooring makes repeated refreshes within one bucket an idempotent
+        upsert (last write wins, with the freshest data) and yields a clean,
+        evenly-spaced series. 16:00 ET always lands on a 5-minute boundary, so
+        the frozen close snapshot keys cleanly.
+        """
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=timezone.utc)
+        epoch = int(anchor.timestamp() // 300) * 300
+        return datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+    async def _upsert_market_tide_snapshot(
+        self, conn, anchor: datetime, window_minutes: int, result: Dict[str, Any]
+    ) -> None:
+        """Idempotently persist one computed reading as a snapshot row."""
+        bucket_ts = self._market_tide_bucket(anchor)
+        session_date = anchor.astimezone(_ET).date()
+        # Serialize the payload the endpoint returns verbatim. Only the
+        # top-level ``timestamp`` is a datetime; render it as strict ISO so
+        # the pydantic response model parses it cleanly on read-back.
+        payload_obj = dict(result)
+        ts = payload_obj.get("timestamp")
+        if isinstance(ts, datetime):
+            payload_obj["timestamp"] = ts.isoformat()
+        payload = json.dumps(payload_obj, default=str)
+        await conn.execute(
+            """
+            INSERT INTO market_tide_snapshots (
+                snapshot_ts, window_minutes, session_date,
+                score, label, participation_pct, source_ts, payload
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+            ON CONFLICT (window_minutes, snapshot_ts) DO UPDATE SET
+                session_date = EXCLUDED.session_date,
+                score = EXCLUDED.score,
+                label = EXCLUDED.label,
+                participation_pct = EXCLUDED.participation_pct,
+                source_ts = EXCLUDED.source_ts,
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            """,
+            bucket_ts,
+            window_minutes,
+            session_date,
+            result.get("score"),
+            result.get("label"),
+            result.get("participation_pct"),
+            anchor,
+            payload,
+        )
+
+    async def write_market_tide_snapshots(
+        self,
+        windows: Optional[Iterable[int]] = None,
+        anchor: Optional[datetime] = None,
+        only_publishable: bool = True,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Compute and persist Market Tide snapshots for the given windows.
+
+        Shared by the live refresher (``anchor=None`` → the data-driven "now",
+        frozen at the 16:00 ET close) and the backfill (``anchor`` = a
+        historical cash-session instant). By default only publishable readings
+        (participation >= 60%, score not null) are stored, so the endpoint's
+        "latest row" is always a real reading rather than a withheld one.
+        With ``dry_run`` the readings are computed and classified but nothing is
+        written. Returns a summary dict for logging / healthchecks.
+        """
+        window_list = tuple(windows) if windows is not None else SUPPORTED_WINDOWS
+        written: List[int] = []
+        skipped: List[int] = []
+        async with self._acquire_connection() as conn:
+            resolved = anchor if anchor is not None else await self._market_tide_anchor(conn)
+            if resolved is None:
+                return {"anchor": None, "written": [], "skipped": list(window_list)}
+            for window_minutes in window_list:
+                result = await self._compute_market_tide(conn, resolved, window_minutes)
+                publishable = (
+                    result.get("score") is not None and result.get("label") != "insufficient_data"
+                )
+                if only_publishable and not publishable:
+                    skipped.append(window_minutes)
+                    continue
+                if not dry_run:
+                    await self._upsert_market_tide_snapshot(conn, resolved, window_minutes, result)
+                written.append(window_minutes)
+        return {
+            "anchor": resolved,
+            "bucket_ts": self._market_tide_bucket(resolved),
+            "written": written,
+            "skipped": skipped,
+        }
+
+    async def get_market_tide_history(
+        self, window_minutes: int = 15, mode: str = "intraday", days: int = 30
+    ) -> Dict[str, Any]:
+        """Return the persisted Market Tide series for charting.
+
+        ``mode='intraday'`` returns every snapshot for the most recent session
+        present for the window, oldest→newest — today's live 5-minute series
+        (or a single close point for a day that was only backfilled).
+        ``mode='daily'`` returns one point per session (that day's last/close
+        snapshot) for the most recent ``days`` sessions, oldest→newest — the
+        macro trend built from the daily closes.
+
+        Each point carries the score, label, and participation columns plus
+        ``flow_direction`` / ``gamma_regime`` read from the stored payload.
+        Pure read over ``market_tide_snapshots`` — no compute.
+        """
+        cache_key = f"market_tide_hist:{window_minutes}:{mode}:{days}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        def _point(row) -> Dict[str, Any]:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return {
+                "timestamp": row["snapshot_ts"],
+                "session_date": row["session_date"],
+                "score": float(row["score"]) if row["score"] is not None else None,
+                "label": row["label"],
+                "participation_pct": float(row["participation_pct"]),
+                "flow_direction": payload.get("flow_direction"),
+                "gamma_regime": payload.get("gamma_regime"),
+            }
+
+        async with self._acquire_connection() as conn:
+            if mode == "daily":
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT ON (session_date)
+                        session_date, snapshot_ts, score, label, participation_pct, payload
+                    FROM market_tide_snapshots
+                    WHERE window_minutes = $1
+                    ORDER BY session_date DESC, snapshot_ts DESC
+                    LIMIT $2
+                    """,
+                    window_minutes,
+                    days,
+                )
+                points = [_point(r) for r in reversed(rows)]
+            else:
+                latest_date = await conn.fetchval(
+                    "SELECT MAX(session_date) FROM market_tide_snapshots WHERE window_minutes = $1",
+                    window_minutes,
+                )
+                if latest_date is None:
+                    points = []
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT session_date, snapshot_ts, score, label, participation_pct, payload
+                        FROM market_tide_snapshots
+                        WHERE window_minutes = $1 AND session_date = $2
+                        ORDER BY snapshot_ts ASC
+                        """,
+                        window_minutes,
+                        latest_date,
+                    )
+                    points = [_point(r) for r in rows]
+
+        result = {"window_minutes": window_minutes, "mode": mode, "points": points}
+        self._cache_set(cache_key, result, 30.0)
+        return result
+
     async def _resolve_flow_series_session(
         self,
         conn: asyncpg.Connection,
@@ -4134,6 +4595,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         extended-hours ticker, the GEX live spot, and chart tip-close
         merge all see real-time prints.
         """
+        symbol = symbol.upper()
+        cache_key = f"session_closes:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
         query = """
             WITH session_closes AS (
                 SELECT DISTINCT ON ((uq.timestamp AT TIME ZONE 'America/New_York')::date)
@@ -4149,6 +4616,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 FROM underlying_quotes uq
                 LEFT JOIN symbols s ON s.symbol = uq.symbol
                 WHERE uq.symbol = $1
+                    -- Sargable lower bound: this uses idx(symbol, timestamp
+                    -- DESC) as a range scan instead of TZ-converting and
+                    -- sorting the symbol's ENTIRE quote history (the cause of
+                    -- the ~4s wall time for a 2-row result). We only ever need
+                    -- the two most recent sessions; 30 days covers any
+                    -- weekend / holiday / ingestion-gap, and if data really is
+                    -- staler than that the latest-quote fallback below still
+                    -- returns a price. Every predicate below is preserved.
+                    AND uq.timestamp >= NOW() - INTERVAL '30 days'
                     AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
                     AND (uq.timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
                     AND uq.timestamp <= NOW()
@@ -4211,13 +4687,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 if current_close is None:
                     return None
 
-                return {
+                result = {
                     "symbol": symbol,
                     "current_session_close": current_close,
                     "current_session_close_ts": current_ts,
                     "prior_session_close": prior_close,
                     "prior_session_close_ts": prior_ts,
                 }
+                self._cache_set(
+                    cache_key, result, self._session_closes_cache_ttl_seconds
+                )
+                return result
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}", exc_info=True)
             raise

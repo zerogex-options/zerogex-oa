@@ -3,12 +3,15 @@
 Two modes, both back-ended by the same script + two systemd timers:
 
   * ``--mode morning`` fires 07:10 ET, ~10 minutes after the morning writer
-    lands the ``daily_forecast`` row. Tweets today's projected range /
-    pin strike / regime + the ``/forecast/{symbol}/{date}`` permalink.
+    lands the ``daily_forecast`` row. Tweets today's projected range +
+    expected-volatility call + the ``/forecast/{symbol}/{date}`` permalink.
   * ``--mode receipt`` fires 16:10 ET, ~5 minutes after the receipt writer
-    grades the morning commitment. Tweets the verdict overlay ("range
-    held/broken", "pin hit/missed", "regime correct/wrong") + the same
-    permalink (which now renders in receipt state).
+    grades the morning commitment. Tweets the RANGE verdict ("range
+    held/broken") — the one graded headline claim — plus the realized close and
+    realized-vol state as neutral context, then the permalink. The expected-vol
+    call is DEMOTED to informational: it never beat its majority-bucket baseline
+    on the corrected scale, so we state what vol did rather than score it (the
+    same treatment pin/regime got in the v1.4 reframe).
 
 Both modes share the ``scorecard_tweet`` design rules:
   * Never throw. Every failure path logs + exits 0 so the timer keeps
@@ -109,12 +112,6 @@ def _is_trading_day(day: date) -> bool:
     return True
 
 
-def _humanize_regime(value: str | None) -> str:
-    if not value:
-        return "Unknown"
-    return value.replace("_", " ").title()
-
-
 def _fmt_price(v: float | None) -> str:
     if v is None:
         return "—"
@@ -127,6 +124,13 @@ def _fmt_verdict(v: bool | None) -> str:
     if v is False:
         return "✗"
     return "—"
+
+
+def _fmt_vol_state(value: str | None) -> str:
+    """Title-case the compression/normal/expansion call; '—' when absent."""
+    if not value:
+        return "—"
+    return str(value).replace("_", " ").title()
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +148,7 @@ def build_morning_tweet(row: dict[str, Any], site_url: str) -> str:
         day_iso = day.isoformat()
     low = _fmt_price(row.get("projected_low"))
     high = _fmt_price(row.get("projected_high"))
-    pin = _fmt_price(row.get("pin_strike"))
-    regime = _humanize_regime(row.get("regime"))
+    vol_state = _fmt_vol_state(row.get("expected_vol_state"))
     permalink = f"{site_url.rstrip('/')}/forecast/{sym}/{day_iso}"
 
     # Asymmetric ± % display makes the confidence readable at a glance —
@@ -164,10 +167,21 @@ def build_morning_tweet(row: dict[str, Any], site_url: str) -> str:
     except (TypeError, ValueError):
         pass
 
+    # Expected-vol line mirrors the site's headline claims: the range and the
+    # compression/normal/expansion call, plus the flip-cross odds when present.
+    # No direction — matching the "we never forecast direction" thesis.
+    vol_line = f"Expected vol: {vol_state}"
+    flip_p = row.get("flip_cross_prob")
+    try:
+        if flip_p is not None:
+            vol_line += f" · Flip-cross {float(flip_p) * 100:.0f}%"
+    except (TypeError, ValueError):
+        pass
+
     body = (
         f"{sym} · {day_iso} morning forecast\n"
         f"Range: {low} – {high}{pct_line}\n"
-        f"Pin: {pin} · Regime: {regime}"
+        f"{vol_line}"
     )
     text = f"{body}\n{permalink}"
     if len(text) <= TWEET_MAX_LEN:
@@ -186,23 +200,25 @@ def build_receipt_tweet(row: dict[str, Any], site_url: str) -> str:
     else:
         day_iso = day.isoformat()
     range_v = row.get("range_respected")
-    pin_v = row.get("pin_hit")
-    regime_v = row.get("regime_correct")
+    vol_state = _fmt_vol_state(row.get("expected_vol_state"))
     actual_close = _fmt_price(row.get("actual_close"))
     permalink = f"{site_url.rstrip('/')}/forecast/{sym}/{day_iso}"
 
     range_txt = "held" if range_v is True else "broken" if range_v is False else "—"
-    pin_txt = "hit" if pin_v is True else "missed" if pin_v is False else "—"
-    regime_txt = (
-        "correct" if regime_v is True else "wrong" if regime_v is False else "n/a"
-    )
 
+    # Range coverage is the graded claim. The expected-vol call is DEMOTED to
+    # informational (it doesn't beat its baseline), so the receipt states what
+    # realized vol actually did as neutral context — no ✓/✗ verdict on it.
     body = (
         f"{sym} · {day_iso} receipt\n"
-        f"Range {_fmt_verdict(range_v)} {range_txt} · "
-        f"Pin {_fmt_verdict(pin_v)} {pin_txt} · Regime {_fmt_verdict(regime_v)} {regime_txt}\n"
-        f"Close: {actual_close}"
+        f"Range {_fmt_verdict(range_v)} {range_txt} · closed {actual_close}"
     )
+    realized_ratio = row.get("realized_vol_ratio")
+    try:
+        if realized_ratio is not None and vol_state != "—":
+            body += f"\nRealized vol: {vol_state.lower()} ({float(realized_ratio):.2f}× normal)"
+    except (TypeError, ValueError):
+        pass
     text = f"{body}\n{permalink}"
     if len(text) <= TWEET_MAX_LEN:
         return text

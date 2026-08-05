@@ -415,6 +415,20 @@ else
     WARNING_CHECKS=$((WARNING_CHECKS + 1))
 fi
 
+# /api/flow/market-tide is a pure cache read over market_tide_snapshots; if
+# this 5-min timer isn't enabled the snapshot stops advancing and the metric
+# freezes (then, once the current row ages out of relevance, the endpoint
+# falls back to the live insufficient-data compute after hours).  Flag a
+# not-enabled timer the same way the max-pain one is flagged.
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+if sudo systemctl is-enabled --quiet zerogex-oa-market-tide-refresh.timer 2>/dev/null; then
+    log "  ✓ Market Tide refresh timer enabled"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    log "  ⚠ Market Tide refresh timer not enabled (run: make market-tide-refresh-install)"
+    WARNING_CHECKS=$((WARNING_CHECKS + 1))
+fi
+
 # Per-minute lightweight system monitor.  A missing timer here means the
 # rolling hourly/daily history at ~ubuntu/monitoring/state.json stops
 # updating silently — flag it the same way max-pain-refresh is flagged.

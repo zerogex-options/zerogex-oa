@@ -30,15 +30,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import os
+import statistics
 import sys
-from datetime import datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
+from src.jobs.forecast_range_model import RANGE_OVER_SIGMA
 
 logger = logging.getLogger("zerogex.forecast_calibrate")
 ET = ZoneInfo("America/New_York")
@@ -57,6 +57,12 @@ BOUNDS = {
     "pin_tolerance_mult": (0.50, 2.00),
     "upside_lean": (-0.20, 0.20),
     "downside_lean": (-0.20, 0.20),
+    # A symbol's "normal day" range vs the Parkinson expectation.  Floor lowered
+    # 0.60 → 0.45: index symbols pinned the old floor exactly (realized ran near
+    # 1× implied, i.e. ~0.63 of Parkinson), so 0.60 was clipping the true center
+    # and leaving the vol grade slightly mis-centered. 0.45 gives the calibrator
+    # room to reach a genuinely quiet, VRP-heavy regime; 1.40 still caps a spike.
+    "vol_range_basis_mult": (0.45, 1.40),
 }
 
 
@@ -88,17 +94,46 @@ def _compute_updates(
     up_lean = float(current.get("upside_lean", 0.0))
     down_lean = float(current.get("downside_lean", 0.0))
 
+    # Vol-range basis: re-center the expected-range denominator on the symbol's
+    # OWN realized-range distribution.  For each receipt, raw = realized range ÷
+    # (√(8/π)·implied); the divisor that maps the MEDIAN day to a ratio of 1.0
+    # is exactly the median of those raws, so we drift the basis toward it.
+    # Robust to outliers (median, not mean) and independent of the band cold
+    # start — it only needs implied_move + actuals, which v1.4 rows always have.
+    vol_basis = float(current.get("vol_range_basis_mult", 1.0))
+    raw_ratios = [
+        (float(r["actual_high"]) - float(r["actual_low"]))
+        / (RANGE_OVER_SIGMA * float(r["implied_move"]))
+        for r in receipts
+        if r.get("actual_high") is not None
+        and r.get("actual_low") is not None
+        and r.get("implied_move") is not None
+        and float(r["implied_move"]) > 0
+    ]
+    vol_n = len(raw_ratios)
+    vol_basis_target: Optional[float] = None
+    if vol_n >= MIN_RECEIPTS:
+        vol_basis_target = statistics.median(raw_ratios)
+        vol_basis = _bounded(
+            "vol_range_basis_mult",
+            vol_basis + LEARNING_RATE * (vol_basis_target - vol_basis) * 5.0,
+        )
+
     if n < MIN_RECEIPTS:
         summary = {
             "n_receipts_used": n,
             "action": "cold_start_hold",
             "message": f"only {n} v1.2 receipts available; need >= {MIN_RECEIPTS}",
+            "vol_n": vol_n,
+            "vol_basis_target": round(vol_basis_target, 4) if vol_basis_target is not None else None,
+            "vol_range_basis_mult": round(vol_basis, 4),
         }
         return {
             "band_width_mult": band,
             "pin_tolerance_mult": pin_mult,
             "upside_lean": up_lean,
             "downside_lean": down_lean,
+            "vol_range_basis_mult": vol_basis,
             "n_receipts_used": n,
             "summary": summary,
         }
@@ -157,6 +192,9 @@ def _compute_updates(
         "up_break_rate": round(up_break_rate, 4),
         "down_break_rate": round(down_break_rate, 4),
         "pin_hit_rate": round(pin_hit_rate, 4),
+        "vol_n": vol_n,
+        "vol_basis_target": round(vol_basis_target, 4) if vol_basis_target is not None else None,
+        "vol_range_basis_mult": round(vol_basis, 4),
         "action": "updated",
     }
     return {
@@ -164,6 +202,7 @@ def _compute_updates(
         "pin_tolerance_mult": pin_mult,
         "upside_lean": up_lean,
         "downside_lean": down_lean,
+        "vol_range_basis_mult": vol_basis,
         "n_receipts_used": n,
         "summary": summary,
     }
@@ -180,10 +219,12 @@ async def _recalibrate_one(db: DatabaseManager, symbol: str, dry_run: bool) -> d
     summary = updates["summary"]
     if dry_run:
         logger.info(
-            "forecast_calibrate[dry-run]: %s → band=%.3f pin=%.3f up=%+.3f down=%+.3f n=%d (%s)",
+            "forecast_calibrate[dry-run]: %s → band=%.3f pin=%.3f up=%+.3f down=%+.3f "
+            "vol_basis=%.3f n=%d (%s)",
             symbol,
             updates["band_width_mult"], updates["pin_tolerance_mult"],
             updates["upside_lean"], updates["downside_lean"],
+            updates["vol_range_basis_mult"],
             updates["n_receipts_used"], summary.get("action"),
         )
         return {"symbol": symbol, **updates}
@@ -194,15 +235,18 @@ async def _recalibrate_one(db: DatabaseManager, symbol: str, dry_run: bool) -> d
         pin_tolerance_mult=updates["pin_tolerance_mult"],
         upside_lean=updates["upside_lean"],
         downside_lean=updates["downside_lean"],
+        vol_range_basis_mult=updates["vol_range_basis_mult"],
         n_receipts_used=updates["n_receipts_used"],
         summary=summary,
     )
     if ok:
         logger.info(
-            "forecast_calibrate: %s → band=%.3f pin=%.3f up=%+.3f down=%+.3f n=%d (%s)",
+            "forecast_calibrate: %s → band=%.3f pin=%.3f up=%+.3f down=%+.3f "
+            "vol_basis=%.3f n=%d (%s)",
             symbol,
             updates["band_width_mult"], updates["pin_tolerance_mult"],
             updates["upside_lean"], updates["downside_lean"],
+            updates["vol_range_basis_mult"],
             updates["n_receipts_used"], summary.get("action"),
         )
     return {"symbol": symbol, **updates, "ok": ok}

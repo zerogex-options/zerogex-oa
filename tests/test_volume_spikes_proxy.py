@@ -98,7 +98,7 @@ class TestVolumeSpikeProxyForCashIndices:
 
 
 class TestVolumeSpikeNoProxyForEquitiesAndEtfs:
-    """SPY/QQQ/AAPL should keep using the canonical view directly."""
+    """SPY/QQQ/AAPL should keep using the canonical (inline, non-proxy) path."""
 
     def test_spy_uses_canonical_view(self):
         conn = _RecordingConn(rows=[])
@@ -107,7 +107,10 @@ class TestVolumeSpikeNoProxyForEquitiesAndEtfs:
         asyncio.run(db.get_unusual_volume_spikes("SPY", limit=20))
 
         assert conn.last_query is not None
-        assert "unusual_volume_spikes" in conn.last_query
+        # The canonical path inlines the volume-spike window over the symbol's
+        # own underlying_quotes (it reads that table directly) and must NOT use
+        # the proxy CTEs — those are the reliable canonical-vs-proxy markers.
+        assert "FROM underlying_quotes" in conn.last_query
         assert "index_quotes" not in conn.last_query
         assert "proxy_volume" not in conn.last_query
         # Canonical path passes (symbol, limit) — no proxy positional arg.
@@ -119,7 +122,8 @@ class TestVolumeSpikeNoProxyForEquitiesAndEtfs:
 
         asyncio.run(db.get_unusual_volume_spikes("AAPL", limit=10))
 
-        assert "unusual_volume_spikes" in conn.last_query
+        assert "index_quotes" not in conn.last_query
+        assert "proxy_volume" not in conn.last_query
         assert conn.last_args == ("AAPL", 10)
 
     def test_canonical_response_has_no_volume_proxy_field(self):

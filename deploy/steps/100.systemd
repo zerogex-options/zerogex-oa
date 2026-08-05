@@ -95,6 +95,12 @@ TIMER_UNITS=(
     "zerogex-oa-normalizer-refresh"
     "zerogex-oa-normalizer-healthcheck"
     "zerogex-oa-max-pain-refresh"
+    # Market Tide snapshot refresh (every 5 min through the cash session,
+    # frozen at the 16:00 ET close).  Feeds /api/flow/market-tide as a pure
+    # cache read so the metric stays populated after hours instead of showing
+    # "insufficient_data".  See src/tools/market_tide_refresh.py; seed prior
+    # sessions once with `make market-tide-backfill`.
+    "zerogex-oa-market-tide-refresh"
     # Per-minute lightweight monitor (CPU/mem/disk/per-engine errs+warns/
     # analytics cycle time).  See src/tools/system_monitor.py.  Writes
     # state to $HOME/monitoring/state.json; the directory is created

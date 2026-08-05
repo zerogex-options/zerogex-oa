@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type
+from enum import IntEnum
 import os
 from src.config import _getenv_str
 import re
@@ -34,6 +35,8 @@ from .models import (
     FlowPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
+    MarketTideResponse,
+    MarketTideHistoryResponse,
     SmartMoneyFlowPoint,
     MomentumDivergencePoint,
     FlowBuyingPressurePoint,
@@ -74,6 +77,16 @@ from .routers.admin_xpost import router as admin_xpost_router
 from src.utils import get_logger  # noqa: E402
 
 logger = get_logger(__name__)
+
+
+class MarketTideWindow(IntEnum):
+    """Supported Market Tide lookbacks, parsed from HTTP query strings."""
+
+    FIVE_MINUTES = 5
+    FIFTEEN_MINUTES = 15
+    THIRTY_MINUTES = 30
+    SIXTY_MINUTES = 60
+
 
 # Database manager
 db_manager: Optional[DatabaseManager] = None
@@ -894,6 +907,62 @@ def _format_flow_series_row(row: dict) -> dict:
         "contract_count": _to_int(row.get("contract_count")),
         "is_synthetic": bool(row.get("is_synthetic")),
     }
+
+
+@app.get(
+    "/api/flow/market-tide",
+    response_model=MarketTideResponse,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/market-tide")
+async def get_market_tide(
+    window: MarketTideWindow = Query(
+        default=MarketTideWindow.FIFTEEN_MINUTES,
+        description="Directional premium lookback in minutes.",
+    ),
+):
+    """Market-wide directional options flow adjusted by dealer gamma.
+
+    The score is withheld when fewer than 60% of active symbols have fresh
+    gamma and flow inputs. Component leaders/laggards explain which names are
+    driving the reading.
+    """
+    return await _db().get_market_tide(window_minutes=int(window))
+
+
+@app.get(
+    "/api/flow/market-tide/history",
+    response_model=MarketTideHistoryResponse,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/market-tide/history")
+async def get_market_tide_history(
+    window: MarketTideWindow = Query(
+        default=MarketTideWindow.FIFTEEN_MINUTES,
+        description="Directional premium lookback in minutes.",
+    ),
+    mode: Literal["intraday", "daily"] = Query(
+        default="intraday",
+        description="'intraday' = the most recent session's 5-minute series; "
+        "'daily' = one close per session.",
+    ),
+    days: int = Query(
+        default=30,
+        ge=1,
+        le=90,
+        description="Trailing sessions to return in daily mode (ignored for intraday).",
+    ),
+):
+    """Persisted Market Tide series for the trend chart.
+
+    A pure cache read over the snapshot table: ``intraday`` returns the most
+    recent session's 5-minute series (frozen at the 16:00 ET close after
+    hours), ``daily`` returns the last ``days`` session closes. Empty until
+    the refresher/backfill has written snapshots.
+    """
+    return await _db().get_market_tide_history(window_minutes=int(window), mode=mode, days=days)
 
 
 @app.get(

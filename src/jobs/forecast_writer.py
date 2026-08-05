@@ -41,9 +41,13 @@ from src.jobs.forecast_calendar import (
     is_vix_expiration_day,
 )
 from src.jobs.forecast_range_model import (
+    RANGE_OVER_SIGMA,
+    VOL_PERSISTENCE_WINDOW,
     ForecastInputs,
     ForecastResult,
     compute_forecast,
+    implied_move_sanity,
+    robust_persistence_anchor,
 )
 from src.jobs.index_projection import implied_index_spot
 from src.market_calendar import NYSE_HOLIDAYS
@@ -155,6 +159,40 @@ async def _fetch_optional(db: DatabaseManager, method_name: str, label: str, sym
     except Exception as exc:  # noqa: BLE001
         logger.warning("forecast_writer: %s failed (%s): %s", label, symbol, exc)
         return None
+
+
+async def _compute_persistence_anchor(
+    db: DatabaseManager, symbol: str, vol_basis: float
+) -> Optional[float]:
+    """Median of the symbol's recent realized vol ratios (on the calibrated
+    "× a normal day's range" scale) — the vol-clustering anchor for the
+    expected-vol call.  Best-effort: thin history or any failure returns None
+    and the predictor falls back to the ATR anchor / neutral 1.0.
+    """
+    rows = await _fetch_optional(
+        db, "get_daily_forecast_history", "get_daily_forecast_history[persist]",
+        symbol, symbol, limit=VOL_PERSISTENCE_WINDOW * 2,
+    )
+    if not rows:
+        return None
+    basis = vol_basis if vol_basis and vol_basis > 0 else 1.0
+    ratios: list[float] = []
+    # Reverse to oldest-first so robust_persistence_anchor's trailing window
+    # lines up with the most recent receipts.
+    for r in reversed(rows):
+        if r.get("receipt_ts") is None:
+            continue
+        lo, hi, im = r.get("actual_low"), r.get("actual_high"), r.get("implied_move")
+        if lo is None or hi is None or im is None:
+            continue
+        try:
+            lo, hi, im = float(lo), float(hi), float(im)
+        except (TypeError, ValueError):
+            continue
+        denom = RANGE_OVER_SIGMA * basis * im
+        if im > 0 and denom > 0:
+            ratios.append((hi - lo) / denom)
+    return robust_persistence_anchor(ratios)
 
 
 async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastInputs]:
@@ -281,8 +319,23 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
             "pin_tolerance_mult": float(calibration_row["pin_tolerance_mult"]),
             "upside_lean": float(calibration_row["upside_lean"]),
             "downside_lean": float(calibration_row["downside_lean"]),
+            # Per-symbol expected-range center for the vol grade.  Carried into
+            # forecast_inputs.calibration_applied by compute_forecast so the
+            # receipt grades against the basis committed this morning.
+            "vol_range_basis_mult": float(
+                calibration_row.get("vol_range_basis_mult", 1.0) or 1.0
+            ),
             "n_receipts_used": int(calibration_row.get("n_receipts_used") or 0),
         }
+
+    # Vol-persistence anchor: median of recent realized ratios on the calibrated
+    # grading scale.  This is the primary driver of the expected-vol call — the
+    # v1.4 gamma-only model scored below the realized base rate by defaulting to
+    # "normal"; anchoring on how the tape has actually been trading fixes that.
+    vol_basis = (
+        calibration_payload["vol_range_basis_mult"] if calibration_payload else 1.0
+    )
+    persistence_anchor = await _compute_persistence_anchor(db, symbol, vol_basis)
 
     # MSI sub-signals for the "screaming amplifier" — put/call ratio and
     # skew_delta.  Both live in gex_summary / basic_signals respectively.
@@ -336,6 +389,7 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         days_to_opex=days_to_next_opex(today),
         strike_step=_strike_step_for(symbol),
         calibration=calibration_payload,
+        vol_persistence_anchor=persistence_anchor,
     )
 
     # Signal-health summary — one line per symbol per fire so a daily
@@ -389,6 +443,7 @@ def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: date
         "call_wall_0dte": inputs.call_wall_0dte,
         "put_wall_0dte": inputs.put_wall_0dte,
         "top_gamma_nodes": inputs.top_gamma_nodes,
+        "net_gex": inputs.net_gex,
         "local_gex": inputs.local_gex,
         "convexity_risk": inputs.convexity_risk,
         "flip_distance": inputs.flip_distance,
@@ -405,6 +460,11 @@ def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: date
         "open_spot_source": inputs.open_spot_source,
         "open_spot_projection": inputs.open_spot_projection,
         "futures_gap_pct": inputs.futures_gap_pct,
+        # Expected-vol audit: the anchor the prediction rode + a data-quality
+        # cross-check of the implied move against realized ATR (see
+        # implied_move_sanity). Both immutable once committed.
+        "vol_persistence_anchor": inputs.vol_persistence_anchor,
+        "implied_move_sanity": implied_move_sanity(result.implied_move, inputs.atr_5d),
     }
 
     base = {
@@ -468,6 +528,20 @@ async def _run(args: argparse.Namespace) -> int:
             if args.date:
                 inputs.forecast_date = day
             result = compute_forecast(inputs)
+            # Data-quality guard: a VIX-implied move wildly out of line with
+            # realized ATR mis-scales the whole vol grade (an over-large implied
+            # move pins the calibrated basis at its floor and biases the call to
+            # compression). Log it loudly; the value is also snapshotted.
+            _sanity = implied_move_sanity(result.implied_move, inputs.atr_5d)
+            if _sanity is not None and not _sanity["sane"]:
+                logger.warning(
+                    "forecast_writer: %s implied_move sanity FAIL — ATR/implied=%.2f "
+                    "(implied=$%.2f, atr_5d=$%.2f); implied move likely mis-scaled "
+                    "(vol index / units / horizon). This biases the vol grade.",
+                    sym, _sanity["atr_over_implied"],
+                    result.implied_move if result.implied_move is not None else float("nan"),
+                    inputs.atr_5d if inputs.atr_5d is not None else float("nan"),
+                )
             open_ts = datetime.now(tz=ET)
             payload = _build_payload(inputs, result, open_ts)
             if args.dry_run:

@@ -1121,6 +1121,29 @@ type-check: ## Run mypy on src
 	$(PY) -m mypy src
 
 # =============================================================================
+# =============================================================================
+# Trade Bias / MSI calibration sweeps (read-only; run against the live DB)
+# Horizons use assigned vars so commas survive $(or): TB_HORIZONS / TB_MSI_HORIZONS
+# =============================================================================
+TB_HORIZONS ?= 15,30,60
+TB_MSI_HORIZONS ?= 30,60
+
+.PHONY: trade-bias-direction
+trade-bias-direction: ## Trade Bias signed-direction hit-rate by confidence bucket. Vars: SYMBOL=SPY TENOR=swing DAYS=30 TB_HORIZONS=15,30,60
+	$(PY) -m src.backtesting.trade_bias_direction_sweep --symbol $(or $(SYMBOL),SPY) --tenor $(or $(TENOR),swing) --days $(or $(DAYS),30) --horizons $(TB_HORIZONS)
+
+.PHONY: trade-bias-override
+trade-bias-override: ## Trade Bias override-threshold sweep. Vars: SYMBOL=SPY TENOR=swing DAYS=30 TB_HORIZONS=15,30,60
+	$(PY) -m src.backtesting.trade_bias_override_sweep --symbol $(or $(SYMBOL),SPY) --tenor $(or $(TENOR),swing) --days $(or $(DAYS),30) --horizons $(TB_HORIZONS)
+
+.PHONY: msi-regime
+msi-regime: ## MSI regime-validity sweep (continuation vs reversal by MSI band). Vars: SYMBOL=SPY DAYS=30 TB_MSI_HORIZONS=30,60
+	$(PY) -m src.backtesting.msi_regime_sweep --symbol $(or $(SYMBOL),SPY) --tenor $(or $(TENOR),swing) --days $(or $(DAYS),30) --horizons $(TB_MSI_HORIZONS)
+
+.PHONY: trade-bias-report
+trade-bias-report: ## All Trade Bias + MSI sweeps across SPY/SPX/QQQ over a longer window. Vars: SYMBOLS="SPY SPX QQQ" DAYS=90
+	@for sym in $(or $(SYMBOLS),SPY SPX QQQ); do echo ""; echo "===== $$sym (last $(or $(DAYS),90)d) ====="; $(PY) -m src.backtesting.trade_bias_direction_sweep --symbol $$sym --tenor swing --days $(or $(DAYS),90) --horizons $(TB_HORIZONS); $(PY) -m src.backtesting.trade_bias_direction_sweep --symbol $$sym --tenor intraday --days $(or $(DAYS),90) --horizons $(TB_HORIZONS); $(PY) -m src.backtesting.trade_bias_override_sweep --symbol $$sym --tenor swing --days $(or $(DAYS),90) --horizons $(TB_HORIZONS); $(PY) -m src.backtesting.msi_regime_sweep --symbol $$sym --days $(or $(DAYS),90) --horizons $(TB_MSI_HORIZONS); done
+
 # TradeWorkz thesis backtests (run against the live/analytics DB)
 # =============================================================================
 .PHONY: tw-magnet-backtest
@@ -2938,6 +2961,13 @@ gamma-flip-revalidate: ## Re-validate relative gamma-flip thresholds vs post-dep
 		--window-days $(GAMMA_FLIP_WINDOW_DAYS) \
 		$(if $(GAMMA_FLIP_STABLE_SINCE),--stable-since $(GAMMA_FLIP_STABLE_SINCE))
 
+.PHONY: vol-scale-regrade-report
+vol-scale-regrade-report: ## Backtest the corrected vol-grade range/σ scale vs stored history (read-only). Vars: VOL_SYMBOL (optional), VOL_JSON (optional out path)
+	@echo "$(BLUE)=== Vol-scale regrade backtest (read-only) ===$(NC)"
+	@$(PY) -m src.tools.vol_scale_regrade_report \
+		$(if $(VOL_SYMBOL),--symbol $(VOL_SYMBOL)) \
+		$(if $(VOL_JSON),--json $(VOL_JSON))
+
 .PHONY: regime-regrade-report
 regime-regrade-report: ## Backtest the corrected dealer-gamma regime vs stored history (read-only). Vars: REGIME_SYMBOL (optional), REGIME_JSON (optional out path)
 	@echo "$(BLUE)=== Regime regrade backtest (read-only) ===$(NC)"
@@ -3625,6 +3655,59 @@ max-pain-refresh-status: ## Show max-pain refresh timer status + last/next fire 
 	@systemctl status zerogex-oa-max-pain-refresh.service --no-pager -l || true
 	@echo ""
 	@sudo journalctl -u zerogex-oa-max-pain-refresh -n 30 --no-pager || true
+
+# =============================================================================
+# Market Tide snapshots (every 5 min cash session + historical backfill)
+# =============================================================================
+# /api/flow/market-tide is a pure cache read over market_tide_snapshots. The
+# refresh timer writes the live reading every 5 min through the session and
+# freezes it at the 16:00 ET close; the backfill seeds prior sessions from
+# retained history so the metric is populated immediately after a deploy.
+# Override the window set with: make market-tide-refresh MARKET_TIDE_WINDOWS="5 15"
+.PHONY: market-tide-refresh
+market-tide-refresh: ## Write the current Market Tide snapshot (every 5 min via timer; RTH-gated)
+	@echo "$(BLUE)=== Refreshing Market Tide snapshot ===$(NC)"
+	@$(PY) -m src.tools.market_tide_refresh \
+		$(if $(MARKET_TIDE_WINDOWS),--windows $(MARKET_TIDE_WINDOWS))
+
+# Seed / repair the snapshot history. Override range + granularity with
+# MARKET_TIDE_DAYS / MARKET_TIDE_START / MARKET_TIDE_END / MARKET_TIDE_CADENCE.
+.PHONY: market-tide-backfill
+market-tide-backfill: ## Seed market_tide_snapshots from history (default: last 90 days, closes)
+	@echo "$(BLUE)=== Backfilling Market Tide snapshots ===$(NC)"
+	@$(PY) -m src.tools.market_tide_backfill \
+		$(if $(MARKET_TIDE_DAYS),--days $(MARKET_TIDE_DAYS)) \
+		$(if $(MARKET_TIDE_START),--start $(MARKET_TIDE_START)) \
+		$(if $(MARKET_TIDE_END),--end $(MARKET_TIDE_END)) \
+		$(if $(MARKET_TIDE_CADENCE),--cadence-minutes $(MARKET_TIDE_CADENCE)) \
+		$(if $(MARKET_TIDE_WINDOWS),--windows $(MARKET_TIDE_WINDOWS))
+
+.PHONY: market-tide-snapshot-healthcheck
+market-tide-snapshot-healthcheck: ## Verify each window has a Market Tide snapshot (0=ok,1=missing,2=db err)
+	@$(PY) -m src.tools.market_tide_snapshot_healthcheck \
+		$(if $(MARKET_TIDE_WINDOWS),--windows $(MARKET_TIDE_WINDOWS))
+
+.PHONY: market-tide-refresh-install
+market-tide-refresh-install: ## Install the 5-min Market Tide refresh timer (cash session)
+	@echo "$(BLUE)=== Installing Market Tide Refresh Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-market-tide-refresh.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-market-tide-refresh.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-market-tide-refresh.timer
+	@echo "$(GREEN)✅ Market-tide-refresh timer (every 5 min, cash session) installed and started$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-market-tide-refresh.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-market-tide-refresh$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-market-tide-refresh.service$(NC)"
+	@echo "$(YELLOW)Backfill:    make market-tide-backfill$(NC)"
+
+.PHONY: market-tide-refresh-status
+market-tide-refresh-status: ## Show Market Tide refresh timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Market Tide Refresh Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-market-tide-refresh.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-market-tide-refresh.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-market-tide-refresh -n 30 --no-pager || true
 
 # =============================================================================
 # Yesterday's Scorecard auto-tweet (16:15 ET weekdays)

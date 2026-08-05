@@ -205,7 +205,7 @@ def compute_bias(inp: BiasInput) -> BiasResult:
     if market_state == "TRAP_REVERSAL":
         trend = "bearish"
         bias = "FADE_STRENGTH"
-        bias_label = "Fade Strength"
+        bias_label = "Sell Strength"
         regime_label = "Trap / Reversal Regime"
         regime_desc = "Short gamma + bullish flow + crowded structure = reversal setup."
         setup = "Trap / Reversal"
@@ -231,7 +231,7 @@ def compute_bias(inp: BiasInput) -> BiasResult:
     elif market_state == "TRAP_SQUEEZE":
         trend = "bullish"
         bias = "FADE_WEAKNESS"
-        bias_label = "Fade Weakness"
+        bias_label = "Buy Weakness"
         regime_label = "Trap / Squeeze Regime"
         regime_desc = "Short gamma + bearish flow + trapped shorts = squeeze setup."
         setup = "Trap / Squeeze"
@@ -307,7 +307,7 @@ def compute_bias(inp: BiasInput) -> BiasResult:
     elif market_state == "CHOP":
         trend = "neutral"
         bias = "RANGE_FADE"
-        bias_label = "Range Fade"
+        bias_label = "Range-Bound"
         regime_label = "Chop / Range Regime"
         regime_desc = "Mixed signals — no dominant directional thesis."
         setup = "Mean Reversion"

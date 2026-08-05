@@ -436,10 +436,14 @@ def test_deterministic_for_same_inputs():
 from src.jobs.forecast_range_model import (  # noqa: E402
     LEVEL_TOUCH_MAX,
     LEVEL_TOUCH_MIN,
+    RANGE_OVER_SIGMA,
     VOL_NORMAL_HIGH,
     VOL_NORMAL_LOW,
     _barrier_touch_prob,
     _classify_vol_state,
+    implied_move_sanity,
+    predict_expected_vol,
+    robust_persistence_anchor,
 )
 
 
@@ -506,6 +510,20 @@ def test_wall_touch_odds_higher_in_short_gamma_than_long():
     assert short_g.level_touch_probs["call_wall"] > long_g.level_touch_probs["call_wall"]
 
 
+def test_level_touch_odds_use_calibrated_intraday_sigma():
+    # implied_move fix: a smaller per-symbol basis (realized runs below the raw
+    # close-to-close implied move, as the VIX names do) shrinks the reflection
+    # σ, so touch odds drop — correcting the overstatement that inflated the
+    # levels Brier. Default basis 1.0 leaves prior behavior unchanged.
+    wide = compute_forecast(
+        _vol_inputs(call_wall=605.0, calibration={"vol_range_basis_mult": 1.0})
+    )
+    tight = compute_forecast(
+        _vol_inputs(call_wall=605.0, calibration={"vol_range_basis_mult": 0.5})
+    )
+    assert tight.level_touch_probs["call_wall"] < wide.level_touch_probs["call_wall"]
+
+
 def test_flip_cross_prob_not_regime_tilted():
     # Same geometry, opposite regime — the flip-cross prob must be identical
     # (crossing the flip IS the regime change, so it isn't regime-tilted).
@@ -546,33 +564,148 @@ def test_classify_vol_state_band_edges():
 
 
 # ---------------------------------------------------------------------------
+# v1.5 expected-vol rework — persistence anchor + gamma tilt
+# ---------------------------------------------------------------------------
+
+
+def test_persistence_anchor_needs_min_obs():
+    # Below VOL_PERSISTENCE_MIN_OBS (5) there isn't enough history to trust it.
+    assert robust_persistence_anchor([1.0, 1.1, 0.9]) is None
+    # Exactly 5 → median of the observations.
+    assert robust_persistence_anchor([0.6, 0.7, 0.6, 0.65, 0.6]) == pytest.approx(0.6)
+
+
+def test_persistence_anchor_uses_recent_window_and_is_outlier_robust():
+    # Only the trailing VOL_PERSISTENCE_WINDOW (10) count; two stale hot days
+    # at the front are dropped, and the median ignores a single spike.
+    ratios = [2.0, 2.0] + [0.5] * 9 + [3.0]
+    assert robust_persistence_anchor(ratios) == pytest.approx(0.5)
+
+
+def test_implied_move_sanity_flags_mis_scaled_move():
+    assert implied_move_sanity(None, 5.0) is None
+    assert implied_move_sanity(5.0, None) is None
+    ok = implied_move_sanity(5.0, 6.5)          # ATR/implied = 1.3 → healthy
+    assert ok["sane"] is True and ok["atr_over_implied"] == pytest.approx(1.3)
+    too_big = implied_move_sanity(10.0, 4.0)    # ratio 0.4 → implied too large
+    assert too_big["sane"] is False
+    too_small = implied_move_sanity(1.0, 5.0)   # ratio 5.0 → implied too small
+    assert too_small["sane"] is False
+
+
+def test_predict_vol_anchors_on_persistence_not_flat_normal():
+    # THE rework: a compression-heavy trailing regime (anchor 0.6) predicts
+    # compression — NOT the flat-1.0 "normal" default that scored below the
+    # realized base rate. No gamma signal, so the anchor drives it.
+    state, ratio, msg = predict_expected_vol(
+        persistence_anchor=0.6, atr_5d=None, implied_move=5.0, vol_basis=1.0,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    assert ratio == pytest.approx(0.6)
+    assert state == "compression"
+    assert "anchor=persistence" in msg
+
+
+def test_predict_vol_falls_back_to_atr_anchor():
+    # No history → ATR anchor: recent avg range 1.4× the calibrated normal
+    # range reads expansion.
+    implied, basis = 5.0, 1.0
+    atr = 1.4 * RANGE_OVER_SIGMA * basis * implied
+    state, ratio, msg = predict_expected_vol(
+        persistence_anchor=None, atr_5d=atr, implied_move=implied, vol_basis=basis,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    assert ratio == pytest.approx(1.4, abs=1e-3)
+    assert state == "expansion"
+    assert "anchor=atr" in msg
+
+
+def test_predict_vol_gamma_tilts_the_anchor():
+    # Same neutral anchor; short gamma tilts up (expansion), long gamma down.
+    def r(net_gex):
+        return predict_expected_vol(
+            persistence_anchor=1.0, atr_5d=None, implied_move=5.0, vol_basis=1.0,
+            net_gex=net_gex, gex_surface_fresh=True, local_gex=None,
+            vix_z_score_20d=None, flip_distance=None,
+        )[1]
+    assert r(-3.0e9) > r(None) > r(3.0e9)
+
+
+def test_predict_vol_calibrated_basis_shifts_atr_anchor():
+    # A VRP regime: the SAME recent ATR reads compression under basis 1.0 but
+    # normal once the basis learns the symbol's lower center (0.7).
+    implied = 5.0
+    atr = 0.7 * RANGE_OVER_SIGMA * 1.0 * implied  # 0.7× the pure-Parkinson normal
+    tight = predict_expected_vol(
+        persistence_anchor=None, atr_5d=atr, implied_move=implied, vol_basis=1.0,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    recentered = predict_expected_vol(
+        persistence_anchor=None, atr_5d=atr, implied_move=implied, vol_basis=0.7,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    assert tight[0] == "compression"
+    assert recentered[1] == pytest.approx(1.0, abs=1e-3)
+    assert recentered[0] == "normal"
+
+
+# ---------------------------------------------------------------------------
 # v1.4 receipt grading — grade_realized_claims (pure, magnitude-only)
 # ---------------------------------------------------------------------------
 
 from src.jobs.forecast_range_model import grade_realized_claims  # noqa: E402
 
 
+def test_grade_normal_day_reads_normal_not_expansion():
+    # THE regression test for the range/σ scale fix: a statistically ORDINARY
+    # day realizes a high-low range of √(8/π)·implied ≈ 1.6× the 1-σ implied
+    # move.  It must grade "normal" (ratio ≈ 1.0), NOT "expansion".  Before the
+    # fix this exact day scored expansion at every VIX level.
+    implied = 50.0
+    normal_range = RANGE_OVER_SIGMA * implied  # ≈ 79.79
+    g = grade_realized_claims(
+        open_spot=600.0,
+        actual_low=600.0 - normal_range / 2,
+        actual_high=600.0 + normal_range / 2,
+        implied_move=implied, expected_vol_state="normal",
+        call_wall=None, put_wall=None, gamma_flip=None,
+        level_touch_probs=None, flip_cross_prob=None,
+    )
+    assert g["realized_vol_ratio"] == pytest.approx(1.0, abs=1e-3)
+    assert g["vol_state_correct"] is True
+
+
 def test_grade_vol_compression_hit():
+    # A genuinely quiet day: a $30 range against a $50 1-σ move is only ~0.38×
+    # a normal day's range (√(8/π)·50 ≈ 80), well inside compression.
     g = grade_realized_claims(
         open_spot=600.0, actual_low=585.0, actual_high=615.0,  # range 30
         implied_move=50.0, expected_vol_state="compression",
         call_wall=None, put_wall=None, gamma_flip=None,
         level_touch_probs=None, flip_cross_prob=None,
     )
-    assert g["realized_vol_ratio"] == pytest.approx(0.6)
+    assert g["realized_vol_ratio"] == pytest.approx(30.0 / (RANGE_OVER_SIGMA * 50.0), abs=1e-3)
+    assert g["realized_vol_ratio"] < VOL_NORMAL_LOW
     assert g["vol_state_correct"] is True
 
 
 def test_grade_expansion_is_path_independent():
-    # A violent two-way day (range 60) that closes right back at the open is
-    # still graded EXPANSION — the whole point of the reframe.
+    # A genuinely violent two-way day (range 120 ≈ 1.5× a normal day's range)
+    # that closes right back at the open is still graded EXPANSION — the whole
+    # point of the reframe. (Under the corrected scale a "violent" day is one
+    # whose RANGE clears ~1.15× the ~1.6·σ normal range, not merely 1.15·σ.)
     g = grade_realized_claims(
-        open_spot=600.0, actual_low=570.0, actual_high=630.0,  # range 60
+        open_spot=600.0, actual_low=540.0, actual_high=660.0,  # range 120
         implied_move=50.0, expected_vol_state="expansion",
         call_wall=None, put_wall=None, gamma_flip=None,
         level_touch_probs=None, flip_cross_prob=None,
     )
-    assert g["realized_vol_ratio"] == pytest.approx(1.2)
+    assert g["realized_vol_ratio"] == pytest.approx(120.0 / (RANGE_OVER_SIGMA * 50.0), abs=1e-3)
+    assert g["realized_vol_ratio"] > VOL_NORMAL_HIGH
     assert g["vol_state_correct"] is True
 
 
