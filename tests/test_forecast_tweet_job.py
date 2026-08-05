@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import sys
 from datetime import date, datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -91,29 +90,30 @@ def test_morning_tweet_shape():
     assert len(text) <= mod.TWEET_MAX_LEN
 
 
-def test_receipt_tweet_uses_verdict_pills():
+def test_receipt_tweet_grades_range_and_states_vol_as_context():
     mod = _reload_module()
     text = mod.build_receipt_tweet(_receipt_row(), "https://zerogex.io")
     assert text.startswith("SPY · 2026-07-01 receipt")
-    # The two graded claims — range coverage + the vol call — must be visible,
-    # with the realized ratio on the "× a normal day's range" scale.
+    # Range is the one GRADED claim (✓/✗). The vol call is demoted: it appears
+    # only as neutral realized-vol context, never as a scored verdict.
     assert "Range ✓ held" in text
-    assert "Vol ✓ Compression" in text
-    assert "0.72× normal" in text
+    assert "closed $746.90" in text
+    assert "Realized vol: compression (0.72× normal)" in text
+    assert "Vol ✓" not in text and "Vol ✗" not in text
     assert "Pin" not in text
     assert "Regime" not in text
-    assert "Close: $746.90" in text
     assert text.endswith("https://zerogex.io/forecast/SPY/2026-07-01")
 
 
-def test_receipt_tweet_handles_ungraded_vol_gracefully():
-    """vol_state_correct is NULL when no implied move was on file — the tweet
-    should surface a neutral 'n/a' rather than pretend it graded the call."""
+def test_receipt_tweet_omits_vol_context_when_ungraded():
+    """No realized ratio on file → the receipt just grades range and skips the
+    vol context line entirely (no scored verdict either way)."""
     mod = _reload_module()
     row = _receipt_row(vol_state_correct=None, realized_vol_ratio=None)
     text = mod.build_receipt_tweet(row, "https://zerogex.io")
-    assert "Vol — n/a" in text
-    assert "Vol ✓" not in text
+    assert "Range ✓ held" in text
+    assert "Realized vol" not in text
+    assert "Vol ✓" not in text and "Vol ✗" not in text
 
 
 def test_morning_tweet_truncates_to_280():

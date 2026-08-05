@@ -6,11 +6,12 @@ Two modes, both back-ended by the same script + two systemd timers:
     lands the ``daily_forecast`` row. Tweets today's projected range +
     expected-volatility call + the ``/forecast/{symbol}/{date}`` permalink.
   * ``--mode receipt`` fires 16:10 ET, ~5 minutes after the receipt writer
-    grades the morning commitment. Tweets the verdict overlay ("range
-    held/broken", "volatility called/missed") + the same permalink (which now
-    renders in receipt state).  These are the two headline claims the website
-    grades — pin/regime were retired in the v1.4 reframe, so the tweet and the
-    site now show one scorecard, not two.
+    grades the morning commitment. Tweets the RANGE verdict ("range
+    held/broken") — the one graded headline claim — plus the realized close and
+    realized-vol state as neutral context, then the permalink. The expected-vol
+    call is DEMOTED to informational: it never beat its majority-bucket baseline
+    on the corrected scale, so we state what vol did rather than score it (the
+    same treatment pin/regime got in the v1.4 reframe).
 
 Both modes share the ``scorecard_tweet`` design rules:
   * Never throw. Every failure path logs + exits 0 so the timer keeps
@@ -199,34 +200,25 @@ def build_receipt_tweet(row: dict[str, Any], site_url: str) -> str:
     else:
         day_iso = day.isoformat()
     range_v = row.get("range_respected")
-    vol_v = row.get("vol_state_correct")
     vol_state = _fmt_vol_state(row.get("expected_vol_state"))
     actual_close = _fmt_price(row.get("actual_close"))
     permalink = f"{site_url.rstrip('/')}/forecast/{sym}/{day_iso}"
 
     range_txt = "held" if range_v is True else "broken" if range_v is False else "—"
 
-    # Vol verdict: the ✓/✗ carries called-vs-missed; the state is the morning
-    # call and the ratio is the realized outcome as a multiple of a normal day's
-    # range (1.0 == an ordinary day), so a miss is legible at a glance.
-    ratio_txt = ""
-    realized_ratio = row.get("realized_vol_ratio")
-    try:
-        if realized_ratio is not None:
-            ratio_txt = f" · {float(realized_ratio):.2f}× normal"
-    except (TypeError, ValueError):
-        ratio_txt = ""
-    vol_seg = (
-        f"Vol {_fmt_verdict(vol_v)} {vol_state}{ratio_txt}"
-        if vol_v is not None
-        else "Vol — n/a"
-    )
-
+    # Range coverage is the graded claim. The expected-vol call is DEMOTED to
+    # informational (it doesn't beat its baseline), so the receipt states what
+    # realized vol actually did as neutral context — no ✓/✗ verdict on it.
     body = (
         f"{sym} · {day_iso} receipt\n"
-        f"Range {_fmt_verdict(range_v)} {range_txt} · {vol_seg}\n"
-        f"Close: {actual_close}"
+        f"Range {_fmt_verdict(range_v)} {range_txt} · closed {actual_close}"
     )
+    realized_ratio = row.get("realized_vol_ratio")
+    try:
+        if realized_ratio is not None and vol_state != "—":
+            body += f"\nRealized vol: {vol_state.lower()} ({float(realized_ratio):.2f}× normal)"
+    except (TypeError, ValueError):
+        pass
     text = f"{body}\n{permalink}"
     if len(text) <= TWEET_MAX_LEN:
         return text

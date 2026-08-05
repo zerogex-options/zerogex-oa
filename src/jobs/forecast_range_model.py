@@ -616,8 +616,19 @@ def _compute_level_touch_probs(
     implied_move: Optional[float],
     regime: str,
     rationale: list[str],
+    vol_basis: float = 1.0,
 ) -> tuple[dict[str, float], Optional[float]]:
     """Reflection-principle P(touch today) for each wall + P(flip cross).
+
+    The barrier σ is the CALIBRATED intraday move ``vol_basis · implied_move``,
+    not the raw VIX-implied 1-day move.  ``implied_move`` is a close-to-close
+    1-σ figure and (for the VIX names especially) runs well above how the cash
+    session actually travels — the ATR÷implied sanity check flags ~0.74 for
+    SPY/SPX — so feeding it straight into the reflection principle overstated
+    every touch/flip probability and inflated the levels Brier.  ``vol_basis``
+    is the per-symbol scalar the nightly cron already learns from realized
+    intraday range (σ_intraday ≈ vol_basis · implied_move), so reusing it here
+    calibrates the touch odds to how the tape really moves — no magic factor.
 
     Walls are tilted by the dealer regime (long gamma defends them, short
     gamma lets them break).  The flip-cross probability is deliberately NOT
@@ -627,6 +638,9 @@ def _compute_level_touch_probs(
     spot = inp.spot
     if implied_move is None or implied_move <= 0 or spot <= 0:
         return {}, None
+    # Calibrated intraday σ for the reflection principle (guard against a
+    # degenerate basis so σ stays positive).
+    sigma = max(vol_basis, 1e-9) * implied_move
     tilt = (
         LEVEL_LONG_GAMMA_DAMP if regime == "long_gamma"
         else LEVEL_SHORT_GAMMA_AMP if regime == "short_gamma"
@@ -634,11 +648,11 @@ def _compute_level_touch_probs(
     )
     probs: dict[str, float] = {}
     for name, level in (("call_wall", inp.call_wall), ("put_wall", inp.put_wall)):
-        p = _barrier_touch_prob((level - spot) if level is not None else None, implied_move)
+        p = _barrier_touch_prob((level - spot) if level is not None else None, sigma)
         if p is not None:
             probs[name] = round(_clamp(p * tilt, LEVEL_TOUCH_MIN, LEVEL_TOUCH_MAX), 4)
     flip_prob = _barrier_touch_prob(
-        (inp.gamma_flip - spot) if inp.gamma_flip is not None else None, implied_move
+        (inp.gamma_flip - spot) if inp.gamma_flip is not None else None, sigma
     )
     if flip_prob is not None:
         flip_prob = round(flip_prob, 4)
@@ -1121,7 +1135,8 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         implied_move=implied_move,
     )
     level_touch_probs, flip_cross_prob = _compute_level_touch_probs(
-        inp, implied_move, regime, rationale
+        inp, implied_move, regime, rationale,
+        vol_basis=float(calibration.get("vol_range_basis_mult", 1.0)),
     )
     gravity_center = _select_gravity_center(inp)
 
