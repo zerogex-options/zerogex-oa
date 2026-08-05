@@ -113,10 +113,19 @@ def tick() -> Dict[str, Any]:
     }
     with db_connection() as conn:
         cur = conn.cursor()
+        # Load every ENABLED bot (full open + manage) PLUS any bot that still
+        # holds an open position (manage-only). A bot disabled while holding a
+        # position — manually or via the circuit-breaker auto-disable — must
+        # still have that position marked, exited, and settled; it just stops
+        # OPENING new ones (gated on `enabled` in _run_bot). Filtering solely on
+        # `enabled = TRUE` here orphaned such positions: never marked, never
+        # closed, stuck past their time_stop forever (Invariant D violation).
         cur.execute("""
             SELECT id, display_name, strategy_class, tier, direction_mode,
                    universe, tagline, description, is_public, enabled, params
-            FROM tw_bots WHERE enabled = TRUE
+            FROM tw_bots b
+            WHERE b.enabled = TRUE
+               OR EXISTS (SELECT 1 FROM tw_positions p WHERE p.bot_id = b.id)
             """)
         bots = cur.fetchall()
 
@@ -275,10 +284,12 @@ def _run_bot(
                     stats["scaled"] += 1
 
             # 2. Look for a new entry in this underlying — but only when the
-            # market-hours gate allows opens. Exits above always run; this
-            # skips ONLY the open path so no bot can start a 0DTE outside the
-            # cash session (which would instantly time-stop for a loss).
-            if not opens_allowed:
+            # market-hours gate allows opens AND the bot is enabled. Exits above
+            # always run (so a DISABLED bot's open positions still settle); this
+            # skips ONLY the open path, so no bot starts a 0DTE outside the cash
+            # session, and a disabled bot never opens while its held positions
+            # are wound down.
+            if not enabled or not opens_allowed:
                 continue
             signal = bot.open_criteria(snap)
             if signal is not None and bot._bias_veto(snap, signal.direction):
