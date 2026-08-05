@@ -30,12 +30,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import statistics
 import sys
-from datetime import datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -59,10 +57,12 @@ BOUNDS = {
     "pin_tolerance_mult": (0.50, 2.00),
     "upside_lean": (-0.20, 0.20),
     "downside_lean": (-0.20, 0.20),
-    # A symbol's "normal day" can't sanely be less than 60% or more than 140%
-    # of the Parkinson expected range — realized-vol regimes drift, but not
-    # that far.  Clamps a freak fortnight from moving the grading goalposts.
-    "vol_range_basis_mult": (0.60, 1.40),
+    # A symbol's "normal day" range vs the Parkinson expectation.  Floor lowered
+    # 0.60 → 0.45: index symbols pinned the old floor exactly (realized ran near
+    # 1× implied, i.e. ~0.63 of Parkinson), so 0.60 was clipping the true center
+    # and leaving the vol grade slightly mis-centered. 0.45 gives the calibrator
+    # room to reach a genuinely quiet, VRP-heavy regime; 1.40 still caps a spike.
+    "vol_range_basis_mult": (0.45, 1.40),
 }
 
 

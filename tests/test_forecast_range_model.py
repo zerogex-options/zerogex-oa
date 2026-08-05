@@ -441,6 +441,9 @@ from src.jobs.forecast_range_model import (  # noqa: E402
     VOL_NORMAL_LOW,
     _barrier_touch_prob,
     _classify_vol_state,
+    implied_move_sanity,
+    predict_expected_vol,
+    robust_persistence_anchor,
 )
 
 
@@ -544,6 +547,96 @@ def test_classify_vol_state_band_edges():
     assert _classify_vol_state(VOL_NORMAL_LOW) == "compression"
     assert _classify_vol_state(VOL_NORMAL_HIGH) == "expansion"
     assert _classify_vol_state(1.0) == "normal"
+
+
+# ---------------------------------------------------------------------------
+# v1.5 expected-vol rework — persistence anchor + gamma tilt
+# ---------------------------------------------------------------------------
+
+
+def test_persistence_anchor_needs_min_obs():
+    # Below VOL_PERSISTENCE_MIN_OBS (5) there isn't enough history to trust it.
+    assert robust_persistence_anchor([1.0, 1.1, 0.9]) is None
+    # Exactly 5 → median of the observations.
+    assert robust_persistence_anchor([0.6, 0.7, 0.6, 0.65, 0.6]) == pytest.approx(0.6)
+
+
+def test_persistence_anchor_uses_recent_window_and_is_outlier_robust():
+    # Only the trailing VOL_PERSISTENCE_WINDOW (10) count; two stale hot days
+    # at the front are dropped, and the median ignores a single spike.
+    ratios = [2.0, 2.0] + [0.5] * 9 + [3.0]
+    assert robust_persistence_anchor(ratios) == pytest.approx(0.5)
+
+
+def test_implied_move_sanity_flags_mis_scaled_move():
+    assert implied_move_sanity(None, 5.0) is None
+    assert implied_move_sanity(5.0, None) is None
+    ok = implied_move_sanity(5.0, 6.5)          # ATR/implied = 1.3 → healthy
+    assert ok["sane"] is True and ok["atr_over_implied"] == pytest.approx(1.3)
+    too_big = implied_move_sanity(10.0, 4.0)    # ratio 0.4 → implied too large
+    assert too_big["sane"] is False
+    too_small = implied_move_sanity(1.0, 5.0)   # ratio 5.0 → implied too small
+    assert too_small["sane"] is False
+
+
+def test_predict_vol_anchors_on_persistence_not_flat_normal():
+    # THE rework: a compression-heavy trailing regime (anchor 0.6) predicts
+    # compression — NOT the flat-1.0 "normal" default that scored below the
+    # realized base rate. No gamma signal, so the anchor drives it.
+    state, ratio, msg = predict_expected_vol(
+        persistence_anchor=0.6, atr_5d=None, implied_move=5.0, vol_basis=1.0,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    assert ratio == pytest.approx(0.6)
+    assert state == "compression"
+    assert "anchor=persistence" in msg
+
+
+def test_predict_vol_falls_back_to_atr_anchor():
+    # No history → ATR anchor: recent avg range 1.4× the calibrated normal
+    # range reads expansion.
+    implied, basis = 5.0, 1.0
+    atr = 1.4 * RANGE_OVER_SIGMA * basis * implied
+    state, ratio, msg = predict_expected_vol(
+        persistence_anchor=None, atr_5d=atr, implied_move=implied, vol_basis=basis,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    assert ratio == pytest.approx(1.4, abs=1e-3)
+    assert state == "expansion"
+    assert "anchor=atr" in msg
+
+
+def test_predict_vol_gamma_tilts_the_anchor():
+    # Same neutral anchor; short gamma tilts up (expansion), long gamma down.
+    def r(net_gex):
+        return predict_expected_vol(
+            persistence_anchor=1.0, atr_5d=None, implied_move=5.0, vol_basis=1.0,
+            net_gex=net_gex, gex_surface_fresh=True, local_gex=None,
+            vix_z_score_20d=None, flip_distance=None,
+        )[1]
+    assert r(-3.0e9) > r(None) > r(3.0e9)
+
+
+def test_predict_vol_calibrated_basis_shifts_atr_anchor():
+    # A VRP regime: the SAME recent ATR reads compression under basis 1.0 but
+    # normal once the basis learns the symbol's lower center (0.7).
+    implied = 5.0
+    atr = 0.7 * RANGE_OVER_SIGMA * 1.0 * implied  # 0.7× the pure-Parkinson normal
+    tight = predict_expected_vol(
+        persistence_anchor=None, atr_5d=atr, implied_move=implied, vol_basis=1.0,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    recentered = predict_expected_vol(
+        persistence_anchor=None, atr_5d=atr, implied_move=implied, vol_basis=0.7,
+        net_gex=None, gex_surface_fresh=True, local_gex=None,
+        vix_z_score_20d=None, flip_distance=None,
+    )
+    assert tight[0] == "compression"
+    assert recentered[1] == pytest.approx(1.0, abs=1e-3)
+    assert recentered[0] == "normal"
 
 
 # ---------------------------------------------------------------------------

@@ -46,9 +46,10 @@ meantime, heuristic_v1_3 + Layer 2 corrections is what powers the card.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 # ---------------------------------------------------------------------------
 # Tuning constants
@@ -155,7 +156,14 @@ DEFAULT_STRIKE_STEP = 1.0
 RANGE_OVER_SIGMA = math.sqrt(8.0 / math.pi)  # ≈ 1.5958 — Parkinson E[range]/σ
 
 VOL_BASE_RATIO = 1.0
-VOL_GAMMA_WEIGHT = 0.35          # dealer-gamma sign is the dominant driver
+# Persistence is the anchor (vol clusters); gamma is a MODIFIER on top of it.
+# The v1.4 gamma-only model predicted from a flat 1.0 base and scored BELOW the
+# realized base rate because it defaulted to "normal" while realized ran
+# compression-heavy — a distribution mismatch.  v1.5 anchors on the trailing
+# realized ratio so the predicted regime matches the base rate, then tilts.
+VOL_PERSISTENCE_MIN_OBS = 5     # need this many trailing receipts to trust the anchor
+VOL_PERSISTENCE_WINDOW = 10     # trailing receipts the writer medians for the anchor
+VOL_GAMMA_WEIGHT = 0.25         # dealer-gamma sign — a tilt on the persistence anchor
 VOL_GEX_SATURATION = 2.0e9      # |net_gex| that saturates the damping/amplifying pull
 VOL_VIXZ_WEIGHT = 0.15          # vol-of-vol context (20d VIX z-score)
 VOL_FLIP_PROX_WEIGHT = 0.10     # nearness to the flip raises expansion odds
@@ -164,6 +172,14 @@ VOL_LOCAL_GAMMA_WEIGHT = 0.08   # dense local gamma adds pinning — long-gamma 
 VOL_LOCAL_GEX_SATURATION = 5.0e8
 VOL_RATIO_MIN = 0.45
 VOL_RATIO_MAX = 1.90
+
+# implied_move sanity: ATR-5d (avg daily range, ≈1.6·σ_realized) vs the stored
+# VIX-implied 1-day move (σ_implied).  With realized vol typically 0.7–1.0× of
+# implied, the ratio ATR÷implied should sit ~1.1–1.7; well outside [LOW, HIGH]
+# means implied_move is likely mis-scaled (wrong vol index, √252 vs cash
+# session, index-vs-ETF units) — the writer logs a data-quality WARNING.
+IMPLIED_MOVE_ATR_RATIO_LOW = 0.80
+IMPLIED_MOVE_ATR_RATIO_HIGH = 3.00
 # Grading band, shared with the receipt grader (kept in sync there).  The
 # ratio is realized-range ÷ EXPECTED-range (√(8/π)·implied, per-symbol
 # calibrated), so 1.0 == "a statistically normal day" and the edges read:
@@ -248,6 +264,16 @@ class ForecastInputs:
     vix_z_score_20d: Optional[float] = None      # for screaming-vol detection
     iv_rank_30d: Optional[float] = None          # 0-100
     atr_5d: Optional[float] = None               # dollar terms
+
+    # Vol-persistence anchor for the expected-vol call: a robust central
+    # tendency (median) of this symbol's RECENT realized vol ratios, on the
+    # same calibrated "× a normal day's range" scale the receipt grades.  The
+    # writer computes it from the trailing receipts; None on cold start.  This
+    # is the dominant driver of the expected-vol prediction — vol clusters, so
+    # how the tape has actually been trading beats gamma structure alone, and
+    # anchoring here makes the predicted regime match the realized base rate
+    # instead of defaulting to "normal".
+    vol_persistence_anchor: Optional[float] = None
 
     # Overnight action.
     futures_gap_pct: Optional[float] = None      # overnight ES/NQ gap
@@ -458,37 +484,131 @@ def _classify_vol_state(ratio: float) -> str:
     return "normal"
 
 
-def _compute_expected_vol(inp: ForecastInputs, rationale: list[str]) -> tuple[str, float]:
+def robust_persistence_anchor(prior_ratios: Sequence[float]) -> Optional[float]:
+    """Central tendency of a symbol's RECENT realized vol ratios — the vol
+    clustering signal that anchors the expected-vol prediction.
+
+    ``prior_ratios`` are trailing realized ratios on the calibrated "× a normal
+    day's range" scale, newest-last.  Returns the median of the most recent
+    ``VOL_PERSISTENCE_WINDOW`` (robust to a single outlier day), or None when
+    there aren't at least ``VOL_PERSISTENCE_MIN_OBS`` usable observations — the
+    caller then falls back to the ATR anchor / neutral 1.0.
+    """
+    clean = [float(r) for r in prior_ratios if r is not None and r > 0]
+    if len(clean) < VOL_PERSISTENCE_MIN_OBS:
+        return None
+    return statistics.median(clean[-VOL_PERSISTENCE_WINDOW:])
+
+
+def implied_move_sanity(
+    implied_move: Optional[float], atr_5d: Optional[float]
+) -> Optional[dict[str, Any]]:
+    """Cross-check the stored implied 1-day move against realized ATR.
+
+    ATR-5d (avg daily range ≈ 1.6·σ_realized) over the VIX-implied move
+    (σ_implied) should land ~1.1–1.7 for liquid names.  A ratio well below
+    ``IMPLIED_MOVE_ATR_RATIO_LOW`` means the implied move is implausibly LARGE
+    relative to how the tape actually trades (the symptom that pinned the vol
+    basis at its floor for the index symbols); well above HIGH means it's too
+    small.  Returns ``{atr_over_implied, sane}`` or None when either input is
+    missing, so the writer can log a data-quality WARNING without failing.
+    """
+    if not implied_move or implied_move <= 0 or not atr_5d or atr_5d <= 0:
+        return None
+    ratio = atr_5d / implied_move
+    return {
+        "atr_over_implied": round(ratio, 3),
+        "sane": IMPLIED_MOVE_ATR_RATIO_LOW <= ratio <= IMPLIED_MOVE_ATR_RATIO_HIGH,
+    }
+
+
+def predict_expected_vol(
+    *,
+    persistence_anchor: Optional[float],
+    atr_5d: Optional[float],
+    implied_move: Optional[float],
+    vol_basis: float,
+    net_gex: Optional[float],
+    gex_surface_fresh: bool,
+    local_gex: Optional[float],
+    vix_z_score_20d: Optional[float],
+    flip_distance: Optional[float],
+) -> tuple[str, float, str]:
     """Predict realized daily range as a multiple of a NORMAL day's range.
 
-    A ratio of 1.0 means "expect a statistically ordinary day"; dealer-gamma
-    sign is the dominant driver — long gamma suppresses realized volatility
-    (ratio < 1, compression), short gamma amplifies it (ratio > 1, expansion).
-    Dense local gamma adds pinning (long-gamma only), a stretched VIX z-score
-    lifts the whole tape, and proximity to the flip raises expansion odds
-    because the regime itself is unstable there.  The prediction is on the same
-    "× a normal day's range" scale the receipt grades against (a normal day's
-    range being √(8/π)·implied, per-symbol calibrated).  Makes NO claim about
+    v1.5 — anchor + tilt.  The ANCHOR is where realized vol has actually been
+    sitting (vol clustering), on the same calibrated scale the receipt grades:
+
+      1. the trailing-realized-ratio median (``persistence_anchor``) when we
+         have enough history — this makes the predicted regime match the
+         realized base rate instead of defaulting to "normal";
+      2. else the ATR-5d anchor: recent avg daily range ÷ the calibrated normal
+         range (√(8/π)·vol_basis·implied);
+      3. else a neutral 1.0.
+
+    Dealer gamma then TILTS the anchor (short gamma amplifies, long gamma damps
+    — a modifier, not the driver), dense local gamma adds long-gamma pinning, a
+    stretched VIX z-score lifts the whole tape, and flip proximity raises
+    expansion odds.  Returns (state, ratio, rationale).  Makes NO claim about
     direction.
     """
-    ratio = VOL_BASE_RATIO
-    if inp.gex_surface_fresh and inp.net_gex is not None:
-        g = math.tanh(inp.net_gex / VOL_GEX_SATURATION)  # +long / -short
+    anchor_src = "neutral"
+    if persistence_anchor is not None and persistence_anchor > 0:
+        ratio = float(persistence_anchor)
+        anchor_src = "persistence"
+    elif (
+        atr_5d is not None and atr_5d > 0
+        and implied_move is not None and implied_move > 0
+    ):
+        normal_range = RANGE_OVER_SIGMA * max(vol_basis, 1e-9) * implied_move
+        ratio = atr_5d / normal_range if normal_range > 0 else VOL_BASE_RATIO
+        anchor_src = "atr"
+    else:
+        ratio = VOL_BASE_RATIO
+
+    if gex_surface_fresh and net_gex is not None:
+        g = math.tanh(net_gex / VOL_GEX_SATURATION)  # +long / -short
         ratio *= 1.0 - VOL_GAMMA_WEIGHT * g
-        if inp.net_gex > 0 and inp.local_gex is not None and inp.local_gex > 0:
-            dens = math.tanh(inp.local_gex / VOL_LOCAL_GEX_SATURATION)
+        if net_gex > 0 and local_gex is not None and local_gex > 0:
+            dens = math.tanh(local_gex / VOL_LOCAL_GEX_SATURATION)
             ratio *= 1.0 - VOL_LOCAL_GAMMA_WEIGHT * dens
-    if inp.vix_z_score_20d is not None:
-        z = _clamp(inp.vix_z_score_20d / 3.0, -1.0, 1.0)
+    if vix_z_score_20d is not None:
+        z = _clamp(vix_z_score_20d / 3.0, -1.0, 1.0)
         ratio *= 1.0 + VOL_VIXZ_WEIGHT * z
-    if inp.flip_distance is not None and VOL_FLIP_PROX_SPAN > 0:
-        prox = max(0.0, 1.0 - abs(inp.flip_distance) / VOL_FLIP_PROX_SPAN)
+    if flip_distance is not None and VOL_FLIP_PROX_SPAN > 0:
+        prox = max(0.0, 1.0 - abs(flip_distance) / VOL_FLIP_PROX_SPAN)
         if prox > 0:
             ratio *= 1.0 + VOL_FLIP_PROX_WEIGHT * prox
+
     ratio = _clamp(ratio, VOL_RATIO_MIN, VOL_RATIO_MAX)
     state = _classify_vol_state(ratio)
-    rationale.append(f"Expected vol={state} (realized≈{ratio:.2f}× a normal day's range)")
-    return state, round(ratio, 4)
+    rationale = (
+        f"Expected vol={state} (≈{ratio:.2f}× a normal day, anchor={anchor_src})"
+    )
+    return state, round(ratio, 4), rationale
+
+
+def _compute_expected_vol(
+    inp: ForecastInputs, rationale: list[str], *, vol_basis: float,
+    implied_move: Optional[float],
+) -> tuple[str, float]:
+    """Wire ``ForecastInputs`` into the pure ``predict_expected_vol``.
+
+    Kept as a thin adapter so the writer path and the backtest tool call the
+    exact same prediction logic on the same features."""
+    state, ratio, msg = predict_expected_vol(
+        persistence_anchor=inp.vol_persistence_anchor,
+        atr_5d=inp.atr_5d,
+        implied_move=implied_move,
+        vol_basis=vol_basis,
+        net_gex=inp.net_gex,
+        gex_surface_fresh=inp.gex_surface_fresh,
+        local_gex=inp.local_gex,
+        vix_z_score_20d=inp.vix_z_score_20d,
+        flip_distance=inp.flip_distance,
+    )
+    rationale.append(msg)
+    return state, ratio
 
 
 def _compute_level_touch_probs(
@@ -995,7 +1115,11 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
     # headline claim of its own.
     vol_proxy = inp.vix_close if inp.vix_close is not None else inp.vxn_close
     implied_move = _vix_implied_daily_move(spot, vol_proxy)
-    expected_vol_state, expected_vol_ratio = _compute_expected_vol(inp, rationale)
+    expected_vol_state, expected_vol_ratio = _compute_expected_vol(
+        inp, rationale,
+        vol_basis=float(calibration.get("vol_range_basis_mult", 1.0)),
+        implied_move=implied_move,
+    )
     level_touch_probs, flip_cross_prob = _compute_level_touch_probs(
         inp, implied_move, regime, rationale
     )
