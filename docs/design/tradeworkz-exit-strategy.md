@@ -331,19 +331,24 @@ floor((Q−t1)/2)`, `runner = Q − t1 − t2` (Q=4 → 2/1/1; Q=6 → 3/1/2).
 
 Three independent layers, all still in effect under the new ladder:
 
-### 6.1 Premium damage-control stop — **now 25%** (configurable)
+### 6.1 Premium damage-control stop — **40% with a grace window** (configurable)
 
 If the option mark drops below `(1 − MAX_PREMIUM_LOSS_PCT) × entry_price`, the
-reconciler closes the position with `reason="premium_stop"`
-(`base.py:196-205`). **Default lowered from 40% → 25%** this change
-(`config.py:75-77`, `.env.example:1438`).
+reconciler closes the position with `reason="premium_stop"`. The default is
+**40%** (`MAX_PREMIUM_LOSS_PCT`, `config.py`). A tighter 25% was tried and
+reverted: on cheap 0DTE debits the bid/ask + slippage gap on the very first
+mark can read as a 30–45% "loss" that is only the spread, so a 25% stop knifed
+positions out on entry for the spread, not on a real adverse move.
 
+- **Entry grace window** (`PREMIUM_STOP_GRACE_SECONDS`, default 45s): the
+  premium stop is suppressed for the first N seconds after open so it fires on
+  moves, not on the entry-tick spread. Structural / time / wall stops still
+  apply during the grace.
 - Fleet-wide via `TRADEWORKZ_MAX_PREMIUM_LOSS_PCT`.
 - Per-bot via `params['max_premium_loss_pct']`, which overrides the fleet
-  default (`base.py:126-144`). `0` disables it for that bot.
-- Only `put_wall_magnet_reversal` overrides it today (already `0.25`,
-  `bots/put_wall_magnet_reversal.py:81`); it is now equal to the fleet default.
-  Every other bot inherits the new 25% cap.
+  default. `0` disables it for that bot.
+- `put_wall_magnet_reversal` overrides it to `0.25` — now *tighter* than the
+  40% fleet default. Every other bot inherits 40%.
 
 Note the interaction with the runner: the premium stop is measured from
 **entry**. Once a trade is a large winner, the `(1 − 0.25)×entry` floor sits far
@@ -365,8 +370,26 @@ For wall-fade bots, a volatility-scaled break of the referenced wall
 
 ### 6.4 Time-stop / EOD
 
-`time_stop_at` from `max_hold_minutes`, hard-capped at 15:55 ET (§1.2).
-Unchanged; it is the final backstop for the Stage-2 runner.
+`time_stop_at` from `max_hold_minutes`, hard-capped at 15:55 ET (§1.2). It is
+the final backstop for the Stage-2 runner.
+
+**Settlement backstop for an unpriceable 0DTE.** Every exit (mark, stop, target,
+time-stop) is reached only after `mark_position` succeeds; the engine skips a
+position it cannot price and retries next tick. That skip is correct while a
+quote may still return, but it strands a position that can *never* be priced
+again — an expired 0DTE whose option quotes have rolled off and whose intrinsic
+settlement is unavailable (`spread_price` returns `None`, so both
+`mark_position` and `close_position` bail). Such a position sits open past its
+time-stop, its stale unrealized P&L corrupting NAV / heat, and never realizes.
+
+So once a position is **past `time_stop_at` (or its legs have expired)** and
+still cannot be priced, the engine force-settles it at its **last observed
+mark** — `close_position(reason="time_stop_settle", fallback_fill=current_price)`
+(`engine._force_settle_due`, `close_position`'s `fallback_fill`). A normal close
+still bails on an unpriceable structure; only the past-time-stop path passes a
+fallback. Invariant A holds for the settled row by construction. This is the
+backstop for the 2026-08-04 bug where two 0DTE puts sat open ~13 hours past an
+11:00 ET time-stop because their legs could no longer be priced.
 
 ---
 

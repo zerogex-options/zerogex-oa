@@ -29,9 +29,10 @@ from src.tradeworkz import config as tw_config
 from src.tradeworkz import ml as ml_mod
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.context import MarketSnapshot, build_snapshot
-from src.tradeworkz.models import BotSpec
+from src.tradeworkz.models import BotSpec, OpenPosition
 from src.tradeworkz.registry import get_bot_class, DEFAULT_ROSTER, RETIRED_BOT_IDS
 from src.tradeworkz.reconciler import (
+    _earliest_leg_expiration,
     close_position,
     daily_realized_pnl,
     load_capital,
@@ -76,6 +77,26 @@ def _opens_allowed(now_utc: datetime) -> bool:
     if not is_market_hours(now_utc):
         return False
     return now_utc.astimezone(_ET).time() < _NO_NEW_OPENS_AFTER
+
+
+def _force_settle_due(pos: OpenPosition, now_utc: datetime) -> bool:
+    """Whether an UNPRICEABLE position must be force-settled rather than skipped.
+
+    ``mark_position`` returns ``None`` when :func:`spread_price` cannot value the
+    structure — an expired 0DTE whose option quotes have rolled off and whose
+    intrinsic settlement is unavailable. Normally that position is skipped and
+    retried next tick. But once it is past its hard ``time_stop_at`` (or its legs
+    have expired outright), retrying forever just strands it open: it never
+    realizes, and its stale unrealized P&L keeps corrupting NAV / heat. In that
+    case the engine settles it at its last observed mark instead of skipping.
+    This is the backstop for the money bug where a 0DTE sat open ~13 hours past
+    an 11:00 time_stop because its legs could no longer be priced.
+    """
+    tsa = pos.time_stop_at
+    if tsa is not None and now_utc >= tsa:
+        return True
+    exp = _earliest_leg_expiration(pos.legs)
+    return exp is not None and exp < now_utc.astimezone(_ET).date()
 
 
 def tick() -> Dict[str, Any]:
@@ -213,11 +234,30 @@ def _run_bot(
             # 1. Mark + evaluate exits on any open positions in THIS
             # underlying only. Positions in other underlyings for the
             # same bot are handled on their own iteration.
+            now_utc = datetime.now(timezone.utc)
             for pos in load_open_positions(conn, bot_id):
                 if pos.underlying != u:
                     continue
                 mark = mark_position(conn, pos)
                 if mark is None:
+                    # Unpriceable structure. If it is past its hard time_stop
+                    # (or expired), force-settle at the last observed mark so a
+                    # 0DTE can never strand open; otherwise skip and retry next
+                    # tick when a quote may return. See _force_settle_due.
+                    if _force_settle_due(pos, now_utc):
+                        settled = close_position(
+                            conn, pos, reason="time_stop_settle",
+                            fallback_fill=pos.current_price,
+                        )
+                        if settled is not None:
+                            stats["closed"] += 1
+                        else:
+                            logger.warning(
+                                "TradeWorkz: %s position %s is past time_stop but "
+                                "unsettleable (no live mark, no last price); left "
+                                "open for manual review",
+                                bot_id, pos.id,
+                            )
                     continue
                 stats["marked"] += 1
                 decision = bot.exit_criteria(snap, pos)
