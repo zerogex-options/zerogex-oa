@@ -162,6 +162,7 @@ class _MLState:
 class _FakeBot:
     def __init__(self, spec, ml_state=None):
         self.exit_called = False
+        self.open_called = False
 
     def size_multiplier(self):
         return 1.0
@@ -169,6 +170,10 @@ class _FakeBot:
     def exit_criteria(self, snap, pos):
         self.exit_called = True
         return MagicMock(should_close=False, should_cut=False)
+
+    def open_criteria(self, snap):
+        self.open_called = True
+        return None
 
 
 class _NullConn:
@@ -195,26 +200,27 @@ _ROW = (
 
 
 def _wire(monkeypatch, pos):
+    the_bot = _FakeBot(spec=None)
     monkeypatch.setattr(engine, "db_connection", lambda: _NullConn())
     monkeypatch.setattr(engine, "load_capital", lambda conn, bid: object())
     monkeypatch.setattr(engine.ml_mod, "load_state", lambda conn, bid: _MLState())
-    monkeypatch.setattr(
-        engine, "get_bot_class", lambda cls: (lambda spec, ml_state=None: _FakeBot(spec))
-    )
+    monkeypatch.setattr(engine, "get_bot_class", lambda cls: (lambda spec, ml_state=None: the_bot))
     monkeypatch.setattr(engine, "load_open_positions", lambda conn, bid: [pos])
     monkeypatch.setattr(engine, "mark_position", lambda conn, p: None)  # unpriceable
+    monkeypatch.setattr(engine, "daily_realized_pnl", lambda conn, bid: 0.0)
+    monkeypatch.setattr(engine, "open_position", lambda *a, **k: 1)
     settled = []
     monkeypatch.setattr(
         engine, "close_position",
         lambda conn, p, reason=None, fallback_fill=None: settled.append(
             (reason, fallback_fill)) or 123,
     )
-    return settled
+    return the_bot, settled
 
 
 def test_run_bot_force_settles_unmarkable_past_time_stop(monkeypatch):
     pos = _Pos(time_stop_at=_NOW - timedelta(hours=13), current_price=0.55)
-    settled = _wire(monkeypatch, pos)
+    _bot, settled = _wire(monkeypatch, pos)
     stats = engine._run_bot(_ROW, {"SPY": object()}, ("SPY",), opens_allowed=False)
     assert settled == [("time_stop_settle", 0.55)]
     assert stats["closed"] == 1
@@ -222,7 +228,25 @@ def test_run_bot_force_settles_unmarkable_past_time_stop(monkeypatch):
 
 def test_run_bot_skips_unmarkable_before_time_stop(monkeypatch):
     pos = _Pos(time_stop_at=_NOW + timedelta(hours=1), current_price=0.55)
-    settled = _wire(monkeypatch, pos)
+    _bot, settled = _wire(monkeypatch, pos)
     stats = engine._run_bot(_ROW, {"SPY": object()}, ("SPY",), opens_allowed=False)
     assert settled == []            # not past time_stop -> skip and retry
     assert stats["closed"] == 0
+
+
+# ── disabled bot: still settles its open position, never opens ─────────
+
+# _ROW with enabled flipped to False (index 9 is the `enabled` column).
+_ROW_DISABLED = _ROW[:9] + (False,) + _ROW[10:]
+
+
+def test_run_bot_disabled_bot_still_settles_but_never_opens(monkeypatch):
+    # The money bug: a bot auto-disabled by the circuit breaker while holding a
+    # position must still have that position marked/exited/settled — and must
+    # not open a new one even when the session window allows opens.
+    pos = _Pos(time_stop_at=_NOW - timedelta(hours=13), current_price=0.55)
+    the_bot, settled = _wire(monkeypatch, pos)
+    stats = engine._run_bot(_ROW_DISABLED, {"SPY": object()}, ("SPY",), opens_allowed=True)
+    assert settled == [("time_stop_settle", 0.55)]   # settled despite disabled
+    assert stats["closed"] == 1
+    assert the_bot.open_called is False               # disabled -> never opens
