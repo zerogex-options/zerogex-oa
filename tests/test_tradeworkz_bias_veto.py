@@ -5,7 +5,9 @@ to trade_bias_scores; context.build_snapshot reads it into snap.trade_bias_code
 / trade_bias_trend / trade_bias_confidence (preferring the intraday tenor). The
 engine calls _bias_veto on every signal and drops one that opposes a confident
 DIRECTIONAL read. RANGE_FADE / WAIT never veto — they carry a nominal long/short
-at near-zero conviction (confidence runs ~9-14 for real directional reads).
+that is not a directional call. The intraday RTH confidence distribution runs
+BUY_DIPS / SELL_RIPS medians ~36-40, FADE_* medians ~24-26; the default floor
+is 30 (BIAS_VETO_MIN_CONFIDENCE).
 """
 
 from __future__ import annotations
@@ -34,12 +36,12 @@ def _snap(code, trend, conf) -> MarketSnapshot:
 
 
 def test_veto_bullish_against_confident_bearish_bias():
-    assert _bot()._bias_veto(_snap("SELL_RIPS", "bearish", 30.0), "bullish") is True
+    assert _bot()._bias_veto(_snap("SELL_RIPS", "bearish", 60.0), "bullish") is True
 
 
 def test_veto_bearish_against_confident_bullish_bias():
     # The incident: a bearish fade on a day the bias called BUY_DIPS / long.
-    assert _bot()._bias_veto(_snap("BUY_DIPS", "bullish", 12.0), "bearish") is True
+    assert _bot()._bias_veto(_snap("BUY_DIPS", "bullish", 60.0), "bearish") is True
 
 
 def test_no_veto_when_aligned_with_bias():
@@ -63,8 +65,8 @@ def test_no_veto_when_bias_unavailable():
 
 
 def test_no_veto_below_confidence_floor():
-    # Opposing BUY_DIPS but only 5 confidence (< 10 default) -> don't veto.
-    assert _bot()._bias_veto(_snap("BUY_DIPS", "bullish", 5.0), "bearish") is False
+    # Opposing BUY_DIPS but only 2 confidence (< 30 default) -> don't veto.
+    assert _bot()._bias_veto(_snap("BUY_DIPS", "bullish", 2.0), "bearish") is False
 
 
 def test_disabled_per_bot():
