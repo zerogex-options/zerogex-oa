@@ -225,6 +225,11 @@ async def get_replay_range(
             # frontend simply omits the line when null.
             "call_wall": _f(bar.get("call_wall")),
             "put_wall": _f(bar.get("put_wall")),
+            # Max pain rides along too so the scrubber can draw the same
+            # five-level set (spot, flip, call/put walls, max pain) the live
+            # view shows. Null on rows written before max_pain was recorded;
+            # the frontend omits the marker when null.
+            "max_pain": _f(bar.get("max_pain")),
             "strikes": [
                 {"strike": _f(s.get("strike")), "net_gex": _f(s.get("net_gex"))}
                 for s in (bar.get("strikes") or [])
