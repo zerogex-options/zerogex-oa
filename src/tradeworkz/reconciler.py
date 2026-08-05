@@ -533,13 +533,26 @@ def partial_close_position(
     return pos.id
 
 
-def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
+def close_position(
+    conn: Any, pos: OpenPosition, reason: str, fallback_fill: Optional[float] = None
+) -> Optional[int]:
     """Close ``pos``, write an immutable tw_trades row, update capital,
     fan out notifications, and update the bot's ML state.
 
     Returns the ``tw_trades`` row id.
+
+    ``fallback_fill`` is a last-resort per-share settlement price used ONLY
+    when the structure cannot be priced live (``spread_price`` returns
+    ``None`` — e.g. an expired 0DTE whose option quotes have rolled off and
+    whose intrinsic settlement is unavailable). The engine passes the
+    position's last observed mark here when force-settling a position that is
+    past its hard time_stop, so a 0DTE can never strand open indefinitely. A
+    normal close passes no fallback and still bails on an unpriceable
+    structure, exactly as before.
     """
     final_fill = spread_price(conn, pos.legs, action="close")
+    if final_fill is None:
+        final_fill = fallback_fill
     if final_fill is None:
         return None
     # Consolidated close. Fold every scale-out tranche already booked on this
