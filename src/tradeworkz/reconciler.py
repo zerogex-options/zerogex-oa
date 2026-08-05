@@ -243,18 +243,33 @@ def open_position(
 
     legs_dicts = [asdict(leg) for leg in signal.legs]
     entry_price = spread_price(conn, legs_dicts, action="open")
-    if entry_price is None or entry_price <= 0:
+    if entry_price is None:
         logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
         return None
-    # Minimum-premium floor: below this, the bid/ask width dominates the premium
-    # and the position round-trips at a loss on the spread alone. Default 0 (no
-    # floor). See MIN_ENTRY_PREMIUM.
-    min_prem = float(tw_config.MIN_ENTRY_PREMIUM)
-    if min_prem > 0 and entry_price < min_prem:
-        logger.debug(
-            "entry premium %.4f below floor %.4f for bot=%s", entry_price, min_prem, signal.bot_id
-        )
-        return None
+    # spread_price returns the SIGNED net: positive = debit paid, negative =
+    # credit received. Long-debit structures need a positive debit and a
+    # premium above the floor; defined-risk credit structures (any short leg)
+    # need a real net credit (a slippage-eroded ~$0 net can't profit).
+    has_short = any(str(leg.get("side", "")).lower() == "short" for leg in legs_dicts)
+    if not has_short:
+        if entry_price <= 0:
+            logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
+            return None
+        min_prem = float(tw_config.MIN_ENTRY_PREMIUM)
+        if min_prem > 0 and entry_price < min_prem:
+            logger.debug(
+                "entry premium %.4f below floor %.4f for bot=%s",
+                entry_price, min_prem, signal.bot_id,
+            )
+            return None
+    else:
+        credit = -entry_price  # credit received per share (negative entry = credit)
+        if credit < float(tw_config.MIN_CREDIT_PER_SHARE):
+            logger.debug(
+                "net credit %.4f below floor %.4f for bot=%s",
+                credit, tw_config.MIN_CREDIT_PER_SHARE, signal.bot_id,
+            )
+            return None
 
     # Size on the structure's TRUE per-contract max loss, not the net premium.
     # Identical to entry_price for long-debit structures; for a defined-risk
@@ -388,20 +403,18 @@ def open_position(
 def mark_position(conn: Any, pos: OpenPosition) -> Optional[float]:
     """Mark-to-market ``pos``. Returns updated per-share liquidation value.
 
-    Every strategy in this engine trades LONG debits (BUY_CALL_DEBIT /
-    BUY_PUT_DEBIT — see the bot classes; every leg is ``side='long'``).
-    For a long option position the P&L is simply
-    ``(exit − entry) × contracts × 100``, regardless of whether the bot's
-    thesis is bullish or bearish: a put you bought at 1.80 and sold at
-    2.20 gained $0.40/share whether the intended market view was up or
-    down. The earlier code negated the P&L when ``direction == 'bearish'``,
-    which flipped every real winner into a "loss" and every real loser
-    into a "win" — the reason the leaderboard showed bearish bots
-    running the sleeve up from $111k to $4.4M in a bull market: their
-    real losses were being booked as wins. The negation is gone.
-
-    If a strategy ever adds true SHORT legs, this needs to key off the
-    per-leg ``side`` field, not ``direction``.
+    P&L is ``(mark − entry) × contracts × 100``. This is correct for BOTH
+    long-debit structures and defined-risk credit structures (the iron condor),
+    because :func:`spread_price` returns the SIGNED net of the whole structure —
+    a debit is positive, a credit negative, at BOTH open and close — so
+    ``entry_price`` and ``mark`` already carry the structure's sign. A short
+    condor collected for a 0.50 credit (``entry_price = −0.50``) that decays to a
+    0.00 mark books ``(0 − (−0.50)) × qty × 100`` = a WIN; no per-leg-``side``
+    keying is needed. It is also independent of the bot's directional thesis: a
+    put bought at 1.80 and sold at 2.20 gained $0.40/share either way. (The
+    earlier code negated the P&L for ``direction == 'bearish'``, flipping every
+    winner and loser — the bug that ran bearish sleeves from $111k to $4.4M in a
+    bull market. The negation is gone.)
     """
     mark = spread_price(conn, pos.legs, action="close")
     if mark is None:
@@ -549,13 +562,17 @@ def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
     total_qty = int(pos.quantity_initial) if pos.quantity_initial else remaining_qty
     if total_qty <= 0:
         total_qty = remaining_qty
-    if pos.entry_price > 0 and total_qty > 0:
+    if total_qty > 0:
         # Size-weighted exit that reproduces `realized` exactly for this qty.
+        # Holds for debit AND credit — entry_price carries the sign, so
+        # Invariant A (realized == (exit − entry) × qty × 100) is preserved.
         exit_price = pos.entry_price + realized / (total_qty * 100.0)
-        pnl_pct = exit_price / pos.entry_price - 1.0
     else:
         exit_price = final_fill
-        pnl_pct = 0.0
+    # pnl_percent as return on the signed net entry: (exit − entry) / |entry|.
+    # Identical to exit/entry − 1 for a debit; sensible and correctly-signed for
+    # a credit structure (negative entry), where a decaying condor is a WIN.
+    pnl_pct = (exit_price - pos.entry_price) / abs(pos.entry_price) if pos.entry_price else 0.0
 
     if realized > 0:
         outcome = "win"

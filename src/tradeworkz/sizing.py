@@ -90,10 +90,11 @@ def compute_contracts(
     :func:`structure_max_loss_per_share`); when given it is the risk
     denominator instead of ``entry_price`` — identical for long-debit
     structures, but far larger (correct) for defined-risk credit structures.
-    """
-    if entry_price <= 0:
-        return 0
 
+    Credit structures: ``entry_price`` may be <= 0 (a net credit). Sizing then
+    relies entirely on ``max_loss_per_share`` (the wing width − credit); a
+    non-positive risk denominator still returns 0.
+    """
     heat_dollars = capital.current_capital * capital.max_heat_pct
     kelly_denom = max(0.05, 1.0 - capital.kelly_fraction * conviction)
 

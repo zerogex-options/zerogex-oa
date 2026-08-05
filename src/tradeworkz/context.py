@@ -100,6 +100,14 @@ class MarketSnapshot:
 
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    # Fused directional trade-bias (latest trade_bias_scores row for this
+    # underlying; None when unavailable). ``trade_bias_trend`` maps the persisted
+    # long/short/neutral ``direction`` to bullish/bearish/neutral so bots can
+    # avoid trading against the fleet's synthesized directional read.
+    trade_bias_code: Optional[str] = None          # BUY_DIPS / SELL_RIPS / FADE_* / WAIT
+    trade_bias_trend: Optional[str] = None         # 'bullish' | 'bearish' | 'neutral'
+    trade_bias_confidence: Optional[float] = None  # [0, 100]
+
     # ---- Convenience derivations ---------------------------------------
 
     @property
@@ -192,6 +200,46 @@ class MarketSnapshot:
         ``round(price)``; on SPX's 5-point grid it snaps to a real strike.
         """
         return nearest_strike(price, self.effective_strike_increment())
+
+
+def _fetch_trade_bias(
+    conn: Any, underlying: str
+) -> tuple[Optional[str], Optional[str], Optional[float]]:
+    """Latest fused directional bias for ``underlying`` — best-effort.
+
+    Returns ``(bias_code, trend, confidence)`` from the freshest
+    ``trade_bias_scores`` row, or ``(None, None, None)`` when the table has no
+    row for this symbol or the read errors. The persisted ``direction``
+    (long/short/neutral) maps to bullish/bearish/neutral. Isolated in a SAVEPOINT
+    so a hiccup here can only null these three fields, never abort the snapshot.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("SAVEPOINT tw_bias")
+        cur.execute(
+            """
+            SELECT bias_code, direction, confidence
+            FROM trade_bias_scores
+            WHERE underlying = %s
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (underlying,),
+        )
+        row = cur.fetchone()
+        cur.execute("RELEASE SAVEPOINT tw_bias")
+    except Exception:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT tw_bias")
+        except Exception:
+            pass
+        return (None, None, None)
+    if not row:
+        return (None, None, None)
+    direction = str(row[1] or "").lower()
+    trend = {"long": "bullish", "short": "bearish"}.get(direction, "neutral")
+    conf = float(row[2]) if row[2] is not None else None
+    return (row[0], trend, conf)
 
 
 def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
@@ -359,6 +407,10 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         conn, underlying, "put", put_wall_strength, snapshot_ts
     )
 
+    # Fused directional trade-bias (best-effort; isolated so a missing/empty
+    # trade_bias_scores never aborts the snapshot build).
+    bias_code, bias_trend, bias_conf = _fetch_trade_bias(conn, underlying)
+
     return MarketSnapshot(
         underlying=underlying,
         timestamp=snapshot_ts,
@@ -389,6 +441,9 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         net_gex_pctile=net_gex_pctile,
         strike_increment=default_strike_increment(underlying),
         recent_closes=closes,
+        trade_bias_code=bias_code,
+        trade_bias_trend=bias_trend,
+        trade_bias_confidence=bias_conf,
     )
 
 

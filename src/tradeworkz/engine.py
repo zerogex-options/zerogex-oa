@@ -177,7 +177,7 @@ def _run_bot(
         except Exception:
             params = {}
 
-    stats = {"opened": 0, "closed": 0, "marked": 0, "scaled": 0}
+    stats = {"opened": 0, "closed": 0, "marked": 0, "scaled": 0, "bias_vetoed": 0}
     bot_universes = _bot_underlyings(universe, fleet_universes)
     if not bot_universes:
         return stats
@@ -241,6 +241,11 @@ def _run_bot(
             if not opens_allowed:
                 continue
             signal = bot.open_criteria(snap)
+            if signal is not None and bot._bias_veto(snap, signal.direction):
+                # Fleet-wide gate: drop a signal that fights the fused
+                # trade-bias so no bot trades against the fleet's own read.
+                stats["bias_vetoed"] += 1
+                signal = None
             if signal is not None:
                 wall_strength = (
                     signal.components_at_entry.get("wall_strength")

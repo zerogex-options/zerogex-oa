@@ -98,6 +98,15 @@ PREMIUM_STOP_GRACE_SECONDS: int = _getenv_int(
 # floor (unchanged); raise it (e.g. 0.30) per fleet or per-bot after reviewing
 # tradeworkz-review, since it will filter otherwise-valid cheap 0DTE structures.
 MIN_ENTRY_PREMIUM: float = _getenv_float("TRADEWORKZ_MIN_ENTRY_PREMIUM", 0.0, min=0.0, max=1000.0)
+# Minimum NET CREDIT (per share) to open a defined-risk credit structure (iron
+# condor). spread_price returns a signed net — negative for a credit — so the
+# collected credit is -entry_price. A short condor whose credit has been eroded
+# to ~$0 (or a small net debit) by slippage cannot profit even on a perfect
+# in-range expiry, so require a real credit before opening. Only applies to
+# structures that have short legs.
+MIN_CREDIT_PER_SHARE: float = _getenv_float(
+    "TRADEWORKZ_MIN_CREDIT_PER_SHARE", 0.10, min=0.0, max=1000.0
+)
 
 # ---------------------------------------------------------------------------
 # Scale-out ladder (profit-harvesting on positions in profit)
@@ -165,6 +174,24 @@ LADDER_MAX_MOVE_PCT: float = _getenv_float(
 TREND_VETO_PCT: float = _getenv_float("TRADEWORKZ_TREND_VETO_PCT", 0.002, min=0.0, max=1.0)
 TREND_VETO_LOOKBACK_BARS: int = _getenv_int(
     "TRADEWORKZ_TREND_VETO_LOOKBACK_BARS", 10, min=2, max=390
+)
+
+# ---------------------------------------------------------------------------
+# Fused trade-bias gate (don't fight the fleet's synthesized directional read)
+# ---------------------------------------------------------------------------
+# The Signals Engine already computes a directional bias per underlying and
+# persists it to trade_bias_scores (long / short / neutral + confidence). The
+# TradeWorkz bots historically ignored it and each computed their own direction
+# — so on a day the bias called long/buy-dips, the reversion bots still went
+# short and got run over. This gate vetoes ANY bot signal whose direction
+# OPPOSES a confident (>= BIAS_VETO_MIN_CONFIDENCE, 0-100) fused bias. Applied
+# centrally in the engine, so a momentum bot aligned with the bias passes
+# through while a counter-trend fade is dropped. No veto when the bias is
+# unavailable / neutral / low-confidence. Per-bot override via
+# params['bias_veto_enabled']; BIAS_VETO_ENABLED=false disables it fleet-wide.
+BIAS_VETO_ENABLED: bool = _getenv_bool("TRADEWORKZ_BIAS_VETO_ENABLED", True)
+BIAS_VETO_MIN_CONFIDENCE: float = _getenv_float(
+    "TRADEWORKZ_BIAS_VETO_MIN_CONFIDENCE", 50.0, min=0.0, max=100.0
 )
 
 # ---------------------------------------------------------------------------

@@ -24,8 +24,9 @@
 \echo ============================================================
 \echo  Every closed-trade realized_pnl must equal
 \echo    (exit - entry) * quantity * 100
-\echo  for LONG-DEBIT positions (every current bot; check per-leg
-\echo  side if you add short structures). Live rows only - sim rows
+\echo  Sign-general: entry_price / exit_price carry the structure's signed net
+\echo  (debit positive, credit negative), so it holds for long-debit AND
+\echo  defined-risk credit structures (iron condor). Live rows only - sim rows
 \echo  use a synthesized pnl_pct that does not follow this formula.
 \echo  Expected: 0 rows.
 \echo
