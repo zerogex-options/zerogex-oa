@@ -27,6 +27,11 @@ from src.tradeworkz.models import BotSpec, ExitDecision, Leg, OpenPosition, Trad
 
 logger = logging.getLogger(__name__)
 
+# Trade-bias playbooks that represent a genuine DIRECTIONAL call. RANGE_FADE and
+# WAIT are non-directional even when they carry a nominal long/short with a tiny
+# confidence, so the bias veto ignores them. See BaseBot._bias_veto.
+_DIRECTIONAL_BIAS_CODES = {"BUY_DIPS", "SELL_RIPS", "FADE_STRENGTH", "FADE_WEAKNESS"}
+
 # Trading minutes in a US equity RTH year — 252 sessions × 390 min. Used to
 # convert an annualized VIX into a per-1-minute sigma when realized recent
 # closes aren't available to estimate short-horizon vol directly.
@@ -342,6 +347,12 @@ class BaseBot:
         override = self.params.get("bias_veto_enabled")
         enabled = bool(override) if override is not None else bool(tw_config.BIAS_VETO_ENABLED)
         if not enabled or direction not in ("bullish", "bearish"):
+            return False
+        # Only a genuine DIRECTIONAL playbook counts. RANGE_FADE / WAIT (and any
+        # unknown code) carry a nominal long/short at near-zero conviction — they
+        # must never veto, regardless of the confidence number.
+        code = str(snap.trade_bias_code or "").upper()
+        if code not in _DIRECTIONAL_BIAS_CODES:
             return False
         trend = snap.trade_bias_trend
         if trend not in ("bullish", "bearish") or trend == direction:
