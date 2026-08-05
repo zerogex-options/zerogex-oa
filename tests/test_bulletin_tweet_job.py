@@ -253,7 +253,7 @@ async def test_fetch_bulletins_projects_spx_spot(monkeypatch):
     db.get_latest_forced_flow = AsyncMock(return_value=None)
     db.get_session_closes = AsyncMock(return_value=None)
     db.get_intraday_ohlc = AsyncMock(return_value=None)
-    bulletins = await mod._fetch_bulletins(db, ["SPY", "SPX"], date(2026, 7, 3))
+    bulletins = await mod._fetch_bulletins(db, ["SPY", "SPX"], date(2026, 7, 3), "premarket")
     by_sym = {b.symbol: b for b in bulletins}
     # SPX spot replaced with the implied level and flagged.
     assert by_sym["SPX"].spot == pytest.approx(6432.0)
@@ -1186,7 +1186,11 @@ async def test_attach_price_action_sets_prior_close_and_regime():
         _summary_row("SPY", spot=743.0, gamma_flip=747.0, net_gex=-3.4e9), "SPY"
     )
     db = MagicMock()
-    db.get_session_closes = AsyncMock(return_value={"prior_session_close": 744.0})
+    # premarket read: the "prior close" is the most recent COMPLETED session
+    # close (current_session_close = yesterday), NOT prior_session_close.
+    db.get_session_closes = AsyncMock(
+        return_value={"current_session_close": 744.0, "prior_session_close": 730.0}
+    )
     db.get_intraday_ohlc = AsyncMock(
         return_value={
             "session_open": 744.1,
@@ -1196,11 +1200,51 @@ async def test_attach_price_action_sets_prior_close_and_regime():
             "bar_count": 180,
         }
     )
-    await mod._attach_price_action(db, b, date(2026, 7, 3))
+    await mod._attach_price_action(db, b, date(2026, 7, 3), "premarket")
     assert b.prior_close == pytest.approx(744.0)
     assert b.session_low == pytest.approx(739.6)
     assert b.regime == "negative"  # spot below flip, net gex negative
     assert b.momentum_label  # derived, non-empty
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        # Wednesday's pre-market / midday reads gap from Tuesday's close (the
+        # most recent completed session = current_session_close), NOT Monday's.
+        ("premarket", 772.68),
+        ("midday", 772.68),
+        # The 16:05 close read fires once today's session has closed, so
+        # current_session_close is today and the reference is the one before
+        # it: prior_session_close.
+        ("close", 772.68),
+    ],
+)
+async def test_attach_price_action_prior_close_is_mode_aware(mode, expected):
+    """Regression: a Wednesday Morning Read was quoting Monday's close.
+
+    ``get_session_closes`` shifts which of its two closes is "yesterday"
+    depending on whether today's session has ended, so the fields carry
+    different dates per fire.  Both framings must resolve to Tuesday's
+    772.68 — the actual prior close — never Monday's 758.33."""
+    mod = _reload_module()
+    b = mod._shape_bulletin(_summary_row("SPY", spot=775.38, gamma_flip=758.22), "SPY")
+    db = MagicMock()
+    db.get_intraday_ohlc = AsyncMock(return_value=None)
+    if mode == "close":
+        # 16:05 fire: current_session_close folded in today's close (Wed);
+        # Tuesday is now prior_session_close.
+        closes = {"current_session_close": 775.38, "prior_session_close": 772.68}
+    else:
+        # Pre-market / midday: today (Wed) not yet closed, so Tuesday is
+        # current_session_close and Monday is prior_session_close.
+        closes = {"current_session_close": 772.68, "prior_session_close": 758.33}
+    db.get_session_closes = AsyncMock(return_value=closes)
+    await mod._attach_price_action(db, b, date(2026, 8, 5), mode)
+    assert b.prior_close == pytest.approx(expected)
+    # Never Monday's close (the pre-fix bug).
+    assert b.prior_close != pytest.approx(758.33)
 
 
 def test_latest_record_roundtrip(tmp_path, monkeypatch):

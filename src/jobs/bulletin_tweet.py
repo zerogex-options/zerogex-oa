@@ -1200,7 +1200,7 @@ async def generate_and_store(
     symbol = symbol.upper()
     site = site_url or os.environ.get("ZEROGEX_SITE_URL", "").strip() or DEFAULT_SITE_URL
 
-    bulletins = await _fetch_bulletins(db, [symbol], day)
+    bulletins = await _fetch_bulletins(db, [symbol], day, mode)
     headlines = _fetch_headlines_safe()
     tweet = build_tweet_body(
         mode=mode,
@@ -1482,13 +1482,46 @@ def post_tweet_via_x_api(
 # ---------------------------------------------------------------------------
 
 
-async def _attach_price_action(db: DatabaseManager, bulletin: SymbolBulletin, day: date) -> None:
+def _reference_close(closes: dict[str, Any], mode: str) -> Any:
+    """The session close the featured symbol's spot is measured against.
+
+    ``get_session_closes`` returns TWO closes and folds today's close into
+    ``current_session_close`` only once the cash session has ended (>= 16:00
+    ET):
+
+      * ``current_session_close`` — the most recent COMPLETED session close.
+      * ``prior_session_close``   — the session close immediately before it.
+
+    Which one is "the prior close" the read gaps from depends on the fire,
+    because the featured ``spot`` refers to a different session in each:
+
+      * premarket / midday — ``spot`` is today's pre-market / live price and
+        today's session has NOT closed, so ``current_session_close`` is
+        yesterday's close: exactly the reference the gap is measured from.
+      * close — fired at 16:05 once today's session HAS closed, so ``spot``
+        is today's fresh close and ``current_session_close`` is today; the
+        reference is the session *before* it, ``prior_session_close``.
+
+    Reading ``prior_session_close`` for every mode (the old behaviour) quoted
+    the close from TWO sessions ago on the pre-market and midday reads — e.g.
+    a Wednesday Morning Read gapping from Monday's close instead of
+    Tuesday's."""
+    key = "prior_session_close" if mode == "close" else "current_session_close"
+    return closes.get(key)
+
+
+async def _attach_price_action(
+    db: DatabaseManager, bulletin: SymbolBulletin, day: date, mode: str
+) -> None:
     """Best-effort: hang the featured symbol's price action off the bulletin.
 
     Pulls the previous close (position vs prior close) and the day's
     intraday session range so the LLM can narrate the path, then derives a
     plain-language regime + momentum cue.  Every query is wrapped — a miss
-    just leaves that field None, and the LLM writes with what resolved."""
+    just leaves that field None, and the LLM writes with what resolved.
+
+    ``mode`` picks which of the two session closes is the "prior close" the
+    spot is measured against — see :func:`_reference_close`."""
     sym = bulletin.symbol
     try:
         closes = await db.get_session_closes(sym)
@@ -1496,7 +1529,7 @@ async def _attach_price_action(db: DatabaseManager, bulletin: SymbolBulletin, da
         logger.warning("bulletin_tweet: get_session_closes(%s) failed (%s)", sym, exc)
         closes = None
     if closes:
-        bulletin.prior_close = _to_float(closes.get("prior_session_close"))
+        bulletin.prior_close = _to_float(_reference_close(closes, mode))
 
     try:
         ohlc = await db.get_intraday_ohlc(sym, day)
@@ -1516,12 +1549,17 @@ async def _fetch_bulletins(
     db: DatabaseManager,
     symbols: list[str],
     day: date,
+    mode: str,
 ) -> list[SymbolBulletin]:
     """Fetch the latest GEX summary + price action for every requested symbol.
 
     Each call is wrapped so a single symbol's DB miss doesn't take
     the whole tweet down — we just render a placeholder block for the
-    missing symbol (or elide it entirely if it has no fields at all)."""
+    missing symbol (or elide it entirely if it has no fields at all).
+
+    ``mode`` is passed down to the price-action attach so the "prior close"
+    the read gaps from is the right session for the fire (see
+    :func:`_reference_close`)."""
     out: list[SymbolBulletin] = []
     for sym in symbols:
         sym = sym.upper()
@@ -1577,7 +1615,7 @@ async def _fetch_bulletins(
             )
         # Price action (prior close, session range, regime, momentum) — the
         # inputs the LLM narrates the day's path from.  Best-effort.
-        await _attach_price_action(db, bulletin, day)
+        await _attach_price_action(db, bulletin, day, mode)
         out.append(bulletin)
     return out
 
@@ -1725,7 +1763,7 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        bulletins = await _fetch_bulletins(db, symbols, day)
+        bulletins = await _fetch_bulletins(db, symbols, day, args.mode)
     finally:
         try:
             await db.disconnect()
