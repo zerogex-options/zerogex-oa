@@ -190,8 +190,13 @@ TREND_VETO_LOOKBACK_BARS: int = _getenv_int(
 # unavailable / neutral / low-confidence. Per-bot override via
 # params['bias_veto_enabled']; BIAS_VETO_ENABLED=false disables it fleet-wide.
 BIAS_VETO_ENABLED: bool = _getenv_bool("TRADEWORKZ_BIAS_VETO_ENABLED", True)
+# NOTE the confidence scale runs SMALL in practice: live directional reads
+# (BUY_DIPS / SELL_RIPS) observed at ~9-14, RANGE_FADE near 0-5. A 50 floor
+# would make the veto a no-op, so the default is 10 — but the bias_code gate
+# (directional playbooks only) does the real filtering, and this floor should
+# be tuned to the intraday RTH distribution of directional-read confidence.
 BIAS_VETO_MIN_CONFIDENCE: float = _getenv_float(
-    "TRADEWORKZ_BIAS_VETO_MIN_CONFIDENCE", 50.0, min=0.0, max=100.0
+    "TRADEWORKZ_BIAS_VETO_MIN_CONFIDENCE", 10.0, min=0.0, max=100.0
 )
 
 # ---------------------------------------------------------------------------

@@ -216,12 +216,16 @@ def _fetch_trade_bias(
     cur = conn.cursor()
     try:
         cur.execute("SAVEPOINT tw_bias")
+        # Prefer the intraday (0DTE) tenor at the freshest timestamp; both an
+        # 'intraday' and a 'swing' row are written each cycle at the SAME
+        # timestamp, so order by timestamp first then favor intraday, falling
+        # back to whatever tenor exists.
         cur.execute(
             """
             SELECT bias_code, direction, confidence
             FROM trade_bias_scores
             WHERE underlying = %s
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, (tenor = 'intraday') DESC
             LIMIT 1
             """,
             (underlying,),
