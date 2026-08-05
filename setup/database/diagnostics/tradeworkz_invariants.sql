@@ -24,7 +24,7 @@
 \echo ============================================================
 \echo  Every closed-trade realized_pnl must equal
 \echo    (exit - entry) * quantity * 100
-\echo  Sign-general: entry_price / exit_price carry the structure's signed net
+\echo  Sign-general: entry_price / exit_price carry the signed net of the structure
 \echo  (debit positive, credit negative), so it holds for long-debit AND
 \echo  defined-risk credit structures (iron condor). Live rows only - sim rows
 \echo  use a synthesized pnl_pct that does not follow this formula.
