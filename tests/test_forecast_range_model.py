@@ -510,6 +510,20 @@ def test_wall_touch_odds_higher_in_short_gamma_than_long():
     assert short_g.level_touch_probs["call_wall"] > long_g.level_touch_probs["call_wall"]
 
 
+def test_level_touch_odds_use_calibrated_intraday_sigma():
+    # implied_move fix: a smaller per-symbol basis (realized runs below the raw
+    # close-to-close implied move, as the VIX names do) shrinks the reflection
+    # σ, so touch odds drop — correcting the overstatement that inflated the
+    # levels Brier. Default basis 1.0 leaves prior behavior unchanged.
+    wide = compute_forecast(
+        _vol_inputs(call_wall=605.0, calibration={"vol_range_basis_mult": 1.0})
+    )
+    tight = compute_forecast(
+        _vol_inputs(call_wall=605.0, calibration={"vol_range_basis_mult": 0.5})
+    )
+    assert tight.level_touch_probs["call_wall"] < wide.level_touch_probs["call_wall"]
+
+
 def test_flip_cross_prob_not_regime_tilted():
     # Same geometry, opposite regime — the flip-cross prob must be identical
     # (crossing the flip IS the regime change, so it isn't regime-tilted).
