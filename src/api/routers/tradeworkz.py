@@ -24,6 +24,7 @@ from src.api.identity import ANONYMOUS, resolve_end_user
 from src.api.scopes import SIGNALS
 from src.api.security import require_scopes
 from src.tradeworkz import config as tw_config
+from src.tradeworkz.trend import build_trend
 
 logger = logging.getLogger(__name__)
 
@@ -481,6 +482,105 @@ async def all_equity_curves(
         for b in bots
     ]
     return {"days": days, "bundles": bundles}
+
+
+@router.get("/performance-trend")
+async def performance_trend(
+    days: int = Query(default=30, ge=5, le=365),
+    windows: str = Query(default="5,10,20", description="Rolling window sizes, comma-separated"),
+    db: DatabaseManager = Depends(get_db),
+) -> Dict[str, Any]:
+    """Fleet performance TREND — the slope, not the since-inception level.
+
+    The ``/summary`` hero (``current/starting - 1``) is cumulative from
+    inception, so it stays anchored to the pre-fix drawdown and to any large
+    loss that settled late, and it hides whether performance is *improving*.
+    This returns the per-session P&L series with a cumulative line rebased to
+    the window start, rolling win rate / profit factor / expectancy over the
+    requested windows, a SPY buy-hold benchmark over the same sessions, and the
+    dated change-log inflections for chart annotations. ``headline`` carries the
+    latest rolling values — the number that should front the dashboard instead
+    of the since-inception NAV. Sessions are the ET trading day (``closed_at``
+    bucketed in America/New_York), matching the rest of the fleet's accounting.
+    """
+    try:
+        win_sizes = sorted({int(w) for w in windows.split(",") if w.strip()})
+    except ValueError:
+        win_sizes = []
+    win_sizes = [w for w in win_sizes if 2 <= w <= 200] or [5, 10, 20]
+
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT (closed_at AT TIME ZONE 'America/New_York')::date AS session_date,
+                   COALESCE(SUM(realized_pnl), 0)                    AS realized_pnl,
+                   COUNT(*)                                          AS trades,
+                   SUM(CASE WHEN outcome = 'win'  THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
+                   COALESCE(SUM(realized_pnl) FILTER (WHERE realized_pnl > 0), 0)  AS gross_win,
+                   COALESCE(-SUM(realized_pnl) FILTER (WHERE realized_pnl < 0), 0) AS gross_loss
+            FROM tw_trades
+            WHERE (closed_at AT TIME ZONE 'America/New_York')::date
+                  >= (CURRENT_DATE - ($1 || ' days')::interval)
+            GROUP BY 1 ORDER BY 1
+            """,
+            str(days),
+        )
+        cap = await conn.fetchrow(
+            "SELECT COALESCE(SUM(starting_capital), 0) AS start FROM tw_bot_capital"
+        )
+        changes = await conn.fetch(
+            """
+            SELECT change_date, label, detail FROM tw_change_log
+            WHERE change_date >= (CURRENT_DATE - ($1 || ' days')::interval)
+            ORDER BY change_date
+            """,
+            str(days),
+        )
+        # SPY session close (last tick of the ET day) for the buy-hold benchmark.
+        spy = await conn.fetch(
+            """
+            SELECT (timestamp AT TIME ZONE 'America/New_York')::date  AS session_date,
+                   (array_agg(close ORDER BY timestamp DESC))[1]       AS close
+            FROM underlying_quotes
+            WHERE symbol = 'SPY'
+              AND (timestamp AT TIME ZONE 'America/New_York')::date
+                  >= (CURRENT_DATE - ($1 || ' days')::interval)
+            GROUP BY 1
+            """,
+            str(days),
+        )
+
+    daily = [
+        {
+            "session_date": r["session_date"].isoformat(),
+            "realized_pnl": float(r["realized_pnl"] or 0.0),
+            "trades": int(r["trades"] or 0),
+            "wins": int(r["wins"] or 0),
+            "losses": int(r["losses"] or 0),
+            "gross_win": float(r["gross_win"] or 0.0),
+            "gross_loss": float(r["gross_loss"] or 0.0),
+        }
+        for r in rows
+    ]
+    spy_closes = {
+        r["session_date"].isoformat(): float(r["close"])
+        for r in spy
+        if r["close"] is not None
+    }
+    trend = build_trend(
+        daily,
+        spy_closes=spy_closes,
+        windows=win_sizes,
+        fleet_start_capital=float(cap["start"] or 0.0) if cap else 0.0,
+    )
+    trend["days"] = days
+    trend["changes"] = [
+        {"date": c["change_date"].isoformat(), "label": c["label"], "detail": c["detail"]}
+        for c in changes
+    ]
+    trend["fleet_start_capital"] = float(cap["start"] or 0.0) if cap else 0.0
+    return trend
 
 
 @router.get("/bots/{bot_id}/metrics")

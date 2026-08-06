@@ -2627,6 +2627,28 @@ CREATE TABLE IF NOT EXISTS tw_notifications_log (
 CREATE INDEX IF NOT EXISTS idx_tw_notifications_user_sent ON tw_notifications_log(end_user, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tw_notifications_bot_sent ON tw_notifications_log(bot_id, sent_at DESC);
 
+-- 9.11 Change log — dated engine/strategy inflection points, surfaced as
+--      annotations on the performance-trend chart so a change and the curve
+--      bending after it line up visually (see /tradeworkz/performance-trend).
+--      Seeded below with the known inflections; add more via SQL as they ship.
+CREATE TABLE IF NOT EXISTS tw_change_log (
+    id           BIGSERIAL    PRIMARY KEY,
+    change_date  DATE         NOT NULL,
+    label        VARCHAR(120) NOT NULL,
+    detail       TEXT,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (change_date, label)
+);
+CREATE INDEX IF NOT EXISTS idx_tw_change_log_date ON tw_change_log(change_date);
+
+-- Initial seed (idempotent). Edit/extend as changes ship.
+INSERT INTO tw_change_log (change_date, label, detail) VALUES
+    ('2026-08-04', 'Exit ladder + condor rework + gates',
+     'Scale-out ladder live; iron condor credit rework + max-loss sizing; reversion trend gate; fused trade_bias veto (floor 30).'),
+    ('2026-08-05', 'Disabled-bot settlement + force-settle',
+     'Engine manages/settles open positions of disabled bots; unpriceable 0DTE past time_stop force-settles; full fleet re-enabled.')
+ON CONFLICT (change_date, label) DO NOTHING;
+
 -- ============================================================================
 -- daily_forecast (Phase 3: Gamma Forecast Card + 4 PM Receipt)
 -- ============================================================================
