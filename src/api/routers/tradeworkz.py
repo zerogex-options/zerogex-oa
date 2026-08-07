@@ -522,6 +522,12 @@ async def performance_trend(
             FROM tw_trades
             WHERE (closed_at AT TIME ZONE 'America/New_York')::date
                   >= (CURRENT_DATE - ($1 || ' days')::interval)
+              -- Live engine trades only, matching the accounting invariants'
+              -- "live rows only" definition. The trend is about REAL fleet
+              -- performance improving; seeded demo trades
+              -- (components_at_entry.origin = 'simulate') would swamp it.
+              AND (components_at_entry ->> 'origin') IS DISTINCT FROM 'simulate'
+              AND (components_at_entry ->> 'simulated') IS DISTINCT FROM 'true'
             GROUP BY 1 ORDER BY 1
             """,
             str(days),
