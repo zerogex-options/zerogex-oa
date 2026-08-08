@@ -128,11 +128,13 @@ def test_range_returns_session_frames_by_date(monkeypatch):
         {"timestamp": bar_a, "gamma_flip": Decimal("600.5"),
          "call_wall": Decimal("606"), "put_wall": Decimal("594"),
          "max_pain": Decimal("599"),
-         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5")}]},
+         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5"),
+                      "call_gex": Decimal("2000.5"), "put_gex": Decimal("-766.0")}]},
         {"timestamp": bar_b, "gamma_flip": Decimal("601"),
          "call_wall": Decimal("607"), "put_wall": Decimal("595"),
          "max_pain": Decimal("599.5"),
-         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("2222.5")}]},
+         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("2222.5"),
+                      "call_gex": Decimal("3000.5"), "put_gex": Decimal("-778.0")}]},
     ])
     dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[
         {"timestamp": bar_a, "open": Decimal("600.10"), "high": Decimal("600.50"),
@@ -152,6 +154,15 @@ def test_range_returns_session_frames_by_date(monkeypatch):
     assert body["frames"][0]["timestamp"] == bar_a.isoformat()
     assert body["frames"][1]["timestamp"] == bar_b.isoformat()
     assert body["frames"][0]["strikes"][0]["strike"] == pytest.approx(600.0)
+    # Per-strike call/put split rides along so the scrubber can render the
+    # Split / Combined gamma views (calls right, puts left, net overlaid)
+    # exactly like the Strike Profile chart.
+    s0 = body["frames"][0]["strikes"][0]
+    assert s0["net_gex"] == pytest.approx(1234.5)
+    assert s0["call_gex"] == pytest.approx(2000.5)
+    assert s0["put_gex"] == pytest.approx(-766.0)
+    assert body["frames"][1]["strikes"][0]["call_gex"] == pytest.approx(3000.5)
+    assert body["frames"][1]["strikes"][0]["put_gex"] == pytest.approx(-778.0)
     # Call/put walls ride along on each frame so the scrubber can draw the
     # same level lines the snapshot view shows for that minute.
     assert body["frames"][0]["call_wall"] == pytest.approx(606.0)

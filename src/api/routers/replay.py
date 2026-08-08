@@ -230,8 +230,17 @@ async def get_replay_range(
             # view shows. Null on rows written before max_pain was recorded;
             # the frontend omits the marker when null.
             "max_pain": _f(bar.get("max_pain")),
+            # Per-strike net plus the call/put split (dollar GEX). call_gex/
+            # put_gex let the scrubber render the Split / Combined gamma views
+            # like the Strike Profile chart; they're null on rows too old to
+            # carry the gamma columns, and the frontend falls back to Net-only.
             "strikes": [
-                {"strike": _f(s.get("strike")), "net_gex": _f(s.get("net_gex"))}
+                {
+                    "strike": _f(s.get("strike")),
+                    "net_gex": _f(s.get("net_gex")),
+                    "call_gex": _f(s.get("call_gex")),
+                    "put_gex": _f(s.get("put_gex")),
+                }
                 for s in (bar.get("strikes") or [])
             ],
         }

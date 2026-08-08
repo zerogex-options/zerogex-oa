@@ -2163,10 +2163,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         rows. The call/put walls, gamma flip and max pain come straight from
         the canonical ``gex_summary`` columns (same source the ``/replay/frame``
         and snapshot views read), so the scrubber's level lines match the
-        shareable snapshot for the same minute. Each frame's ``strikes`` is a list of ``{strike,
-        net_gex}`` entries filtered to a ±``strike_band_pct`` band around
-        the bar's spot so the payload stays bounded (a full session at every
-        strike would be ~40k rows for SPX).
+        shareable snapshot for the same minute. Each frame's ``strikes`` is a
+        list of ``{strike, net_gex, call_gex, put_gex}`` entries filtered to a
+        ±``strike_band_pct`` band around the bar's spot so the payload stays
+        bounded (a full session at every strike would be ~40k rows for SPX).
+        call_gex/put_gex are the dollar-scaled call/put split (nullable on
+        pre-gamma-column rows) that drives the scrubber's Split/Combined views.
 
         Returns ``[]`` on any error so the endpoint can render an empty
         state instead of crashing.
@@ -2185,6 +2187,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # (walls, flip, GEX) but the spot underlying comes from underlying_quotes.
         # gex_by_strike already stores a per-strike net_gex; AVG across
         # expirations mirrors the aggregation get_gex_heatmap uses.
+        #
+        # call_gex / put_gex are derived per minute from the raw ``call_gamma``
+        # / ``put_gamma`` (γ × OI) columns the same way /replay/frame and the
+        # analytics engine do — dollar gamma per 1% move, γ × 100 × S² × 0.01,
+        # calls positive and puts negative — so the scrubber can render the
+        # Split / Combined gamma views (call/put split, plus a Net overlay)
+        # exactly like the Strike Profile chart.  The stored ``net_gex`` column
+        # is already dollar-scaled (call_gex + put_gex at the analytics spot),
+        # so ``net_gex`` is left as the canonical AVG and call/put are derived
+        # against the same per-minute spot (``s.spot`` — underlying_quotes close
+        # at-or-before the bar) they were originally scaled with, keeping
+        # call_gex + put_gex ≈ net_gex.  A correlated sub-select (not LATERAL)
+        # keeps the spot lookup one-per-minute and portable.
         query = """
             WITH session_spot AS (
                 SELECT close::numeric AS spot_close
@@ -2196,12 +2211,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 LIMIT 1
             ),
             session_summary AS (
-                SELECT timestamp, gamma_flip_point AS gamma_flip,
-                       call_wall, put_wall, max_pain
-                FROM gex_summary
-                WHERE underlying = $1
-                  AND timestamp >= $2
-                  AND timestamp < $3
+                SELECT gs.timestamp, gs.gamma_flip_point AS gamma_flip,
+                       gs.call_wall, gs.put_wall, gs.max_pain,
+                       (SELECT uq.close::numeric
+                          FROM underlying_quotes uq
+                         WHERE uq.symbol = $1
+                           AND uq.timestamp <= gs.timestamp
+                         ORDER BY uq.timestamp DESC
+                         LIMIT 1) AS spot
+                FROM gex_summary gs
+                WHERE gs.underlying = $1
+                  AND gs.timestamp >= $2
+                  AND gs.timestamp < $3
             )
             SELECT
                 s.timestamp,
@@ -2210,7 +2231,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.put_wall,
                 s.max_pain,
                 gbs.strike,
-                AVG(gbs.net_gex) AS net_gex
+                AVG(gbs.net_gex) AS net_gex,
+                AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
+                AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex
             FROM session_summary s
             LEFT JOIN gex_by_strike gbs
               ON gbs.underlying = $1
@@ -2223,7 +2246,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                  <= (SELECT spot_close FROM session_spot) * $4
             -- call_wall / put_wall / max_pain are functionally dependent on
             -- timestamp (one gex_summary row per minute) but must be listed in
-            -- GROUP BY because they're not aggregated.
+            -- GROUP BY because they're not aggregated.  s.spot is likewise
+            -- per-timestamp; it only appears inside AVG(...) so it needs no
+            -- GROUP BY entry.
             GROUP BY s.timestamp, s.gamma_flip, s.call_wall, s.put_wall, s.max_pain, gbs.strike
             ORDER BY s.timestamp ASC, gbs.strike ASC
         """
@@ -2259,7 +2284,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "strikes": [],
                 }
             if r["strike"] is not None:
-                frames[ts]["strikes"].append({"strike": r["strike"], "net_gex": r["net_gex"]})
+                frames[ts]["strikes"].append(
+                    {
+                        "strike": r["strike"],
+                        "net_gex": r["net_gex"],
+                        "call_gex": r["call_gex"],
+                        "put_gex": r["put_gex"],
+                    }
+                )
         return list(frames.values())
 
     async def get_replay_session_dates(self, symbol: str, limit: int = 30) -> List[Dict[str, Any]]:
