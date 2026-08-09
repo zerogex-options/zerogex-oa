@@ -574,18 +574,26 @@ async def performance_trend(
         for r in spy
         if r["close"] is not None
     }
+    # Denominator for the historical fleet-return %. Normally the live sum of
+    # sleeve starting_capital. But once the fleet is retired the sleeves are
+    # zeroed (SUM = 0), which would blank the % line for every past session —
+    # even though those sessions ran against a real, funded fleet. Fall back to
+    # the configured FLEET_CAPITAL so the historical drawdown % stays anchored
+    # to the capital that was actually deployed then, instead of dividing by 0.
+    sleeve_start = float(cap["start"] or 0.0) if cap else 0.0
+    fleet_start_capital = sleeve_start if sleeve_start > 0 else float(tw_config.FLEET_CAPITAL)
     trend = build_trend(
         daily,
         spy_closes=spy_closes,
         windows=win_sizes,
-        fleet_start_capital=float(cap["start"] or 0.0) if cap else 0.0,
+        fleet_start_capital=fleet_start_capital,
     )
     trend["days"] = days
     trend["changes"] = [
         {"date": c["change_date"].isoformat(), "label": c["label"], "detail": c["detail"]}
         for c in changes
     ]
-    trend["fleet_start_capital"] = float(cap["start"] or 0.0) if cap else 0.0
+    trend["fleet_start_capital"] = fleet_start_capital
     return trend
 
 
