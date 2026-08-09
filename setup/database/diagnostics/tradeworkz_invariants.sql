@@ -54,7 +54,7 @@ LIMIT 100;
 \echo  tw_bot_capital, or the other way around).
 \echo  RETIRED bots are exempt: retirement zeroes the sleeve
 \echo  (starting=current=0) on purpose, which deliberately decouples the
-\echo  sleeve from the bot's historical realized P&L (the immutable
+\echo  sleeve from its historical realized P&L (the immutable
 \echo  tw_trades rows survive for the audit trail). A fully-zeroed sleeve
 \echo  is therefore skipped; a zeroed-starting sleeve that still shows
 \echo  non-zero current_capital is NOT skipped (that would be a real
