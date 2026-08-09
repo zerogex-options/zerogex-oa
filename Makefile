@@ -3049,6 +3049,11 @@ tradeworkz-review: ## Show scale-out ladder activity for the latest session (arm
 	@echo "$(BLUE)=== TradeWorkz scale-out review ===$(NC)"
 	@$(PSQL) -f setup/database/diagnostics/tradeworkz_scale_review.sql
 
+.PHONY: tradeworkz-backtest
+tradeworkz-backtest: ## Replay bots over history to screen for entry edge (args: ARGS="--days 5 --interval-min 5 --bots id1,id2 --json")
+	@echo "$(BLUE)=== TradeWorkz backtest (research screen: 1 contract, scaling OFF, ML neutral) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tradeworkz.backtest $(ARGS)
+
 .PHONY: query
 query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
 	@$(PSQL) -c "$(SQL)"
