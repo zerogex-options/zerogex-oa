@@ -2043,7 +2043,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                        total_net_gex, net_gex_at_spot,
                        gamma_flip_point, gamma_flip_raw, gamma_flip_span_used,
                        flip_distance, max_pain, call_wall, put_wall,
-                       total_call_oi, total_put_oi, put_call_ratio
+                       total_call_oi, total_put_oi, put_call_ratio,
+                       pin_strike, pin_score, pin_confidence, pin_strike_reason
                 FROM gex_summary
                 WHERE underlying = $1
                   AND timestamp <= $2
@@ -2070,7 +2071,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 f.put_wall,
                 f.total_call_oi,
                 f.total_put_oi,
-                f.put_call_ratio
+                f.put_call_ratio,
+                f.pin_strike,
+                f.pin_score,
+                f.pin_confidence,
+                f.pin_strike_reason
             FROM frame f
         """
         try:
@@ -2224,6 +2229,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             session_summary AS (
                 SELECT gs.timestamp, gs.gamma_flip_point AS gamma_flip,
                        gs.call_wall, gs.put_wall, gs.max_pain,
+                       gs.pin_strike, gs.pin_confidence,
                        (SELECT uq.close::numeric
                           FROM underlying_quotes uq
                          WHERE uq.symbol = $1
@@ -2241,6 +2247,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.call_wall,
                 s.put_wall,
                 s.max_pain,
+                s.pin_strike,
+                s.pin_confidence,
                 gbs.strike,
                 AVG(gbs.net_gex) AS net_gex,
                 AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
@@ -2255,12 +2263,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
              -- yet) short-circuits to no-band, matching get_gex_heatmap.
              AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
                  <= (SELECT spot_close FROM session_spot) * $4
-            -- call_wall / put_wall / max_pain are functionally dependent on
-            -- timestamp (one gex_summary row per minute) but must be listed in
-            -- GROUP BY because they're not aggregated.  s.spot is likewise
-            -- per-timestamp; it only appears inside AVG(...) so it needs no
-            -- GROUP BY entry.
-            GROUP BY s.timestamp, s.gamma_flip, s.call_wall, s.put_wall, s.max_pain, gbs.strike
+            -- call_wall / put_wall / max_pain / pin_strike / pin_confidence are
+            -- functionally dependent on timestamp (one gex_summary row per
+            -- minute) but must be listed in GROUP BY because they're not
+            -- aggregated.  s.spot is likewise per-timestamp; it only appears
+            -- inside AVG(...) so it needs no GROUP BY entry.
+            GROUP BY s.timestamp, s.gamma_flip, s.call_wall, s.put_wall, s.max_pain,
+                     s.pin_strike, s.pin_confidence, gbs.strike
             ORDER BY s.timestamp ASC, gbs.strike ASC
         """
         try:
@@ -2292,6 +2301,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "call_wall": r["call_wall"],
                     "put_wall": r["put_wall"],
                     "max_pain": r["max_pain"],
+                    "pin_strike": r["pin_strike"],
+                    "pin_confidence": r["pin_confidence"],
                     "strikes": [],
                 }
             if r["strike"] is not None:

@@ -80,6 +80,15 @@ def _shape_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "put_wall": _f(row.get("put_wall")),
         "gamma_flip": _f(row.get("gamma_flip")),
         "max_pain": _f(row.get("max_pain")),
+        # Pin Strike — reachable 0DTE positive-gamma pin (distinct from the
+        # walls/flip/max-pain). pin_strike is the drawable level; pin_score /
+        # pin_confidence classify strength; pin_strike_reason carries a REASON_*
+        # code when there's no active pin (and is null when a pin is present).
+        # All null on rows written before pin_strike shipped.
+        "pin_strike": _f(row.get("pin_strike")),
+        "pin_score": _f(row.get("pin_score")),
+        "pin_confidence": _f(row.get("pin_confidence")),
+        "pin_strike_reason": row.get("pin_strike_reason"),
         "net_gex": _f(row.get("net_gex")),
         "net_gex_at_spot": _f(row.get("net_gex_at_spot")),
         "put_call_ratio": _f(row.get("put_call_ratio")),
@@ -230,6 +239,14 @@ async def get_replay_range(
             # view shows. Null on rows written before max_pain was recorded;
             # the frontend omits the marker when null.
             "max_pain": _f(bar.get("max_pain")),
+            # Pin Strike rides along per-minute too — the reachable 0DTE strike
+            # with the strongest modeled positive (restoring) dealer gamma into
+            # expiration (distinct from the walls/flip/max-pain). pin_confidence
+            # (0..1) travels with it so the scrubber can indicate pin strength.
+            # Both null on rows written before pin_strike shipped; the frontend
+            # omits the line when null.
+            "pin_strike": _f(bar.get("pin_strike")),
+            "pin_confidence": _f(bar.get("pin_confidence")),
             # Per-strike net plus the call/put split (dollar GEX). call_gex/
             # put_gex let the scrubber render the Split / Combined gamma views
             # like the Strike Profile chart; they're null on rows too old to

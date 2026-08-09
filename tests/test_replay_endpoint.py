@@ -44,6 +44,10 @@ def _summary(ts: datetime, **overrides) -> dict:
         "put_wall": Decimal("594.00"),
         "gamma_flip": Decimal("600.50"),
         "max_pain": Decimal("599.00"),
+        "pin_strike": Decimal("601.00"),
+        "pin_score": Decimal("1500000000"),
+        "pin_confidence": Decimal("0.42"),
+        "pin_strike_reason": None,
         "net_gex": Decimal("12345.6789"),
         "net_gex_at_spot": Decimal("2345.0"),
         "put_call_ratio": Decimal("1.23"),
@@ -95,6 +99,11 @@ def test_frame_returns_summary_plus_strikes(monkeypatch):
     assert body["requested_ts"] == "2026-06-29T14:35:00+00:00"
     assert body["summary"]["spot"] == pytest.approx(600.0)
     assert body["summary"]["call_wall"] == pytest.approx(606.0)
+    # Pin Strike (+ strength metadata) rides along on the frame summary so the
+    # Strike Profile snapshot can draw the pin line.
+    assert body["summary"]["pin_strike"] == pytest.approx(601.0)
+    assert body["summary"]["pin_confidence"] == pytest.approx(0.42)
+    assert body["summary"]["pin_strike_reason"] is None
     assert len(body["strikes"]) == 7
     # Strikes carry the four expected fields.
     assert all({"strike", "call_gex", "put_gex", "net_gex"} <= row.keys() for row in body["strikes"])
@@ -128,11 +137,13 @@ def test_range_returns_session_frames_by_date(monkeypatch):
         {"timestamp": bar_a, "gamma_flip": Decimal("600.5"),
          "call_wall": Decimal("606"), "put_wall": Decimal("594"),
          "max_pain": Decimal("599"),
+         "pin_strike": Decimal("601"), "pin_confidence": Decimal("0.42"),
          "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5"),
                       "call_gex": Decimal("2000.5"), "put_gex": Decimal("-766.0")}]},
         {"timestamp": bar_b, "gamma_flip": Decimal("601"),
          "call_wall": Decimal("607"), "put_wall": Decimal("595"),
          "max_pain": Decimal("599.5"),
+         "pin_strike": Decimal("602"), "pin_confidence": Decimal("0.55"),
          "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("2222.5"),
                       "call_gex": Decimal("3000.5"), "put_gex": Decimal("-778.0")}]},
     ])
@@ -173,6 +184,12 @@ def test_range_returns_session_frames_by_date(monkeypatch):
     # the same five-level set (spot/flip/walls/max-pain) the live view shows.
     assert body["frames"][0]["max_pain"] == pytest.approx(599.0)
     assert body["frames"][1]["max_pain"] == pytest.approx(599.5)
+    # Pin Strike (+ confidence) rides along per frame too, so the scrubber can
+    # draw the pin line alongside the walls/flip/max-pain for each minute.
+    assert body["frames"][0]["pin_strike"] == pytest.approx(601.0)
+    assert body["frames"][0]["pin_confidence"] == pytest.approx(0.42)
+    assert body["frames"][1]["pin_strike"] == pytest.approx(602.0)
+    assert body["frames"][1]["pin_confidence"] == pytest.approx(0.55)
     # Confirm the endpoint routed to the date-scoped helper, not the
     # latest-N heatmap (the actual bug we're guarding against).
     call = dbmod.DatabaseManager.get_gex_frames_for_session.call_args
