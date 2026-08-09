@@ -152,7 +152,11 @@ These are registered in `STRATEGY_CLASSES` and carried in `CANDIDATE_SPECS`, but
 **`DEFAULT_ROSTER` stays empty** — they never provision, size, or open. That is
 deliberate: the whole point of the shelving was that nothing goes live on hope.
 
-A candidate is promoted **only** after it clears the same gate revival requires:
+A candidate is never provisioned into `tw_bots`, so the backtest harness
+resolves an un-provisioned `--bots <id>` from the registry catalog
+(`registry.known_specs`, wired into `_load_backtest_bots`) — that is what makes
+a candidate screenable *before* it is ever seeded. A candidate is promoted
+**only** after it clears the same gate revival requires:
 
 ```
 make tradeworkz-backtest ARGS="--days 45 --interval-min 5 --bots charm_close_magnet,vanna_vol_crush_rider,aggressor_flow_divergence,gamma_regime_shift_rider --json"

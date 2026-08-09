@@ -452,6 +452,31 @@ RETIRED_BOT_IDS: tuple[str, ...] = tuple(spec.id for spec in SHELVED_SPECS) + (
 )
 
 
+def known_specs() -> Dict[str, BotSpec]:
+    """Every registry spec by id — active roster + candidates + shelved + the
+    standalone magnet spec.
+
+    The backtest harness (``_load_backtest_bots``) uses this to screen a bot
+    that has NEVER been provisioned into ``tw_bots`` — every candidate and
+    every shelved bot. That is what keeps the promotion gate honest: a
+    ``CANDIDATE_SPECS`` bot is deliberately never seeded into the DB (it must
+    not provision, size, or open), yet ``make tradeworkz-backtest --bots <id>``
+    still needs to measure its edge before anyone moves it into
+    ``DEFAULT_ROSTER``. Without this fallback the harness would report "no bots
+    found" for an un-provisioned candidate.
+
+    Ordering: shelved first, then candidates, then the (currently empty) active
+    roster last so a revived id would win — ids do not collide across groups
+    today, so ordering is only a future-proofing detail.
+    """
+    specs: Dict[str, BotSpec] = {}
+    for group in (SHELVED_SPECS, CANDIDATE_SPECS, DEFAULT_ROSTER):
+        for s in group:
+            specs[s.id] = s
+    specs.setdefault(PUT_WALL_MAGNET_REVERSAL_SPEC.id, PUT_WALL_MAGNET_REVERSAL_SPEC)
+    return specs
+
+
 def get_bot_class(name: str) -> type[BaseBot]:
     """Resolve a ``strategy_class`` string to the concrete class."""
     try:

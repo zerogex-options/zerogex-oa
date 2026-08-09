@@ -300,3 +300,38 @@ def test_candidate_set_is_the_four_edge_bots():
         "aggressor_flow_divergence",
         "gamma_regime_shift_rider",
     }
+
+
+def test_backtest_screens_unprovisioned_candidates_via_registry_fallback():
+    """The promotion gate must actually be runnable: a candidate is NEVER in
+    ``tw_bots`` (it must not provision), so ``make tradeworkz-backtest
+    --bots <id>`` has to resolve it from the registry catalog. Without the
+    fallback the harness returns "no bots found" (the exact failure hit on the
+    first live run)."""
+    from src.tradeworkz.backtest import _load_backtest_bots
+
+    class _EmptyCur:
+        """tw_bots returns nothing — simulates the un-provisioned candidate."""
+
+        def execute(self, sql, params=None):
+            self._rows = []
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+    class _EmptyConn:
+        def cursor(self):
+            return _EmptyCur()
+
+    requested = [s.id for s in CANDIDATE_SPECS]
+    specs = _load_backtest_bots(_EmptyConn(), requested)
+    loaded = {s.id for s in specs}
+    assert loaded == set(requested), (
+        "every requested candidate must be screenable even though none is in "
+        f"tw_bots; got {loaded}"
+    )
+    for spec in specs:
+        assert get_bot_class(spec.strategy_class) is not None

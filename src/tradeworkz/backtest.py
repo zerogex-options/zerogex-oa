@@ -69,7 +69,7 @@ from src.tradeworkz.reconciler import (
     _cap_time_stop_at_expiration,
     _earliest_leg_expiration,
 )
-from src.tradeworkz.registry import get_bot_class
+from src.tradeworkz.registry import get_bot_class, known_specs
 from src.tradeworkz.sizing import structure_max_loss_per_share
 
 logger = logging.getLogger(__name__)
@@ -515,13 +515,21 @@ class _BotRunner:
 
 
 def _load_backtest_bots(conn: Any, bot_ids: Optional[List[str]]) -> List[BotSpec]:
-    """Load bot specs from ``tw_bots`` for the screen.
+    """Load bot specs for the screen.
 
     Loads ALL bots (or the given subset) regardless of the live ``enabled``
     flag — the point of the screen is to measure edge, including for bots that
     are currently disabled. The live on/off switch is not a market gate, so it
     is not replicated; the report notes each bot's current enabled state for
     context.
+
+    Primary source is ``tw_bots`` (the provisioned fleet). When explicit
+    ``bot_ids`` are requested, any id NOT present in ``tw_bots`` falls back to
+    the registry catalog (``registry.known_specs`` — candidates + shelved + the
+    standalone magnet). This is what lets a ``CANDIDATE_SPECS`` bot be screened
+    before it is ever provisioned: the promotion discipline keeps candidates out
+    of the DB, but the whole point of a candidate is that it must clear the
+    backtest first, so the harness has to be able to find it by id.
     """
     cur = conn.cursor()
     if bot_ids:
@@ -557,6 +565,18 @@ def _load_backtest_bots(conn: Any, bot_ids: Optional[List[str]]) -> List[BotSpec
                 is_public=bool(r[8]), enabled=bool(r[9]),
             )
         )
+
+    # Registry fallback for explicitly-requested ids not in tw_bots — screens
+    # un-provisioned candidates / shelved bots (see docstring).
+    if bot_ids:
+        found = {s.id for s in specs}
+        missing = [b for b in bot_ids if b not in found]
+        if missing:
+            catalog = known_specs()
+            for bid in missing:
+                spec = catalog.get(bid)
+                if spec is not None:
+                    specs.append(spec)
     return specs
 
 
