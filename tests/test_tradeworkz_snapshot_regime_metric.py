@@ -30,7 +30,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Iterable, List, Optional, Tuple
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -95,7 +94,10 @@ def _build_scripted_conn(
     # gex_summary — this is the row the test cares about. The SELECT
     # order is: net_gex_at_spot, gamma_flip_point, max_pain,
     # put_call_ratio, call_wall, put_wall, max_gamma_strike,
-    # total_net_gex, call_wall_strength, put_wall_strength.
+    # total_net_gex, call_wall_strength, put_wall_strength,
+    # pin_strike, pin_score, pin_confidence, flip_distance,
+    # convexity_risk, local_gex (the last 6 are the v4 edge-metric
+    # columns; None here — this test only exercises the net_gex path).
     cur.program(
         "FROM gex_summary",
         [
@@ -110,6 +112,12 @@ def _build_scripted_conn(
                 total_net_gex,
                 1.0e9,
                 8.0e8,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
         ],
     )

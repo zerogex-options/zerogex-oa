@@ -19,6 +19,12 @@ from datetime import date, datetime, time, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
+from src.tradeworkz.flow_context import (
+    fetch_forced_flow,
+    fetch_recent_option_flow,
+    fetch_second_order_totals,
+    fetch_vix_lookback,
+)
 from src.tradeworkz.gex_stats import fetch_net_gex_pctile, fetch_wall_strength_pctile
 from src.tradeworkz.strikes import default_strike_increment, nearest_strike
 
@@ -108,6 +114,57 @@ class MarketSnapshot:
     trade_bias_trend: Optional[str] = None         # 'bullish' | 'bearish' | 'neutral'
     trade_bias_confidence: Optional[float] = None  # [0, 100]
 
+    # ===================================================================
+    # Edge metrics (see src/tradeworkz/flow_context.py). All best-effort:
+    # None when the source table/history is unavailable. The retired fleet
+    # traded only the FIRST-ORDER levels above; these three richer layers —
+    # aggressor order flow, second-order forced dealer flow, and the
+    # gamma-restoring Pin Strike — power the candidate edge bots and are
+    # ignored by every existing bot.
+    # ===================================================================
+
+    # Pin Strike — the reachable strike with the strongest restoring (positive)
+    # dealer gamma into expiration. Gamma-based and reachability-filtered, so a
+    # stronger, better-calibrated magnet than the OI-based ``max_pain``.
+    pin_strike: Optional[float] = None
+    pin_score: Optional[float] = None
+    pin_confidence: Optional[float] = None  # [0, 1]
+
+    # Extra dealer-gamma structure already on gex_summary but never surfaced.
+    flip_distance: Optional[float] = None  # (spot - flip)/spot, signed
+    convexity_risk: Optional[float] = None  # |total_net_gex| / |flip_distance|
+    local_gex: Optional[float] = None  # sum |net_gex| within +-1% of spot
+
+    # Prior-tick dealer positioning — lets a bot trade the CHANGE in structure
+    # (regime flipping) rather than a static level. Read from the same 2-row
+    # gex_summary fetch, so no extra query.
+    prior_net_gex: Optional[float] = None
+    prior_gamma_flip: Optional[float] = None
+
+    # Second-order forced dealer flow (front-expiration aggregate). Dealer
+    # sign: +vanna => dealers buy as IV rises; +charm => dealers buy as time
+    # passes. These are scheduled, direction-known hedging flows.
+    dealer_vanna_total: Optional[float] = None
+    dealer_charm_total: Optional[float] = None
+
+    # Modeled forced-hedging levels (forced_flow_profile). ``close_charm_flow``
+    # is the dollars of stock dealers must trade by the cash close if spot
+    # holds — positive => forced dealer BUYING into the close.
+    close_charm_flow: Optional[float] = None
+    charm_flip: Optional[float] = None
+    vanna_flip: Optional[float] = None
+
+    # Aggressor-classified option order flow (flow_series_5min, signed). +
+    # premium/volume => call-led / bullish aggression. ``flow_net_premium_prev``
+    # is the previous 5-min bucket so a bot can read the freshest flow delta.
+    flow_net_premium: Optional[float] = None
+    flow_net_premium_prev: Optional[float] = None
+    flow_net_volume: Optional[float] = None
+
+    # VIX ~30 minutes ago, for a session-scale ΔVIX (vanna flow is driven by
+    # the CHANGE in implied vol, not its level).
+    prior_vix: Optional[float] = None
+
     # ---- Convenience derivations ---------------------------------------
 
     @property
@@ -140,6 +197,44 @@ class MarketSnapshot:
         t = self.et_time
         m = (16 * 60) - (t.hour * 60 + t.minute)
         return float(m) if m > 0 else None
+
+    def net_gex_change(self) -> Optional[float]:
+        """Change in net dealer gamma vs the prior tick (regime velocity).
+
+        Negative and large => dealers shedding long gamma toward a short-gamma
+        (trending) regime — the transition the regime-shift bot rides. ``None``
+        when either reading is unavailable.
+        """
+        if self.net_gex is None or self.prior_net_gex is None:
+            return None
+        return self.net_gex - self.prior_net_gex
+
+    def flow_premium_delta(self) -> Optional[float]:
+        """Latest 5-minute change in cumulative signed option premium.
+
+        The freshest aggressor lean — positive => a fresh burst of call-side
+        (bullish) buying this bucket. ``None`` until two buckets exist.
+        """
+        if self.flow_net_premium is None or self.flow_net_premium_prev is None:
+            return None
+        return self.flow_net_premium - self.flow_net_premium_prev
+
+    def vix_change(self) -> Optional[float]:
+        """Session-scale ΔVIX (current minus ~30-minutes-ago). Negative on a
+        vol crush. ``None`` when the lookback bar is unavailable."""
+        if self.vix is None or self.prior_vix is None:
+            return None
+        return self.vix - self.prior_vix
+
+    def distance_to_pin_pct(self) -> Optional[float]:
+        """Signed distance from spot to the Pin Strike as a fraction of spot.
+
+        Positive => the pin sits ABOVE spot (a restoring drift would be up).
+        ``None`` when no pin is present.
+        """
+        if self.pin_strike is None or self.spot <= 0:
+            return None
+        return (self.pin_strike - self.spot) / self.spot
 
     def distance_to_call_wall_pct(self) -> Optional[float]:
         if self.call_wall is None or self.spot <= 0:
@@ -338,7 +433,9 @@ def build_snapshot(
         """
         SELECT net_gex_at_spot, gamma_flip_point, max_pain, put_call_ratio,
                call_wall, put_wall, max_gamma_strike, total_net_gex,
-               call_wall_strength, put_wall_strength
+               call_wall_strength, put_wall_strength,
+               pin_strike, pin_score, pin_confidence,
+               flip_distance, convexity_risk, local_gex
         FROM gex_summary
         WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC
@@ -351,7 +448,7 @@ def build_snapshot(
         gx = gex_rows[0]
         prior = gex_rows[1] if len(gex_rows) > 1 else None
     else:
-        gx = (None,) * 10
+        gx = (None,) * 16
         prior = None
 
     cur.execute("""
@@ -428,6 +525,18 @@ def build_snapshot(
     # trade_bias_scores never aborts the snapshot build).
     bias_code, bias_trend, bias_conf = _fetch_trade_bias(conn, underlying, as_of)
 
+    # ---- Edge metrics (best-effort; each isolated in its own SAVEPOINT, so
+    # a missing table or thin history nulls only its own fields). These are
+    # the flow / second-order / pin layers the retired fleet never used; see
+    # src/tradeworkz/flow_context.py. Every read is as-of bounded for the
+    # backtest harness.
+    close_charm_flow, charm_flip, vanna_flip = fetch_forced_flow(conn, underlying, as_of)
+    dealer_vanna_total, dealer_charm_total = fetch_second_order_totals(conn, underlying, as_of)
+    flow_net_premium, flow_net_premium_prev, flow_net_volume = fetch_recent_option_flow(
+        conn, underlying, as_of
+    )
+    prior_vix = fetch_vix_lookback(conn, 30, as_of)
+
     return MarketSnapshot(
         underlying=underlying,
         timestamp=snapshot_ts,
@@ -461,6 +570,24 @@ def build_snapshot(
         trade_bias_code=bias_code,
         trade_bias_trend=bias_trend,
         trade_bias_confidence=bias_conf,
+        # -- Edge metrics --
+        pin_strike=_maybe_float(gx[10]),
+        pin_score=_maybe_float(gx[11]),
+        pin_confidence=_maybe_float(gx[12]),
+        flip_distance=_maybe_float(gx[13]),
+        convexity_risk=_maybe_float(gx[14]),
+        local_gex=_maybe_float(gx[15]),
+        prior_net_gex=_maybe_float(prior[0]) if prior else None,
+        prior_gamma_flip=_maybe_float(prior[1]) if prior else None,
+        dealer_vanna_total=dealer_vanna_total,
+        dealer_charm_total=dealer_charm_total,
+        close_charm_flow=close_charm_flow,
+        charm_flip=charm_flip,
+        vanna_flip=vanna_flip,
+        flow_net_premium=flow_net_premium,
+        flow_net_premium_prev=flow_net_premium_prev,
+        flow_net_volume=flow_net_volume,
+        prior_vix=prior_vix,
     )
 
 

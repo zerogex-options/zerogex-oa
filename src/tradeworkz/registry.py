@@ -10,17 +10,21 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, Type
 
+from src.tradeworkz.bots.aggressor_flow_divergence import AggressorFlowDivergence
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.bots.bull_momentum_climber import BullMomentumClimber
+from src.tradeworkz.bots.charm_close_magnet import CharmCloseMagnet
 from src.tradeworkz.bots.dealer_delta_pressure_rider import DealerDeltaPressureRider
 from src.tradeworkz.bots.eod_pin_drifter import EodPinDrifter
 from src.tradeworkz.bots.gamma_flip_breaker import GammaFlipBreaker
 from src.tradeworkz.bots.gamma_flip_defender import GammaFlipDefender
+from src.tradeworkz.bots.gamma_regime_shift_rider import GammaRegimeShiftRider
 from src.tradeworkz.bots.max_pain_gravitator import MaxPainGravitator
 from src.tradeworkz.bots.opening_range_hunter import OpeningRangeHunter
 from src.tradeworkz.bots.put_call_wall_bouncer import PutCallWallBouncer
 from src.tradeworkz.bots.put_wall_magnet_reversal import PutWallMagnetReversal
 from src.tradeworkz.bots.range_iron_condor import RangeIronCondor
+from src.tradeworkz.bots.vanna_vol_crush_rider import VannaVolCrushRider
 from src.tradeworkz.bots.vix_regime_breakout import VixRegimeBreakout
 from src.tradeworkz.bots.vol_expansion_straddle import VolExpansionStraddle
 from src.tradeworkz.bots.vwap_reversion_scalper import VwapReversionScalper
@@ -51,6 +55,16 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     # the record; do NOT enable without a theta-aware spread-P&L backtest
     # that shows a real edge.
     "PutWallMagnetReversal": PutWallMagnetReversal,
+    # v4: edge-metric candidates. Each trades a data layer the retired fleet
+    # never touched — aggressor order flow, second-order forced dealer flow
+    # (vanna/charm), and the gamma-restoring Pin Strike. Registered (runnable /
+    # backtestable) but intentionally NOT in DEFAULT_ROSTER (see CANDIDATE_SPECS
+    # and the shelving note below): they go live only after clearing
+    # `make tradeworkz-backtest`.
+    "CharmCloseMagnet": CharmCloseMagnet,
+    "VannaVolCrushRider": VannaVolCrushRider,
+    "AggressorFlowDivergence": AggressorFlowDivergence,
+    "GammaRegimeShiftRider": GammaRegimeShiftRider,
 }
 
 # Roster entry for PutWallMagnetReversal, deliberately kept OUT of the live
@@ -289,6 +303,121 @@ SHELVED_SPECS: tuple[BotSpec, ...] = (
         },
     ),
 )
+
+
+# ── Candidate roster (edge-metric bots, NOT yet live) ───────────────
+# The v4 strategies. These are the first bots to trade the data layers the
+# shelved fleet never used — aggressor order flow, second-order forced dealer
+# flow (vanna/charm), the modeled close-charm flow, and the gamma-restoring Pin
+# Strike (see docs/design/tradeworkz-edge-strategies.md). They are deliberately
+# kept OUT of DEFAULT_ROSTER: the whole point of the 2026-08-09 shelving was
+# that nothing goes live on a thesis alone. Each is registered in
+# STRATEGY_CLASSES so `make tradeworkz-backtest --bots <id>` can screen it; move
+# a spec into DEFAULT_ROSTER (and out of here) ONLY after it clears the gate —
+# PF >= 1.1, positive expectancy, >= 20 trades. Until then they never
+# provision, never size, never open.
+CANDIDATE_SPECS: tuple[BotSpec, ...] = (
+    BotSpec(
+        id="charm_close_magnet",
+        display_name="Charm Close Magnet",
+        strategy_class="CharmCloseMagnet",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Ride the forced charm flow into the pin. Quantified, not folklore.",
+        description=(
+            "Final-window drift toward the gamma-restoring Pin Strike, but only "
+            "when the modeled close_charm_flow (dollars dealers must trade by the "
+            "close) actually points at the pin. Positive-γ, confident pin, "
+            "defined-risk vertical. Supersedes EodPinDrifter / MaxPainGravitator, "
+            "which drifted on displacement + folklore."
+        ),
+        params={
+            "max_minutes_to_close": 120,
+            "min_pin_confidence": 0.55,
+            "min_drift_pct": 0.001,
+            "max_drift_pct": 0.010,
+            "max_hold_minutes": 90,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="vanna_vol_crush_rider",
+        display_name="Vanna Vol-Crush Rider",
+        strategy_class="VannaVolCrushRider",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Vol is moving. Ride the vanna hedging flow it forces on dealers.",
+        description=(
+            "Trades the sign+size of dealer_vanna_total × ΔVIX — a short-vanna "
+            "book into a vol crush must buy (melt-up), and the mirror for a vol "
+            "spike. Defined-risk vertical. Supersedes VixRegimeBreakout, which "
+            "used only the VIX level and never vanna or the vol change."
+        ),
+        params={
+            "min_vix_change": 0.30,
+            "min_dealer_vanna": 4.0e7,
+            "target_pct": 0.004,
+            "stop_pct": 0.003,
+            "max_hold_minutes": 60,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="aggressor_flow_divergence",
+        display_name="Aggressor Flow Divergence",
+        strategy_class="AggressorFlowDivergence",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Aggressive option flow leans hard; price hasn't caught up. Lead it.",
+        description=(
+            "Leads price with aggressor-classified net option premium "
+            "(flow_series_5min) when it is strong, still accelerating, confirmed "
+            "on volume, and price has NOT yet moved to match. Stands down in a "
+            "strong positive-γ pin. The first bot to use option order flow at "
+            "all — no retired bot did."
+        ),
+        params={
+            "min_net_premium": 5.0e5,
+            "max_price_move_pct": 0.0025,
+            "target_pct": 0.004,
+            "stop_pct": 0.003,
+            "max_hold_minutes": 60,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="gamma_regime_shift_rider",
+        display_name="Gamma Regime Shift Rider",
+        strategy_class="GammaRegimeShiftRider",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Dealer gamma is flipping short at the flip. Ride the regime break.",
+        description=(
+            "Trades the long→short gamma TRANSITION — net_gex collapsing tick "
+            "over tick with spot at the flip and convexity elevated — not a "
+            "static level break. Flow-confirmed; stop is a reclaim of the flip. "
+            "Supersedes GammaFlipBreaker / DealerDeltaPressureRider, which read a "
+            "static level / sign."
+        ),
+        params={
+            "min_net_gex_drop": 5.0e8,
+            "max_flip_distance_pct": 0.003,
+            "min_break_trend_pct": 0.0010,
+            "target_pct": 0.006,
+            "max_hold_minutes": 60,
+            "dte_target": 0,
+        },
+    ),
+)
+
+
+def candidate_specs() -> Iterable[BotSpec]:
+    """Backtest-gated edge candidates — registered/runnable, NOT auto-provisioned."""
+    return CANDIDATE_SPECS
 
 
 # ── Active roster ───────────────────────────────────────────────────

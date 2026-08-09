@@ -1,0 +1,181 @@
+# TradeWorkz v4 — Edge-Metric Strategies
+
+**Status:** candidates (registered + backtestable; **not live**)
+**Date:** 2026-08-09
+**Supersedes the intent of:** the fleet shelved in `df9d593`
+
+---
+
+## 1. Why the old fleet had no edge
+
+On 2026-08-09 the entire TradeWorkz fleet was shelved. The backtest harness
+screened every bot over 45 days / 2,065 trades and found none with entry edge —
+best profit factor 0.78, live PF ~0.42, −$174K. A frictionless run on the worst
+loser proved *the signal was dead, not just expensive*.
+
+Looking at the fourteen retired bots, they share one root cause:
+
+> **Every retired bot traded a *static, first-order* positioning level.**
+
+Walls, gamma flip, VWAP, max-pain, net-GEX sign. `DealerDeltaPressureRider`'s
+"dealer delta" was literally `net_gex_at_spot` re-used. These are the exact
+levels every SpotGamma-style dashboard publishes — the retail GEX narrative
+("positive gamma pins, negative gamma trends, price gravitates to max pain").
+A well-known, widely-published level is arbitraged away; trading *the level*
+statically has no edge left in it.
+
+What the retired fleet **never touched** is the richer data ZeroGEX also
+generates — the layers where information, not folklore, lives:
+
+| Layer | Table / field | What it is |
+|---|---|---|
+| **Aggressor order flow** | `flow_series_5min.net_premium_cum`, `net_volume_cum` | Lee-Ready buy/sell-classified signed option premium. *Who is aggressively paying up, right now.* |
+| **Second-order forced dealer flow** | `gex_by_strike.dealer_vanna_exposure`, `dealer_charm_exposure` | The mechanical hedge dealers **must** do as time passes (charm) and as IV moves (vanna). Direction-known, scheduled. |
+| **Modeled close-charm flow** | `forced_flow_profile.close_charm_flow(_smooth)` | "$ of stock dealers must trade by the cash close if spot holds." A *quantified* version of the afternoon-drift folklore. |
+| **Pin Strike** | `gex_summary.pin_strike`, `pin_confidence` | The gamma-restoring, reachability-filtered magnet — distinct from OI-based max-pain. |
+| **Positioning *velocity*** | `net_gex` vs `prior_net_gex`, `flip_distance`, `convexity_risk` | The *change* in dealer positioning, not the standing level. |
+
+The v4 thesis in one line:
+
+> **Trade flow, change, and second-order mechanics — not static first-order
+> levels.** Where the retired bots read a level, these read a *forced flow* or a
+> *transition*, and each fires only when the mechanism actually points the way
+> the folklore assumes.
+
+---
+
+## 2. The data layer (what made these possible)
+
+The bots consume a `MarketSnapshot`, and that snapshot historically carried
+**only** the first-order levels. Two additions open the new layers to the bot
+tier, both strictly additive and best-effort (every existing bot ignores them):
+
+- **`src/tradeworkz/flow_context.py`** — four as-of-bounded, transaction-isolated
+  fetchers (`fetch_forced_flow`, `fetch_second_order_totals`,
+  `fetch_recent_option_flow`, `fetch_vix_lookback`). Each mirrors the failure
+  semantics of `_fetch_trade_bias`: a missing table / thin history nulls only
+  its own fields and never aborts the snapshot, and every read is bounded to
+  `timestamp <= COALESCE(as_of, NOW())` so the backtest harness stays faithful.
+- **`MarketSnapshot`** gains `pin_strike/score/confidence`, `flip_distance`,
+  `convexity_risk`, `local_gex`, `prior_net_gex/gamma_flip`,
+  `dealer_vanna_total`, `dealer_charm_total`, `close_charm_flow`, `charm_flip`,
+  `vanna_flip`, `flow_net_premium(_prev)`, `flow_net_volume`, `prior_vix`, plus
+  derived helpers `net_gex_change()`, `flow_premium_delta()`, `vix_change()`,
+  `distance_to_pin_pct()`.
+
+---
+
+## 3. The strategies
+
+Each is a defined-risk debit **vertical** (naked 0DTE debits bleed too fast);
+each has an explicit *edge filter* that the folklore version lacks.
+
+### 3.1 Charm Close Magnet — `charm_close_magnet`
+
+- **Supersedes:** `EodPinDrifter`, `MaxPainGravitator` (drifted toward OI
+  max-pain on displacement + time-of-day alone — folklore).
+- **Mechanism:** In the final ~2 hours, charm (dΔ/dt) forces an *accelerating*
+  dealer hedge into expiry. ZeroGEX **quantifies** it:
+  `forced_flow_profile.close_charm_flow` is the dollars dealers must trade by
+  the close, and the magnet is the gamma-restoring **Pin Strike**, not OI
+  max-pain.
+- **Edge filter:** fires only when the forced charm flow **actually points at
+  the pin** (`sign(close_charm_flow) == sign(pin − spot)`), in positive-γ, with
+  a confident pin. When flow and pin disagree — exactly the losing setups for
+  the retired pin-drifters — it **abstains**.
+- **Entry:** last 10–120 min to close · positive-γ · `pin_confidence ≥ 0.55` ·
+  pin 0.1–1.0% away · charm-flow/pin sign agreement · bias-veto.
+- **Structure/exit:** narrow vertical toward the pin; target = pin; stop = a
+  move to the wrong side of `charm_flip`; time-stop into the close.
+
+### 3.2 Vanna Vol-Crush Rider — `vanna_vol_crush_rider`
+
+- **Supersedes:** `VixRegimeBreakout` (used only the VIX *level* > 16; never
+  vanna, never the vol *change*).
+- **Mechanism:** forced dealer flow ≈ `dealer_vanna_total × ΔIV`.
+  `dealer_vanna_exposure` is "$ dealers must trade per +1 vol point"; multiply
+  by the session ΔVIX for the sign **and** size of the hedge. The canonical case
+  is the vol-crush melt-up: a short-vanna book (`dealer_vanna_total < 0`) into a
+  falling VIX yields a positive product → dealers **buy**.
+- **Edge filter:** direction is a *two-sign product* (`vanna × ΔVIX`), not a
+  VIX threshold — non-obvious and not the retail "high VIX ⇒ trend" trade.
+  Requires a real vol move (`|ΔVIX| ≥ 0.30`) and meaningful vanna.
+- **Structure/exit:** vertical in the forced direction; modest grind target
+  (vanna flow is steady, not explosive) capped at `vanna_flip`; small stop.
+
+### 3.3 Aggressor Flow Divergence — `aggressor_flow_divergence`
+
+- **Supersedes:** *nothing* — **no retired bot used option order flow at all.**
+- **Mechanism:** aggressor-classified net premium (`net_premium_cum`) leads
+  price on liquid names. The edge is a **divergence**: real money is
+  aggressively paying up on one side while price has **not yet** moved to match.
+  That gap is a coiled directional move — lead it.
+- **Edge filter:** strong, *still-accelerating* net premium **confirmed on
+  volume**, while the recent price move is still small (< 0.25%). Stands down in
+  a strong positive-γ pin, where dealers absorb the flow and the lead-lag breaks.
+- **Structure/exit:** vertical in the flow direction; target = first wall that
+  way; stop = a small move *against* the flow (thesis invalidated).
+
+### 3.4 Gamma Regime Shift Rider — `gamma_regime_shift_rider`
+
+- **Supersedes:** `GammaFlipBreaker`, `DealerDeltaPressureRider` (traded a
+  static flip *break* / static net-GEX *sign*).
+- **Mechanism:** the edge is the **derivative**, not the level. When dealer net
+  gamma collapses tick-over-tick (`net_gex_change` strongly negative) *through*
+  positive territory, with spot **at** the flip and `convexity_risk` elevated,
+  the regime is transitioning long→short — absorption turning into
+  amplification. That transition is the clean leg the static break missed.
+- **Edge filter:** requires a genuine **crossing** (`prior_net_gex > 0`, fast
+  shed, spot within 0.3% of the flip) and aggressor **volume that confirms** the
+  break direction.
+- **Structure/exit:** vertical in the break direction; target = far wall (short-γ
+  lets price run); stop = a **reclaim of the flip** (transition aborted).
+
+---
+
+## 4. Differentiation matrix
+
+| v4 bot | Untapped axis | Retired analog | Why the analog failed |
+|---|---|---|---|
+| Charm Close Magnet | time-Greek + quantified forced flow + pin | EodPinDrifter / MaxPainGravitator | drift on displacement + folklore, wrong magnet |
+| Vanna Vol-Crush Rider | vol-Greek × Δvol | VixRegimeBreakout | VIX *level* only, no vanna, no Δvol |
+| Aggressor Flow Divergence | order flow (lead-lag) | *(none)* | fleet never used flow |
+| Gamma Regime Shift Rider | positioning *velocity* | GammaFlipBreaker / DealerDeltaPressureRider | static level / sign |
+
+Each hits a **distinct** axis, so as a set they are non-overlapping.
+
+---
+
+## 5. Promotion gate — nothing goes live on a thesis
+
+These are registered in `STRATEGY_CLASSES` and carried in `CANDIDATE_SPECS`, but
+**`DEFAULT_ROSTER` stays empty** — they never provision, size, or open. That is
+deliberate: the whole point of the shelving was that nothing goes live on hope.
+
+A candidate is promoted **only** after it clears the same gate revival requires:
+
+```
+make tradeworkz-backtest ARGS="--days 45 --interval-min 5 --bots charm_close_magnet,vanna_vol_crush_rider,aggressor_flow_divergence,gamma_regime_shift_rider --json"
+```
+
+Promotion criterion (unchanged from the shelving note): **profit factor ≥ 1.1,
+positive expectancy, ≥ 20 trades.** To promote a bot that clears it, move its
+spec from `CANDIDATE_SPECS` into `DEFAULT_ROSTER` (leave it out of
+`RETIRED_BOT_IDS`). Nothing else is required — the engine provisions it on the
+next boot.
+
+> The backtest requires historical `gex_by_strike` / `forced_flow_profile` /
+> `flow_series_5min` / `option_chains(_archive)` coverage. On symbols/windows
+> where those tables are thin, the relevant snapshot fields read `None` and the
+> dependent bot simply abstains (it never trades on absent data) — so a thin
+> backtest reads as thin coverage, never as false edge.
+
+---
+
+## 6. Backlog — next candidate
+
+- **Skew Snap Reversal** — `skew_delta` (OTM put−call IV differential) at a fear
+  extreme while the tape is *not* breaking down → contrarian long. Distinct axis
+  again (vol *skew*, not level/flow/time). Deferred until the backtest verdicts
+  on the first four are in, so the candidate set stays small and each addition is
+  screened on its own.

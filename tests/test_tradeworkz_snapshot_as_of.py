@@ -58,9 +58,30 @@ def _scripted() -> _Conn:
     ts = datetime(2026, 8, 1, 14, 30, tzinfo=timezone.utc)
     cur.program("SELECT timestamp, close\n        FROM underlying_quotes", [(ts, 746.0)])
     cur.program("SELECT MIN(low), MAX(high)", [(739.0, 750.0, 745.0)])
+    # 16 columns: the 10 original + the 6 v4 edge columns (pin_strike,
+    # pin_score, pin_confidence, flip_distance, convexity_risk, local_gex).
     cur.program(
         "FROM gex_summary",
-        [(3.2e9, 745.5, 745.0, 1.0, 750.0, 740.0, 745.0, 3.2e9, 1.0e9, 8.0e8)],
+        [
+            (
+                3.2e9,
+                745.5,
+                745.0,
+                1.0,
+                750.0,
+                740.0,
+                745.0,
+                3.2e9,
+                1.0e9,
+                8.0e8,
+                745.0,
+                0.9,
+                0.7,
+                0.001,
+                5.0e11,
+                1.2e9,
+            )
+        ],
     )
     cur.program("FROM vix_bars", [(17.0,)])
     cur.program("FROM underlying_vwap_deviation", [(746.5, -0.1)])
@@ -100,9 +121,7 @@ def test_bias_read_is_bounded_by_as_of():
     as_of = datetime(2026, 8, 1, 15, 0, tzinfo=timezone.utc)
     conn = _scripted()
     build_snapshot(conn, "SPY", as_of=as_of)
-    bias_calls = [
-        c for c in conn.cursor().calls if "FROM trade_bias_scores" in c[0]
-    ]
+    bias_calls = [c for c in conn.cursor().calls if "FROM trade_bias_scores" in c[0]]
     assert bias_calls, "trade_bias read never issued"
     for sql, params in bias_calls:
         assert _BOUND in sql and as_of in tuple(params or ())
