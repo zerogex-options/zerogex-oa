@@ -14,6 +14,16 @@ DOMAIN_NAME="${OA_API_DOMAIN}"
 SITE_CONF="/etc/nginx/sites-available/zerogex-oa-api"
 LE_EMAIL="${LETSENCRYPT_EMAIL}"
 
+# TLS cert/key paths. Default to the Let's Encrypt live cert (the direct-to-
+# origin setup). When the API is proxied through Cloudflare, Let's Encrypt's
+# HTTP-01 challenge can't validate (the hostname resolves to Cloudflare, not
+# this box), so use a long-lived Cloudflare Origin Certificate instead: install
+# it on the box, point OA_TLS_CERT / OA_TLS_KEY at it, and set SKIP_CERTBOT=1 so
+# this step skips the DNS preflight + certbot and just writes/reloads nginx with
+# these paths. See deploy/API_BEHIND_CLOUDFLARE.md.
+OA_TLS_CERT="${OA_TLS_CERT:-/etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem}"
+OA_TLS_KEY="${OA_TLS_KEY:-/etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem}"
+
 if [ ! -f "$SITE_CONF" ]; then
     log "  ✗ Nginx site config not found: $SITE_CONF"
     log "    Run step 120 first."
@@ -136,8 +146,8 @@ server {
     listen [::]:443 ssl http2;
     server_name ${DOMAIN_NAME};
 
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
+    ssl_certificate ${OA_TLS_CERT};
+    ssl_certificate_key ${OA_TLS_KEY};
 
     ssl_session_timeout 1d;
     ssl_session_cache shared:MozSSL:10m;
