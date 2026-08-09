@@ -203,7 +203,7 @@ class MarketSnapshot:
 
 
 def _fetch_trade_bias(
-    conn: Any, underlying: str
+    conn: Any, underlying: str, as_of: Optional[datetime] = None
 ) -> tuple[Optional[str], Optional[str], Optional[float]]:
     """Latest fused directional bias for ``underlying`` — best-effort.
 
@@ -224,11 +224,11 @@ def _fetch_trade_bias(
             """
             SELECT bias_code, direction, confidence
             FROM trade_bias_scores
-            WHERE underlying = %s
+            WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
             ORDER BY timestamp DESC, (tenor = 'intraday') DESC
             LIMIT 1
             """,
-            (underlying,),
+            (underlying, as_of),
         )
         row = cur.fetchone()
         cur.execute("RELEASE SAVEPOINT tw_bias")
@@ -246,13 +246,21 @@ def _fetch_trade_bias(
     return (row[0], trend, conf)
 
 
-def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
-    """Build the current ``MarketSnapshot`` for ``underlying`` from the DB.
+def build_snapshot(
+    conn: Any, underlying: str, as_of: Optional[datetime] = None
+) -> Optional[MarketSnapshot]:
+    """Build the ``MarketSnapshot`` for ``underlying`` from the DB.
 
     Uses the existing ``gex_summary`` row (canonical wall + flip + max-pain
     source), the latest ``underlying_quotes`` price, and the most recent
     ``vix_bars`` close. Returns ``None`` when there is no usable spot price
     or gex_summary row for the symbol.
+
+    ``as_of`` reconstructs the snapshot AS IT WOULD HAVE BEEN at a past instant,
+    for the backtest harness. Every read is bounded to
+    ``timestamp <= COALESCE(as_of, NOW())``, so ``as_of=None`` (the live engine
+    path) reproduces the old "latest row" behavior exactly, while a past
+    ``as_of`` yields only rows visible at that time.
     """
     cur = conn.cursor()
 
@@ -264,11 +272,11 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         """
         SELECT timestamp, close
         FROM underlying_quotes
-        WHERE symbol = %s
+        WHERE symbol = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC
         LIMIT 1
         """,
-        (underlying,),
+        (underlying, as_of),
     )
     row = cur.fetchone()
     if row is None:
@@ -286,12 +294,16 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         """
         SELECT MIN(low), MAX(high),
                (SELECT open FROM underlying_quotes
-                WHERE symbol = %s AND timestamp >= NOW() - INTERVAL '24 hours'
+                WHERE symbol = %s
+                  AND timestamp >= COALESCE(%s::timestamptz, NOW()) - INTERVAL '24 hours'
+                  AND timestamp <= COALESCE(%s::timestamptz, NOW())
                 ORDER BY timestamp ASC LIMIT 1)
         FROM underlying_quotes
-        WHERE symbol = %s AND timestamp >= NOW() - INTERVAL '24 hours'
+        WHERE symbol = %s
+          AND timestamp >= COALESCE(%s::timestamptz, NOW()) - INTERVAL '24 hours'
+          AND timestamp <= COALESCE(%s::timestamptz, NOW())
         """,
-        (underlying, underlying),
+        (underlying, as_of, as_of, underlying, as_of, as_of),
     )
     session_row = cur.fetchone()
     sess_lo = session_row[0] if session_row else None
@@ -328,11 +340,11 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
                call_wall, put_wall, max_gamma_strike, total_net_gex,
                call_wall_strength, put_wall_strength
         FROM gex_summary
-        WHERE underlying = %s
+        WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC
         LIMIT 2
         """,
-        (underlying,),
+        (underlying, as_of),
     )
     gex_rows = cur.fetchall()
     if gex_rows:
@@ -344,8 +356,9 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
 
     cur.execute("""
         SELECT close FROM vix_bars
+        WHERE timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC LIMIT 1
-        """)
+        """, (as_of,))
     vix_row = cur.fetchone()
     vix = float(vix_row[0]) if vix_row and vix_row[0] is not None else None
 
@@ -357,11 +370,11 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         """
         SELECT vwap, vwap_deviation_pct
         FROM underlying_vwap_deviation
-        WHERE symbol = %s
+        WHERE symbol = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC
         LIMIT 1
         """,
-        (underlying,),
+        (underlying, as_of),
     )
     vwap_row = cur.fetchone()
     vwap_value = _maybe_float(vwap_row[0]) if vwap_row else None
@@ -370,11 +383,11 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     cur.execute(
         """
         SELECT close FROM underlying_quotes
-        WHERE symbol = %s
+        WHERE symbol = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC
         LIMIT 30
         """,
-        (underlying,),
+        (underlying, as_of),
     )
     closes = [float(r[0]) for r in cur.fetchall() if r[0] is not None][::-1]
 
@@ -413,7 +426,7 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
 
     # Fused directional trade-bias (best-effort; isolated so a missing/empty
     # trade_bias_scores never aborts the snapshot build).
-    bias_code, bias_trend, bias_conf = _fetch_trade_bias(conn, underlying)
+    bias_code, bias_trend, bias_conf = _fetch_trade_bias(conn, underlying, as_of)
 
     return MarketSnapshot(
         underlying=underlying,

@@ -20,7 +20,7 @@ import logging
 import math
 import statistics
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import BotSpec, ExitDecision, Leg, OpenPosition, TradeSignal
@@ -949,5 +949,28 @@ def _synthetic_option_symbol(underlying: str, opt: str, strike: float, exp: str)
     return f"{root} {exp_compact}{right}{strike_str}"
 
 
+# Optional simulated wall-clock. The live engine leaves this None; the backtest
+# harness installs a callable via set_backtest_clock so every bot's time-based
+# logic runs on replay time instead of real time. Kept module-level (not per-bot)
+# because bots are stateless and re-instantiated each tick — the clock is a
+# property of the run, not the instance.
+_backtest_clock: Optional[Callable[[], datetime]] = None
+
+
+def set_backtest_clock(fn: Optional[Callable[[], datetime]]) -> None:
+    """Install (``fn``) or clear (``None``) the simulated clock for :func:`_utcnow`.
+
+    When set, every bot reads replay time through ``_utcnow()`` — the entry-time
+    ``time_stop_at`` stamps, the min-hold gate, the premium-stop grace window, and
+    the time-stop all move on the backtest clock. Production never calls this, so
+    ``_backtest_clock`` stays ``None`` and live behavior is byte-for-byte the old
+    ``datetime.now(timezone.utc)``.
+    """
+    global _backtest_clock
+    _backtest_clock = fn
+
+
 def _utcnow() -> datetime:
+    if _backtest_clock is not None:
+        return _backtest_clock()
     return datetime.now(timezone.utc)
