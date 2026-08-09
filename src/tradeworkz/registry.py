@@ -78,7 +78,14 @@ PUT_WALL_MAGNET_REVERSAL_SPEC = BotSpec(
 )
 
 
-DEFAULT_ROSTER: tuple[BotSpec, ...] = (
+# ── Shelved catalog ─────────────────────────────────────────────────
+# The full set of bot specs that HAVE shipped. As of 2026-08-09 none are
+# in the active DEFAULT_ROSTER (below) — the fleet was shelved after the
+# backtest screen found no edge. These definitions are preserved verbatim
+# so a strategy can be revived (moved back into DEFAULT_ROSTER) the moment
+# it clears `make tradeworkz-backtest`. They are also what
+# RETIRED_BOT_IDS is built from, so every shipped bot is retired in the DB.
+SHELVED_SPECS: tuple[BotSpec, ...] = (
     BotSpec(
         id="put_call_wall_bouncer",
         display_name="Put/Call Wall Bouncer",
@@ -284,16 +291,33 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
 )
 
 
+# ── Active roster ───────────────────────────────────────────────────
+# EMPTY. The entire fleet was shelved on 2026-08-09 after the backtest
+# harness (make tradeworkz-backtest) screened every bot over 45 days /
+# 2,065 trades and found NONE with edge — the best profit factor in the
+# fleet was 0.78, and four bots never fired at all. The live record
+# (PF ~0.42) and the backtest agree. Rather than keep paper capital on a
+# negative-edge fleet, every bot is retired (below) while the engine keeps
+# running so a future, edge-positive strategy can be added.
+#
+# To REVIVE a strategy: move its spec from SHELVED_SPECS into this tuple
+# and drop its id from RETIRED_BOT_IDS — but ONLY after it clears the
+# screen (PF >= 1.1 with positive expectancy over >= 20 trades on
+# `make tradeworkz-backtest`). The harness is the gate; nothing goes live
+# on hope again.
+DEFAULT_ROSTER: tuple[BotSpec, ...] = ()
+
+
 # ── Retired bots ────────────────────────────────────────────────────
-# Bots that were once shipped but no longer belong in the fleet. The
-# engine calls ``retire_stale_bots`` on provision so historical trade
-# rows survive (audit stays intact) but the sleeve is zeroed and the
-# bot flipped to enabled=false, freeing capital for the active roster
-# on the next re-balance. Do NOT delete the id itself — foreign keys
-# from tw_trades / tw_positions point at it and the audit UI needs it.
-RETIRED_BOT_IDS: tuple[str, ...] = (
-    # Symbol-specific variants collapsed into their symbol-agnostic
-    # parents when the fleet universe expanded from SPY-only to CSV.
+# Bots retired from the live fleet. On provision the engine flips each to
+# enabled=false and zeroes its sleeve, so historical trade rows survive
+# (audit + leaderboard stay intact) but no capital rides on them and they
+# never open. Do NOT delete an id — foreign keys from tw_trades /
+# tw_positions point at it and the audit UI needs it. This is currently the
+# WHOLE shipped catalog (see the shelving note above) plus the two legacy
+# symbol-specific variants collapsed into their parents when the fleet
+# universe expanded from SPY-only to CSV.
+RETIRED_BOT_IDS: tuple[str, ...] = tuple(spec.id for spec in SHELVED_SPECS) + (
     "qqq_gamma_flip_breaker",
     "qqq_dealer_delta_pressure_rider",
 )

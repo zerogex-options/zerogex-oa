@@ -490,11 +490,13 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
       fresh baseline.
     """
     fleet = tw_config.FLEET_CAPITAL if fleet_capital is None else float(fleet_capital)
+    # DEFAULT_ROSTER is empty when the whole fleet is shelved (see
+    # registry.SHELVED_SPECS): the seed / re-sync loop below then no-ops (an
+    # empty active_ids matches no rows) and only the RETIRED_BOT_IDS retire step
+    # runs — so a fully-shelved fleet still gets disabled + zeroed on the next
+    # provision instead of being skipped by an early return.
     roster = list(DEFAULT_ROSTER)
-    if not roster:
-        return 0
-
-    slice_amount = round(fleet / len(roster), 2)
+    slice_amount = round(fleet / len(roster), 2) if roster else 0.0
     now = datetime.now(timezone.utc)
 
     inserted = 0
