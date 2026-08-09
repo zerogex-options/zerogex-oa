@@ -228,7 +228,19 @@ class _ProvConn:
         return self._cur
 
 
-def test_provision_does_not_resync_enabled():
+def test_provision_does_not_resync_enabled(monkeypatch):
+    # The live DEFAULT_ROSTER is currently empty (the fleet is shelved), so
+    # inject a one-bot roster to exercise the upsert path independently of the
+    # active roster's state — the invariant under test is about the SQL, not
+    # which bots happen to be active.
+    from src.tradeworkz.models import BotSpec
+
+    fake = BotSpec(
+        id="t_prov", display_name="T", strategy_class="PutCallWallBouncer",
+        tier="0DTE", direction_mode="context", universe="*",
+        tagline="", description="", params={},
+    )
+    monkeypatch.setattr(engine, "DEFAULT_ROSTER", (fake,))
     conn = _ProvConn()
     engine.provision_defaults(conn, fleet_capital=12000.0)
     upserts = [s for s in conn.cursor().sqls if "INSERT INTO tw_bots " in s]
