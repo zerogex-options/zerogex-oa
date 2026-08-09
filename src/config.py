@@ -531,6 +531,41 @@ if GAMMA_PROFILE_DTE_WEIGHT_SHAPE not in ("linear", "sqrt", "exp"):
     )
     GAMMA_PROFILE_DTE_WEIGHT_SHAPE = "linear"
 
+# =============================================================================
+# Pin Strike
+# =============================================================================
+# Pin Strike estimates the reachable 0DTE strike with the strongest modeled
+# POSITIVE (restoring) dealer gamma into expiration — a metric distinct from
+# Call/Put Wall, Gamma Flip, Max Pain and King Node (see
+# src/analytics/pin_strike.py).  All knobs are isolated here so the model can
+# be tuned without a code change.
+#
+# Kernel bandwidth as a multiple of the median nearby strike interval.  The
+# Gaussian kernel concentrates gamma around a candidate strike; deriving the
+# bandwidth from measured strike spacing (rather than a hardcoded dollar
+# width) makes it correct across SPY/QQQ (~$1 grid), SPX (~5pt), NDX
+# (coarser).  ~1–2 strike intervals is the sensible range.
+PIN_STRIKE_BANDWIDTH_STRIKE_MULT = _getenv_float(
+    "PIN_STRIKE_BANDWIDTH_STRIKE_MULT", 1.0, min=0.1, max=10.0
+)
+# Candidate strikes are restricted to within ±this many expected moves of spot
+# (|ln(K/spot)| ≤ max_z · sigma · √tau).  Keeps the per-cycle simulation cheap
+# and the pin realistically reachable; scale-free across underlyings.
+PIN_STRIKE_CANDIDATE_MAX_Z = _getenv_float(
+    "PIN_STRIKE_CANDIDATE_MAX_Z", 2.5, min=0.5, max=6.0
+)
+# Raw-magnitude floor below which the best pin is suppressed as
+# PIN_SCORE_TOO_WEAK.  Default 0 == gate DISABLED: no arbitrary user-facing
+# threshold is invented (the spec's guidance); an operator can raise it once
+# the score distribution has been observed in production.
+PIN_STRIKE_MIN_SCORE = _getenv_float("PIN_STRIKE_MIN_SCORE", 0.0, min=0.0)
+# Half-width (fraction of spot) of the ATM band used to derive the
+# representative implied volatility for the reachability weight — mirrors the
+# ±1% band the daily_atm_iv anchor already uses.
+PIN_STRIKE_ATM_IV_BAND_PCT = _getenv_float(
+    "PIN_STRIKE_ATM_IV_BAND_PCT", 0.01, min=0.001, max=0.1
+)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = _getenv_int("QUOTE_BATCH_SIZE", 100)  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = _getenv_int("OPTION_BATCH_SIZE", 100)

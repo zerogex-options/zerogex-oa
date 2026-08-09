@@ -88,6 +88,13 @@ class DealerLevels(BaseModel):
     call_wall: Optional[float] = None
     put_wall: Optional[float] = None
     max_pain: Optional[float] = None
+    # Pin Strike — reachable 0DTE strike with the strongest modeled positive
+    # (restoring) dealer gamma into expiration.  A fifth drawable horizontal
+    # level, distinct from the walls/flip/max-pain above (see
+    # src/analytics/pin_strike.py).  ``null`` when no meaningful pin exists —
+    # hide, don't zero; the reason and score/confidence metadata for that case
+    # live at the response top level.
+    pin_strike: Optional[float] = None
 
 
 class LevelsResponse(BaseModel):
@@ -97,6 +104,12 @@ class LevelsResponse(BaseModel):
     age_seconds: Optional[int] = None
     net_gex_at_spot: Optional[float] = None
     levels: DealerLevels
+    # Pin Strike metadata (scalars, not drawable lines): the raw maximum pin
+    # score, its dominance over all viable pins (0..1), and — when there is no
+    # active pin — a REASON_* code (``pin_strike`` in ``levels`` is then null).
+    pin_score: Optional[float] = None
+    pin_confidence: Optional[float] = None
+    pin_strike_reason: Optional[str] = None
     profile: List[StrikeGamma]
 
 
@@ -179,6 +192,10 @@ async def get_levels(
             call_wall=_maybe_float(summary.get("call_wall")),
             put_wall=_maybe_float(summary.get("put_wall")),
             max_pain=_maybe_float(summary.get("max_pain")),
+            pin_strike=_maybe_float(summary.get("pin_strike")),
         ),
+        pin_score=_maybe_float(summary.get("pin_score")),
+        pin_confidence=_maybe_float(summary.get("pin_confidence")),
+        pin_strike_reason=summary.get("pin_strike_reason"),
         profile=profile,
     )

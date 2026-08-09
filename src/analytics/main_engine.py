@@ -48,12 +48,18 @@ from src.config import (
     GAMMA_PROFILE_DTE_WEIGHTING,
     GAMMA_PROFILE_DTE_REF_DAYS,
     GAMMA_PROFILE_DTE_WEIGHT_SHAPE,
+    PIN_STRIKE_BANDWIDTH_STRIKE_MULT,
+    PIN_STRIKE_CANDIDATE_MAX_Z,
+    PIN_STRIKE_MIN_SCORE,
+    PIN_STRIKE_ATM_IV_BAND_PCT,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
+from src.tradeworkz.strikes import default_strike_increment
 from src.analytics.walls import (
     compute_call_put_walls,
     compute_call_put_walls_with_strength,
 )
+from src.analytics import pin_strike as pin_strike_mod
 from src.greeks_fd import fd_charm, fd_vanna
 from src.analytics.forced_flow import (
     ContractLeg,
@@ -2496,6 +2502,142 @@ class AnalyticsEngine:
                 return c1 + (c2 - c1) * (underlying_price - s1) / (s2 - s1)
         return last_v
 
+    def _calculate_pin_strike(
+        self,
+        options: List[Dict[str, Any]],
+        underlying_price: float,
+        timestamp: datetime,
+    ) -> "pin_strike_mod.PinStrikeResult":
+        """Pin Strike for the nearest same-day (0DTE) expiration.
+
+        Thin engine adapter around the pure :func:`pin_strike.calculate_pin_strike`
+        — it resolves the market-data inputs (0DTE contract set, settlement-aware
+        per-contract T, representative ATM IV and reachability horizon) and
+        delegates the modeling to the pure function, passing the SAME canonical
+        BSM gamma (:meth:`_calculate_bs_gamma`), dealer-sign / OI / dollar-gamma
+        conventions used everywhere else in the engine.
+
+        V1 restrictions (see the module docstring): only the nearest same-day
+        expiration is used — no 1DTE / weekly / monthly blending — and no
+        intraday-flow OI adjustment (the core OI basis is used as-is).
+
+        Returns a :class:`PinStrikeResult`; an inactive pin (no 0DTE, no valid
+        data, no positive restoring gamma, …) comes back as
+        ``pin_strike=None`` with a ``reason`` code rather than a forced value.
+        """
+        # Same-day (0DTE) expiration in ET, matching the engine's existing
+        # "today" convention (see _calculate_max_pain / the AM-settled SOQ drop).
+        today_et = timestamp.astimezone(ET).date()
+        same_day = [o for o in options if o.get("expiration") == today_et]
+        if not same_day:
+            return pin_strike_mod.calculate_pin_strike(
+                [],
+                spot=underlying_price,
+                tau=0.0,
+                sigma=None,
+                gamma_fn=self._calculate_bs_gamma,
+                risk_free_rate=self.risk_free_rate,
+                dividend_yield=self.dividend_yield,
+                expiration=None,
+                has_0dte=False,
+            )
+
+        # Representative reachability horizon tau: remaining time to the 0DTE
+        # settlement.  0DTE index/ETF pins resolve at the 16:00 ET cash close
+        # (SPXW/ETF PM settlement); AM-settled SPX same-day rows are already
+        # dropped after 09:30 upstream, so the 16:00 close is the correct
+        # "into expiration" horizon here.  calculate_time_to_expiration returns
+        # the intraday-accurate remainder in years (not 1/365) and 0.0 once
+        # past the settlement instant, which the pure function reads as EXPIRED.
+        tau = calculate_time_to_expiration(
+            timestamp, today_et, market_close_time="16:00:00"
+        )
+
+        # Representative ATM IV via the engine's established ±band policy
+        # (mirrors _store_daily_atm_iv): mean ATM call IV, calls preferred.
+        atm_contracts = [
+            {
+                "strike": o.get("strike"),
+                "option_type": o.get("option_type"),
+                "iv": o.get("implied_volatility"),
+            }
+            for o in same_day
+        ]
+        sigma = pin_strike_mod.representative_atm_iv(
+            atm_contracts, underlying_price, band_pct=PIN_STRIKE_ATM_IV_BAND_PCT
+        )
+
+        # Normalize the 0DTE contracts, resolving each contract's own
+        # settlement-aware T for the gamma re-pricing (SPX vs SPXW at a shared
+        # date get distinct closes — same keying the GEX-by-strike loop uses).
+        tte_cache: Dict = {}
+        contracts: List[Dict[str, Any]] = []
+        for o in same_day:
+            close_t = settlement_close_time_for_contract(
+                self.db_symbol, o.get("option_symbol"), today_et
+            )
+            T = tte_cache.get(close_t)
+            if T is None:
+                T = calculate_time_to_expiration(
+                    timestamp, today_et, market_close_time=close_t
+                )
+                tte_cache[close_t] = T
+            contracts.append(
+                {
+                    "strike": o.get("strike"),
+                    "option_type": o.get("option_type"),
+                    "open_interest": o.get("open_interest"),
+                    "iv": o.get("implied_volatility"),
+                    "T": T,
+                }
+            )
+
+        result = pin_strike_mod.calculate_pin_strike(
+            contracts,
+            spot=underlying_price,
+            tau=tau,
+            sigma=sigma,
+            gamma_fn=self._calculate_bs_gamma,
+            risk_free_rate=self.risk_free_rate,
+            dividend_yield=self.dividend_yield,
+            expiration=today_et,
+            has_0dte=True,
+            bandwidth_strike_mult=PIN_STRIKE_BANDWIDTH_STRIKE_MULT,
+            fallback_increment=default_strike_increment(self.db_symbol),
+            candidate_max_z=PIN_STRIKE_CANDIDATE_MAX_Z,
+            min_pin_score=PIN_STRIKE_MIN_SCORE,
+        )
+
+        # Concise, non-spammy diagnostic (one INFO line per cycle).  The full
+        # per-candidate curve stays in the result object for tests / ad-hoc
+        # inspection and is never logged per-minute in production.
+        if result.is_active:
+            logger.info(
+                "Pin Strike %s @ %s: K=%.2f score=%.3g conf=%.2f reach=%.2f "
+                "local_gex=%.3g (exp %s, sigma=%.3f, tau=%.5f, bw=%.3f, %d candidates)",
+                self.db_symbol,
+                timestamp,
+                result.pin_strike,
+                result.pin_score or 0.0,
+                result.pin_confidence or 0.0,
+                result.reachability or 0.0,
+                result.local_gex or 0.0,
+                result.expiration,
+                result.sigma or 0.0,
+                result.tau or 0.0,
+                result.bandwidth or 0.0,
+                len(result.candidates),
+            )
+        else:
+            logger.info(
+                "Pin Strike %s @ %s: no active pin (reason=%s, %d candidates)",
+                self.db_symbol,
+                timestamp,
+                result.reason,
+                len(result.candidates),
+            )
+        return result
+
     def _calculate_gex_summary(
         self,
         gex_by_strike: List[Dict[str, Any]],
@@ -2753,6 +2895,15 @@ class AnalyticsEngine:
             put_wall_strength,
         ) = compute_call_put_walls_with_strength(gex_by_strike, underlying_price)
 
+        # Pin Strike — reachable 0DTE strike with the strongest modeled positive
+        # (restoring) dealer gamma into expiration.  Distinct from the walls /
+        # flip / max-pain / king-node above; see src/analytics/pin_strike.py.
+        # Returns a null pin (with a reason) rather than forcing a value when no
+        # meaningful positive-gamma pin exists.  summary_fields() is the
+        # additive, persist-ready subset (pin_strike / pin_score /
+        # pin_confidence / pin_strike_reason).
+        pin_result = self._calculate_pin_strike(options, underlying_price, timestamp)
+
         summary = {
             "underlying": self.db_symbol,
             "timestamp": timestamp,
@@ -2785,6 +2936,9 @@ class AnalyticsEngine:
             # can overlay the curve on the per-strike GEX chart without
             # the API recomputing the BS gamma grid on every request.
             "gamma_profile": gamma_profile,
+            # Pin Strike (nullable). pin_strike / pin_score / pin_confidence /
+            # pin_strike_reason.
+            **pin_result.summary_fields(),
         }
 
         return summary
@@ -2944,6 +3098,14 @@ class AnalyticsEngine:
         )
         gamma_flip_span_used = summary.get("gamma_flip_span_used")
         gamma_flip_raw = summary.get("gamma_flip_raw")
+        # Pin Strike (nullable). ``pin_strike_reason`` is a REASON_* code when
+        # there's no active pin, NULL when a pin is present (mirrors the
+        # walls/flip "nullable, hide-don't-zero" persistence convention, plus a
+        # reason string for observability).
+        pin_strike_val = summary.get("pin_strike")
+        pin_score_val = summary.get("pin_score")
+        pin_confidence_val = summary.get("pin_confidence")
+        pin_strike_reason_val = summary.get("pin_strike_reason")
         cursor.execute(
             """
             INSERT INTO gex_summary
@@ -2953,8 +3115,9 @@ class AnalyticsEngine:
              net_gex_at_spot, flip_distance, local_gex, convexity_risk,
              call_wall, put_wall, call_wall_strength, put_wall_strength,
              max_pain_by_expiration, gamma_flip_span_used,
-             gamma_flip_raw)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             gamma_flip_raw, pin_strike, pin_score, pin_confidence,
+             pin_strike_reason)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -2976,7 +3139,11 @@ class AnalyticsEngine:
                 call_wall_strength = EXCLUDED.call_wall_strength,
                 put_wall_strength = EXCLUDED.put_wall_strength,
                 max_pain_by_expiration = EXCLUDED.max_pain_by_expiration,
-                gamma_flip_span_used = EXCLUDED.gamma_flip_span_used
+                gamma_flip_span_used = EXCLUDED.gamma_flip_span_used,
+                pin_strike = EXCLUDED.pin_strike,
+                pin_score = EXCLUDED.pin_score,
+                pin_confidence = EXCLUDED.pin_confidence,
+                pin_strike_reason = EXCLUDED.pin_strike_reason
             WHERE
                 EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                 OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -2999,6 +3166,10 @@ class AnalyticsEngine:
                 OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
                 OR EXCLUDED.gamma_flip_span_used IS DISTINCT FROM gex_summary.gamma_flip_span_used
                 OR EXCLUDED.gamma_flip_raw IS DISTINCT FROM gex_summary.gamma_flip_raw
+                OR EXCLUDED.pin_strike IS DISTINCT FROM gex_summary.pin_strike
+                OR EXCLUDED.pin_score IS DISTINCT FROM gex_summary.pin_score
+                OR EXCLUDED.pin_confidence IS DISTINCT FROM gex_summary.pin_confidence
+                OR EXCLUDED.pin_strike_reason IS DISTINCT FROM gex_summary.pin_strike_reason
         """,
             (
                 summary["underlying"],
@@ -3024,6 +3195,10 @@ class AnalyticsEngine:
                 mp_by_exp_json,
                 (float(gamma_flip_span_used) if gamma_flip_span_used is not None else None),
                 (float(gamma_flip_raw) if gamma_flip_raw is not None else None),
+                (float(pin_strike_val) if pin_strike_val is not None else None),
+                (float(pin_score_val) if pin_score_val is not None else None),
+                (float(pin_confidence_val) if pin_confidence_val is not None else None),
+                (str(pin_strike_reason_val) if pin_strike_reason_val is not None else None),
             ),
         )
         logger.info("✅ Stored GEX summary")

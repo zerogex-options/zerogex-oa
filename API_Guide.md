@@ -242,8 +242,12 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
     "gamma_flip": 675.0,
     "call_wall": 680.0,
     "put_wall": 670.0,
-    "max_pain": 676.0
+    "max_pain": 676.0,
+    "pin_strike": 676.0
   },
+  "pin_score": 1504000000.0,
+  "pin_confidence": 0.31,
+  "pin_strike_reason": null,
   "profile": [
     {"strike": 670.0, "net_gex": -500000000.0, "call_gex": 100000000.0, "put_gex": -600000000.0},
     {"strike": 676.0, "net_gex":          0.0, "call_gex": 200000000.0, "put_gex": -200000000.0},
@@ -255,6 +259,19 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
 - `levels.*` draw as horizontal lines. Any field may be `null` when the
   engine can't resolve it (e.g. an unresolved gamma flip on a thin chain)
   — hide the line, don't render a `0`.
+- `levels.pin_strike` is the **Pin Strike** — the reachable 0DTE strike with
+  the strongest modeled positive (restoring) dealer gamma into expiration. It
+  is a *distinct* metric, not a wall / flip / max-pain / king-node: it
+  simulates spot AT each candidate strike, keeps only locally-concentrated
+  positive gamma, and weights by the probability price reaches that strike
+  before the 0DTE close. `null` when no meaningful pin exists (hide, don't
+  zero) — then `pin_strike_reason` carries a code (`NO_0DTE_EXPIRATION`,
+  `NO_POSITIVE_RESTORING_GAMMA`, `INSUFFICIENT_OPTION_DATA`,
+  `INSUFFICIENT_IV_DATA`, `EXPIRED`, `PIN_SCORE_TOO_WEAK`).
+- `pin_score` (raw max pin score = restoring gamma × reachability) and
+  `pin_confidence` (its dominance over all viable pins, `0..1`) are top-level
+  scalar metadata a client can use to classify pin strength; both `null` when
+  there is no active pin.
 - `profile` is ascending by strike (histogram order). `net_gex` is dollar
   gamma per 1% move, calls positive / puts negative, and
   `net_gex == call_gex + put_gex` by construction.
@@ -272,6 +289,11 @@ Get latest GEX summary with key metrics.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
+
+Includes the nullable **Pin Strike** fields `pin_strike`, `pin_score`,
+`pin_confidence` and `pin_strike_reason` (same semantics as the
+`/api/v1/levels` fields above — hide, don't zero; a `REASON_*` code populates
+`pin_strike_reason` when there is no active pin).
 
 ### GET /api/gex/by-strike
 Get GEX breakdown by individual strikes.

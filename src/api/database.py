@@ -1584,7 +1584,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.net_gex_at_spot,
                     gs.call_wall AS stored_call_wall,
                     gs.put_wall  AS stored_put_wall,
-                    gs.gamma_flip_span_used
+                    gs.gamma_flip_span_used,
+                    gs.pin_strike,
+                    gs.pin_score,
+                    gs.pin_confidence,
+                    gs.pin_strike_reason
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                 ORDER BY gs.timestamp DESC
@@ -1676,7 +1680,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 COALESCE(ls.stored_put_wall,  fpw.put_wall)  AS put_wall,
                 ls.total_call_oi,
                 ls.total_put_oi,
-                ls.put_call_ratio
+                ls.put_call_ratio,
+                -- Pin Strike (nullable; hide-don't-zero, same as the walls/flip).
+                -- pin_strike_reason carries a REASON_* code when there's no
+                -- active pin and is NULL when a pin is present.
+                ls.pin_strike,
+                ls.pin_score,
+                ls.pin_confidence,
+                ls.pin_strike_reason
             FROM latest_summary ls
             JOIN latest_quote lq ON TRUE
             JOIN strike_totals st ON TRUE

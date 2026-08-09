@@ -114,6 +114,11 @@ def _summary(**overrides):
         "call_wall": 680.0,
         "put_wall": 670.0,
         "max_pain": 676.0,
+        # Pin Strike columns the summary query now returns (additive).
+        "pin_strike": 676.0,
+        "pin_score": 1.504e9,
+        "pin_confidence": 0.31,
+        "pin_strike_reason": None,
     }
     base.update(overrides)
     return base
@@ -165,10 +170,37 @@ def test_endpoint_returns_consolidated_contract(monkeypatch: pytest.MonkeyPatch)
         "call_wall": 680.0,
         "put_wall": 670.0,
         "max_pain": 676.0,
+        # Pin Strike is a fifth drawable level (additive; existing four unchanged).
+        "pin_strike": 676.0,
     }
+    # Pin Strike scalar metadata rides at the response top level.
+    assert body["pin_score"] == 1.504e9
+    assert body["pin_confidence"] == 0.31
+    assert body["pin_strike_reason"] is None
     # freshness surfaced for the delayed-vs-live gate
     assert body["as_of"].startswith("2026-07-06T19:30:00")
     assert isinstance(body["age_seconds"], int) and body["age_seconds"] >= 0
+
+
+def test_endpoint_surfaces_null_pin_with_reason(monkeypatch: pytest.MonkeyPatch):
+    """No active pin ⇒ levels.pin_strike is null (hide, don't zero) and the
+    REASON_* code rides in pin_strike_reason — the nullable-analytics contract."""
+    summary = _summary(
+        pin_strike=None,
+        pin_score=None,
+        pin_confidence=None,
+        pin_strike_reason="NO_POSITIVE_RESTORING_GAMMA",
+    )
+    client = _build_app(monkeypatch, summary=summary, profile=_profile_rows())
+    with client:
+        r = client.get("/api/v1/levels/SPY")
+    body = r.json()
+    assert body["levels"]["pin_strike"] is None
+    assert body["pin_score"] is None
+    assert body["pin_confidence"] is None
+    assert body["pin_strike_reason"] == "NO_POSITIVE_RESTORING_GAMMA"
+    # The other four levels are unaffected.
+    assert body["levels"]["gamma_flip"] == 675.0
 
 
 def test_endpoint_profile_sorted_ascending_by_strike(monkeypatch: pytest.MonkeyPatch):

@@ -47,6 +47,21 @@ class GEXSummary(BaseModel):
     total_call_oi: Optional[int] = None
     total_put_oi: Optional[int] = None
     put_call_ratio: Optional[Decimal] = None
+    # Pin Strike — the reachable 0DTE strike with the strongest modeled
+    # POSITIVE (restoring) dealer gamma into expiration.  Distinct from the
+    # walls / flip / max-pain / king-node: it simulates spot AT each candidate
+    # strike, keeps only locally-concentrated positive gamma, and weights by
+    # the probability price reaches that strike before the 0DTE close (see
+    # src/analytics/pin_strike.py).  Nullable — hide, don't zero.
+    # ``pin_score`` is the raw maximum pin score (restoring gamma × reachability);
+    # ``pin_confidence`` its dominance over all viable pins (0..1); together they
+    # let a client classify pin strength.  ``pin_strike_reason`` carries a
+    # REASON_* code when there is no active pin (e.g. NO_0DTE_EXPIRATION,
+    # NO_POSITIVE_RESTORING_GAMMA) and is null when a pin is present.
+    pin_strike: Optional[Decimal] = None
+    pin_score: Optional[float] = None
+    pin_confidence: Optional[float] = None
+    pin_strike_reason: Optional[str] = None
 
     class Config:
         from_attributes = True

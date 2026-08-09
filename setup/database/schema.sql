@@ -484,6 +484,20 @@ CREATE TABLE IF NOT EXISTS gex_summary (
     -- relative to its own history.  See src/analytics/walls.py.
     call_wall_strength DOUBLE PRECISION,
     put_wall_strength  DOUBLE PRECISION,
+    -- Pin Strike: the reachable 0DTE strike with the strongest modeled
+    -- POSITIVE (restoring) dealer gamma into expiration -- distinct from the
+    -- walls/flip/max-pain/king-node above (it simulates spot AT each candidate
+    -- strike, keeps only locally-concentrated positive gamma, and weights by
+    -- reachability).  See src/analytics/pin_strike.py.  All four are NULL when
+    -- no meaningful pin exists; pin_strike_reason then carries a REASON_* code
+    -- (NO_0DTE_EXPIRATION / NO_POSITIVE_RESTORING_GAMMA / INSUFFICIENT_* /
+    -- EXPIRED / PIN_SCORE_TOO_WEAK) and is NULL when a pin is present.
+    -- pin_score is the raw maximum pin score (restoring_gex x reachability);
+    -- pin_confidence is its dominance over all viable pins (0..1).
+    pin_strike NUMERIC(12, 4),
+    pin_score DOUBLE PRECISION,
+    pin_confidence DOUBLE PRECISION,
+    pin_strike_reason TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp)
 );
@@ -535,6 +549,17 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_span_used DOUBLE PRE
 -- horizon-occupancy ramp is dropped so near-dated walls can pull it toward
 -- spot).  See src/analytics/main_engine.py::_calculate_gex_summary.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_raw DOUBLE PRECISION;
+
+-- Pin Strike: reachable 0DTE strike with the strongest modeled positive
+-- (restoring) dealer gamma into expiration (see src/analytics/pin_strike.py
+-- and the CREATE TABLE above).  All NULL when no meaningful pin exists;
+-- pin_strike_reason then carries a REASON_* code and is NULL when a pin is
+-- present.  Additive — existing rows backfill to NULL, existing consumers
+-- ignore the new columns.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_strike NUMERIC(12, 4);
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_score DOUBLE PRECISION;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_confidence DOUBLE PRECISION;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_strike_reason TEXT;
 
 -- Volume column semantics. ``total_call_volume`` and ``total_put_volume``
 -- are per-snapshot session-cumulative aggregates summed across every
