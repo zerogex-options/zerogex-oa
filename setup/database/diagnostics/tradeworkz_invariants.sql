@@ -47,11 +47,18 @@ LIMIT 100;
 \echo ============================================================
 \echo  Invariant B: current_capital reconciles to sum of live trades
 \echo ============================================================
-\echo  For each bot:
+\echo  For each FUNDED bot:
 \echo    current_capital - starting_capital
 \echo      MUST equal SUM(realized_pnl) across every LIVE closed trade
 \echo  Any drift means a close() half-wrote (updated tw_trades but not
 \echo  tw_bot_capital, or the other way around).
+\echo  RETIRED bots are exempt: retirement zeroes the sleeve
+\echo  (starting=current=0) on purpose, which deliberately decouples the
+\echo  sleeve from the bot's historical realized P&L (the immutable
+\echo  tw_trades rows survive for the audit trail). A fully-zeroed sleeve
+\echo  is therefore skipped; a zeroed-starting sleeve that still shows
+\echo  non-zero current_capital is NOT skipped (that would be a real
+\echo  half-write worth catching).
 \echo  Expected: 0 rows.
 \echo
 
@@ -69,7 +76,11 @@ LEFT JOIN (
                   THEN realized_pnl ELSE 0 END) AS sum_realized_live_only
   FROM tw_trades GROUP BY bot_id
 ) agg ON agg.bot_id = c.bot_id
-WHERE ABS(c.current_capital - c.starting_capital
+-- Skip fully-retired (zeroed) sleeves: their sleeve is intentionally reset to
+-- 0 and no longer tracks the historical realized P&L. Funded sleeves, and any
+-- sleeve with a non-zero side, must still reconcile exactly.
+WHERE NOT (c.starting_capital = 0 AND c.current_capital = 0)
+  AND ABS(c.current_capital - c.starting_capital
           - COALESCE(agg.sum_realized_live_only, 0)) > 0.01
 ORDER BY drift DESC;
 
