@@ -236,6 +236,41 @@ names the gate that abstained every tick, so further tuning is data-driven, not
 guesswork (this is the tradeworkz analog of the signals playbook's
 `explain_miss`).
 
+## 8. Screen results (2026-08-09, 45d / interval 5m / 1 contract)
+
+The third screen (entry bug fixed) produced real trades and real verdicts:
+
+| Bot | Trades | PF | Expectancy | Verdict |
+|---|---:|---:|---:|---|
+| aggressor_flow_divergence | 404 | **0.31** | −$36.63 | **no-edge → SCREENED OUT** |
+| gamma_regime_shift_rider | 9 | 0.23 | −$30.97 | insufficient (weak early read) |
+| charm_close_magnet | 8 | 1.01 | +$0.97 | insufficient (breakeven) |
+| vanna_vol_crush_rider | 5 | 15.3 | +$109.89 | insufficient (VIX-gated, promising) |
+
+**Nothing is promoted — `DEFAULT_ROSTER` stays empty.** The honest reading:
+
+- **aggressor_flow_divergence — decisive no-edge, shelved.** 404 trades is a
+  real sample; PF 0.31 with wins *smaller* than losses at a 31% win rate is a
+  directional-prediction failure, not a stop/target tuning issue — the
+  cumulative day-to-date net premium is a lagging signal. Moved to a standalone
+  screened-out spec (out of `CANDIDATE_SPECS`, kept backtestable). A "fresh-flow"
+  redesign — keying on the per-bucket flow *delta* rather than the cumulative —
+  would be a NEW hypothesis, screened from scratch, not a revival of this one.
+- **charm / gamma — underpowered.** The option-chain history only reaches back
+  to 2026-06-10, so ~45d is near the maximum window; these low-frequency bots
+  (8 and 9 trades) simply cannot reach the 20-trade bar on available data. Their
+  early reads (charm ≈ breakeven, gamma weak-negative) are not conclusions.
+- **vanna — promising but unvalidated.** The 5 trades it could take (where VIX
+  history existed) went 4-1 for +$549 (PF 15), but `no_vix_change` still gated
+  ~70% of ticks. It validates forward once VIX bars are dense — not now.
+
+The value delivered stands independently of these verdicts: the flow /
+second-order / pin **data layer** on the snapshot, the **backtest instrumentation**
+(`signals` / `entry_rejects` / `miss_reasons`), and the **debit-spread entry-gate
+fix** (which unblocked every debit-vertical bot, including the retired
+`bull_momentum_climber`). The screen did its job — it killed a losing thesis
+with data instead of hope.
+
 **Honest status of the gate.** With the entry-classification bug fixed,
 `aggressor_flow_divergence` (which was already firing ~1,700 signals) and
 `gamma_regime_shift_rider` (crossing trigger) should now produce real trades to

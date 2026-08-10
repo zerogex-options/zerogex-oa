@@ -27,6 +27,7 @@ from src.tradeworkz.registry import (
     DEFAULT_ROSTER,
     RETIRED_BOT_IDS,
     get_bot_class,
+    known_specs,
 )
 
 # ET wall-clock instants used below (July = EDT = UTC-4).
@@ -36,7 +37,9 @@ LATE_MORN_11ET = datetime(2026, 7, 14, 15, 0, tzinfo=timezone.utc)  # 11:00 ET
 
 
 def _bot(bot_id: str):
-    spec = next(s for s in CANDIDATE_SPECS if s.id == bot_id)
+    # Resolve from the full catalog so both live candidates and the
+    # screened-out aggressor spec (kept for the record) work.
+    spec = known_specs()[bot_id]
     return get_bot_class(spec.strategy_class)(spec, ml_state=None)
 
 
@@ -367,14 +370,17 @@ def test_open_criteria_records_miss_reasons():
     assert sum(bot.miss_reasons.values()) == before
 
 
-def test_candidate_set_is_the_four_edge_bots():
+def test_candidate_set_is_the_three_evaluated_bots():
+    """aggressor_flow_divergence was screened out (PF 0.31 / 404 trades) and is
+    no longer a promotion candidate — but it stays resolvable for the record."""
     ids = {s.id for s in CANDIDATE_SPECS}
     assert ids == {
         "charm_close_magnet",
         "vanna_vol_crush_rider",
-        "aggressor_flow_divergence",
         "gamma_regime_shift_rider",
     }
+    assert "aggressor_flow_divergence" not in ids
+    assert "aggressor_flow_divergence" in known_specs()  # backtestable for the record
 
 
 def test_backtest_screens_unprovisioned_candidates_via_registry_fallback():

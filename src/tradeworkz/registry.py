@@ -305,17 +305,53 @@ SHELVED_SPECS: tuple[BotSpec, ...] = (
 )
 
 
+# Aggressor Flow Divergence — SCREENED OUT (edge test failed). Registered and
+# backtestable for the record (see known_specs), but deliberately NOT in
+# CANDIDATE_SPECS. The `make tradeworkz-backtest` screen on 2026-08-09 (45d,
+# 404 trades) returned PF 0.31 / expectancy -$36.63 — a decisive no-edge, a
+# monotonic bleed to -$14.8K, with wins SMALLER than losses at a 31% win rate
+# (a directional-prediction failure, not a stop/target tuning issue). The
+# cumulative day-to-date net premium it keyed on is a lagging signal. Do NOT
+# revive this exact design; a "fresh-flow" variant (keying on the per-bucket
+# flow delta rather than the cumulative) would be a NEW hypothesis, screened
+# from scratch.
+AGGRESSOR_FLOW_DIVERGENCE_SPEC = BotSpec(
+    id="aggressor_flow_divergence",
+    display_name="Aggressor Flow Divergence",
+    strategy_class="AggressorFlowDivergence",
+    tier="0DTE",
+    direction_mode="context",
+    universe="*",
+    tagline="Aggressive option flow leans hard; price hasn't caught up. Lead it.",
+    description=(
+        "SCREENED OUT (PF 0.31 / 404 trades, 2026-08-09). Led price with "
+        "aggressor-classified net option premium (flow_series_5min); the "
+        "cumulative signal did not predict direction. Kept for the record."
+    ),
+    params={
+        "min_net_premium": 5.0e5,
+        "max_price_move_pct": 0.0025,
+        "target_pct": 0.004,
+        "stop_pct": 0.003,
+        "max_hold_minutes": 60,
+        "dte_target": 0,
+    },
+)
+
+
 # ── Candidate roster (edge-metric bots, NOT yet live) ───────────────
-# The v4 strategies. These are the first bots to trade the data layers the
-# shelved fleet never used — aggressor order flow, second-order forced dealer
-# flow (vanna/charm), the modeled close-charm flow, and the gamma-restoring Pin
-# Strike (see docs/design/tradeworkz-edge-strategies.md). They are deliberately
-# kept OUT of DEFAULT_ROSTER: the whole point of the 2026-08-09 shelving was
-# that nothing goes live on a thesis alone. Each is registered in
-# STRATEGY_CLASSES so `make tradeworkz-backtest --bots <id>` can screen it; move
-# a spec into DEFAULT_ROSTER (and out of here) ONLY after it clears the gate —
-# PF >= 1.1, positive expectancy, >= 20 trades. Until then they never
-# provision, never size, never open.
+# The v4 strategies still under evaluation. These trade the data layers the
+# shelved fleet never used — second-order forced dealer flow (vanna/charm), the
+# modeled close-charm flow, and the gamma-restoring Pin Strike / regime velocity
+# (see docs/design/tradeworkz-edge-strategies.md). They are deliberately kept
+# OUT of DEFAULT_ROSTER: the whole point of the 2026-08-09 shelving was that
+# nothing goes live on a thesis alone. Each is registered in STRATEGY_CLASSES so
+# `make tradeworkz-backtest --bots <id>` can screen it; move a spec into
+# DEFAULT_ROSTER (and out of here) ONLY after it clears the gate — PF >= 1.1,
+# positive expectancy, >= 20 trades. Until then they never provision, never
+# size, never open. (aggressor_flow_divergence was screened out — see the
+# standalone spec above; charm/gamma are underpowered on available history and
+# vanna is VIX-history-gated — see design doc §8.)
 CANDIDATE_SPECS: tuple[BotSpec, ...] = (
     BotSpec(
         id="charm_close_magnet",
@@ -358,30 +394,6 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
         params={
             "min_vix_change": 0.30,
             "min_dealer_vanna": 4.0e7,
-            "target_pct": 0.004,
-            "stop_pct": 0.003,
-            "max_hold_minutes": 60,
-            "dte_target": 0,
-        },
-    ),
-    BotSpec(
-        id="aggressor_flow_divergence",
-        display_name="Aggressor Flow Divergence",
-        strategy_class="AggressorFlowDivergence",
-        tier="0DTE",
-        direction_mode="context",
-        universe="*",
-        tagline="Aggressive option flow leans hard; price hasn't caught up. Lead it.",
-        description=(
-            "Leads price with aggressor-classified net option premium "
-            "(flow_series_5min) when it is strong, still accelerating, confirmed "
-            "on volume, and price has NOT yet moved to match. Stands down in a "
-            "strong positive-γ pin. The first bot to use option order flow at "
-            "all — no retired bot did."
-        ),
-        params={
-            "min_net_premium": 5.0e5,
-            "max_price_move_pct": 0.0025,
             "target_pct": 0.004,
             "stop_pct": 0.003,
             "max_hold_minutes": 60,
@@ -474,6 +486,8 @@ def known_specs() -> Dict[str, BotSpec]:
         for s in group:
             specs[s.id] = s
     specs.setdefault(PUT_WALL_MAGNET_REVERSAL_SPEC.id, PUT_WALL_MAGNET_REVERSAL_SPEC)
+    # Screened-out but backtestable-for-the-record (mirrors the magnet spec).
+    specs.setdefault(AGGRESSOR_FLOW_DIVERGENCE_SPEC.id, AGGRESSOR_FLOW_DIVERGENCE_SPEC)
     return specs
 
 
