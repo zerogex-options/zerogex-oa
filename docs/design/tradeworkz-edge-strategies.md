@@ -225,7 +225,37 @@ fading a sustained trend (only a fresh spike qualifies). Uses the same
 `flow_recent_*` window fields. If it clears the gate it is the first promotion;
 if not, it is shelved and the flow axis is closed.
 
-### 6.3 Skew Snap Reversal (not yet built)
+### 6.3 Split flagship wall strategy — `call_wall_rejector` + `put_wall_bouncer` (implemented; screening)
+
+The retired `PutCallWallBouncer` faded both walls from one context bot and was
+**the worst loser in the fleet** — PF 0.53 *frictionless*, which the retirement
+called out as proof the signal was dead, not just expensive. Its flaw: it faded
+on mere PROXIMITY with a naked 0DTE ATM debit — it entered on the touch, treated
+every wall the same, and could not tell a rejection from a break.
+
+Split into two directional bots (so each side tunes/enables independently),
+sharing one engine (`bots/wall_reversion.py`), with the three filters the
+original lacked — the difference between "price touches a wall a lot" and "a
+tradeable fade":
+
+1. **Rejection confirmation** — price must TAG the wall and ROLL BACK (a recent
+   extreme reached it and the close has retreated), not just sit near it.
+2. **Wall-strength gate** — only fade a historically LARGE wall
+   (`{call,put}_wall_strength_pctile`); dealers defend big walls, small ones
+   break. Best-effort (skipped when the percentile history is absent).
+3. **Flow no-pierce** — using the fresh windowed flow: if order flow is still
+   piercing the wall (call-led buying up into the call wall / put-led selling
+   down into the put wall), it is breaking — stand down.
+
+Plus a defined-risk vertical toward max_pain / flip (far less 0DTE theta than
+the original's single long option) and the original's good vol-scaled,
+wick-confirmed wall-break stop (`wall_ref_side`). **Honest caveat:** splitting
+alone changes nothing — a call-wall fade and a put-wall fade are the two halves
+of the same signal that scored 0.53. The three filters are the bet; the backtest
+decides. If they don't clear, the flagship stays retired for a documented,
+data-backed reason, not a hunch.
+
+### 6.4 Skew Snap Reversal (not yet built)
 
 - `skew_delta` (OTM put−call IV differential) at a fear extreme while the tape
   is *not* breaking down → contrarian long. Distinct axis again (vol *skew*, not

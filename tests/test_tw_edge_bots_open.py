@@ -402,6 +402,104 @@ def test_climax_fade_needs_material_size():
 
 
 # ======================================================================
+# CallWallRejector / PutWallBouncer (split flagship wall strategy)
+# ======================================================================
+
+
+def _call_wall_snap(**over) -> MarketSnapshot:
+    base = dict(
+        underlying="SPY",
+        timestamp=MID_12ET,
+        spot=755.0,
+        net_gex=2.0e9,  # positive_strong
+        call_wall=756.0,  # spot pressed just under it (0.13% away)
+        max_pain=752.0,  # bearish target
+        call_wall_strength_pctile=70.0,  # a big wall
+        flow_recent_premium=2.0e5,  # flow not piercing up
+        # tagged 756 then rolled back to 755 (confirmed rejection)
+        recent_closes=[755.0, 755.5, 756.0, 755.5, 755.0],
+    )
+    base.update(over)
+    return MarketSnapshot(**base)
+
+
+def _put_wall_snap(**over) -> MarketSnapshot:
+    base = dict(
+        underlying="SPY",
+        timestamp=MID_12ET,
+        spot=755.0,
+        net_gex=2.0e9,
+        put_wall=754.0,  # spot pressed just above it
+        max_pain=758.0,  # bullish target
+        put_wall_strength_pctile=70.0,
+        flow_recent_premium=-2.0e5,  # flow not piercing down
+        # tagged 754 then bounced back to 755 (confirmed defense)
+        recent_closes=[755.0, 754.5, 754.0, 754.5, 755.0],
+    )
+    base.update(over)
+    return MarketSnapshot(**base)
+
+
+def test_call_wall_rejector_fades_confirmed_rejection():
+    sig = _bot("call_wall_rejector").open_criteria(_call_wall_snap())
+    assert sig is not None
+    assert sig.direction == "bearish"
+    assert sig.legs[0].option_type == "put"
+    assert len(sig.legs) == 2  # defined-risk vertical
+    assert sig.wall_ref_side == "call"
+    assert sig.target_price == 752.0  # max_pain
+
+
+def test_put_wall_bouncer_fades_confirmed_bounce():
+    sig = _bot("put_wall_bouncer").open_criteria(_put_wall_snap())
+    assert sig is not None
+    assert sig.direction == "bullish"
+    assert sig.legs[0].option_type == "call"
+    assert sig.wall_ref_side == "put"
+    assert sig.target_price == 758.0
+
+
+def test_call_wall_rejector_requires_positive_gamma():
+    assert _bot("call_wall_rejector").open_criteria(_call_wall_snap(net_gex=-3.0e9)) is None
+
+
+def test_call_wall_rejector_needs_proximity():
+    # Wall far away -> not pressed.
+    assert _bot("call_wall_rejector").open_criteria(_call_wall_snap(call_wall=765.0)) is None
+
+
+def test_call_wall_rejector_needs_confirmed_rejection():
+    """Still pushing INTO the wall (no rollback) is where the retired bot
+    entered right before breaks -> stand down."""
+    assert (
+        _bot("call_wall_rejector").open_criteria(
+            _call_wall_snap(recent_closes=[754.0, 754.5, 755.0, 755.5, 756.0])  # ends at the high
+        )
+        is None
+    )
+
+
+def test_call_wall_rejector_skips_weak_walls():
+    assert (
+        _bot("call_wall_rejector").open_criteria(_call_wall_snap(call_wall_strength_pctile=30.0))
+        is None
+    )
+
+
+def test_call_wall_rejector_stands_down_when_flow_pierces():
+    """Aggressive call-led buying up through the wall = a break, not a fade."""
+    assert (
+        _bot("call_wall_rejector").open_criteria(_call_wall_snap(flow_recent_premium=1.0e6)) is None
+    )
+
+
+def test_put_wall_bouncer_stands_down_when_flow_pierces():
+    assert (
+        _bot("put_wall_bouncer").open_criteria(_put_wall_snap(flow_recent_premium=-1.0e6)) is None
+    )
+
+
+# ======================================================================
 # FreshFlowMomentum (fresh-flow successor to the shelved aggressor bot)
 # ======================================================================
 
@@ -536,6 +634,8 @@ def test_candidate_set_is_the_evaluated_bots():
         "vanna_vol_crush_rider",
         "gamma_regime_shift_rider",
         "climax_flow_fade",
+        "call_wall_rejector",
+        "put_wall_bouncer",
     }
     for screened in ("aggressor_flow_divergence", "fresh_flow_momentum"):
         assert screened not in ids

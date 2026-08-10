@@ -13,6 +13,7 @@ from typing import Dict, Iterable, Type
 from src.tradeworkz.bots.aggressor_flow_divergence import AggressorFlowDivergence
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.bots.bull_momentum_climber import BullMomentumClimber
+from src.tradeworkz.bots.call_wall_rejector import CallWallRejector
 from src.tradeworkz.bots.charm_close_magnet import CharmCloseMagnet
 from src.tradeworkz.bots.climax_flow_fade import ClimaxFlowFade
 from src.tradeworkz.bots.dealer_delta_pressure_rider import DealerDeltaPressureRider
@@ -24,6 +25,7 @@ from src.tradeworkz.bots.gamma_regime_shift_rider import GammaRegimeShiftRider
 from src.tradeworkz.bots.max_pain_gravitator import MaxPainGravitator
 from src.tradeworkz.bots.opening_range_hunter import OpeningRangeHunter
 from src.tradeworkz.bots.put_call_wall_bouncer import PutCallWallBouncer
+from src.tradeworkz.bots.put_wall_bouncer import PutWallBouncer
 from src.tradeworkz.bots.put_wall_magnet_reversal import PutWallMagnetReversal
 from src.tradeworkz.bots.range_iron_condor import RangeIronCondor
 from src.tradeworkz.bots.vanna_vol_crush_rider import VannaVolCrushRider
@@ -71,6 +73,10 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     "FreshFlowMomentum": FreshFlowMomentum,
     # v6: contrarian read — FADE the flow climax (both follow-bots failed).
     "ClimaxFlowFade": ClimaxFlowFade,
+    # v7: the flagship wall strategy, split into two directional bots with
+    # rejection-confirmation + wall-strength + flow-no-pierce filters.
+    "CallWallRejector": CallWallRejector,
+    "PutWallBouncer": PutWallBouncer,
 }
 
 # Roster entry for PutWallMagnetReversal, deliberately kept OUT of the live
@@ -489,6 +495,54 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "target_pct": 0.003,
             "stop_pct": 0.004,
             "max_hold_minutes": 45,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="call_wall_rejector",
+        display_name="Call Wall Rejector",
+        strategy_class="CallWallRejector",
+        tier="0DTE",
+        direction_mode="bearish",
+        universe="*",
+        tagline="Confirmed rejection at a big call wall. Fade the rally.",
+        description=(
+            "Bearish half of the split flagship wall strategy. Fades a CONFIRMED "
+            "rejection at a historically large call wall in positive γ (price "
+            "tagged the wall and rolled back, flow not piercing) — the rejection "
+            "+ wall-strength + no-pierce filters the retired PutCallWallBouncer "
+            "(PF 0.53) lacked. Defined-risk bear put vertical toward max_pain."
+        ),
+        params={
+            "wall_proximity_pct": 0.002,
+            "wall_reject_margin_pct": 0.0007,
+            "min_wall_strength_pctile": 50.0,
+            "pierce_premium": 6.0e5,
+            "max_hold_minutes": 90,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="put_wall_bouncer",
+        display_name="Put Wall Bouncer",
+        strategy_class="PutWallBouncer",
+        tier="0DTE",
+        direction_mode="bullish",
+        universe="*",
+        tagline="Confirmed bounce off a big put wall. Fade the dip.",
+        description=(
+            "Bullish half of the split flagship wall strategy. Fades a CONFIRMED "
+            "bounce at a historically large put wall in positive γ (price tagged "
+            "the wall and turned up, flow not piercing) — the rejection + "
+            "wall-strength + no-pierce filters the retired PutCallWallBouncer "
+            "(PF 0.53) lacked. Defined-risk bull call vertical toward max_pain."
+        ),
+        params={
+            "wall_proximity_pct": 0.002,
+            "wall_reject_margin_pct": 0.0007,
+            "min_wall_strength_pctile": 50.0,
+            "pierce_premium": 6.0e5,
+            "max_hold_minutes": 90,
             "dte_target": 0,
         },
     ),
