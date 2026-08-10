@@ -204,7 +204,28 @@ If it clears PF ≥ 1.1 / positive expectancy / ≥ 20 trades it earns
 `DEFAULT_ROSTER`; if not, it is shelved like its predecessor — a fresh signal is
 a hypothesis, not a promise.
 
-### 6.2 Skew Snap Reversal (not yet built)
+### 6.2 Climax Flow Fade — `climax_flow_fade` (implemented; screening)
+
+The contrarian read the two flow-follow failures pointed at directly. Their
+signature (33% win rate, wins < losses) says an aggressive 0DTE flow burst marks
+a *local extreme that reverts*. So this bot flips both knobs the follow-bots had
+wrong:
+
+- **Direction is OPPOSITE the flow** — fade a call-led buying burst short, a
+  put-led selling burst long.
+- **Regime is POSITIVE gamma** — the mean-reverting regime (dealers sell
+  rallies / buy dips), where the follow-bots stood *down*.
+
+The trigger — and the differentiator from the retired VWAP-reversion / wall-fade
+bots (which faded extension in positive γ and also failed) — is that the fade is
+armed by a large, volume-confirmed **flow burst** that has *overshot* price (the
+climax/exhaustion signal those bots lacked), not by extension alone. Target is
+the mean (VWAP); stop is a *continuation* of the burst; a `_trend_veto` blocks
+fading a sustained trend (only a fresh spike qualifies). Uses the same
+`flow_recent_*` window fields. If it clears the gate it is the first promotion;
+if not, it is shelved and the flow axis is closed.
+
+### 6.3 Skew Snap Reversal (not yet built)
 
 - `skew_delta` (OTM put−call IV differential) at a fear extreme while the tape
   is *not* breaking down → contrarian long. Distinct axis again (vol *skew*, not

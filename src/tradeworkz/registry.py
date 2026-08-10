@@ -14,6 +14,7 @@ from src.tradeworkz.bots.aggressor_flow_divergence import AggressorFlowDivergenc
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.bots.bull_momentum_climber import BullMomentumClimber
 from src.tradeworkz.bots.charm_close_magnet import CharmCloseMagnet
+from src.tradeworkz.bots.climax_flow_fade import ClimaxFlowFade
 from src.tradeworkz.bots.dealer_delta_pressure_rider import DealerDeltaPressureRider
 from src.tradeworkz.bots.eod_pin_drifter import EodPinDrifter
 from src.tradeworkz.bots.fresh_flow_momentum import FreshFlowMomentum
@@ -68,6 +69,8 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     "GammaRegimeShiftRider": GammaRegimeShiftRider,
     # v5: fresh-flow successor to the screened-out cumulative-flow bot.
     "FreshFlowMomentum": FreshFlowMomentum,
+    # v6: contrarian read — FADE the flow climax (both follow-bots failed).
+    "ClimaxFlowFade": ClimaxFlowFade,
 }
 
 # Roster entry for PutWallMagnetReversal, deliberately kept OUT of the live
@@ -461,6 +464,31 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "min_break_trend_pct": 0.0010,
             "target_pct": 0.006,
             "max_hold_minutes": 60,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="climax_flow_fade",
+        display_name="Climax Flow Fade",
+        strategy_class="ClimaxFlowFade",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Aggressive flow burst spiked price into a pin. Fade the climax.",
+        description=(
+            "The CONTRARIAN read of the two screened-out follow-the-flow bots: "
+            "their 33% win rate with wins < losses showed that chasing a 0DTE "
+            "flow burst buys a local extreme that reverts. This FADES a large, "
+            "volume-confirmed fresh flow burst that has overshot price, in a "
+            "positive-γ (mean-reverting) regime. Flow burst = the exhaustion "
+            "trigger the retired VWAP-reversion bots lacked."
+        ),
+        params={
+            "min_recent_premium": 3.0e5,
+            "min_extension_pct": 0.0015,
+            "target_pct": 0.003,
+            "stop_pct": 0.004,
+            "max_hold_minutes": 45,
             "dte_target": 0,
         },
     ),

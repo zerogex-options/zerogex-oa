@@ -323,6 +323,85 @@ def test_candidates_are_registered_but_not_live():
 
 
 # ======================================================================
+# ClimaxFlowFade (contrarian: FADE the flow burst)
+# ======================================================================
+
+# A recent UP-spike: last 5 bars pop +0.18% (> min_extension 0.15%) but the
+# 10-bar move is only +0.11% (< TREND_VETO_PCT 0.2%), so it's a fresh climax,
+# not a sustained trend. Mirror for the down-spike.
+_UP_SPIKE = [754.2, 754.0, 753.9, 753.8, 753.7, 753.64, 753.9, 754.2, 754.6, 755.0]
+_DOWN_SPIKE = [755.8, 756.0, 756.1, 756.2, 756.3, 756.36, 756.1, 755.8, 755.4, 755.0]
+
+
+def _climax_snap(**over) -> MarketSnapshot:
+    base = dict(
+        underlying="SPY",
+        timestamp=MID_12ET,  # 12:00 ET
+        spot=755.0,
+        net_gex=2.0e9,  # positive_strong — the mean-reverting regime
+        flow_recent_premium=8.0e5,  # fresh call-led burst (bullish flow)
+        flow_recent_volume=3000.0,  # volume confirms the burst
+        recent_closes=list(_UP_SPIKE),  # price popped WITH the flow
+    )
+    base.update(over)
+    return MarketSnapshot(**base)
+
+
+def test_climax_fade_shorts_a_bullish_burst():
+    """Call-led burst pops price in positive γ -> fade it SHORT."""
+    sig = _bot("climax_flow_fade").open_criteria(_climax_snap())
+    assert sig is not None
+    assert sig.direction == "bearish"  # OPPOSITE the flow
+    assert sig.legs[0].option_type == "put"
+    assert sig.target_price < 755.0  # target back toward the mean
+
+
+def test_climax_fade_longs_a_bearish_burst():
+    sig = _bot("climax_flow_fade").open_criteria(
+        _climax_snap(
+            flow_recent_premium=-8.0e5,
+            flow_recent_volume=-3000.0,
+            recent_closes=list(_DOWN_SPIKE),
+        )
+    )
+    assert sig is not None
+    assert sig.direction == "bullish"
+    assert sig.target_price > 755.0
+
+
+def test_climax_fade_requires_positive_gamma():
+    """Fading only works where dealers absorb the overshoot."""
+    assert _bot("climax_flow_fade").open_criteria(_climax_snap(net_gex=-3.0e9)) is None
+
+
+def test_climax_fade_needs_an_overshoot():
+    """A burst that has NOT yet moved price is not a climax to fade."""
+    assert (
+        _bot("climax_flow_fade").open_criteria(_climax_snap(recent_closes=_flat(755.0, n=10)))
+        is None
+    )
+
+
+def test_climax_fade_vetoes_into_a_strong_trend():
+    """Don't fade a sustained trend — only a fresh spike (the retired
+    short-into-an-up-day mistake)."""
+    assert (
+        _bot("climax_flow_fade").open_criteria(
+            _climax_snap(recent_closes=_rising(755.0, pct=0.004, n=10))  # 0.4% over 10 bars
+        )
+        is None
+    )
+
+
+def test_climax_fade_requires_volume_agreement():
+    assert _bot("climax_flow_fade").open_criteria(_climax_snap(flow_recent_volume=-3000.0)) is None
+
+
+def test_climax_fade_needs_material_size():
+    assert _bot("climax_flow_fade").open_criteria(_climax_snap(flow_recent_premium=1.0e5)) is None
+
+
+# ======================================================================
 # FreshFlowMomentum (fresh-flow successor to the shelved aggressor bot)
 # ======================================================================
 
@@ -456,6 +535,7 @@ def test_candidate_set_is_the_evaluated_bots():
         "charm_close_magnet",
         "vanna_vol_crush_rider",
         "gamma_regime_shift_rider",
+        "climax_flow_fade",
     }
     for screened in ("aggressor_flow_divergence", "fresh_flow_momentum"):
         assert screened not in ids
