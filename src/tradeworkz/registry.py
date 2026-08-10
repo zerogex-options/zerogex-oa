@@ -16,6 +16,7 @@ from src.tradeworkz.bots.bull_momentum_climber import BullMomentumClimber
 from src.tradeworkz.bots.charm_close_magnet import CharmCloseMagnet
 from src.tradeworkz.bots.dealer_delta_pressure_rider import DealerDeltaPressureRider
 from src.tradeworkz.bots.eod_pin_drifter import EodPinDrifter
+from src.tradeworkz.bots.fresh_flow_momentum import FreshFlowMomentum
 from src.tradeworkz.bots.gamma_flip_breaker import GammaFlipBreaker
 from src.tradeworkz.bots.gamma_flip_defender import GammaFlipDefender
 from src.tradeworkz.bots.gamma_regime_shift_rider import GammaRegimeShiftRider
@@ -65,6 +66,8 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     "VannaVolCrushRider": VannaVolCrushRider,
     "AggressorFlowDivergence": AggressorFlowDivergence,
     "GammaRegimeShiftRider": GammaRegimeShiftRider,
+    # v5: fresh-flow successor to the screened-out cumulative-flow bot.
+    "FreshFlowMomentum": FreshFlowMomentum,
 }
 
 # Roster entry for PutWallMagnetReversal, deliberately kept OUT of the live
@@ -421,6 +424,31 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "min_break_trend_pct": 0.0010,
             "target_pct": 0.006,
             "max_hold_minutes": 60,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="fresh_flow_momentum",
+        display_name="Fresh Flow Momentum",
+        strategy_class="FreshFlowMomentum",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Fresh aggressor-flow burst leads price. Ride the pulse.",
+        description=(
+            "Rides a FRESH, accelerating burst of aggressor-classified net "
+            "option premium (last ~15 min vs the prior window), confirmed on "
+            "volume, that price has only begun to follow. Fresh-flow successor "
+            "to the screened-out cumulative-flow divergence bot (which keyed on "
+            "the lagging day-to-date aggregate)."
+        ),
+        params={
+            "min_recent_premium": 2.0e5,
+            "accel_mult": 1.15,
+            "max_price_move_pct": 0.004,
+            "target_pct": 0.004,
+            "stop_pct": 0.003,
+            "max_hold_minutes": 45,
             "dte_target": 0,
         },
     ),

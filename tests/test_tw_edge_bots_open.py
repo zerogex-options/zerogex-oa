@@ -322,6 +322,84 @@ def test_candidates_are_registered_but_not_live():
         ), f"{spec.id} is a fresh candidate; it must not be in RETIRED_BOT_IDS"
 
 
+# ======================================================================
+# FreshFlowMomentum (fresh-flow successor to the shelved aggressor bot)
+# ======================================================================
+
+
+def _pulse_snap(**over) -> MarketSnapshot:
+    base = dict(
+        underlying="SPY",
+        timestamp=MID_12ET,  # 12:00 ET
+        spot=755.0,
+        net_gex=5.0e8,  # positive_weak (not a strong pin)
+        call_wall=760.0,
+        put_wall=750.0,
+        flow_recent_premium=8.0e5,  # fresh 15-min call-led burst
+        flow_recent_volume=3000.0,  # volume confirms
+        flow_prior_window_premium=5.0e5,  # accelerating (8e5 > 1.15*5e5)
+        recent_closes=_flat(755.0),  # price only beginning to follow
+    )
+    base.update(over)
+    return MarketSnapshot(**base)
+
+
+def test_fresh_flow_fires_on_accelerating_burst():
+    sig = _bot("fresh_flow_momentum").open_criteria(_pulse_snap())
+    assert sig is not None
+    assert sig.direction == "bullish"
+    assert sig.legs[0].option_type == "call"
+    assert len(sig.legs) == 2
+    assert sig.target_price == 760.0  # call wall
+
+
+def test_fresh_flow_flips_bearish():
+    sig = _bot("fresh_flow_momentum").open_criteria(
+        _pulse_snap(
+            flow_recent_premium=-8.0e5,
+            flow_recent_volume=-3000.0,
+            flow_prior_window_premium=-5.0e5,
+        )
+    )
+    assert sig is not None
+    assert sig.direction == "bearish"
+    assert sig.target_price == 750.0  # put wall
+
+
+def test_fresh_flow_needs_acceleration():
+    """A fading burst (recent <= prior) is not a lead — stand down. This is the
+    core difference from the shelved cumulative-flow bot."""
+    assert (
+        _bot("fresh_flow_momentum").open_criteria(
+            _pulse_snap(flow_recent_premium=5.0e5, flow_prior_window_premium=6.0e5)
+        )
+        is None
+    )
+
+
+def test_fresh_flow_requires_volume_agreement():
+    assert (
+        _bot("fresh_flow_momentum").open_criteria(_pulse_snap(flow_recent_volume=-3000.0)) is None
+    )
+
+
+def test_fresh_flow_needs_material_size():
+    assert _bot("fresh_flow_momentum").open_criteria(_pulse_snap(flow_recent_premium=1.0e5)) is None
+
+
+def test_fresh_flow_stands_down_when_price_overran():
+    assert (
+        _bot("fresh_flow_momentum").open_criteria(
+            _pulse_snap(recent_closes=_rising(755.0, pct=0.006))  # +0.6% already
+        )
+        is None
+    )
+
+
+def test_fresh_flow_stands_down_in_strong_pin():
+    assert _bot("fresh_flow_momentum").open_criteria(_pulse_snap(net_gex=3.0e9)) is None
+
+
 def test_debit_spread_signal_is_accepted_at_entry():
     """Regression: a defined-risk DEBIT vertical (long + short, net > 0) must be
     accepted at the entry-viability gate. The old ``has_short => credit
@@ -370,14 +448,16 @@ def test_open_criteria_records_miss_reasons():
     assert sum(bot.miss_reasons.values()) == before
 
 
-def test_candidate_set_is_the_three_evaluated_bots():
+def test_candidate_set_is_the_evaluated_bots():
     """aggressor_flow_divergence was screened out (PF 0.31 / 404 trades) and is
-    no longer a promotion candidate — but it stays resolvable for the record."""
+    no longer a promotion candidate — but it stays resolvable for the record.
+    fresh_flow_momentum is its fresh-flow successor and IS a candidate."""
     ids = {s.id for s in CANDIDATE_SPECS}
     assert ids == {
         "charm_close_magnet",
         "vanna_vol_crush_rider",
         "gamma_regime_shift_rider",
+        "fresh_flow_momentum",
     }
     assert "aggressor_flow_divergence" not in ids
     assert "aggressor_flow_divergence" in known_specs()  # backtestable for the record

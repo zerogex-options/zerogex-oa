@@ -15,6 +15,7 @@ from typing import Any, Iterable, List, Tuple
 
 from src.tradeworkz.flow_context import (
     fetch_forced_flow,
+    fetch_recent_flow_window,
     fetch_recent_option_flow,
     fetch_second_order_totals,
     fetch_vix_lookback,
@@ -113,6 +114,38 @@ def test_recent_option_flow_prev_none_with_one_bar():
 def test_recent_option_flow_none_when_absent():
     cur = _FakeCursor()
     assert fetch_recent_option_flow(_Conn(cur), "SPY", AS_OF) == (None, None, None)
+
+
+# ---------------------------------------------------- recent flow window
+
+
+def test_recent_flow_window_computes_recent_and_prior():
+    cur = _FakeCursor()
+    # DESC by bar_start: index 0 = latest. (net_premium_cum, net_volume_cum).
+    # window=3: recent = cum[0]-cum[3]; prior = cum[3]-cum[6].
+    cur.program(
+        "FROM flow_series_5min",
+        [(1000, 100), (950, 95), (900, 90), (800, 80), (700, 70), (600, 60), (500, 50)],
+    )
+    recent_p, recent_v, prior_p = fetch_recent_flow_window(_Conn(cur), "SPY", 3, AS_OF)
+    assert recent_p == 200.0  # 1000 - 800
+    assert recent_v == 20.0  # 100 - 80
+    assert prior_p == 300.0  # 800 - 500
+
+
+def test_recent_flow_window_prior_none_with_one_window():
+    cur = _FakeCursor()
+    # Only w+1 = 4 rows: recent computable, prior window absent.
+    cur.program("FROM flow_series_5min", [(1000, 100), (950, 95), (900, 90), (800, 80)])
+    recent_p, recent_v, prior_p = fetch_recent_flow_window(_Conn(cur), "SPY", 3, AS_OF)
+    assert recent_p == 200.0
+    assert prior_p is None
+
+
+def test_recent_flow_window_none_when_too_little_history():
+    cur = _FakeCursor()
+    cur.program("FROM flow_series_5min", [(1000, 100), (950, 95)])  # < w+1
+    assert fetch_recent_flow_window(_Conn(cur), "SPY", 3, AS_OF) == (None, None, None)
 
 
 # ----------------------------------------------------- second-order totals

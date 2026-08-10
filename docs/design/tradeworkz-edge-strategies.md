@@ -180,13 +180,36 @@ next boot.
 
 ---
 
-## 6. Backlog — next candidate
+## 6. Backlog & successors
 
-- **Skew Snap Reversal** — `skew_delta` (OTM put−call IV differential) at a fear
-  extreme while the tape is *not* breaking down → contrarian long. Distinct axis
-  again (vol *skew*, not level/flow/time). Deferred until the backtest verdicts
-  on the first four are in, so the candidate set stays small and each addition is
-  screened on its own.
+### 6.1 Fresh Flow Momentum — `fresh_flow_momentum` (implemented; screening)
+
+The successor to the screened-out `aggressor_flow_divergence`. Its post-mortem
+(§8) was that the day-to-date CUMULATIVE net premium is a *lagging* aggregate.
+This is a NEW hypothesis on the same data axis, not a revival:
+
+- **Signal:** the *fresh* windowed flow — net aggressor premium over the last
+  ~15 min (`flow_recent_premium`, a k-bucket cumulative-difference on
+  `flow_series_5min`) — and its **acceleration** vs the window before it
+  (`flow_prior_window_premium`). A burst that is *bigger* than the prior window,
+  confirmed on volume, that price has only *begun* to follow.
+- **Trade:** momentum-continuation (ride the documented ~30s lead-lag), not the
+  old strict price-flat fade. Stands down in a strong positive-γ pin.
+- **Data:** `flow_series_5min` is ~100% populated over the window, so unlike the
+  charm/vanna bots this one is immediately screenable. New snapshot fields
+  `flow_recent_premium` / `flow_recent_volume` / `flow_prior_window_premium` via
+  `flow_context.fetch_recent_flow_window`.
+
+If it clears PF ≥ 1.1 / positive expectancy / ≥ 20 trades it earns
+`DEFAULT_ROSTER`; if not, it is shelved like its predecessor — a fresh signal is
+a hypothesis, not a promise.
+
+### 6.2 Skew Snap Reversal (not yet built)
+
+- `skew_delta` (OTM put−call IV differential) at a fear extreme while the tape
+  is *not* breaking down → contrarian long. Distinct axis again (vol *skew*, not
+  level/flow/time). Deferred so the candidate set stays small and each addition
+  is screened on its own.
 
 ---
 

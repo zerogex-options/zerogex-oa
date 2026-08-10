@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from src.tradeworkz.flow_context import (
     fetch_forced_flow,
+    fetch_recent_flow_window,
     fetch_recent_option_flow,
     fetch_second_order_totals,
     fetch_vix_lookback,
@@ -110,8 +111,8 @@ class MarketSnapshot:
     # underlying; None when unavailable). ``trade_bias_trend`` maps the persisted
     # long/short/neutral ``direction`` to bullish/bearish/neutral so bots can
     # avoid trading against the fleet's synthesized directional read.
-    trade_bias_code: Optional[str] = None          # BUY_DIPS / SELL_RIPS / FADE_* / WAIT
-    trade_bias_trend: Optional[str] = None         # 'bullish' | 'bearish' | 'neutral'
+    trade_bias_code: Optional[str] = None  # BUY_DIPS / SELL_RIPS / FADE_* / WAIT
+    trade_bias_trend: Optional[str] = None  # 'bullish' | 'bearish' | 'neutral'
     trade_bias_confidence: Optional[float] = None  # [0, 100]
 
     # ===================================================================
@@ -160,6 +161,14 @@ class MarketSnapshot:
     flow_net_premium: Optional[float] = None
     flow_net_premium_prev: Optional[float] = None
     flow_net_volume: Optional[float] = None
+
+    # FRESH aggressor flow over the last ~15 min (a k-bucket window on
+    # flow_series_5min), plus the same-length window before it — so a bot can
+    # read the *current* lean and its *acceleration* instead of the lagging
+    # day-to-date cumulative. + => call-led / bullish. See flow_context.
+    flow_recent_premium: Optional[float] = None
+    flow_recent_volume: Optional[float] = None
+    flow_prior_window_premium: Optional[float] = None
 
     # VIX ~30 minutes ago, for a session-scale ΔVIX (vanna flow is driven by
     # the CHANGE in implied vol, not its level).
@@ -451,11 +460,14 @@ def build_snapshot(
         gx = (None,) * 16
         prior = None
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT close FROM vix_bars
         WHERE timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC LIMIT 1
-        """, (as_of,))
+        """,
+        (as_of,),
+    )
     vix_row = cur.fetchone()
     vix = float(vix_row[0]) if vix_row and vix_row[0] is not None else None
 
@@ -535,6 +547,9 @@ def build_snapshot(
     flow_net_premium, flow_net_premium_prev, flow_net_volume = fetch_recent_option_flow(
         conn, underlying, as_of
     )
+    flow_recent_premium, flow_recent_volume, flow_prior_window_premium = fetch_recent_flow_window(
+        conn, underlying, 3, as_of
+    )
     prior_vix = fetch_vix_lookback(conn, 30, as_of)
 
     return MarketSnapshot(
@@ -587,6 +602,9 @@ def build_snapshot(
         flow_net_premium=flow_net_premium,
         flow_net_premium_prev=flow_net_premium_prev,
         flow_net_volume=flow_net_volume,
+        flow_recent_premium=flow_recent_premium,
+        flow_recent_volume=flow_recent_volume,
+        flow_prior_window_premium=flow_prior_window_premium,
         prior_vix=prior_vix,
     )
 

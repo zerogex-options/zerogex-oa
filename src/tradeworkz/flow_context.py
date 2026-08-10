@@ -252,6 +252,67 @@ def fetch_recent_option_flow(
     return (net_premium, net_premium_prev, net_volume)
 
 
+def fetch_recent_flow_window(
+    conn: Any,
+    underlying: str,
+    window_buckets: int = 3,
+    as_of: Optional[datetime] = None,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """FRESH aggressor flow over the last ``window_buckets`` 5-min buckets.
+
+    The shelved ``aggressor_flow_divergence`` keyed on the day-to-date
+    CUMULATIVE net premium — by mid-afternoon that is dominated by the morning's
+    flow and lags badly (PF 0.31 on 404 trades). This returns the net signed
+    flow over a short recent WINDOW instead, recovered as a cumulative-difference
+    over ``flow_series_5min`` (``net_*_cum`` is day-to-date; a k-bucket delta is
+    the net flow of the last k buckets):
+
+        recent = cum(t) − cum(t − window_buckets)
+
+    Returns ``(recent_premium, recent_volume, prior_window_premium)`` where
+    ``prior_window_premium`` is the SAME-length window immediately before
+    (``cum(t−w) − cum(t−2w)``) so a bot can measure *acceleration* (a genuine
+    burst = recent window bigger than the prior). Signs follow the source:
+    positive = call-led / bullish aggression. ``None`` fields when there is not
+    enough history yet (early session) or on error. Best-effort + as-of bounded.
+    """
+    w = max(1, int(window_buckets))
+    need = 2 * w + 1
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_flow_window")
+    try:
+        cur.execute(
+            """
+            SELECT net_premium_cum, net_volume_cum
+            FROM flow_series_5min
+            WHERE symbol = %s AND bar_start <= COALESCE(%s::timestamptz, NOW())
+            ORDER BY bar_start DESC
+            LIMIT %s
+            """,
+            (underlying, as_of, need),
+        )
+        rows = cur.fetchall()
+        _release(cur, "tw_flow_window", armed)
+    except Exception:
+        _rollback(cur, "tw_flow_window", armed)
+        logger.debug("fetch_recent_flow_window failed for %s", underlying, exc_info=True)
+        return (None, None, None)
+    if not rows or len(rows) < w + 1:
+        return (None, None, None)
+    latest_p, latest_v = _f(rows[0][0]), _f(rows[0][1])
+    w_ago_p, w_ago_v = _f(rows[w][0]), _f(rows[w][1])
+    if latest_p is None or w_ago_p is None:
+        return (None, None, None)
+    recent_p = latest_p - w_ago_p
+    recent_v = (latest_v - w_ago_v) if (latest_v is not None and w_ago_v is not None) else None
+    prior_p: Optional[float] = None
+    if len(rows) >= 2 * w + 1:
+        w2_ago_p = _f(rows[2 * w][0])
+        if w2_ago_p is not None:
+            prior_p = w_ago_p - w2_ago_p
+    return (recent_p, recent_v, prior_p)
+
+
 def fetch_vix_lookback(
     conn: Any, lookback_minutes: int = 30, as_of: Optional[datetime] = None
 ) -> Optional[float]:
