@@ -342,6 +342,42 @@ AGGRESSOR_FLOW_DIVERGENCE_SPEC = BotSpec(
 )
 
 
+# Fresh Flow Momentum — SCREENED OUT (edge test failed). The fresh-flow
+# successor to AggressorFlowDivergence: it keyed on the recent WINDOWED flow +
+# acceleration instead of the day-to-date cumulative, precisely to fix the
+# lagging-signal diagnosis. It did not help. The screen on 2026-08-10 (45d, 461
+# trades) returned PF 0.331 / expectancy -$34.68 — the same monotonic bleed and
+# the same signature as its predecessor (33% win rate, wins SMALLER than losses).
+# Two decisive failures settle the "aggressor flow LEADS price" thesis on 0DTE:
+# following the burst systematically buys a local extreme that reverts. Any
+# future work on this data axis should test the CONTRARIAN read (fade the flow
+# extreme), which would be a NEW hypothesis screened from scratch — not another
+# variant of "follow the flow". Registered + backtestable for the record.
+FRESH_FLOW_MOMENTUM_SPEC = BotSpec(
+    id="fresh_flow_momentum",
+    display_name="Fresh Flow Momentum",
+    strategy_class="FreshFlowMomentum",
+    tier="0DTE",
+    direction_mode="context",
+    universe="*",
+    tagline="Fresh aggressor-flow burst leads price. Ride the pulse.",
+    description=(
+        "SCREENED OUT (PF 0.331 / 461 trades, 2026-08-10). Rode a fresh, "
+        "accelerating aggressor-flow burst; following the burst on 0DTE buys a "
+        "local extreme that reverts. Kept for the record."
+    ),
+    params={
+        "min_recent_premium": 2.0e5,
+        "accel_mult": 1.15,
+        "max_price_move_pct": 0.004,
+        "target_pct": 0.004,
+        "stop_pct": 0.003,
+        "max_hold_minutes": 45,
+        "dte_target": 0,
+    },
+)
+
+
 # ── Candidate roster (edge-metric bots, NOT yet live) ───────────────
 # The v4 strategies still under evaluation. These trade the data layers the
 # shelved fleet never used — second-order forced dealer flow (vanna/charm), the
@@ -352,9 +388,10 @@ AGGRESSOR_FLOW_DIVERGENCE_SPEC = BotSpec(
 # `make tradeworkz-backtest --bots <id>` can screen it; move a spec into
 # DEFAULT_ROSTER (and out of here) ONLY after it clears the gate — PF >= 1.1,
 # positive expectancy, >= 20 trades. Until then they never provision, never
-# size, never open. (aggressor_flow_divergence was screened out — see the
-# standalone spec above; charm/gamma are underpowered on available history and
-# vanna is VIX-history-gated — see design doc §8.)
+# size, never open. (Both flow-following bots — aggressor_flow_divergence and
+# fresh_flow_momentum — were screened out, see the standalone specs above;
+# charm/gamma are underpowered on available history and vanna is VIX-history-
+# gated — see design doc §8.)
 CANDIDATE_SPECS: tuple[BotSpec, ...] = (
     BotSpec(
         id="charm_close_magnet",
@@ -427,31 +464,6 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "dte_target": 0,
         },
     ),
-    BotSpec(
-        id="fresh_flow_momentum",
-        display_name="Fresh Flow Momentum",
-        strategy_class="FreshFlowMomentum",
-        tier="0DTE",
-        direction_mode="context",
-        universe="*",
-        tagline="Fresh aggressor-flow burst leads price. Ride the pulse.",
-        description=(
-            "Rides a FRESH, accelerating burst of aggressor-classified net "
-            "option premium (last ~15 min vs the prior window), confirmed on "
-            "volume, that price has only begun to follow. Fresh-flow successor "
-            "to the screened-out cumulative-flow divergence bot (which keyed on "
-            "the lagging day-to-date aggregate)."
-        ),
-        params={
-            "min_recent_premium": 2.0e5,
-            "accel_mult": 1.15,
-            "max_price_move_pct": 0.004,
-            "target_pct": 0.004,
-            "stop_pct": 0.003,
-            "max_hold_minutes": 45,
-            "dte_target": 0,
-        },
-    ),
 )
 
 
@@ -514,8 +526,9 @@ def known_specs() -> Dict[str, BotSpec]:
         for s in group:
             specs[s.id] = s
     specs.setdefault(PUT_WALL_MAGNET_REVERSAL_SPEC.id, PUT_WALL_MAGNET_REVERSAL_SPEC)
-    # Screened-out but backtestable-for-the-record (mirrors the magnet spec).
+    # Screened-out but backtestable-for-the-record (mirror the magnet spec).
     specs.setdefault(AGGRESSOR_FLOW_DIVERGENCE_SPEC.id, AGGRESSOR_FLOW_DIVERGENCE_SPEC)
+    specs.setdefault(FRESH_FLOW_MOMENTUM_SPEC.id, FRESH_FLOW_MOMENTUM_SPEC)
     return specs
 
 

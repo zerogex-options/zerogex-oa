@@ -449,18 +449,17 @@ def test_open_criteria_records_miss_reasons():
 
 
 def test_candidate_set_is_the_evaluated_bots():
-    """aggressor_flow_divergence was screened out (PF 0.31 / 404 trades) and is
-    no longer a promotion candidate — but it stays resolvable for the record.
-    fresh_flow_momentum is its fresh-flow successor and IS a candidate."""
+    """Both flow-following bots were screened out (PF ~0.31/0.33) and are no
+    longer promotion candidates — they stay resolvable for the record."""
     ids = {s.id for s in CANDIDATE_SPECS}
     assert ids == {
         "charm_close_magnet",
         "vanna_vol_crush_rider",
         "gamma_regime_shift_rider",
-        "fresh_flow_momentum",
     }
-    assert "aggressor_flow_divergence" not in ids
-    assert "aggressor_flow_divergence" in known_specs()  # backtestable for the record
+    for screened in ("aggressor_flow_divergence", "fresh_flow_momentum"):
+        assert screened not in ids
+        assert screened in known_specs()  # backtestable for the record
 
 
 def test_backtest_screens_unprovisioned_candidates_via_registry_fallback():

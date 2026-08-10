@@ -182,7 +182,7 @@ next boot.
 
 ## 6. Backlog & successors
 
-### 6.1 Fresh Flow Momentum — `fresh_flow_momentum` (implemented; screening)
+### 6.1 Fresh Flow Momentum — `fresh_flow_momentum` (SCREENED OUT, PF 0.33)
 
 The successor to the screened-out `aggressor_flow_divergence`. Its post-mortem
 (§8) was that the day-to-date CUMULATIVE net premium is a *lagging* aggregate.
@@ -266,9 +266,22 @@ The third screen (entry bug fixed) produced real trades and real verdicts:
 | Bot | Trades | PF | Expectancy | Verdict |
 |---|---:|---:|---:|---|
 | aggressor_flow_divergence | 404 | **0.31** | −$36.63 | **no-edge → SCREENED OUT** |
+| fresh_flow_momentum | 461 | **0.33** | −$34.68 | **no-edge → SCREENED OUT** |
 | gamma_regime_shift_rider | 9 | 0.23 | −$30.97 | insufficient (weak early read) |
 | charm_close_magnet | 8 | 1.01 | +$0.97 | insufficient (breakeven) |
 | vanna_vol_crush_rider | 5 | 15.3 | +$109.89 | insufficient (VIX-gated, promising) |
+
+**The "aggressor flow LEADS price" thesis is dead on 0DTE — two decisive
+failures.** `fresh_flow_momentum` was built specifically to fix the lagging-
+signal diagnosis (fresh windowed flow + acceleration instead of the cumulative),
+and it produced the *same* result over 461 trades: 33% win rate, wins smaller
+than losses, a monotonic bleed. That asymmetry is the tell — following an
+aggressive flow burst on 0DTE systematically buys a local extreme that reverts.
+The signal is real but its sign is backwards for a momentum trade. Any further
+work on this axis should test the CONTRARIAN read (fade the flow extreme), which
+is a NEW hypothesis screened from scratch — not a third "follow the flow"
+variant. Both flow-following bots are shelved as standalone screened-out specs
+(registered + backtestable for the record).
 
 **Nothing is promoted — `DEFAULT_ROSTER` stays empty.** The honest reading:
 
