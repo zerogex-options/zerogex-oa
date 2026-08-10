@@ -247,14 +247,15 @@ def open_position(
         logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
         return None
     # spread_price returns the SIGNED net: positive = debit paid, negative =
-    # credit received. Long-debit structures need a positive debit and a
-    # premium above the floor; defined-risk credit structures (any short leg)
-    # need a real net credit (a slippage-eroded ~$0 net can't profit).
-    has_short = any(str(leg.get("side", "")).lower() == "short" for leg in legs_dicts)
-    if not has_short:
-        if entry_price <= 0:
-            logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
-            return None
+    # credit received. Classify by the SIGN of that net, NOT by whether the
+    # structure has a short leg. A defined-risk DEBIT SPREAD (e.g. a bull call
+    # vertical: long + short, net > 0) is still a debit and must clear the debit
+    # gate — the old "any short leg => credit structure" test wrongly routed
+    # every debit spread into the credit branch, where -entry_price < 0 always
+    # fell below MIN_CREDIT_PER_SHARE, so NO debit-vertical bot could ever open
+    # (live or in the backtest). Only a genuine net credit (entry_price < 0,
+    # e.g. an iron condor) uses the credit floor; a zero net is unfillable.
+    if entry_price > 0:
         min_prem = float(tw_config.MIN_ENTRY_PREMIUM)
         if min_prem > 0 and entry_price < min_prem:
             logger.debug(
@@ -262,7 +263,7 @@ def open_position(
                 entry_price, min_prem, signal.bot_id,
             )
             return None
-    else:
+    elif entry_price < 0:
         credit = -entry_price  # credit received per share (negative entry = credit)
         if credit < float(tw_config.MIN_CREDIT_PER_SHARE):
             logger.debug(
@@ -270,6 +271,9 @@ def open_position(
                 credit, tw_config.MIN_CREDIT_PER_SHARE, signal.bot_id,
             )
             return None
+    else:
+        logger.debug("zero net (unfillable) for bot=%s legs=%s", signal.bot_id, legs_dicts)
+        return None
 
     # Size on the structure's TRUE per-contract max loss, not the net premium.
     # Identical to entry_price for long-debit structures; for a defined-risk

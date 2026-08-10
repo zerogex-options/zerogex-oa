@@ -288,6 +288,8 @@ def _runner_with(bot: _StubBot, enabled: bool = True) -> bt._BotRunner:
     r.vetoed = 0
     r.no_quote_opens = 0
     r.priced_marks = 0
+    r.signals = 0
+    r.entry_rejects = {}
     return r
 
 

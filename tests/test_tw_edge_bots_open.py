@@ -319,6 +319,40 @@ def test_candidates_are_registered_but_not_live():
         ), f"{spec.id} is a fresh candidate; it must not be in RETIRED_BOT_IDS"
 
 
+def test_debit_spread_signal_is_accepted_at_entry():
+    """Regression: a defined-risk DEBIT vertical (long + short, net > 0) must be
+    accepted at the entry-viability gate. The old ``has_short => credit
+    structure`` classification routed every debit spread into the credit floor
+    (-entry < 0.1) and rejected it, so no debit-vertical bot could ever open
+    (the root of the 0-trade screens)."""
+    from unittest.mock import patch
+
+    from src.tradeworkz import backtest as bt
+
+    spec = next(s for s in CANDIDATE_SPECS if s.id == "charm_close_magnet")
+    runner = bt._BotRunner(spec, slippage_pct=0.0, tolerance_min=10)
+    snap = _charm_snap()  # fires a bull call debit vertical
+    with patch.object(bt, "historical_spread_price", return_value=0.50):  # +0.50 debit
+        runner._maybe_open(conn=None, u="SPY", snap=snap, now_utc=snap.timestamp)
+    assert runner.signals == 1
+    assert runner.entry_rejects == {}, f"debit spread wrongly rejected: {runner.entry_rejects}"
+    assert "SPY" in runner.open_by_underlying  # position actually opened
+
+
+def test_zero_net_spread_is_rejected_at_entry():
+    from unittest.mock import patch
+
+    from src.tradeworkz import backtest as bt
+
+    spec = next(s for s in CANDIDATE_SPECS if s.id == "charm_close_magnet")
+    runner = bt._BotRunner(spec, slippage_pct=0.0, tolerance_min=10)
+    snap = _charm_snap()
+    with patch.object(bt, "historical_spread_price", return_value=0.0):
+        runner._maybe_open(conn=None, u="SPY", snap=snap, now_utc=snap.timestamp)
+    assert runner.entry_rejects.get("zero_net", 0) == 1
+    assert "SPY" not in runner.open_by_underlying
+
+
 def test_open_criteria_records_miss_reasons():
     """The backtest screen relies on per-gate miss tallies to explain a
     0-trade result. A rejected setup must name the gate it failed."""

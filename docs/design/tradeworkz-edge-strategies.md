@@ -209,10 +209,26 @@ it to two causes, and the bots were calibrated accordingly:
 
 - **Gamma Regime Shift** — spot was 0.4–2.6% from the flip in every sample, so
   the old `|flip_distance| ≤ 0.3%` gate was unreachable, and the absolute
-  `5e8` net-GEX-shed floor was noise for SPX. Now: **relative** shed
-  (≥ 25% of `|prior_net_gex|`) resolving into short γ (crossed ≤ 0 **or** within
-  ~1.2% of the flip).
+  `5e8` net-GEX-shed floor was noise for SPX. Now the trigger is the **crossing**
+  itself (`prior_net_gex > 0` → `net_gex ≤ 0`), or a not-yet-completed collapse
+  near the flip (≤ 1.2%) that shed ≥ 10% of `|prior_net_gex|` this tick — all
+  RELATIVE, so it means the same for SPY and SPX. (The 25%-in-one-tick floor
+  from the first calibration was still too rare — `shed_small` dominated the
+  miss tally — so it was lowered and the crossing was made the primary path.)
 - **Charm Close Magnet** — magnet falls back from the (empty) pin to `max_pain`.
+
+**The entry-classification bug (the dominant blocker).** The second screen
+surfaced it via the new `signals` / `entry_rejects` counters: Aggressor Flow
+produced **~1,700 signals but 0 trades**, with no quote failures. The cause was
+in `reconciler.open_position` (and mirrored in the backtest): it classified any
+structure with a short leg as a *credit* structure and required
+`-entry_price ≥ MIN_CREDIT_PER_SHARE`. But a defined-risk **debit spread** (the
+structure all four v4 bots — and the retired `bull_momentum_climber` — use) has
+`entry_price > 0`, so `-entry_price` is negative and **every debit spread was
+rejected at entry, live and in backtest**. This almost certainly explains why
+`bull_momentum_climber` "never fired at all" in the retirement screen. Fixed by
+classifying on the **sign of the net** (debit if `entry_price > 0`, credit if
+`< 0`, unfillable at `0`) in both `reconciler.open_position` and the harness.
 
 **Instrumentation.** Every gate now records a reason via `BaseBot._skip(...)`,
 surfaced per bot as `miss_reasons` in the backtest JSON. A 0-trade result now
@@ -220,9 +236,13 @@ names the gate that abstained every tick, so further tuning is data-driven, not
 guesswork (this is the tradeworkz analog of the signals playbook's
 `explain_miss`).
 
-**Honest status of the gate.** `charm_close_magnet`, `aggressor_flow_divergence`
-and `gamma_regime_shift_rider` have their inputs and should now produce trades to
-screen. `vanna_vol_crush_rider` cannot be validated on a window without dense VIX
-history — that is a data gap, not a thesis failure; it screens forward once VIX
-bars accumulate. No bot is promoted until it clears PF ≥ 1.1 / positive
-expectancy / ≥ 20 trades on its own — none goes live on this calibration alone.
+**Honest status of the gate.** With the entry-classification bug fixed,
+`aggressor_flow_divergence` (which was already firing ~1,700 signals) and
+`gamma_regime_shift_rider` (crossing trigger) should now produce real trades to
+screen. `charm_close_magnet` is inherently low-frequency (positive-γ, final 2h,
+flow/magnet sign-agreement) — it may need a longer window than 45 days to reach
+≥ 20 trades; that is a sample-size limit, not a defect. `vanna_vol_crush_rider`
+cannot be validated on a window without dense VIX history — a data gap, not a
+thesis failure; it screens forward once VIX bars accumulate. No bot is promoted
+until it clears PF ≥ 1.1 / positive expectancy / ≥ 20 trades on its own — none
+goes live on this calibration alone.

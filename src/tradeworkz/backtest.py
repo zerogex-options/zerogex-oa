@@ -365,6 +365,10 @@ class _BotRunner:
         self.vetoed = 0
         self.no_quote_opens = 0
         self.priced_marks = 0
+        # Signals that passed open_criteria, and why any of them failed to
+        # become a position at the entry-viability gate (see _maybe_open).
+        self.signals = 0
+        self.entry_rejects: Dict[str, int] = {}
 
     def step(self, conn: Any, u: str, snap: Any, now_utc: datetime, opens_allowed: bool) -> None:
         """Advance this bot one timestep for underlying ``u``.
@@ -409,6 +413,7 @@ class _BotRunner:
         signal = self.bot.open_criteria(snap)
         if signal is None:
             return
+        self.signals += 1
         if self.bot._bias_veto(snap, signal.direction):
             self.vetoed += 1
             return
@@ -420,17 +425,25 @@ class _BotRunner:
         if entry_net is None:
             self.no_quote_opens += 1
             return
-        # Entry-viability gates (mirror reconciler.open_position).
-        has_short = any(str(lg.get("side", "")).lower() == "short" for lg in legs)
-        if not has_short:
-            if entry_net <= 0:
-                return
+        # Entry-viability gates (mirror reconciler.open_position): classify by
+        # the SIGN of the net, not by the presence of a short leg — a defined-
+        # risk DEBIT spread (net > 0) is a debit, not a credit structure. Each
+        # rejection is tallied so a 0-trade run shows signals dying at entry.
+        if entry_net > 0:
             if tw_config.MIN_ENTRY_PREMIUM > 0 and entry_net < tw_config.MIN_ENTRY_PREMIUM:
+                self._entry_reject("below_min_premium")
+                return
+        elif entry_net < 0:
+            if -entry_net < float(tw_config.MIN_CREDIT_PER_SHARE):
+                self._entry_reject("below_min_credit")
                 return
         else:
-            if -entry_net < float(tw_config.MIN_CREDIT_PER_SHARE):
-                return
+            self._entry_reject("zero_net")
+            return
         self.open_by_underlying[u] = self._make_position(signal, legs, entry_net, snap, now_utc)
+
+    def _entry_reject(self, reason: str) -> None:
+        self.entry_rejects[reason] = self.entry_rejects.get(reason, 0) + 1
 
     def _make_position(
         self, signal: Any, legs: List[Dict[str, Any]], entry_net: float, snap: Any, at: datetime
@@ -721,6 +734,14 @@ def summarize_bot(runner: _BotRunner) -> Dict[str, Any]:
         "avg_hold_min": round(sum(t.hold_minutes for t in trades) / n, 1) if n else 0.0,
         "bias_vetoed": runner.vetoed,
         "no_quote_opens": runner.no_quote_opens,
+        # Signals that cleared open_criteria, and where any that did not become
+        # positions were rejected at the entry-viability gate. A large
+        # ``signals`` with 0 trades and non-empty ``entry_rejects`` means the
+        # setup fires but the fills are being refused (not a signal problem).
+        "signals": getattr(runner, "signals", 0),
+        "entry_rejects": dict(
+            sorted(getattr(runner, "entry_rejects", {}).items(), key=lambda kv: kv[1], reverse=True)
+        ),
         # Per-gate rejection tally (most-frequent first). When n_trades is 0
         # this is the diagnostic: it names the gate that abstained every tick.
         "miss_reasons": dict(

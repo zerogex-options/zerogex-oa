@@ -404,7 +404,7 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "static level / sign."
         ),
         params={
-            "min_shed_frac": 0.25,
+            "min_shed_frac": 0.10,
             "max_flip_distance_pct": 0.012,
             "min_break_trend_pct": 0.0010,
             "target_pct": 0.006,

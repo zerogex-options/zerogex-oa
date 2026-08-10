@@ -48,11 +48,15 @@ class GammaRegimeShiftRider(BaseBot):
         if mtc is None or mtc < float(self.params.get("min_minutes_to_close", 45)):
             return self._skip("window_close")
 
-        # -- Regime-velocity gate: dealers must be SHEDDING long gamma fast.
-        # The shed is measured RELATIVE to the prior reading, not in absolute
-        # dollars — net-GEX scales ~price^2 x OI, so a fixed dollar drop that is
-        # meaningful for SPY (~1-8e9) is noise for SPX (~1e10-7e10). Require the
-        # one-tick drop to be at least ``min_shed_frac`` of |prior_net_gex|.
+        # -- Regime-transition gate. The edge is dealers flipping long->short
+        # gamma. The cleanest single-tick signature of that is a CROSSING:
+        # prior_net_gex > 0 and net_gex now <= 0. That is the primary trigger.
+        # A not-yet-completed collapse also qualifies when spot sits near the
+        # flip AND net-GEX shed a meaningful RELATIVE fraction this tick (net-GEX
+        # scales ~price^2 x OI, so the shed is measured against |prior_net_gex|,
+        # not a fixed dollar floor that is noise for SPX and a wall for SPY).
+        # An absolute 25%-in-one-tick requirement (the prior gate) was far too
+        # rare — the miss tally showed it rejecting almost everything.
         if snap.net_gex is None or snap.prior_net_gex is None:
             return self._skip("no_net_gex")
         if snap.prior_net_gex <= 0:
@@ -60,24 +64,23 @@ class GammaRegimeShiftRider(BaseBot):
         dgex = snap.net_gex_change()
         if dgex is None or dgex >= 0:
             return self._skip("not_shedding")
-        shed_frac = float(self.params.get("min_shed_frac", 0.25))
-        if abs(dgex) < shed_frac * abs(snap.prior_net_gex):
-            return self._skip("shed_small")
-        if snap.gex_regime() == "positive_strong":
-            return self._skip("still_pinned")  # transition hasn't taken
-
-        # -- Structural gate: the shed must be resolving toward the short regime.
-        # Either net-GEX has already crossed to short (net_gex <= 0) OR spot is
-        # near the flip. The probe showed spot is typically 0.4-2.6% from the
-        # flip, so the old 0.3% "at the flip" band was unreachable; a crossing
-        # OR a wider proximity band both mark a real transition.
         if snap.gamma_flip is None:
             return self._skip("no_flip")
+        crossed_short = snap.net_gex <= 0
         max_flip_dist = float(self.params.get("max_flip_distance_pct", 0.012))
         near_flip = snap.flip_distance is not None and abs(snap.flip_distance) <= max_flip_dist
-        crossed_short = snap.net_gex <= 0
-        if not (near_flip or crossed_short):
+        shed_ratio = abs(dgex) / max(1e-9, abs(snap.prior_net_gex))
+        min_shed_frac = float(self.params.get("min_shed_frac", 0.10))
+        if crossed_short:
+            pass  # a completed crossing is itself the transition
+        elif near_flip and shed_ratio >= min_shed_frac:
+            pass  # collapsing toward the flip
+        elif near_flip:
+            return self._skip("shed_small")
+        else:
             return self._skip("far_from_transition")
+        if snap.gex_regime() == "positive_strong":
+            return self._skip("still_pinned")  # transition hasn't taken
 
         # -- Direction: the way the tape is breaking, confirmed by flow.
         closes = [float(c) for c in (snap.recent_closes or []) if c is not None and c > 0]
@@ -100,7 +103,6 @@ class GammaRegimeShiftRider(BaseBot):
 
         # Quality: depth of the gamma shed (RELATIVE to prior, symbol-agnostic),
         # whether it fully crossed to short, and break strength.
-        shed_ratio = abs(dgex) / max(1e-9, abs(snap.prior_net_gex))
         drop_score = min(1.0, shed_ratio / max(1e-9, float(self.params.get("shed_ref_frac", 0.5))))
         cross_score = 1.0 if crossed_short else 0.4
         trend_ref = float(self.params.get("trend_ref_pct", 0.003))
