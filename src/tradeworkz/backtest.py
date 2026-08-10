@@ -721,6 +721,15 @@ def summarize_bot(runner: _BotRunner) -> Dict[str, Any]:
         "avg_hold_min": round(sum(t.hold_minutes for t in trades) / n, 1) if n else 0.0,
         "bias_vetoed": runner.vetoed,
         "no_quote_opens": runner.no_quote_opens,
+        # Per-gate rejection tally (most-frequent first). When n_trades is 0
+        # this is the diagnostic: it names the gate that abstained every tick.
+        "miss_reasons": dict(
+            sorted(
+                getattr(runner.bot, "miss_reasons", {}).items(),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+        ),
         "verdict": _verdict(n, pf, expectancy),
         "equity_curve": _equity_curve(trades),
     }

@@ -162,6 +162,19 @@ class BaseBot:
         self.spec = spec
         self.params: Dict[str, Any] = dict(spec.params or {})
         self.ml_state: Dict[str, Any] = dict(ml_state or {})
+        # Gate-rejection tally for the backtest screen. Each ``open_criteria``
+        # abstention calls ``self._skip("<gate>")`` instead of a bare
+        # ``return None``, so a 0-trade backtest reports WHICH gate rejected
+        # every tick (mirrors the signals playbook's ``explain_miss``). The
+        # runner instantiates a bot once and keeps it across steps, so the
+        # counts accumulate over the whole run; the live engine simply never
+        # reads them. Cheap (a small dict) so it stays on in both paths.
+        self.miss_reasons: Dict[str, int] = {}
+
+    def _skip(self, reason: str) -> None:
+        """Record a gate rejection and return ``None`` (no signal this tick)."""
+        self.miss_reasons[reason] = self.miss_reasons.get(reason, 0) + 1
+        return None
 
     # -- ML knobs --------------------------------------------------------
 
@@ -556,9 +569,7 @@ class BaseBot:
         # -- Stage-0 structural stop (S1 spot stop), min_hold-gated. Superseded
         # by S2 + trail once the ladder passes T1, so Stage 0 only.
         if not in_min_hold and stage == 0 and position.stop_price is not None:
-            if (bull and spot <= position.stop_price) or (
-                not bull and spot >= position.stop_price
-            ):
+            if (bull and spot <= position.stop_price) or (not bull and spot >= position.stop_price):
                 return ExitDecision(should_close=True, reason="stop")
 
         # Mirror today's patience window: nothing else fires during min_hold.

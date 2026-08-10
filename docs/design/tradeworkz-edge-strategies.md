@@ -79,14 +79,16 @@ each has an explicit *edge filter* that the folklore version lacks.
   `forced_flow_profile.close_charm_flow` is the dollars dealers must trade by
   the close, and the magnet is the gamma-restoring **Pin Strike**, not OI
   max-pain.
-- **Edge filter:** fires only when the forced charm flow **actually points at
-  the pin** (`sign(close_charm_flow) == sign(pin − spot)`), in positive-γ, with
-  a confident pin. When flow and pin disagree — exactly the losing setups for
-  the retired pin-drifters — it **abstains**.
-- **Entry:** last 10–120 min to close · positive-γ · `pin_confidence ≥ 0.55` ·
-  pin 0.1–1.0% away · charm-flow/pin sign agreement · bias-veto.
-- **Structure/exit:** narrow vertical toward the pin; target = pin; stop = a
-  move to the wrong side of `charm_flip`; time-stop into the close.
+- **Direction** = the sign of `close_charm_flow` itself (the forced flow),
+  confirmed by a **magnet** on the same side: `pin_strike` when a real pin
+  exists, else `max_pain` (see §7 — the pin is persisted only ~0% of the time,
+  so max_pain is the working magnet). The differentiator survives: unlike the
+  retired pin-drifters it demands the QUANTIFIED charm flow point the same way
+  before it trades.
+- **Entry:** last 10–120 min to close · positive-γ · magnet on the flow's side ·
+  magnet 0.1–1.0% away · bias-veto.
+- **Structure/exit:** narrow vertical toward the magnet; target = magnet; stop =
+  a move to the wrong side of `charm_flip`; time-stop into the close.
 
 ### 3.2 Vanna Vol-Crush Rider — `vanna_vol_crush_rider`
 
@@ -125,9 +127,11 @@ each has an explicit *edge filter* that the folklore version lacks.
   positive territory, with spot **at** the flip and `convexity_risk` elevated,
   the regime is transitioning long→short — absorption turning into
   amplification. That transition is the clean leg the static break missed.
-- **Edge filter:** requires a genuine **crossing** (`prior_net_gex > 0`, fast
-  shed, spot within 0.3% of the flip) and aggressor **volume that confirms** the
-  break direction.
+- **Edge filter:** requires a genuine **crossing** — `prior_net_gex > 0` and a
+  one-tick shed of ≥ 25% of `|prior_net_gex|` (RELATIVE, so it means the same
+  for SPY and SPX), resolving into short γ (net-GEX crossed ≤ 0 **or** spot
+  within ~1.2% of the flip — see §7), plus aggressor **volume that confirms**
+  the break.
 - **Structure/exit:** vertical in the break direction; target = far wall (short-γ
   lets price run); stop = a **reclaim of the flip** (transition aborted).
 
@@ -183,3 +187,42 @@ next boot.
   again (vol *skew*, not level/flow/time). Deferred until the backtest verdicts
   on the first four are in, so the candidate set stays small and each addition is
   screened on its own.
+
+---
+
+## 7. Backtest reality & calibration (2026-08-09)
+
+The first screen (45d / 2,370 steps) opened **0 trades** on all four — with 0
+vetoes and 0 fill failures, i.e. `open_criteria` returned `None` every tick.
+The `tw_edge_field_probe` tool (`python -m src.tools.tw_edge_field_probe`) traced
+it to two causes, and the bots were calibrated accordingly:
+
+**Data availability over the window** (probe coverage):
+
+| field | non-null | consequence |
+|---|---|---|
+| `close_charm_flow`, `dealer_vanna/charm_total`, `flow_net_premium/volume`, `flip_distance`, `convexity_risk`, `prior_net_gex` | ~100% | usable |
+| **`pin_strike` / `pin_confidence`** | **2 / 59,682 (~0%)** | Charm bot re-pointed to a `max_pain` magnet (pin optional) |
+| **`prior_vix`** (VIX bars: 781 over 45d, mostly recent) | **~1/8** | Vanna bot is VIX-history-gated; validate forward once VIX is dense |
+
+**Over-strict gates** (fixed, justified by the probe's own values):
+
+- **Gamma Regime Shift** — spot was 0.4–2.6% from the flip in every sample, so
+  the old `|flip_distance| ≤ 0.3%` gate was unreachable, and the absolute
+  `5e8` net-GEX-shed floor was noise for SPX. Now: **relative** shed
+  (≥ 25% of `|prior_net_gex|`) resolving into short γ (crossed ≤ 0 **or** within
+  ~1.2% of the flip).
+- **Charm Close Magnet** — magnet falls back from the (empty) pin to `max_pain`.
+
+**Instrumentation.** Every gate now records a reason via `BaseBot._skip(...)`,
+surfaced per bot as `miss_reasons` in the backtest JSON. A 0-trade result now
+names the gate that abstained every tick, so further tuning is data-driven, not
+guesswork (this is the tradeworkz analog of the signals playbook's
+`explain_miss`).
+
+**Honest status of the gate.** `charm_close_magnet`, `aggressor_flow_divergence`
+and `gamma_regime_shift_rider` have their inputs and should now produce trades to
+screen. `vanna_vol_crush_rider` cannot be validated on a window without dense VIX
+history — that is a data gap, not a thesis failure; it screens forward once VIX
+bars accumulate. No bot is promoted until it clears PF ≥ 1.1 / positive
+expectancy / ≥ 20 trades on its own — none goes live on this calibration alone.

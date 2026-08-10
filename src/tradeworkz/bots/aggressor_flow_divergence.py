@@ -44,34 +44,35 @@ class AggressorFlowDivergence(BaseBot):
         # Session window: past the opening auction, before the EOD charm regime.
         m = snap.minutes_since_open
         if m is None or m < float(self.params.get("min_minutes_since_open", 30)):
-            return None
+            return self._skip("window_open")
         mtc = snap.minutes_to_close
         if mtc is None or mtc < float(self.params.get("min_minutes_to_close", 60)):
-            return None
+            return self._skip("window_close")
 
         # In a strong positive-γ pin dealers absorb aggressive flow — the
         # lead-lag that powers this trade breaks down. Trade thin / one-sided
         # regimes.
         if snap.gex_regime() == "positive_strong":
-            return None
+            return self._skip("regime_pin")
 
         net_prem = snap.flow_net_premium
         net_vol = snap.flow_net_volume
         if net_prem is None or net_vol is None or net_prem == 0.0:
-            return None
+            return self._skip("no_flow")
 
         # Strong one-sided premium, confirmed by same-sign volume.
         min_prem = float(self.params.get("min_net_premium", 5.0e5))
         if abs(net_prem) < min_prem:
-            return None
+            return self._skip("premium_small")
         if (net_prem > 0) != (net_vol > 0):
-            return None  # premium and volume disagree — not a clean lean
+            return self._skip("vol_disagrees")  # premium and volume disagree
 
         # Freshness: the flow must be still building this bucket, same sign as
-        # the cumulative lean (fading flow is not an entry).
+        # the cumulative lean (fading flow is not an entry). Optional — only
+        # applies when a prior bucket exists.
         delta = snap.flow_premium_delta()
         if delta is not None and (delta > 0) != (net_prem > 0):
-            return None
+            return self._skip("flow_fading")
 
         # Divergence: price must NOT already have run with the flow. Measure the
         # recent close-to-close move; if it already agrees strongly, the edge
@@ -86,12 +87,12 @@ class AggressorFlowDivergence(BaseBot):
         direction = "bullish" if net_prem > 0 else "bearish"
         # Price has already caught up if it moved >= max_move WITH the flow.
         if direction == "bullish" and recent_move >= max_move:
-            return None
+            return self._skip("price_caught_up")
         if direction == "bearish" and recent_move <= -max_move:
-            return None
+            return self._skip("price_caught_up")
 
         if self._bias_veto(snap, direction):
-            return None
+            return self._skip("bias_veto")
 
         # Quality: premium size (normalized), plus a bonus for a tighter
         # divergence (less price catch-up = more coiled).
@@ -107,7 +108,7 @@ class AggressorFlowDivergence(BaseBot):
         }
         conviction = self.compute_conviction(snap, quality, components=ml_components)
         if conviction < self.confidence_threshold():
-            return None
+            return self._skip("conviction")
 
         dte_target = int(self.params.get("dte_target", 0))
         expiration = resolve_expiration_iso(snap.et_date, dte_target)

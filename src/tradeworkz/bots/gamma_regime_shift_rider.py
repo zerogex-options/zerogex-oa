@@ -43,71 +43,79 @@ class GammaRegimeShiftRider(BaseBot):
     def open_criteria(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
         m = snap.minutes_since_open
         if m is None or m < float(self.params.get("min_minutes_since_open", 30)):
-            return None
+            return self._skip("window_open")
         mtc = snap.minutes_to_close
         if mtc is None or mtc < float(self.params.get("min_minutes_to_close", 45)):
-            return None
+            return self._skip("window_close")
 
         # -- Regime-velocity gate: dealers must be SHEDDING long gamma fast.
-        dgex = snap.net_gex_change()
-        if dgex is None:
-            return None
-        min_drop = float(self.params.get("min_net_gex_drop", 5.0e8))
-        if dgex > -min_drop:  # not collapsing fast enough (dgex is negative)
-            return None
-        # And the shed must be leaving positive-γ territory — not a dip deeper
-        # into an already-strong short regime (that's a trend-continuation bot).
+        # The shed is measured RELATIVE to the prior reading, not in absolute
+        # dollars — net-GEX scales ~price^2 x OI, so a fixed dollar drop that is
+        # meaningful for SPY (~1-8e9) is noise for SPX (~1e10-7e10). Require the
+        # one-tick drop to be at least ``min_shed_frac`` of |prior_net_gex|.
         if snap.net_gex is None or snap.prior_net_gex is None:
-            return None
+            return self._skip("no_net_gex")
         if snap.prior_net_gex <= 0:
-            return None  # was already short — this bot wants the crossing
+            return self._skip("not_long_gamma")  # was already short — want the crossing
+        dgex = snap.net_gex_change()
+        if dgex is None or dgex >= 0:
+            return self._skip("not_shedding")
+        shed_frac = float(self.params.get("min_shed_frac", 0.25))
+        if abs(dgex) < shed_frac * abs(snap.prior_net_gex):
+            return self._skip("shed_small")
         if snap.gex_regime() == "positive_strong":
-            return None  # still firmly pinned; the transition hasn't taken
+            return self._skip("still_pinned")  # transition hasn't taken
 
-        # -- Structural gate: spot at the flip, convexity elevated.
-        if snap.gamma_flip is None or snap.flip_distance is None:
-            return None
-        max_flip_dist = float(self.params.get("max_flip_distance_pct", 0.003))
-        if abs(snap.flip_distance) > max_flip_dist:
-            return None
+        # -- Structural gate: the shed must be resolving toward the short regime.
+        # Either net-GEX has already crossed to short (net_gex <= 0) OR spot is
+        # near the flip. The probe showed spot is typically 0.4-2.6% from the
+        # flip, so the old 0.3% "at the flip" band was unreachable; a crossing
+        # OR a wider proximity band both mark a real transition.
+        if snap.gamma_flip is None:
+            return self._skip("no_flip")
+        max_flip_dist = float(self.params.get("max_flip_distance_pct", 0.012))
+        near_flip = snap.flip_distance is not None and abs(snap.flip_distance) <= max_flip_dist
+        crossed_short = snap.net_gex <= 0
+        if not (near_flip or crossed_short):
+            return self._skip("far_from_transition")
 
         # -- Direction: the way the tape is breaking, confirmed by flow.
         closes = [float(c) for c in (snap.recent_closes or []) if c is not None and c > 0]
         n = int(self.params.get("trend_lookback_bars", 5))
         if len(closes) < n or closes[-n] <= 0:
-            return None
+            return self._skip("no_trend_data")
         trend = (closes[-1] - closes[-n]) / closes[-n]
         if abs(trend) < float(self.params.get("min_break_trend_pct", 0.0010)):
-            return None
+            return self._skip("trend_flat")
         direction = "bullish" if trend > 0 else "bearish"
 
-        # Aggressor volume must confirm the break direction.
+        # Aggressor volume must confirm the break direction (when flow exists).
         net_vol = snap.flow_net_volume
         if net_vol is not None and net_vol != 0.0:
             if (net_vol > 0) != (direction == "bullish"):
-                return None
+                return self._skip("flow_opposes")
 
         if self._bias_veto(snap, direction):
-            return None
+            return self._skip("bias_veto")
 
-        # Quality: speed of the gamma shed, convexity, and break strength.
-        drop_norm = float(self.params.get("net_gex_drop_norm", 2.0e9))
-        drop_score = min(1.0, abs(dgex) / drop_norm) if drop_norm > 0 else 0.0
-        conv = snap.convexity_risk or 0.0
-        conv_norm = float(self.params.get("convexity_norm", 5.0e11))
-        conv_score = min(1.0, conv / max(1e-9, conv_norm))
+        # Quality: depth of the gamma shed (RELATIVE to prior, symbol-agnostic),
+        # whether it fully crossed to short, and break strength.
+        shed_ratio = abs(dgex) / max(1e-9, abs(snap.prior_net_gex))
+        drop_score = min(1.0, shed_ratio / max(1e-9, float(self.params.get("shed_ref_frac", 0.5))))
+        cross_score = 1.0 if crossed_short else 0.4
         trend_ref = float(self.params.get("trend_ref_pct", 0.003))
         trend_score = min(1.0, abs(trend) / max(1e-9, trend_ref))
-        quality = 0.45 * drop_score + 0.25 * conv_score + 0.30 * trend_score
+        quality = 0.45 * drop_score + 0.25 * cross_score + 0.30 * trend_score
         ml_components = {
             "net_gex_change": dgex,
-            "convexity_risk": conv,
+            "shed_ratio": shed_ratio,
+            "convexity_risk": snap.convexity_risk,
             "flip_distance": snap.flip_distance,
             "trend": trend,
         }
         conviction = self.compute_conviction(snap, quality, components=ml_components)
         if conviction < self.confidence_threshold():
-            return None
+            return self._skip("conviction")
 
         dte_target = int(self.params.get("dte_target", 0))
         expiration = resolve_expiration_iso(snap.et_date, dte_target)
@@ -144,15 +152,17 @@ class GammaRegimeShiftRider(BaseBot):
             stop_price=stop,
             time_stop_at=_utcnow() + timedelta(minutes=hold),
             rationale=(
-                f"net_gex {snap.prior_net_gex:+.2e}→{snap.net_gex:+.2e} (Δ{dgex:+.2e}) "
-                f"at flip {snap.gamma_flip:.2f} ({snap.flip_distance * 100:+.2f}%); "
+                f"net_gex {snap.prior_net_gex:+.2e}->{snap.net_gex:+.2e} (shed "
+                f"{shed_ratio * 100:.0f}%), {'crossed short' if crossed_short else 'near flip'}; "
                 f"break {direction}, flow confirms"
             ),
             components_at_entry={
                 "net_gex_change": dgex,
                 "net_gex": snap.net_gex,
                 "prior_net_gex": snap.prior_net_gex,
-                "convexity_risk": conv,
+                "shed_ratio": shed_ratio,
+                "crossed_short": crossed_short,
+                "convexity_risk": snap.convexity_risk,
                 "flip_distance": snap.flip_distance,
                 "trend": trend,
                 "flow_net_volume": net_vol,

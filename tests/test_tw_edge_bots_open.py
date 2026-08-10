@@ -91,8 +91,21 @@ def test_charm_close_magnet_requires_positive_gamma():
     assert _bot("charm_close_magnet").open_criteria(_charm_snap(net_gex=-3.0e9)) is None
 
 
-def test_charm_close_magnet_needs_a_pin():
-    assert _bot("charm_close_magnet").open_criteria(_charm_snap(pin_strike=None)) is None
+def test_charm_close_magnet_falls_back_to_max_pain_when_no_pin():
+    """Pin Strike is rarely persisted, so the magnet falls back to max_pain
+    (same side as the flow). The bot must still fire on the fallback."""
+    sig = _bot("charm_close_magnet").open_criteria(
+        _charm_snap(pin_strike=None, pin_confidence=None, pin_score=None, max_pain=757.0)
+    )
+    assert sig is not None
+    assert sig.direction == "bullish"
+    assert sig.target_price == 757.0  # max_pain magnet
+
+
+def test_charm_close_magnet_needs_some_magnet():
+    """With neither a pin nor max_pain there is nothing to drift toward."""
+    snap = _charm_snap(pin_strike=None, pin_confidence=None, pin_score=None, max_pain=None)
+    assert _bot("charm_close_magnet").open_criteria(snap) is None
 
 
 def test_charm_close_magnet_only_in_final_window():
@@ -251,16 +264,30 @@ def test_gamma_regime_shift_needs_prior_long_gamma():
 
 
 def test_gamma_regime_shift_needs_fast_shed():
+    """Shed is RELATIVE to prior net-GEX. A 5.0e8 -> 4.7e8 dip is a 6% shed,
+    below the 25% floor -> no regime transition."""
     assert (
         _bot("gamma_regime_shift_rider").open_criteria(
-            _regime_snap(prior_net_gex=5.0e8, net_gex=3.0e8)  # ΔGEX only -2e8
+            _regime_snap(prior_net_gex=5.0e8, net_gex=4.7e8)  # ~6% shed
         )
         is None
     )
 
 
-def test_gamma_regime_shift_needs_spot_at_flip():
-    assert _bot("gamma_regime_shift_rider").open_criteria(_regime_snap(flip_distance=0.01)) is None
+def test_gamma_regime_shift_needs_a_transition():
+    """Far from the flip AND not yet crossed to short -> no transition to ride
+    (net_gex still positive at 2e8, flip 5% away)."""
+    assert _bot("gamma_regime_shift_rider").open_criteria(_regime_snap(flip_distance=0.05)) is None
+
+
+def test_gamma_regime_shift_fires_when_crossed_short_even_if_far_from_flip():
+    """A completed crossing (net_gex <= 0) is itself the transition, so a wide
+    flip distance is fine once dealers are actually short."""
+    sig = _bot("gamma_regime_shift_rider").open_criteria(
+        _regime_snap(net_gex=-3.0e8, flip_distance=0.05)
+    )
+    assert sig is not None
+    assert sig.direction == "bullish"
 
 
 def test_gamma_regime_shift_requires_flow_agreement():
@@ -290,6 +317,20 @@ def test_candidates_are_registered_but_not_live():
         assert (
             spec.id not in RETIRED_BOT_IDS
         ), f"{spec.id} is a fresh candidate; it must not be in RETIRED_BOT_IDS"
+
+
+def test_open_criteria_records_miss_reasons():
+    """The backtest screen relies on per-gate miss tallies to explain a
+    0-trade result. A rejected setup must name the gate it failed."""
+    bot = _bot("charm_close_magnet")
+    # Wrong regime -> the 'regime' gate should tick.
+    bot.open_criteria(_charm_snap(net_gex=-3.0e9))
+    assert bot.miss_reasons.get("regime", 0) >= 1
+    # A firing setup adds no miss.
+    before = sum(bot.miss_reasons.values())
+    sig = bot.open_criteria(_charm_snap())
+    assert sig is not None
+    assert sum(bot.miss_reasons.values()) == before
 
 
 def test_candidate_set_is_the_four_edge_bots():

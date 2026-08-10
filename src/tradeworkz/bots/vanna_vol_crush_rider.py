@@ -49,33 +49,38 @@ class VannaVolCrushRider(BaseBot):
         # measurable vol move.
         m = snap.minutes_since_open
         if m is None or m < float(self.params.get("min_minutes_since_open", 20)):
-            return None
+            return self._skip("window_open")
         # Leave the final window to the charm bot (charm dominates into close).
         mtc = snap.minutes_to_close
         if mtc is not None and mtc < float(self.params.get("min_minutes_to_close", 45)):
-            return None
+            return self._skip("window_close")
 
         vanna = snap.dealer_vanna_total
+        if vanna is None:
+            return self._skip("no_vanna")
+        # ΔVIX drives the vanna flow. NOTE: requires VIX-bar history; when VIX
+        # ingestion is sparse this is the field that gates the bot (the backtest
+        # miss tally will show 'no_vix_change' dominating), not the thesis.
         dvix = snap.vix_change()
-        if vanna is None or dvix is None:
-            return None
+        if dvix is None:
+            return self._skip("no_vix_change")
 
         # Real vol move only — a flat VIX produces no vanna flow.
         min_dvix = float(self.params.get("min_vix_change", 0.30))
         if abs(dvix) < min_dvix:
-            return None
+            return self._skip("vix_move_small")
         # Meaningful dealer vanna only.
         min_vanna = float(self.params.get("min_dealer_vanna", 4.0e7))
         if abs(vanna) < min_vanna:
-            return None
+            return self._skip("vanna_small")
 
         # Forced flow = dealer_vanna_total × ΔIV. Positive => dealers buy.
         forced = vanna * dvix
         if forced == 0.0:
-            return None
+            return self._skip("forced_zero")
         direction = "bullish" if forced > 0 else "bearish"
         if self._bias_veto(snap, direction):
-            return None
+            return self._skip("bias_veto")
 
         # Quality scales with the magnitude of the forced flow, normalized by a
         # per-symbol vanna scale × a reference 1-point vol move.
@@ -94,7 +99,7 @@ class VannaVolCrushRider(BaseBot):
         }
         conviction = self.compute_conviction(snap, quality, components=ml_components)
         if conviction < self.confidence_threshold():
-            return None
+            return self._skip("conviction")
 
         dte_target = int(self.params.get("dte_target", 0))
         expiration = resolve_expiration_iso(snap.et_date, dte_target)
