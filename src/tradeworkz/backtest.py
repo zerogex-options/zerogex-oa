@@ -190,9 +190,7 @@ def _nearest_leg_quote(
     for table in _LEG_QUOTE_TABLES:
         if table == "option_chains_archive" and not _archive_available(conn):
             continue
-        quote = _quote_from_table(
-            conn, table, leg=leg, at=at, tolerance_min=tolerance_min
-        )
+        quote = _quote_from_table(conn, table, leg=leg, at=at, tolerance_min=tolerance_min)
         if quote is not None:
             return quote
     return None
@@ -271,9 +269,7 @@ def _is_trading_day(d: date) -> bool:
     return is_market_hours(_ET.localize(datetime.combine(d, time(12, 0))))
 
 
-def rth_timesteps(
-    start_utc: datetime, end_utc: datetime, interval_min: int
-) -> List[datetime]:
+def rth_timesteps(start_utc: datetime, end_utc: datetime, interval_min: int) -> List[datetime]:
     """RTH (09:30–16:00 ET) wall-clocks in ``[start_utc, end_utc]`` as UTC.
 
     Steps every ``interval_min`` minutes on each trading day, skipping weekends
@@ -337,8 +333,8 @@ class SimTrade:
     exit_net: float
     max_loss_per_share: float
     pnl_dollars: float  # (exit − entry) × 100, downside-clamped to defined risk
-    pnl_pct: float      # (exit − entry) / |entry| — matches live tw_trades
-    outcome: str        # 'win' | 'loss' | 'scratch'
+    pnl_pct: float  # (exit − entry) / |entry| — matches live tw_trades
+    outcome: str  # 'win' | 'loss' | 'scratch'
     reason: str
     conviction: float
 
@@ -388,16 +384,21 @@ class _BotRunner:
 
     def _manage(self, conn: Any, u: str, pos: OpenPosition, snap: Any, now_utc: datetime) -> None:
         mark = historical_spread_price(
-            conn, pos.legs, at=now_utc, action="close",
-            slippage_pct=self.slippage_pct, tolerance_min=self.tolerance_min,
+            conn,
+            pos.legs,
+            at=now_utc,
+            action="close",
+            slippage_pct=self.slippage_pct,
+            tolerance_min=self.tolerance_min,
         )
         if mark is None:
             # Unpriceable. If past its hard time_stop (or expired), force-settle
             # at the last observed mark so a 0DTE can't strand open; else skip
             # and retry next step when a quote may return.
             if _force_settle_due(pos, now_utc) and pos.current_price is not None:
-                self._close(u, pos, exit_net=pos.current_price,
-                            reason="time_stop_settle", at=now_utc)
+                self._close(
+                    u, pos, exit_net=pos.current_price, reason="time_stop_settle", at=now_utc
+                )
             return
         self.priced_marks += 1
         pos.current_price = mark
@@ -419,8 +420,12 @@ class _BotRunner:
             return
         legs = [asdict(leg) for leg in signal.legs]
         entry_net = historical_spread_price(
-            conn, legs, at=now_utc, action="open",
-            slippage_pct=self.slippage_pct, tolerance_min=self.tolerance_min,
+            conn,
+            legs,
+            at=now_utc,
+            action="open",
+            slippage_pct=self.slippage_pct,
+            tolerance_min=self.tolerance_min,
         )
         if entry_net is None:
             self.no_quote_opens += 1
@@ -516,8 +521,12 @@ class _BotRunner:
         """Force-close any still-open positions at the last priceable mark."""
         for u, pos in list(self.open_by_underlying.items()):
             mark = historical_spread_price(
-                conn, pos.legs, at=at, action="close",
-                slippage_pct=self.slippage_pct, tolerance_min=self.tolerance_min,
+                conn,
+                pos.legs,
+                at=at,
+                action="close",
+                slippage_pct=self.slippage_pct,
+                tolerance_min=self.tolerance_min,
             )
             if mark is None:
                 mark = pos.current_price
@@ -555,13 +564,11 @@ def _load_backtest_bots(conn: Any, bot_ids: Optional[List[str]]) -> List[BotSpec
             (list(bot_ids),),
         )
     else:
-        cur.execute(
-            """
+        cur.execute("""
             SELECT id, display_name, strategy_class, tier, direction_mode,
                    universe, tagline, description, is_public, enabled, params
             FROM tw_bots ORDER BY id
-            """
-        )
+            """)
     specs: List[BotSpec] = []
     for r in cur.fetchall():
         params = r[10]
@@ -572,10 +579,17 @@ def _load_backtest_bots(conn: Any, bot_ids: Optional[List[str]]) -> List[BotSpec
                 params = {}
         specs.append(
             BotSpec(
-                id=r[0], display_name=r[1], strategy_class=r[2], tier=r[3],
-                direction_mode=r[4], universe=r[5] or "*", tagline=r[6] or "",
-                description=r[7] or "", params=dict(params or {}),
-                is_public=bool(r[8]), enabled=bool(r[9]),
+                id=r[0],
+                display_name=r[1],
+                strategy_class=r[2],
+                tier=r[3],
+                direction_mode=r[4],
+                universe=r[5] or "*",
+                tagline=r[6] or "",
+                description=r[7] or "",
+                params=dict(params or {}),
+                is_public=bool(r[8]),
+                enabled=bool(r[9]),
             )
         )
 
@@ -609,6 +623,7 @@ def run_fleet_backtest(
     end: Optional[datetime] = None,
     interval_min: int = _DEFAULT_INTERVAL_MIN,
     bot_ids: Optional[List[str]] = None,
+    specs: Optional[List[BotSpec]] = None,
     slippage_pct: Optional[float] = None,
     tolerance_min: int = _DEFAULT_TOLERANCE_MIN,
 ) -> Dict[str, Any]:
@@ -617,7 +632,13 @@ def run_fleet_backtest(
     The window defaults to the last ``days`` calendar days ending now, clamped
     to the option-chain coverage window so we never step over instants that
     cannot be priced. Snapshots are built once per (timestep, underlying) and
-    shared across bots.
+    shared across bots — so running many bots (e.g. an execution sweep of one
+    signal across param configs) costs ~the same wall-clock as one.
+
+    ``specs`` injects a ready list of :class:`BotSpec` directly (bypassing the
+    ``tw_bots`` / registry load), which the execution-sweep tool uses to screen
+    param-varied synthetic configs of the same strategy. When given, ``bot_ids``
+    is ignored.
     """
     now = datetime.now(timezone.utc)
     end = end or now
@@ -636,15 +657,17 @@ def run_fleet_backtest(
             "error": "no priceable window (option_chains history does not cover the request)",
         }
 
-    specs = _load_backtest_bots(conn, bot_ids)
+    if specs is None:
+        specs = _load_backtest_bots(conn, bot_ids)
     if not specs:
-        return {"window": {"start": _iso(start), "end": _iso(end)}, "bots": [],
-                "error": "no bots found"}
+        return {
+            "window": {"start": _iso(start), "end": _iso(end)},
+            "bots": [],
+            "error": "no bots found",
+        }
 
     fleet = tw_config.fleet_universes()
-    runners = [
-        _BotRunner(s, slippage_pct=slippage_pct, tolerance_min=tolerance_min) for s in specs
-    ]
+    runners = [_BotRunner(s, slippage_pct=slippage_pct, tolerance_min=tolerance_min) for s in specs]
     bot_universes = {s.id: _resolve_universe(s.universe, fleet) for s in specs}
     needed = sorted({u for us in bot_universes.values() for u in us})
 
@@ -652,7 +675,11 @@ def run_fleet_backtest(
     steps = rth_timesteps(start, end, interval_min)
     logger.info(
         "tradeworkz backtest: %d steps × %d underlyings × %d bots (%s → %s)",
-        len(steps), len(needed), len(runners), _iso(start), _iso(end),
+        len(steps),
+        len(needed),
+        len(runners),
+        _iso(start),
+        _iso(end),
     )
 
     priced_steps = 0
@@ -689,11 +716,15 @@ def run_fleet_backtest(
             "slippage_pct": (
                 slippage_pct if slippage_pct is not None else tw_config.EXECUTION_SLIPPAGE_PCT
             ),
-            "scaling": "off", "ml": "neutral", "contracts": 1,
+            "scaling": "off",
+            "ml": "neutral",
+            "contracts": 1,
         },
         "coverage": {
-            "chain_min": _iso(chain_lo), "chain_max": _iso(chain_hi),
-            "steps": len(steps), "steps_with_data": priced_steps,
+            "chain_min": _iso(chain_lo),
+            "chain_max": _iso(chain_hi),
+            "steps": len(steps),
+            "steps_with_data": priced_steps,
         },
         "fleet": _fleet_totals(bot_reports),
         "bots": bot_reports,
@@ -864,16 +895,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         prog="tradeworkz-backtest",
         description="Replay TradeWorkz bots over historical data to screen for entry edge.",
     )
-    ap.add_argument("--days", type=int, default=_DEFAULT_DAYS,
-                    help=f"lookback window in days (default {_DEFAULT_DAYS})")
-    ap.add_argument("--interval-min", type=int, default=_DEFAULT_INTERVAL_MIN,
-                    help=f"replay step in minutes (default {_DEFAULT_INTERVAL_MIN})")
-    ap.add_argument("--tolerance-min", type=int, default=_DEFAULT_TOLERANCE_MIN,
-                    help=f"max quote age for a fill (default {_DEFAULT_TOLERANCE_MIN})")
-    ap.add_argument("--slippage", type=float, default=None,
-                    help="override execution slippage fraction (default: config)")
-    ap.add_argument("--bots", type=str, default=None,
-                    help="comma-separated bot ids to test (default: all)")
+    ap.add_argument(
+        "--days",
+        type=int,
+        default=_DEFAULT_DAYS,
+        help=f"lookback window in days (default {_DEFAULT_DAYS})",
+    )
+    ap.add_argument(
+        "--interval-min",
+        type=int,
+        default=_DEFAULT_INTERVAL_MIN,
+        help=f"replay step in minutes (default {_DEFAULT_INTERVAL_MIN})",
+    )
+    ap.add_argument(
+        "--tolerance-min",
+        type=int,
+        default=_DEFAULT_TOLERANCE_MIN,
+        help=f"max quote age for a fill (default {_DEFAULT_TOLERANCE_MIN})",
+    )
+    ap.add_argument(
+        "--slippage",
+        type=float,
+        default=None,
+        help="override execution slippage fraction (default: config)",
+    )
+    ap.add_argument(
+        "--bots", type=str, default=None, help="comma-separated bot ids to test (default: all)"
+    )
     ap.add_argument("--start", type=str, default=None, help="ISO start (overrides --days)")
     ap.add_argument("--end", type=str, default=None, help="ISO end (default: now)")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")

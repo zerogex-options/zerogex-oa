@@ -249,11 +249,17 @@ tradeable fade":
 
 Plus a defined-risk vertical toward max_pain / flip (far less 0DTE theta than
 the original's single long option) and the original's good vol-scaled,
-wick-confirmed wall-break stop (`wall_ref_side`). **Honest caveat:** splitting
-alone changes nothing — a call-wall fade and a put-wall fade are the two halves
-of the same signal that scored 0.53. The three filters are the bet; the backtest
-decides. If they don't clear, the flagship stays retired for a documented,
-data-backed reason, not a hunch.
+wick-confirmed wall-break stop (`wall_ref_side`).
+
+**The debit form failed (PF 0.19 / 0.58) — but that is a verdict on the
+EXECUTION, not the signal.** So the engine was parameterized (`structure`,
+`target_mode`, widths, DTE, hold, credit take — see `wall_reversion.py`) and the
+signal is now swept across executions rather than one-shot; see §9. The key
+addition is the **credit spread** (sell beyond the wall — profit if the wall
+simply holds), the structure that actually matches a boundary thesis, with a
+credit-aware exit (decay profit-take + wall-break stop). The flagship is only
+"dead" once the *signal* fails across a *robust* execution sweep — not after one
+debit screen.
 
 ### 6.4 Skew Snap Reversal (not yet built)
 
@@ -384,3 +390,33 @@ cannot be validated on a window without dense VIX history — a data gap, not a
 thesis failure; it screens forward once VIX bars accumulate. No bot is promoted
 until it clears PF ≥ 1.1 / positive expectancy / ≥ 20 trades on its own — none
 goes live on this calibration alone.
+
+---
+
+## 9. Execution sweep — separating the signal from the execution
+
+A single 45-day screen tests one *execution* of a strategy, not the strategy. A
+signal with no edge as a 0DTE debit vertical can still have edge as a credit
+spread, at a different DTE, hold, or target. `src/tools/tw_execution_sweep.py`
+screens one signal across a whole grid of executions **in one pass** — the
+backtest builds each snapshot once and shares it across every config, so N
+configs cost ~the wall-clock of one.
+
+```
+python -m src.tools.tw_execution_sweep --bot call_wall_rejector --days 45
+python -m src.tools.tw_execution_sweep --bot put_wall_bouncer  --days 45
+```
+
+**Overfitting guard (the whole point).** Picking the best PF from a grid on one
+sample finds a "winner" by chance. Every config is therefore scored on a TRAIN
+half (first 50%) AND a TEST half (second 50%); a config is `robust` only when the
+full-window PF ≥ 1.1 AND expectancy is positive in BOTH halves. A config that
+shines in one half and dies in the other is noise, not edge — and is not
+promotable. This is the disciplined way to "tinker with execution": broad search,
+but the out-of-sample split is the judge, so the tinkering can't fool us.
+
+The wall grid (`wall_execution_grid`) spans debit verticals (target = max_pain /
+flip / vwap × hold), the single-long debit (the retired structure), and credit
+spreads (wing × take × hold). Promotion is unchanged: a config only earns
+`DEFAULT_ROSTER` if it is `robust` here *and* clears a full-window screen — the
+sweep narrows the search, it does not replace the gate.
