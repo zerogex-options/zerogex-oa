@@ -225,7 +225,7 @@ fading a sustained trend (only a fresh spike qualifies). Uses the same
 `flow_recent_*` window fields. If it clears the gate it is the first promotion;
 if not, it is shelved and the flow axis is closed.
 
-### 6.3 Split flagship wall strategy — `call_wall_rejector` + `put_wall_bouncer` (implemented; screening)
+### 6.3 Split flagship wall strategy — `call_wall_rejector` + `put_wall_bouncer` (SCREENED OUT, PF 0.19 / 0.58)
 
 The retired `PutCallWallBouncer` faded both walls from one context bot and was
 **the worst loser in the fleet** — PF 0.53 *frictionless*, which the retirement
@@ -318,9 +318,25 @@ The third screen (entry bug fixed) produced real trades and real verdicts:
 |---|---:|---:|---:|---|
 | aggressor_flow_divergence | 404 | **0.31** | −$36.63 | **no-edge → SCREENED OUT** |
 | fresh_flow_momentum | 461 | **0.33** | −$34.68 | **no-edge → SCREENED OUT** |
+| call_wall_rejector | 33 | **0.19** | −$82.78 | **no-edge → SCREENED OUT** |
+| put_wall_bouncer | 29 | **0.58** | −$34.16 | **no-edge → SCREENED OUT** |
 | gamma_regime_shift_rider | 9 | 0.23 | −$30.97 | insufficient (weak early read) |
 | charm_close_magnet | 8 | 1.01 | +$0.97 | insufficient (breakeven) |
 | vanna_vol_crush_rider | 5 | 15.3 | +$109.89 | insufficient (VIX-gated, promising) |
+
+**The wall fade is dead in DEBIT form — a third failure.** Splitting the retired
+`PutCallWallBouncer` (0.53) into two filtered directional bots did not rescue it:
+`call_wall_rejector` 0.19 and `put_wall_bouncer` 0.58. The rejection /
+wall-strength / no-pierce filters cut frequency by ~30× (the `miss_reasons` show
+`no_rejection` + `not_pressed` absorbing almost everything) but the survivors
+still lost, and the bearish call-fade (15% win) was far worse than the bullish
+put-bounce — i.e. the result was dominated by the window's **up-drift**, not a
+wall edge. STRUCTURAL diagnosis: a **debit** vertical needs price to *move* to a
+target, but "the wall holds" is a *boundary*, not a target — the matching
+structure is a **credit spread beyond the wall** (profit if the wall simply
+isn't broken), a high-win-rate theta-positive trade. That is a NEW hypothesis to
+screen from scratch — and cautioned by the retired iron condor, which sold
+premium at walls and *also* failed.
 
 **The "aggressor flow LEADS price" thesis is dead on 0DTE — two decisive
 failures.** `fresh_flow_momentum` was built specifically to fix the lagging-

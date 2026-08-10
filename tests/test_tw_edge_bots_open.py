@@ -634,10 +634,13 @@ def test_candidate_set_is_the_evaluated_bots():
         "vanna_vol_crush_rider",
         "gamma_regime_shift_rider",
         "climax_flow_fade",
+    }
+    for screened in (
+        "aggressor_flow_divergence",
+        "fresh_flow_momentum",
         "call_wall_rejector",
         "put_wall_bouncer",
-    }
-    for screened in ("aggressor_flow_divergence", "fresh_flow_momentum"):
+    ):
         assert screened not in ids
         assert screened in known_specs()  # backtestable for the record
 

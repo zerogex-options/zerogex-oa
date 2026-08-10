@@ -387,6 +387,60 @@ FRESH_FLOW_MOMENTUM_SPEC = BotSpec(
 )
 
 
+# Split flagship wall bots — SCREENED OUT (edge test failed). The 2026-08-10
+# screen (45d) gave call_wall_rejector PF 0.193 / 33 trades and put_wall_bouncer
+# PF 0.577 / 29 trades — a THIRD wall-fade failure after the retired
+# PutCallWallBouncer (0.53). The rejection-confirmation + wall-strength +
+# flow-no-pierce filters cut frequency hard but did not create edge; the
+# surviving fades still lost, and the bearish call-fade (PF 0.19, 15% win) was
+# far worse than the bullish put-bounce — the result was dominated by the
+# window's up-drift, not a wall edge. STRUCTURAL diagnosis: a DEBIT vertical
+# needs price to MOVE to the target, but "the wall holds" is a boundary, not a
+# target — the right structure to monetize it is a CREDIT spread beyond the wall
+# (profit if the wall holds), which is a NEW hypothesis, screened from scratch
+# (and cautioned by the retired iron condor, which sold premium at walls and
+# also failed). Registered + backtestable for the record.
+_WALL_FILTER_PARAMS = {
+    "wall_proximity_pct": 0.002,
+    "wall_reject_margin_pct": 0.0007,
+    "min_wall_strength_pctile": 50.0,
+    "pierce_premium": 6.0e5,
+    "max_hold_minutes": 90,
+    "dte_target": 0,
+}
+CALL_WALL_REJECTOR_SPEC = BotSpec(
+    id="call_wall_rejector",
+    display_name="Call Wall Rejector",
+    strategy_class="CallWallRejector",
+    tier="0DTE",
+    direction_mode="bearish",
+    universe="*",
+    tagline="Confirmed rejection at a big call wall. Fade the rally.",
+    description=(
+        "SCREENED OUT (PF 0.193 / 33 trades, 2026-08-10). Faded confirmed "
+        "call-wall rejections with a debit put vertical; the debit structure is "
+        "wrong for a boundary thesis and shorting fought the up-drift. Kept for "
+        "the record."
+    ),
+    params=dict(_WALL_FILTER_PARAMS),
+)
+PUT_WALL_BOUNCER_SPEC = BotSpec(
+    id="put_wall_bouncer",
+    display_name="Put Wall Bouncer",
+    strategy_class="PutWallBouncer",
+    tier="0DTE",
+    direction_mode="bullish",
+    universe="*",
+    tagline="Confirmed bounce off a big put wall. Fade the dip.",
+    description=(
+        "SCREENED OUT (PF 0.577 / 29 trades, 2026-08-10). Faded confirmed "
+        "put-wall bounces with a debit call vertical; a boundary thesis wants a "
+        "credit structure, not a debit that needs a move. Kept for the record."
+    ),
+    params=dict(_WALL_FILTER_PARAMS),
+)
+
+
 # ── Candidate roster (edge-metric bots, NOT yet live) ───────────────
 # The v4 strategies still under evaluation. These trade the data layers the
 # shelved fleet never used — second-order forced dealer flow (vanna/charm), the
@@ -397,10 +451,11 @@ FRESH_FLOW_MOMENTUM_SPEC = BotSpec(
 # `make tradeworkz-backtest --bots <id>` can screen it; move a spec into
 # DEFAULT_ROSTER (and out of here) ONLY after it clears the gate — PF >= 1.1,
 # positive expectancy, >= 20 trades. Until then they never provision, never
-# size, never open. (Both flow-following bots — aggressor_flow_divergence and
-# fresh_flow_momentum — were screened out, see the standalone specs above;
-# charm/gamma are underpowered on available history and vanna is VIX-history-
-# gated — see design doc §8.)
+# size, never open. (Screened out so far — see the standalone specs above and
+# design doc §8: both flow-follow bots (aggressor / fresh_flow) and both split
+# wall bots (call_wall_rejector / put_wall_bouncer). Remaining candidates:
+# charm / gamma are underpowered on available history; vanna is VIX-history-
+# gated; climax_flow_fade is the live contrarian test.)
 CANDIDATE_SPECS: tuple[BotSpec, ...] = (
     BotSpec(
         id="charm_close_magnet",
@@ -498,54 +553,6 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "dte_target": 0,
         },
     ),
-    BotSpec(
-        id="call_wall_rejector",
-        display_name="Call Wall Rejector",
-        strategy_class="CallWallRejector",
-        tier="0DTE",
-        direction_mode="bearish",
-        universe="*",
-        tagline="Confirmed rejection at a big call wall. Fade the rally.",
-        description=(
-            "Bearish half of the split flagship wall strategy. Fades a CONFIRMED "
-            "rejection at a historically large call wall in positive γ (price "
-            "tagged the wall and rolled back, flow not piercing) — the rejection "
-            "+ wall-strength + no-pierce filters the retired PutCallWallBouncer "
-            "(PF 0.53) lacked. Defined-risk bear put vertical toward max_pain."
-        ),
-        params={
-            "wall_proximity_pct": 0.002,
-            "wall_reject_margin_pct": 0.0007,
-            "min_wall_strength_pctile": 50.0,
-            "pierce_premium": 6.0e5,
-            "max_hold_minutes": 90,
-            "dte_target": 0,
-        },
-    ),
-    BotSpec(
-        id="put_wall_bouncer",
-        display_name="Put Wall Bouncer",
-        strategy_class="PutWallBouncer",
-        tier="0DTE",
-        direction_mode="bullish",
-        universe="*",
-        tagline="Confirmed bounce off a big put wall. Fade the dip.",
-        description=(
-            "Bullish half of the split flagship wall strategy. Fades a CONFIRMED "
-            "bounce at a historically large put wall in positive γ (price tagged "
-            "the wall and turned up, flow not piercing) — the rejection + "
-            "wall-strength + no-pierce filters the retired PutCallWallBouncer "
-            "(PF 0.53) lacked. Defined-risk bull call vertical toward max_pain."
-        ),
-        params={
-            "wall_proximity_pct": 0.002,
-            "wall_reject_margin_pct": 0.0007,
-            "min_wall_strength_pctile": 50.0,
-            "pierce_premium": 6.0e5,
-            "max_hold_minutes": 90,
-            "dte_target": 0,
-        },
-    ),
 )
 
 
@@ -609,8 +616,13 @@ def known_specs() -> Dict[str, BotSpec]:
             specs[s.id] = s
     specs.setdefault(PUT_WALL_MAGNET_REVERSAL_SPEC.id, PUT_WALL_MAGNET_REVERSAL_SPEC)
     # Screened-out but backtestable-for-the-record (mirror the magnet spec).
-    specs.setdefault(AGGRESSOR_FLOW_DIVERGENCE_SPEC.id, AGGRESSOR_FLOW_DIVERGENCE_SPEC)
-    specs.setdefault(FRESH_FLOW_MOMENTUM_SPEC.id, FRESH_FLOW_MOMENTUM_SPEC)
+    for screened in (
+        AGGRESSOR_FLOW_DIVERGENCE_SPEC,
+        FRESH_FLOW_MOMENTUM_SPEC,
+        CALL_WALL_REJECTOR_SPEC,
+        PUT_WALL_BOUNCER_SPEC,
+    ):
+        specs.setdefault(screened.id, screened)
     return specs
 
 
