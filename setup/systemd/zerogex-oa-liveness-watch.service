@@ -1,0 +1,41 @@
+[Unit]
+Description=ZeroGEX liveness watchdog — alert on a DOWN critical service (covers the OnFailure= gap)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# Intentionally NO OnFailure= here. This unit IS the alerter; wiring it to
+# zerogex-alert@ risks an alert loop, and the script exits 0 on a normal run
+# even when it finds (and alerts on) a down service — so a non-zero exit here
+# would mean the watchdog itself broke, which is not something to page about
+# through its own channel.
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# The dispatcher (zerogex-alert.sh, invoked as a child) re-reads this itself;
+# sourcing it here too makes ALERT_BACKEND visible for an interactive run. The
+# leading `-` tolerates a fresh box that hasn't written alert.env yet.
+EnvironmentFile=-/etc/zerogex/alert.env
+ExecStart=/home/ubuntu/zerogex-oa/setup/systemd/zerogex-liveness-watch.sh
+
+# Must finish fast — it only queries systemd, curls localhost, and writes a
+# few tiny state files. Cap so a stuck curl can't wedge the timer.
+TimeoutStartSec=30
+
+# Sandbox. Needs to: query systemd state, curl 127.0.0.1, read the journal +
+# alert.env (for the dispatched alert's context), and write its per-unit state
+# files under ~ubuntu/monitoring/liveness.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/monitoring
+ReadOnlyPaths=/etc/zerogex /var/log/journal /run/log/journal
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-liveness-watch

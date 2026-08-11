@@ -1340,6 +1340,10 @@ services-restart: ## Restart all 4 services (stop api→…→ingestion, then st
 	done
 	@sleep 2
 	@$(MAKE) --no-print-directory services-status
+	@# Deploy/restart gate: fail loudly if the API did not actually come back
+	@# serving. A stop-all→start-all that leaves the API down (the incident
+	@# shape) otherwise exits 0 with only a printed "INACTIVE".
+	@$(MAKE) --no-print-directory api-health-assert
 
 .PHONY: services-status
 services-status: ## One-line active/inactive status for all 4 services
@@ -4223,3 +4227,60 @@ alert-template-test: ## Fire one synthetic alert through the template (verifies 
 	@sudo systemctl start 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service'
 	@echo "$(GREEN)✅ Triggered. View result:$(NC)"
 	@echo "  journalctl -u 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service' -n 30 --no-pager"
+
+.PHONY: liveness-watch-install
+liveness-watch-install: ## Install the per-minute liveness watchdog (alerts when a critical service is DOWN)
+	@echo "$(BLUE)=== Installing liveness watchdog (1-minute cadence) ===$(NC)"
+	@sudo install -d -o ubuntu -g ubuntu -m 0755 /home/ubuntu/monitoring
+	@chmod +x setup/systemd/zerogex-liveness-watch.sh
+	@sudo cp setup/systemd/zerogex-oa-liveness-watch.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-liveness-watch.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-liveness-watch.timer
+	@echo "$(GREEN)✅ liveness watchdog installed and started (fires every 60s)$(NC)"
+	@echo "$(YELLOW)Alerts route through /etc/zerogex/alert.env (default backend=stderr → journal).$(NC)"
+	@echo "$(YELLOW)  For real paging: make alert-template-install, then edit /etc/zerogex/alert.env$(NC)"
+	@echo "$(YELLOW)Status:      make liveness-watch-status$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-liveness-watch.service$(NC)"
+
+.PHONY: liveness-watch-uninstall
+liveness-watch-uninstall: ## Remove the liveness watchdog timer (keeps per-unit state files)
+	@echo "$(YELLOW)Removing liveness watchdog timer...$(NC)"
+	@sudo systemctl disable --now zerogex-oa-liveness-watch.timer 2>/dev/null || true
+	@sudo rm -f /etc/systemd/system/zerogex-oa-liveness-watch.service \
+	            /etc/systemd/system/zerogex-oa-liveness-watch.timer
+	@sudo systemctl daemon-reload
+	@echo "$(GREEN)✅ liveness watchdog removed; state under /home/ubuntu/monitoring/liveness untouched$(NC)"
+
+.PHONY: liveness-watch-status
+liveness-watch-status: ## Show liveness watchdog timer status + last run + recent alerts
+	@echo "$(BLUE)=== Liveness Watchdog Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-liveness-watch.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-liveness-watch.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-liveness-watch -n 30 --no-pager || true
+
+.PHONY: liveness-watch-test
+liveness-watch-test: ## Run the watchdog once now (against live services) and show its output
+	@echo "$(BLUE)=== Running liveness watchdog once ===$(NC)"
+	@sudo systemctl start zerogex-oa-liveness-watch.service
+	@echo "$(GREEN)✅ Ran. Recent output:$(NC)"
+	@sudo journalctl -u zerogex-oa-liveness-watch -n 20 --no-pager || true
+
+.PHONY: api-health-assert
+api-health-assert: ## Assert API is active AND serving /api/health/live — exit 1 if not (post-restart/deploy gate)
+	@echo "$(BLUE)=== Asserting API health ===$(NC)"
+	@if ! systemctl is-active --quiet $(API_SERVICE); then \
+		echo "$(RED)✖ $(API_SERVICE) is NOT active — the restart/deploy left it down$(NC)"; \
+		echo "  Inspect: sudo systemctl status $(API_SERVICE) --no-pager -l"; \
+		exit 1; \
+	fi
+	@code=$$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8000/api/health/live 2>/dev/null || echo 000); \
+	if [ "$$code" = "200" ]; then \
+		echo "$(GREEN)✔ $(API_SERVICE) active and serving /api/health/live (HTTP 200)$(NC)"; \
+	else \
+		echo "$(RED)✖ /api/health/live returned $$code (expected 200) — process up but not serving$(NC)"; \
+		echo "  Inspect: sudo journalctl -u $(API_SERVICE) -n 50 --no-pager"; \
+		exit 1; \
+	fi

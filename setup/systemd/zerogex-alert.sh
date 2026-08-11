@@ -23,6 +23,11 @@
 set -euo pipefail
 
 unit_name="${1:-unknown}"
+# Optional human reason for the alert. Defaults to the OnFailure= meaning so
+# the single-arg invocation from zerogex-alert@.service is unchanged; the
+# liveness watchdog passes a precise reason ("not active (inactive)",
+# "active but not serving …", "recovered — now active").
+reason="${2:-systemd unit failed}"
 
 # Optional config — keep failures soft so the template install works on a
 # fresh box where the operator hasn't deployed alert.env yet.
@@ -44,7 +49,7 @@ if [ -z "$context" ]; then
     context="(no journal lines for ${unit_name})"
 fi
 
-human_summary="🚨 ZeroGEX systemd unit failed: ${unit_name} on ${host} at ${ts}"
+human_summary="🚨 ZeroGEX: ${reason} — ${unit_name} on ${host} at ${ts}"
 human_message=$(printf '%s\n\nLast 20 journal lines:\n%s' "$human_summary" "$context")
 
 require() {
@@ -92,7 +97,7 @@ case "$backend" in
         require PAGERDUTY_ROUTING_KEY
         payload="$(jq -n \
             --arg routing_key "$PAGERDUTY_ROUTING_KEY" \
-            --arg summary "ZeroGEX unit failure: ${unit_name} on ${host}" \
+            --arg summary "ZeroGEX: ${reason} — ${unit_name} on ${host}" \
             --arg source "$host" \
             --arg dedup "${unit_name}@${host}" \
             --arg ctx "$context" \
@@ -119,10 +124,11 @@ case "$backend" in
         require WEBHOOK_URL
         payload="$(jq -n \
             --arg unit "$unit_name" \
+            --arg reason "$reason" \
             --arg host "$host" \
             --arg ts "$ts" \
             --arg ctx "$context" \
-            '{unit: $unit, host: $host, timestamp: $ts, journal_tail: $ctx}')"
+            '{unit: $unit, reason: $reason, host: $host, timestamp: $ts, journal_tail: $ctx}')"
         curl --fail --silent --show-error \
             -X POST -H 'Content-Type: application/json' \
             -d "$payload" \

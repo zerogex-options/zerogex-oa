@@ -1,0 +1,17 @@
+[Unit]
+Description=Trigger the ZeroGEX liveness watchdog once per minute
+
+[Timer]
+# Fire ~1 min after activation, then every 60 s relative to the last run (not
+# wall-clock), matching the system-monitor timer — steady spacing even if a
+# run overruns slightly, and no overlapping invocations.
+OnBootSec=1min
+OnUnitActiveSec=1min
+# Jitter so this doesn't land on the top-of-second with every other timer.
+AccuracySec=5s
+RandomizedDelaySec=5s
+# Catch up on next boot so a reboot doesn't open a gap in coverage.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

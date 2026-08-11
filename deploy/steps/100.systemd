@@ -106,6 +106,12 @@ TIMER_UNITS=(
     # state to $HOME/monitoring/state.json; the directory is created
     # below before the timer is enabled so the first tick doesn't race.
     "zerogex-oa-system-monitor"
+    # Per-minute liveness watchdog: alerts when a critical service is DOWN
+    # (inactive / stopped / active-but-hung) — the case OnFailure= misses,
+    # and exactly how the API sat down unnoticed. Reuses zerogex-alert.sh; see
+    # setup/systemd/zerogex-liveness-watch.sh. Writes per-unit state under
+    # $HOME/monitoring/liveness (created below via $HOME/monitoring).
+    "zerogex-oa-liveness-watch"
     # Backtesting platform: nightly option_chains → archive copy (17:30 ET) and
     # the playbook pattern-calibration refresh (06:30 ET). See
     # docs/design/backtesting-platform.md + docs/design/pattern-calibration.md.
