@@ -2569,28 +2569,92 @@ class StreamManager:
                             new_price = self._get_underlying_price()
                             if new_price:
                                 self.current_price = new_price
-                                self.tracked_option_symbols = self._build_option_symbols()
-                                # C3: flush the consumer's pending option
-                                # buckets BEFORE swapping accumulators —
-                                # contracts dropped from the recalibrated
-                                # tracked set never tick again, so their
-                                # last partial bucket's classified flow is
-                                # otherwise lost.
-                                yield {"type": "flush_options", "reason": "strike_recalc"}
-                                # Underlying symbol is unchanged; leave its
-                                # bar stream untouched on every recalc so
-                                # it doesn't have to re-race the option
-                                # chunks for a TradeStation stream slot.
-                                self._start_accumulators(
-                                    seed_option_rest=self.seed_rest_on_recalc,
-                                    restart_underlying=False,
+                                # Snapshot the state _build_option_symbols()
+                                # overwrites (metadata, strike sets) so an
+                                # unchanged — or transiently empty — rebuild
+                                # can be rolled back byte-for-byte and leave
+                                # the live accumulator's world intact.
+                                _prev_symbols = self.tracked_option_symbols
+                                _prev_metadata = self._symbol_metadata
+                                _prev_tracked_strikes = self.tracked_strikes
+                                _prev_all_tracked = self.all_tracked_strikes
+                                new_symbols = self._build_option_symbols()
+                                # Only tear down and reopen the option chunks
+                                # when the tracked UNIVERSE actually changed.
+                                #
+                                # This block is gated on an iteration counter,
+                                # but under event-driven wakeups iterations
+                                # advance on every option tick — far faster
+                                # than the "~60s" STRIKE_RECALC_INTERVAL
+                                # nominally models — so recalc runs many times
+                                # a minute. On a calm tape the ±band trims to
+                                # the same nearest-N strikes each pass, so a
+                                # blind reopen re-races the chunks for their
+                                # TradeStation stream slots for an IDENTICAL
+                                # symbol set. Those needless reopens ARE the
+                                # per-account concurrent-stream churn that
+                                # trips the ~10-stream cap: each process
+                                # reopens ~every recalc, evicting another
+                                # process's chunks, which reopen and evict
+                                # back — the short-lifetime disconnects the
+                                # cap classifier reports. Mirror the
+                                # "expirations unchanged, skipping rebuild"
+                                # guard in _refresh_expirations and keep the
+                                # live streams when nothing moved.
+                                #
+                                # Empty is guarded alongside unchanged: a
+                                # transient strike-fetch failure returns [],
+                                # and swapping to it would black out the whole
+                                # option universe (and wipe the metadata the
+                                # accumulator's yields depend on) until the
+                                # next good build. Keep streaming instead.
+                                symbols_changed = bool(new_symbols) and set(new_symbols) != set(
+                                    _prev_symbols
                                 )
-                                logger.info(
-                                    f"Recalibrated strikes around "
-                                    f"${self.current_price:.2f} "
-                                    f"(±{self.strike_pct_range}% band, "
-                                    f"max {self.strike_count_max} strikes/exp)"
-                                )
+                                if symbols_changed:
+                                    self.tracked_option_symbols = new_symbols
+                                    # C3: flush the consumer's pending option
+                                    # buckets BEFORE swapping accumulators —
+                                    # contracts dropped from the recalibrated
+                                    # tracked set never tick again, so their
+                                    # last partial bucket's classified flow is
+                                    # otherwise lost.
+                                    yield {"type": "flush_options", "reason": "strike_recalc"}
+                                    # Underlying symbol is unchanged; leave its
+                                    # bar stream untouched on every recalc so
+                                    # it doesn't have to re-race the option
+                                    # chunks for a TradeStation stream slot.
+                                    self._start_accumulators(
+                                        seed_option_rest=self.seed_rest_on_recalc,
+                                        restart_underlying=False,
+                                    )
+                                    logger.info(
+                                        f"Recalibrated strikes around "
+                                        f"${self.current_price:.2f} "
+                                        f"(±{self.strike_pct_range}% band, "
+                                        f"max {self.strike_count_max} strikes/exp): "
+                                        f"universe changed to "
+                                        f"{len(self.tracked_option_symbols)} contracts, "
+                                        f"option streams reopened"
+                                    )
+                                else:
+                                    # Unchanged (or transient empty build):
+                                    # roll back the rebuild's side effects and
+                                    # keep the existing option streams — no
+                                    # teardown, no flush, no reopen, no cap
+                                    # race.
+                                    self.tracked_option_symbols = _prev_symbols
+                                    self._symbol_metadata = _prev_metadata
+                                    self.tracked_strikes = _prev_tracked_strikes
+                                    self.all_tracked_strikes = _prev_all_tracked
+                                    logger.debug(
+                                        "Strike recalc around $%.2f: tracked "
+                                        "universe unchanged (%d contracts) — "
+                                        "keeping existing option streams "
+                                        "(no reopen).",
+                                        self.current_price,
+                                        len(self.tracked_option_symbols),
+                                    )
 
                     # Cleanup expired strikes periodically
                     if iteration % STRIKE_CLEANUP_INTERVAL == 0:
