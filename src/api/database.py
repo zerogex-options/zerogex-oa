@@ -3134,6 +3134,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- admits.  The (${expiration_param_idx}::date[] IS NULL OR
             -- gbs.expiration = ANY(...)) predicate keeps a single fixed-shape
             -- SQL for both the "all" (NULL) and specific-set modes.
+            --
+            -- The extra ``gbs.timestamp BETWEEN start_ts AND end_ts`` bound is
+            -- logically REDUNDANT (every br.rep_ts already lies inside the
+            -- window ``bucket_reps`` was filtered to) but performance-critical.
+            -- ``bucket_reps``/``bounds`` are optimisation-fence CTEs, so the
+            -- planner cannot estimate how many rep_ts values the join probes
+            -- and periodically abandons the ~window_units-probe index nested
+            -- loop for a merge/hash join that reads the ENTIRE gex_by_strike
+            -- table (tens of millions of rows across the 90-day retention) —
+            -- the 15s-timeout path behind "Strike-profile timeseries query
+            -- timed out ... returning empty".  With the window bound, even
+            -- that fallback plan range-scans only the ~window's worth of rows
+            -- (idx_gex_by_strike_underlying_timestamp_strike), keeping the
+            -- query bounded regardless of which join strategy is chosen.  Its
+            -- sibling CTEs (bucket_reps, ohlc) already carry the same bound;
+            -- this restores that symmetry for the one CTE that hits the
+            -- highest-cardinality table.
             strikes AS (
                 SELECT
                     br.bucket_ts,
@@ -3146,6 +3163,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 JOIN gex_by_strike gbs
                   ON gbs.underlying = $1
                  AND gbs.timestamp  = br.rep_ts
+                 AND gbs.timestamp  BETWEEN (SELECT start_ts FROM bounds)
+                                        AND (SELECT end_ts FROM bounds)
                 WHERE (${expiration_param_idx}::date[] IS NULL OR gbs.expiration = ANY(${expiration_param_idx}::date[]))
                 GROUP BY br.bucket_ts, gbs.strike
             )

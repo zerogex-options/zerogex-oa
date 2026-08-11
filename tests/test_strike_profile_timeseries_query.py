@@ -7,9 +7,10 @@ collapses to direct indexing into the returned array — so the contract
 this test pins is:
 
   * the SQL has the same right-edge anchor + bucket-rep + JOIN-on-rep_ts
-    shape every historical GEX endpoint uses (no full-window scan of
-    gex_by_strike — that would be tens of millions of rows on long
-    windows);
+    shape every historical GEX endpoint uses, and the gex_by_strike read is
+    fenced to the window — JOIN-on-rep_ts PLUS a logically-redundant
+    ``timestamp BETWEEN start_ts AND end_ts`` bound — so no query plan can
+    scan the whole 90-day table (the timeout this endpoint used to hit);
   * for cash indices (SPX / NDX / RUT) the cash-session filter is applied
     to BOTH the window anchor and the bucket-rep CTE — same rationale as
     get_historical_gex / get_gex_heatmap;
@@ -93,26 +94,46 @@ def test_query_anchors_on_gex_summary_and_picks_bucket_representative():
     assert bucket_reps_idx < strikes_idx
 
 
-def test_strikes_join_on_rep_ts_not_window_scan():
-    """The core anti-regression: gex_by_strike must be JOINed at the
-    per-bucket representative timestamps (g.timestamp = br.rep_ts), NOT
-    range-scanned across the whole window.  A full window scan of
-    gex_by_strike is the highest-cardinality read on the API and the
-    timeout that previously took down the heatmap."""
+def test_strikes_join_keyed_on_rep_ts_and_fenced_to_window():
+    """The core anti-regression: the gex_by_strike read must be BOUNDED.
+
+    gex_by_strike is the highest-cardinality table on the API — one row per
+    strike×expiration every ~60s analytics cycle, tens of millions of rows
+    across the 90-day retention.  The strikes CTE keys the JOIN on the
+    per-bucket representative timestamps (``gbs.timestamp = br.rep_ts``), so
+    the *intended* plan is ~window_units index point-lookups.
+
+    But ``bucket_reps`` / ``bounds`` are optimisation-fence CTEs whose row
+    counts the planner cannot estimate, so under production stats it
+    periodically abandons the point-lookup nested loop for a merge/hash join
+    that reads the ENTIRE gex_by_strike table.  That is the 15s
+    "Strike-profile timeseries query timed out ... returning empty" path
+    (reproduced with EXPLAIN ANALYZE: an 8.5M-row table read end to end in
+    ~1.9s; linear in table size, so a real multi-underlying / 90-day table
+    crosses the 15s timeout).
+
+    The fix is a logically-REDUNDANT window bound on the same JOIN
+    (``gbs.timestamp BETWEEN start_ts AND end_ts``): every ``rep_ts`` already
+    lies inside ``[start_ts, end_ts]`` (bucket_reps was filtered to exactly
+    that range), so the result set is byte-for-byte identical, but now even
+    the fallback plan range-scans only the window's rows off the
+    ``(underlying, timestamp, strike)`` index instead of the whole table.
+    Its sibling CTEs (bucket_reps, ohlc) already carry this same window bound.
+    """
     captured = _run("SPY")
     sql = captured["query"]
 
     assert "JOIN gex_by_strike gbs" in sql
+    # Still keyed on the per-bucket representative (the point-lookup path).
     assert "gbs.timestamp  = br.rep_ts" in sql or "gbs.timestamp = br.rep_ts" in sql
 
-    # gex_by_strike must NOT have a timestamp >= ... start_ts predicate —
-    # that would degenerate the JOIN into a window scan.
+    # AND fenced to the window so NO plan can scan the whole table. The bound
+    # must be a direct predicate on gbs.timestamp referencing the bounds CTE.
     gbs_idx = sql.index("gex_by_strike gbs")
     tail = sql[gbs_idx:]
-    # The tail can carry the bounds CTE only by name, never as a direct
-    # predicate on gbs.timestamp.
-    assert "gbs.timestamp BETWEEN" not in tail
-    assert "gbs.timestamp >=" not in tail
+    assert "gbs.timestamp  BETWEEN" in tail or "gbs.timestamp BETWEEN" in tail
+    assert "start_ts FROM bounds" in tail
+    assert "end_ts FROM bounds" in tail
 
 
 # ---------------------------------------------------------------------------
