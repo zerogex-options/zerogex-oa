@@ -254,12 +254,21 @@ wick-confirmed wall-break stop (`wall_ref_side`).
 **The debit form failed (PF 0.19 / 0.58) — but that is a verdict on the
 EXECUTION, not the signal.** So the engine was parameterized (`structure`,
 `target_mode`, widths, DTE, hold, credit take — see `wall_reversion.py`) and the
-signal is now swept across executions rather than one-shot; see §9. The key
-addition is the **credit spread** (sell beyond the wall — profit if the wall
-simply holds), the structure that actually matches a boundary thesis, with a
-credit-aware exit (decay profit-take + wall-break stop). The flagship is only
-"dead" once the *signal* fails across a *robust* execution sweep — not after one
-debit screen.
+signal was swept across executions rather than one-shot (see §9), including the
+**credit spread** (sell beyond the wall — profit if the wall simply holds).
+
+**Sweep verdict (2026-08-10, 16 configs × 2 sides, train/test split): the signal
+is dead in EVERY execution.** Not one of the 32 configurations was `robust`; not
+one had positive expectancy in even a single half. The best profit factor across
+the entire grid was **0.67** (put side, debit vertical). The credit spread — the
+boundary-matched structure — did **not** help: middling on the call side, and
+*worse* than the debit on the put side (matching the retired iron condor, which
+also sold premium at walls and failed). The put-bounce beat the call-reject
+across the board, but that is the window's **up-drift** (buying dips loses less
+than shorting rallies), not a wall edge. This is now a complete case: the
+wall-fade thesis has been tested across three structures, three targets, several
+holds, both directions, and out-of-sample — and has no edge on this data. It
+stays retired, for a documented, exhaustive reason.
 
 ### 6.4 Skew Snap Reversal (not yet built)
 
@@ -324,8 +333,8 @@ The third screen (entry bug fixed) produced real trades and real verdicts:
 |---|---:|---:|---:|---|
 | aggressor_flow_divergence | 404 | **0.31** | −$36.63 | **no-edge → SCREENED OUT** |
 | fresh_flow_momentum | 461 | **0.33** | −$34.68 | **no-edge → SCREENED OUT** |
-| call_wall_rejector | 33 | **0.19** | −$82.78 | **no-edge → SCREENED OUT** |
-| put_wall_bouncer | 29 | **0.58** | −$34.16 | **no-edge → SCREENED OUT** |
+| call_wall_rejector | 33 | **0.19** | −$82.78 | **no-edge → SCREENED OUT** (best of 16-config sweep: PF 0.42, still −exp both halves) |
+| put_wall_bouncer | 29 | **0.58** | −$34.16 | **no-edge → SCREENED OUT** (best of 16-config sweep: PF 0.67, still −exp both halves) |
 | gamma_regime_shift_rider | 9 | 0.23 | −$30.97 | insufficient (weak early read) |
 | charm_close_magnet | 8 | 1.01 | +$0.97 | insufficient (breakeven) |
 | vanna_vol_crush_rider | 5 | 15.3 | +$109.89 | insufficient (VIX-gated, promising) |
