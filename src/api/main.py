@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type
@@ -480,9 +481,34 @@ app.include_router(admin_xpost_router)
 # ============================================================================
 
 
+# Liveness and readiness/deep health are split ON PURPOSE.
+#
+# /api/health/live answers only "is this worker process up and serving
+# HTTP?" — with NO database dependency — and is what the systemd unit's
+# ExecStartPost gate (and any process-liveness monitor) probes. The deep
+# /api/health below reports DB reachability + data freshness for load
+# balancers and uptime monitors, and returns 503 when the backend is degraded.
+#
+# Why the split matters: when the DB-touching /api/health gated the systemd
+# readiness probe, a transient DB blip *during a (re)start* failed
+# ExecStartPost; Restart=always then relaunched, and five such failures
+# inside StartLimitIntervalSec latched the unit into start-limit-hit — i.e.
+# seconds of DB trouble became a full API outage needing a human restart. A
+# liveness probe must not depend on the database.
+@app.get("/api/health/live", tags=["Health"])
+async def liveness_probe():
+    """Liveness probe: the process is up and able to serve HTTP. No DB call.
+
+    Public (see ``security._PUBLIC_PATHS``) and dependency-free so it cannot
+    401, 503, or hang on the database — the properties a systemd/ELB liveness
+    gate needs. Deep DB + freshness health lives at ``/api/health``.
+    """
+    return {"status": "alive"}
+
+
 @app.get("/api/health", response_model=HealthStatus, tags=["Health"])
 async def health_check(response: Response):
-    """Check API and database health.
+    """Check API and database health (DEEP — touches the DB).
 
     Returns HTTP 200 only when the database is reachable. A degraded
     backend (db_manager.check_health() returns False) surfaces as HTTP
@@ -490,34 +516,49 @@ async def health_check(response: Response):
     and Kubernetes probes can act on the status code — the previous
     behavior returned 200 with ``status="degraded"`` and was treated as
     healthy by every standard probe.
+
+    For a process-liveness signal that does NOT depend on the DB (e.g. the
+    systemd ExecStartPost gate), use ``/api/health/live`` instead.
     """
     try:
         db = _db()
-        # Test database connection
+        # DB connectivity is the fitness signal. check_health() is bounded
+        # (see DatabaseManager.check_health) so a saturated pool fails this
+        # fast instead of hanging the probe.
         is_healthy = await db.check_health()
-
-        # Get data freshness
-        last_quote = await db.get_latest_quote()
-        last_update = last_quote["timestamp"] if last_quote else None
-
-        # Calculate data age
-        data_age_seconds = None
-        if last_update:
-            et_tz = pytz.timezone("US/Eastern")
-            now = datetime.now(et_tz)
-            age = (now - last_update).total_seconds()
-            data_age_seconds = int(age)
 
         if not is_healthy:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return HealthStatus(
+                status="degraded",
+                database_connected=False,
+                last_data_update=None,
+                data_age_seconds=None,
+            )
+
+        # Data freshness is BEST-EFFORT: a slow or failed freshness read must
+        # not turn a reachable backend into a 503, and must not hang the
+        # response, so it is bounded and its failure is swallowed.
+        last_update = None
+        data_age_seconds = None
+        try:
+            last_quote = await asyncio.wait_for(db.get_latest_quote(), timeout=3.0)
+            last_update = last_quote["timestamp"] if last_quote else None
+            if last_update:
+                et_tz = pytz.timezone("US/Eastern")
+                now = datetime.now(et_tz)
+                data_age_seconds = int((now - last_update).total_seconds())
+        except Exception:
+            logger.warning("health: data-freshness read unavailable", exc_info=True)
+
         return HealthStatus(
-            status="healthy" if is_healthy else "degraded",
-            database_connected=is_healthy,
+            status="healthy",
+            database_connected=True,
             last_data_update=last_update,
             data_age_seconds=data_age_seconds,
         )
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error(f"Health check failed: {e!r}")
         raise HTTPException(status_code=503, detail="Service unavailable")
 
 

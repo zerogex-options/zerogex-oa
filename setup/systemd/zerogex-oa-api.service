@@ -29,23 +29,21 @@ ExecStart=/home/ubuntu/zerogex-oa/venv/bin/uvicorn \
     --log-level info
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Readiness probe: don't mark the unit Active until /api/health responds
-# 200. Retries up to 30s while uvicorn binds. Sends X-API-Key when set
-# in EnvironmentFile (the global Depends(api_key_auth) covers /api/health
-# too) and falls back to anonymous when API_KEY is empty so dev installs
-# without auth still boot. --retry-connrefused needs curl >= 7.52
-# (Ubuntu 22.04 ships 7.81).
+# Readiness gate: don't mark the unit Active until the process answers on
+# /api/health/live — a DB-FREE liveness endpoint (src/api/main.py; listed in
+# security._PUBLIC_PATHS so it needs no credentials). Retries up to ~30s while
+# uvicorn binds. --retry-connrefused needs curl >= 7.52 (Ubuntu 22.04 ships
+# 7.81).
 #
-# `$$API_KEY` (with the $$ escape) is the shell expansion, not a systemd
-# substitution — necessary so keys containing $/'/" pass through cleanly
-# instead of being interpolated by systemd before reaching the shell.
-ExecStartPost=/bin/sh -c 'if [ -n "$$API_KEY" ]; then \
-    /usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused --max-time 5 \
-        -H "X-API-Key: $$API_KEY" http://127.0.0.1:8000/api/health > /dev/null; \
-  else \
-    /usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused --max-time 5 \
-        http://127.0.0.1:8000/api/health > /dev/null; \
-  fi'
+# This intentionally does NOT probe the deep, DB-touching /api/health. Gating
+# startup on a DB check means a transient DB blip during a (re)start fails
+# ExecStartPost; Restart=always then relaunches and StartLimitBurst latches
+# the unit into start-limit-hit — turning seconds of DB trouble into a full,
+# human-in-the-loop outage. Liveness must reflect only "is this process
+# serving HTTP?"; deep DB health is monitored separately via /api/health.
+ExecStartPost=/bin/sh -c '/usr/bin/curl --fail --silent --show-error \
+    --retry 30 --retry-delay 1 --retry-connrefused --max-time 5 \
+    http://127.0.0.1:8000/api/health/live > /dev/null'
 
 # Restart policy
 Restart=always

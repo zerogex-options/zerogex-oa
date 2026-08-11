@@ -61,3 +61,34 @@ def test_health_returns_503_when_db_unreachable(monkeypatch):
     # that DO read the body see the same diagnostics they always did.
     assert body["status"] == "degraded"
     assert body["database_connected"] is False
+
+
+def test_liveness_returns_200_even_when_db_down(monkeypatch):
+    """``/api/health/live`` is the process-up signal the systemd
+    ExecStartPost gate probes. It must NOT depend on the database — that
+    coupling is what let a transient DB blip during a (re)start latch the
+    unit into start-limit-hit. So even with the deep DB health failing,
+    liveness stays 200."""
+    app = _build_app(monkeypatch, check_health_returns=False)
+
+    # Make the DB freshness read explode if it is ever touched: liveness
+    # must reach none of it.
+    from src.api import database as dbmod
+
+    dbmod.DatabaseManager.get_latest_quote = AsyncMock(
+        side_effect=RuntimeError("liveness must not touch the DB")
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/health/live")
+    assert response.status_code == 200
+    assert response.json()["status"] == "alive"
+
+
+def test_liveness_path_is_public():
+    """The liveness path must bypass auth so the probe never 401s when
+    ``API_KEY`` is set in production (Phase 7 removes the nginx X-API-Key
+    injection)."""
+    from src.api.security import _PUBLIC_PATHS
+
+    assert "/api/health/live" in _PUBLIC_PATHS

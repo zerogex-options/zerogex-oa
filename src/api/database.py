@@ -795,14 +795,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             except Exception:
                 logger.warning("Failed to release DB connection", exc_info=True)
 
-    async def check_health(self) -> bool:
-        """Check database connection health"""
+    async def check_health(self, timeout: float = 5.0) -> bool:
+        """Check database connection health, bounded by ``timeout`` seconds.
+
+        The bound matters under pool saturation: with every request slot held
+        by slow reads, even this ``SELECT 1`` used to queue behind them (see
+        the sizing note in ``_create_pool``), so the deep ``/api/health`` could
+        hang well past a monitor's own timeout. Bounding it makes a saturated
+        or unreachable backend fail *fast* — a prompt 503 the load balancer and
+        uptime monitors can act on — instead of blocking. Liveness
+        (``/api/health/live``) is DB-free and never reaches this path.
+        """
         try:
-            async with self._acquire_connection() as conn:
-                await conn.fetchval("SELECT 1")
+            async def _probe() -> None:
+                async with self._acquire_connection() as conn:
+                    await conn.fetchval("SELECT 1")
+
+            await asyncio.wait_for(_probe(), timeout=timeout)
             return True
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
+            logger.error(f"Health check failed: {e!r}")
             return False
 
     @staticmethod

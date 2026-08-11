@@ -54,7 +54,7 @@ _bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 # — critical for Phase 7 when API_KEY is removed from .env: the systemd
 # unit's ExecStartPost curl /api/health would otherwise 401 and trip the
 # service into a restart loop.
-_PUBLIC_PATHS: Set[str] = {"/api/health"}
+_PUBLIC_PATHS: Set[str] = {"/api/health", "/api/health/live"}
 
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
 _ENVIRONMENT: str = _getenv_str("ENVIRONMENT", "development").lower()
