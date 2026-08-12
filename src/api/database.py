@@ -3147,6 +3147,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- gbs.expiration = ANY(...)) predicate keeps a single fixed-shape
             -- SQL for both the "all" (NULL) and specific-set modes.
             --
+            -- AGGREGATION CONTRACT — per-strike gamma is a TRUE SUM across the
+            -- selected expirations.  ``expiration`` is summed OVER: it is never
+            -- a GROUP BY key and never escapes ``SUM()``, so several expirations
+            -- at one (bucket_ts, strike) ADD rather than collapse to one row.
+            -- ``= ANY($3)`` admits a SUPERSET of any subset, and call/put gamma
+            -- are stored non-negative (Σ γ·OI, see _calculate_gex_by_strike),
+            -- so the per-(rep_ts, strike) aggregate is MONOTONE in the
+            -- expiration set: adding an expiration can only grow or hold it,
+            -- never shrink it.  Do NOT rewrite this as a DISTINCT ON (strike) /
+            -- "latest expiration per strike" — that collapse makes a
+            -- multi-expiration chart's per-strike gamma SHRINK to one
+            -- expiration's value (regression-guarded by
+            -- tests/test_strike_profile_timeseries_expiration_sum.py and the
+            -- SQL-shape check in tests/test_strike_profile_timeseries_query.py).
+            --
             -- The extra ``gbs.timestamp BETWEEN start_ts AND end_ts`` bound is
             -- logically REDUNDANT (every br.rep_ts already lies inside the
             -- window ``bucket_reps`` was filtered to) but performance-critical.

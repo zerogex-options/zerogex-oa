@@ -223,6 +223,57 @@ def test_expiration_filter_is_fixed_shape_predicate():
 
 
 # ---------------------------------------------------------------------------
+# Per-strike gamma is SUMMED across expirations (never collapsed to one)
+# ---------------------------------------------------------------------------
+
+
+def test_strikes_cte_sums_gamma_across_expirations_not_collapse():
+    """Per-(bucket, strike) gamma must be a SUM across every admitted
+    expiration — the aggregate a multi-expiration Strike-Profile selection
+    renders.  The regression this guards against is a *collapse* that reduces
+    multiple expirations to a single one per strike (a ``DISTINCT ON (strike)``
+    "latest row per group", an average, or a JOIN-then-dedup): that makes the
+    chart's per-strike gamma SHRINK when a second expiration is added instead
+    of growing — the reported symptom (an isolated 0DTE per-strike max ~3.6B
+    dropping to the next day's value ALONE ~350.7M once a second date is
+    added).  ``call_gamma``/``put_gamma`` are stored as non-negative
+    ``sum(γ × OI)`` (see ``_calculate_gex_by_strike``), so a true SUM is
+    monotone in the expiration set while a collapse is not.
+
+    Pinned at the SQL-shape level so it runs in CI without a database; the
+    value-level invariant is exercised against a real Postgres in
+    ``tests/test_strike_profile_timeseries_expiration_sum.py``.
+    """
+    sql = _run("SPY")["query"]
+
+    # Isolate the ``strikes`` CTE (header -> its GROUP BY) so an assertion
+    # can't be satisfied by an unrelated part of the surrounding query.
+    start = sql.index("strikes AS (")
+    group_by = "GROUP BY br.bucket_ts, gbs.strike"
+    end = sql.index(group_by, start) + len(group_by)
+    strikes_cte = sql[start:end]
+
+    # Gamma (and OI) are SUMmed across the admitted expirations.
+    assert "SUM(COALESCE(gbs.call_gamma, 0))" in strikes_cte
+    assert "SUM(COALESCE(gbs.put_gamma, 0))" in strikes_cte
+    assert "SUM(COALESCE(gbs.call_oi, 0))" in strikes_cte
+    assert "SUM(COALESCE(gbs.put_oi, 0))" in strikes_cte
+
+    # Grouped by (bucket, strike) ONLY: expiration is summed OVER, not a
+    # grouping key, so one output row per (bucket, strike) carries every
+    # selected expiration's gamma.  (``expiration`` still appears earlier in
+    # the CTE's WHERE filter — that's the set predicate, not a grouping key —
+    # so this check is scoped to the text after GROUP BY.)
+    assert "expiration" not in strikes_cte.split("GROUP BY")[1]
+
+    # No collapse: the strikes CTE must not reduce to a single row per strike
+    # via a DISTINCT ON / latest-expiration ordering.  Either would keep only
+    # one expiration per strike and reintroduce the shrink-on-add regression.
+    assert "DISTINCT ON" not in strikes_cte
+    assert "ORDER BY" not in strikes_cte
+
+
+# ---------------------------------------------------------------------------
 # OHLC bucketed against the SAME bucket expression
 # ---------------------------------------------------------------------------
 
