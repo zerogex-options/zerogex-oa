@@ -1,15 +1,16 @@
 """Forced Flow API (Phase 3).
 
-Six read endpoints over the forced-flow engine (``src.analytics.forced_flow``),
+Eight read endpoints over the forced-flow engine (``src.analytics.forced_flow``),
 all derived from the one ``dealer_hedge_flow`` primitive:
 
-    GET /api/forced-flow/curve         flow vs. spot (grid) + per-source attribution
-    GET /api/forced-flow/charm-decay   cumulative time-forced flow to the close
-    GET /api/forced-flow/vanna-ladder  flow vs. IV change (vol points)
-    GET /api/forced-flow/surface       spot x time-of-day -> flow (heatmap)
-    GET /api/forced-flow/levels        gamma / charm / vanna flip + zero-flow level
-    GET /api/forced-flow/scenario      one arbitrary (spot, time, vol) what-if
-    GET /api/forced-flow/backtest      charm-into-close track record (hit rate)
+    GET /api/forced-flow/curve            flow vs. spot (grid) + per-source attribution
+    GET /api/forced-flow/charm-decay      cumulative time-forced flow to the close
+    GET /api/forced-flow/vanna-ladder     flow vs. IV change (vol points)
+    GET /api/forced-flow/surface          spot x time-of-day -> flow (heatmap)
+    GET /api/forced-flow/session-surface  full-session field: actual history + projection
+    GET /api/forced-flow/levels           gamma / charm / vanna flip + zero-flow level
+    GET /api/forced-flow/scenario         one arbitrary (spot, time, vol) what-if
+    GET /api/forced-flow/backtest         charm-into-close track record (hit rate)
 
 Each response carries the snapshot ``timestamp`` and the ``spot`` it was computed
 against. Results are recomputed on demand from the latest chain (fresh, always
@@ -25,25 +26,29 @@ import asyncio
 import logging
 import threading
 import time
-from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from datetime import datetime, time as dt_time, timedelta
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from src.analytics.forced_flow import (
+    SessionColumn,
     charm_backtest_summary,
     charm_flip,
     charm_into_close,
     dealer_hedge_flow,
     flow_total,
     forced_flow_curve,
+    session_forced_flow_field,
     spot_grid,
     vanna_flip,
     vanna_ladder,
     zero_flow_level,
 )
-from src.analytics.main_engine import AnalyticsEngine
+from src.analytics.main_engine import ET, AnalyticsEngine
+from src.database import db_connection
+from src.symbols import get_canonical_symbol
 
 from ..database import DatabaseManager
 
@@ -70,6 +75,21 @@ _SCENARIO_MIN_TTE_YEARS = 30.0 / (365.0 * 24.0 * 60.0)
 # dominates the wings; the actionable gamma structure lives near spot. Callers
 # can widen via the query param.
 _DEFAULT_VIEW_SPAN_PCT = 0.02
+
+# Full-session field (/session-surface) tuning.
+# Fixed price-grid resolution, held constant across every column so the field is
+# a clean rectangle sharing one axis (the surface heatmap the frontend draws).
+_SESSION_PRICE_POINTS = 41
+# Lookback for the as-of latest-per-contract reconstruction (query #3). Matches
+# the engine's steady-state snapshot window: during RTH every active contract is
+# requoted within minutes, so a 2h window always covers the book recorded at that
+# minute, and the DISTINCT-ON walk stays cheap.
+_ASOF_LOOKBACK_HOURS = 2.0
+# Hard row cap on the as-of chain query (mirrors the engine's default
+# ANALYTICS_SNAPSHOT_MAX_ROWS); well above any realistic chain size.
+_ASOF_SNAPSHOT_ROW_CAP = 50000
+# Below this many surviving columns the field is too sparse to plot; return 404.
+_SESSION_MIN_COLUMNS = 3
 
 _cache: Dict[tuple, Dict[str, Any]] = {}
 _cache_lock = threading.Lock()
@@ -145,6 +165,148 @@ def _load(symbol: str, expiry: Optional[str] = None) -> Optional[Dict[str, Any]]
         "q": engine.dividend_yield,
         "session_days": engine._session_days_remaining(snapshot["timestamp"]),
     }
+
+
+def _load_asof(sym: str, at_ts: datetime) -> Optional[Dict[str, Any]]:
+    """As-of snapshot for the session field's PAST columns: the book actually
+    recorded at or before ``at_ts``, rebuilt straight from ``option_chains``.
+
+    Mirrors the three queries of ``AnalyticsEngine._get_snapshot`` -- (1) latest
+    chain timestamp for the underlying, (2) underlying close as of that ts, (3)
+    the DISTINCT-ON latest-per-contract chain over a lookback window with the
+    expiration roll-off and ``gamma IS NOT NULL`` filter -- but pinned to
+    ``timestamp <= at_ts`` and WITHOUT the live-cycle gates: no in-session
+    max-staleness refusal, no close-stamp forward re-anchor, no extended-hours
+    spot re-anchor. Those gates defend the LIVE recompute against a stuck feed;
+    here we deliberately want the frozen historical book exactly as it was
+    recorded at that minute, so recomputing the past field is faithful. The
+    persisted ``forced_flow_profile.profile`` JSONB is written empty, so this
+    reconstruction is the ONLY source of the actual past field.
+
+    Does NOT modify ``_get_snapshot``. Query #3 reuses the engine's own
+    ``_SNAPSHOT_QUERY`` class attribute, so the column list and predicates are
+    byte-identical and cannot drift. Returns ``{'timestamp', 'spot', 'options'}``
+    or None when no chain / no spot / no priceable rows exist at or before
+    ``at_ts``.
+    """
+    db_symbol = get_canonical_symbol(sym)
+    with db_connection() as conn:
+        cursor = conn.cursor()
+
+        # 1. Latest option-chain timestamp for this underlying at or before at_ts.
+        cursor.execute(
+            """
+            SELECT timestamp
+            FROM option_chains
+            WHERE underlying = %s
+              AND timestamp <= %s
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (db_symbol, at_ts),
+        )
+        ts_row = cursor.fetchone()
+        if not ts_row or ts_row[0] is None:
+            return None
+        ts = ts_row[0]
+
+        # 2. Underlying close as of that chain timestamp. No staleness gate: an
+        # hours-old close is exactly what we want for a frozen historical minute.
+        cursor.execute(
+            """
+            SELECT close
+            FROM underlying_quotes
+            WHERE symbol = %s
+              AND timestamp <= %s
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (db_symbol, ts),
+        )
+        uq_row = cursor.fetchone()
+        spot = float(uq_row[0]) if uq_row and uq_row[0] is not None else None
+        if spot is None or spot <= 0:
+            return None
+
+        # 3. Latest-per-contract chain over the lookback window, with the same
+        # 16:15 ET expiration roll-off as _get_snapshot and the gamma-populated
+        # filter. Reuses _SNAPSHOT_QUERY verbatim so the SELECT column list and
+        # predicates match query #3 exactly.
+        ts_et = ts.astimezone(ET)
+        if ts_et.time() < dt_time(16, 15):
+            min_expiration = ts_et.date() - timedelta(days=1)
+        else:
+            min_expiration = ts_et.date()
+        lookback_start = ts - timedelta(hours=_ASOF_LOOKBACK_HOURS)
+        cursor.execute(
+            AnalyticsEngine._SNAPSHOT_QUERY,
+            (db_symbol, ts, lookback_start, min_expiration, _ASOF_SNAPSHOT_ROW_CAP),
+        )
+        rows = cursor.fetchall()
+
+    # Same row->dict mapping as _get_snapshot (only the fields build_legs reads
+    # are load-bearing; the rest are carried for parity).
+    options = [
+        {
+            "option_symbol": row[0],
+            "strike": float(row[1]),
+            "expiration": row[2],
+            "option_type": row[3],
+            "last": float(row[4]) if row[4] else 0.0,
+            "bid": float(row[5]) if row[5] else 0.0,
+            "ask": float(row[6]) if row[6] else 0.0,
+            "volume": int(row[7]) if row[7] else 0,
+            "open_interest": int(row[8]) if row[8] else 0,
+            "delta": float(row[9]) if row[9] else 0.0,
+            "gamma": float(row[10]) if row[10] else 0.0,
+            "theta": float(row[11]) if row[11] else 0.0,
+            "vega": float(row[12]) if row[12] else 0.0,
+            "implied_volatility": float(row[13]) if row[13] else None,
+        }
+        for row in rows
+    ]
+    if not options:
+        return None
+    return {"timestamp": ts, "spot": spot, "options": options}
+
+
+def _session_day_range(
+    db_symbol: str, day_start: datetime
+) -> Tuple[Optional[float], Optional[float]]:
+    """Today's realized ``(low, high)`` for ``db_symbol`` from ``underlying_quotes``,
+    from ``day_start`` (the ET session open) to now.
+
+    Used only to widen the field's price grid so it spans where spot ACTUALLY
+    travelled today, not just a symmetric band around the last print. Returns
+    ``(None, None)`` on any error or an empty session so the caller falls back to
+    the span window alone -- a missing day-range must never fail the endpoint.
+    """
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT min(low), max(high)
+                FROM underlying_quotes
+                WHERE symbol = %s
+                  AND timestamp >= %s
+                """,
+                (db_symbol, day_start),
+            )
+            row = cursor.fetchone()
+        if row and row[0] is not None and row[1] is not None:
+            return float(row[0]), float(row[1])
+    except Exception as e:  # pragma: no cover - defensive; grid falls back to span
+        logger.debug("session-surface day-range query failed for %s: %s", db_symbol, e)
+    return None, None
+
+
+def _linspace(lo: float, hi: float, n: int) -> List[float]:
+    """``n``-point inclusive linear grid from ``lo`` to ``hi`` (numpy-free)."""
+    if n <= 1:
+        return [lo]
+    step = (hi - lo) / (n - 1)
+    return [lo + step * i for i in range(n)]
 
 
 async def _run(key: tuple, fn: Callable[..., Optional[Dict[str, Any]]], *args) -> Dict[str, Any]:
@@ -223,6 +385,25 @@ class SurfaceResponse(_TsModel):
     spots: List[float]
     times_days: List[float]
     z: List[List[float]]  # z[i][j] = flow at spots[i], times_days[j]
+
+
+class SessionColumnOut(BaseModel):
+    min_to_close: float  # minutes remaining to the cash close at this time-slice
+    spot: float  # reference spot for this column
+    magnet: Optional[float] = None  # zero-flow level for this column (nearest to spot)
+    is_past: bool  # True = actual recorded book; False = current-book projection
+
+
+class SessionSurfaceResponse(_TsModel):
+    symbol: str
+    spot: float
+    timestamp: datetime
+    session_open_min_to_close: float  # minutes open->close (~390)
+    now_min_to_close: float  # minutes now->close
+    prices: List[float]  # shared ascending price axis
+    z: List[List[float]]  # z[col][price] = flow to move spot to prices[price] by close
+    columns: List[SessionColumnOut]  # one per time-slice, open (left) -> close (right)
+    now_index: int  # index of the last actual (is_past) column -- the NOW column
 
 
 class LevelsResponse(_TsModel):
@@ -466,6 +647,124 @@ def _surface_sync(sym, expiry, spot_range_pct, time_steps):
         "spots": spots,
         "times_days": times,
         "z": z,
+    }
+
+
+@router.get("/session-surface", response_model=SessionSurfaceResponse)
+async def get_session_surface(
+    symbol: str = Query(default="SPY"),
+    spot_range_pct: float = Query(default=_DEFAULT_VIEW_SPAN_PCT, gt=0.0, le=0.5),
+    past_steps: int = Query(default=30, ge=1, le=120, description="Actual-history columns"),
+    future_steps: int = Query(default=8, ge=1, le=48, description="Projection columns to close"),
+    expiry: Optional[str] = Query(default=None),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Full-session forced-flow field: the ACTUAL historical field recomputed from
+    stored ``option_chains`` (RTH open -> now) plus a projection of the current
+    book (now -> close).
+
+    Columns march left (open) to right (close); ``now_index`` marks the boundary
+    between recorded history and projection. History is rebuilt from
+    ``option_chains`` because the persisted ``forced_flow_profile.profile`` JSONB
+    is written empty -- so the past field cannot be read back, only recomputed.
+    """
+    sym = symbol.upper()
+    key = ("session-surface", sym, spot_range_pct, past_steps, future_steps, expiry)
+    data = await _run(
+        key, _session_surface_sync, sym, spot_range_pct, past_steps, future_steps, expiry
+    )
+    return SessionSurfaceResponse(**data)
+
+
+def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
+    ctx = _load(sym, expiry)
+    if ctx is None:
+        return None
+    now_ts = ctx["timestamp"]
+    spot = ctx["spot"]
+    r, q = ctx["r"], ctx["q"]
+
+    # Anchor the time axis to today's 16:00 ET cash close, in minutes-to-close.
+    # Mirrors _session_days_remaining's .replace() convention (safe within a
+    # single trading day -- no DST transition between the open and the close).
+    now_et = now_ts.astimezone(ET)
+    close_dt = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    open_dt = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    now_min_to_close = max(0.0, (close_dt - now_et).total_seconds() / 60.0)
+    # Full RTH span (~390 min), floored at now's remaining minutes so a pre-open
+    # call (now farther from the close than the open is) still yields open >= now.
+    session_open_min_to_close = max(now_min_to_close, (close_dt - open_dt).total_seconds() / 60.0)
+
+    # Price grid: union today's realized [low, high] with the +/- span window, so
+    # the field spans both where spot actually travelled and a symmetric view
+    # band. Any failure falls back to the span window alone.
+    day_lo, day_hi = _session_day_range(get_canonical_symbol(sym), open_dt)
+    p_lo = spot * (1.0 - span) if day_lo is None else min(day_lo, spot * (1.0 - span))
+    p_hi = spot * (1.0 + span) if day_hi is None else max(day_hi, spot * (1.0 + span))
+    if not (p_hi > p_lo > 0.0):
+        p_lo, p_hi = spot * (1.0 - span), spot * (1.0 + span)
+    prices = _linspace(p_lo, p_hi, _SESSION_PRICE_POINTS)
+
+    # One engine, reused for as-of leg-building across every past column.
+    engine = AnalyticsEngine(sym)
+    columns: List[SessionColumn] = []
+
+    # PAST columns: open (left) marching toward now, EXCLUSIVE of the now endpoint
+    # (range(past_steps) stops one step short of frac==1). Each is the actual book
+    # recorded at that minute, rebuilt from option_chains via _load_asof. The
+    # column's min_to_close is taken from tau (a clean, evenly-spaced time axis);
+    # its book/spot are the as-of actuals at or before tau.
+    for k in range(past_steps):
+        frac = k / past_steps  # 0 .. (N-1)/N -- never reaches 1 (now)
+        mtc = session_open_min_to_close + frac * (now_min_to_close - session_open_min_to_close)
+        tau = close_dt - timedelta(minutes=mtc)
+        try:
+            asof = _load_asof(sym, tau)
+            if asof is None:
+                continue
+            legs = engine._build_forced_flow_legs(asof["options"], asof["timestamp"])
+        except Exception as e:  # pragma: no cover - defensive per-bucket skip
+            logger.debug("session-surface as-of bucket at %s failed: %s", tau, e)
+            continue
+        if not legs:
+            continue
+        columns.append(
+            SessionColumn(min_to_close=mtc, spot=float(asof["spot"]), is_past=True, legs=legs)
+        )
+
+    # NOW column: the live book/spot -- still an ACTUAL reading, and the boundary.
+    columns.append(
+        SessionColumn(min_to_close=now_min_to_close, spot=spot, is_past=True, legs=ctx["legs"])
+    )
+    now_index = len(columns) - 1  # index of the last is_past column (the NOW column)
+
+    # FUTURE columns: project the CURRENT book/spot forward, now -> ~close.
+    for k in range(1, future_steps + 1):
+        mtc = now_min_to_close * (1.0 - k / future_steps)
+        columns.append(
+            SessionColumn(min_to_close=max(0.0, mtc), spot=spot, is_past=False, legs=ctx["legs"])
+        )
+
+    # Too few surviving columns -> the field is not meaningfully plottable.
+    if len(columns) < _SESSION_MIN_COLUMNS:
+        return None
+
+    field = session_forced_flow_field(columns, prices, r, q, min_tte_years=_SCENARIO_MIN_TTE_YEARS)
+    return {
+        "symbol": sym,
+        "spot": spot,
+        "timestamp": now_ts,
+        "session_open_min_to_close": session_open_min_to_close,
+        "now_min_to_close": now_min_to_close,
+        "prices": field["prices"],
+        "z": field["z"],
+        "columns": [
+            {"min_to_close": mtc, "spot": s, "magnet": mag, "is_past": past}
+            for mtc, s, mag, past in zip(
+                field["min_to_close"], field["spots"], field["magnets"], field["is_past"]
+            )
+        ],
+        "now_index": now_index,
     }
 
 
