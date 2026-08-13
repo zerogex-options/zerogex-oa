@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 import time
 from datetime import datetime, time as dt_time, timedelta
@@ -33,14 +34,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from src.analytics.forced_flow import (
-    SessionColumn,
     charm_backtest_summary,
     charm_flip,
     charm_into_close,
     dealer_hedge_flow,
     flow_total,
     forced_flow_curve,
-    session_forced_flow_field,
+    session_column_flow,
     spot_grid,
     vanna_flip,
     vanna_ladder,
@@ -93,6 +93,48 @@ _SESSION_MIN_COLUMNS = 3
 
 _cache: Dict[tuple, Dict[str, Any]] = {}
 _cache_lock = threading.Lock()
+
+# Per-(trading-day, symbol, time-bucket, price-grid) cache of ONE computed PAST
+# column of the session field. A past bucket's as-of book is immutable, so its
+# z-row / magnet never change once computed -- memoize them so each 30s
+# response-cache expiry reprices only the live now + projection columns (the
+# whole recorded history is then DB-free and reprice-free on a warm cache). The
+# trading date is the leading key element so a daily prune drops yesterday.
+_past_col_cache: Dict[tuple, Dict[str, Any]] = {}
+_past_col_cache_lock = threading.Lock()
+# Insertion-order eviction ceiling (dicts preserve insertion order). ~30 buckets
+# x a few symbols x a couple of grids per day sits far under this.
+_PAST_COL_CACHE_MAX = 6000
+# Snap the price band to this fraction of spot so a fresh intraday extreme only
+# re-grids -- and cold-misses the past cache -- when it moves the band a real
+# amount, not on every tick.
+_SESSION_GRID_QUANTUM_PCT = 0.001
+
+
+def _quantize_band(p_lo: float, p_hi: float, spot: float) -> Tuple[float, float]:
+    """Snap ``[p_lo, p_hi]`` out to a coarse grid (~0.1% of spot) so tiny intraday
+    range changes keep the same price axis -- and the same past-column cache."""
+    step = max(1e-6, spot * _SESSION_GRID_QUANTUM_PCT)
+    return math.floor(p_lo / step) * step, math.ceil(p_hi / step) * step
+
+
+def _past_col_get(key: tuple) -> Optional[Dict[str, Any]]:
+    with _past_col_cache_lock:
+        return _past_col_cache.get(key)
+
+
+def _past_col_put(key: tuple, value: Dict[str, Any]) -> None:
+    with _past_col_cache_lock:
+        _past_col_cache[key] = value
+        while len(_past_col_cache) > _PAST_COL_CACHE_MAX:
+            _past_col_cache.pop(next(iter(_past_col_cache)))  # evict oldest
+
+
+def _past_col_prune_to_day(trading_date: str) -> None:
+    """Drop cached columns from any other trading date (``key[0]`` is the date)."""
+    with _past_col_cache_lock:
+        for k in [k for k in _past_col_cache if k[0] != trading_date]:
+            _past_col_cache.pop(k, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -697,26 +739,43 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
 
     # Price grid: union today's realized [low, high] with the +/- span window, so
     # the field spans both where spot actually travelled and a symmetric view
-    # band. Any failure falls back to the span window alone.
+    # band. Any failure falls back to the span window alone. Quantized so a fresh
+    # extreme keeps the same axis (and past-column cache) unless it moves the band
+    # meaningfully.
     day_lo, day_hi = _session_day_range(get_canonical_symbol(sym), open_dt)
     p_lo = spot * (1.0 - span) if day_lo is None else min(day_lo, spot * (1.0 - span))
     p_hi = spot * (1.0 + span) if day_hi is None else max(day_hi, spot * (1.0 + span))
     if not (p_hi > p_lo > 0.0):
         p_lo, p_hi = spot * (1.0 - span), spot * (1.0 + span)
+    p_lo, p_hi = _quantize_band(p_lo, p_hi, spot)
     prices = _linspace(p_lo, p_hi, _SESSION_PRICE_POINTS)
 
-    # One engine, reused for as-of leg-building across every past column.
-    engine = AnalyticsEngine(sym)
-    columns: List[SessionColumn] = []
+    # Cache identity for the immutable PAST columns: (trading-day, symbol,
+    # time-bucket, price-grid). Prune any prior day, then reuse/compute per bucket.
+    db_symbol = get_canonical_symbol(sym)
+    trading_date = now_et.date().isoformat()
+    grid_key = (round(p_lo, 4), round(p_hi, 4), _SESSION_PRICE_POINTS)
+    _past_col_prune_to_day(trading_date)
 
-    # PAST columns: open (left) marching toward now, EXCLUSIVE of the now endpoint
-    # (range(past_steps) stops one step short of frac==1). Each is the actual book
-    # recorded at that minute, rebuilt from option_chains via _load_asof. The
-    # column's min_to_close is taken from tau (a clean, evenly-spaced time axis);
-    # its book/spot are the as-of actuals at or before tau.
-    for k in range(past_steps):
-        frac = k / past_steps  # 0 .. (N-1)/N -- never reaches 1 (now)
-        mtc = session_open_min_to_close + frac * (now_min_to_close - session_open_min_to_close)
+    # One engine, reused for as-of leg-building across every (cold) past column.
+    engine = AnalyticsEngine(sym)
+
+    # PAST columns on a FIXED minutes-to-close grid marching from the open toward
+    # now (exclusive of now). Fixed buckets map to the same wall-clock instant
+    # every request, so each computed column stays cache-hot -- a warm session
+    # reprices only the live now + projection columns below. Each cold bucket is
+    # the actual book recorded at or before that instant, rebuilt via _load_asof.
+    past_cols: List[Dict[str, Any]] = []
+    step = session_open_min_to_close / past_steps if past_steps > 0 else session_open_min_to_close
+    for k in range(past_steps + 1):
+        mtc = session_open_min_to_close - k * step
+        if mtc <= now_min_to_close + 1e-6:
+            break  # the live NOW column (below) takes over from here to the close
+        ckey = (trading_date, db_symbol, round(mtc, 3), grid_key)
+        cached = _past_col_get(ckey)
+        if cached is not None:
+            past_cols.append(cached)
+            continue
         tau = close_dt - timedelta(minutes=mtc)
         try:
             asof = _load_asof(sym, tau)
@@ -728,41 +787,66 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
             continue
         if not legs:
             continue
-        columns.append(
-            SessionColumn(min_to_close=mtc, spot=float(asof["spot"]), is_past=True, legs=legs)
+        row, mag = session_column_flow(
+            float(asof["spot"]), legs, mtc, prices, r, q, _SCENARIO_MIN_TTE_YEARS
         )
+        col = {
+            "min_to_close": mtc,
+            "spot": float(asof["spot"]),
+            "magnet": mag,
+            "is_past": True,
+            "z": row,
+        }
+        _past_col_put(ckey, col)
+        past_cols.append(col)
 
-    # NOW column: the live book/spot -- still an ACTUAL reading, and the boundary.
-    columns.append(
-        SessionColumn(min_to_close=now_min_to_close, spot=spot, is_past=True, legs=ctx["legs"])
+    # NOW column: the live book/spot -- an ACTUAL reading and the boundary. Never
+    # cached (it moves every cycle).
+    now_row, now_mag = session_column_flow(
+        spot, ctx["legs"], now_min_to_close, prices, r, q, _SCENARIO_MIN_TTE_YEARS
     )
-    now_index = len(columns) - 1  # index of the last is_past column (the NOW column)
+    columns: List[Dict[str, Any]] = past_cols + [
+        {
+            "min_to_close": now_min_to_close,
+            "spot": spot,
+            "magnet": now_mag,
+            "is_past": True,
+            "z": now_row,
+        }
+    ]
+    now_index = len(columns) - 1  # index of the NOW column (last is_past)
 
-    # FUTURE columns: project the CURRENT book/spot forward, now -> ~close.
+    # FUTURE columns: project the CURRENT book/spot forward, now -> ~close. Always
+    # fresh (they advance every cycle) and cheap -- only a handful.
     for k in range(1, future_steps + 1):
-        mtc = now_min_to_close * (1.0 - k / future_steps)
+        mtc = max(0.0, now_min_to_close * (1.0 - k / future_steps))
+        row, mag = session_column_flow(
+            spot, ctx["legs"], mtc, prices, r, q, _SCENARIO_MIN_TTE_YEARS
+        )
         columns.append(
-            SessionColumn(min_to_close=max(0.0, mtc), spot=spot, is_past=False, legs=ctx["legs"])
+            {"min_to_close": mtc, "spot": spot, "magnet": mag, "is_past": False, "z": row}
         )
 
     # Too few surviving columns -> the field is not meaningfully plottable.
     if len(columns) < _SESSION_MIN_COLUMNS:
         return None
 
-    field = session_forced_flow_field(columns, prices, r, q, min_tte_years=_SCENARIO_MIN_TTE_YEARS)
     return {
         "symbol": sym,
         "spot": spot,
         "timestamp": now_ts,
         "session_open_min_to_close": session_open_min_to_close,
         "now_min_to_close": now_min_to_close,
-        "prices": field["prices"],
-        "z": field["z"],
+        "prices": prices,
+        "z": [c["z"] for c in columns],
         "columns": [
-            {"min_to_close": mtc, "spot": s, "magnet": mag, "is_past": past}
-            for mtc, s, mag, past in zip(
-                field["min_to_close"], field["spots"], field["magnets"], field["is_past"]
-            )
+            {
+                "min_to_close": c["min_to_close"],
+                "spot": c["spot"],
+                "magnet": c["magnet"],
+                "is_past": c["is_past"],
+            }
+            for c in columns
         ],
         "now_index": now_index,
     }

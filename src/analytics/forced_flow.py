@@ -502,6 +502,38 @@ def zero_flow_level(
 # --------------------------------------------------------------------------- #
 # Full-session field -- the actual-history + projection heatmap.
 # --------------------------------------------------------------------------- #
+def session_column_flow(
+    spot: float,
+    legs: Sequence[ContractLeg],
+    min_to_close: float,
+    price_grid: Sequence[float],
+    r: float,
+    q: float = 0.0,
+    min_tte_years: float = 0.0,
+) -> Tuple[List[float], Optional[float]]:
+    """One session column: its forced-flow row over ``price_grid`` + its magnet.
+
+    The cell at price ``p`` is the flow (USD, +=buy) to walk spot from ``spot`` to
+    ``p`` while ``min_to_close`` minutes elapse to the bell::
+
+        f = flow_total(legs, spot, p/spot - 1, min_to_close/1440, 0, r, q)
+
+    ``magnet`` is the grid price nearest ``spot`` at which the row crosses zero --
+    that time-of-day's zero-flow level. Pure. This is the cacheable primitive
+    behind :func:`session_forced_flow_field`: a PAST column's book is immutable,
+    so the API layer can memoize one of these per (symbol, time-bucket, grid) and
+    reprice only the live now/projection columns each cycle.
+    """
+    prices = list(price_grid)
+    days_elapsed = min_to_close / 1440.0  # minutes-to-close -> engine days_elapsed
+    row = [
+        flow_total(legs, spot, p / spot - 1.0, days_elapsed, 0.0, r, q, min_tte_years)
+        for p in prices
+    ]
+    magnet = _nearest_crossing(list(zip(prices, row)), spot)
+    return row, magnet
+
+
 def session_forced_flow_field(
     columns: Sequence[SessionColumn],
     price_grid: Sequence[float],
@@ -545,16 +577,11 @@ def session_forced_flow_field(
     z: List[List[float]] = []
     magnets: List[Optional[float]] = []
     for col in columns:
-        # min_to_close minutes -> the engine's calendar-day ``days_elapsed``.
-        days_elapsed = col.min_to_close / 1440.0
-        row = [
-            flow_total(
-                col.legs, col.spot, p / col.spot - 1.0, days_elapsed, 0.0, r, q, min_tte_years
-            )
-            for p in prices
-        ]
+        row, magnet = session_column_flow(
+            col.spot, col.legs, col.min_to_close, prices, r, q, min_tte_years
+        )
         z.append(row)
-        magnets.append(_nearest_crossing(list(zip(prices, row)), col.spot))
+        magnets.append(magnet)
     return {
         "prices": prices,
         "z": z,

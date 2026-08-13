@@ -14,6 +14,7 @@ from src.analytics.forced_flow import (
     ContractLeg,
     SessionColumn,
     _nearest_crossing,
+    session_column_flow,
     session_forced_flow_field,
 )
 
@@ -121,6 +122,18 @@ def test_distinct_columns_yield_distinct_z_rows():
     assert field["z"][0] != field["z"][1]
     # Col 0 vs col 2: same legs, but different spot AND horizon -- still distinct.
     assert field["z"][0] != field["z"][2]
+
+
+def test_session_column_flow_matches_the_field():
+    # session_forced_flow_field delegates to session_column_flow per column (the
+    # cacheable primitive the API memoizes for immutable PAST columns), so one
+    # column's (row, magnet) must equal that column's slice of the full field.
+    cols = _columns()
+    field = session_forced_flow_field(cols, GRID, R, Q)
+    for i, c in enumerate(cols):
+        row, magnet = session_column_flow(c.spot, c.legs, c.min_to_close, GRID, R, Q)
+        assert row == field["z"][i]
+        assert magnet == field["magnets"][i]
 
 
 def test_min_tte_floor_is_inert_for_longer_dated_book():
