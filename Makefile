@@ -190,6 +190,10 @@ db-tail-api-calls: ## Show 50 most recent rows from tradestation_api_calls
 	@echo "$(BLUE)=== tradestation_api_calls (last 50) ===$(NC)"
 	@$(PSQL) -c "SELECT * FROM tradestation_api_calls ORDER BY window_start DESC LIMIT 50;"
 
+.PHONY: watch-quote-notify
+watch-quote-notify: ## Tail the real-time quote NOTIFY bus (zgx_quote_updates) in arrival order. Optional: SYMBOL=SPY RAW=1
+	@$(VENV_PYTHON) bin/watch_quote_notify.py $(if $(SYMBOL),--symbol $(SYMBOL),) $(if $(RAW),--raw,)
+
 .PHONY: db-diagnostics
 db-diagnostics: ## Run DB diagnostics snapshot (sessions, waits, blockers, slow queries, dead tuples)
 	@echo "$(BLUE)=== DB Diagnostics Snapshot ===$(NC)"
