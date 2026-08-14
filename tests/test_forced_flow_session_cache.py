@@ -73,21 +73,29 @@ def test_warm_one_caches_under_the_exact_endpoint_key(monkeypatch):
     # The whole point of the warmer is that on-demand GETs hit its cache -- so the
     # key _warm_one writes MUST equal the one get_session_surface reads. Stub the
     # (DB-backed) rebuild and assert the warmed value lands under that key.
+    import asyncio
+
     ff._cache.clear()
+    ff._inflight_tasks.clear()
     fake = {"symbol": "SPY", "z": [[1.0]], "now_index": 0}
     monkeypatch.setattr(ff, "_session_surface_sync", lambda *a, **k: fake)
-    ff._warm_one("SPY")
+    asyncio.run(ff._warm_one("SPY"))
     assert ff._cache_get(_endpoint_key("SPY")) is fake
     ff._cache.clear()
+    ff._inflight_tasks.clear()
 
 
 def test_warm_one_skips_cache_when_rebuild_returns_none(monkeypatch):
     # A degraded snapshot (None) must NOT poison the cache with an empty entry.
+    import asyncio
+
     ff._cache.clear()
+    ff._inflight_tasks.clear()
     monkeypatch.setattr(ff, "_session_surface_sync", lambda *a, **k: None)
-    ff._warm_one("SPY")
+    asyncio.run(ff._warm_one("SPY"))
     assert ff._cache_get(_endpoint_key("SPY")) is None
     ff._cache.clear()
+    ff._inflight_tasks.clear()
 
 
 def test_warm_loop_is_a_noop_when_disabled(monkeypatch):
@@ -99,3 +107,32 @@ def test_warm_loop_is_a_noop_when_disabled(monkeypatch):
     monkeypatch.setattr(ff, "_warm_one", lambda sym: called.append(sym))
     asyncio.run(ff.session_surface_warm_loop())
     assert called == []
+
+
+def test_session_surface_async_coalesces_concurrent_builds(monkeypatch):
+    # The stampede fix: N concurrent callers for the SAME field must trigger only
+    # ONE underlying rebuild; the rest await the shared Task and get its result.
+    import asyncio
+    import time as _t
+
+    ff._cache.clear()
+    ff._inflight_tasks.clear()
+    builds = []
+
+    def slow_build(*args, **kwargs):
+        builds.append(args[0])
+        _t.sleep(0.2)  # hold the build (in its worker thread) so callers pile up
+        return {"symbol": args[0], "z": [[1.0]], "now_index": 0}
+
+    monkeypatch.setattr(ff, "_session_surface_sync", slow_build)
+
+    async def main():
+        return await asyncio.gather(
+            *[ff._session_surface_async("SPY", 0.02, 30, 8, None) for _ in range(5)]
+        )
+
+    results = asyncio.run(main())
+    assert len(builds) == 1  # exactly one rebuild ran, not five
+    assert len(results) == 5 and all(r is not None and r["z"] == [[1.0]] for r in results)
+    ff._cache.clear()
+    ff._inflight_tasks.clear()
