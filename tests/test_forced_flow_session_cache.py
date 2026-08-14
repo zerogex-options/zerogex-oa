@@ -99,3 +99,36 @@ def test_warm_loop_is_a_noop_when_disabled(monkeypatch):
     monkeypatch.setattr(ff, "_warm_one", lambda sym: called.append(sym))
     asyncio.run(ff.session_surface_warm_loop())
     assert called == []
+
+
+def test_session_surface_cached_coalesces_concurrent_builds(monkeypatch):
+    # The stampede fix: N concurrent callers for the SAME field must trigger only
+    # ONE underlying rebuild; the rest wait on it and share the result.
+    import threading
+    import time as _t
+
+    ff._cache.clear()
+    ff._inflight.clear()
+    builds = []
+
+    def slow_build(*args, **kwargs):
+        builds.append(args[0])
+        _t.sleep(0.3)  # hold the build so the others pile up behind the owner
+        return {"symbol": args[0], "z": [[1.0]], "now_index": 0}
+
+    monkeypatch.setattr(ff, "_session_surface_sync", slow_build)
+    results = []
+
+    def call():
+        results.append(ff._session_surface_cached("SPY", 0.02, 30, 8, None))
+
+    threads = [threading.Thread(target=call) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(builds) == 1  # exactly one rebuild ran, not five
+    assert len(results) == 5 and all(r is not None and r["z"] == [[1.0]] for r in results)
+    ff._cache.clear()
+    ff._inflight.clear()

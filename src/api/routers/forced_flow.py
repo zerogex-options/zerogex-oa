@@ -115,6 +115,17 @@ _PAST_COL_CACHE_MAX = 6000
 # amount, not on every tick.
 _SESSION_GRID_QUANTUM_PCT = 0.001
 
+# Single-flight registry: coalesce concurrent identical session-surface rebuilds
+# so the warmer, the frontend, and any ad-hoc caller SHARE one rebuild instead of
+# each launching their own and stampeding the DB (the cold-start thundering herd
+# that turned a ~30s build into minutes). Keyed by the response-cache key; the
+# value is an Event the waiters block on until the owner populates the cache.
+_inflight: Dict[tuple, threading.Event] = {}
+_inflight_lock = threading.Lock()
+# Cap how long a waiter blocks on the in-flight owner before giving up and reading
+# whatever is cached -- guards against a wedged owner hanging every caller.
+_SESSION_BUILD_TIMEOUT_S = 180.0
+
 
 def _quantize_band(p_lo: float, p_hi: float, spot: float) -> Tuple[float, float]:
     """Snap ``[p_lo, p_hi]`` out to a coarse grid (~0.1% of spot) so tiny intraday
@@ -723,10 +734,11 @@ async def get_session_surface(
     is written empty -- so the past field cannot be read back, only recomputed.
     """
     sym = symbol.upper()
-    key = ("session-surface", sym, spot_range_pct, past_steps, future_steps, expiry)
-    data = await _run(
-        key, _session_surface_sync, sym, spot_range_pct, past_steps, future_steps, expiry
+    data = await asyncio.to_thread(
+        _session_surface_cached, sym, spot_range_pct, past_steps, future_steps, expiry
     )
+    if data is None:
+        raise HTTPException(status_code=404, detail="No forced-flow data available")
     return SessionSurfaceResponse(**data)
 
 
@@ -864,6 +876,41 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
     }
 
 
+def _session_surface_cached(sym, span, past_steps, future_steps, expiry):
+    """Single-flight, cached session-surface build.
+
+    Returns the cached response if warm. Otherwise exactly ONE caller (the owner)
+    runs the rebuild while every concurrent caller for the same key waits on it and
+    shares the result -- this is what stops the cold-start stampede where both
+    workers' warmers plus the frontend poll would each launch their own full-day
+    rebuild and contend the DB into the ground.
+    """
+    key = ("session-surface", sym, span, past_steps, future_steps, expiry)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    with _inflight_lock:
+        event = _inflight.get(key)
+        owner = event is None
+        if owner:
+            event = threading.Event()
+            _inflight[key] = event
+    if not owner:
+        # A build for this exact field is already running -- wait for it, then
+        # read the cache it populated (None if it failed / timed out).
+        event.wait(timeout=_SESSION_BUILD_TIMEOUT_S)
+        return _cache_get(key)
+    try:
+        data = _session_surface_sync(sym, span, past_steps, future_steps, expiry)
+        if data is not None:
+            _cache_put(key, data)
+        return data
+    finally:
+        with _inflight_lock:
+            _inflight.pop(key, None)
+        event.set()
+
+
 # --------------------------------------------------------------------------- #
 # Background cache warmer
 # --------------------------------------------------------------------------- #
@@ -881,30 +928,23 @@ _WARM_SYMBOLS = [
 
 
 def _warm_one(sym: str) -> None:
-    """Compute + cache the DEFAULT session-surface for one symbol (sync path).
+    """Warm the DEFAULT session-surface for one symbol via the single-flight path.
 
-    Populates the per-column cache (a side effect of the rebuild) AND the response
-    cache under the exact key :func:`get_session_surface` builds, so the next
-    on-demand GET for that symbol is an instant cache hit.
+    Uses :func:`_session_surface_cached` so the warmer coalesces with any
+    concurrent frontend / ad-hoc request for the same field (default grid) instead
+    of racing it -- and it caches under the exact key :func:`get_session_surface`
+    reads, so the next on-demand GET is an instant hit.
     """
-    span = _DEFAULT_VIEW_SPAN_PCT
-    key = (
-        "session-surface",
-        sym,
-        span,
-        _SESSION_PAST_STEPS_DEFAULT,
-        _SESSION_FUTURE_STEPS_DEFAULT,
-        None,
-    )
     try:
-        data = _session_surface_sync(
-            sym, span, _SESSION_PAST_STEPS_DEFAULT, _SESSION_FUTURE_STEPS_DEFAULT, None
+        _session_surface_cached(
+            sym,
+            _DEFAULT_VIEW_SPAN_PCT,
+            _SESSION_PAST_STEPS_DEFAULT,
+            _SESSION_FUTURE_STEPS_DEFAULT,
+            None,
         )
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("session-surface warm failed for %s: %s", sym, e)
-        return
-    if data is not None:
-        _cache_put(key, data)
 
 
 async def session_surface_warm_loop() -> None:
