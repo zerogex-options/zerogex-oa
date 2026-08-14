@@ -252,6 +252,19 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001
         logger.warning("TradeWorkz scheduler failed to start", exc_info=True)
 
+    # Keep the full-session forced-flow field warm so no user pays the cold
+    # full-day rebuild. Runs PER uvicorn worker (each worker has its own
+    # in-process cache), so a request landing on a cold worker no longer stalls.
+    # Background asyncio task; the sync reprice inside runs via asyncio.to_thread
+    # so it never blocks the event loop.
+    _ff_warm_task = None
+    try:
+        from .routers.forced_flow import session_surface_warm_loop
+
+        _ff_warm_task = asyncio.create_task(session_surface_warm_loop())
+    except Exception:  # noqa: BLE001
+        logger.warning("session-surface warmer failed to start", exc_info=True)
+
     yield
 
     # Shutdown
@@ -275,6 +288,15 @@ async def lifespan(app: FastAPI):
         await _tw_scheduler.stop()
     except Exception:  # noqa: BLE001
         logger.warning("TradeWorkz scheduler shutdown failed", exc_info=True)
+    # Stop the session-surface warmer.
+    if _ff_warm_task is not None:
+        _ff_warm_task.cancel()
+        try:
+            await _ff_warm_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.warning("session-surface warmer shutdown error", exc_info=True)
     if db_manager:
         await db_manager.disconnect()
     logger.info("Shutdown complete")

@@ -55,3 +55,47 @@ def test_past_col_cache_evicts_oldest_over_cap():
     finally:
         ff._PAST_COL_CACHE_MAX = original_max
         ff._past_col_cache.clear()
+
+
+def _endpoint_key(sym):
+    # The exact response-cache key get_session_surface builds for a default call.
+    return (
+        "session-surface",
+        sym,
+        ff._DEFAULT_VIEW_SPAN_PCT,
+        ff._SESSION_PAST_STEPS_DEFAULT,
+        ff._SESSION_FUTURE_STEPS_DEFAULT,
+        None,
+    )
+
+
+def test_warm_one_caches_under_the_exact_endpoint_key(monkeypatch):
+    # The whole point of the warmer is that on-demand GETs hit its cache -- so the
+    # key _warm_one writes MUST equal the one get_session_surface reads. Stub the
+    # (DB-backed) rebuild and assert the warmed value lands under that key.
+    ff._cache.clear()
+    fake = {"symbol": "SPY", "z": [[1.0]], "now_index": 0}
+    monkeypatch.setattr(ff, "_session_surface_sync", lambda *a, **k: fake)
+    ff._warm_one("SPY")
+    assert ff._cache_get(_endpoint_key("SPY")) is fake
+    ff._cache.clear()
+
+
+def test_warm_one_skips_cache_when_rebuild_returns_none(monkeypatch):
+    # A degraded snapshot (None) must NOT poison the cache with an empty entry.
+    ff._cache.clear()
+    monkeypatch.setattr(ff, "_session_surface_sync", lambda *a, **k: None)
+    ff._warm_one("SPY")
+    assert ff._cache_get(_endpoint_key("SPY")) is None
+    ff._cache.clear()
+
+
+def test_warm_loop_is_a_noop_when_disabled(monkeypatch):
+    # With the warmer disabled it must return immediately without repricing.
+    import asyncio
+
+    monkeypatch.setattr(ff, "_WARM_ENABLED", False)
+    called = []
+    monkeypatch.setattr(ff, "_warm_one", lambda sym: called.append(sym))
+    asyncio.run(ff.session_surface_warm_loop())
+    assert called == []
