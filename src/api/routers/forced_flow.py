@@ -118,13 +118,11 @@ _SESSION_GRID_QUANTUM_PCT = 0.001
 # Single-flight registry: coalesce concurrent identical session-surface rebuilds
 # so the warmer, the frontend, and any ad-hoc caller SHARE one rebuild instead of
 # each launching their own and stampeding the DB (the cold-start thundering herd
-# that turned a ~30s build into minutes). Keyed by the response-cache key; the
-# value is an Event the waiters block on until the owner populates the cache.
-_inflight: Dict[tuple, threading.Event] = {}
-_inflight_lock = threading.Lock()
-# Cap how long a waiter blocks on the in-flight owner before giving up and reading
-# whatever is cached -- guards against a wedged owner hanging every caller.
-_SESSION_BUILD_TIMEOUT_S = 180.0
+# that turned a ~30s build into minutes). Async, on the worker's event loop: the
+# owner runs the sync build in ONE worker thread while every waiter just awaits the
+# shared Task -- so a cold start can't tie up the (small) threadpool with blocked
+# waiters and starve other endpoints. Keyed by the response-cache key.
+_inflight_tasks: Dict[tuple, "asyncio.Task"] = {}
 
 
 def _quantize_band(p_lo: float, p_hi: float, spot: float) -> Tuple[float, float]:
@@ -734,9 +732,7 @@ async def get_session_surface(
     is written empty -- so the past field cannot be read back, only recomputed.
     """
     sym = symbol.upper()
-    data = await asyncio.to_thread(
-        _session_surface_cached, sym, spot_range_pct, past_steps, future_steps, expiry
-    )
+    data = await _session_surface_async(sym, spot_range_pct, past_steps, future_steps, expiry)
     if data is None:
         raise HTTPException(status_code=404, detail="No forced-flow data available")
     return SessionSurfaceResponse(**data)
@@ -876,39 +872,40 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
     }
 
 
-def _session_surface_cached(sym, span, past_steps, future_steps, expiry):
-    """Single-flight, cached session-surface build.
+async def _session_surface_async(sym, span, past_steps, future_steps, expiry):
+    """Single-flight, cached session-surface build (async, per worker event loop).
 
     Returns the cached response if warm. Otherwise exactly ONE caller (the owner)
-    runs the rebuild while every concurrent caller for the same key waits on it and
-    shares the result -- this is what stops the cold-start stampede where both
-    workers' warmers plus the frontend poll would each launch their own full-day
-    rebuild and contend the DB into the ground.
+    launches the rebuild as a Task -- running the sync build in a worker thread --
+    while every concurrent caller for the same key awaits that same Task and shares
+    its result. Waiters await on the loop and hold no thread, so a cold start can't
+    starve the threadpool. This is what stops the stampede where both workers'
+    warmers plus the frontend poll each launched their own full-day rebuild.
+
+    Runs entirely on the single worker event loop (no await between the registry
+    lookup and create_task), so the get/create is race-free without a lock.
     """
     key = ("session-surface", sym, span, past_steps, future_steps, expiry)
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    with _inflight_lock:
-        event = _inflight.get(key)
-        owner = event is None
-        if owner:
-            event = threading.Event()
-            _inflight[key] = event
-    if not owner:
-        # A build for this exact field is already running -- wait for it, then
-        # read the cache it populated (None if it failed / timed out).
-        event.wait(timeout=_SESSION_BUILD_TIMEOUT_S)
-        return _cache_get(key)
-    try:
-        data = _session_surface_sync(sym, span, past_steps, future_steps, expiry)
-        if data is not None:
-            _cache_put(key, data)
-        return data
-    finally:
-        with _inflight_lock:
-            _inflight.pop(key, None)
-        event.set()
+    task = _inflight_tasks.get(key)
+    if task is None:
+
+        async def _build():
+            try:
+                data = await asyncio.to_thread(
+                    _session_surface_sync, sym, span, past_steps, future_steps, expiry
+                )
+                if data is not None:
+                    _cache_put(key, data)
+                return data
+            finally:
+                _inflight_tasks.pop(key, None)
+
+        task = asyncio.create_task(_build())
+        _inflight_tasks[key] = task
+    return await task
 
 
 # --------------------------------------------------------------------------- #
@@ -927,16 +924,16 @@ _WARM_SYMBOLS = [
 ]
 
 
-def _warm_one(sym: str) -> None:
+async def _warm_one(sym: str) -> None:
     """Warm the DEFAULT session-surface for one symbol via the single-flight path.
 
-    Uses :func:`_session_surface_cached` so the warmer coalesces with any
-    concurrent frontend / ad-hoc request for the same field (default grid) instead
-    of racing it -- and it caches under the exact key :func:`get_session_surface`
-    reads, so the next on-demand GET is an instant hit.
+    Awaits :func:`_session_surface_async`, so the warm coalesces with any concurrent
+    frontend / ad-hoc request for the same (default-grid) field instead of racing
+    it -- and it caches under the exact key :func:`get_session_surface` reads, so
+    the next on-demand GET is an instant hit.
     """
     try:
-        _session_surface_cached(
+        await _session_surface_async(
             sym,
             _DEFAULT_VIEW_SPAN_PCT,
             _SESSION_PAST_STEPS_DEFAULT,
@@ -968,7 +965,7 @@ async def session_surface_warm_loop() -> None:
     while True:
         for sym in _WARM_SYMBOLS:
             try:
-                await asyncio.to_thread(_warm_one, sym)
+                await _warm_one(sym)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # pragma: no cover - defensive
