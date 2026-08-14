@@ -81,11 +81,17 @@ _DEFAULT_VIEW_SPAN_PCT = 0.02
 # Fixed price-grid resolution, held constant across every column so the field is
 # a clean rectangle sharing one axis (the surface heatmap the frontend draws).
 _SESSION_PRICE_POINTS = 41
-# Lookback for the as-of latest-per-contract reconstruction (query #3). Matches
-# the engine's steady-state snapshot window: during RTH every active contract is
-# requoted within minutes, so a 2h window always covers the book recorded at that
-# minute, and the DISTINCT-ON walk stays cheap.
-_ASOF_LOOKBACK_HOURS = 2.0
+# Lookback for the as-of latest-per-contract reconstruction (query #3). During RTH
+# every active contract requotes within a few minutes, so a SHORT window still
+# captures the book as it stood at that minute -- and a narrow window is far
+# cheaper per bucket (the DISTINCT-ON walks a fraction of the rows), which matters
+# because a cold session rebuild fires ~30 of these back-to-back against a
+# live-ingestion table (a 2h window there cost ~100s/build). Deliberately tighter
+# than the engine's 2h GEX snapshot window -- this is a viz, not the persisted
+# book. Widen via env if a thin far wing ever matters.
+_ASOF_LOOKBACK_HOURS = _getenv_float(
+    "SESSION_SURFACE_ASOF_LOOKBACK_HOURS", 20.0 / 60.0, min=1.0 / 60.0
+)
 # Hard row cap on the as-of chain query (mirrors the engine's default
 # ANALYTICS_SNAPSHOT_MAX_ROWS); well above any realistic chain size.
 _ASOF_SNAPSHOT_ROW_CAP = 50000
@@ -745,6 +751,7 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
     now_ts = ctx["timestamp"]
     spot = ctx["spot"]
     r, q = ctx["r"], ctx["q"]
+    t0 = time.monotonic()  # build-time telemetry (logged at the end)
 
     # Anchor the time axis to today's 16:00 ET cash close, in minutes-to-close.
     # Mirrors _session_days_remaining's .replace() convention (safe within a
@@ -786,6 +793,7 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
     # reprices only the live now + projection columns below. Each cold bucket is
     # the actual book recorded at or before that instant, rebuilt via _load_asof.
     past_cols: List[Dict[str, Any]] = []
+    cold_builds = 0  # past buckets rebuilt from the DB this call (cache misses)
     step = session_open_min_to_close / past_steps if past_steps > 0 else session_open_min_to_close
     for k in range(past_steps + 1):
         mtc = session_open_min_to_close - k * step
@@ -819,6 +827,7 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
         }
         _past_col_put(ckey, col)
         past_cols.append(col)
+        cold_builds += 1
 
     # NOW column: the live book/spot -- an ACTUAL reading and the boundary. Never
     # cached (it moves every cycle).
@@ -851,6 +860,13 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
     if len(columns) < _SESSION_MIN_COLUMNS:
         return None
 
+    logger.info(
+        "session-surface %s: %d cols (%d cold buckets) built in %.1fs",
+        sym,
+        len(columns),
+        cold_builds,
+        time.monotonic() - t0,
+    )
     return {
         "symbol": sym,
         "spot": spot,
