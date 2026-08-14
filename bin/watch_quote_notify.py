@@ -50,6 +50,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 # Allow ``import src.*`` when invoked as ``python bin/watch_quote_notify.py``
 # from anywhere — mirror the repo-root-on-path assumption the app modules make.
@@ -58,7 +59,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    import asyncpg
+    import asyncpg  # noqa: E402
 except ImportError:  # pragma: no cover - dependency is declared in pyproject
     print(
         "asyncpg is required (it is a project dependency). Run inside the "
@@ -72,6 +73,16 @@ NOTIFY_CHANNEL = "zgx_quote_updates"
 # ANSI colours — disabled automatically when stdout is not a TTY (piped to a
 # file or a pager) so the log stays clean.
 _TTY = sys.stdout.isatty()
+
+# Receive-time is shown in US Eastern so it lines up with the (ET) bar-bucket
+# column — the zone the trading day and every payload timestamp already use.
+# Falls back to UTC if the tz database isn't installed; the printed label
+# reflects whichever is actually in effect.
+try:
+    _RECV_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - missing tzdata
+    _RECV_TZ = timezone.utc
+_RECV_TZ_LABEL = datetime.now(_RECV_TZ).strftime("%Z") or "ET"
 
 
 def _c(code: str, text: str) -> str:
@@ -138,7 +149,7 @@ class Tape:
         _channel: str,
         payload: str,
     ) -> None:
-        recv = datetime.now(timezone.utc)
+        recv = datetime.now(_RECV_TZ)
         try:
             data: Dict[str, Any] = json.loads(payload)
         except (ValueError, TypeError):
@@ -213,8 +224,9 @@ async def run(symbol_filter: Optional[str], raw: bool) -> None:
         file=sys.stderr,
     )
     print(
-        _c("90", "Columns: #seq  recv-time  SYMBOL  bucket(minute)  OHLC  volumes  "
-                 "Δclose  inter-arrival.  (server_ts lives on the WS wire, not here.)"),
+        _c("90", f"Columns: #seq  recv-time({_RECV_TZ_LABEL})  SYMBOL  bucket(minute, ET)  "
+                 "OHLC  volumes  Δclose  inter-arrival.  "
+                 "(server_ts lives on the WS wire, not here.)"),
         file=sys.stderr,
     )
 
