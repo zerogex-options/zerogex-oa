@@ -526,10 +526,17 @@ def session_column_flow(
     """
     prices = list(price_grid)
     days_elapsed = min_to_close / 1440.0  # minutes-to-close -> engine days_elapsed
-    row = [
-        flow_total(legs, spot, p / spot - 1.0, days_elapsed, 0.0, r, q, min_tte_years)
-        for p in prices
-    ]
+    # dd_now (aggregate dealer delta at THIS column's spot, no move / no time) is
+    # invariant across the whole price grid, so compute it ONCE rather than
+    # re-summing the entire book inside flow_total for every price -- this halves
+    # the aggregate-delta work, which dominates a 30-column history rebuild. The
+    # arithmetic is otherwise identical to flow_total: scenario spot is exactly
+    # ``p`` and the flow is -(dd_scn - dd_now) * p.
+    dd_now = _aggregate_dealer_delta(legs, spot, 0.0, 0.0, r, q, min_tte_years)
+    row: List[float] = []
+    for p in prices:
+        dd_scn = _aggregate_dealer_delta(legs, p, days_elapsed, 0.0, r, q, min_tte_years)
+        row.append(-(dd_scn - dd_now) * p)
     magnet = _nearest_crossing(list(zip(prices, row)), spot)
     return row, magnet
 
