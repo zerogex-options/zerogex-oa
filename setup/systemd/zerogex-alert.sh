@@ -7,13 +7,15 @@
 # the first positional argument and used to pull recent journal context.
 #
 # Configuration lives in /etc/zerogex/alert.env — see alert.env.example for
-# the available backends (slack | sns | pagerduty | webhook | stderr).  The
-# default backend is ``stderr`` so a fresh install logs visibly without
+# the available backends (slack | sns | pagerduty | webhook | resend | stderr).
+# The default backend is ``stderr`` so a fresh install logs visibly without
 # depending on infra the operator may not have wired up yet.
 #
-# Dependencies: bash, curl, journalctl.  Slack / generic-webhook / pagerduty
-# additionally need jq.  SNS additionally needs the AWS CLI configured for
-# the host's IAM role.
+# Dependencies: bash, curl, journalctl.  Slack / generic-webhook / pagerduty /
+# resend additionally need jq.  SNS additionally needs the AWS CLI configured
+# for the host's IAM role.  ``resend`` sends email via https://resend.com and
+# reads RESEND_API_KEY / RESEND_FROM_EMAIL from alert.env or, failing that,
+# from the app .env (ALERT_APP_ENV) so the key need not be duplicated.
 #
 # Exit codes:
 #   0 — alert sent (or stderr fallback printed)
@@ -136,8 +138,56 @@ case "$backend" in
             || { echo "zerogex-alert: webhook POST failed" >&2; exit 2; }
         ;;
 
+    resend)
+        # Email via Resend (https://resend.com). The API key + From address are
+        # taken from the environment (alert.env) when set, otherwise pulled
+        # straight from the app .env (ALERT_APP_ENV) so the secret already
+        # configured for the app is not duplicated into a second file.
+        # Recipient: ALERT_EMAIL_TO if set, else the address in RESEND_FROM_EMAIL.
+        app_env="${ALERT_APP_ENV:-/home/ubuntu/zerogex-oa/.env}"
+        # Parse ONLY the two RESEND_* lines (never source the whole .env), and
+        # only for values not already supplied via alert.env. Guarded with
+        # `set +e` so a missing key/file cannot abort the dispatcher.
+        set +e
+        if [ -z "${RESEND_API_KEY:-}" ] && [ -r "$app_env" ]; then
+            RESEND_API_KEY="$(grep -E '^RESEND_API_KEY=' "$app_env" | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//')"
+        fi
+        if [ -z "${RESEND_FROM_EMAIL:-}" ] && [ -r "$app_env" ]; then
+            RESEND_FROM_EMAIL="$(grep -E '^RESEND_FROM_EMAIL=' "$app_env" | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//')"
+        fi
+        set -e
+        if [ -z "${ALERT_EMAIL_TO:-}" ] && [ -n "${RESEND_FROM_EMAIL:-}" ]; then
+            # Default the recipient to the From address: "Name <addr>" -> addr,
+            # or the whole value if it carries no angle-bracketed address.
+            ALERT_EMAIL_TO="$(printf '%s' "$RESEND_FROM_EMAIL" | sed -n 's/.*<\(.*\)>.*/\1/p')"
+            [ -z "$ALERT_EMAIL_TO" ] && ALERT_EMAIL_TO="$RESEND_FROM_EMAIL"
+        fi
+        require RESEND_API_KEY
+        require RESEND_FROM_EMAIL
+        require ALERT_EMAIL_TO
+        # jq builds the JSON (and escapes the body); ALERT_EMAIL_TO may be a
+        # comma-separated list -> a JSON array of trimmed, non-empty addresses.
+        payload="$(jq -n \
+            --arg from "$RESEND_FROM_EMAIL" \
+            --arg to "$ALERT_EMAIL_TO" \
+            --arg subject "$human_summary" \
+            --arg text "$human_message" \
+            '{from: $from,
+              to: ($to | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))),
+              subject: $subject,
+              text: $text}')"
+        # The API key travels only in the Authorization header (never printed).
+        curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d "$payload" \
+            https://api.resend.com/emails >/dev/null \
+            || { echo "zerogex-alert: resend email send failed" >&2; exit 2; }
+        ;;
+
     *)
-        echo "zerogex-alert: unknown backend '${backend}' (set ALERT_BACKEND in /etc/zerogex/alert.env to one of: stderr, slack, sns, pagerduty, webhook)" >&2
+        echo "zerogex-alert: unknown backend '${backend}' (set ALERT_BACKEND in /etc/zerogex/alert.env to one of: stderr, slack, sns, pagerduty, webhook, resend)" >&2
         exit 1
         ;;
 esac
