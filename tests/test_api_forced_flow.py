@@ -148,32 +148,30 @@ def test_degraded_snapshot_returns_404(monkeypatch):
 
 def test_backtest_reports_hit_rate(monkeypatch):
     # /backtest is a pure DB read -- no snapshot/_load needed, so mock the
-    # session-assembling query directly. Each session carries BOTH predictors;
-    # the smooth sign is inverted from the full sign to prove the A/B scores
-    # them independently.
+    # session-assembling query directly. The endpoint scores each session's flow
+    # against its own trailing-median baseline (default 10-session warm-up), so
+    # we feed 10 flat warm-up sessions and then decisive days whose flow runs
+    # above / below that baseline. full and smooth deviate in opposite directions
+    # to prove the A/B scores them independently.
     app, dbmod = _build_app(monkeypatch)
     sessions = [
         {
-            "session_date": "2026-07-01",
+            "session_date": f"2026-06-{d:02d}",
             "charm_flow": 5.0,
-            "charm_flow_smooth": -5.0,
-            "noon_px": 100.0,
-            "close_px": 101.0,
-        },
-        {
-            "session_date": "2026-07-02",
-            "charm_flow": -5.0,
             "charm_flow_smooth": 5.0,
             "noon_px": 100.0,
-            "close_px": 99.0,
-        },
-        {
-            "session_date": "2026-07-03",
-            "charm_flow": 5.0,
-            "charm_flow_smooth": -5.0,
-            "noon_px": 100.0,
-            "close_px": 99.0,
-        },
+            "close_px": 100.0,
+        }
+        for d in range(1, 11)  # 10 warm-up sessions establishing a baseline of 5.0
+    ]
+    # Decisive days: full above/below 5.0 => Buy/Sell; smooth is the mirror.
+    sessions += [
+        {"session_date": "2026-06-11", "charm_flow": 6.0, "charm_flow_smooth": 4.0,
+         "noon_px": 100.0, "close_px": 101.0},  # full Buy/up hit ; smooth Sell/up miss
+        {"session_date": "2026-06-12", "charm_flow": 4.0, "charm_flow_smooth": 6.0,
+         "noon_px": 100.0, "close_px": 99.0},   # full Sell/down hit; smooth Buy/down miss
+        {"session_date": "2026-06-13", "charm_flow": 6.0, "charm_flow_smooth": 4.0,
+         "noon_px": 100.0, "close_px": 99.0},   # full Buy/down miss; smooth Sell/down hit
     ]
     dbmod.DatabaseManager.get_charm_backtest_sessions = AsyncMock(return_value=sessions)
     with TestClient(app) as c:
@@ -182,19 +180,22 @@ def test_backtest_reports_hit_rate(monkeypatch):
     b = r.json()
     assert b["symbol"] == "SPY" and b["lookback_days"] == 90
     full, smooth = b["full"], b["smooth"]
+    assert full["total_sessions"] == 13 and full["warmup_sessions"] == 10
     assert full["evaluated_sessions"] == 3 and full["hits"] == 2
     assert abs(full["hit_rate"] - (2 / 3)) < 1e-9
-    # Smooth sign is inverted, so it hits exactly where full misses: 1/3.
+    # Smooth deviates opposite to full, so it hits exactly where full misses: 1/3.
     assert smooth["hits"] == 1 and abs(smooth["hit_rate"] - (1 / 3)) < 1e-9
     # Statistics present on both; the tiny sample is not certified significant.
     assert full["hit_rate_ci_low"] is not None and full["hit_rate_ci_high"] is not None
     assert full["significant"] is False and smooth["significant"] is False
     assert "edge_p_value" in full and "signal_t_stat" in smooth
     assert len(full["records"]) == 3
-    assert full["records"][0]["date"] == "2026-07-03"  # most-recent first
+    assert full["records"][0]["date"] == "2026-06-13"  # most-recent first
     assert set(full["records"][0]) == {
         "date",
         "charm_flow",
+        "charm_baseline",
+        "charm_deviation",
         "return_pct",
         "predicted_dir",
         "realized_dir",
@@ -211,4 +212,5 @@ def test_backtest_empty_history_is_200_not_404(monkeypatch):
     b = r.json()
     for variant in (b["full"], b["smooth"]):
         assert variant["total_sessions"] == 0 and variant["evaluated_sessions"] == 0
+        assert variant["warmup_sessions"] == 0
         assert variant["hit_rate"] is None and variant["records"] == []

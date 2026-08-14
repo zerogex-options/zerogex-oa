@@ -40,6 +40,7 @@ have) slots in additively -- delta is linear, so the two sources sum. See
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -623,6 +624,19 @@ _Z_95 = 1.959963984540054
 # regardless of p-value -- a normal approximation on a handful of days lies.
 _MIN_SIGNIFICANT_N = 30
 
+# Trailing-baseline scoring. The raw SIGN of close_charm_flow is structurally
+# almost constant for an index book: a chronically put-heavy chain keeps dealers
+# modeled net BUYERS into the close on nearly every session, so the sign reads
+# "buy" essentially every day. Scoring that sign is therefore worthless -- it
+# degenerates to "always guess the majority direction", whose hit rate equals the
+# naive baseline and whose edge is ~0 by construction, no matter what the market
+# does. What actually VARIES, and can carry information, is how today's modeled
+# pressure compares to its own recent normal. So we score the sign of the
+# DEVIATION of the charm flow from the trailing median of the prior sessions'
+# charm -- look-ahead-free, and non-degenerate.
+_BASELINE_WINDOW = 20  # trailing sessions that define "recent normal"
+_BASELINE_MIN_HISTORY = 10  # min prior sessions before a session can be scored
+
 
 def _sign(x: float) -> int:
     return 1 if x > 0 else (-1 if x < 0 else 0)
@@ -692,19 +706,39 @@ def _accuracy_beats_baseline_p(hits: int, n: int, baseline: float) -> Optional[f
 
 
 def charm_backtest_summary(
-    sessions: Sequence[dict], recent_limit: int = 90, charm_key: str = "charm_flow"
+    sessions: Sequence[dict],
+    recent_limit: int = 90,
+    charm_key: str = "charm_flow",
+    baseline_window: int = _BASELINE_WINDOW,
+    min_baseline_history: int = _BASELINE_MIN_HISTORY,
 ) -> dict:
-    """Honest hit-rate of the Charm-into-Close forecast.
+    """Honest hit-rate of the Charm-into-Close forecast, scored RELATIVE to the
+    signal's own recent baseline.
 
-    The single testable claim behind the headline "time decay alone forces
-    dealers to buy/sell $X by 4pm": if the morning charm sign (dealers must
-    BUY -> ``+``, must SELL -> ``-``) has any edge, it should lean the same way
-    as the actual noon->close return. This aggregates one row per session --
-    each a dict with ``session_date``, the predictor under ``charm_key``,
-    ``noon_px`` and ``close_px`` -- into a hit rate. ``charm_key`` selects which
-    forecast to score: ``charm_flow`` (the full 0DTE-inclusive close flow) or
-    ``charm_flow_smooth`` (the first-order charm only), so the two definitions
-    can be A/B'd over identical sessions.
+    The claim behind the headline "time decay alone forces dealers to buy/sell
+    $X by 4pm" is that the morning charm read should lean the same way as the
+    actual noon->close return. Scoring the raw *sign* of that read does not test
+    it: for an index book the sign is structurally almost constant (a chronically
+    put-heavy chain keeps dealers modeled net BUYERS into the close on nearly
+    every session), so a raw-sign predictor degenerates to "always guess the
+    majority direction" -- its hit rate equals the naive baseline and its edge is
+    ~0 by construction, whatever the market does.
+
+    What varies -- and can actually carry information -- is how the modeled
+    pressure compares to its own recent normal. So the predictor here is the sign
+    of the DEVIATION of today's charm flow from the trailing median of the prior
+    ``baseline_window`` sessions: ``+1`` when the modeled buy-pressure is stronger
+    than usual (a bullish lean), ``-1`` when weaker (a bearish lean). The baseline
+    uses only sessions STRICTLY BEFORE the one being scored, so there is no
+    look-ahead. A session cannot be scored until at least ``min_baseline_history``
+    prior sessions exist to define "normal"; those early sessions are counted in
+    ``total_sessions`` and reported as ``warmup_sessions`` but excluded from
+    ``evaluated_sessions``.
+
+    ``charm_key`` selects which forecast to score -- ``charm_flow`` (the full
+    0DTE-inclusive close flow) or ``charm_flow_smooth`` (the first-order charm
+    only) -- and each is demeaned against ITS OWN history, so the two definitions
+    are A/B'd honestly over identical sessions.
 
     It is deliberately unflattering by construction:
 
@@ -712,8 +746,8 @@ def charm_backtest_summary(
       accuracy. A hit rate at or below it is worth nothing, and the frontend is
       handed both numbers side by side so a coin flip cannot read as signal.
     * ``signal_mean_return`` is the mean of ``predicted_dir * noon->close
-      return`` -- the average P&L of taking the charm sign at noon and closing
-      at the bell, before costs. It can be negative. That is the point.
+      return`` -- the average P&L of taking the demeaned charm lean at noon and
+      closing at the bell, before costs. It can be negative. That is the point.
     * ``hit_rate_ci_low`` / ``hit_rate_ci_high`` bound the hit rate with a 95%
       Wilson interval; ``edge_p_value`` is the one-sided probability the
       accuracy beats the naive baseline by luck; ``signal_t_stat`` tests the
@@ -721,25 +755,43 @@ def charm_backtest_summary(
       clears 95% on a sample of at least ``_MIN_SIGNIFICANT_N`` sessions. A
       thin or lucky record cannot pass for a real one.
 
-    Sessions with a flat charm read or an exactly-flat afternoon are counted in
-    ``total_sessions`` but excluded from ``evaluated_sessions`` (no directional
-    call to score). Pure function: no DB, no clock -- fully unit-testable.
+    Sessions with a flat afternoon, a charm read sitting exactly at its baseline,
+    or too little history to form a baseline are counted in ``total_sessions``
+    but excluded from ``evaluated_sessions`` (no directional call to score). A
+    structurally constant signal therefore scores as *no call* rather than a
+    vacuous baseline match. Pure function: no DB, no clock -- fully
+    unit-testable. Input need not be pre-sorted; sessions are ordered by
+    ``session_date`` internally before the trailing baseline is formed.
     """
+    # Valid rows (charm present, priceable noon), oldest first -- the trailing
+    # baseline needs a chronological order and must not depend on the caller's.
+    valid: List[dict] = [
+        row
+        for row in sessions
+        if float(row["noon_px"]) > 0 and row.get(charm_key) is not None
+    ]
+    valid.sort(key=lambda r: str(r["session_date"]))
+    charms = [float(r[charm_key]) for r in valid]
+
     decisive: List[dict] = []
-    total = 0
+    total = len(valid)
+    warmup = 0
     hits = 0
     up_real = 0
     signal_returns: List[float] = []
 
-    for row in sessions:
+    for i, row in enumerate(valid):
+        prior = charms[max(0, i - baseline_window) : i]
+        if len(prior) < min_baseline_history:
+            warmup += 1  # not enough history to define "normal" yet
+            continue
         noon = float(row["noon_px"])
         close = float(row["close_px"])
-        charm = row.get(charm_key)
-        if noon <= 0 or charm is None:
-            continue
-        total += 1
+        charm = charms[i]
+        baseline = statistics.median(prior)
+        deviation = charm - baseline
         ret = (close - noon) / noon
-        pred = _sign(float(charm))
+        pred = _sign(deviation)  # +1 = above recent normal, -1 = below
         real = _sign(ret)
         if pred == 0 or real == 0:
             continue
@@ -752,7 +804,9 @@ def charm_backtest_summary(
         decisive.append(
             {
                 "date": str(row["session_date"]),
-                "charm_flow": float(charm),
+                "charm_flow": charm,
+                "charm_baseline": baseline,
+                "charm_deviation": deviation,
                 "return_pct": ret,
                 "predicted_dir": pred,
                 "realized_dir": real,
@@ -763,16 +817,16 @@ def charm_backtest_summary(
     evaluated = len(decisive)
     hit_rate = hits / evaluated if evaluated else None
     up_rate = up_real / evaluated if evaluated else None
-    baseline = max(up_rate, 1.0 - up_rate) if up_rate is not None else None
+    baseline_rate = max(up_rate, 1.0 - up_rate) if up_rate is not None else None
     signal_mean_return = sum(signal_returns) / len(signal_returns) if signal_returns else None
-    edge = hit_rate - baseline if (hit_rate is not None and baseline is not None) else None
+    edge = hit_rate - baseline_rate if (hit_rate is not None and baseline_rate is not None) else None
 
     # Institutional read: a point estimate is not a result. Report a 95%
     # confidence band on the hit rate, the p-value that it beats the naive
     # baseline, and a t-stat on the per-session P&L -- so a thin or lucky
     # sample cannot pass for a real edge.
     ci_low, ci_high = _wilson_interval(hits, evaluated) if evaluated else (None, None)
-    edge_p_value = _accuracy_beats_baseline_p(hits, evaluated, baseline) if evaluated else None
+    edge_p_value = _accuracy_beats_baseline_p(hits, evaluated, baseline_rate) if evaluated else None
     signal_t_stat = _t_stat(signal_returns)
     # Significant only if the edge clears 95% AND the sample is not a handful.
     significant = bool(
@@ -781,11 +835,14 @@ def charm_backtest_summary(
     return {
         "total_sessions": total,
         "evaluated_sessions": evaluated,
+        # Early sessions with too little history to define a baseline yet. Part
+        # of total_sessions, not of evaluated_sessions.
+        "warmup_sessions": warmup,
         "hits": hits,
         "hit_rate": hit_rate,
         "hit_rate_ci_low": ci_low,
         "hit_rate_ci_high": ci_high,
-        "baseline_rate": baseline,
+        "baseline_rate": baseline_rate,
         "edge": edge,
         "edge_p_value": edge_p_value,
         "significant": significant,

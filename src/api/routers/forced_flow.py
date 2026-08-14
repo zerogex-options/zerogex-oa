@@ -495,6 +495,10 @@ class ScenarioResponse(_TsModel):
 class BacktestRecord(BaseModel):
     date: str
     charm_flow: float
+    # The trailing-median "recent normal" this session was scored against, and
+    # today's flow minus it. predicted_dir is the sign of charm_deviation.
+    charm_baseline: float
+    charm_deviation: float
     return_pct: float
     predicted_dir: int
     realized_dir: int
@@ -504,6 +508,8 @@ class BacktestRecord(BaseModel):
 class BacktestVariant(BaseModel):
     total_sessions: int
     evaluated_sessions: int
+    # Early sessions excluded only because no trailing baseline exists yet.
+    warmup_sessions: int = 0
     hits: int
     hit_rate: Optional[float] = None
     hit_rate_ci_low: Optional[float] = None
@@ -1107,16 +1113,21 @@ async def get_backtest(
     ),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Charm-into-Close track record: does the morning charm-flow sign lean the
-    same way as the actual noon->close return?
+    """Charm-into-Close track record: when the morning charm flow is stronger
+    (or weaker) than its own recent normal, does the noon->close return lean the
+    same way?
 
-    Reads the persisted ``forced_flow_profile`` + ``underlying_quotes`` history
-    and reports the hit rate against a naive directional baseline -- honestly,
-    including when the sample is thin or the edge is nil. Scores TWO forecast
-    definitions over identical sessions (``full`` = 0DTE-inclusive close flow;
-    ``smooth`` = first-order charm only) so the A/B is visible. Returns 200 with
-    zeroed counts (not 404) before enough sessions have accrued, so the page can
-    show an honest "collecting" state rather than an error.
+    Scores the charm read RELATIVE to its trailing baseline rather than by raw
+    sign -- for an index book the raw sign is structurally almost constant ("buy"
+    nearly every day), so it degenerates to the naive baseline and tests nothing;
+    the deviation from recent normal is the part that varies. Reads the persisted
+    ``forced_flow_profile`` + ``underlying_quotes`` history and reports the hit
+    rate against a naive directional baseline -- honestly, including when the
+    sample is thin or the edge is nil. Scores TWO forecast definitions over
+    identical sessions (``full`` = 0DTE-inclusive close flow; ``smooth`` =
+    first-order charm only) so the A/B is visible. Returns 200 with zeroed counts
+    (not 404) before enough sessions have accrued, so the page can show an honest
+    "collecting" state rather than an error.
     """
     sym = symbol.upper()
     key = ("backtest", sym, lookback_days)
