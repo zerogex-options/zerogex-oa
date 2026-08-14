@@ -47,6 +47,7 @@ from src.analytics.forced_flow import (
     zero_flow_level,
 )
 from src.analytics.main_engine import ET, AnalyticsEngine
+from src.config import _getenv_float, _getenv_str
 from src.database import db_connection
 from src.symbols import get_canonical_symbol
 
@@ -90,6 +91,10 @@ _ASOF_LOOKBACK_HOURS = 2.0
 _ASOF_SNAPSHOT_ROW_CAP = 50000
 # Below this many surviving columns the field is too sparse to plot; return 404.
 _SESSION_MIN_COLUMNS = 3
+# Default column counts for /session-surface. Shared by the endpoint's Query
+# defaults AND the background warmer so their response-cache keys can never drift.
+_SESSION_PAST_STEPS_DEFAULT = 30
+_SESSION_FUTURE_STEPS_DEFAULT = 8
 
 _cache: Dict[tuple, Dict[str, Any]] = {}
 _cache_lock = threading.Lock()
@@ -696,8 +701,15 @@ def _surface_sync(sym, expiry, spot_range_pct, time_steps):
 async def get_session_surface(
     symbol: str = Query(default="SPY"),
     spot_range_pct: float = Query(default=_DEFAULT_VIEW_SPAN_PCT, gt=0.0, le=0.5),
-    past_steps: int = Query(default=30, ge=1, le=120, description="Actual-history columns"),
-    future_steps: int = Query(default=8, ge=1, le=48, description="Projection columns to close"),
+    past_steps: int = Query(
+        default=_SESSION_PAST_STEPS_DEFAULT, ge=1, le=120, description="Actual-history columns"
+    ),
+    future_steps: int = Query(
+        default=_SESSION_FUTURE_STEPS_DEFAULT,
+        ge=1,
+        le=48,
+        description="Projection columns to close",
+    ),
     expiry: Optional[str] = Query(default=None),
     db: DatabaseManager = Depends(get_db),
 ):
@@ -850,6 +862,78 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
         ],
         "now_index": now_index,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Background cache warmer
+# --------------------------------------------------------------------------- #
+# Keep the full-session field hot so no user ever pays the cold full-day rebuild.
+# Critically, this runs PER uvicorn worker -- each worker holds its own in-process
+# cache, so without per-worker warming the requests that land on a cold worker
+# still pay the rebuild. Tunable / disable-able via env.
+_WARM_ENABLED = _getenv_str("SESSION_SURFACE_WARM", "1").strip().lower() not in {"0", "false", "no"}
+_WARM_INTERVAL_SECONDS = _getenv_float("SESSION_SURFACE_WARM_INTERVAL_SECONDS", 30.0, min=5.0)
+_WARM_SYMBOLS = [
+    s.strip().upper()
+    for s in _getenv_str("SESSION_SURFACE_WARM_SYMBOLS", "SPY,SPX,QQQ,NDX").split(",")
+    if s.strip()
+]
+
+
+def _warm_one(sym: str) -> None:
+    """Compute + cache the DEFAULT session-surface for one symbol (sync path).
+
+    Populates the per-column cache (a side effect of the rebuild) AND the response
+    cache under the exact key :func:`get_session_surface` builds, so the next
+    on-demand GET for that symbol is an instant cache hit.
+    """
+    span = _DEFAULT_VIEW_SPAN_PCT
+    key = (
+        "session-surface",
+        sym,
+        span,
+        _SESSION_PAST_STEPS_DEFAULT,
+        _SESSION_FUTURE_STEPS_DEFAULT,
+        None,
+    )
+    try:
+        data = _session_surface_sync(
+            sym, span, _SESSION_PAST_STEPS_DEFAULT, _SESSION_FUTURE_STEPS_DEFAULT, None
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("session-surface warm failed for %s: %s", sym, e)
+        return
+    if data is not None:
+        _cache_put(key, data)
+
+
+async def session_surface_warm_loop() -> None:
+    """Keep the session-field cache hot in the background (started per worker).
+
+    The costly part is the cold full-day rebuild; running it here on startup and
+    every ``_WARM_INTERVAL_SECONDS`` moves it entirely off the user's first view.
+    The per-column cache makes every warm after the first cheap -- only the live
+    now + projection columns and any newly-past bucket are repriced. The
+    synchronous reprice is dispatched through ``asyncio.to_thread`` so it never
+    blocks the event loop; the task is cancelled on shutdown.
+    """
+    if not _WARM_ENABLED or not _WARM_SYMBOLS:
+        logger.info("session-surface warmer disabled")
+        return
+    logger.info(
+        "session-surface warmer: %s every %.0fs",
+        ",".join(_WARM_SYMBOLS),
+        _WARM_INTERVAL_SECONDS,
+    )
+    while True:
+        for sym in _WARM_SYMBOLS:
+            try:
+                await asyncio.to_thread(_warm_one, sym)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("session-surface warm cycle error for %s: %s", sym, e)
+        await asyncio.sleep(_WARM_INTERVAL_SECONDS)
 
 
 @router.get("/scenario", response_model=ScenarioResponse)
