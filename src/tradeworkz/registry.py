@@ -17,21 +17,27 @@ from src.tradeworkz.bots.call_wall_rejector import CallWallRejector
 from src.tradeworkz.bots.charm_close_magnet import CharmCloseMagnet
 from src.tradeworkz.bots.climax_flow_fade import ClimaxFlowFade
 from src.tradeworkz.bots.dealer_delta_pressure_rider import DealerDeltaPressureRider
+from src.tradeworkz.bots.dual_flip_dislocation import DualFlipDislocation
 from src.tradeworkz.bots.eod_pin_drifter import EodPinDrifter
 from src.tradeworkz.bots.fresh_flow_momentum import FreshFlowMomentum
+from src.tradeworkz.bots.hedge_impulse_quiet_tape import HedgeImpulseQuietTape
 from src.tradeworkz.bots.gamma_flip_breaker import GammaFlipBreaker
 from src.tradeworkz.bots.gamma_flip_defender import GammaFlipDefender
 from src.tradeworkz.bots.gamma_regime_shift_rider import GammaRegimeShiftRider
 from src.tradeworkz.bots.max_pain_gravitator import MaxPainGravitator
 from src.tradeworkz.bots.opening_range_hunter import OpeningRangeHunter
+from src.tradeworkz.bots.profile_shelf_breaker import ProfileShelfBreaker
 from src.tradeworkz.bots.put_call_wall_bouncer import PutCallWallBouncer
+from src.tradeworkz.bots.put_capitulation_credit_fade import PutCapitulationCreditFade
 from src.tradeworkz.bots.put_wall_bouncer import PutWallBouncer
 from src.tradeworkz.bots.put_wall_magnet_reversal import PutWallMagnetReversal
 from src.tradeworkz.bots.range_iron_condor import RangeIronCondor
+from src.tradeworkz.bots.settlement_flow_snap import SettlementFlowSnap
 from src.tradeworkz.bots.vanna_vol_crush_rider import VannaVolCrushRider
 from src.tradeworkz.bots.vix_regime_breakout import VixRegimeBreakout
 from src.tradeworkz.bots.vol_expansion_straddle import VolExpansionStraddle
 from src.tradeworkz.bots.vwap_reversion_scalper import VwapReversionScalper
+from src.tradeworkz.bots.weekly_charm_grind import WeeklyCharmGrind
 from src.tradeworkz.models import BotSpec
 
 STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
@@ -77,6 +83,18 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     # rejection-confirmation + wall-strength + flow-no-pierce filters.
     "CallWallRejector": CallWallRejector,
     "PutWallBouncer": PutWallBouncer,
+    # v8 (the "v5 fleet", docs/design/tradeworkz-v5-strategies.md): six
+    # candidates trading data layers no bot tier ever consumed — the
+    # forced-flow raw/smooth settlement residual, the dual-flip disagreement
+    # band, gex_profile curve geometry, the delta-weighted pending hedge
+    # obligation, the per-type put-capitulation split (first credit-exit
+    # bot), and the bucketed weekly charm ladder (first 1DTE candidate).
+    "SettlementFlowSnap": SettlementFlowSnap,
+    "DualFlipDislocation": DualFlipDislocation,
+    "ProfileShelfBreaker": ProfileShelfBreaker,
+    "HedgeImpulseQuietTape": HedgeImpulseQuietTape,
+    "PutCapitulationCreditFade": PutCapitulationCreditFade,
+    "WeeklyCharmGrind": WeeklyCharmGrind,
 }
 
 # Roster entry for PutWallMagnetReversal, deliberately kept OUT of the live
@@ -551,6 +569,173 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "stop_pct": 0.004,
             "max_hold_minutes": 45,
             "dte_target": 0,
+        },
+    ),
+    # ── The v5 fleet (docs/design/tradeworkz-v5-strategies.md) ─────────
+    # Six candidates, each on a data axis no bot tier has ever consumed.
+    # Same discipline as every candidate above: registered + screenable by
+    # id, never provisioned until it clears PF >= 1.1 / positive
+    # expectancy / >= 20 trades on `make tradeworkz-backtest`.
+    BotSpec(
+        id="settlement_flow_snap",
+        display_name="Settlement Residual Snap",
+        strategy_class="SettlementFlowSnap",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Ride the pure settlement-unwind hedge into the close.",
+        description=(
+            "Trades the raw-minus-smooth close_charm_flow residual — the "
+            "dollars of the by-close dealer hedge that come from 0DTE strikes "
+            "resolving to intrinsic, not from smooth charm drift. Fires only "
+            "when that settlement leg dominates the drift (keeping it "
+            "disjoint from charm_close_magnet) and rivals the local gamma "
+            "pool in size. Defined-risk vertical, rides to ~15:52 ET."
+        ),
+        params={
+            "min_minutes_to_close": 30,
+            "max_minutes_to_close": 90,
+            "min_residual_local_gex_frac": 0.25,
+            "min_residual_dominance": 1.5,
+            "target_pct": 0.003,
+            "stop_pct": 0.002,
+            "max_premium_loss_pct": 0.45,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="dual_flip_dislocation",
+        display_name="Dual-Flip Dislocation",
+        strategy_class="DualFlipDislocation",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Two flip conventions disagree. Ride the fast book across the band.",
+        description=(
+            "Fires on a fresh, momentum-confirmed price entry into the band "
+            "between gamma_flip_raw (where the un-DTE-weighted 0DTE fast book "
+            "flips — an unconsumed column) and the structural DTE-weighted "
+            "flip: the state where intraday hedgers are short gamma while "
+            "single-flip dashboards still read positive. Targets the band's "
+            "far edge; stops on a re-cross. Defined-risk vertical."
+        ),
+        params={
+            "min_band_pct": 0.002,
+            "min_momentum_pct": 0.0005,
+            "stop_buffer_pct": 0.001,
+            "band_collapse_pct": 0.001,
+            "max_hold_minutes": 75,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="profile_shelf_breaker",
+        display_name="Gamma Shelf Cascade",
+        strategy_class="ProfileShelfBreaker",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="A gamma cliff sits just off spot and price is sliding into it.",
+        description=(
+            "Reads the persisted gex_profile spot-shift curve — consumed by "
+            "one frontend overlay and zero bots — for a steep one-sided "
+            "negative-gamma shelf within ~0.5% of spot, and buys a vertical "
+            "spanning it when the tape slides that way. The dealers' own "
+            "hedge schedule accelerates the move; the trough bottom (a "
+            "computed, unpublished level) is the target."
+        ),
+        params={
+            "min_shelf_depth_local_frac": 0.75,
+            "min_asymmetry_ratio": 2.0,
+            "max_spot_gex_local_frac": 0.5,
+            "min_trigger_pct": 0.001,
+            "stop_pct": 0.0015,
+            "max_hold_minutes": 100,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="hedge_impulse_quiet_tape",
+        display_name="Quiet-Tape Hedge Impulse",
+        strategy_class="HedgeImpulseQuietTape",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="A hedge obligation is staged and the tape hasn't moved. Front-run it.",
+        description=(
+            "Computes the literal shares dealers must trade to hedge the last "
+            "~15 minutes of delta-weighted aggressor flow and enters in the "
+            "hedge direction ONLY while the tape is still flat, in negative "
+            "gamma. The structural inverse of the two dead flow-followers: "
+            "delta-weighting kills the lotto noise, and the flat-tape gate "
+            "refuses the buy-the-extreme entries that killed them. "
+            "Defined-risk vertical; ladder off for a clean screen."
+        ),
+        params={
+            "min_impulse_ratio": 0.08,
+            "max_flat_move_pct": 0.0015,
+            "flip_exit_ratio": 0.04,
+            "no_move_expiry_minutes": 45,
+            "target_pct": 0.004,
+            "stop_pct": 0.003,
+            "max_hold_minutes": 75,
+            "scale_out_enabled": False,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="put_capitulation_credit_fade",
+        display_name="Put Capitulation Credit Fade",
+        strategy_class="PutCapitulationCreditFade",
+        tier="0DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Panic put buying into a full-strength long-gamma book. Sell it the IV.",
+        description=(
+            "When a put-only aggressor burst (3x session baseline, put-"
+            "dominant) hits a top-quartile positive-gamma book with spot "
+            "still above the put wall, sells a 0DTE put credit vertical "
+            "below the dip low — short the IV the capitulators spiked, long "
+            "the mechanical dealer dip-buy. First credit-exit bot "
+            "(credit_take/credit_stop); the put wall is only the "
+            "invalidation floor, never the trigger."
+        ),
+        params={
+            "min_burst_multiple": 3.0,
+            "min_put_dominance": 0.65,
+            "min_displacement_pct": 0.0035,
+            "min_wall_room_pct": 0.0025,
+            "short_strike_offset_pct": 0.0035,
+            "credit_take_frac": 0.55,
+            "credit_stop_mult": 1.75,
+            "max_hold_minutes": 120,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="weekly_charm_grind",
+        display_name="Weekly Charm Grind",
+        strategy_class="WeeklyCharmGrind",
+        tier="1DTE",
+        direction_mode="context",
+        universe="*",
+        tagline="Quiet positive-gamma midday: weekly-book time decay is the only flow.",
+        description=(
+            "Rides the deterministic delta-decay rebalance of the 1-7 DTE "
+            "weekly dealer book through the 11:00-14:00 lull, gated on the "
+            "weekly charm bucket dominating the 0DTE bucket (a ladder "
+            "ZeroGEX computes and nobody consumes) and a compressed session. "
+            "1DTE debit vertical — half the theta of 0DTE over the hold — "
+            "hard exit 15:00 ET, never overnight."
+        ),
+        params={
+            "min_bucket_dominance": 2.0,
+            "min_flow_local_gex_frac": 0.10,
+            "max_session_range_pct": 0.006,
+            "target_pct": 0.0035,
+            "stop_pct": 0.0025,
+            "scale_out_enabled": False,
+            "dte_target": 1,
         },
     ),
 )
