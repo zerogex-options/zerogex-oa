@@ -53,10 +53,24 @@ def _install_conn(db, conn):
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
 
-def test_heatmap_reads_gex_by_strike_only_at_representative_timestamps():
-    """The core anti-regression: gex_by_strike must be JOINed on the
-    per-bucket representative timestamps (g.timestamp = br.rep_ts), NOT
-    range-scanned across the whole window."""
+def test_heatmap_join_keyed_on_rep_ts_and_fenced_to_window():
+    """The core anti-regression: the gex_by_strike read must be BOUNDED.
+
+    The strikes join keys on the per-bucket representative timestamps
+    (``g.timestamp = br.rep_ts``), so the *intended* plan is ~window_units
+    index point-lookups.  But ``time_window`` / ``bucket_reps`` are
+    optimisation-fence CTEs whose row counts the planner cannot estimate, so
+    under production stats it periodically abandons that nested loop for a
+    merge/hash join that reads the ENTIRE gex_by_strike table — the 15s
+    "GEX heatmap query timed out ... returning empty" path.
+
+    The fix (mirroring get_strike_profile_timeseries, commit c4d6463) is a
+    logically-REDUNDANT window bound on the same JOIN
+    (``g.timestamp BETWEEN start_time AND end_time``): every ``rep_ts`` already
+    lies inside ``[start_time, end_time]`` (bucket_reps was filtered to exactly
+    that range) so the result set is byte-for-byte identical, but now even the
+    fallback plan range-scans only the window's rows.  So the join must be BOTH
+    keyed on rep_ts AND fenced to the window."""
     db = DatabaseManager()
     conn = _RecordingConn(fetch_rows=[])
     _install_conn(db, conn)
@@ -72,16 +86,16 @@ def test_heatmap_reads_gex_by_strike_only_at_representative_timestamps():
     assert "FROM gex_summary" in sql
     assert "DISTINCT ON" in sql
 
-    # gex_by_strike is joined on the representative timestamp, never
-    # range-scanned.  If a future edit reintroduces a windowed scan of
-    # gex_by_strike (timestamp >= start_time), this fails.
     assert "JOIN gex_by_strike g" in sql
-    assert "g.timestamp = br.rep_ts" in sql
     gbs_idx = sql.index("gex_by_strike g")
-    # No "timestamp >= ... start_time" predicate attached to the
-    # gex_by_strike read.
     tail = sql[gbs_idx:]
-    assert "start_time" not in tail, "gex_by_strike must not be window-scanned"
+    # Still keyed on the per-bucket representative (the point-lookup path)...
+    assert "g.timestamp = br.rep_ts" in tail
+    # ...AND fenced to the window so NO plan can scan the whole table. The
+    # bound must be a direct predicate on g.timestamp referencing time_window.
+    assert "g.timestamp BETWEEN" in tail
+    assert "start_time FROM time_window" in tail
+    assert "end_time FROM time_window" in tail
 
     # The v1/v2 shapes must be gone.
     assert "recent_data AS" not in sql
