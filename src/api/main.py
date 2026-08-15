@@ -69,6 +69,7 @@ from .routers.forced_flow import router as forced_flow_router
 from .routers.levels import router as levels_router
 from .routers.admin_api_keys import router as admin_api_keys_router
 from .routers.admin_xpost import router as admin_xpost_router
+from .routers.news import router as news_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -497,6 +498,12 @@ app.include_router(admin_api_keys_router)
 
 # X-post review page (/admin/x-post): admin-token-gated, same rationale.
 app.include_router(admin_xpost_router)
+
+# CNBC market headlines — the same feed the Live-Bulletin auto-tweet is built
+# from, surfaced for the website's "Top Headlines" dropdown and dashboard
+# wire. Deliberately NOT scope-gated: market headlines are broadly
+# redistributable, so it rides the app-wide api_key_auth only.
+app.include_router(news_router)
 
 # ============================================================================
 # Health Check
