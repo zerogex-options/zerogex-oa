@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WATCH = REPO_ROOT / "setup" / "systemd" / "zerogex-liveness-watch.sh"
+MUTE_SCRIPT = REPO_ROOT / "setup" / "systemd" / "zerogex-liveness-mute.sh"
 
 # Fake systemctl: `is-active [--quiet] <unit>` reads active/inactive from
 # $FAKE_UNIT_STATE_DIR/<unit>; exit 0 when active, 3 otherwise (as real
@@ -69,6 +71,15 @@ class _Harness:
 
     def set_unit(self, unit: str, *, active: bool) -> None:
         (self.unit_state / unit).write_text("active" if active else "inactive")
+
+    def set_mute(self, unit: str, *, offset: int) -> None:
+        """Write a maintenance mute expiring ``offset`` seconds from now
+        (negative = already expired)."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / f"{unit}.mute").write_text(str(int(time.time()) + offset))
+
+    def mute_file(self, unit: str) -> Path:
+        return self.state_dir / f"{unit}.mute"
 
     def run(self, *, api_ok: bool) -> None:
         env = dict(os.environ)
@@ -129,3 +140,42 @@ def test_active_but_not_serving_is_down(harness):
     fired = harness.alerts()
     assert len(fired) == 1, fired
     assert "not serving" in fired[0]
+
+
+def test_muted_down_does_not_alert(harness):
+    """A planned stop/restart writes a mute; the watchdog must stay silent."""
+    harness.set_unit("zerogex-oa-api", active=False)
+    harness.set_mute("zerogex-oa-api", offset=3600)
+    harness.run(api_ok=False)
+    assert harness.alerts() == []
+
+
+def test_expired_mute_still_alerts_when_down(harness):
+    """A lapsed mute must NOT mask a still-down unit — a forgotten stop is
+    exactly the incident we must still catch."""
+    harness.set_unit("zerogex-oa-api", active=False)
+    harness.set_mute("zerogex-oa-api", offset=-10)  # already expired
+    harness.run(api_ok=False)
+    fired = harness.alerts()
+    assert len(fired) == 1 and "not active" in fired[0], fired
+    assert not harness.mute_file("zerogex-oa-api").exists()  # stale mute cleared
+
+
+def test_mute_dropped_once_service_back_up(harness):
+    """Restart case: the unit is back up within the window → the mute is
+    dropped so monitoring resumes at once, and no recovery page fires."""
+    harness.set_unit("zerogex-oa-api", active=True)
+    harness.set_mute("zerogex-oa-api", offset=3600)
+    harness.run(api_ok=True)
+    assert harness.alerts() == []
+    assert not harness.mute_file("zerogex-oa-api").exists()
+
+
+def test_mute_script_writes_future_expiry(tmp_path):
+    """The mute writer drops a future-epoch file the watchdog will honor."""
+    state = tmp_path / "liveness"
+    env = dict(os.environ, LIVENESS_STATE_DIR=str(state))
+    subprocess.run(["bash", str(MUTE_SCRIPT), "zerogex-oa-api", "600"], env=env, check=True)
+    mute = state / "zerogex-oa-api.mute"
+    assert mute.exists()
+    assert int(mute.read_text().strip()) > int(time.time()) + 300
