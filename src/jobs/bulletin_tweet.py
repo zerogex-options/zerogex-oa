@@ -92,6 +92,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
+from src.jobs import level_history as lh
 from src.jobs.index_projection import implied_index_spot
 from src.market_calendar import NYSE_HOLIDAYS
 
@@ -395,6 +396,12 @@ class SymbolBulletin:
     # is the future it was projected from (e.g. "@ES") for the indicator.
     spot_is_projected: bool = False
     future_symbol: str | None = None
+    # How the walls / flip MOVED through the session, and what price did to
+    # each one while it was in force (see :mod:`src.jobs.level_history`).
+    # Populated on the midday and close fires only — the pre-market read has
+    # no session path yet.  None everywhere else, and the post then renders
+    # exactly as it did before the tracking existed.
+    level_history: "lh.LevelHistory | None" = None
 
     def has_any_level(self) -> bool:
         return any(
@@ -773,6 +780,11 @@ def _try_llm_post(
             momentum_label=b.momentum_label,
             spot_is_projected=b.spot_is_projected,
             future_symbol=b.future_symbol,
+            # How the levels moved through the session and what price did to
+            # each print — so the prose narrates the real path instead of
+            # inferring one from the closing snapshot.
+            level_history=(b.level_history.to_prompt_dict() if b.level_history else None),
+            historical_level_values=(b.level_history.quoted_values() if b.level_history else []),
         )
         for b in present
     ]
@@ -822,8 +834,16 @@ def _key_levels_block(featured: SymbolBulletin, level_notes: dict[str, str] | No
     """The deterministic ``• <price> → <label>`` block — Python owns the prices.
 
     Order matches the operator's examples: Put Wall, Call Wall, Gamma Flip.
-    Only levels present in the DB row render; an optional short LLM note is
-    shown in parentheses after the base label."""
+    Only levels present in the DB row render; a short note is shown in
+    parentheses after the base label.
+
+    The note comes from the session's own level path when we have one — the
+    walls migrate through the day, and what price did to each print is a fact
+    the tape already settled, not something to leave to the model.  That
+    reading beats the LLM's note, which only ever saw the closing snapshot
+    and would happily call a wall "never tested" when the tape had broken two
+    earlier prints of it.  The LLM note is the fallback for pre-market fires
+    and for days with too thin a path to read."""
     notes = level_notes or {}
     specs = (
         ("put_wall", featured.put_wall, "Put Wall"),
@@ -834,10 +854,22 @@ def _key_levels_block(featured: SymbolBulletin, level_notes: dict[str, str] | No
     for key, value, base in specs:
         if value is None:
             continue
-        note = (notes.get(key) or "").strip()
+        note = lh.note_for(featured.level_history, key) or (notes.get(key) or "").strip()
         label = f"{base} ({note})" if note else base
         lines.append(f"• {_fmt_level(value)} → {label}")
     return "\n".join(lines)
+
+
+def _append_key_levels(blocks: list[str], featured: SymbolBulletin, notes: dict[str, str]) -> None:
+    """Append the ``Key levels:`` paragraph plus the after-the-bell line.
+
+    The trailing line only renders on a close fire whose chain re-priced once
+    the day's 0DTE rolled off — see :func:`level_history.post_close_line`.  It
+    is its own paragraph so the bullets stay a clean, scannable block."""
+    levels = _key_levels_block(featured, notes)
+    if levels:
+        _append_para(blocks, "Key levels:\n" + levels)
+    _append_para(blocks, lh.post_close_line(featured.level_history))
 
 
 def _compose_new_post(post, featured: SymbolBulletin, mode: str) -> str:
@@ -857,9 +889,7 @@ def _compose_new_post(post, featured: SymbolBulletin, mode: str) -> str:
     header_label = _valid_read_label(post.header_label, mode)
     blocks: list[str] = [f"{header_label} — ${featured.symbol}"]
     _append_para(blocks, post.opening)
-    levels = _key_levels_block(featured, post.level_notes)
-    if levels:
-        _append_para(blocks, "Key levels:\n" + levels)
+    _append_key_levels(blocks, featured, post.level_notes)
     if post.bottom_line.strip():
         _append_para(blocks, f"Bottom line: {post.bottom_line.strip()}")
     return "\n".join(blocks).strip()
@@ -917,9 +947,7 @@ def _build_static_post(mode: str, featured: SymbolBulletin) -> str:
     built only from the DB numbers — no scraped news, no narrated path."""
     blocks: list[str] = [f"{_mode_read_label(mode)} — ${featured.symbol}"]
     _append_para(blocks, _static_hook(featured, mode))
-    levels = _key_levels_block(featured, {})
-    if levels:
-        _append_para(blocks, "Key levels:\n" + levels)
+    _append_key_levels(blocks, featured, {})
     _append_para(blocks, f"Bottom line: {_static_bottom_line(featured)}")
     return "\n".join(blocks).strip()
 
@@ -1070,6 +1098,13 @@ def build_latest_record(
             "max_pain": featured.max_pain,
             "net_gex": featured.net_gex,
             "regime": featured.regime,
+            # The session's level path (walls that migrated, what price did
+            # to each print, the post-bell roll-off).  Null on pre-market
+            # fires and on days with too thin a path to read.  Lets the
+            # review page show WHY the post says what it says about a level.
+            "level_history": (
+                featured.level_history.to_prompt_dict() if featured.level_history else None
+            ),
         }
     return {
         "mode": mode,
@@ -1545,6 +1580,89 @@ async def _attach_price_action(
     bulletin.momentum_label = _derive_momentum_label(bulletin)
 
 
+# The fires that have a session path worth reading.  The 09:15 pre-market
+# read is deliberately excluded: nothing has traded yet, so there is no
+# migration to describe and no tape to test a level against.
+LEVEL_HISTORY_MODES = ("midday", "close")
+
+
+async def _attach_level_history(
+    db: DatabaseManager, bulletin: SymbolBulletin, day: date, mode: str
+) -> None:
+    """Best-effort: hang the day's level path off the bulletin.
+
+    Two things come out of this, both of which the old single-snapshot read
+    got wrong:
+
+      * **The walls migrate.**  A put wall that walked 777 → 776 → 775,
+        breaking the first two and holding the third, is three separate
+        stories — and the closing snapshot alone tells none of them.  The
+        Key-levels note now states what actually happened at each print.
+      * **The close fire reads a post-bell chain.**  At 16:05 the latest
+        ``gex_summary`` row is written after the day's 0DTE has rolled off,
+        which re-prices the walls to the NEXT session.  For a close read we
+        therefore re-anchor the quoted structure to the last in-session frame
+        (<= 16:00 ET) and let :func:`level_history.post_close_line` report the
+        reset separately — the value the attached card renders — instead of
+        passing tomorrow's map off as today's tape.
+
+    Every failure just leaves ``level_history`` None and the post renders the
+    way it always did."""
+    if mode not in LEVEL_HISTORY_MODES:
+        return
+    sym = bulletin.symbol
+    try:
+        level_rows = await db.get_intraday_level_series(sym, day)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: get_intraday_level_series(%s) failed (%s)", sym, exc)
+        return
+    if not level_rows:
+        return
+    try:
+        price_rows = await db.get_underlying_candles_for_session(sym, day)
+    except Exception as exc:  # noqa: BLE001
+        # Without bars we can still report the migration, just not the
+        # tested/held/broke outcomes.
+        logger.warning(
+            "bulletin_tweet: get_underlying_candles_for_session(%s) failed (%s) — "
+            "level outcomes will be unknown",
+            sym,
+            exc,
+        )
+        price_rows = []
+
+    try:
+        history = lh.build_level_history(sym, day, mode, level_rows, price_rows)
+    except Exception as exc:  # noqa: BLE001 — never let this break the tweet
+        logger.warning("bulletin_tweet: level-history build failed for %s (%s)", sym, exc)
+        return
+    if history is None:
+        return
+    bulletin.level_history = history
+
+    if mode != "close":
+        return
+    for attr in ("put_wall", "call_wall", "gamma_flip", "max_pain"):
+        value = history.session_close_levels.get(attr)
+        if value is not None and value != getattr(bulletin, attr):
+            logger.info(
+                "bulletin_tweet: %s close read re-anchored %s %s → %s "
+                "(post-bell value kept for the roll-off line)",
+                sym,
+                attr,
+                getattr(bulletin, attr),
+                value,
+            )
+            setattr(bulletin, attr, value)
+    # Net GEX collapses across the roll-off too (the expiring gamma is what
+    # was holding it), so the close read's headline figure has to come from
+    # the same in-session frame.  Only swap when both sides are the at-spot
+    # quantity, so we never silently switch the basis under the number.
+    session_net_gex = history.session_close_levels.get("net_gex_at_spot")
+    if session_net_gex is not None and history.post_close_levels.get("net_gex_at_spot") is not None:
+        bulletin.net_gex = session_net_gex
+
+
 async def _fetch_bulletins(
     db: DatabaseManager,
     symbols: list[str],
@@ -1613,6 +1731,10 @@ async def _fetch_bulletins(
                 proj.cash_ref_close,
                 proj.gap_points,
             )
+        # The day's level path.  Runs BEFORE the price-action attach because
+        # a close read re-anchors the walls / flip / net GEX to the last
+        # in-session frame, and the regime label is derived from those.
+        await _attach_level_history(db, bulletin, day, mode)
         # Price action (prior close, session range, regime, momentum) — the
         # inputs the LLM narrates the day's path from.  Best-effort.
         await _attach_price_action(db, bulletin, day, mode)
@@ -1678,6 +1800,10 @@ def _write_manifest_and_text(
                 "put_wall": b.put_wall,
                 "max_pain": b.max_pain,
                 "net_gex": b.net_gex,
+                # Traceability: on a close fire the four level fields above are
+                # the last IN-SESSION frame, not the live post-roll-off chain,
+                # so the manifest carries the path they were read off.
+                "level_history": (b.level_history.to_prompt_dict() if b.level_history else None),
             }
             for b in bulletins
         ],

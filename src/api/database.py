@@ -2316,6 +2316,79 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )
         return list(frames.values())
 
+    async def get_intraday_level_series(
+        self,
+        symbol: str,
+        session_date: date,
+        end_ts: Optional[datetime] = None,
+        include_post_close: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """The day's per-minute level path — walls, flip, max pain, net GEX.
+
+        Powers the bulletin write-ups' "the levels moved" tracking
+        (:mod:`src.jobs.level_history`). Levels are NOT static through a
+        session: the walls migrate strike to strike as dealer positioning
+        re-prices, and the gamma flip drifts every cycle. Quoting only the
+        latest row — what the tweet used to do — erases that path.
+
+        The window opens at 09:30 ET and, when ``include_post_close`` is set,
+        runs to 20:00 ET so the caller can also see the post-bell rows. Those
+        matter specifically because they are NOT the session's structure: once
+        the day's 0DTE contracts roll off the chain after the close, the walls
+        re-price to the next session, and a 16:05 fire reading the plain
+        "latest" row would quote that reset as if the tape had traded against
+        it. :func:`src.jobs.level_history.build_level_history` splits the two
+        apart on the same 16:00 ET boundary used here.
+
+        ``end_ts`` clamps the window (a backfilled run reproducing what a fire
+        would have seen at a given moment). Unlike
+        ``get_gex_frames_for_session`` this reads summary columns only — no
+        per-strike join — so a full day is a few hundred narrow rows.
+
+        Returns chronological ``{timestamp, gamma_flip, call_wall, put_wall,
+        max_pain, net_gex_at_spot}`` dicts, or ``[]`` on any error so the
+        write-up degrades to the single-snapshot rendering.
+        """
+        et = ZoneInfo("America/New_York")
+        utc = ZoneInfo("UTC")
+        start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
+        # 16:01 includes the 16:00 bar itself; 20:00 covers the post-close
+        # re-publish window without dragging in the next day's pre-market.
+        last_et = time(20, 0) if include_post_close else time(16, 1)
+        end_et = datetime.combine(session_date, last_et, tzinfo=et)
+        start_utc = start_et.astimezone(utc)
+        end_utc = end_et.astimezone(utc)
+        if end_ts is not None:
+            end_utc = min(end_utc, end_ts.astimezone(utc))
+        if end_utc <= start_utc:
+            return []
+
+        query = """
+            SELECT timestamp,
+                   gamma_flip_point AS gamma_flip,
+                   call_wall,
+                   put_wall,
+                   max_pain,
+                   net_gex_at_spot
+            FROM gex_summary
+            WHERE underlying = $1
+              AND timestamp >= $2
+              AND timestamp <= $3
+            ORDER BY timestamp ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, start_utc, end_utc)
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_intraday_level_series(%s, %s) failed: %s",
+                symbol,
+                session_date,
+                e,
+            )
+            return []
+
     async def get_replay_session_dates(self, symbol: str, limit: int = 30) -> List[Dict[str, Any]]:
         """Distinct trading dates that have ``gex_summary`` rows, newest first.
 
