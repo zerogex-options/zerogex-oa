@@ -21,8 +21,12 @@ from zoneinfo import ZoneInfo
 
 from src.tradeworkz.flow_context import (
     fetch_forced_flow,
+    fetch_hedge_impulse,
+    fetch_profile_geometry,
+    fetch_put_panic_window,
     fetch_recent_flow_window,
     fetch_recent_option_flow,
+    fetch_second_order_by_bucket,
     fetch_second_order_totals,
     fetch_vix_lookback,
 )
@@ -174,6 +178,61 @@ class MarketSnapshot:
     # the CHANGE in implied vol, not its level).
     prior_vix: Optional[float] = None
 
+    # ===================================================================
+    # v5 edge metrics. Same best-effort contract as everything above:
+    # None when the source is unavailable, and every dependent bot
+    # abstains on None. These surface data ZeroGEX has computed all along
+    # but no bot tier ever consumed — the forced-flow raw/smooth split,
+    # the un-DTE-weighted flip, the bucketed charm/vanna ladder, the
+    # gex_profile curve geometry, and the per-contract flow microstructure.
+    # ===================================================================
+
+    # Forced-flow decomposition (forced_flow_profile). ``raw`` is the exact
+    # full-reprice by-close flow INCLUDING same-day 0DTE strikes resolving to
+    # intrinsic; ``smooth`` is the first-order charm drift only. raw − smooth
+    # isolates the pure settlement-unwind leg. ``close_charm_flow`` above
+    # stays the smooth-preferred collapsed value for back-compat.
+    close_charm_flow_raw: Optional[float] = None
+    close_charm_flow_smooth: Optional[float] = None
+
+    # The un-DTE-weighted "nearest crossing" flip (gex_summary.gamma_flip_raw)
+    # — 0DTE-wall-dominated, i.e. where the fast-rehedging intraday book flips
+    # — plus its prior-tick value and the quality flag for the structural flip
+    # (span_used > the base profile span means the flip only resolved on an
+    # expansion rung and is marginal by the engine's own definition).
+    gamma_flip_raw: Optional[float] = None
+    prior_gamma_flip_raw: Optional[float] = None
+    gamma_flip_span_used: Optional[float] = None
+
+    # Dealer second-order exposure split by expiration bucket (0dte vs the
+    # 1-7 DTE weekly book). Sign follows the source columns: positive charm
+    # => dealers BUY as time passes.
+    dealer_charm_0dte: Optional[float] = None
+    dealer_charm_weekly: Optional[float] = None
+    dealer_vanna_0dte: Optional[float] = None
+    dealer_vanna_weekly: Optional[float] = None
+
+    # Local geometry of the spot-shift dealer gamma curve (gex_profile JSONB):
+    # curve value ~0.5% below / above spot, and the most negative point within
+    # ±1.5% (where a hedging cascade exhausts).
+    profile_gex_down: Optional[float] = None
+    profile_gex_up: Optional[float] = None
+    profile_trough_price: Optional[float] = None
+    profile_trough_gex: Optional[float] = None
+
+    # Pending dealer hedge obligation (shares) from the last ~15 min of
+    # delta-weighted aggressor flow, plus same-window tape volume to
+    # normalize it. Positive => dealers must BUY stock.
+    hedge_impulse_shares: Optional[float] = None
+    hedge_tape_volume: Optional[float] = None
+
+    # Put-side capitulation metrics over the last ~15 min: net aggressor buy
+    # premium into puts, put share of gross premium, and the session median
+    # per-window baseline for the burst multiple.
+    put_panic_premium: Optional[float] = None
+    put_panic_dominance: Optional[float] = None
+    put_panic_baseline: Optional[float] = None
+
     # ---- Convenience derivations ---------------------------------------
 
     @property
@@ -234,6 +293,34 @@ class MarketSnapshot:
         if self.vix is None or self.prior_vix is None:
             return None
         return self.vix - self.prior_vix
+
+    def settlement_flow_residual(self) -> Optional[float]:
+        """Pure settlement-unwind leg of the by-close forced flow.
+
+        ``close_charm_flow_raw − close_charm_flow_smooth``: the raw figure
+        includes same-day 0DTE strikes resolving to intrinsic at the close;
+        the smooth figure is the first-order charm drift only. The residual
+        is therefore non-zero precisely when large near-ATM 0DTE strikes are
+        resolving — the flow ``settlement_flow_snap`` trades. ``None`` when
+        either side is unavailable.
+        """
+        if self.close_charm_flow_raw is None or self.close_charm_flow_smooth is None:
+            return None
+        return self.close_charm_flow_raw - self.close_charm_flow_smooth
+
+    def hedge_impulse_ratio(self) -> Optional[float]:
+        """Pending hedge obligation as a fraction of same-window tape volume.
+
+        ``hedge_impulse_shares / hedge_tape_volume`` — how much of the tape
+        the dealers' un-executed hedge would consume. Signed like the impulse
+        (positive => forced dealer buying). ``None`` when either side is
+        unavailable or the tape volume is zero/negative.
+        """
+        if self.hedge_impulse_shares is None or not self.hedge_tape_volume:
+            return None
+        if self.hedge_tape_volume <= 0:
+            return None
+        return self.hedge_impulse_shares / self.hedge_tape_volume
 
     def distance_to_pin_pct(self) -> Optional[float]:
         """Signed distance from spot to the Pin Strike as a fraction of spot.
@@ -444,7 +531,8 @@ def build_snapshot(
                call_wall, put_wall, max_gamma_strike, total_net_gex,
                call_wall_strength, put_wall_strength,
                pin_strike, pin_score, pin_confidence,
-               flip_distance, convexity_risk, local_gex
+               flip_distance, convexity_risk, local_gex,
+               gamma_flip_raw, gamma_flip_span_used
         FROM gex_summary
         WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
         ORDER BY timestamp DESC
@@ -453,11 +541,19 @@ def build_snapshot(
         (underlying, as_of),
     )
     gex_rows = cur.fetchall()
+
+    # Fail-soft on rows shorter than the SELECT above (a scripted test
+    # fixture or a stale fake): pad with None so a missing trailing column
+    # degrades to the field's best-effort None instead of an IndexError.
+    def _pad(row: Any) -> tuple:
+        row = tuple(row)
+        return row + (None,) * (18 - len(row)) if len(row) < 18 else row
+
     if gex_rows:
-        gx = gex_rows[0]
-        prior = gex_rows[1] if len(gex_rows) > 1 else None
+        gx = _pad(gex_rows[0])
+        prior = _pad(gex_rows[1]) if len(gex_rows) > 1 else None
     else:
-        gx = (None,) * 16
+        gx = (None,) * 18
         prior = None
 
     cur.execute(
@@ -542,7 +638,13 @@ def build_snapshot(
     # the flow / second-order / pin layers the retired fleet never used; see
     # src/tradeworkz/flow_context.py. Every read is as-of bounded for the
     # backtest harness.
-    close_charm_flow, charm_flip, vanna_flip = fetch_forced_flow(conn, underlying, as_of)
+    (
+        close_charm_flow,
+        close_charm_flow_raw,
+        close_charm_flow_smooth,
+        charm_flip,
+        vanna_flip,
+    ) = fetch_forced_flow(conn, underlying, as_of)
     dealer_vanna_total, dealer_charm_total = fetch_second_order_totals(conn, underlying, as_of)
     flow_net_premium, flow_net_premium_prev, flow_net_volume = fetch_recent_option_flow(
         conn, underlying, as_of
@@ -551,6 +653,24 @@ def build_snapshot(
         conn, underlying, 3, as_of
     )
     prior_vix = fetch_vix_lookback(conn, 30, as_of)
+
+    # ---- v5 edge metrics (same best-effort / as-of semantics as above).
+    (
+        dealer_charm_0dte,
+        dealer_charm_weekly,
+        dealer_vanna_0dte,
+        dealer_vanna_weekly,
+    ) = fetch_second_order_by_bucket(conn, underlying, as_of)
+    (
+        profile_gex_down,
+        profile_gex_up,
+        profile_trough_price,
+        profile_trough_gex,
+    ) = fetch_profile_geometry(conn, underlying, float(spot), as_of)
+    hedge_impulse_shares, hedge_tape_volume = fetch_hedge_impulse(conn, underlying, 15, as_of)
+    put_panic_premium, put_panic_dominance, put_panic_baseline = fetch_put_panic_window(
+        conn, underlying, 15, as_of
+    )
 
     return MarketSnapshot(
         underlying=underlying,
@@ -606,6 +726,25 @@ def build_snapshot(
         flow_recent_volume=flow_recent_volume,
         flow_prior_window_premium=flow_prior_window_premium,
         prior_vix=prior_vix,
+        # -- v5 edge metrics --
+        close_charm_flow_raw=close_charm_flow_raw,
+        close_charm_flow_smooth=close_charm_flow_smooth,
+        gamma_flip_raw=_maybe_float(gx[16]),
+        prior_gamma_flip_raw=_maybe_float(prior[16]) if prior else None,
+        gamma_flip_span_used=_maybe_float(gx[17]),
+        dealer_charm_0dte=dealer_charm_0dte,
+        dealer_charm_weekly=dealer_charm_weekly,
+        dealer_vanna_0dte=dealer_vanna_0dte,
+        dealer_vanna_weekly=dealer_vanna_weekly,
+        profile_gex_down=profile_gex_down,
+        profile_gex_up=profile_gex_up,
+        profile_trough_price=profile_trough_price,
+        profile_trough_gex=profile_trough_gex,
+        hedge_impulse_shares=hedge_impulse_shares,
+        hedge_tape_volume=hedge_tape_volume,
+        put_panic_premium=put_panic_premium,
+        put_panic_dominance=put_panic_dominance,
+        put_panic_baseline=put_panic_baseline,
     )
 
 
