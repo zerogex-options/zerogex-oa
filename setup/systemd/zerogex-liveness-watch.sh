@@ -20,6 +20,13 @@
 # /etc/zerogex/alert.env config as the OnFailure path); with no alert.env it
 # falls back to stderr, which lands in this unit's own journal.
 #
+# Maintenance mutes: `make <svc>-stop` / `-restart` (via zerogex-liveness-
+# mute.sh) drop a <unit>.mute expiry file so PLANNED downtime does not page.
+# The watchdog stays quiet for that unit until the mute lapses, and drops it
+# early the moment the unit is back up (a restart resumes monitoring at once).
+# A unit left down PAST the window still alerts, so a forgotten stop is not
+# masked. See the mute handling in Main.
+#
 # Dependencies: bash, systemctl, curl. No Python/venv — so it still runs when
 # the application environment itself is the thing that is broken.
 #
@@ -76,9 +83,26 @@ verdict() {
 }
 
 # --- Main ------------------------------------------------------------------
+now_epoch="$(date +%s)"
 for svc in $SERVICES; do
     now="$(verdict "$svc")"
     state_file="${STATE_DIR}/${svc}.state"
+    mute_file="${STATE_DIR}/${svc}.mute"
+
+    # Operator maintenance mute (written by zerogex-liveness-mute.sh from
+    # `make <svc>-stop` / `-restart`): while it is live, record the unit as
+    # healthy for edge-tracking so neither the planned stop nor the following
+    # recovery pages, and drop the mute as soon as the unit is back up so a
+    # restart resumes monitoring immediately. An expired mute falls through to
+    # a normal alert, so a unit left down past the window is still caught.
+    if [ -f "$mute_file" ] \
+       && [ "$(cat "$mute_file" 2>/dev/null || echo 0)" -gt "$now_epoch" ] 2>/dev/null; then
+        [ "$now" = "up" ] && rm -f "$mute_file" 2>/dev/null
+        printf 'up\n' >"$state_file" 2>/dev/null || true
+        continue
+    fi
+    rm -f "$mute_file" 2>/dev/null || true  # no mute, or expired — clear stale
+
     prev="up"
     [ -f "$state_file" ] && prev="$(cat "$state_file" 2>/dev/null || echo up)"
 

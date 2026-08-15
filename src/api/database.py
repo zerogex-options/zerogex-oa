@@ -5820,6 +5820,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             JOIN gex_by_strike g
                 ON g.underlying = $1
                AND g.timestamp = br.rep_ts
+               -- Logically REDUNDANT window bound (every br.rep_ts already lies
+               -- in [start_time, end_time] — bucket_reps was filtered to exactly
+               -- that range) but performance-critical: time_window / bucket_reps
+               -- are optimisation-fence CTEs, so the planner cannot estimate how
+               -- many rep_ts values the join probes and periodically abandons the
+               -- ~window_units-probe index nested loop for a merge/hash join that
+               -- reads the ENTIRE gex_by_strike table -- the 15s "GEX heatmap
+               -- query timed out ... returning empty" path.  With the bound, even
+               -- that fallback range-scans only the window's rows off
+               -- idx_gex_by_strike_underlying_timestamp_strike.  Mirrors the fix
+               -- in get_strike_profile_timeseries (commit c4d6463); this is the
+               -- fast-follow that commit flagged.
+               AND g.timestamp BETWEEN (SELECT start_time FROM time_window)
+                                   AND (SELECT end_time FROM time_window)
             WHERE ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
             GROUP BY br.bucket_ts, g.strike
             ORDER BY br.bucket_ts DESC, g.strike ASC

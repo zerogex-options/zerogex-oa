@@ -46,6 +46,14 @@ SIGNALS_SERVICE = zerogex-oa-signals
 SERVICES_START_ORDER = $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE) $(API_SERVICE)
 SERVICES_STOP_ORDER  = $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE)
 
+# Liveness watchdog maintenance mute. The *-stop / *-restart targets (and
+# services-stop / services-restart) drop a per-unit mute here via this helper
+# so the per-minute watchdog stays quiet during PLANNED downtime. Default
+# window is 15 min (the script's default); override per-invocation with
+# MUTE=<seconds>, e.g. `make api-stop MUTE=3600`. A unit left down past the
+# window still alerts, so a forgotten stop is not masked.
+LIVENESS_MUTE_SCRIPT = setup/systemd/zerogex-liveness-mute.sh
+
 # Window + level for `make services-check` (override: SINCE="2 hours ago" LEVEL=errors)
 # SINCE accepts any journalctl --since value; LEVEL ∈ {errors, warnings, both}.
 SINCE ?= 1 hour ago
@@ -92,18 +100,25 @@ $(1)-start: ## Start the $(3) service
 	@sudo systemctl status $$($(2)) --no-pager
 
 .PHONY: $(1)-stop
-$(1)-stop: ## Stop the $(3) service
+$(1)-stop: ## Stop the $(3) service (mutes liveness alerts; MUTE=<secs> for the window)
 	@echo "$$(YELLOW)Stopping $$($(2))...$$(NC)"
+	@$(LIVENESS_MUTE_SCRIPT) $$($(2)) $(MUTE) 2>/dev/null || true
 	@sudo systemctl stop $$($(2))
 	@sleep 1
 	@echo "$$(GREEN)Service stopped$$(NC)"
 
 .PHONY: $(1)-restart
-$(1)-restart: ## Restart the $(3) service
+$(1)-restart: ## Restart the $(3) service (mutes liveness alerts across the restart)
 	@echo "$$(YELLOW)Restarting $$($(2))...$$(NC)"
+	@$(LIVENESS_MUTE_SCRIPT) $$($(2)) $(MUTE) 2>/dev/null || true
 	@sudo systemctl restart $$($(2))
 	@sleep 2
 	@sudo systemctl status $$($(2)) --no-pager
+
+.PHONY: $(1)-unmute
+$(1)-unmute: ## Clear any liveness maintenance mute for the $(3) service
+	@rm -f "$${HOME}/monitoring/liveness/$$($(2)).mute" 2>/dev/null || true
+	@echo "$$(GREEN)Liveness mute cleared for $$($(2)) (watchdog resumes next tick)$$(NC)"
 
 .PHONY: $(1)-status
 $(1)-status: ## Show $(3) service status
@@ -1326,6 +1341,7 @@ services-stop: ## Stop all 4 services (api → signals → analytics → ingesti
 	@echo "$(YELLOW)=== Stopping all services ===$(NC)"
 	@for svc in $(SERVICES_STOP_ORDER); do \
 		echo "$(YELLOW)→ Stopping $$svc...$(NC)"; \
+		$(LIVENESS_MUTE_SCRIPT) $$svc $(MUTE) 2>/dev/null || true; \
 		sudo systemctl stop $$svc; \
 	done
 	@echo "$(GREEN)All services stopped$(NC)"
@@ -1335,6 +1351,7 @@ services-restart: ## Restart all 4 services (stop api→…→ingestion, then st
 	@echo "$(YELLOW)=== Restarting all services ===$(NC)"
 	@for svc in $(SERVICES_STOP_ORDER); do \
 		echo "$(YELLOW)→ Stopping $$svc...$(NC)"; \
+		$(LIVENESS_MUTE_SCRIPT) $$svc $(MUTE) 2>/dev/null || true; \
 		sudo systemctl stop $$svc; \
 	done
 	@sleep 1
