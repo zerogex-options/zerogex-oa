@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date, datetime, timedelta
 from typing import Optional, Sequence
@@ -53,19 +54,64 @@ def _default_underlyings() -> list[str]:
     return [s.strip().upper() for s in (SIGNALS_UNDERLYINGS or "SPY").split(",") if s.strip()]
 
 
+def _chunk_minutes() -> int:
+    """Width of each per-day archive window (minutes). Default 60."""
+    try:
+        v = int(os.getenv("BACKTEST_ARCHIVE_CHUNK_MINUTES", "60"))
+    except ValueError:
+        v = 60
+    return v if v > 0 else 60
+
+
+def _statement_timeout_ms() -> int:
+    """Per-chunk statement_timeout (ms) for the archive session. Default 5 min.
+    0 leaves the connection's default (DB_STATEMENT_TIMEOUT_MS) in place."""
+    try:
+        return max(0, int(os.getenv("BACKTEST_ARCHIVE_STATEMENT_TIMEOUT_MS", "300000")))
+    except ValueError:
+        return 300000
+
+
 def archive_day(conn, day: date, underlyings: Optional[Sequence[str]] = None) -> int:
-    """Archive one ET calendar day's option_chains rows. Returns rows inserted."""
-    start = datetime(day.year, day.month, day.day)
-    end = start + timedelta(days=1)
-    cur = conn.cursor()
-    params: list = [start, end]
+    """Archive one ET calendar day's option_chains rows. Returns rows inserted.
+
+    The day is split into ``BACKTEST_ARCHIVE_CHUNK_MINUTES`` (default 60) wide
+    windows, each written in its OWN transaction (committed independently).
+    Copying a whole day in one ``INSERT … SELECT`` periodically exceeded the DB
+    statement_timeout as option_chains grew ("canceling statement due to
+    statement timeout"), taking the nightly job down; small windows keep every
+    statement well under the ceiling, and because the write is idempotent
+    (``ON CONFLICT DO NOTHING``) a mid-day failure just resumes on the next run
+    instead of losing the whole day. The chunk windows tile ``[day, day+1)``
+    exactly, so the set of rows archived is unchanged."""
+    day_start = datetime(day.year, day.month, day.day)
+    day_end = day_start + timedelta(days=1)
+    step = timedelta(minutes=_chunk_minutes())
+    timeout_ms = _statement_timeout_ms()
+
     underlying_clause = ""
+    extra_params: list = []
     if underlyings:
         underlying_clause = "AND underlying = ANY(%s)"
-        params.append([u.upper() for u in underlyings])
-    cur.execute(_ARCHIVE_INSERT.format(underlying_clause=underlying_clause), params)
-    inserted = cur.rowcount if cur.rowcount is not None else 0
-    conn.commit()
+        extra_params = [[u.upper() for u in underlyings]]
+    sql = _ARCHIVE_INSERT.format(underlying_clause=underlying_clause)
+
+    cur = conn.cursor()
+    inserted = 0
+    win_start = day_start
+    while win_start < day_end:
+        win_end = min(win_start + step, day_end)
+        # SET LOCAL scopes the raised ceiling to THIS transaction only, so the
+        # pooled connection returns to its default statement_timeout after the
+        # commit below (no cross-caller leakage).
+        if timeout_ms > 0:
+            cur.execute("SET LOCAL statement_timeout = %s", (timeout_ms,))
+        cur.execute(sql, [win_start, win_end, *extra_params])
+        if cur.rowcount and cur.rowcount > 0:
+            inserted += cur.rowcount
+        conn.commit()
+        win_start = win_end
+
     scope = ",".join(underlyings) if underlyings else "all"
     logger.info("archived %s: %d new rows (%s)", day, inserted, scope)
     return inserted
