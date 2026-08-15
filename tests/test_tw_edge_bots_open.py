@@ -634,6 +634,13 @@ def test_candidate_set_is_the_evaluated_bots():
         "vanna_vol_crush_rider",
         "gamma_regime_shift_rider",
         "climax_flow_fade",
+        # v5 fleet (docs/design/tradeworkz-v5-strategies.md).
+        "settlement_flow_snap",
+        "dual_flip_dislocation",
+        "profile_shelf_breaker",
+        "hedge_impulse_quiet_tape",
+        "put_capitulation_credit_fade",
+        "weekly_charm_grind",
     }
     for screened in (
         "aggressor_flow_divergence",

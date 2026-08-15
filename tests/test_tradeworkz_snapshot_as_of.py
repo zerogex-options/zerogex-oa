@@ -58,8 +58,9 @@ def _scripted() -> _Conn:
     ts = datetime(2026, 8, 1, 14, 30, tzinfo=timezone.utc)
     cur.program("SELECT timestamp, close\n        FROM underlying_quotes", [(ts, 746.0)])
     cur.program("SELECT MIN(low), MAX(high)", [(739.0, 750.0, 745.0)])
-    # 16 columns: the 10 original + the 6 v4 edge columns (pin_strike,
-    # pin_score, pin_confidence, flip_distance, convexity_risk, local_gex).
+    # 18 columns: the 10 original + the 6 v4 edge columns (pin_strike,
+    # pin_score, pin_confidence, flip_distance, convexity_risk, local_gex)
+    # + the 2 v5 columns (gamma_flip_raw, gamma_flip_span_used).
     cur.program(
         "FROM gex_summary",
         [
@@ -80,6 +81,8 @@ def _scripted() -> _Conn:
                 0.001,
                 5.0e11,
                 1.2e9,
+                744.8,
+                0.20,
             )
         ],
     )

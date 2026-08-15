@@ -85,17 +85,23 @@ def _f(v: Any) -> Optional[float]:
 
 def fetch_forced_flow(
     conn: Any, underlying: str, as_of: Optional[datetime] = None
-) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """Latest modeled forced-hedging levels for ``underlying``.
 
-    Returns ``(close_charm_flow, charm_flip, vanna_flip)`` from the freshest
-    ``forced_flow_profile`` row at-or-before ``as_of``:
+    Returns ``(close_charm_flow, close_charm_flow_raw, close_charm_flow_smooth,
+    charm_flip, vanna_flip)`` from the freshest ``forced_flow_profile`` row
+    at-or-before ``as_of``:
 
     * ``close_charm_flow`` — dollars of stock dealers must trade by the cash
       close if spot holds (the Bulletin headline figure). Prefers the
       ``close_charm_flow_smooth`` first-order value (drops the noisy same-day
       expiry resolution) and falls back to the raw ``close_charm_flow``.
       **Sign convention: positive => dealers must BUY into the close.**
+    * ``close_charm_flow_raw`` / ``close_charm_flow_smooth`` — the two source
+      figures SEPARATELY. The raw value is the exact full-reprice flow
+      *including* same-day 0DTE strikes resolving to intrinsic at the close;
+      the smooth value is the first-order charm drift only. Their difference
+      isolates the pure settlement-unwind leg (see ``settlement_flow_snap``).
     * ``charm_flip`` — spot level where time-decay hedging flips sign.
     * ``vanna_flip`` — spot level where vol-driven hedging flips sign.
 
@@ -119,14 +125,13 @@ def fetch_forced_flow(
     except Exception:
         _rollback(cur, "tw_forced_flow", armed)
         logger.debug("fetch_forced_flow failed for %s", underlying, exc_info=True)
-        return (None, None, None)
+        return (None, None, None, None, None)
     if not row:
-        return (None, None, None)
+        return (None, None, None, None, None)
     raw, smooth, charm_flip, vanna_flip = row
-    close_charm = _f(smooth)
-    if close_charm is None:
-        close_charm = _f(raw)
-    return (close_charm, _f(charm_flip), _f(vanna_flip))
+    raw_f, smooth_f = _f(raw), _f(smooth)
+    close_charm = smooth_f if smooth_f is not None else raw_f
+    return (close_charm, raw_f, smooth_f, _f(charm_flip), _f(vanna_flip))
 
 
 def fetch_second_order_totals(
@@ -311,6 +316,306 @@ def fetch_recent_flow_window(
         if w2_ago_p is not None:
             prior_p = w_ago_p - w2_ago_p
     return (recent_p, recent_v, prior_p)
+
+
+def fetch_second_order_by_bucket(
+    conn: Any, underlying: str, as_of: Optional[datetime] = None
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Dealer charm / vanna exposure split by expiration bucket.
+
+    ``fetch_second_order_totals`` collapses the book to a front-expiration
+    total; this returns the ladder the ``weekly_charm_grind`` bot needs —
+    the same-day book vs the 1–7 DTE weekly book, whose time-decay rebalance
+    is the dominant midday forced flow when gamma hedging is quiet:
+
+        (dealer_charm_0dte, dealer_charm_weekly,
+         dealer_vanna_0dte, dealer_vanna_weekly)
+
+    Buckets come from ``gex_by_strike.expiration_bucket`` ('0dte' / 'weekly'),
+    summed at the latest snapshot timestamp at-or-before ``as_of``. Dealer
+    sign convention matches the source columns: positive charm => dealers BUY
+    as time passes. Legacy rows without the dealer-sign columns fall back to
+    negating the market-aggregate exposures (documented market->dealer
+    convention). All ``None`` when the bucket column has no data or on error.
+    """
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_so_bucket")
+    try:
+        cur.execute(
+            """
+            SELECT MAX(timestamp)
+            FROM gex_by_strike
+            WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
+            """,
+            (underlying, as_of),
+        )
+        row = cur.fetchone()
+        ts0 = row[0] if row else None
+        if ts0 is None:
+            _release(cur, "tw_so_bucket", armed)
+            return (None, None, None, None)
+        cur.execute(
+            """
+            SELECT expiration_bucket,
+                   SUM(COALESCE(dealer_charm_exposure, -charm_exposure)),
+                   SUM(COALESCE(dealer_vanna_exposure, -vanna_exposure)),
+                   COUNT(*)
+            FROM gex_by_strike
+            WHERE underlying = %s AND timestamp = %s
+              AND expiration_bucket IN ('0dte', 'weekly')
+            GROUP BY expiration_bucket
+            """,
+            (underlying, ts0),
+        )
+        rows = cur.fetchall()
+        _release(cur, "tw_so_bucket", armed)
+    except Exception:
+        _rollback(cur, "tw_so_bucket", armed)
+        logger.debug("fetch_second_order_by_bucket failed for %s", underlying, exc_info=True)
+        return (None, None, None, None)
+    charm_0dte = charm_weekly = vanna_0dte = vanna_weekly = None
+    for bucket, charm, vanna, n in rows or []:
+        if not n:
+            continue
+        if bucket == "0dte":
+            charm_0dte, vanna_0dte = _f(charm), _f(vanna)
+        elif bucket == "weekly":
+            charm_weekly, vanna_weekly = _f(charm), _f(vanna)
+    return (charm_0dte, charm_weekly, vanna_0dte, vanna_weekly)
+
+
+def fetch_hedge_impulse(
+    conn: Any,
+    underlying: str,
+    window_min: int = 15,
+    as_of: Optional[datetime] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Pending dealer hedge obligation from the last ``window_min`` of flow.
+
+    When customers aggressively buy options the dealer inherits the opposite
+    delta and must neutralize it in stock within minutes. The obligation in
+    SHARES is exactly ``Σ delta_i · (buy_volume_i − sell_volume_i) · 100``
+    over ``flow_contract_facts`` (per-contract delta and the Lee-Ready
+    buy/sell split are both persisted per row). Delta-weighting is the point:
+    a $500k sweep of 0.03-delta lottos creates almost no hedge demand — it is
+    exactly the noise that polluted the raw-premium flow bots.
+
+    Returns ``(hedge_impulse_shares, tape_volume_shares)`` where the tape
+    volume is the same-window ``underlying_quotes`` up+down volume, so the
+    caller can normalize the obligation against what the tape can absorb.
+    Sign: positive => dealers must BUY stock (call buying / put selling).
+    ``None`` fields on missing data or error.
+    """
+    w = max(1, int(window_min))
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_hedge_impulse")
+    try:
+        cur.execute(
+            """
+            SELECT SUM(delta * (buy_volume - sell_volume) * 100.0), COUNT(*)
+            FROM flow_contract_facts
+            WHERE symbol = %s
+              AND timestamp <= COALESCE(%s::timestamptz, NOW())
+              AND timestamp > COALESCE(%s::timestamptz, NOW())
+                              - (%s * INTERVAL '1 minute')
+              AND delta IS NOT NULL
+            """,
+            (underlying, as_of, as_of, w),
+        )
+        frow = cur.fetchone()
+        cur.execute(
+            """
+            SELECT SUM(COALESCE(up_volume, 0) + COALESCE(down_volume, 0))
+            FROM underlying_quotes
+            WHERE symbol = %s
+              AND timestamp <= COALESCE(%s::timestamptz, NOW())
+              AND timestamp > COALESCE(%s::timestamptz, NOW())
+                              - (%s * INTERVAL '1 minute')
+            """,
+            (underlying, as_of, as_of, w),
+        )
+        vrow = cur.fetchone()
+        _release(cur, "tw_hedge_impulse", armed)
+    except Exception:
+        _rollback(cur, "tw_hedge_impulse", armed)
+        logger.debug("fetch_hedge_impulse failed for %s", underlying, exc_info=True)
+        return (None, None)
+    if not frow or not frow[1]:
+        return (None, None)
+    impulse = _f(frow[0])
+    tape = _f(vrow[0]) if vrow else None
+    return (impulse, tape)
+
+
+def fetch_put_panic_window(
+    conn: Any,
+    underlying: str,
+    window_min: int = 15,
+    as_of: Optional[datetime] = None,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Put-side aggressor capitulation metrics over the last ``window_min``.
+
+    Reads per-type Lee-Ready flow from ``flow_contract_facts`` and returns:
+
+    * ``put_net_buy_premium`` — Σ(buy_premium − sell_premium) over PUT rows in
+      the window. Large positive = a one-way rush INTO puts.
+    * ``put_dominance`` — put gross premium / (put + call gross premium) in
+      the window, in [0, 1]. High = the burst is fear, not two-way repricing.
+    * ``session_baseline`` — median of the per-``window_min``-bucket put net
+      buy premium since today's 09:30 ET session open (excluding the current
+      window). The burst multiple against this baseline is self-scaling
+      across SPY/SPX. ``None`` until at least 3 completed prior buckets.
+
+    All ``None`` on missing data or error; best-effort + as-of bounded.
+    """
+    w = max(1, int(window_min))
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_put_panic")
+    try:
+        cur.execute(
+            """
+            SELECT
+                SUM(CASE WHEN option_type = 'P' THEN buy_premium - sell_premium ELSE 0 END),
+                SUM(CASE WHEN option_type = 'P' THEN buy_premium + sell_premium ELSE 0 END),
+                SUM(buy_premium + sell_premium),
+                COUNT(*)
+            FROM flow_contract_facts
+            WHERE symbol = %s
+              AND timestamp <= COALESCE(%s::timestamptz, NOW())
+              AND timestamp > COALESCE(%s::timestamptz, NOW())
+                              - (%s * INTERVAL '1 minute')
+            """,
+            (underlying, as_of, as_of, w),
+        )
+        wrow = cur.fetchone()
+        # Per-bucket put net buy premium since the ET session open, excluding
+        # the in-flight window. Bucketing is relative to as_of so the windows
+        # tile back from "now" exactly like the live window above.
+        cur.execute(
+            """
+            SELECT FLOOR(EXTRACT(EPOCH FROM (COALESCE(%s::timestamptz, NOW()) - timestamp))
+                         / (%s * 60.0)) AS bucket_back,
+                   SUM(CASE WHEN option_type = 'P' THEN buy_premium - sell_premium ELSE 0 END)
+            FROM flow_contract_facts
+            WHERE symbol = %s
+              AND timestamp <= COALESCE(%s::timestamptz, NOW())
+              AND timestamp > (COALESCE(%s::timestamptz, NOW()) AT TIME ZONE
+                               'America/New_York')::date::timestamp
+                              AT TIME ZONE 'America/New_York' + INTERVAL '9 hours 30 minutes'
+            GROUP BY bucket_back
+            HAVING FLOOR(EXTRACT(EPOCH FROM (COALESCE(%s::timestamptz, NOW()) - timestamp))
+                         / (%s * 60.0)) >= 1
+            """,
+            (as_of, w, underlying, as_of, as_of, as_of, w),
+        )
+        brows = cur.fetchall()
+        _release(cur, "tw_put_panic", armed)
+    except Exception:
+        _rollback(cur, "tw_put_panic", armed)
+        logger.debug("fetch_put_panic_window failed for %s", underlying, exc_info=True)
+        return (None, None, None)
+    if not wrow or not wrow[3]:
+        return (None, None, None)
+    put_net = _f(wrow[0])
+    put_gross = _f(wrow[1]) or 0.0
+    all_gross = _f(wrow[2]) or 0.0
+    dominance = (put_gross / all_gross) if all_gross > 0 else None
+    baseline: Optional[float] = None
+    vals = sorted(v for _, raw in (brows or []) if (v := _f(raw)) is not None)
+    if len(vals) >= 3:
+        mid = len(vals) // 2
+        baseline = vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+    return (put_net, dominance, baseline)
+
+
+def fetch_profile_geometry(
+    conn: Any,
+    underlying: str,
+    spot: float,
+    as_of: Optional[datetime] = None,
+    probe_pct: float = 0.005,
+    window_pct: float = 0.015,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Local geometry of the spot-shift dealer gamma curve (``gex_profile``).
+
+    The persisted profile IS the dealers' forced order schedule: the signed
+    dollar GEX they would carry at each hypothetical price. Its local shape —
+    a steep one-sided negative shelf just off spot — is the pre-condition for
+    a hedging cascade, and no bot has ever consumed it. Returns:
+
+        (gex_down, gex_up, trough_price, trough_gex)
+
+    * ``gex_down`` / ``gex_up`` — curve value interpolated at
+      ``spot·(1∓probe_pct)``.
+    * ``trough_price`` / ``trough_gex`` — the most negative grid point within
+      ``spot·(1±window_pct)`` (where forced selling/buying exhausts because
+      the curve flattens back toward zero).
+
+    All ``None`` when there is no profile row, the JSONB is empty/malformed,
+    or the read errors. Best-effort + as-of bounded.
+    """
+    if spot is None or spot <= 0:
+        return (None, None, None, None)
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_profile_geo")
+    try:
+        cur.execute(
+            """
+            SELECT profile
+            FROM gex_profile
+            WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (underlying, as_of),
+        )
+        row = cur.fetchone()
+        _release(cur, "tw_profile_geo", armed)
+    except Exception:
+        _rollback(cur, "tw_profile_geo", armed)
+        logger.debug("fetch_profile_geometry failed for %s", underlying, exc_info=True)
+        return (None, None, None, None)
+    if not row or not row[0]:
+        return (None, None, None, None)
+    points = row[0]
+    if isinstance(points, str):
+        try:
+            import json
+
+            points = json.loads(points)
+        except (TypeError, ValueError):
+            return (None, None, None, None)
+    grid: list[Tuple[float, float]] = []
+    try:
+        for p in points:
+            price, gex = _f(p.get("price")), _f(p.get("gex"))
+            if price is not None and gex is not None and price > 0:
+                grid.append((price, gex))
+    except (AttributeError, TypeError):
+        return (None, None, None, None)
+    if len(grid) < 3:
+        return (None, None, None, None)
+    grid.sort(key=lambda pg: pg[0])
+
+    def _interp(target: float) -> Optional[float]:
+        if target < grid[0][0] or target > grid[-1][0]:
+            return None
+        for (p_a, g_a), (p_b, g_b) in zip(grid, grid[1:]):
+            if p_a <= target <= p_b:
+                if p_b == p_a:
+                    return g_a
+                frac = (target - p_a) / (p_b - p_a)
+                return g_a + frac * (g_b - g_a)
+        return None
+
+    gex_down = _interp(spot * (1.0 - probe_pct))
+    gex_up = _interp(spot * (1.0 + probe_pct))
+    lo, hi = spot * (1.0 - window_pct), spot * (1.0 + window_pct)
+    in_window = [(p, g) for p, g in grid if lo <= p <= hi]
+    trough_price = trough_gex = None
+    if in_window:
+        trough_price, trough_gex = min(in_window, key=lambda pg: pg[1])
+    return (gex_down, gex_up, trough_price, trough_gex)
 
 
 def fetch_vix_lookback(

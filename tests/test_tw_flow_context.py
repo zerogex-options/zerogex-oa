@@ -15,8 +15,12 @@ from typing import Any, Iterable, List, Tuple
 
 from src.tradeworkz.flow_context import (
     fetch_forced_flow,
+    fetch_hedge_impulse,
+    fetch_profile_geometry,
+    fetch_put_panic_window,
     fetch_recent_flow_window,
     fetch_recent_option_flow,
+    fetch_second_order_by_bucket,
     fetch_second_order_totals,
     fetch_vix_lookback,
 )
@@ -68,8 +72,10 @@ def test_forced_flow_prefers_smooth_and_passes_levels():
     cur = _FakeCursor()
     # (close_charm_flow, close_charm_flow_smooth, charm_flip, vanna_flip)
     cur.program("FROM forced_flow_profile", [(9.9e8, 6.0e8, 751.0, 748.0)])
-    close, charm_flip, vanna_flip = fetch_forced_flow(_Conn(cur), "SPY", AS_OF)
+    close, raw, smooth, charm_flip, vanna_flip = fetch_forced_flow(_Conn(cur), "SPY", AS_OF)
     assert close == 6.0e8  # smooth preferred over raw 9.9e8
+    assert raw == 9.9e8  # both sources surfaced separately (settlement residual)
+    assert smooth == 6.0e8
     assert charm_flip == 751.0
     assert vanna_flip == 748.0
     # as-of bounded
@@ -80,13 +86,15 @@ def test_forced_flow_prefers_smooth_and_passes_levels():
 def test_forced_flow_falls_back_to_raw_when_smooth_null():
     cur = _FakeCursor()
     cur.program("FROM forced_flow_profile", [(9.9e8, None, None, None)])
-    close, _, _ = fetch_forced_flow(_Conn(cur), "SPY", AS_OF)
+    close, raw, smooth, _, _ = fetch_forced_flow(_Conn(cur), "SPY", AS_OF)
     assert close == 9.9e8
+    assert raw == 9.9e8
+    assert smooth is None
 
 
 def test_forced_flow_none_when_absent():
     cur = _FakeCursor()  # nothing programmed
-    assert fetch_forced_flow(_Conn(cur), "SPY", AS_OF) == (None, None, None)
+    assert fetch_forced_flow(_Conn(cur), "SPY", AS_OF) == (None, None, None, None, None)
 
 
 # ------------------------------------------------------------- recent flow
@@ -189,3 +197,111 @@ def test_vix_lookback_returns_close_and_is_bounded():
 def test_vix_lookback_none_when_absent():
     cur = _FakeCursor()
     assert fetch_vix_lookback(_Conn(cur), 30, AS_OF) is None
+
+
+# --------------------------------------------------- v5: bucketed second order
+
+
+def test_second_order_by_bucket_splits_the_ladder():
+    cur = _FakeCursor()
+    ts0 = datetime(2026, 8, 1, 14, 30, tzinfo=timezone.utc)
+    cur.program("SELECT MAX(timestamp)", [(ts0,)])
+    # (bucket, sum charm, sum vanna, count)
+    cur.program(
+        "GROUP BY expiration_bucket",
+        [("0dte", 1.0e8, -3.0e7, 20), ("weekly", 6.0e8, -1.1e8, 55)],
+    )
+    charm_0, charm_w, vanna_0, vanna_w = fetch_second_order_by_bucket(_Conn(cur), "SPY", AS_OF)
+    assert charm_0 == 1.0e8 and charm_w == 6.0e8
+    assert vanna_0 == -3.0e7 and vanna_w == -1.1e8
+
+
+def test_second_order_by_bucket_none_when_column_unpopulated():
+    cur = _FakeCursor()
+    ts0 = datetime(2026, 8, 1, 14, 30, tzinfo=timezone.utc)
+    cur.program("SELECT MAX(timestamp)", [(ts0,)])
+    # No rows grouped — expiration_bucket is null on early history.
+    assert fetch_second_order_by_bucket(_Conn(cur), "SPY", AS_OF) == (None, None, None, None)
+
+
+# --------------------------------------------------------- v5: hedge impulse
+
+
+def test_hedge_impulse_returns_shares_and_tape_and_is_bounded():
+    cur = _FakeCursor()
+    cur.program("FROM flow_contract_facts", [(7.5e5, 340)])
+    cur.program("FROM underlying_quotes", [(5.0e6,)])
+    shares, tape = fetch_hedge_impulse(_Conn(cur), "SPY", 15, AS_OF)
+    assert shares == 7.5e5
+    assert tape == 5.0e6
+    call = _select_calls(cur, "FROM flow_contract_facts")[0]
+    assert _BOUND in call[0] and AS_OF in tuple(call[1])
+
+
+def test_hedge_impulse_none_when_no_flow_rows():
+    cur = _FakeCursor()
+    cur.program("FROM flow_contract_facts", [(None, 0)])  # count == 0
+    assert fetch_hedge_impulse(_Conn(cur), "SPY", 15, AS_OF) == (None, None)
+
+
+# ------------------------------------------------------------ v5: put panic
+
+
+def test_put_panic_window_metrics_and_median_baseline():
+    cur = _FakeCursor()
+    # Both queries hit flow_contract_facts; the cursor matches first-substring-
+    # wins, so the more specific baseline matcher must be programmed first.
+    cur.program("GROUP BY bucket_back", [(1, 1.0e5), (2, 3.0e5), (3, 0.5e5), (4, 2.0e5)])
+    # (put net buy, put gross, all gross, count)
+    cur.program("FROM flow_contract_facts", [(8.0e5, 1.2e6, 1.5e6, 90)])
+    put_net, dominance, baseline = fetch_put_panic_window(_Conn(cur), "SPY", 15, AS_OF)
+    assert put_net == 8.0e5
+    assert dominance == 1.2e6 / 1.5e6
+    assert baseline == 1.5e5  # median of [0.5e5, 1.0e5, 2.0e5, 3.0e5]
+
+
+def test_put_panic_window_no_baseline_early_session():
+    cur = _FakeCursor()
+    cur.program("GROUP BY bucket_back", [(1, 1.0e5)])  # < 3 prior buckets
+    cur.program("FROM flow_contract_facts", [(8.0e5, 1.2e6, 1.5e6, 90)])
+    _, _, baseline = fetch_put_panic_window(_Conn(cur), "SPY", 15, AS_OF)
+    assert baseline is None
+
+
+# ------------------------------------------------------ v5: profile geometry
+
+
+def _profile_points() -> list[dict]:
+    # Simple V: deep trough 1% below spot 755, flat above.
+    return [
+        {"price": 743.0, "gex": -2.0e8},
+        {"price": 747.5, "gex": -1.4e9},  # the trough
+        {"price": 751.2, "gex": -9.0e8},
+        {"price": 755.0, "gex": 1.0e8},
+        {"price": 758.8, "gex": 2.0e8},
+        {"price": 762.6, "gex": 3.0e8},
+    ]
+
+
+def test_profile_geometry_interpolates_and_finds_trough():
+    cur = _FakeCursor()
+    cur.program("FROM gex_profile", [(_profile_points(),)])
+    g_dn, g_up, trough_price, trough_gex = fetch_profile_geometry(_Conn(cur), "SPY", 755.0, AS_OF)
+    # spot*(1-0.005)=751.225 ~ the -9.0e8 grid point; spot*1.005 between +1e8/+2e8.
+    assert g_dn is not None and -9.5e8 < g_dn < -8.5e8
+    assert g_up is not None and 1.0e8 < g_up < 2.0e8
+    assert trough_price == 747.5
+    assert trough_gex == -1.4e9
+    call = _select_calls(cur, "FROM gex_profile")[0]
+    assert _BOUND in call[0] and AS_OF in tuple(call[1])
+
+
+def test_profile_geometry_none_on_empty_profile():
+    cur = _FakeCursor()
+    cur.program("FROM gex_profile", [([],)])
+    assert fetch_profile_geometry(_Conn(cur), "SPY", 755.0, AS_OF) == (
+        None,
+        None,
+        None,
+        None,
+    )

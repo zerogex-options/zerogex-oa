@@ -450,6 +450,22 @@ class BaseBot:
             if loss_pct >= pct:
                 return ExitDecision(should_close=True, reason="premium_stop")
 
+        # Credit-structure premium exits. The debit premium stop above skips
+        # any structure with entry_price <= 0 — the "wider profit-loss check"
+        # its comment defers to. This is that check, opt-in per bot: a credit
+        # position (entry_price = -credit received; mark = -(cost to close))
+        # books profit as ``mark - entry`` rising from 0 toward the credit.
+        #  * ``credit_take_frac``  — close with reason 'credit_take' once
+        #    profit >= frac × credit (decay take; respects min_hold).
+        #  * ``credit_stop_mult``  — close with reason 'credit_stop' once
+        #    loss >= mult × credit (damage control; fires regardless of
+        #    min_hold but honors the entry grace window, same as the debit
+        #    stop, so the entry-tick spread can't knife a fresh position).
+        # Bots that set neither param see byte-for-byte today's behavior.
+        credit_exit = self._credit_exit_decision(position, in_min_hold, in_premium_grace)
+        if credit_exit is not None:
+            return credit_exit
+
         # Scale-out ladder. When armed (geometry frozen at entry), this OWNS the
         # exit — profit-taking cuts at T1/T2 plus the runner stops — so the
         # single-target branch below runs only for unarmed positions. The
@@ -483,6 +499,41 @@ class BaseBot:
         if drift is not None:
             return drift
         return ExitDecision(should_close=False)
+
+    def _credit_exit_decision(
+        self,
+        position: OpenPosition,
+        in_min_hold: bool,
+        in_premium_grace: bool,
+    ) -> Optional[ExitDecision]:
+        """Premium take / stop for a CREDIT structure, or ``None`` to pass.
+
+        Generalizes the ``wall_reversion.wall_credit_exit`` decay-take
+        convention and adds the loss side. Only active when the position is a
+        real credit (``entry_price < 0``), the mark is available, and the bot
+        opted in via ``params['credit_take_frac']`` / ``params['credit_stop_mult']``.
+        """
+        entry = position.entry_price
+        mark = position.current_price
+        if entry is None or entry >= 0 or mark is None:
+            return None
+        credit = -float(entry)  # per-share credit received, > 0
+        if credit <= 0:
+            return None
+        profit = float(mark) - float(entry)  # rises from ~0 toward +credit
+        try:
+            stop_mult = float(self.params.get("credit_stop_mult", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            stop_mult = 0.0
+        try:
+            take_frac = float(self.params.get("credit_take_frac", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            take_frac = 0.0
+        if stop_mult > 0 and not in_premium_grace and profit <= -stop_mult * credit:
+            return ExitDecision(should_close=True, reason="credit_stop")
+        if take_frac > 0 and not in_min_hold and profit >= take_frac * credit:
+            return ExitDecision(should_close=True, reason="credit_take")
+        return None
 
     def _scale_exit_decision(
         self,

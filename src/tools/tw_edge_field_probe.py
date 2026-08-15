@@ -38,11 +38,32 @@ from src.tradeworkz.context import build_snapshot
 
 # (label, table, [columns to count non-null]).
 _COVERAGE = [
-    ("gex_summary", "gex_summary", ["pin_strike", "flip_distance", "convexity_risk", "local_gex"]),
+    (
+        "gex_summary",
+        "gex_summary",
+        [
+            "pin_strike",
+            "flip_distance",
+            "convexity_risk",
+            "local_gex",
+            # v5: the dual-flip pair the dislocation bot gates on.
+            "gamma_flip_raw",
+            "gamma_flip_span_used",
+        ],
+    ),
     (
         "gex_by_strike",
         "gex_by_strike",
-        ["dealer_vanna_exposure", "dealer_charm_exposure", "vanna_exposure", "charm_exposure"],
+        [
+            "dealer_vanna_exposure",
+            "dealer_charm_exposure",
+            "vanna_exposure",
+            "charm_exposure",
+            # v5: the bucket column the weekly-charm ladder groups by
+            # (recent ALTER — early rows may be null; that shrinks the
+            # weekly_charm_grind window, honestly).
+            "expiration_bucket",
+        ],
     ),
     (
         "forced_flow_profile",
@@ -54,6 +75,14 @@ _COVERAGE = [
         "flow_series_5min",
         ["net_premium_cum", "net_volume_cum"],
     ),
+    # v5: the per-contract microstructure the hedge-impulse and
+    # put-capitulation bots aggregate, and the curve the shelf bot reads.
+    (
+        "flow_contract_facts",
+        "flow_contract_facts",
+        ["delta", "buy_volume", "sell_volume", "buy_premium", "sell_premium"],
+    ),
+    ("gex_profile", "gex_profile", ["profile"]),
     ("vix_bars", "vix_bars", ["close"]),
 ]
 
@@ -71,6 +100,19 @@ _EDGE_FIELDS = [
     "flip_distance",
     "convexity_risk",
     "prior_net_gex",
+    # v5 snapshot fields.
+    "close_charm_flow_raw",
+    "close_charm_flow_smooth",
+    "gamma_flip_raw",
+    "gamma_flip_span_used",
+    "dealer_charm_0dte",
+    "dealer_charm_weekly",
+    "profile_gex_down",
+    "profile_trough_price",
+    "hedge_impulse_shares",
+    "hedge_tape_volume",
+    "put_panic_premium",
+    "put_panic_baseline",
 ]
 
 
