@@ -123,6 +123,39 @@ MATCH THE MODE:
 * close ("Post-Market Read") — look BACK at the session's battle around the
   levels, then the standing structure into tomorrow.
 
+THE LEVELS MOVE — READ "level_history" BEFORE YOU DESCRIBE ANY OF THEM:
+On the midday and close fires each symbol carries a "level_history" object
+describing what the walls and the gamma flip actually did during the session.
+The top-level "put_wall" / "call_wall" / "gamma_flip" figures are the
+structure as of the LAST IN-SESSION frame — the end of the story, not the
+whole of it.  When "level_history" is present it is the ONLY acceptable
+source for a claim about what happened at a level.
+
+* Each wall carries a "path": the ordered list of values it sat at, each with
+  the window it was in force and an "outcome" — "broke" (price traded
+  decisively through it), "held" (price came to it and turned), "untested"
+  (price never got near it), "unknown" (no tape to judge by).  Narrate the
+  path when "changed_during_session" is true: a put wall that walked
+  777 → 776 → 775, losing the first two and defending the third, is a far
+  better story than the closing number alone, and it is what actually
+  happened.
+* NEVER say a level was untested, defended, held or broken unless the
+  matching "outcome" says so.  A level that only became the wall at 14:00 was
+  not in play at the open — do not narrate it as if it were.
+* "after_the_bell" values are NOT the session's levels.  They are what the
+  chain re-priced to once the day's 0DTE expiries rolled off after 16:00 ET,
+  i.e. tomorrow's structure.  Never attribute any of today's price action to
+  them.  You may mention the reset as a forward-looking note ("the roll-off
+  resets the put wall well lower into tomorrow"), never as something the tape
+  traded against today.  A separate line stating the reset is appended for
+  you, so do not spell out those numbers yourself.
+* The gamma flip is a drifting computed price, not a strike.  Use
+  "spot_crossings", "spot_side_at_open" and "spot_side_at_close" for whether
+  the tape ever changed regime — zero crossings means it never did, however
+  close it came.
+* Any value appearing in a wall's "path" is a real level from today and may
+  be quoted in prose even though it is no longer the standing wall.
+
 REPLY:
 Also write a threaded reply that is exactly ONE sentence — a sharp, specific
 add-on that builds on THIS post, not a generic lesson or a restatement of it.
@@ -168,6 +201,9 @@ OUTPUT — reply with a single JSON object and NOTHING else:
                   no numbers) — e.g. {"put_wall": "successfully defended",
                   "call_wall": "first resistance"}.  Omit a key or use "" when
                   there's nothing to add.  These annotate the Key levels block.
+                  When the input carries "level_history" the caller writes
+                  those notes itself from the session path and ignores yours,
+                  so spend the detail on the prose instead.
   "bottom_line":  the takeaway — 1-3 sentences.  Opinionated but no trade
                   calls.  Do NOT include the words "Bottom line:" — that label
                   is added for you.
@@ -219,6 +255,14 @@ class SymbolInput:
     # must frame such a spot as implied/overnight, never as a live cash print.
     spot_is_projected: bool = False
     future_symbol: str | None = None
+    # How the walls / gamma flip MOVED through the session, and what price did
+    # to each print while it was in force — see
+    # :func:`src.jobs.level_history.LevelHistory.to_prompt_dict`.  None on the
+    # pre-market fire (no session path yet).  ``historical_level_values`` is
+    # the flat list of every value in that path, so the invented-price guard
+    # accepts a wall print that has since been superseded.
+    level_history: dict[str, Any] | None = None
+    historical_level_values: list[float] = field(default_factory=list)
 
     def change_pct(self) -> float | None:
         if self.spot is None or self.prior_close in (None, 0):
@@ -249,6 +293,10 @@ class SymbolInput:
             "momentum": self.momentum_label,
             "vwap": self.vwap,
             "vwap_position": self.vwap_position,
+            # Present only on the midday / close fires.  The four level fields
+            # above are the structure as of the LAST IN-SESSION frame; this is
+            # the path they took to get there.
+            "level_history": self.level_history,
         }
 
 
@@ -552,7 +600,13 @@ def _validate_no_invented_prices(
     flagged those as invented prices and threw the whole (good) post away,
     which is exactly what forced the bland static fallback.  Anchoring the
     check on the price band keeps the anti-hallucination guard for actual level
-    claims while letting the story breathe."""
+    claims while letting the story breathe.
+
+    Values the level path carried EARLIER in the session count as known: once
+    the model has been told the put wall walked 777 → 776 → 775, "it lost 777
+    and 776 before defending 775" is the accurate read, and rejecting it would
+    force the post back to the closing-snapshot version this tracking exists
+    to replace."""
     import re
 
     raw_values: list[float] = []
@@ -572,6 +626,7 @@ def _validate_no_invented_prices(
             s.put_wall,
             s.max_pain,
             s.vwap,
+            *s.historical_level_values,
         ):
             if v is None:
                 continue

@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -1768,3 +1769,246 @@ def test_approve_prints_for_manual_when_bearer_unset(tmp_path, monkeypatch, caps
     captured = capsys.readouterr()
     assert "MANUAL POSTING MODE" in captured.out
     assert "full tweet body here" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Intraday level tracking — the walls move, and the close fire must not quote
+# the post-bell chain as if the tape had traded against it.
+# ---------------------------------------------------------------------------
+
+
+def _et(hour: int, minute: int, day: date = date(2026, 8, 13)) -> datetime:
+    """An ET wall-clock moment on the session date, as an aware datetime."""
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+
+
+def _level_rows() -> list[dict]:
+    """A session where the put wall walks 777 → 776 → 775, then resets to
+    765 after the bell once the day's 0DTE rolls off."""
+    rows = []
+    windows = [
+        ((9, 30), (10, 30), 777.0),
+        ((10, 35), (12, 0), 776.0),
+        ((12, 5), (16, 0), 775.0),
+    ]
+    for (sh, sm), (eh, em), wall in windows:
+        cursor = _et(sh, sm)
+        while cursor <= _et(eh, em):
+            rows.append(
+                {
+                    "timestamp": cursor,
+                    "put_wall": wall,
+                    "call_wall": 780.0,
+                    "gamma_flip": 769.75,
+                    "max_pain": 776.0,
+                    "net_gex_at_spot": -1.4e9,
+                }
+            )
+            cursor += timedelta(minutes=5)
+    for minute in (5, 10, 15):
+        rows.append(
+            {
+                "timestamp": _et(16, minute),
+                "put_wall": 765.0,
+                "call_wall": 780.0,
+                "gamma_flip": 769.80,
+                "max_pain": 776.0,
+                "net_gex_at_spot": -4.0e8,
+            }
+        )
+    return rows
+
+
+def _price_rows() -> list[dict]:
+    return [
+        {"timestamp": _et(9, 30), "low": 778.20, "high": 779.90, "close": 778.40},
+        {"timestamp": _et(10, 0), "low": 776.40, "high": 778.60, "close": 776.60},
+        {"timestamp": _et(11, 0), "low": 775.30, "high": 776.90, "close": 775.60},
+        {"timestamp": _et(13, 0), "low": 774.95, "high": 776.10, "close": 775.40},
+        {"timestamp": _et(15, 55), "low": 775.80, "high": 776.90, "close": 776.80},
+    ]
+
+
+def _history_db() -> MagicMock:
+    db = MagicMock()
+    db.get_intraday_level_series = AsyncMock(return_value=_level_rows())
+    db.get_underlying_candles_for_session = AsyncMock(return_value=_price_rows())
+    return db
+
+
+@pytest.mark.asyncio
+async def test_close_read_reanchors_levels_to_the_last_in_session_frame():
+    """Regression: the 16:05 fire quoted "765 → Put Wall (never tested)".
+
+    765 only became the put wall after the bell, when the day's 0DTE rolled
+    off the chain — the session's wall was 775.  The close read must quote
+    what was actually in play and keep the reset for the roll-off line."""
+    mod = _reload_module()
+    b = mod._shape_bulletin(
+        # What get_latest_gex_summary returns at 16:05: the POST-BELL row.
+        _summary_row("SPY", spot=776.80, gamma_flip=769.80, call_wall=780.0, put_wall=765.0),
+        "SPY",
+    )
+    await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
+
+    assert b.put_wall == pytest.approx(775.0)
+    assert b.gamma_flip == pytest.approx(769.75)
+    assert b.call_wall == pytest.approx(780.0)
+    assert b.level_history is not None
+    assert b.level_history.put_wall.values == [777.0, 776.0, 775.0]
+    assert b.level_history.post_close_levels["put_wall"] == pytest.approx(765.0)
+
+
+@pytest.mark.asyncio
+async def test_close_read_net_gex_comes_from_the_session_not_the_roll_off():
+    """The expiring gamma is what was holding net GEX up; a post-roll-off
+    figure describes tomorrow's book, not the session just traded."""
+    mod = _reload_module()
+    b = mod._shape_bulletin(_summary_row("SPY", spot=776.80, put_wall=765.0, net_gex=-4.0e8), "SPY")
+    b.net_gex = -4.0e8  # the post-bell value the latest row carried
+    await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
+    assert b.net_gex == pytest.approx(-1.4e9)
+
+
+@pytest.mark.asyncio
+async def test_midday_read_tracks_migration_without_a_roll_off_line():
+    mod = _reload_module()
+    b = mod._shape_bulletin(_summary_row("SPY", spot=775.40, put_wall=775.0), "SPY")
+    await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "midday")
+    assert b.level_history is not None
+    # Midday never re-anchors — the latest row IS the session structure.
+    assert b.put_wall == pytest.approx(775.0)
+    from src.jobs import level_history as lh
+
+    assert lh.note_for(b.level_history, "put_wall").startswith("moved 777 → 776 → 775")
+
+
+@pytest.mark.asyncio
+async def test_premarket_read_skips_level_history():
+    """Nothing has traded yet — there is no path to describe."""
+    mod = _reload_module()
+    db = _history_db()
+    b = mod._shape_bulletin(_summary_row("SPY", spot=776.80), "SPY")
+    await mod._attach_level_history(db, b, date(2026, 8, 13), "premarket")
+    assert b.level_history is None
+    db.get_intraday_level_series.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attach_level_history_survives_a_db_failure():
+    mod = _reload_module()
+    db = MagicMock()
+    db.get_intraday_level_series = AsyncMock(side_effect=RuntimeError("pool exhausted"))
+    b = mod._shape_bulletin(_summary_row("SPY", spot=776.80, put_wall=765.0), "SPY")
+    await mod._attach_level_history(db, b, date(2026, 8, 13), "close")
+    assert b.level_history is None
+    assert b.put_wall == pytest.approx(765.0)  # untouched — renders as before
+
+
+@pytest.mark.asyncio
+async def test_key_levels_block_reports_the_session_path_over_the_llm_note():
+    """The model only ever saw the closing snapshot; the tape is the authority."""
+    mod = _reload_module()
+    b = mod._shape_bulletin(
+        _summary_row("SPY", spot=776.80, gamma_flip=769.80, call_wall=780.0, put_wall=765.0),
+        "SPY",
+    )
+    await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
+    block = mod._key_levels_block(b, {"put_wall": "never tested"})
+    lines = block.splitlines()
+    assert lines[0] == "• 775 → Put Wall (moved 777 → 776 → 775; both broke, 775 tested and held)"
+    assert lines[1] == "• 780 → Call Wall (tested and held)"
+    assert lines[2] == "• 769.75 → Gamma Flip (spot held above all session)"
+    assert "never tested" not in block
+
+
+@pytest.mark.asyncio
+async def test_close_post_carries_the_after_the_bell_line():
+    """Named explicitly so the post and the attached (live) card agree."""
+    mod = _reload_module()
+    b = mod._shape_bulletin(
+        _summary_row("SPY", spot=776.80, gamma_flip=769.80, call_wall=780.0, put_wall=765.0),
+        "SPY",
+    )
+    await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
+    text = mod._build_static_post("close", b)
+    assert "• 775 → Put Wall (moved 777 → 776 → 775; both broke, 775 tested and held)" in text
+    assert "After the bell: today's 0DTE rolled off and Put Wall resets to 765." in text
+    # ...and it lands between the levels block and the takeaway.
+    assert text.index("Key levels:") < text.index("After the bell:") < text.index("Bottom line:")
+
+
+@pytest.mark.asyncio
+async def test_level_history_reaches_the_llm_inputs_and_the_review_record():
+    mod = _reload_module()
+    b = mod._shape_bulletin(
+        _summary_row("SPY", spot=776.80, gamma_flip=769.80, call_wall=780.0, put_wall=765.0),
+        "SPY",
+    )
+    await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
+
+    captured = {}
+
+    def _fake_generate_post(**kwargs):
+        captured.update(kwargs)
+        return None  # force the static path; we only care about the inputs
+
+    from src.jobs import bulletin_llm
+
+    original = bulletin_llm.generate_post
+    bulletin_llm.generate_post = _fake_generate_post
+    try:
+        mod._try_llm_post("close", date(2026, 8, 13), [b], "SPY", [])
+    finally:
+        bulletin_llm.generate_post = original
+
+    payload = captured["symbols"][0].to_prompt_dict()["level_history"]
+    assert [seg["value"] for seg in payload["put_wall"]["path"]] == [777.0, 776.0, 775.0]
+    assert payload["put_wall"]["after_the_bell"] == pytest.approx(765.0)
+    assert 777.0 in captured["symbols"][0].historical_level_values
+
+    record = mod.build_latest_record(
+        mode="close",
+        day=date(2026, 8, 13),
+        tweet=mod.TweetBody(
+            text="Post-Market Read — $SPY",
+            fallback="$SPY",
+            lead_symbol="SPY",
+            featured_symbol="SPY",
+        ),
+        featured=b,
+    )
+    assert record["levels"]["put_wall"] == pytest.approx(775.0)
+    assert record["levels"]["level_history"]["put_wall"]["at_session_close"] == pytest.approx(775.0)
+
+
+def test_llm_validator_accepts_superseded_wall_prints():
+    """A wall the tape has already moved past is a fact, not a hallucination.
+
+    Once the model is told the put wall walked 777 → 776 → 775, "it lost 777
+    and 776 before defending 775" is the accurate read — rejecting it would
+    force the post back to the closing-snapshot version the level tracking
+    exists to replace."""
+    from src.jobs import bulletin_llm
+
+    post = bulletin_llm.LlmPost(
+        header_label="Post-Market Read",
+        opening="SPY lost 777, lost 776, and finally found bids at 775.",
+        bottom_line="775 is the line into tomorrow.",
+        reply="The tell was how little follow-through each break got.",
+        level_notes={},
+    )
+    inputs = [
+        bulletin_llm.SymbolInput(
+            symbol="SPY",
+            spot=776.80,
+            put_wall=775.0,
+            call_wall=780.0,
+            historical_level_values=[777.0, 776.0, 775.0, 780.0],
+        ),
+    ]
+    assert bulletin_llm._validate_no_invented_prices(post, inputs) is True
+
+    # ...but an in-band number that was never a level still fails.
+    post.opening = "SPY lost 777 and stalled at the 771 shelf."
+    assert bulletin_llm._validate_no_invented_prices(post, inputs) is False
