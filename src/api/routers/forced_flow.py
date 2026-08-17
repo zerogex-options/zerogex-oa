@@ -363,6 +363,60 @@ def _session_day_range(
     return None, None
 
 
+def _session_price_bars(
+    db_symbol: str, day_start: datetime, now_ts: datetime, bucket_minutes: int = 5
+) -> List[Dict[str, Any]]:
+    """``bucket_minutes`` OHLC candles for ``db_symbol`` from the 1-minute
+    ``underlying_quotes`` rows, over the ET session ``day_start`` -> ``now_ts``.
+
+    Aggregates the stored 1-minute bars into fixed epoch-aligned buckets --
+    first-seen open, max high, min low, last close, the period-correct OHLC --
+    entirely in SQL. Returns ``[{'ts', 'open', 'high', 'low', 'close'}, ...]``
+    ascending by bucket start, or ``[]`` on any error / empty session: the price
+    candles are additive, so a missing series must never fail the endpoint (the
+    frontend falls back to the realized-price line).
+    """
+    secs = max(60, int(bucket_minutes) * 60)
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    to_timestamp(floor(extract(epoch FROM timestamp) / %s) * %s) AS bucket,
+                    (array_agg(open  ORDER BY timestamp ASC))[1]  AS o,
+                    max(high)                                     AS h,
+                    min(low)                                      AS l,
+                    (array_agg(close ORDER BY timestamp DESC))[1] AS c
+                FROM underlying_quotes
+                WHERE symbol = %s
+                  AND timestamp >= %s
+                  AND timestamp <= %s
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                (secs, secs, db_symbol, day_start, now_ts),
+            )
+            rows = cursor.fetchall()
+        bars: List[Dict[str, Any]] = []
+        for bucket, o, h, low_v, c in rows:
+            if bucket is None or o is None or h is None or low_v is None or c is None:
+                continue
+            bars.append(
+                {
+                    "ts": bucket,
+                    "open": float(o),
+                    "high": float(h),
+                    "low": float(low_v),
+                    "close": float(c),
+                }
+            )
+        return bars
+    except Exception as e:  # pragma: no cover - defensive; candles are optional
+        logger.debug("session-surface price-bars query failed for %s: %s", db_symbol, e)
+        return []
+
+
 def _linspace(lo: float, hi: float, n: int) -> List[float]:
     """``n``-point inclusive linear grid from ``lo`` to ``hi`` (numpy-free)."""
     if n <= 1:
@@ -456,6 +510,16 @@ class SessionColumnOut(BaseModel):
     is_past: bool  # True = actual recorded book; False = current-book projection
 
 
+class SessionPriceBar(BaseModel):
+    """One 5-minute realized OHLC candle on the field's minutes-to-close axis."""
+
+    min_to_close: float  # minutes remaining to the close at this bar's CENTRE
+    open: float
+    high: float
+    low: float
+    close: float
+
+
 class SessionSurfaceResponse(_TsModel):
     symbol: str
     spot: float
@@ -466,6 +530,10 @@ class SessionSurfaceResponse(_TsModel):
     z: List[List[float]]  # z[col][price] = flow to move spot to prices[price] by close
     columns: List[SessionColumnOut]  # one per time-slice, open (left) -> close (right)
     now_index: int  # index of the last actual (is_past) column -- the NOW column
+    # Realized-price candles: 5-min OHLC (open->now) on the SAME min-to-close axis
+    # as `columns`, for the price overlay. Additive + best-effort -- an empty list
+    # just means the frontend draws no candles (older payloads omit it entirely).
+    price_bars: List[SessionPriceBar] = []
 
 
 class LevelsResponse(_TsModel):
@@ -866,6 +934,26 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
     if len(columns) < _SESSION_MIN_COLUMNS:
         return None
 
+    # Realized-price candles: 5-minute OHLC from the 1-minute underlying_quotes,
+    # placed on the SAME minutes-to-close axis as the columns (each candle at its
+    # bucket CENTRE) so the frontend overlays them directly. Best-effort: an empty
+    # series just means no candles are drawn.
+    price_bars: List[Dict[str, Any]] = []
+    for bar in _session_price_bars(db_symbol, open_dt, now_ts, bucket_minutes=5):
+        centre = bar["ts"] + timedelta(minutes=2.5)
+        mtc = (close_dt - centre).total_seconds() / 60.0
+        if mtc < -1e-6:  # a bucket centre past the close (guard; shouldn't happen intraday)
+            continue
+        price_bars.append(
+            {
+                "min_to_close": mtc,
+                "open": bar["open"],
+                "high": bar["high"],
+                "low": bar["low"],
+                "close": bar["close"],
+            }
+        )
+
     logger.info(
         "session-surface %s: %d cols (%d cold buckets) built in %.1fs",
         sym,
@@ -891,6 +979,7 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
             for c in columns
         ],
         "now_index": now_index,
+        "price_bars": price_bars,
     }
 
 
