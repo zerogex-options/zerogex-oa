@@ -421,6 +421,39 @@ def _nearest_crossing(points: Sequence[Tuple[float, float]], ref: float) -> Opti
     return min(xs, key=lambda x: abs(x - ref))
 
 
+def _classified_crossings(
+    points: Sequence[Tuple[float, float]],
+) -> List[Tuple[float, str]]:
+    """Zero crossings of ``y(x)`` tagged by stability. ``points`` are ``(x, y)``
+    with x ASCENDING. As x rises through a crossing, ``y`` going ``+ -> -`` (buy
+    below, sell above) is an ``"attractor"`` -- forced flow restores price to it,
+    a STABLE pin (the true magnet). ``y`` going ``- -> +`` (sell below, buy above)
+    is a ``"repeller"`` -- forced flow pushes price AWAY, an UNSTABLE pivot /
+    tipping point (a short-gamma tripwire). Distinguishing the two is what keeps a
+    repeller that merely sits near spot from being mislabeled a magnet."""
+    out: List[Tuple[float, str]] = []
+    for (x1, y1), (x2, y2) in zip(points, points[1:]):
+        if y1 == 0.0 and y2 == 0.0:
+            continue
+        if y1 == 0.0:
+            out.append((x1, "attractor" if y2 < 0.0 else "repeller"))
+        elif y1 * y2 < 0.0:
+            x = x1 + (x2 - x1) * (-y1) / (y2 - y1)
+            out.append((x, "attractor" if y1 > 0.0 else "repeller"))
+    return out
+
+
+def _nearest_of_kind(
+    points: Sequence[Tuple[float, float]], ref: float, kind: str
+) -> Optional[float]:
+    """Nearest zero crossing of a given stability (``"attractor"`` or
+    ``"repeller"``) to ``ref`` -- or None when the row has none of that kind."""
+    xs = [x for x, k in _classified_crossings(points) if k == kind]
+    if not xs:
+        return None
+    return min(xs, key=lambda x: abs(x - ref))
+
+
 def _level_from_spot_axis(
     legs: Sequence[ContractLeg],
     spot: float,
@@ -511,19 +544,24 @@ def session_column_flow(
     r: float,
     q: float = 0.0,
     min_tte_years: float = 0.0,
-) -> Tuple[List[float], Optional[float]]:
-    """One session column: its forced-flow row over ``price_grid`` + its magnet.
+) -> Tuple[List[float], Optional[float], Optional[float]]:
+    """One session column: its forced-flow row over ``price_grid`` + its magnet
+    and its pivot.
 
     The cell at price ``p`` is the flow (USD, +=buy) to walk spot from ``spot`` to
     ``p`` while ``min_to_close`` minutes elapse to the bell::
 
         f = flow_total(legs, spot, p/spot - 1, min_to_close/1440, 0, r, q)
 
-    ``magnet`` is the grid price nearest ``spot`` at which the row crosses zero --
-    that time-of-day's zero-flow level. Pure. This is the cacheable primitive
-    behind :func:`session_forced_flow_field`: a PAST column's book is immutable,
-    so the API layer can memoize one of these per (symbol, time-bucket, grid) and
-    reprice only the live now/projection columns each cycle.
+    ``magnet`` is the nearest STABLE zero-flow crossing to ``spot`` (an attractor:
+    dealers buy below it and sell above it, so forced flow restores price to it --
+    the genuine pin). ``pivot`` is the nearest UNSTABLE crossing (a repeller:
+    dealers sell below and buy above, so flow pushes price away -- a short-gamma
+    tipping point). Either is None when the row has no crossing of that kind near
+    spot; a short-gamma tape typically shows a pivot with no nearby magnet. Pure.
+    This is the cacheable primitive behind :func:`session_forced_flow_field`: a
+    PAST column's book is immutable, so the API layer can memoize one of these per
+    (symbol, time-bucket, grid) and reprice only the live now/projection columns.
     """
     prices = list(price_grid)
     days_elapsed = min_to_close / 1440.0  # minutes-to-close -> engine days_elapsed
@@ -538,8 +576,10 @@ def session_column_flow(
     for p in prices:
         dd_scn = _aggregate_dealer_delta(legs, p, days_elapsed, 0.0, r, q, min_tte_years)
         row.append(-(dd_scn - dd_now) * p)
-    magnet = _nearest_crossing(list(zip(prices, row)), spot)
-    return row, magnet
+    pts = list(zip(prices, row))
+    magnet = _nearest_of_kind(pts, spot, "attractor")
+    pivot = _nearest_of_kind(pts, spot, "repeller")
+    return row, magnet, pivot
 
 
 def session_forced_flow_field(
@@ -576,7 +616,8 @@ def session_forced_flow_field(
 
         prices        the shared ascending price grid, echoed back
         z             z[colIndex][priceIndex] flow -- one row per column
-        magnets       per-column nearest zero-crossing to that column's spot
+        magnets       per-column nearest STABLE zero-crossing (attractor pin)
+        pivots        per-column nearest UNSTABLE zero-crossing (repeller pivot)
         spots         per-column reference spot
         min_to_close  per-column minutes remaining to the close
         is_past       per-column True = actual recorded book, False = projection
@@ -584,16 +625,19 @@ def session_forced_flow_field(
     prices = list(price_grid)
     z: List[List[float]] = []
     magnets: List[Optional[float]] = []
+    pivots: List[Optional[float]] = []
     for col in columns:
-        row, magnet = session_column_flow(
+        row, magnet, pivot = session_column_flow(
             col.spot, col.legs, col.min_to_close, prices, r, q, min_tte_years
         )
         z.append(row)
         magnets.append(magnet)
+        pivots.append(pivot)
     return {
         "prices": prices,
         "z": z,
         "magnets": magnets,
+        "pivots": pivots,
         "spots": [col.spot for col in columns],
         "min_to_close": [col.min_to_close for col in columns],
         "is_past": [col.is_past for col in columns],
@@ -766,9 +810,7 @@ def charm_backtest_summary(
     # Valid rows (charm present, priceable noon), oldest first -- the trailing
     # baseline needs a chronological order and must not depend on the caller's.
     valid: List[dict] = [
-        row
-        for row in sessions
-        if float(row["noon_px"]) > 0 and row.get(charm_key) is not None
+        row for row in sessions if float(row["noon_px"]) > 0 and row.get(charm_key) is not None
     ]
     valid.sort(key=lambda r: str(r["session_date"]))
     charms = [float(r[charm_key]) for r in valid]
@@ -819,7 +861,9 @@ def charm_backtest_summary(
     up_rate = up_real / evaluated if evaluated else None
     baseline_rate = max(up_rate, 1.0 - up_rate) if up_rate is not None else None
     signal_mean_return = sum(signal_returns) / len(signal_returns) if signal_returns else None
-    edge = hit_rate - baseline_rate if (hit_rate is not None and baseline_rate is not None) else None
+    edge = (
+        hit_rate - baseline_rate if (hit_rate is not None and baseline_rate is not None) else None
+    )
 
     # Institutional read: a point estimate is not a result. Report a 95%
     # confidence band on the hit rate, the p-value that it beats the naive

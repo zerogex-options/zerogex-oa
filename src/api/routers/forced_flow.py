@@ -506,7 +506,8 @@ class SurfaceResponse(_TsModel):
 class SessionColumnOut(BaseModel):
     min_to_close: float  # minutes remaining to the cash close at this time-slice
     spot: float  # reference spot for this column
-    magnet: Optional[float] = None  # zero-flow level for this column (nearest to spot)
+    magnet: Optional[float] = None  # nearest STABLE zero-flow level (attractor pin)
+    pivot: Optional[float] = None  # nearest UNSTABLE zero-flow level (repeller tripwire)
     is_past: bool  # True = actual recorded book; False = current-book projection
 
 
@@ -889,13 +890,14 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
             continue
         if not legs:
             continue
-        row, mag = session_column_flow(
+        row, mag, piv = session_column_flow(
             float(asof["spot"]), legs, mtc, prices, r, q, _SCENARIO_MIN_TTE_YEARS
         )
         col = {
             "min_to_close": mtc,
             "spot": float(asof["spot"]),
             "magnet": mag,
+            "pivot": piv,
             "is_past": True,
             "z": row,
         }
@@ -905,7 +907,7 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
 
     # NOW column: the live book/spot -- an ACTUAL reading and the boundary. Never
     # cached (it moves every cycle).
-    now_row, now_mag = session_column_flow(
+    now_row, now_mag, now_piv = session_column_flow(
         spot, ctx["legs"], now_min_to_close, prices, r, q, _SCENARIO_MIN_TTE_YEARS
     )
     columns: List[Dict[str, Any]] = past_cols + [
@@ -913,6 +915,7 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
             "min_to_close": now_min_to_close,
             "spot": spot,
             "magnet": now_mag,
+            "pivot": now_piv,
             "is_past": True,
             "z": now_row,
         }
@@ -923,11 +926,18 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
     # fresh (they advance every cycle) and cheap -- only a handful.
     for k in range(1, future_steps + 1):
         mtc = max(0.0, now_min_to_close * (1.0 - k / future_steps))
-        row, mag = session_column_flow(
+        row, mag, piv = session_column_flow(
             spot, ctx["legs"], mtc, prices, r, q, _SCENARIO_MIN_TTE_YEARS
         )
         columns.append(
-            {"min_to_close": mtc, "spot": spot, "magnet": mag, "is_past": False, "z": row}
+            {
+                "min_to_close": mtc,
+                "spot": spot,
+                "magnet": mag,
+                "pivot": piv,
+                "is_past": False,
+                "z": row,
+            }
         )
 
     # Too few surviving columns -> the field is not meaningfully plottable.
@@ -974,6 +984,7 @@ def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
                 "min_to_close": c["min_to_close"],
                 "spot": c["spot"],
                 "magnet": c["magnet"],
+                "pivot": c.get("pivot"),
                 "is_past": c["is_past"],
             }
             for c in columns

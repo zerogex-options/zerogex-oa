@@ -13,7 +13,8 @@ import math
 from src.analytics.forced_flow import (
     ContractLeg,
     SessionColumn,
-    _nearest_crossing,
+    _classified_crossings,
+    _nearest_of_kind,
     session_column_flow,
     session_forced_flow_field,
 )
@@ -94,22 +95,33 @@ def test_every_magnet_is_none_or_inside_the_grid():
         assert m is None or (lo <= m <= hi)
 
 
-def test_magnet_sits_on_its_columns_sign_change():
+def test_magnet_sits_on_an_attractor_and_pivot_on_a_repeller():
     field = session_forced_flow_field(_columns(), GRID, R, Q)
-    # The construction is only meaningful if at least one column actually magnets.
-    assert any(m is not None for m in field["magnets"])
-    for row, magnet in zip(field["z"], field["magnets"]):
+    ref = sum(GRID) / len(GRID)
+    # The construction is only meaningful if some column actually produced a
+    # crossing (a stable magnet or an unstable pivot).
+    assert any(m is not None for m in field["magnets"]) or any(
+        p is not None for p in field["pivots"]
+    )
+    for row, magnet, pivot in zip(field["z"], field["magnets"], field["pivots"]):
+        pts = list(zip(GRID, row))
+        # magnet is None <=> the row has no ATTRACTOR (a repeller may still exist:
+        # the short-gamma case this fix separates out).
         if magnet is None:
-            # No magnet <=> the row never crosses zero between adjacent samples.
-            assert _nearest_crossing(list(zip(GRID, row)), sum(GRID) / len(GRID)) is None
-            continue
-        # The magnet must bracket a genuine sign change of THIS row: the grid
-        # samples on either side of it differ in sign (or one is exactly zero).
-        lo = [p for p in GRID if p <= magnet][-1]
-        hi = [p for p in GRID if p >= magnet][0]
-        y_lo = row[GRID.index(lo)]
-        y_hi = row[GRID.index(hi)]
-        assert y_lo == 0.0 or y_hi == 0.0 or y_lo * y_hi <= 0.0
+            assert _nearest_of_kind(pts, ref, "attractor") is None
+        else:
+            # The magnet brackets a + -> - crossing: buy below, sell above.
+            lo = [p for p in GRID if p <= magnet][-1]
+            hi = [p for p in GRID if p >= magnet][0]
+            assert row[GRID.index(lo)] >= 0.0 >= row[GRID.index(hi)]
+        # pivot is None <=> the row has no REPELLER.
+        if pivot is None:
+            assert _nearest_of_kind(pts, ref, "repeller") is None
+        else:
+            # The pivot brackets a - -> + crossing: sell below, buy above.
+            lo = [p for p in GRID if p <= pivot][-1]
+            hi = [p for p in GRID if p >= pivot][0]
+            assert row[GRID.index(lo)] <= 0.0 <= row[GRID.index(hi)]
 
 
 # --------------------------------------------------------------------------- #
@@ -127,13 +139,40 @@ def test_distinct_columns_yield_distinct_z_rows():
 def test_session_column_flow_matches_the_field():
     # session_forced_flow_field delegates to session_column_flow per column (the
     # cacheable primitive the API memoizes for immutable PAST columns), so one
-    # column's (row, magnet) must equal that column's slice of the full field.
+    # column's (row, magnet, pivot) must equal that column's slice of the field.
     cols = _columns()
     field = session_forced_flow_field(cols, GRID, R, Q)
     for i, c in enumerate(cols):
-        row, magnet = session_column_flow(c.spot, c.legs, c.min_to_close, GRID, R, Q)
+        row, magnet, pivot = session_column_flow(c.spot, c.legs, c.min_to_close, GRID, R, Q)
         assert row == field["z"][i]
         assert magnet == field["magnets"][i]
+        assert pivot == field["pivots"][i]
+
+
+def test_crossings_are_classified_by_stability():
+    # y over ascending x: +, -, -, +  -> a + -> - down-crossing (an ATTRACTOR:
+    # positive/buy below, negative/sell above -> restoring) then a - -> +
+    # up-crossing (a REPELLER: sell below, buy above -> amplifying).
+    pts = [(0.0, 2.0), (1.0, -1.0), (2.0, -0.5), (3.0, 1.0)]
+    assert [k for _, k in _classified_crossings(pts)] == ["attractor", "repeller"]
+    ax = _nearest_of_kind(pts, 0.0, "attractor")
+    rx = _nearest_of_kind(pts, 3.0, "repeller")
+    assert ax is not None and 0.0 < ax < 1.0
+    assert rx is not None and 2.0 < rx < 3.0
+    # The magnet (attractor) and pivot (repeller) are distinct crossings.
+    assert ax != rx
+    # A row that only ever rises through zero has a repeller and NO attractor.
+    up_only = [(0.0, -1.0), (1.0, 1.0)]
+    assert _nearest_of_kind(up_only, 0.5, "attractor") is None
+    assert _nearest_of_kind(up_only, 0.5, "repeller") is not None
+
+
+def test_every_pivot_is_none_or_inside_the_grid():
+    field = session_forced_flow_field(_columns(), GRID, R, Q)
+    lo, hi = min(GRID), max(GRID)
+    assert len(field["pivots"]) == len(field["magnets"])
+    for p in field["pivots"]:
+        assert p is None or (lo <= p <= hi)
 
 
 def test_min_tte_floor_is_inert_for_longer_dated_book():
