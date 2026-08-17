@@ -39,7 +39,14 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Optional
 
-from src.tradeworkz.bots.base import BaseBot, _utcnow, resolve_expiration_iso
+import math
+
+from src.tradeworkz.bots.base import (
+    BaseBot,
+    _short_horizon_sigma_pct,
+    _utcnow,
+    resolve_expiration_iso,
+)
 from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import ExitDecision, OpenPosition, TradeSignal
 
@@ -79,7 +86,20 @@ class PutCapitulationCreditFade(BaseBot):
         if len(closes) < disp_bars + 1:
             return self._skip("no_history")
         displacement = (closes[-1] - closes[-1 - disp_bars]) / closes[-1 - disp_bars]
-        min_disp = float(self.params.get("min_displacement_pct", 0.0035))
+        # Vol-relative dip threshold. The second screen exposed a structural
+        # tension in a fixed 0.35% gate: the strong positive-gamma regime this
+        # bot requires SUPPRESSES 0.35% dips (958 of the 962 regime-passing
+        # ticks died at no_dip), so the trigger could ~never co-occur with the
+        # absorber. "A real dip" must mean real relative to the pinned tape's
+        # own vol: k sigma-scaled over the displacement window, floored so a
+        # dead tape can't fire on noise.
+        sigma_1m = _short_horizon_sigma_pct(snap)
+        floor_pct = float(self.params.get("min_displacement_pct", 0.0020))
+        if sigma_1m is not None:
+            k = float(self.params.get("displacement_sigma_mult", 2.0))
+            min_disp = max(floor_pct, k * sigma_1m * math.sqrt(disp_bars))
+        else:
+            min_disp = float(self.params.get("displacement_fallback_pct", 0.0035))
         if displacement > -min_disp:
             return self._skip("no_dip")
 

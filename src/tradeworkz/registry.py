@@ -740,7 +740,17 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
         params={
             "min_burst_multiple": 3.0,
             "min_put_dominance": 0.65,
-            "min_displacement_pct": 0.0035,
+            # Second-screen calibration (2026-08-17): with the no_history bug
+            # fixed, 958 of the 962 regime-passing ticks died at no_dip — the
+            # strong positive-gamma regime this bot REQUIRES suppresses fixed
+            # 0.35% dips, so trigger and absorber could ~never co-occur. The
+            # dip is now vol-relative (displacement_sigma_mult x realized
+            # 1-min sigma x sqrt(bars)) with min_displacement_pct as the
+            # noise floor; the fixed fallback applies only when no sigma is
+            # computable.
+            "min_displacement_pct": 0.0020,
+            "displacement_sigma_mult": 2.0,
+            "displacement_fallback_pct": 0.0035,
             # First-screen bug fix (2026-08-15): the 30-bar displacement
             # window needed 31 closes but build_snapshot fetches only 30, so
             # every tick that cleared regime+window died at no_history

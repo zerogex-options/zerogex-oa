@@ -168,14 +168,18 @@ def test_settlement_snap_abstains_when_tape_fights_the_flow():
     )
 
 
-def test_settlement_snap_exit_on_flow_flip_and_fade():
+def test_settlement_snap_exit_on_flow_flip_only():
     bot = _bot("settlement_flow_snap")
     pos = _pos("settlement_flow_snap", components={"settlement_residual": 6.0e8})
     flipped = _settle_snap(close_charm_flow_raw=-7.0e8, close_charm_flow_smooth=-2.0e8)
     assert bot.exit_criteria(flipped, pos).reason == "flow_flip"
-    faded = _settle_snap(close_charm_flow_raw=2.5e8, close_charm_flow_smooth=1.5e8)
-    assert bot.exit_criteria(faded, pos).reason == "flow_faded"
-    # A data hiccup (missing pair) must NOT force an exit.
+    # Residual DECAY must NOT close: close_charm_flow measures the flow
+    # remaining by the close, so it mechanically shrinks as dealers execute
+    # it — decay is the mechanism working, not the thesis dying (the second
+    # screen's fade-exit churned every position out within ~8 minutes).
+    decayed = _settle_snap(close_charm_flow_raw=2.5e8, close_charm_flow_smooth=1.5e8)
+    assert bot.exit_criteria(decayed, pos).should_close is False
+    # A data hiccup (missing pair) must NOT force an exit either.
     hiccup = _settle_snap(close_charm_flow_raw=None, close_charm_flow_smooth=None)
     assert bot.exit_criteria(hiccup, pos).should_close is False
 
@@ -454,6 +458,20 @@ def test_put_capitulation_sells_the_panic():
     short_leg = next(leg for leg in sig.legs if leg.side == "short")
     assert long_leg.strike < short_leg.strike < 755.0  # credit spread below spot
     assert sig.target_price is None and sig.stop_price is None  # premium exits only
+
+
+def test_put_capitulation_dip_gate_adapts_to_a_pinned_tape():
+    """The vol-relative dip gate: a -0.24% dip is a real dip when the pinned
+    tape's own sigma is tiny (the old fixed 0.35% gate could ~never co-occur
+    with the strong positive-gamma regime this bot requires — 958 of 962
+    regime-passing ticks died at no_dip on the second screen)."""
+    decline = [757.3 - (757.3 - 755.3) * i / 20.0 for i in range(21)]
+    tail = [755.3 - 0.3 * i / 9.0 for i in range(10)]
+    sig = _bot("put_capitulation_credit_fade").open_criteria(
+        _capit_snap(recent_closes=decline + tail)
+    )
+    assert sig is not None
+    assert sig.strategy_type == "BULL_PUT_CREDIT_SPREAD"
 
 
 def test_put_capitulation_needs_the_full_strength_absorber():

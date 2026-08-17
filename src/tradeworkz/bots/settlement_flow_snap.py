@@ -96,7 +96,10 @@ class SettlementFlowSnap(BaseBot):
             return self._skip("bias_veto")
 
         # -- Quality: how far past the magnitude floor the residual runs.
-        quality = min(1.0, abs(residual) / max(1e-9, 3.0 * min_frac * local))
+        # Saturates at 1.5x the floor so a setup that cleared the hard gates
+        # can also clear the conviction gate (the second screen's quality
+        # scale rated floor-passers ~0.35 and killed 13 of them there).
+        quality = min(1.0, abs(residual) / max(1e-9, 1.5 * min_frac * local))
         ml_components = {
             "settlement_residual": residual,
             "close_charm_flow_smooth": smooth,
@@ -160,11 +163,19 @@ class SettlementFlowSnap(BaseBot):
         )
 
     def exit_criteria(self, snap: MarketSnapshot, position: OpenPosition) -> ExitDecision:
-        """Default stack plus the residual-invalidation check.
+        """Default stack plus a SIGN-FLIP invalidation — and nothing more.
 
-        The thesis is a live forced flow; if a fresh snapshot shows the
-        residual flipped sign or decayed away, the pressure resolved early
-        and the position has no reason to exist — close regardless of P&L.
+        The thesis is a live forced flow, so a fresh snapshot showing the
+        residual with the OPPOSITE sign means positioning rolled and the
+        forced flow now points against the position: close regardless of P&L.
+
+        Deliberately NO magnitude-decay exit. The first build closed when
+        |D| fell below a fraction of its entry value, and the second screen
+        showed why that was wrong (3 trades, all dead within ~8 minutes):
+        ``close_charm_flow`` measures the flow REMAINING by the close, so it
+        mechanically shrinks as dealers execute it — decay is the mechanism
+        WORKING (and pushing spot toward the target), not the thesis dying.
+        The spot stop, target, and near-the-bell time-stop own the exits.
         Missing fields on a tick (a data hiccup) never force an exit.
         """
         entry_residual = position.components_at_entry.get("settlement_residual")
@@ -172,7 +183,4 @@ class SettlementFlowSnap(BaseBot):
         if residual is not None and isinstance(entry_residual, (int, float)) and entry_residual:
             if (residual > 0) != (entry_residual > 0):
                 return ExitDecision(should_close=True, reason="flow_flip")
-            revoke_frac = float(self.params.get("residual_revoke_frac", 0.4))
-            if abs(residual) < revoke_frac * abs(entry_residual):
-                return ExitDecision(should_close=True, reason="flow_faded")
         return super().exit_criteria(snap, position)

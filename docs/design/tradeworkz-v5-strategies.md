@@ -408,16 +408,57 @@ carries no validation weight for the new config.
 
 This mirrors the v4 sequence exactly (first screen → probe/funnel →
 calibration → re-screen): the counters, not intuition, chose every change.
-Re-screen with:
+
+### 7.1 Second screen (2026-08-17, 60d / 5m / 1 contract)
+
+The recalibrated five-bot fleet flipped to net-positive: **25 trades,
++$96.40, expectancy +$3.86** (vs 391 trades / −$4,194 with the flow bot in).
+
+| Bot | Trades | PF | Expectancy | Read |
+|---|---:|---:|---:|---|
+| profile_shelf_breaker | 17 | **1.27** | **+$17.62** | insufficient — **3 trades short of the bar**, barbell intact (avg win $356 vs avg loss $87) |
+| weekly_charm_grind | 3 | — (3W/0L) | +$12.32 | insufficient — the drift is real but small ($12/trade at time-stop); accumulating |
+| settlement_flow_snap | 3 | 0.00 | −$30.46 | insufficient — all 3 churned out in ~8 min by the fade exit (design flaw, below) |
+| dual_flip_dislocation | 2 | 0.37 | −$74.38 | insufficient — the amplifying ordering is structurally rare (~20% of ticks); 3 of 6 fresh crosses died at conviction |
+| put_capitulation_credit_fade | 0 | — | — | insufficient — bug fixed, but a structural tension surfaced (below) |
+
+**Shelf: hold the line.** PF 1.27 with positive expectancy across 17 trades,
+and the win/loss shape the mechanism predicts. No knob is touched this round
+— it crosses the 20-trade bar on data accumulation alone within ~2 weeks, and
+its verdict should come from the config as-is.
+
+**Mechanism-level fixes from this screen (not knob tweaks):**
+
+- `settlement_flow_snap` — **the fade exit was wrong on its own mechanism.**
+  `close_charm_flow` measures the flow REMAINING by the close, so it
+  mechanically shrinks as dealers execute it: |D| decaying is the trade
+  *working*, and the `flow_faded` exit closed every position within ~8
+  minutes for it. Removed; invalidation is now sign-flip only, and the spot
+  stop / target / near-bell time-stop own the exits.
+- `put_capitulation_credit_fade` — **the dip gate fought the regime gate.**
+  With `no_history` fixed, 958 of 962 regime-passing ticks died at `no_dip`:
+  the strong positive-gamma book this bot requires *suppresses* fixed-0.35%
+  dips, so trigger and absorber could ~never co-occur. The dip is now
+  vol-relative (`2σ·√bars` of the tape's own realized 1-min sigma, floored
+  at 0.20%) — "a real dip" measured against the pinned tape it happens in.
+- `settlement` + `dual_flip` — quality scales matched to entry floors (the
+  same disease weekly_charm_grind had on screen one: setups clearing every
+  hard gate then dying at conviction because the quality scale saturated far
+  above the floors — 13 and 3 conviction deaths respectively).
+
+Re-screen with the same five-bot command:
 
 ```
 make tradeworkz-backtest ARGS="--days 60 --interval-min 5 --bots settlement_flow_snap,dual_flip_dislocation,profile_shelf_breaker,put_capitulation_credit_fade,weekly_charm_grind --json"
 ```
 
-Promotion criteria unchanged: PF ≥ 1.1, positive expectancy, ≥ 20 trades. If
-the recalibrated shelf/settlement/dual-flip configs still can't reach 20
-trades, the next lever is `tw_execution_sweep` grids with the train/test
-split — not further ad-hoc loosening.
+Promotion criteria unchanged: PF ≥ 1.1, positive expectancy, ≥ 20 trades.
+Frequency reality after two screens: shelf reaches the bar soon;
+settlement / dual-flip / weekly / put-capitulation are low-frequency,
+regime-conditional setups that validate on accumulation (the
+vanna_vol_crush_rider posture) — the next lever for any of them is a
+`tw_execution_sweep` grid with the train/test split, not further ad-hoc
+loosening.
 
 ---
 
