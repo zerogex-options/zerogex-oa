@@ -104,6 +104,16 @@ _SESSION_FUTURE_STEPS_DEFAULT = 8
 
 _cache: Dict[tuple, Dict[str, Any]] = {}
 _cache_lock = threading.Lock()
+# Insertion-order eviction ceiling, same idiom as _past_col_cache below. This
+# cache had NO bound: _cache_put only ever overwrote its own key and _cache_get
+# never dropped a stale entry, so every distinct key this router ever saw stayed
+# resident with its full payload for the life of the worker. The keyspace is
+# request-driven -- ("backtest", symbol, lookback_days) alone spans ~1000
+# lookback values, and session-surface keys carry the price-grid span -- so a
+# client sweeping a parameter grew the worker's RSS monotonically through the
+# session. Sized well above the working set the warmer plus the frontend touch
+# (a few symbols x a handful of grids), so a normal session never evicts.
+_RESPONSE_CACHE_MAX = 256
 
 # Per-(trading-day, symbol, time-bucket, price-grid) cache of ONE computed PAST
 # column of the session field. A past bucket's as-of book is immutable, so its
@@ -182,8 +192,27 @@ def _cache_get(key: tuple) -> Optional[Dict[str, Any]]:
 
 
 def _cache_put(key: tuple, data: Dict[str, Any]) -> None:
+    now = time.monotonic()
     with _cache_lock:
-        _cache[key] = {"ts": time.monotonic(), "data": data}
+        # Pop before re-inserting so position tracks the most recent WRITE:
+        # a plain overwrite would keep the key at its original insertion slot
+        # and let eviction take the entry the warmer is actively refreshing.
+        _cache.pop(key, None)
+        _cache[key] = {"ts": now, "data": data}
+        if len(_cache) > _RESPONSE_CACHE_MAX:
+            # Expired entries are free to drop, so sweep those first; only
+            # then fall back to evicting the least-recently-written.
+            for k in [
+                k
+                for k, v in _cache.items()
+                if k != key and now - v["ts"] >= _RESPONSE_CACHE_TTL_SECONDS
+            ]:
+                _cache.pop(k, None)
+            while len(_cache) > _RESPONSE_CACHE_MAX:
+                oldest = next(iter(_cache))
+                if oldest == key:  # never evict the entry just written
+                    break
+                _cache.pop(oldest, None)
 
 
 # --------------------------------------------------------------------------- #

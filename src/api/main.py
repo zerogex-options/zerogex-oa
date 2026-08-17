@@ -822,10 +822,22 @@ async def get_strike_profile_timeseries(
         # than a chart-blanking empty filter.
         expiration_dates = parsed or None
 
-    data = await _db().get_strike_profile_timeseries(
+    # Return the raw bucket dicts and let ``response_model`` do the single
+    # validation + encode pass. Building StrikeProfileBucket instances here was
+    # a redundant round-trip: FastAPI's serializer calls model_dump() on
+    # whatever it is handed and re-validates that back into the response field,
+    # so constructing them up front made it dict -> model -> dict -> model.
+    # Dropping it is strictly less work on the largest response this API
+    # serves, though measurement puts the request's peak heap in the
+    # serialisation that follows, so expect a smaller allocation churn rather
+    # than a lower high-water mark.
+    #
+    # Same JSON either way — verified byte-for-byte, including Decimal
+    # precision and nulls. The model's json_encoders still run: they apply to
+    # the field FastAPI validates into, not to the object the endpoint returns.
+    return await _db().get_strike_profile_timeseries(
         symbol, timeframe, window_units, expiration_dates
     )
-    return [StrikeProfileBucket(**row) for row in data]
 
 
 # ============================================================================

@@ -12,6 +12,25 @@ Wants=network-online.target
 # land in the alert unit's own journal so the wiring is verifiable.
 OnFailure=zerogex-alert@%n.service
 
+# Restart rate limiting — 5 starts per 300s, unchanged; this is purely a move
+# to the canonical section. systemd moved these to [Unit] in v229 and renamed
+# StartLimitInterval -> StartLimitIntervalSec. The old [Service] spelling still
+# WORKS (it is a documented backward-compat alias that writes into the same
+# per-unit rate limiter, which is why `systemd-analyze verify` never flagged
+# it), but it reads like a [Service] knob when it is not one. Same values, same
+# behaviour, canonical spelling.
+#
+# The window is intentionally long relative to RestartSec=10 below, so a unit
+# that dies immediately on start — a genuine crash loop from a bad deploy —
+# latches instead of flapping forever. Note the flip side, which the
+# ExecStartPost comment below also cares about: a failure that recurs faster
+# than 5-per-300s WILL latch the unit into start-limit-hit and hold the API
+# down until a human runs `systemctl reset-failed`. That is why the MemoryMax
+# headroom in [Service] matters — it keeps OOM restarts, which recur minutes
+# apart, from ever accumulating to this bound.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=ubuntu
@@ -45,11 +64,9 @@ ExecStartPost=/bin/sh -c '/usr/bin/curl --fail --silent --show-error \
     --retry 30 --retry-delay 1 --retry-connrefused --max-time 5 \
     http://127.0.0.1:8000/api/health/live > /dev/null'
 
-# Restart policy
+# Restart policy (StartLimit* moved to [Unit], its canonical section)
 Restart=always
 RestartSec=10
-StartLimitBurst=5
-StartLimitInterval=300
 
 # Process management
 KillMode=mixed
@@ -58,7 +75,36 @@ TimeoutStopSec=30
 SendSIGKILL=yes
 
 # Resource limits
-MemoryMax=1G
+#
+# MemoryMax is enforced against the unit's whole cgroup — the uvicorn parent
+# AND both workers share this budget, it is not per-process. At 1G that gave
+# each worker only ~500M, and a couple of concurrent large analytics reads
+# (strike-profile-timeseries / heatmap over a wide window) were enough to trip
+# the kernel OOM killer. One worker dying takes the whole unit down, systemd
+# reports `Failed with result 'oom-kill'`, OnFailure= fires, and Restart=always
+# brings it back ~10s later — a self-healing flap whose only visible symptom
+# was a stream of alert emails.
+#
+# 2G budget on the m5.large (8 GiB, deploy/README.md): during the cash session
+# the concurrent units are ingestion 2G + analytics 1G + signals 1G + api 2G =
+# 6G, leaving ~2 GiB for the OS and nginx. backtest-worker (2G) is excluded
+# because its timer fires post-close at 17:30 ET, so it never overlaps.
+MemoryMax=2G
+# Soft brake: past this the kernel applies reclaim pressure and throttles
+# allocation instead of killing outright, which gives the allocator a chance to
+# return freed arenas. The band is deliberately narrow (200M) because the box
+# has no swap — a Python worker's memory is mostly anonymous, so sustained
+# throttling here would stall requests rather than free much. It should only
+# ever engage in the last stretch before the hard cap; idle/normal-load steady
+# state sits far below it. Remove this line if reclaim stalls ever show up
+# before an actual OOM.
+#
+# NOTE this is headroom, not a cure. A single window_units=480 strike-profile
+# request still peaks in the hundreds of MB — dominated by serialising the
+# finished payload, not by the query — so a burst of wide concurrent requests
+# can still reach 2G. If these alerts return, the fix is to shrink that
+# response (cap window_units, or stream it), not to keep raising this number.
+MemoryHigh=1800M
 # 2 uvicorn workers (one event loop each) → allow up to 2 cores. At 100% the two
 # workers shared a single core and CFS-throttled in bursts during the cash session,
 # adding event-loop scheduling delay on top of DB reads. CPUWeight below still wins
