@@ -1,6 +1,8 @@
 # TradeWorkz v5 — Unconsumed-Data Strategies
 
-**Status:** candidates (registered + backtestable; **not live**)
+**Status:** candidates (registered + backtestable; **not live**) — first
+screen run 2026-08-15, results + calibration in §8; `hedge_impulse_quiet_tape`
+SCREENED OUT.
 **Date:** 2026-08-15
 **Extends:** `tradeworkz-edge-strategies.md` (the v4 fleet and its screen verdicts)
 
@@ -176,7 +178,7 @@ Known data traps, designed around (not into):
   or no longer one-sided (< 1.3:1) closes regardless of P&L · 100-min
   time-stop · ladder stays ON (real directional target).
 
-### 3.4 Quiet-Tape Hedge Impulse — `hedge_impulse_quiet_tape`
+### 3.4 Quiet-Tape Hedge Impulse — `hedge_impulse_quiet_tape` (SCREENED OUT, PF 0.32)
 
 - **Axis:** the pending hedge OBLIGATION (per-contract delta × Lee-Ready
   split — fields no strategy ever consumed).
@@ -309,8 +311,11 @@ stays empty**. A candidate is promoted only after clearing the same gate as
 always — **PF ≥ 1.1, positive expectancy, ≥ 20 trades**:
 
 ```
-make tradeworkz-backtest ARGS="--days 60 --interval-min 5 --bots settlement_flow_snap,dual_flip_dislocation,profile_shelf_breaker,hedge_impulse_quiet_tape,put_capitulation_credit_fade,weekly_charm_grind --json"
+make tradeworkz-backtest ARGS="--days 60 --interval-min 5 --bots settlement_flow_snap,dual_flip_dislocation,profile_shelf_breaker,put_capitulation_credit_fade,weekly_charm_grind --json"
 ```
+
+(The original six-bot command included `hedge_impulse_quiet_tape`; it was
+screened out on the first run — see §7.)
 
 Screen order of operations (the v4 lessons, proceduralized):
 
@@ -340,7 +345,83 @@ everything, the sweep — not an ad-hoc loosening — decides.
 
 ---
 
-## 7. What shipped with this doc
+## 7. First screen — results & calibration (2026-08-15, 60d / 5m / 1 contract)
+
+The first `make tradeworkz-backtest` run (2026-06-16 → 2026-08-15, 3,318
+steps × SPY/QQQ/SPX, full chain coverage) produced real verdicts on day one:
+
+| Bot | Trades | PF | Expectancy | Verdict |
+|---|---:|---:|---:|---|
+| profile_shelf_breaker | 5 | **2.28** | **+$89.99** | insufficient (best early read in the fleet) |
+| hedge_impulse_quiet_tape | 383 | **0.32** | −$11.66 | **no-edge → SCREENED OUT** |
+| settlement_flow_snap | 1 | 0.00 | −$29.16 | insufficient (magnitude gate mis-calibrated) |
+| dual_flip_dislocation | 2 | 0.37 | −$74.38 | insufficient (fresh-cross gate vs replay cadence) |
+| put_capitulation_credit_fade | 0 | — | — | insufficient (**bug**: could never fire) |
+| weekly_charm_grind | 0 | — | — | insufficient (gate intersection near-empty) |
+
+**The flow-direction axis is now closed — four formulations, one verdict.**
+`hedge_impulse_quiet_tape` was the strongest read that axis will ever get:
+delta-weighted OBLIGATION instead of premium sentiment, a flat-tape gate that
+entered *ahead* of the hedge instead of chasing it, negative-gamma
+amplification, and sign persistence. It returned PF 0.32 at a 22% win rate
+over 383 trades — statistically indistinguishable from
+`aggressor_flow_divergence` (0.31) and `fresh_flow_momentum` (0.33). The
+designed ablation is thereby answered in the strongest possible way: the
+failure was never the *formulation* of flow-following; recent flow direction
+simply does not predict 0DTE price direction on these underlyings at this
+cadence. Moved to a standalone screened-out spec (out of `CANDIDATE_SPECS`,
+kept backtestable). Do not build a fifth variant; the only open read of this
+data is the contrarian one (`climax_flow_fade`, still screening).
+
+**Gamma Shelf Cascade is the one to watch.** PF 2.28, +$450, 40% win rate
+with average wins 3.4× average losses — exactly the profile the mechanism
+predicts (capped losses at the stop, cascades that run to the trough). But 5
+trades is a read, not a verdict, and the funnel shows the geometry gates
+(`no_shelf` 3,495 / `not_on_shoulder` 3,329) throttle it below the 20-trade
+bar on a window that cannot grow (chain history starts 2026-06-15). Depth and
+shoulder gates were widened one notch (0.75→0.60 / 0.5→0.60 of local_gex);
+the defining mechanism gates (2:1 one-sidedness, the live slide trigger) are
+untouched. This is a recalibrated hypothesis screened from scratch — the 2.28
+carries no validation weight for the new config.
+
+**Fixed from the funnel (every change names its miss counter):**
+
+- `put_capitulation_credit_fade` — **implementation bug**: `no_history` on
+  all 1,300 regime-passing ticks. The 30-bar displacement window needed 31
+  closes; `build_snapshot` carries at most 30. `displacement_bars` → 25. The
+  strategy was never actually tested; this screen tells us nothing about it.
+- `dual_flip_dislocation` — **cadence bug**: the fresh-cross test compared
+  the last 1-MINUTE close, but the engine/replay evaluate every ~5 minutes,
+  so a cross older than 60s never registered (valid bands on ~1,500 ticks,
+  2 entries). The cross is now detected over the last 6 one-minute closes —
+  a cadence-compatibility fix, not a loosening.
+- `settlement_flow_snap` — the `0.25 × local_gex` magnitude prior blocked
+  1,607 in-window ticks and admitted one trade; the residual is real but
+  smaller relative to local gamma than assumed. Floor → `0.10`; the
+  dominance-over-drift gate (the qualitative differentiator vs
+  `charm_close_magnet`) is unchanged.
+- `weekly_charm_grind` — only 3 ticks in 60d survived the gate stack, and
+  all 3 then died at `conviction` because the quality scale saturated far
+  above the entry floor. Gates relaxed one notch each (range ≤ 0.8%,
+  dominance ≥ 1.5×, flow ≥ 0.08 × local_gex) and the quality scale matched
+  to the floor so a gate-passing setup can pass conviction.
+
+This mirrors the v4 sequence exactly (first screen → probe/funnel →
+calibration → re-screen): the counters, not intuition, chose every change.
+Re-screen with:
+
+```
+make tradeworkz-backtest ARGS="--days 60 --interval-min 5 --bots settlement_flow_snap,dual_flip_dislocation,profile_shelf_breaker,put_capitulation_credit_fade,weekly_charm_grind --json"
+```
+
+Promotion criteria unchanged: PF ≥ 1.1, positive expectancy, ≥ 20 trades. If
+the recalibrated shelf/settlement/dual-flip configs still can't reach 20
+trades, the next lever is `tw_execution_sweep` grids with the train/test
+split — not further ad-hoc loosening.
+
+---
+
+## 8. What shipped with this doc
 
 - `src/tradeworkz/flow_context.py` — raw/smooth forced-flow split + 4 new
   as-of, savepoint-isolated fetchers (bucketed second-order, hedge impulse,

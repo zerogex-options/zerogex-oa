@@ -405,6 +405,51 @@ FRESH_FLOW_MOMENTUM_SPEC = BotSpec(
 )
 
 
+# Quiet-Tape Hedge Impulse — SCREENED OUT (edge test failed). The strongest
+# formulation the flow-direction axis will ever get: it weighted the flow by
+# per-contract DELTA (the hedge OBLIGATION, not premium sentiment), required a
+# FLAT tape (entering ahead of the hedge instead of chasing it — the exact
+# inverse of the entry state that killed the first two flow bots), conditioned
+# on NEGATIVE gamma (amplification), and required sign persistence. The
+# 2026-08-15 screen (60d, 383 trades) returned PF 0.32 / expectancy -$11.66 /
+# 22% win rate — the SAME signature as aggressor_flow_divergence (0.31) and
+# fresh_flow_momentum (0.33). Four independent formulations of "trade the
+# direction of recent option flow on 0DTE" have now failed identically:
+# cumulative premium, windowed premium + acceleration, and delta-weighted
+# obligation both behind and AHEAD of the tape. The axis is closed — recent
+# flow direction does not predict 0DTE price direction on these underlyings at
+# this cadence, full stop. Do not build a fifth variant; the one live read of
+# this data that remains open is the CONTRARIAN one (climax_flow_fade,
+# screening). Registered + backtestable for the record.
+HEDGE_IMPULSE_QUIET_TAPE_SPEC = BotSpec(
+    id="hedge_impulse_quiet_tape",
+    display_name="Quiet-Tape Hedge Impulse",
+    strategy_class="HedgeImpulseQuietTape",
+    tier="0DTE",
+    direction_mode="context",
+    universe="*",
+    tagline="A hedge obligation is staged and the tape hasn't moved. Front-run it.",
+    description=(
+        "SCREENED OUT (PF 0.32 / 383 trades, 2026-08-15). Front-ran the "
+        "delta-weighted pending dealer hedge on a flat tape in negative "
+        "gamma — the fourth and strongest flow-direction formulation, and it "
+        "failed with the same signature as the first three. The flow-follow "
+        "axis is closed. Kept for the record."
+    ),
+    params={
+        "min_impulse_ratio": 0.08,
+        "max_flat_move_pct": 0.0015,
+        "flip_exit_ratio": 0.04,
+        "no_move_expiry_minutes": 45,
+        "target_pct": 0.004,
+        "stop_pct": 0.003,
+        "max_hold_minutes": 75,
+        "scale_out_enabled": False,
+        "dte_target": 0,
+    },
+)
+
+
 # Split flagship wall bots — SCREENED OUT (edge test failed). The 2026-08-10
 # screen (45d) gave call_wall_rejector PF 0.193 / 33 trades and put_wall_bouncer
 # PF 0.577 / 29 trades — a THIRD wall-fade failure after the retired
@@ -595,7 +640,12 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
         params={
             "min_minutes_to_close": 30,
             "max_minutes_to_close": 90,
-            "min_residual_local_gex_frac": 0.25,
+            # First-screen calibration (2026-08-15): the 0.25 prior blocked
+            # 1,607 in-window ticks (miss_reason=residual_small) and let ONE
+            # trade through in 60d — the residual is real but runs smaller
+            # relative to local_gex than the prior assumed. The dominance
+            # gate (vs the smooth drift) stays as the qualitative filter.
+            "min_residual_local_gex_frac": 0.10,
             "min_residual_dominance": 1.5,
             "target_pct": 0.003,
             "stop_pct": 0.002,
@@ -622,6 +672,13 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
         params={
             "min_band_pct": 0.002,
             "min_momentum_pct": 0.0005,
+            # First-screen calibration (2026-08-15): the fresh-cross test
+            # compared against the last 1-MINUTE close, but the replay (and
+            # the engine) evaluate every ~5 minutes — a cross older than a
+            # minute never registered, so valid bands produced only 2 entries
+            # in 60d (miss: outside_band 1455 / no_fresh_cross 115). The
+            # cross is now detected over the last N one-minute closes.
+            "cross_lookback_bars": 6,
             "stop_buffer_pct": 0.001,
             "band_collapse_pct": 0.001,
             "max_hold_minutes": 75,
@@ -645,41 +702,21 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "computed, unpublished level) is the target."
         ),
         params={
-            "min_shelf_depth_local_frac": 0.75,
+            # First-screen calibration (2026-08-15): PF 2.28 / +$450 on 5
+            # trades with the 0.75/0.5 priors — the best early read in the
+            # fleet, but the geometry gates (no_shelf 3495 / not_on_shoulder
+            # 3329) throttle it far below the 20-trade bar, and the screen
+            # window cannot grow (chain history starts 2026-06-15). Depth
+            # and shoulder are widened modestly to buy sample; this is a
+            # recalibrated hypothesis screened from scratch, NOT a validated
+            # PF 2.28 — the asymmetry (2:1) and live-slide gates that define
+            # the mechanism are unchanged.
+            "min_shelf_depth_local_frac": 0.60,
             "min_asymmetry_ratio": 2.0,
-            "max_spot_gex_local_frac": 0.5,
+            "max_spot_gex_local_frac": 0.60,
             "min_trigger_pct": 0.001,
             "stop_pct": 0.0015,
             "max_hold_minutes": 100,
-            "dte_target": 0,
-        },
-    ),
-    BotSpec(
-        id="hedge_impulse_quiet_tape",
-        display_name="Quiet-Tape Hedge Impulse",
-        strategy_class="HedgeImpulseQuietTape",
-        tier="0DTE",
-        direction_mode="context",
-        universe="*",
-        tagline="A hedge obligation is staged and the tape hasn't moved. Front-run it.",
-        description=(
-            "Computes the literal shares dealers must trade to hedge the last "
-            "~15 minutes of delta-weighted aggressor flow and enters in the "
-            "hedge direction ONLY while the tape is still flat, in negative "
-            "gamma. The structural inverse of the two dead flow-followers: "
-            "delta-weighting kills the lotto noise, and the flat-tape gate "
-            "refuses the buy-the-extreme entries that killed them. "
-            "Defined-risk vertical; ladder off for a clean screen."
-        ),
-        params={
-            "min_impulse_ratio": 0.08,
-            "max_flat_move_pct": 0.0015,
-            "flip_exit_ratio": 0.04,
-            "no_move_expiry_minutes": 45,
-            "target_pct": 0.004,
-            "stop_pct": 0.003,
-            "max_hold_minutes": 75,
-            "scale_out_enabled": False,
             "dte_target": 0,
         },
     ),
@@ -704,6 +741,12 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "min_burst_multiple": 3.0,
             "min_put_dominance": 0.65,
             "min_displacement_pct": 0.0035,
+            # First-screen bug fix (2026-08-15): the 30-bar displacement
+            # window needed 31 closes but build_snapshot fetches only 30, so
+            # every tick that cleared regime+window died at no_history
+            # (1,300 of them) and the bot could never fire. 25 bars fits the
+            # snapshot's history with margin.
+            "displacement_bars": 25,
             "min_wall_room_pct": 0.0025,
             "short_strike_offset_pct": 0.0035,
             "credit_take_frac": 0.55,
@@ -729,9 +772,19 @@ CANDIDATE_SPECS: tuple[BotSpec, ...] = (
             "hard exit 15:00 ET, never overnight."
         ),
         params={
-            "min_bucket_dominance": 2.0,
-            "min_flow_local_gex_frac": 0.10,
-            "max_session_range_pct": 0.006,
+            # First-screen calibration (2026-08-15): 0 trades — only 3 ticks
+            # in 60d survived the gate stack and all 3 then died at
+            # conviction (quality saturated too high for setups that had
+            # already cleared every hard gate). The intersection of
+            # range<=0.6% AND dominance>=2x AND flow>=0.10*local_gex was
+            # near-empty (range_wide 2100 / odte_dominates 347 / flow_small
+            # 41); each gate is relaxed one notch and the quality scale is
+            # matched to the entry floor so a passing setup can also pass
+            # conviction.
+            "min_bucket_dominance": 1.5,
+            "min_flow_local_gex_frac": 0.08,
+            "max_session_range_pct": 0.008,
+            "quality_flow_saturation": 0.15,
             "target_pct": 0.0035,
             "stop_pct": 0.0025,
             "scale_out_enabled": False,
@@ -806,6 +859,7 @@ def known_specs() -> Dict[str, BotSpec]:
         FRESH_FLOW_MOMENTUM_SPEC,
         CALL_WALL_REJECTOR_SPEC,
         PUT_WALL_BOUNCER_SPEC,
+        HEDGE_IMPULSE_QUIET_TAPE_SPEC,
     ):
         specs.setdefault(screened.id, screened)
     return specs

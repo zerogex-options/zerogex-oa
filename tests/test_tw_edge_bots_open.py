@@ -638,7 +638,6 @@ def test_candidate_set_is_the_evaluated_bots():
         "settlement_flow_snap",
         "dual_flip_dislocation",
         "profile_shelf_breaker",
-        "hedge_impulse_quiet_tape",
         "put_capitulation_credit_fade",
         "weekly_charm_grind",
     }
@@ -647,6 +646,9 @@ def test_candidate_set_is_the_evaluated_bots():
         "fresh_flow_momentum",
         "call_wall_rejector",
         "put_wall_bouncer",
+        # v5: the fourth flow-direction formulation, dead like the first
+        # three (PF 0.32 / 383 trades, 2026-08-15) — the axis is closed.
+        "hedge_impulse_quiet_tape",
     ):
         assert screened not in ids
         assert screened in known_specs()  # backtestable for the record
