@@ -104,7 +104,12 @@ class WeeklyCharmGrind(BaseBot):
 
         flow_ratio = remaining_flow / local
         dom_ratio = abs(charm_w) / max(1e-9, abs(charm_0)) if charm_0 else 4.0
-        quality = min(1.0, flow_ratio / 0.25) * min(1.0, max(0.5, dom_ratio / 4.0))
+        # Quality saturates just above the entry floor: a setup that cleared
+        # every hard gate must also be able to clear the conviction gate (the
+        # first screen's 3 sole gate-survivors all died at conviction because
+        # the old /0.25 scale rated them ~0.4).
+        flow_sat = float(self.params.get("quality_flow_saturation", 0.15))
+        quality = min(1.0, flow_ratio / max(1e-9, flow_sat)) * min(1.0, max(0.5, dom_ratio / 4.0))
         ml_components = {
             "dealer_charm_weekly": charm_w,
             "dealer_charm_0dte": charm_0,

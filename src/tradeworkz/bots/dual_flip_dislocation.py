@@ -89,26 +89,30 @@ class DualFlipDislocation(BaseBot):
         if not (structural < snap.spot < raw):
             return self._skip("outside_band")
 
-        # -- Fresh crossing THIS tick, with momentum: no chasing a band spot
-        # has sat in for an hour. recent_closes are 1-min bars oldest->newest.
+        # -- Fresh crossing, with momentum: no chasing a band spot has sat in
+        # for an hour. recent_closes are 1-min bars oldest->newest, but the
+        # engine (and the replay) evaluate every ~5 minutes — so "fresh" is
+        # judged over the last ``cross_lookback_bars`` one-minute closes, not
+        # only the single previous bar (the first screen showed a strict
+        # prev-bar test made valid bands nearly unenterable at 5-min cadence:
+        # 2 entries in 60 days against ~1,500 in-band ticks).
         closes = [c for c in (snap.recent_closes or []) if c and c > 0]
-        if len(closes) < 3:
-            return self._skip("no_history")
-        prev = closes[-2]
+        lookback = max(2, int(self.params.get("cross_lookback_bars", 6)))
         mom_bars = max(2, int(self.params.get("momentum_bars", 2)))
-        if len(closes) < mom_bars + 1:
+        if len(closes) < max(lookback, mom_bars) + 1:
             return self._skip("no_history")
+        window = closes[-1 - lookback : -1]  # the bars before the current one
         momentum = (closes[-1] - closes[-1 - mom_bars]) / closes[-1 - mom_bars]
         min_mom = float(self.params.get("min_momentum_pct", 0.0005))
 
         direction: Optional[str] = None
         target: Optional[float] = None
         stop_edge: Optional[float] = None
-        if prev >= raw and snap.spot < raw and momentum <= -min_mom:
+        if max(window) >= raw and snap.spot < raw and momentum <= -min_mom:
             # Down-cross of the raw flip: fast book just went short gamma,
             # amplifying the decline toward the structural flip below.
             direction, target, stop_edge = "bearish", structural, raw
-        elif prev <= structural and snap.spot > structural and momentum >= min_mom:
+        elif min(window) <= structural and snap.spot > structural and momentum >= min_mom:
             # Up-cross of the structural flip from below: fast book still
             # short gamma inside the band, amplifying the rally toward the
             # raw flip above (where it turns positive and stabilizes).

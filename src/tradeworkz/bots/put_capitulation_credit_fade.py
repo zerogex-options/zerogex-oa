@@ -70,9 +70,12 @@ class PutCapitulationCreditFade(BaseBot):
         if snap.gex_regime() != "positive_strong":
             return self._skip("regime")
 
-        # -- There must be a dip being bought.
+        # -- There must be a dip being bought. NOTE: build_snapshot carries at
+        # most 30 recent closes, and the displacement needs bars+1 of history
+        # — a default above 29 can never evaluate (the first screen died at
+        # no_history on every regime-passing tick with the old 30-bar default).
         closes = [c for c in (snap.recent_closes or []) if c and c > 0]
-        disp_bars = max(5, int(self.params.get("displacement_bars", 30)))
+        disp_bars = max(5, int(self.params.get("displacement_bars", 25)))
         if len(closes) < disp_bars + 1:
             return self._skip("no_history")
         displacement = (closes[-1] - closes[-1 - disp_bars]) / closes[-1 - disp_bars]

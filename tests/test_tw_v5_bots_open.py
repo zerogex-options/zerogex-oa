@@ -136,10 +136,12 @@ def test_settlement_snap_needs_both_ff_fields():
 
 
 def test_settlement_snap_requires_residual_to_rival_local_gamma():
-    # |D| = 1.4e8 < 0.25 * local_gex (2.5e8) — too small to move price.
+    # |D| = 0.9e8 < 0.10 * local_gex (1.0e8) — too small to move price.
+    # (The 0.10 floor is the first-screen recalibration of the 0.25 prior,
+    # which blocked 1,607 in-window ticks over 60 days.)
     assert (
         _bot("settlement_flow_snap").open_criteria(
-            _settle_snap(close_charm_flow_raw=2.4e8, close_charm_flow_smooth=1.0e8)
+            _settle_snap(close_charm_flow_raw=1.5e8, close_charm_flow_smooth=0.6e8)
         )
         is None
     )
@@ -192,8 +194,9 @@ def _dualflip_snap(**over) -> MarketSnapshot:
         gamma_flip=750.0,  # structural
         gamma_flip_raw=756.0,  # fast/unweighted flip ABOVE — band [750, 756]
         gamma_flip_span_used=0.20,
-        # Fresh down-cross of the raw flip with 2-bar momentum down.
-        recent_closes=[757.0, 757.0, 756.8, 756.5, 755.0],
+        # Fresh down-cross of the raw flip (within the 6-bar cross lookback)
+        # with 2-bar momentum down.
+        recent_closes=[757.0, 757.0, 757.0, 757.0, 756.8, 756.5, 755.0],
     )
     base.update(over)
     return MarketSnapshot(**base)
@@ -210,7 +213,7 @@ def test_dual_flip_fires_bearish_on_fresh_down_cross():
 
 def test_dual_flip_fires_bullish_on_up_cross_of_structural():
     sig = _bot("dual_flip_dislocation").open_criteria(
-        _dualflip_snap(spot=751.0, recent_closes=[749.0, 749.0, 749.2, 749.5, 751.0])
+        _dualflip_snap(spot=751.0, recent_closes=[749.0, 749.0, 749.0, 749.0, 749.2, 749.5, 751.0])
     )
     assert sig is not None
     assert sig.direction == "bullish"
@@ -250,10 +253,11 @@ def test_dual_flip_distrusts_expansion_rung_flips():
 
 
 def test_dual_flip_never_chases_a_stale_band():
-    # Spot has been inside the band all along — no fresh crossing.
+    # Spot has been inside the band throughout the cross lookback — no fresh
+    # crossing to ride.
     assert (
         _bot("dual_flip_dislocation").open_criteria(
-            _dualflip_snap(recent_closes=[755.6, 755.5, 755.5, 755.5, 755.0])
+            _dualflip_snap(recent_closes=[755.6, 755.5, 755.5, 755.5, 755.4, 755.3, 755.0])
         )
         is None
     )
@@ -415,9 +419,10 @@ def test_hedge_impulse_exit_on_reversal_and_expiry():
 
 
 def _capit_closes() -> list[float]:
-    # -0.4% displacement over 30 bars, but front-loaded: the last 10 bars are
-    # nearly flat so the fleet trend-veto (10-bar, 0.2%) does not fire.
-    decline = [758.0 - (758.0 - 755.3) * i / 20.0 for i in range(21)]
+    # A ~-0.45% displacement over the 25-bar window, but front-loaded: the
+    # last 10 bars are nearly flat so the fleet trend-veto (10-bar, 0.2%)
+    # does not fire.
+    decline = [759.5 - (759.5 - 755.3) * i / 20.0 for i in range(21)]
     tail = [755.3 - 0.3 * i / 9.0 for i in range(10)]
     return decline + tail
 
@@ -585,6 +590,13 @@ def test_weekly_charm_grind_exit_on_positioning_turnover():
 # ======================================================================
 
 
+# hedge_impulse_quiet_tape was SCREENED OUT on the 2026-08-15 first screen
+# (PF 0.32 / 383 trades — the fourth flow-direction failure, same signature
+# as the first three; the axis is closed). It stays registered + backtestable
+# for the record but is no longer a promotion candidate.
+V5_SCREENED_OUT = ("hedge_impulse_quiet_tape",)
+
+
 def test_v5_candidates_are_registered_not_live():
     """Same discipline as v4: registered + screenable by id, but nothing is
     provisioned, sized, or opened until it clears the backtest gate."""
@@ -593,7 +605,10 @@ def test_v5_candidates_are_registered_not_live():
     candidate_ids = {s.id for s in CANDIDATE_SPECS}
     for bot_id in V5_IDS:
         assert bot_id in specs
-        assert bot_id in candidate_ids
+        if bot_id in V5_SCREENED_OUT:
+            assert bot_id not in candidate_ids  # no longer promotable
+        else:
+            assert bot_id in candidate_ids
         assert bot_id not in roster_ids
         assert bot_id not in RETIRED_BOT_IDS
         # Resolvable and constructible.
