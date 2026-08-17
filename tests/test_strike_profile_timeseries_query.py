@@ -728,7 +728,9 @@ def test_response_cached_with_dedicated_ttl():
     # the shared TTL and the rewind chart's polling cost will collapse.
     matching_keys = [k for k in db._read_cache if k.startswith("strike_profile_ts:")]
     assert matching_keys, "endpoint did not cache its response"
-    expires_at, _ = db._read_cache[matching_keys[0]]
+    # Index rather than unpack so the assertion does not depend on the cache
+    # entry's internal arity (expiry, payload, and a size-accounting field).
+    expires_at = db._read_cache[matching_keys[0]][0]
     assert db._strike_profile_timeseries_cache_ttl_seconds > db._analytics_cache_ttl_seconds
 
     # Second call hits the cache, no extra DB round-trip.

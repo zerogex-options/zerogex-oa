@@ -33,6 +33,39 @@ logger = logging.getLogger(__name__)
 
 
 _ET = ZoneInfo("America/New_York")
+# "No value yet" marker for streaming row folds, where ``None`` is a legitimate
+# value and so cannot double as the marker.
+_UNSET: Any = object()
+
+
+def _cache_weight(payload: Any) -> int:
+    """Approximate element count for a cached payload — a cheap size proxy.
+
+    Deliberately O(1): it samples a few elements rather than walking the
+    structure, so it can run on every cache write without becoming its own
+    cost.  A nested per-row list (a strike-profile bucket's ``strikes``, a
+    timeseries point's components) is what actually dominates an entry's
+    footprint, so the widest sampled one is extrapolated across the payload.
+
+    The estimate errs HIGH on purpose.  It only drives cache eviction, and the
+    cache is a pure latency optimisation — over-counting costs a little hit
+    rate, under-counting costs the memory bound this exists to enforce.
+    """
+    if not isinstance(payload, (list, tuple)):
+        return 1
+    n = len(payload)
+    if n == 0:
+        return 1
+    widest_nested = 0
+    for idx in {0, n // 2, n - 1}:
+        item = payload[idx]
+        if isinstance(item, dict):
+            for value in item.values():
+                if isinstance(value, (list, tuple)) and len(value) > widest_nested:
+                    widest_nested = len(value)
+    return n * (1 + widest_nested)
+
+
 # Default history depth for component score endpoints. Sized to span the two
 # most recent trading sessions at the engine's heartbeat cadence (~one row
 # per 5-min bucket, 24/5 engine = 12 * 24 hours per session * 2 sessions =
@@ -539,17 +572,33 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # and evicting oldest/expired keeps memory bounded — the cache is a
         # pure latency optimization so eviction can never affect correctness.
         self._read_cache_maxsize: int = max(64, _getenv_int("READ_CACHE_MAXSIZE", 2048))
-        self._read_cache: "OrderedDict[str, Tuple[float, Any]]" = OrderedDict()
+        # Second bound, on approximate CONTENT size rather than entry count.
+        # An entry cap alone says nothing about bytes: the endpoints with the
+        # widest keyspaces are also the ones with the largest payloads (a
+        # strike-profile window is up to 480 buckets x every strike), so 2048
+        # entries can be anywhere from a few MB to well past the worker's whole
+        # cgroup budget. Counted in rough "row units" via _cache_weight.
+        # Default ~250K units is a few of the largest responses plus all the
+        # small ones — enough to keep the DB-protecting TTLs effective.
+        self._read_cache_max_units: int = max(1000, _getenv_int("READ_CACHE_MAX_UNITS", 250_000))
+        self._read_cache: "OrderedDict[str, Tuple[float, Any, int]]" = OrderedDict()
+        self._read_cache_units: int = 0
         self._load_credentials()
+
+    def _cache_drop(self, key: str) -> None:
+        """Remove an entry, keeping the running unit total in step."""
+        entry = self._read_cache.pop(key, None)
+        if entry is not None:
+            self._read_cache_units -= entry[2]
 
     def _cache_get(self, key: str) -> Optional[Any]:
         """Get a cached value if it has not expired."""
         cached = self._read_cache.get(key)
         if not cached:
             return None
-        expires_at, payload = cached
+        expires_at, payload, _units = cached
         if time_module.monotonic() >= expires_at:
-            self._read_cache.pop(key, None)
+            self._cache_drop(key)
             return None
         # Mark as most-recently-used for LRU eviction.
         self._read_cache.move_to_end(key)
@@ -560,16 +609,32 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if ttl_seconds <= 0:
             return
         now = time_module.monotonic()
-        self._read_cache[key] = (now + ttl_seconds, payload)
-        self._read_cache.move_to_end(key)
-        if len(self._read_cache) > self._read_cache_maxsize:
+        # Replacing an existing key must not double-count its units.
+        self._cache_drop(key)
+        units = _cache_weight(payload)
+        self._read_cache[key] = (now + ttl_seconds, payload, units)
+        self._read_cache_units += units
+        if (
+            len(self._read_cache) > self._read_cache_maxsize
+            or self._read_cache_units > self._read_cache_max_units
+        ):
             # Opportunistically drop already-expired entries first; if still
-            # over capacity, evict least-recently-used until within bound.
-            for k in list(self._read_cache.keys()):
-                if self._read_cache[k][0] <= now:
-                    self._read_cache.pop(k, None)
-            while len(self._read_cache) > self._read_cache_maxsize:
-                self._read_cache.popitem(last=False)
+            # over either bound, evict least-recently-used until within them.
+            for k in [k for k, v in self._read_cache.items() if v[0] <= now and k != key]:
+                self._cache_drop(k)
+            # Never evict the entry just written, even if it alone exceeds the
+            # unit budget: the largest responses are exactly the ones whose TTL
+            # protects the DB, and it is already on the heap as the caller's
+            # return value. So the ceiling is "budget + one payload", not
+            # "refuse to cache anything big".
+            while len(self._read_cache) > 1 and (
+                len(self._read_cache) > self._read_cache_maxsize
+                or self._read_cache_units > self._read_cache_max_units
+            ):
+                oldest = next(iter(self._read_cache))
+                if oldest == key:
+                    break
+                self._cache_drop(oldest)
 
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
@@ -3313,13 +3378,66 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # — the chart renders the candle/flip without a per-strike
                 # surface for that bucket.
                 grouped: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
-                # Raw per-strike gamma rows per bucket, used as input to
-                # compute_call_put_walls.  Kept separate from the response
-                # ``strikes`` list because that list ships dollar-GEX
-                # quantities (and the put values are sign-flipped) — the
-                # wall helper needs the unsigned summed gamma straight from
-                # ``gex_by_strike``.
-                wall_inputs: "OrderedDict[Any, List[Dict[str, float]]]" = OrderedDict()
+
+                # Raw per-strike gamma rows for the bucket currently being
+                # read, used as input to compute_call_put_walls.  Kept
+                # separate from the response ``strikes`` list because that
+                # list ships dollar-GEX quantities (and the put values are
+                # sign-flipped) — the wall helper needs the unsigned summed
+                # gamma straight from ``gex_by_strike``.
+                #
+                # MEMORY: this holds ONE bucket at a time, not all of them.
+                # It used to accumulate every bucket's raw rows and run the
+                # wall pass afterwards, keeping a second copy of the whole
+                # window alive alongside the response payload. Each bucket's
+                # walls depend only on ITS OWN strikes and close, so a bucket
+                # can be finalised the moment its last row is read and its raw
+                # rows dropped. Measured ~5% off peak heap for three
+                # overlapping 240-bucket x 200-strike folds — worth having, but
+                # note the fold is NOT this endpoint's dominant cost: response
+                # serialisation of the finished payload is, and a full
+                # window_units=480 request peaks in the hundreds of MB
+                # regardless of what happens here.
+                #
+                # This relies on the query's ``ORDER BY br.bucket_ts ASC,
+                # s.strike ASC`` making a bucket's rows contiguous — the same
+                # ordering the response array's bucket order already depends
+                # on (see the grouping comment above). The check below turns a
+                # violation into a loud log rather than silently-wrong walls.
+                pending_ts: Any = _UNSET
+                pending_inputs: List[Dict[str, float]] = []
+                finalized: set = set()
+
+                def _finalize_bucket(ts: Any, inputs: List[Dict[str, float]]) -> None:
+                    """Compute a completed bucket's walls (and, for a filtered
+                    expiration set, its flip) from that bucket's own rows.
+
+                    Spot is the bucket's own close so the wall stays consistent
+                    with the candle in that bucket.  Buckets without a close
+                    (no underlying tape) leave both walls NULL.
+
+                    When a specific expiration set is requested, also override
+                    the flip: the persisted ``gamma_flip`` is aggregate-only, so
+                    recompute it from the same summed-by-strike gamma the bars
+                    render (cumulative net-GEX zero crossing).
+                    ``expirations=None`` (All) leaves the canonical spot-shift
+                    flip untouched so the chart's "All" view stays in parity
+                    with ``/api/gex/summary``.
+                    """
+                    bucket = grouped[ts]
+                    close_val = bucket.get("close")
+                    if close_val is not None and inputs:
+                        cw, pw = compute_call_put_walls(inputs, float(close_val))
+                        bucket["call_wall"] = cw
+                        bucket["put_wall"] = pw
+                    if exp_filter is not None:
+                        bucket["gamma_flip"] = (
+                            compute_gamma_flip_from_strikes(inputs, float(close_val))
+                            if close_val is not None and inputs
+                            else None
+                        )
+                    finalized.add(ts)
+
                 for r in rows:
                     ts = r["timestamp"]
                     bucket = grouped.get(ts)
@@ -3339,7 +3457,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "strikes": [],
                         }
                         grouped[ts] = bucket
-                        wall_inputs[ts] = []
+                    if ts != pending_ts:
+                        # Bucket boundary: the previous bucket has all its rows
+                        # now, so finalise it and release its raw gamma rows.
+                        if pending_ts is not _UNSET:
+                            _finalize_bucket(pending_ts, pending_inputs)
+                        if ts in finalized:
+                            # Structurally impossible under the query's
+                            # ORDER BY; if it ever happens this bucket's walls
+                            # would be built from a partial strike set, so say
+                            # so loudly rather than shipping a wrong wall.
+                            logger.error(
+                                "strike-profile timeseries: non-contiguous bucket %s for "
+                                "%s timeframe=%s — walls for this bucket are computed from "
+                                "a partial strike set (query ORDER BY changed?)",
+                                ts,
+                                symbol,
+                                timeframe,
+                            )
+                        pending_ts = ts
+                        pending_inputs = []
                     if r["strike"] is None:
                         continue
                     # Omit empty strikes — when every gamma/OI component is
@@ -3372,39 +3509,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "put_oi": int(put_oi),
                         }
                     )
-                    wall_inputs[ts].append(
+                    pending_inputs.append(
                         {
                             "strike": float(r["strike"]),
                             "call_gamma": float(r["call_gamma_raw"] or 0.0),
                             "put_gamma": float(r["put_gamma_raw"] or 0.0),
                         }
                     )
-                # Compute per-bucket walls from the (expiration-filtered,
-                # summed-by-strike) gamma rows the chart bars render.  Spot
-                # is the bucket's own close so the wall stays consistent
-                # with the candle in that bucket.  Buckets without a close
-                # (no underlying tape) leave both walls NULL.
-                #
-                # When a specific expiration set is requested, also override
-                # the flip: the persisted ``gamma_flip`` is aggregate-only, so
-                # recompute it from the same summed-by-strike gamma the bars
-                # render (cumulative net-GEX zero crossing).  ``expirations=None``
-                # (All) leaves the canonical spot-shift flip untouched so the
-                # chart's "All" view stays in parity with ``/api/gex/summary``.
-                for ts, bucket in grouped.items():
-                    close_val = bucket.get("close")
-                    inputs = wall_inputs.get(ts, [])
-                    if close_val is not None and inputs:
-                        cw, pw = compute_call_put_walls(inputs, float(close_val))
-                        bucket["call_wall"] = cw
-                        bucket["put_wall"] = pw
-                    if exp_filter is not None:
-                        bucket["gamma_flip"] = (
-                            compute_gamma_flip_from_strikes(inputs, float(close_val))
-                            if close_val is not None and inputs
-                            else None
-                        )
+                # Finalise the last bucket (no boundary follows it).
+                if pending_ts is not _UNSET:
+                    _finalize_bucket(pending_ts, pending_inputs)
                 result = list(grouped.values())
+                # Release the raw rows before _cache_set. Modest — the frame is
+                # about to be dropped anyway, which frees them — but it keeps
+                # the window where rows and the finished payload are both live
+                # from spanning the cache write.
+                del rows, pending_inputs
                 self._cache_set(
                     cache_key, result, self._strike_profile_timeseries_cache_ttl_seconds
                 )
