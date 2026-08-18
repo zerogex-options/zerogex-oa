@@ -24,13 +24,13 @@ unchanged.
 
 **Sessions.** A backfill exists to repair what the live feed missed, so it
 requests the same window the live feed runs in: 04:00-20:00 ET
-(``USEQ24Hour``), not TradeStation's ``Default`` template. The endpoint
-serves nothing outside the requested template's session window, and
-``Default`` does not reach the 04:00 ET pre-market open — a backfill run with
-it silently starts hours into the trading day and leaves the pre-market gap
-it was run to repair (see ``--session-template``). Cash indices (SPX / NDX)
-print only 09:30-16:00 ET whatever the template, which is why the coverage
-check below is symbol-aware.
+(``USEQ24Hour``), matching the ingester's ``SESSION_TEMPLATE``, rather than
+TradeStation's ``Default``. The template bounds how much of the day the
+endpoint will serve, so it has to be at least as wide as the window the
+charts draw. It is a necessary condition, not a sufficient one — the vendor
+can still be missing bars inside the requested window (see the coverage check
+below). Cash indices (SPX / NDX) print only 09:30-16:00 ET whatever the
+template, which is why that check is symbol-aware.
 
 **Dates.** ``--start`` / ``--end`` are inclusive *ET trading dates*, and the
 request windows are anchored on ET midnights. A UTC-anchored day would start
@@ -82,16 +82,20 @@ _INTER_REQUEST_SECONDS = 0.3
 
 _ET = ZoneInfo("America/New_York")
 
-# TradeStation session template for the fetch. The template, not the date
-# range, decides how early in the day bars come back: the endpoint serves
-# nothing outside the template's own session window. "Default" does not reach
-# the 04:00 ET pre-market open, so a backfill run with it starts hours into
-# the day and leaves the gap it was run to repair (observed on QQQ
-# 2026-08-18: a full-day request came back starting 07:33 ET). "USEQ24Hour"
-# is the 04:00-20:00 ET window the ingester streams in production
-# (SESSION_TEMPLATE), so a backfilled day covers exactly what the streamed
-# day would have — which is the whole point of a backfill. Overridable via
-# --session-template for the rare narrower pull ("Default", "USEQPre", ...).
+# TradeStation session template for the fetch. The template bounds the day
+# the endpoint will serve, so it has to be at least as wide as the window the
+# charts draw. "USEQ24Hour" is the 04:00-20:00 ET window the ingester streams
+# in production (SESSION_TEMPLATE), so a backfilled day covers exactly what
+# the streamed day would have — which is the whole point of a backfill.
+# Overridable via --session-template for a narrower pull ("Default",
+# "USEQPre", ...).
+#
+# Widening the template is necessary but not sufficient: on 2026-08-18 QQQ
+# returned bars from 07:35 ET under BOTH "Default" and "USEQ24Hour", for two
+# different firstdates 43 minutes apart — an absolute boundary in the
+# vendor's data, not in the request. When a run comes back short, the
+# coverage check below is what says so; do not assume the template explains
+# it.
 _DEFAULT_SESSION_TEMPLATE = "USEQ24Hour"
 
 # How late a trading day's first bar may land before the coverage check calls
@@ -529,8 +533,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         # only place that shows up otherwise is the chart, hours later.
         logger.error(
             "Incomplete coverage: %d trading day(s) start after the session open %s. "
-            "Those windows stay empty on the charts — re-run the affected dates, and "
-            "check --session-template (%s serves only its own session window).",
+            "Those windows stay empty on the charts. The template caps how much of "
+            "the day is served (%s), but a gap INSIDE the requested window is the "
+            "vendor's, not this tool's — re-run the affected dates later, and compare "
+            "another symbol and another date to tell the two apart.",
             sum(short.values()),
             short,
             args.session_template,
