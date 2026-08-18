@@ -123,7 +123,11 @@ class DualFlipDislocation(BaseBot):
         if self._bias_veto(snap, direction):
             return self._skip("bias_veto")
 
-        quality = 0.6 * min(1.0, band_pct / 0.005) + 0.4 * min(1.0, abs(momentum) / 0.0015)
+        # Quality saturates just above the entry floors (band 0.2%, momentum
+        # 0.05%) so a gate-passing setup can also pass conviction — the second
+        # screen's wider scale rated at-floor setups ~0.37 and killed 3 of the
+        # 6 fresh crosses at the conviction gate.
+        quality = 0.6 * min(1.0, band_pct / 0.003) + 0.4 * min(1.0, abs(momentum) / 0.00075)
         ml_components = {
             "band_pct": band_pct,
             "gamma_flip_raw": raw,
