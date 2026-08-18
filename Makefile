@@ -3659,14 +3659,33 @@ normalizer-cache-healthcheck-strict: ## Healthcheck that also fails on missing r
 		--max-age-hours $(NORMALIZER_MAX_AGE_HOURS) --strict
 
 # Staleness threshold for the per-symbol ingestion freshness check, in
-# minutes. Above the 1-minute bar cadence and the sparse pre-market tape,
-# far below the hours an unnoticed dead worker costs.
+# minutes. Applies inside the regular cash session (09:30-16:00 ET), where
+# 1-minute bars are dense: above the bar cadence, far below the hours an
+# unnoticed dead worker costs.
 INGEST_FRESHNESS_MAX_STALE_MINUTES ?= 15
+
+# Extended-hours threshold. Empty/0 = do not check outside the cash session,
+# because the vendor's own extended-hours delivery is discontinuous (measured
+# 2026-08-18: no QQQ bars at all 04:00-07:35 ET, and SPY+QQQ both silent from
+# 16:14 ET with healthy workers), so any fixed threshold there pages on the
+# feed's gaps rather than on a fault.
+INGEST_FRESHNESS_EXTENDED_MAX_STALE_MINUTES ?=
+
+# Edge-triggered alert state. Set (the systemd unit does) to page once per
+# stale episode plus one reminder per INGEST_FRESHNESS_RENOTIFY_MINUTES,
+# instead of once per 10-minute run for as long as the outage lasts. Left
+# empty for hand runs: an ad-hoc `make` neither consumes the alert budget nor
+# suppresses the next real page.
+INGEST_FRESHNESS_STATE_FILE ?=
+INGEST_FRESHNESS_RENOTIFY_MINUTES ?= 60
 
 .PHONY: ingestion-freshness-healthcheck
 ingestion-freshness-healthcheck: ## Alert if a symbol stopped writing bars mid-session (0=ok, 1=stale, 2=db error)
 	@$(PY) -m src.tools.ingestion_freshness_healthcheck \
 		--max-stale-minutes $(INGEST_FRESHNESS_MAX_STALE_MINUTES) \
+		--renotify-minutes $(INGEST_FRESHNESS_RENOTIFY_MINUTES) \
+		$(if $(INGEST_FRESHNESS_EXTENDED_MAX_STALE_MINUTES),--extended-max-stale-minutes $(INGEST_FRESHNESS_EXTENDED_MAX_STALE_MINUTES)) \
+		$(if $(INGEST_FRESHNESS_STATE_FILE),--state-file $(INGEST_FRESHNESS_STATE_FILE)) \
 		$(if $(JSON),--json)
 
 .PHONY: normalizer-cache-healthcheck-json

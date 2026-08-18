@@ -123,12 +123,15 @@ TIMER_UNITS=(
     # See src/jobs/session_levels.py.
     "zerogex-oa-session-levels"
     # Per-symbol ingestion freshness (every 10 min, all day): alerts when a
-    # configured underlying stops writing bars inside its delivery window.
-    # This is the ONLY check that sees a single dead per-symbol worker --
-    # the ingestion unit runs one child process per symbol, so one child
-    # dying leaves the parent alive, the unit `active`, Restart=always
+    # configured underlying stops writing bars during the regular cash
+    # session. This is the ONLY check that sees a single dead per-symbol
+    # worker -- the ingestion unit runs one child process per symbol, so one
+    # child dying leaves the parent alive, the unit `active`, Restart=always
     # untriggered, and the is-active liveness watchdog green while that
     # symbol's data silently stops (the 2026-08-17 QQQ outage, ~6 h).
+    # Writes edge-trigger state to $HOME/monitoring/ingestion-freshness.json
+    # (created below via $HOME/monitoring) so a sustained outage pages hourly
+    # rather than every 10 minutes.
     # See src/tools/ingestion_freshness_healthcheck.py.
     "zerogex-oa-ingestion-freshness"
 )
@@ -139,7 +142,7 @@ TIMER_UNITS=(
 # exist before the first tick fires.
 log "  → Pre-creating state directories for timer units..."
 sudo install -d -o "$USER" -g "$USER" -m 0755 "$HOME/monitoring"
-log "     ✓ $HOME/monitoring (system-monitor state)"
+log "     ✓ $HOME/monitoring (system-monitor, liveness + freshness alert state)"
 
 log "  → Installing timer-based maintenance units..."
 TIMER_INSTALLED=()

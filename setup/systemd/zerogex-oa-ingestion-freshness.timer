@@ -10,10 +10,13 @@ Description=Periodic ZeroGEX per-symbol ingestion freshness check (every 10 min)
 # is cheap; the tool's own staleness threshold (15 min by default) is what
 # decides whether a given run alerts, not this interval.
 #
-# Deliberately NOT restricted to market hours: the 04:00 ET pre-market open
-# is exactly when the QQQ worker failed to come back, and the tool already
-# reports symbols outside their delivery window as `not_expected` rather
-# than alerting on them.
+# Deliberately NOT restricted to market hours in the timer: the tool decides
+# what to assert per symbol per run, reporting anything it will not hold to a
+# deadline (overnight, weekends, and extended hours, where the vendor's own
+# bar delivery is discontinuous) rather than alerting on it. Running all day
+# keeps that judgement in one place, and keeps the 09:30 ET open — the first
+# moment a worker that died overnight becomes provable — covered without a
+# second schedule.
 OnCalendar=*:0/10
 RandomizedDelaySec=1m
 Persistent=false

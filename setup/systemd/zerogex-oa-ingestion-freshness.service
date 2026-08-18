@@ -20,12 +20,23 @@ WorkingDirectory=/home/ubuntu/zerogex-oa
 Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
-# Exits 0 when every symbol inside its delivery window has a recent bar (and
-# when none is in its window at all — overnight, weekends, and 04:00–09:30 ET
-# for the cash indices), 1 when any expected symbol is stale, 2 on DB error.
-# A nonzero exit marks the unit failed, which surfaces in `systemctl --failed`,
-# logs the offending symbols, and fires the OnFailure hook above.
-ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa ingestion-freshness-healthcheck
+# Exits 0 when every checked symbol has a recent bar (and when none is being
+# checked at all — overnight, weekends, and extended hours, where the vendor's
+# own bar delivery is too discontinuous to hold to a deadline), 1 when a stale
+# symbol is due to page, 2 on DB error. A nonzero exit marks the unit failed,
+# which surfaces in `systemctl --failed` and fires the OnFailure hook above.
+#
+# INGEST_FRESHNESS_STATE_FILE makes the paging edge-triggered: a stale symbol
+# alerts on the run that first sees it and then at most once an hour, the same
+# contract zerogex-liveness-watch.sh uses. Without it this timer's 10-minute
+# cadence would send six emails an hour for as long as the outage lasted —
+# and the outage it exists to catch lasts until a human acts (the QQQ incident
+# ran ~6 h, i.e. ~36 emails). While a known-stale symbol is inside its quiet
+# period the unit exits 0, so `systemctl --failed` goes green even though the
+# symbol is still dark; `journalctl -u zerogex-oa-ingestion-freshness` keeps
+# logging it at ERROR on every run and is the live view.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa ingestion-freshness-healthcheck \
+    INGEST_FRESHNESS_STATE_FILE=/home/ubuntu/monitoring/ingestion-freshness.json
 
 # A single GROUP BY over an indexed column — no excuse for it to run long.
 TimeoutStartSec=120
@@ -35,7 +46,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/zerogex-oa
+# /home/ubuntu/monitoring holds the edge-trigger state file above (the same
+# directory the system-monitor and liveness watchdog already write to; the
+# deploy pre-creates it). ReadWritePaths= overrides ProtectHome for it.
+ReadWritePaths=/home/ubuntu/zerogex-oa /home/ubuntu/monitoring
 
 # Logging
 StandardOutput=journal
