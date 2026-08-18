@@ -180,6 +180,15 @@ WORKER_RESTART_BACKOFF_BASE_SECONDS = _getenv_float(
 WORKER_RESTART_BACKOFF_MAX_SECONDS = _getenv_float(
     "INGEST_WORKER_RESTART_BACKOFF_MAX_SECONDS", 120.0
 )
+# How long an abandoned worker stays abandoned before one more attempt.
+# Abandonment must never be permanent: with backoff the restart budget spans
+# only a couple of minutes, so ANY upstream outage longer than that (a
+# TradeStation incident, an RDS restart) would otherwise write a symbol off
+# until a human noticed and restarted the unit -- the exact silent-single-
+# symbol failure this supervisor exists to prevent, just with extra steps.
+# Mirrors the stream watchdog's slow re-attempt
+# (UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS in stream_manager).
+WORKER_ABANDON_RETRY_SECONDS = _getenv_int("INGEST_WORKER_ABANDON_RETRY_SECONDS", 900)
 
 
 def _worker_restart_delay(consecutive_deaths: int) -> float:
@@ -2259,7 +2268,20 @@ def supervise_workers(
 
         for name, target, args in worker_specs:
             if name in abandoned:
-                continue
+                if time.monotonic() < retry_at.get(name, 0.0):
+                    continue
+                # Slow re-attempt: give the worker a fresh budget and let the
+                # respawn path below pick it up. An upstream outage that
+                # outlasts the fast-retry budget must still self-heal.
+                abandoned.discard(name)
+                restart_history[name] = []
+                logger.warning(
+                    "Re-attempting abandoned ingestion worker %s after %ds -- if "
+                    "whatever was killing it has cleared, %s starts writing again.",
+                    name,
+                    WORKER_ABANDON_RETRY_SECONDS,
+                    name,
+                )
 
             proc = processes.get(name)
             if proc is not None:
@@ -2303,13 +2325,20 @@ def supervise_workers(
                         name,
                         name,
                     )
+                    retry_at[name] = now + WORKER_ABANDON_RETRY_SECONDS
                     if len(abandoned) >= len(worker_specs):
+                        # Deliberately NOT an exit. Exiting here would hand a
+                        # total upstream outage to systemd's StartLimitBurst,
+                        # which fails the unit permanently after ~5 tries --
+                        # so the unit would stay dead long after upstream came
+                        # back. Staying up and slow-retrying self-heals; the
+                        # freshness check is what pages meanwhile.
                         logger.error(
-                            "Every ingestion worker has been abandoned -- nothing left "
-                            "to supervise. Exiting nonzero so systemd restarts the unit."
+                            "Every ingestion worker is currently abandoned -- no data "
+                            "is being written for any symbol. Staying up and "
+                            "re-attempting each every %ds.",
+                            WORKER_ABANDON_RETRY_SECONDS,
                         )
-                        shutting_down.set()
-                        break
                     continue
 
                 delay = _worker_restart_delay(len(history))
@@ -2537,8 +2566,15 @@ def main():
     # like every worker crashing at once and trip the restart escalation on
     # the way down.
     shutting_down = threading.Event()
+    # Set ONLY by the signal handler, so the exit code can tell a planned stop
+    # from the supervisor giving up. Without it every `systemctl restart`
+    # exits 1 (children are terminated, so they exit -SIGTERM), the unit is
+    # marked failed, and OnFailure pages on a routine deploy -- noise that
+    # teaches people to ignore the alert that matters.
+    signalled = threading.Event()
 
     def shutdown_children(signum, frame):
+        signalled.set()
         shutting_down.set()
         logger.info(f"Received signal {signum}, terminating ingestion workers...")
         for proc in processes.values():
@@ -2575,6 +2611,12 @@ def main():
             continue
         if proc.exitcode not in (0, None):
             exit_code = 1
+
+    if signalled.is_set():
+        # Planned stop: we terminated the children ourselves, so their
+        # -SIGTERM exits are expected, not a fault. Any degradation on the way
+        # down was already logged at ERROR and alerted by the freshness check.
+        exit_code = 0
 
     sys.exit(exit_code)
 
