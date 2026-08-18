@@ -63,7 +63,29 @@ class _FakeProcess:
         self.exitcode = exitcode
 
 
-def _harness(names, monkeypatch, poll=0.0, max_restarts=5, window=900, backoff=0.0):
+class _StopAfterPolls(threading.Event):
+    """Event that sets itself after N supervisor poll waits.
+
+    Needed because an abandoned (or healthy) worker is skipped without its
+    is_alive() being called, so a hook on the fake process cannot reliably
+    end the loop.
+    """
+
+    def __init__(self, polls):
+        super().__init__()
+        self.limit = polls
+        self.waits = 0
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self.waits >= self.limit:
+            self.set()
+        return super().wait(0)
+
+
+def _harness(
+    names, monkeypatch, poll=0.0, max_restarts=5, window=900, backoff=0.0, abandon_retry=10_000
+):
     """Wire up worker_specs/processes/spawn against fake processes.
 
     Respawn backoff defaults to 0 so tests that are not about backoff run at
@@ -74,6 +96,7 @@ def _harness(names, monkeypatch, poll=0.0, max_restarts=5, window=900, backoff=0
     monkeypatch.setattr(main_engine, "WORKER_RESTART_WINDOW_SECONDS", window)
     monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_BASE_SECONDS", backoff)
     monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_MAX_SECONDS", backoff)
+    monkeypatch.setattr(main_engine, "WORKER_ABANDON_RETRY_SECONDS", abandon_retry)
 
     worker_specs = [(name, lambda *a: None, ()) for name in names]
     processes = {}
@@ -179,12 +202,52 @@ def test_crash_looping_worker_is_abandoned_and_survivors_keep_running(monkeypatc
     assert exit_code == 1
 
 
-def test_all_workers_abandoned_exits_nonzero(monkeypatch):
-    """Nothing left to supervise is a real total failure -- let systemd retry."""
+def test_abandoned_worker_is_retried_on_the_slow_clock(monkeypatch):
+    """Abandonment must never be permanent.
+
+    With backoff the fast-retry budget spans only a couple of minutes, so any
+    upstream outage longer than that (a TradeStation incident, an RDS
+    restart) would write the symbol off until a human noticed -- the silent
+    single-symbol failure this supervisor exists to prevent, just with extra
+    steps. Once the slow clock elapses the worker gets a fresh budget, and
+    recovers if whatever was killing it has cleared.
+    """
     specs, processes, history, spawns = _harness(
-        ["ingest-SPY", "ingest-QQQ"], monkeypatch, max_restarts=2
+        ["ingest-QQQ"], monkeypatch, max_restarts=2, abandon_retry=0
     )
-    shutting_down = threading.Event()
+    shutting_down = _StopAfterPolls(40)
+
+    # Dead on every spawn until the "outage" clears partway through.
+    def spawn(name, target, args):
+        proc = _FakeProcess(name)
+        if len(spawns) < 5:
+            proc.die(exitcode=1)
+        processes[name] = proc
+        spawns.append(name)
+        return proc
+
+    processes["ingest-QQQ"].die(exitcode=1)
+
+    main_engine.supervise_workers(specs, processes, history, shutting_down, spawn)
+
+    # A budget of 2 caps respawns at 2 if abandonment is permanent; the slow
+    # retry carries past that, and the worker ends up alive again.
+    assert len(spawns) > 2, "abandonment must not be the end of the story"
+    assert processes["ingest-QQQ"].is_alive()
+
+
+def test_all_workers_abandoned_keeps_the_unit_up(monkeypatch):
+    """A total outage must not be handed to systemd's StartLimitBurst.
+
+    Exiting when every worker is abandoned looks tidy, but the unit's
+    StartLimitBurst fails it permanently after ~5 restarts -- so it would
+    stay dead long after upstream recovered. Staying up and slow-retrying
+    self-heals; the freshness check is what pages meanwhile.
+    """
+    specs, processes, history, spawns = _harness(
+        ["ingest-SPY", "ingest-QQQ"], monkeypatch, max_restarts=2, abandon_retry=10_000
+    )
+    shutting_down = _StopAfterPolls(30)
 
     def spawn_already_dead(name, target, args):
         proc = _FakeProcess(name)
@@ -196,12 +259,13 @@ def test_all_workers_abandoned_exits_nonzero(monkeypatch):
     for proc in processes.values():
         proc.die(exitcode=1)
 
-    exit_code = main_engine.supervise_workers(
-        specs, processes, history, shutting_down, spawn_already_dead
-    )
+    main_engine.supervise_workers(specs, processes, history, shutting_down, spawn_already_dead)
 
-    assert exit_code == 1
-    assert shutting_down.is_set(), "loop must end once every worker is abandoned"
+    # Ran to the external stop instead of exiting when everything was
+    # abandoned, and stopped respawning once each budget was spent.
+    assert shutting_down.waits >= 30
+    assert spawns.count("ingest-SPY") == 2
+    assert spawns.count("ingest-QQQ") == 2
 
 
 def test_shutdown_does_not_count_as_worker_failure(monkeypatch):
@@ -401,3 +465,66 @@ def test_spawn_loop_does_not_shadow_the_argparse_namespace(monkeypatch):
     # which is only possible if `args` still refers to it at spawn time.
     assert [kwargs["underlying"] for kwargs in built] == ["SPY", "QQQ"]
     assert all(kwargs["num_expirations"] == 4 for kwargs in built)
+
+
+def test_planned_shutdown_exits_zero(monkeypatch):
+    """A `systemctl restart` must not mark the unit failed.
+
+    On a planned stop the handler terminates the children, so they exit
+    -SIGTERM. Counting that as failure exits 1, systemd marks the unit
+    failed, and OnFailure pages on a routine deploy -- noise that teaches
+    people to ignore the alert that matters.
+    """
+    import os
+    import signal as signal_mod
+    import sys
+
+    monkeypatch.setenv("INGEST_UNDERLYINGS", "SPY,QQQ")
+    monkeypatch.setenv("INGEST_VIX_ENABLED", "false")
+    monkeypatch.setenv("INGEST_VXN_ENABLED", "false")
+    monkeypatch.setenv("INGEST_FUTURES_ENABLED", "false")
+    monkeypatch.setattr(sys, "argv", ["main_engine"])
+
+    class _TerminatedProcess:
+        """A child that was terminated by our own shutdown: exitcode -SIGTERM."""
+
+        def __init__(self, target=None, args=(), name=None):
+            self.name = name
+            self.exitcode = -signal_mod.SIGTERM
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+        def terminate(self):
+            return None
+
+    def _fake_supervise(*a, **k):
+        # Deliver a real SIGTERM so main()'s own handler runs, exactly as a
+        # `systemctl stop` would, then report a clean supervisor return.
+        os.kill(os.getpid(), signal_mod.SIGTERM)
+        return 0
+
+    import src.ingestion.api_call_tracker as api_call_tracker
+
+    monkeypatch.setattr(api_call_tracker, "attach_db_writer", lambda *a, **k: None)
+    monkeypatch.setattr(main_engine, "TradeStationClient", lambda *a, **k: object())
+    monkeypatch.setattr(main_engine, "IngestionEngine", lambda **k: None)
+    monkeypatch.setattr(main_engine, "Process", _TerminatedProcess)
+    monkeypatch.setattr(main_engine, "supervise_workers", _fake_supervise)
+
+    prev_term = signal_mod.getsignal(signal_mod.SIGTERM)
+    prev_int = signal_mod.getsignal(signal_mod.SIGINT)
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            main_engine.main()
+    finally:
+        signal_mod.signal(signal_mod.SIGTERM, prev_term)
+        signal_mod.signal(signal_mod.SIGINT, prev_int)
+
+    assert exit_info.value.code == 0, "a planned stop is not a unit failure"
