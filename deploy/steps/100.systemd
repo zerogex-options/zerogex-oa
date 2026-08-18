@@ -122,6 +122,15 @@ TIMER_UNITS=(
     # /api/market/session-levels and the frontend chart level overlays.
     # See src/jobs/session_levels.py.
     "zerogex-oa-session-levels"
+    # Per-symbol ingestion freshness (every 10 min, all day): alerts when a
+    # configured underlying stops writing bars inside its delivery window.
+    # This is the ONLY check that sees a single dead per-symbol worker --
+    # the ingestion unit runs one child process per symbol, so one child
+    # dying leaves the parent alive, the unit `active`, Restart=always
+    # untriggered, and the is-active liveness watchdog green while that
+    # symbol's data silently stops (the 2026-08-17 QQQ outage, ~6 h).
+    # See src/tools/ingestion_freshness_healthcheck.py.
+    "zerogex-oa-ingestion-freshness"
 )
 
 # Pre-create writable state directories needed by the timer units above.

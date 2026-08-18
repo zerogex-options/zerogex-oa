@@ -284,6 +284,30 @@ def _feed_session_window(session_template: Optional[str]) -> tuple[time, time]:
     return time(4, 0), time(20, 0)
 
 
+def feed_session_window(
+    session_template: str = "Default",
+    symbol: Optional[str] = None,
+) -> tuple[time, time]:
+    """ET (open, close) the underlying bar feed should deliver bars in.
+
+    The template's window, clamped to the regular cash session for cash
+    indices (SPX, NDX, ...): their underlying level prints only 09:30-16:00
+    ET regardless of template -- the *options* trade extended hours but the
+    index itself does not.
+
+    Public because callers outside the stream watchdog need the window's
+    edges, not just "is it open now": measuring how stale a feed is has to
+    anchor at the session OPEN, otherwise the first check after an open
+    compares against the previous session's last bar and reports an
+    overnight-sized gap that is not a fault.
+    """
+    open_t, close_t = _feed_session_window(session_template)
+    if symbol and is_cash_index(symbol):
+        open_t = max(open_t, time(9, 30))
+        close_t = min(close_t, time(16, 0))
+    return open_t, close_t
+
+
 def underlying_feed_expected(
     dt: Optional[datetime],
     session_template: str = "Default",
@@ -304,12 +328,7 @@ def underlying_feed_expected(
     dt = _to_et(dt)
     if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
         return False
-    open_t, close_t = _feed_session_window(session_template)
-    if symbol and is_cash_index(symbol):
-        # A cash index has no pre/after-hours print even under a 24h
-        # template — clamp to the regular cash session.
-        open_t = max(open_t, time(9, 30))
-        close_t = min(close_t, time(16, 0))
+    open_t, close_t = feed_session_window(session_template, symbol)
     return open_t <= dt.time() <= close_t
 
 

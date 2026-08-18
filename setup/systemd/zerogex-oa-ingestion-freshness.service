@@ -1,0 +1,43 @@
+[Unit]
+Description=ZeroGEX per-symbol ingestion freshness check (alerts when a symbol goes dark)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# Wired to the same dispatcher as the ingestion unit itself. This check is
+# the ONLY thing that notices a single dead per-symbol worker: the ingestion
+# unit's own OnFailure cannot fire for it, because the parent process stays
+# alive as long as one worker survives, so systemd never sees the unit fail.
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Exits 0 when every symbol inside its delivery window has a recent bar (and
+# when none is in its window at all — overnight, weekends, and 04:00–09:30 ET
+# for the cash indices), 1 when any expected symbol is stale, 2 on DB error.
+# A nonzero exit marks the unit failed, which surfaces in `systemctl --failed`,
+# logs the offending symbols, and fires the OnFailure hook above.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa ingestion-freshness-healthcheck
+
+# A single GROUP BY over an indexed column — no excuse for it to run long.
+TimeoutStartSec=120
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-ingestion-freshness

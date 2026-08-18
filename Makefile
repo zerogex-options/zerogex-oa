@@ -1478,16 +1478,29 @@ logs-clear: ## Interactive log cleanup (prompts; calls logs-clear-noconfirm)
 	fi; \
 	$(MAKE) logs-clear-noconfirm
 
+# Journal size cap. SINGLE SOURCE OF TRUTH: read SystemMaxUse out of the
+# installed journald drop-in so this nightly vacuum can never shrink the
+# journal below what journald itself is configured to retain. These two were
+# separate hardcoded 100M literals, which meant raising the drop-in for more
+# retention silently did nothing -- the next nightly run vacuumed it straight
+# back down. Falls back to 100M when the drop-in is absent (fresh box, or a
+# `make logs-clear` run from a dev checkout).
+JOURNAL_DROPIN ?= /etc/systemd/journald.conf.d/10-zerogex-oa.conf
+JOURNAL_MAX_USE ?= $(shell sed -n 's/^[[:space:]]*SystemMaxUse=//p' $(JOURNAL_DROPIN) 2>/dev/null | tail -1)
+ifeq ($(strip $(JOURNAL_MAX_USE)),)
+JOURNAL_MAX_USE := 100M
+endif
+
 .PHONY: logs-clear-noconfirm
 logs-clear-noconfirm: ## Non-interactive log cleanup (driven by zerogex-oa-logs-clear.timer)
 	@echo "$(BLUE)Disk usage BEFORE:$(NC)"; df -h / | tail -1; echo ""
-	@echo "$(YELLOW)→ journalctl: rotate + vacuum journals older than 7d + cap total to 100M...$(NC)"
+	@echo "$(YELLOW)→ journalctl: rotate + vacuum journals older than 7d + cap total to $(JOURNAL_MAX_USE)...$(NC)"
 	@sudo journalctl --rotate
 # Retain 7d, not 1s: the flow-series covering-index decommission gate verifies "no shortfall warnings / steady stage timings" from zerogex-oa-{api,analytics} across >=2-3 sessions; disk stays bounded by the --vacuum-size cap below.
 	@sudo journalctl --vacuum-time=7d \
 		-u $(INGESTION_SERVICE) -u $(ANALYTICS_SERVICE) \
 		-u $(API_SERVICE) -u $(SIGNALS_SERVICE)
-	@sudo journalctl --vacuum-size=100M
+	@sudo journalctl --vacuum-size=$(JOURNAL_MAX_USE)
 	@echo "$(YELLOW)→ Truncating active syslog-group files...$(NC)"
 	@for f in /var/log/syslog /var/log/auth.log /var/log/kern.log \
 	         /var/log/dpkg.log /var/log/ufw.log /var/log/fail2ban.log \
@@ -3644,6 +3657,17 @@ normalizer-cache-healthcheck: ## Verify cache rows are fresh (exit 0=ok, 1=stale
 normalizer-cache-healthcheck-strict: ## Healthcheck that also fails on missing rows
 	@$(PY) -m src.tools.normalizer_cache_healthcheck \
 		--max-age-hours $(NORMALIZER_MAX_AGE_HOURS) --strict
+
+# Staleness threshold for the per-symbol ingestion freshness check, in
+# minutes. Above the 1-minute bar cadence and the sparse pre-market tape,
+# far below the hours an unnoticed dead worker costs.
+INGEST_FRESHNESS_MAX_STALE_MINUTES ?= 15
+
+.PHONY: ingestion-freshness-healthcheck
+ingestion-freshness-healthcheck: ## Alert if a symbol stopped writing bars mid-session (0=ok, 1=stale, 2=db error)
+	@$(PY) -m src.tools.ingestion_freshness_healthcheck \
+		--max-stale-minutes $(INGEST_FRESHNESS_MAX_STALE_MINUTES) \
+		$(if $(JSON),--json)
 
 .PHONY: normalizer-cache-healthcheck-json
 normalizer-cache-healthcheck-json: ## Healthcheck output as JSON (for monitoring scrapers)

@@ -1,0 +1,22 @@
+[Unit]
+Description=Periodic ZeroGEX per-symbol ingestion freshness check (every 10 min)
+
+[Timer]
+# Every 10 minutes, all day. Unlike the nightly healthchecks this one is a
+# LIVE detector: the failure it exists to catch (a per-symbol worker dying
+# and never being restarted) costs irreplaceable market data for as long as
+# it goes unnoticed — the QQQ outage it was written for ran ~6 hours into a
+# session. The check itself is one indexed GROUP BY, so a 10-minute cadence
+# is cheap; the tool's own staleness threshold (15 min by default) is what
+# decides whether a given run alerts, not this interval.
+#
+# Deliberately NOT restricted to market hours: the 04:00 ET pre-market open
+# is exactly when the QQQ worker failed to come back, and the tool already
+# reports symbols outside their delivery window as `not_expected` rather
+# than alerting on them.
+OnCalendar=*:0/10
+RandomizedDelaySec=1m
+Persistent=false
+
+[Install]
+WantedBy=timers.target
