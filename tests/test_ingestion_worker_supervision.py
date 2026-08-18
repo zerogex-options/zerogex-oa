@@ -20,6 +20,8 @@ workers killed by our own SIGTERM never count against the budget.
 
 import threading
 
+import pytest
+
 from src.ingestion import main_engine
 
 
@@ -61,11 +63,17 @@ class _FakeProcess:
         self.exitcode = exitcode
 
 
-def _harness(names, monkeypatch, poll=0.0, max_restarts=5, window=900):
-    """Wire up worker_specs/processes/spawn against fake processes."""
+def _harness(names, monkeypatch, poll=0.0, max_restarts=5, window=900, backoff=0.0):
+    """Wire up worker_specs/processes/spawn against fake processes.
+
+    Respawn backoff defaults to 0 so tests that are not about backoff run at
+    full speed; the ones that are set it explicitly.
+    """
     monkeypatch.setattr(main_engine, "WORKER_SUPERVISE_POLL_SECONDS", poll)
     monkeypatch.setattr(main_engine, "WORKER_MAX_RESTARTS_PER_WINDOW", max_restarts)
     monkeypatch.setattr(main_engine, "WORKER_RESTART_WINDOW_SECONDS", window)
+    monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_BASE_SECONDS", backoff)
+    monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_MAX_SECONDS", backoff)
 
     worker_specs = [(name, lambda *a: None, ()) for name in names]
     processes = {}
@@ -241,3 +249,155 @@ def test_restart_budget_is_a_sliding_window(monkeypatch):
     assert spawns == ["ingest-QQQ"]
     assert len(history["ingest-QQQ"]) == 1, "the two stale entries were pruned"
     assert history["ingest-QQQ"][0] >= now, "only this pass's death is on the books"
+
+
+def test_restart_delay_backs_off_and_caps(monkeypatch):
+    """Doubling per consecutive death, bounded so retries never stop entirely."""
+    monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_BASE_SECONDS", 5.0)
+    monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_MAX_SECONDS", 120.0)
+
+    assert main_engine._worker_restart_delay(1) == 5.0
+    assert main_engine._worker_restart_delay(2) == 10.0
+    assert main_engine._worker_restart_delay(3) == 20.0
+    assert main_engine._worker_restart_delay(4) == 40.0
+    # Capped, not unbounded — a worker must keep getting retried.
+    assert main_engine._worker_restart_delay(99) == 120.0
+
+
+def test_respawn_waits_for_backoff_and_death_counts_once(monkeypatch):
+    """A fast-dying worker must not burn its whole budget in a few seconds.
+
+    Without backoff the supervisor respawns on every poll, so a worker that
+    dies instantly exhausts a 5-restart budget in ~30s and gets abandoned
+    before a transient cause (stream slots from the previous process not yet
+    released, a brief API/DB blip) has any chance to clear.
+    """
+    specs, processes, history, spawns = _harness(["ingest-SPY", "ingest-QQQ"], monkeypatch)
+    monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_BASE_SECONDS", 3600.0)
+    shutting_down = threading.Event()
+
+    polls = {"n": 0}
+
+    def count_polls():
+        polls["n"] += 1
+        if polls["n"] > 8:
+            shutting_down.set()
+
+    processes["ingest-SPY"].on_is_alive = count_polls
+
+    def spawn(name, target, args):
+        proc = _FakeProcess(name)
+        processes[name] = proc
+        spawns.append(name)
+        return proc
+
+    processes["ingest-QQQ"].die(exitcode=1)
+
+    exit_code = main_engine.supervise_workers(specs, processes, history, shutting_down, spawn)
+
+    assert exit_code == 0
+    assert spawns == [], "must not respawn until the backoff has elapsed"
+    # And the single death is counted ONCE, not re-counted on every poll while
+    # the worker sits in backoff — otherwise backoff would itself burn budget.
+    assert len(history["ingest-QQQ"]) == 1
+
+
+def test_spawn_failure_does_not_kill_the_supervisor(monkeypatch):
+    """A failed respawn must not take the healthy workers down with it."""
+    specs, processes, history, spawns = _harness(["ingest-SPY", "ingest-QQQ"], monkeypatch)
+    monkeypatch.setattr(main_engine, "WORKER_RESTART_BACKOFF_BASE_SECONDS", 0.0)
+    shutting_down = threading.Event()
+
+    polls = {"n": 0}
+
+    def count_polls():
+        polls["n"] += 1
+        if polls["n"] > 6:
+            shutting_down.set()
+
+    processes["ingest-SPY"].on_is_alive = count_polls
+
+    def spawn_raises(name, target, args):
+        spawns.append(name)
+        raise RuntimeError("fork failed")
+
+    processes["ingest-QQQ"].die(exitcode=1)
+
+    exit_code = main_engine.supervise_workers(
+        specs, processes, history, shutting_down, spawn_raises
+    )
+
+    assert spawns, "it did try to respawn"
+    assert exit_code == 0
+    # SPY was never disturbed by QQQ's failure to come back.
+    assert processes["ingest-SPY"].is_alive()
+    assert not processes["ingest-SPY"].terminated
+
+
+def test_spawn_loop_does_not_shadow_the_argparse_namespace(monkeypatch):
+    """main()'s spawn loop must not bind a loop variable named ``args``.
+
+    run_for_symbol (and the VIX/VXN/futures targets) are closures over
+    main()'s locals, where ``args`` is the argparse Namespace they read their
+    config from. A loop variable of that name silently rebinds it to a tuple
+    for EVERY worker, so each child dies instantly on ``args.expirations``.
+
+    This is a total ingestion outage that is nearly invisible from the parent:
+    the traceback only ever appears in the child, so the parent just reports
+    workers dying with exitcode 1 for no stated reason. It took down
+    production once; this test runs the worker target inline so the closure
+    breaks loudly and locally instead.
+    """
+    import sys
+
+    monkeypatch.setenv("INGEST_UNDERLYINGS", "SPY,QQQ")
+    monkeypatch.setenv("INGEST_VIX_ENABLED", "false")
+    monkeypatch.setenv("INGEST_VXN_ENABLED", "false")
+    monkeypatch.setenv("INGEST_FUTURES_ENABLED", "false")
+    monkeypatch.setenv("INGEST_EXPIRATIONS", "4")
+    monkeypatch.setattr(sys, "argv", ["main_engine"])
+
+    built = []
+
+    class _RecordingEngine:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+        def run(self):
+            return None
+
+    class _SyncProcess:
+        """Runs the target INLINE on start(), so a bad closure raises here."""
+
+        def __init__(self, target=None, args=(), name=None):
+            self._target, self._args, self.name = target, args, name
+            self.exitcode = 0
+
+        def start(self):
+            self._target(*self._args)
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+        def terminate(self):
+            return None
+
+    import src.ingestion.api_call_tracker as api_call_tracker
+
+    monkeypatch.setattr(api_call_tracker, "attach_db_writer", lambda *a, **k: None)
+    monkeypatch.setattr(main_engine, "TradeStationClient", lambda *a, **k: object())
+    monkeypatch.setattr(main_engine, "IngestionEngine", _RecordingEngine)
+    monkeypatch.setattr(main_engine, "Process", _SyncProcess)
+    monkeypatch.setattr(main_engine, "supervise_workers", lambda *a, **k: 0)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main_engine.main()
+
+    assert exit_info.value.code == 0
+    # Both workers were constructed, each reading config off the Namespace --
+    # which is only possible if `args` still refers to it at spawn time.
+    assert [kwargs["underlying"] for kwargs in built] == ["SPY", "QQQ"]
+    assert all(kwargs["num_expirations"] == 4 for kwargs in built)

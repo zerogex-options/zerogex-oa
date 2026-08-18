@@ -167,6 +167,27 @@ _CB_SKIP_LOG_INTERVAL_SECONDS = _getenv_float("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL
 WORKER_SUPERVISE_POLL_SECONDS = _getenv_float("INGEST_WORKER_SUPERVISE_POLL_SECONDS", 5.0)
 WORKER_RESTART_WINDOW_SECONDS = _getenv_int("INGEST_WORKER_RESTART_WINDOW_SECONDS", 900)
 WORKER_MAX_RESTARTS_PER_WINDOW = _getenv_int("INGEST_WORKER_MAX_RESTARTS_PER_WINDOW", 5)
+# Delay before respawning a worker that just died, doubling per consecutive
+# death (5s, 10s, 20s, ... capped). Without it a worker that dies instantly is
+# respawned every poll, which burns the whole restart budget in ~30s and
+# abandons the symbol before a transient cause -- the previous process's
+# TradeStation stream slots not yet released after a restart, a brief API or
+# DB blip -- has had any chance to clear. With it, the budget spans minutes,
+# so only a genuinely persistent failure gets abandoned.
+WORKER_RESTART_BACKOFF_BASE_SECONDS = _getenv_float(
+    "INGEST_WORKER_RESTART_BACKOFF_BASE_SECONDS", 5.0
+)
+WORKER_RESTART_BACKOFF_MAX_SECONDS = _getenv_float(
+    "INGEST_WORKER_RESTART_BACKOFF_MAX_SECONDS", 120.0
+)
+
+
+def _worker_restart_delay(consecutive_deaths: int) -> float:
+    """Seconds to wait before respawning after ``consecutive_deaths`` deaths."""
+    if consecutive_deaths <= 1:
+        return WORKER_RESTART_BACKOFF_BASE_SECONDS
+    delay = WORKER_RESTART_BACKOFF_BASE_SECONDS * (2 ** (consecutive_deaths - 1))
+    return min(delay, WORKER_RESTART_BACKOFF_MAX_SECONDS)
 
 
 def _to_db_float(value: Any) -> Optional[float]:
@@ -2228,6 +2249,8 @@ def supervise_workers(
     # Workers past their restart budget. Left dead on purpose, still counted
     # so we can tell "some symbols degraded" from "nothing left running".
     abandoned: set = set()
+    # name -> monotonic time before which we must not respawn it (backoff).
+    retry_at: Dict[str, float] = {}
 
     while not shutting_down.is_set():
         shutting_down.wait(WORKER_SUPERVISE_POLL_SECONDS)
@@ -2237,68 +2260,88 @@ def supervise_workers(
         for name, target, args in worker_specs:
             if name in abandoned:
                 continue
+
             proc = processes.get(name)
-            if proc is None or proc.is_alive():
-                continue
+            if proc is not None:
+                if proc.is_alive():
+                    continue
 
-            exitcode = proc.exitcode
-            # Reap before respawning so the dead child does not linger as a
-            # zombie, and release its sentinel fd (bounded restarts keep the
-            # leak small, but a long-lived unit should not accumulate them).
-            proc.join()
-            try:
-                proc.close()
-            except (ValueError, AttributeError):  # pragma: no cover - defensive
-                pass
-            # Drop the closed handle immediately. is_alive()/join() raise
-            # ValueError on a closed Process, and both terminate_all() and
-            # the caller's final join walk this dict -- the restart path puts
-            # a fresh handle back under the same name.
-            processes.pop(name, None)
+                exitcode = proc.exitcode
+                # Reap before respawning so the dead child does not linger as
+                # a zombie, and release its sentinel fd.
+                proc.join()
+                try:
+                    proc.close()
+                except (ValueError, AttributeError):  # pragma: no cover
+                    pass
+                # Drop the closed handle immediately: is_alive()/join() raise
+                # ValueError on a closed Process, and the caller's final join
+                # walks this dict. Its absence below means "awaiting respawn".
+                processes.pop(name, None)
 
-            now = time.monotonic()
-            history = [t for t in restart_history[name] if now - t <= WORKER_RESTART_WINDOW_SECONDS]
-            history.append(now)
-            restart_history[name] = history
+                now = time.monotonic()
+                history = [
+                    t for t in restart_history[name] if now - t <= WORKER_RESTART_WINDOW_SECONDS
+                ]
+                history.append(now)
+                restart_history[name] = history
 
-            if len(history) > WORKER_MAX_RESTARTS_PER_WINDOW:
-                abandoned.add(name)
-                exit_code = 1
+                if len(history) > WORKER_MAX_RESTARTS_PER_WINDOW:
+                    abandoned.add(name)
+                    exit_code = 1
+                    logger.error(
+                        "Ingestion worker %s has died %d times in %ds (last exitcode "
+                        "%s) -- past the restart budget, so respawning again is not "
+                        "going to fix it. GIVING UP on %s; the other workers keep "
+                        "running. No data will be written for %s until this is fixed "
+                        "and the unit is restarted -- the per-symbol freshness check "
+                        "is what pages for it.",
+                        name,
+                        len(history),
+                        WORKER_RESTART_WINDOW_SECONDS,
+                        exitcode,
+                        name,
+                        name,
+                    )
+                    if len(abandoned) >= len(worker_specs):
+                        logger.error(
+                            "Every ingestion worker has been abandoned -- nothing left "
+                            "to supervise. Exiting nonzero so systemd restarts the unit."
+                        )
+                        shutting_down.set()
+                        break
+                    continue
+
+                delay = _worker_restart_delay(len(history))
+                retry_at[name] = now + delay
                 logger.error(
-                    "Ingestion worker %s has died %d times in %ds (last exitcode %s) "
-                    "-- past the restart budget, so respawning again is not going to "
-                    "fix it. GIVING UP on %s; the other workers keep running. No data "
-                    "will be written for %s until this is fixed and the unit is "
-                    "restarted -- the per-symbol freshness check is what pages for it.",
+                    "Ingestion worker %s exited unexpectedly (exitcode %s) -- "
+                    "respawning in %.0fs (%d/%d within %ds). Every worker is meant to "
+                    "stay up for the life of the unit, so this is always a fault: "
+                    "while it is down, %s writes no data.",
                     name,
-                    len(history),
-                    WORKER_RESTART_WINDOW_SECONDS,
                     exitcode,
-                    name,
+                    delay,
+                    len(history),
+                    WORKER_MAX_RESTARTS_PER_WINDOW,
+                    WORKER_RESTART_WINDOW_SECONDS,
                     name,
                 )
-                if len(abandoned) >= len(worker_specs):
-                    logger.error(
-                        "Every ingestion worker has been abandoned -- nothing left to "
-                        "supervise. Exiting nonzero so systemd restarts the unit."
-                    )
-                    shutting_down.set()
-                    break
                 continue
 
-            logger.error(
-                "Ingestion worker %s exited unexpectedly (exitcode %s) -- restarting "
-                "(%d/%d within %ds). Every worker is meant to stay up for the life of "
-                "the unit, so this is always a fault: while it was down, %s wrote no "
-                "data and nothing outside this supervisor would have noticed.",
-                name,
-                exitcode,
-                len(history),
-                WORKER_MAX_RESTARTS_PER_WINDOW,
-                WORKER_RESTART_WINDOW_SECONDS,
-                name,
-            )
-            spawn_worker(name, target, args)
+            # No live handle: the worker is dead and awaiting its backoff.
+            if time.monotonic() < retry_at.get(name, 0.0):
+                continue
+            try:
+                spawn_worker(name, target, args)
+                logger.info("Ingestion worker %s respawned", name)
+            except Exception:
+                # A failed spawn must not kill the supervisor -- that would
+                # take every healthy worker down with it. Back off and retry.
+                retry_at[name] = time.monotonic() + _worker_restart_delay(
+                    len(restart_history[name])
+                )
+                logger.error("Could not respawn ingestion worker %s", name, exc_info=True)
 
     return exit_code
 
@@ -2473,14 +2516,21 @@ def main():
     # that crash-loops still trips the escalation.
     restart_history: Dict[str, List[float]] = {name: [] for name, _, _ in worker_specs}
 
-    def spawn_worker(name: str, target: Any, args: tuple) -> Process:
-        proc = Process(target=target, args=args, name=name)
+    def spawn_worker(name: str, target: Any, worker_args: tuple) -> Process:
+        proc = Process(target=target, args=worker_args, name=name)
         proc.start()
         processes[name] = proc
         return proc
 
-    for name, target, args in worker_specs:
-        spawn_worker(name, target, args)
+    # NB: the loop variable must NOT be called `args`. run_for_symbol and the
+    # other worker targets are closures over main()'s locals, where `args` is
+    # the argparse Namespace they read their config from -- binding a loop
+    # variable of that name here silently rebinds it to a tuple for every
+    # worker, and each child dies instantly on `args.expirations`. That is a
+    # total ingestion outage whose traceback only ever appears in the CHILD,
+    # so the parent just reports workers dying for no stated reason.
+    for name, target, worker_args in worker_specs:
+        spawn_worker(name, target, worker_args)
 
     # Set by the signal handler so the supervisor can tell a worker we killed
     # on purpose from one that died on its own. Without it, SIGTERM would look
@@ -2498,12 +2548,31 @@ def main():
     signal.signal(signal.SIGINT, shutdown_children)
     signal.signal(signal.SIGTERM, shutdown_children)
 
-    exit_code = supervise_workers(
-        worker_specs, processes, restart_history, shutting_down, spawn_worker
-    )
+    try:
+        exit_code = supervise_workers(
+            worker_specs, processes, restart_history, shutting_down, spawn_worker
+        )
+    except BaseException:
+        # The supervisor is the parent's whole job; if it dies the unit exits
+        # and systemd restarts it. Log the traceback FIRST so the next start
+        # is not another blind post-mortem -- an unexplained `status=1/FAILURE`
+        # with nothing in the journal is exactly what made the 2026-08-17
+        # outage take a day to understand.
+        logger.error("Ingestion supervisor crashed; terminating workers", exc_info=True)
+        shutting_down.set()
+        for proc in processes.values():
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except ValueError:  # pragma: no cover - already-closed handle
+                pass
+        raise
 
     for proc in processes.values():
-        proc.join()
+        try:
+            proc.join()
+        except ValueError:  # pragma: no cover - already-closed handle
+            continue
         if proc.exitcode not in (0, None):
             exit_code = 1
 
