@@ -16,6 +16,13 @@ QQQ,SPY``) and a known-good date localizes it further: one symbol short on
 one date is a vendor gap for that symbol; every symbol short on the same
 date is a feed-wide outage.
 
+Measured windows, 2026-08-18 (the names are not reliable — check with this
+tool before trusting one, and re-check if TradeStation changes anything)::
+
+    Default      09:30-16:00 ET   core session only
+    USEQPre      06:00-09:30 ET   does NOT start at 04:00, despite the name
+    USEQ24Hour   04:00-20:00 ET   the only template reaching the 04:00 open
+
 Usage::
 
     python -m src.tools.probe_bar_availability --symbols QQQ,SPY --date 2026-08-18

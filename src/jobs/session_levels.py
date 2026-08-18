@@ -4,9 +4,13 @@ Captures, per non-index symbol (ETFs/equities such as SPY, QQQ):
 
 * **Pre-market high/low** — the 04:00-09:30 ET extended-hours session of
   the current trading date.  Sources: the TradeStation bars API
-  (``sessiontemplate=USEQPre``, works regardless of the live stream's
+  (``sessiontemplate=USEQ24Hour``, works regardless of the live stream's
   ``SESSION_TEMPLATE``) unioned with whatever 1-min pre-market bars the
-  ingestion engine already wrote to ``underlying_quotes``.
+  ingestion engine already wrote to ``underlying_quotes``.  The template is
+  the 24-hour one, not ``USEQPre``, because ``USEQPre`` does not start at
+  04:00 — measured 2026-08-18, it serves from 06:00 ET, so it silently drops
+  the first two hours of the window this job exists to measure.  The
+  response is filtered to [04:00, 09:30) here either way.
 * **Previous-session high/low** — the prior trading day's regular session
   (09:30-16:00 ET; 09:30-13:00 on NYSE half-days) including the closing
   auction print (the close-time bar's ``open`` — the same asset-aware
@@ -183,7 +187,16 @@ def _bars_window_extremes(
 def _fetch_premarket_from_ts(
     client: Any, ts_symbol: str, day: date, now_et: datetime
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Pre-market high/low for ``day`` from the TradeStation bars API."""
+    """Pre-market high/low for ``day`` from the TradeStation bars API.
+
+    Fetched under ``USEQ24Hour`` rather than the name-appropriate
+    ``USEQPre``: the latter serves from 06:00 ET, not 04:00 (measured
+    2026-08-18 — same symbol and day returned 04:01 under ``USEQ24Hour``
+    and 06:01 under ``USEQPre``), which would drop the first two hours of
+    the pre-market window without any error. The requested range and the
+    ``_bars_window_extremes`` filter below both still bound the result to
+    [04:00, 09:30), so the wider template only adds the bars that belong.
+    """
     first = datetime.combine(day, PREMARKET_START, tzinfo=ET)
     last = min(now_et, datetime.combine(day, PREMARKET_END, tzinfo=ET))
     if last <= first:
@@ -195,7 +208,7 @@ def _fetch_premarket_from_ts(
             "Minute",
             firstdate=_utc_iso(first),
             lastdate=_utc_iso(last),
-            sessiontemplate="USEQPre",
+            sessiontemplate="USEQ24Hour",
             warn_if_closed=False,
         )
     except Exception as exc:

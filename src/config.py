@@ -623,7 +623,10 @@ STRIKE_RECALC_INTERVAL = _getenv_int("STRIKE_RECALC_INTERVAL", 12)  # iterations
 STRIKE_CLEANUP_INTERVAL = _getenv_int("STRIKE_CLEANUP_INTERVAL", 100)  # iterations
 
 # Session template for market data
-# Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
+# Options (ET windows measured against the live API 2026-08-18, NOT as the
+# names suggest): "Default" (9:30-16:00), "USEQPre" (6:00-9:30 — it does NOT
+# start at 4:00), "USEQ24Hour" (4:00-20:00). Only USEQ24Hour reaches the
+# 4:00 pre-market open.
 SESSION_TEMPLATE = _getenv_str("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 TS_STREAM_REUSE_CONNECTIONS = _getenv_bool("TS_STREAM_REUSE_CONNECTIONS", False)

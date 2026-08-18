@@ -90,6 +90,10 @@ _ET = ZoneInfo("America/New_York")
 # Overridable via --session-template for a narrower pull ("Default",
 # "USEQPre", ...).
 #
+# Measured ET windows (2026-08-18, via src/tools/probe_bar_availability.py):
+# Default 09:30-16:00, USEQPre 06:00-09:30 (NOT 04:00, despite the name),
+# USEQ24Hour 04:00-20:00. Only the last reaches the pre-market open.
+#
 # Widening the template is necessary but not sufficient: on 2026-08-18 QQQ
 # returned bars from 07:35 ET under BOTH "Default" and "USEQ24Hour", for two
 # different firstdates 43 minutes apart — an absolute boundary in the

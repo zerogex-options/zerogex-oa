@@ -59,7 +59,10 @@ class _FakeTsClient:
 
     def get_bars(self, symbol, interval, unit, **kwargs):
         self.calls.append((symbol, interval, unit, kwargs))
-        if kwargs.get("sessiontemplate") == "USEQPre":
+        # The pre-market fetch is the USEQ24Hour one; the previous-session
+        # fetch uses Default. (USEQPre is deliberately NOT used — it serves
+        # from 06:00 ET, missing the first two hours of the pre-market.)
+        if kwargs.get("sessiontemplate") == "USEQ24Hour":
             return {"Bars": self.premarket_bars}
         return {"Bars": self.rth_bars}
 
@@ -226,9 +229,11 @@ async def test_tradestation_union_and_prev_session_precedence(monkeypatch):
     assert kwargs["prev_session_low"] == 620.10
     assert kwargs["prev_session_source"] == "tradestation"
 
-    # Both fetches used the expected session templates.
+    # Both fetches used the expected session templates. The pre-market leg
+    # must NOT use USEQPre: that template serves from 06:00 ET, so it drops
+    # 04:00-06:00 from the window this job measures.
     templates = [c[3].get("sessiontemplate") for c in client.calls]
-    assert templates == ["USEQPre", "Default"]
+    assert templates == ["USEQ24Hour", "Default"]
 
 
 def test_prev_trading_day_skips_weekend_and_holiday(monkeypatch):

@@ -279,7 +279,12 @@ def _feed_session_window(session_template: Optional[str]) -> tuple[time, time]:
     if st == "default":
         return time(9, 30), time(16, 0)
     if st == "useqpre":
-        return time(4, 0), time(9, 30)
+        # 06:00, not 04:00: measured against the live bars API 2026-08-18,
+        # USEQPre serves from 06:00 ET while USEQ24Hour serves the same
+        # symbol/day from 04:00. Anchoring staleness at 04:00 here would
+        # report a two-hour "stall" every morning that is really just the
+        # template's window.
+        return time(6, 0), time(9, 30)
     # "useq24hour" and any unrecognised template -> widest (fail safe).
     return time(4, 0), time(20, 0)
 
