@@ -144,6 +144,30 @@ def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
 # from the live option stream hits the early-return + log path.
 _CB_SKIP_LOG_INTERVAL_SECONDS = _getenv_float("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", 5.0)
 
+# --- per-symbol worker supervision -------------------------------------
+# main() runs one child process per symbol, plus the VIX / VXN / futures
+# side feeds. Every one of them is meant to stay up for the life of the
+# unit, so a child that is no longer running is ALWAYS a fault -- there is
+# no path where a worker exiting on its own is normal.
+#
+# Before supervision the parent simply sat in join() until *all* children
+# exited. One child dying (the sys.exit(1) in IngestionEngine.run, or a
+# clean return out of its loop) was therefore completely silent: the
+# survivors kept streaming, the unit stayed `active`, the
+# `systemctl is-active` liveness watchdog stayed green, systemd's
+# Restart=always never triggered because the parent had not exited, and
+# OnFailure never fired. The dead symbol's data just stopped, and stayed
+# stopped until a human noticed by eye and restarted the unit.
+#
+# Poll the children instead and restart the ones that died. A worker that
+# keeps dying is not something a respawn can fix (bad credentials, a
+# poisoned symbol config), so bound the restarts: past the budget, tear
+# the unit down and exit nonzero so systemd restarts it wholesale and the
+# OnFailure alert actually pages someone.
+WORKER_SUPERVISE_POLL_SECONDS = _getenv_float("INGEST_WORKER_SUPERVISE_POLL_SECONDS", 5.0)
+WORKER_RESTART_WINDOW_SECONDS = _getenv_int("INGEST_WORKER_RESTART_WINDOW_SECONDS", 900)
+WORKER_MAX_RESTARTS_PER_WINDOW = _getenv_int("INGEST_WORKER_MAX_RESTARTS_PER_WINDOW", 5)
+
 
 def _to_db_float(value: Any) -> Optional[float]:
     """Convert numeric-like values (including numpy scalars) to plain float for DB writes."""
@@ -2169,6 +2193,98 @@ class IngestionEngine:
             close_connection_pool()
 
 
+def supervise_workers(
+    worker_specs: List[Any],
+    processes: Dict[str, Process],
+    restart_history: Dict[str, List[float]],
+    shutting_down: threading.Event,
+    spawn_worker: Any,
+) -> int:
+    """Keep the per-symbol ingestion workers running; return the exit code.
+
+    Polls the children and restarts any that are no longer alive. A worker
+    exiting is never normal -- each one is meant to stay up for the life of
+    the unit -- so it is logged at ERROR and respawned.
+
+    The restart budget is per worker and per sliding window: a symbol that
+    blips occasionally recovers indefinitely, while one that crash-loops
+    (bad credentials, a poisoned symbol config -- things a respawn cannot
+    fix) trips the escalation, which tears the unit down and returns 1 so
+    systemd restarts it wholesale and the OnFailure alert pages someone.
+
+    ``shutting_down`` is set by the SIGTERM/SIGINT handler; workers we kill
+    on purpose must not count against the restart budget on the way down.
+    """
+    exit_code = 0
+
+    def terminate_all() -> None:
+        for proc in processes.values():
+            if proc.is_alive():
+                proc.terminate()
+
+    while not shutting_down.is_set():
+        shutting_down.wait(WORKER_SUPERVISE_POLL_SECONDS)
+        if shutting_down.is_set():
+            break
+
+        for name, target, args in worker_specs:
+            proc = processes.get(name)
+            if proc is None or proc.is_alive():
+                continue
+
+            exitcode = proc.exitcode
+            # Reap before respawning so the dead child does not linger as a
+            # zombie, and release its sentinel fd (bounded restarts keep the
+            # leak small, but a long-lived unit should not accumulate them).
+            proc.join()
+            try:
+                proc.close()
+            except (ValueError, AttributeError):  # pragma: no cover - defensive
+                pass
+            # Drop the closed handle immediately. is_alive()/join() raise
+            # ValueError on a closed Process, and both terminate_all() and
+            # the caller's final join walk this dict -- the restart path puts
+            # a fresh handle back under the same name.
+            processes.pop(name, None)
+
+            now = time.monotonic()
+            history = [t for t in restart_history[name] if now - t <= WORKER_RESTART_WINDOW_SECONDS]
+            history.append(now)
+            restart_history[name] = history
+
+            if len(history) > WORKER_MAX_RESTARTS_PER_WINDOW:
+                logger.error(
+                    "Ingestion worker %s has died %d times in %ds (last exitcode %s) "
+                    "-- past the restart budget, so respawning again is not going to "
+                    "fix it. Terminating the remaining workers and exiting nonzero so "
+                    "systemd restarts the whole unit and OnFailure alerts fire.",
+                    name,
+                    len(history),
+                    WORKER_RESTART_WINDOW_SECONDS,
+                    exitcode,
+                )
+                exit_code = 1
+                shutting_down.set()
+                terminate_all()
+                break
+
+            logger.error(
+                "Ingestion worker %s exited unexpectedly (exitcode %s) -- restarting "
+                "(%d/%d within %ds). Every worker is meant to stay up for the life of "
+                "the unit, so this is always a fault: while it was down, %s wrote no "
+                "data and nothing outside this supervisor would have noticed.",
+                name,
+                exitcode,
+                len(history),
+                WORKER_MAX_RESTARTS_PER_WINDOW,
+                WORKER_RESTART_WINDOW_SECONDS,
+                name,
+            )
+            spawn_worker(name, target, args)
+
+    return exit_code
+
+
 def main():
     """Main entry point"""
     import argparse
@@ -2306,22 +2422,17 @@ def main():
         logger.info("Starting VIX ingester alongside symbol engines")
     if vxn_enabled:
         logger.info("Starting VXN ingester alongside symbol engines")
-    processes: List[Process] = []
-
-    for symbol in symbols:
-        process = Process(target=run_for_symbol, args=(symbol,), name=f"ingest-{symbol}")
-        process.start()
-        processes.append(process)
+    # (name, target, args) for every child this unit supervises. Built up
+    # front so the supervisor below can respawn any of them by name.
+    worker_specs: List[Any] = [
+        (f"ingest-{symbol}", run_for_symbol, (symbol,)) for symbol in symbols
+    ]
 
     if vix_enabled:
-        vix_process = Process(target=run_vix_ingester, name="ingest-vix")
-        vix_process.start()
-        processes.append(vix_process)
+        worker_specs.append(("ingest-vix", run_vix_ingester, ()))
 
     if vxn_enabled:
-        vxn_process = Process(target=run_vxn_ingester, name="ingest-vxn")
-        vxn_process.start()
-        processes.append(vxn_process)
+        worker_specs.append(("ingest-vxn", run_vxn_ingester, ()))
 
     if futures_enabled:
         for index_symbol in futures_indexes:
@@ -2329,25 +2440,51 @@ def main():
                 "Starting futures ingester for %s (overnight display feed)",
                 index_symbol,
             )
-            fut_process = Process(
-                target=run_futures_for_index,
-                args=(index_symbol,),
-                name=f"ingest-futures-{index_symbol}",
+            worker_specs.append(
+                (
+                    f"ingest-futures-{index_symbol}",
+                    run_futures_for_index,
+                    (index_symbol,),
+                )
             )
-            fut_process.start()
-            processes.append(fut_process)
+
+    processes: Dict[str, Process] = {}
+    # Monotonic timestamps of each worker's recent respawns, pruned to the
+    # sliding window -- the restart budget is "N per window", not "N ever",
+    # so a symbol that blips once an hour keeps recovering forever while one
+    # that crash-loops still trips the escalation.
+    restart_history: Dict[str, List[float]] = {name: [] for name, _, _ in worker_specs}
+
+    def spawn_worker(name: str, target: Any, args: tuple) -> Process:
+        proc = Process(target=target, args=args, name=name)
+        proc.start()
+        processes[name] = proc
+        return proc
+
+    for name, target, args in worker_specs:
+        spawn_worker(name, target, args)
+
+    # Set by the signal handler so the supervisor can tell a worker we killed
+    # on purpose from one that died on its own. Without it, SIGTERM would look
+    # like every worker crashing at once and trip the restart escalation on
+    # the way down.
+    shutting_down = threading.Event()
 
     def shutdown_children(signum, frame):
+        shutting_down.set()
         logger.info(f"Received signal {signum}, terminating ingestion workers...")
-        for proc in processes:
+        for proc in processes.values():
             if proc.is_alive():
                 proc.terminate()
 
     signal.signal(signal.SIGINT, shutdown_children)
     signal.signal(signal.SIGTERM, shutdown_children)
 
-    exit_code = 0
-    for proc in processes:
+    exit_code = supervise_workers(
+        worker_specs, processes, restart_history, shutting_down, spawn_worker
+    )
+
+    for proc in processes.values():
         proc.join()
         if proc.exitcode not in (0, None):
             exit_code = 1
