@@ -2209,18 +2209,25 @@ def supervise_workers(
     The restart budget is per worker and per sliding window: a symbol that
     blips occasionally recovers indefinitely, while one that crash-loops
     (bad credentials, a poisoned symbol config -- things a respawn cannot
-    fix) trips the escalation, which tears the unit down and returns 1 so
-    systemd restarts it wholesale and the OnFailure alert pages someone.
+    fix) is ABANDONED: we stop respawning it, log loudly, and keep
+    supervising everyone else.
+
+    Abandoning rather than escalating is deliberate. Taking the unit down
+    over one bad worker would kill three healthy symbols to punish one, and
+    with the unit's StartLimitBurst that turns a single crash-looping symbol
+    into a permanent total outage -- strictly worse than the silent single-
+    symbol gap this supervisor exists to fix. The loud path for an abandoned
+    worker is the per-symbol freshness timer, which pages on exactly this.
+    Only when every worker has been abandoned is there nothing left to
+    supervise; that returns 1 so systemd restarts the unit wholesale.
 
     ``shutting_down`` is set by the SIGTERM/SIGINT handler; workers we kill
     on purpose must not count against the restart budget on the way down.
     """
     exit_code = 0
-
-    def terminate_all() -> None:
-        for proc in processes.values():
-            if proc.is_alive():
-                proc.terminate()
+    # Workers past their restart budget. Left dead on purpose, still counted
+    # so we can tell "some symbols degraded" from "nothing left running".
+    abandoned: set = set()
 
     while not shutting_down.is_set():
         shutting_down.wait(WORKER_SUPERVISE_POLL_SECONDS)
@@ -2228,6 +2235,8 @@ def supervise_workers(
             break
 
         for name, target, args in worker_specs:
+            if name in abandoned:
+                continue
             proc = processes.get(name)
             if proc is None or proc.is_alive():
                 continue
@@ -2253,20 +2262,29 @@ def supervise_workers(
             restart_history[name] = history
 
             if len(history) > WORKER_MAX_RESTARTS_PER_WINDOW:
+                abandoned.add(name)
+                exit_code = 1
                 logger.error(
                     "Ingestion worker %s has died %d times in %ds (last exitcode %s) "
                     "-- past the restart budget, so respawning again is not going to "
-                    "fix it. Terminating the remaining workers and exiting nonzero so "
-                    "systemd restarts the whole unit and OnFailure alerts fire.",
+                    "fix it. GIVING UP on %s; the other workers keep running. No data "
+                    "will be written for %s until this is fixed and the unit is "
+                    "restarted -- the per-symbol freshness check is what pages for it.",
                     name,
                     len(history),
                     WORKER_RESTART_WINDOW_SECONDS,
                     exitcode,
+                    name,
+                    name,
                 )
-                exit_code = 1
-                shutting_down.set()
-                terminate_all()
-                break
+                if len(abandoned) >= len(worker_specs):
+                    logger.error(
+                        "Every ingestion worker has been abandoned -- nothing left to "
+                        "supervise. Exiting nonzero so systemd restarts the unit."
+                    )
+                    shutting_down.set()
+                    break
+                continue
 
             logger.error(
                 "Ingestion worker %s exited unexpectedly (exitcode %s) -- restarting "

@@ -33,10 +33,15 @@ class _FakeProcess:
         self.joined = False
         self.closed = False
         self.terminated = False
+        # Optional callback fired on each is_alive() poll, so a test can end
+        # the supervisor loop after a set number of passes.
+        self.on_is_alive = None
 
     def is_alive(self):
         if self.closed:
             raise ValueError("process object is closed")
+        if self.on_is_alive is not None:
+            self.on_is_alive()
         return self._alive
 
     def join(self, timeout=None):
@@ -115,8 +120,15 @@ def test_dead_worker_is_restarted_and_survivors_untouched(monkeypatch):
     assert dead_qqq.joined and dead_qqq.closed
 
 
-def test_crash_looping_worker_escalates_instead_of_respawning_forever(monkeypatch):
-    """Past the budget: tear down, exit nonzero, let systemd + OnFailure act."""
+def test_crash_looping_worker_is_abandoned_and_survivors_keep_running(monkeypatch):
+    """One bad worker must not take the healthy ones down with it.
+
+    Escalating to a unit-wide exit here would kill three healthy symbols to
+    punish one, and the unit's StartLimitBurst would turn a single
+    crash-looping symbol into a permanent TOTAL outage -- strictly worse
+    than the single-symbol gap this supervisor exists to fix. So the bad
+    worker is abandoned and everyone else keeps streaming.
+    """
     specs, processes, history, spawns = _harness(
         ["ingest-SPY", "ingest-QQQ"], monkeypatch, max_restarts=3
     )
@@ -131,18 +143,57 @@ def test_crash_looping_worker_escalates_instead_of_respawning_forever(monkeypatc
         spawns.append(name)
         return proc
 
+    # End the loop a few passes after QQQ is abandoned, so we can observe
+    # that the supervisor kept going rather than exiting.
+    polls = {"n": 0}
+
+    def count_polls():
+        polls["n"] += 1
+        if polls["n"] > 12:
+            shutting_down.set()
+
+    processes["ingest-SPY"].on_is_alive = count_polls
     processes["ingest-QQQ"].die(exitcode=1)
 
     exit_code = main_engine.supervise_workers(
         specs, processes, history, shutting_down, spawn_already_dead
     )
 
-    assert exit_code == 1, "must exit nonzero so systemd restarts the unit"
-    assert shutting_down.is_set()
-    # Budget is 3, so 3 respawns then escalation on the 4th death.
+    # Budget is 3, so 3 respawns then abandonment on the 4th death -- and no
+    # further respawns after that, however long the loop runs.
     assert spawns.count("ingest-QQQ") == 3
-    # Escalation terminates the survivors so the unit goes down cleanly.
-    assert processes["ingest-SPY"].terminated
+    # The healthy worker is never touched: not terminated, not restarted.
+    assert not processes["ingest-SPY"].terminated
+    assert spawns.count("ingest-SPY") == 0
+    assert processes["ingest-SPY"].is_alive()
+    # Nonzero so the unit reports failure when it eventually stops, but the
+    # supervisor stayed up rather than tearing everything down.
+    assert exit_code == 1
+
+
+def test_all_workers_abandoned_exits_nonzero(monkeypatch):
+    """Nothing left to supervise is a real total failure -- let systemd retry."""
+    specs, processes, history, spawns = _harness(
+        ["ingest-SPY", "ingest-QQQ"], monkeypatch, max_restarts=2
+    )
+    shutting_down = threading.Event()
+
+    def spawn_already_dead(name, target, args):
+        proc = _FakeProcess(name)
+        proc.die(exitcode=1)
+        processes[name] = proc
+        spawns.append(name)
+        return proc
+
+    for proc in processes.values():
+        proc.die(exitcode=1)
+
+    exit_code = main_engine.supervise_workers(
+        specs, processes, history, shutting_down, spawn_already_dead
+    )
+
+    assert exit_code == 1
+    assert shutting_down.is_set(), "loop must end once every worker is abandoned"
 
 
 def test_shutdown_does_not_count_as_worker_failure(monkeypatch):
