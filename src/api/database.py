@@ -3467,38 +3467,89 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- tests/test_strike_profile_timeseries_expiration_sum.py and the
             -- SQL-shape check in tests/test_strike_profile_timeseries_query.py).
             --
-            -- The extra ``gbs.timestamp BETWEEN start_ts AND end_ts`` bound is
-            -- logically REDUNDANT (every br.rep_ts already lies inside the
-            -- window ``bucket_reps`` was filtered to) but performance-critical.
-            -- ``bucket_reps``/``bounds`` are optimisation-fence CTEs, so the
-            -- planner cannot estimate how many rep_ts values the join probes
-            -- and periodically abandons the ~window_units-probe index nested
-            -- loop for a merge/hash join that reads the ENTIRE gex_by_strike
-            -- table (tens of millions of rows across the 90-day retention) —
-            -- the 15s-timeout path behind "Strike-profile timeseries query
-            -- timed out ... returning empty".  With the window bound, even
-            -- that fallback plan range-scans only the ~window's worth of rows
-            -- (idx_gex_by_strike_underlying_timestamp_strike), keeping the
-            -- query bounded regardless of which join strategy is chosen.  Its
-            -- sibling CTEs (bucket_reps, ohlc) already carry the same bound;
-            -- this restores that symmetry for the one CTE that hits the
-            -- highest-cardinality table.
+            -- BOUNDED READ — the gex_by_strike probe is fenced to the
+            -- ~window_units bucket-representative timestamps by construction,
+            -- and no query plan can widen it.
+            --
+            -- This was a plain ``JOIN gex_by_strike gbs ON gbs.timestamp =
+            -- br.rep_ts``, whose intended plan is ~window_units index probes.
+            -- ``bucket_reps``/``bounds`` are optimisation-fence CTEs, though,
+            -- so the planner cannot estimate how many rep_ts values the join
+            -- probes and periodically abandoned that nested loop for a
+            -- merge/hash join reading the ENTIRE table (tens of millions of
+            -- rows across the 90-day retention) — the 15s-timeout path behind
+            -- "Strike-profile timeseries query timed out ... returning empty".
+            -- Commit c4d6463 added the logically-redundant ``gbs.timestamp
+            -- BETWEEN start_ts AND end_ts`` bound to cap that fallback at the
+            -- window's rows rather than the table's.
+            --
+            -- Capping is not fixing, because the WINDOW is not the REP SET:
+            -- each bucket contributes ONE rep_ts out of every snapshot inside
+            -- it, so the window holds ~``timeframe / cycle`` times more
+            -- gex_by_strike timestamps than this CTE reads.  At 1min the two
+            -- nearly coincide (window_units=78 is a 78-minute window) and the
+            -- fallback fit inside the timeout; the same 78 buckets at 5min
+            -- span a 390-minute session, so it read ~5x the rows and kept
+            -- crossing 15s.  Measured on a seeded 5.85M-row table with the
+            -- nested loop forced off: 5.0x the buffers at 5min, 15.2x at
+            -- 15min, ~1x at 1min — which is why the alert was 5min-only.
+            --
+            -- So the fence is structural now rather than another bound.  The
+            -- probe is a LATERAL subquery correlated on ``br.rep_ts``: a
+            -- lateral reference is evaluated per outer row, and this one
+            -- carries its own GROUP BY, which blocks subquery pull-up — so PG
+            -- cannot re-plan it as a hash/merge join over the window or the
+            -- table.  The read is ~window_units equality probes on
+            -- (underlying, timestamp, strike) whatever else the planner does,
+            -- flat in the window's span, so 15min costs what 1min costs.  The
+            -- redundant window bound stays as defence in depth (and keeps this
+            -- CTE symmetric with bucket_reps / ohlc) but is no longer
+            -- load-bearing.
+            --
+            -- Grouping by strike INSIDE the lateral is identical to grouping
+            -- by (bucket_ts, strike) — ``bucket_reps`` is DISTINCT ON the
+            -- bucket, so bucket_ts <-> rep_ts is 1:1 — and it sums one
+            -- timestamp's rows at a time instead of one grand GROUP BY over
+            -- every (bucket x strike x expiration) row in the window.
+            --
+            -- The HAVING drops all-zero strikes at the source.  gex_by_strike
+            -- carries a row for every (strike, expiration) the chain quotes,
+            -- including the zero-OI wings that are the bulk of an SPX chain,
+            -- and the Python grouping below already discards exactly those —
+            -- so they were pure transfer and decode cost on the largest
+            -- response this API serves (~66% of rows on the seeded chain).
+            -- The SQL predicate is strictly narrower than the Python one (it
+            -- cannot see the bucket's close, which zeroes a whole bucket's
+            -- dollar-GEX when the tape is missing), so the Python filter stays
+            -- and the returned buckets are unchanged.
             strikes AS (
                 SELECT
                     br.bucket_ts,
-                    gbs.strike,
-                    SUM(COALESCE(gbs.call_gamma, 0))::numeric AS call_gamma,
-                    SUM(COALESCE(gbs.put_gamma, 0))::numeric  AS put_gamma,
-                    SUM(COALESCE(gbs.call_oi, 0))::bigint     AS call_oi,
-                    SUM(COALESCE(gbs.put_oi, 0))::bigint      AS put_oi
+                    sx.strike,
+                    sx.call_gamma,
+                    sx.put_gamma,
+                    sx.call_oi,
+                    sx.put_oi
                 FROM bucket_reps br
-                JOIN gex_by_strike gbs
-                  ON gbs.underlying = $1
-                 AND gbs.timestamp  = br.rep_ts
-                 AND gbs.timestamp  BETWEEN (SELECT start_ts FROM bounds)
-                                        AND (SELECT end_ts FROM bounds)
-                WHERE (${expiration_param_idx}::date[] IS NULL OR gbs.expiration = ANY(${expiration_param_idx}::date[]))
-                GROUP BY br.bucket_ts, gbs.strike
+                CROSS JOIN LATERAL (
+                    SELECT
+                        gbs.strike,
+                        SUM(COALESCE(gbs.call_gamma, 0))::numeric AS call_gamma,
+                        SUM(COALESCE(gbs.put_gamma, 0))::numeric  AS put_gamma,
+                        SUM(COALESCE(gbs.call_oi, 0))::bigint     AS call_oi,
+                        SUM(COALESCE(gbs.put_oi, 0))::bigint      AS put_oi
+                    FROM gex_by_strike gbs
+                    WHERE gbs.underlying = $1
+                      AND gbs.timestamp  = br.rep_ts
+                      AND gbs.timestamp  BETWEEN (SELECT start_ts FROM bounds)
+                                             AND (SELECT end_ts FROM bounds)
+                      AND (${expiration_param_idx}::date[] IS NULL OR gbs.expiration = ANY(${expiration_param_idx}::date[]))
+                    GROUP BY gbs.strike
+                    HAVING SUM(COALESCE(gbs.call_gamma, 0)) <> 0
+                        OR SUM(COALESCE(gbs.put_gamma, 0)) <> 0
+                        OR SUM(COALESCE(gbs.call_oi, 0)) <> 0
+                        OR SUM(COALESCE(gbs.put_oi, 0)) <> 0
+                ) sx
             )
             SELECT
                 br.bucket_ts AS timestamp,
@@ -3530,6 +3581,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ORDER BY br.bucket_ts ASC, s.strike ASC
         """
 
+        # Stamped before the pool acquire so the timeout log can tell the two
+        # ways this call can blow its budget apart: the 15s ceiling is on the
+        # fetch alone (asyncio.wait_for starts after a connection is in hand),
+        # so an elapsed of ~15s is a slow QUERY while anything materially above
+        # that is time spent queueing for one of the ~3 pool connections.
+        started = time_module.monotonic()
         try:
             async with self._acquire_connection() as conn:
                 rows = await asyncio.wait_for(
@@ -3650,6 +3707,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # zero/None there is nothing for the panels to render
                     # at that strike and shipping them just bloats the
                     # payload for a few-hundred-bucket window.
+                    #
+                    # The strikes CTE's HAVING already dropped the strikes
+                    # whose summed gamma and OI are all zero, so what reaches
+                    # here is the case SQL cannot see: a bucket with no close,
+                    # which zeroes every dollar-GEX value in it while the raw
+                    # gamma behind them is non-zero.
                     call_gex = r["call_gex"]
                     put_gex = r["put_gex"]
                     net_gex = r["net_gex"]
@@ -3697,9 +3760,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )
                 return result
         except asyncio.TimeoutError:
+            # Carry the full request shape: timeframe and the expiration scope
+            # both change which index the read lands on and how many rows it
+            # aggregates, and elapsed separates a slow query from pool
+            # starvation (see ``started`` above). Without these the warning
+            # named a symptom but nothing you could reproduce from.
             logger.warning(
-                "Strike-profile timeseries query timed out for "
-                f"{symbol} timeframe={timeframe} window={window_units}, returning empty"
+                "Strike-profile timeseries query timed out after %.1fs for "
+                "%s timeframe=%s window=%s expirations=%s, returning empty",
+                time_module.monotonic() - started,
+                symbol,
+                timeframe,
+                window_units,
+                ",".join(d.isoformat() for d in exp_filter) if exp_filter else "all",
             )
             return []
         except Exception as e:

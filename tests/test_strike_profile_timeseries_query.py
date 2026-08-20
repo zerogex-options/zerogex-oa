@@ -47,6 +47,20 @@ class _RecordingConn:
         return list(self._fetch_rows)
 
 
+def _sql_only(sql: str) -> str:
+    """Strip ``--`` comment lines so a structural assertion can only be
+    satisfied by executable SQL.
+
+    The strikes CTE carries a long comment explaining which join shapes are
+    forbidden and why — including the literal text of the shape it replaced.
+    Asserting against the raw query string let those assertions pass on the
+    prose alone, which is exactly backwards for a regression guard.
+    """
+    return "\n".join(
+        line.split("--", 1)[0] if "--" in line else line for line in sql.splitlines()
+    )
+
+
 def _install_conn(db, conn):
     @asynccontextmanager
     async def _acquire():
@@ -95,45 +109,95 @@ def test_query_anchors_on_gex_summary_and_picks_bucket_representative():
 
 
 def test_strikes_join_keyed_on_rep_ts_and_fenced_to_window():
-    """The core anti-regression: the gex_by_strike read must be BOUNDED.
+    """The core anti-regression: the gex_by_strike read must be BOUNDED to the
+    ~window_units bucket-representative timestamps, by construction.
 
     gex_by_strike is the highest-cardinality table on the API — one row per
-    strike×expiration every ~60s analytics cycle, tens of millions of rows
-    across the 90-day retention.  The strikes CTE keys the JOIN on the
+    strike x expiration every ~60s analytics cycle, tens of millions of rows
+    across the 90-day retention.  The strikes CTE keys the read on the
     per-bucket representative timestamps (``gbs.timestamp = br.rep_ts``), so
     the *intended* plan is ~window_units index point-lookups.
 
-    But ``bucket_reps`` / ``bounds`` are optimisation-fence CTEs whose row
-    counts the planner cannot estimate, so under production stats it
-    periodically abandons the point-lookup nested loop for a merge/hash join
-    that reads the ENTIRE gex_by_strike table.  That is the 15s
-    "Strike-profile timeseries query timed out ... returning empty" path
-    (reproduced with EXPLAIN ANALYZE: an 8.5M-row table read end to end in
-    ~1.9s; linear in table size, so a real multi-underlying / 90-day table
-    crosses the 15s timeout).
+    That intent used to be expressed as a plain JOIN, which the planner was
+    free to ignore: ``bucket_reps`` / ``bounds`` are optimisation-fence CTEs
+    whose row counts it cannot estimate, so under production stats it
+    periodically abandoned the point-lookup nested loop for a merge/hash join
+    reading the ENTIRE table.  That was the 15s "Strike-profile timeseries
+    query timed out ... returning empty" path (reproduced with EXPLAIN ANALYZE:
+    an 8.5M-row table read end to end in ~1.9s; linear in table size, so a real
+    multi-underlying / 90-day table crosses the timeout).
 
-    The fix is a logically-REDUNDANT window bound on the same JOIN
-    (``gbs.timestamp BETWEEN start_ts AND end_ts``): every ``rep_ts`` already
-    lies inside ``[start_ts, end_ts]`` (bucket_reps was filtered to exactly
-    that range), so the result set is byte-for-byte identical, but now even
-    the fallback plan range-scans only the window's rows off the
-    ``(underlying, timestamp, strike)`` index instead of the whole table.
-    Its sibling CTEs (bucket_reps, ohlc) already carry this same window bound.
+    A logically-redundant ``gbs.timestamp BETWEEN start_ts AND end_ts`` bound
+    (commit c4d6463) capped that fallback to the window's rows.  It was not
+    enough, because the window is not the rep set: each bucket contributes ONE
+    rep_ts out of every snapshot inside it, so at 5min the window holds ~5x the
+    timestamps the CTE reads (at 15min, ~15x).  window_units=78 at 1min is a
+    78-minute window and the fallback fit inside the timeout; the same 78
+    buckets at 5min span a 390-minute session and it did not — which is why the
+    alert that prompted this fires on timeframe=5min only.
+
+    So the fence is now structural.  The read is a LATERAL subquery correlated
+    on ``br.rep_ts`` that carries its own GROUP BY: a lateral reference is
+    evaluated per outer row, and the grouping blocks subquery pull-up, so PG
+    cannot re-plan it as a hash/merge join over the table or over the window.
+    The read is ~window_units equality probes whatever else the planner does —
+    flat in the window's span, so 15min costs what 1min costs.  The redundant
+    window bound stays as defence in depth.
+
+    Asserted against comment-stripped SQL: the CTE's comment quotes the very
+    join shape this test forbids, so matching the raw string would pass on the
+    prose.
     """
-    captured = _run("SPY")
-    sql = captured["query"]
+    sql = _sql_only(_run("SPY")["query"])
 
-    assert "JOIN gex_by_strike gbs" in sql
-    # Still keyed on the per-bucket representative (the point-lookup path).
-    assert "gbs.timestamp  = br.rep_ts" in sql or "gbs.timestamp = br.rep_ts" in sql
+    start = sql.index("strikes AS (")
+    end = sql.index(") sx", start)
+    strikes_cte = sql[start:end]
 
-    # AND fenced to the window so NO plan can scan the whole table. The bound
-    # must be a direct predicate on gbs.timestamp referencing the bounds CTE.
-    gbs_idx = sql.index("gex_by_strike gbs")
-    tail = sql[gbs_idx:]
-    assert "gbs.timestamp  BETWEEN" in tail or "gbs.timestamp BETWEEN" in tail
-    assert "start_ts FROM bounds" in tail
-    assert "end_ts FROM bounds" in tail
+    # Correlated LATERAL read: cannot be re-planned as a hash/merge join.
+    assert "CROSS JOIN LATERAL" in strikes_cte
+    assert "FROM gex_by_strike gbs" in strikes_cte
+    # Keyed on the per-bucket representative (the point-lookup path).
+    assert "gbs.timestamp  = br.rep_ts" in strikes_cte
+
+    # The lateral subquery must aggregate, which is what blocks PG from
+    # pulling it up into the parent and losing the nested loop.
+    lateral = strikes_cte[strikes_cte.index("CROSS JOIN LATERAL") :]
+    assert "GROUP BY gbs.strike" in lateral
+
+    # NOT re-planned back into a plain join on the table.
+    assert "JOIN gex_by_strike" not in strikes_cte.replace("CROSS JOIN LATERAL", "")
+
+    # Window bound retained as defence in depth.
+    assert "gbs.timestamp  BETWEEN" in strikes_cte
+    assert "start_ts FROM bounds" in strikes_cte
+    assert "end_ts FROM bounds" in strikes_cte
+
+
+def test_strikes_cte_drops_all_zero_strikes_in_sql():
+    """All-zero (bucket, strike) aggregates must be dropped by the query, not
+    just by the Python grouping.
+
+    gex_by_strike holds a row for every (strike, expiration) the chain quotes,
+    including the zero-OI wings that are the bulk of an SPX chain.  The Python
+    grouping already discards a strike whose gex and both OI legs are zero, so
+    without a HAVING those rows are fetched, decoded and thrown away — on the
+    largest response this API serves.
+
+    The SQL predicate is deliberately NARROWER than the Python one (it cannot
+    see the bucket's close, which zeroes a whole bucket's dollar-GEX when the
+    underlying tape is missing), so what it drops is a strict subset of what
+    Python drops and the response is unchanged.
+    """
+    sql = _sql_only(_run("SPY")["query"])
+    strikes_cte = sql[sql.index("strikes AS (") : sql.index(") sx")]
+
+    having = strikes_cte[strikes_cte.index("HAVING") :]
+    for col in ("call_gamma", "put_gamma", "call_oi", "put_oi"):
+        assert f"SUM(COALESCE(gbs.{col}, 0)) <> 0" in having, col
+    # ORed, not ANDed: a strike survives if ANY leg carries data.
+    assert having.count("OR ") == 3
+    assert "AND " not in having
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +308,14 @@ def test_strikes_cte_sums_gamma_across_expirations_not_collapse():
     value-level invariant is exercised against a real Postgres in
     ``tests/test_strike_profile_timeseries_expiration_sum.py``.
     """
-    sql = _run("SPY")["query"]
+    sql = _sql_only(_run("SPY")["query"])
 
-    # Isolate the ``strikes`` CTE (header -> its GROUP BY) so an assertion
-    # can't be satisfied by an unrelated part of the surrounding query.
+    # Isolate the ``strikes`` CTE (header -> the close of its lateral) so an
+    # assertion can't be satisfied by an unrelated part of the surrounding
+    # query.  Comment-stripped, because the CTE's own comment spells out the
+    # collapse shapes this test forbids.
     start = sql.index("strikes AS (")
-    group_by = "GROUP BY br.bucket_ts, gbs.strike"
-    end = sql.index(group_by, start) + len(group_by)
+    end = sql.index(") sx", start)
     strikes_cte = sql[start:end]
 
     # Gamma (and OI) are SUMmed across the admitted expirations.
@@ -259,11 +324,15 @@ def test_strikes_cte_sums_gamma_across_expirations_not_collapse():
     assert "SUM(COALESCE(gbs.call_oi, 0))" in strikes_cte
     assert "SUM(COALESCE(gbs.put_oi, 0))" in strikes_cte
 
-    # Grouped by (bucket, strike) ONLY: expiration is summed OVER, not a
-    # grouping key, so one output row per (bucket, strike) carries every
-    # selected expiration's gamma.  (``expiration`` still appears earlier in
-    # the CTE's WHERE filter — that's the set predicate, not a grouping key —
-    # so this check is scoped to the text after GROUP BY.)
+    # Grouped by strike ONLY, inside a lateral that runs at a single rep_ts:
+    # expiration is summed OVER, never a grouping key, so one output row per
+    # (bucket, strike) carries every selected expiration's gamma.  Grouping by
+    # strike within one rep_ts is identical to grouping by (bucket_ts, strike)
+    # — bucket_reps is DISTINCT ON the bucket, so bucket_ts <-> rep_ts is 1:1.
+    # (``expiration`` still appears earlier in the lateral's WHERE — that's the
+    # set predicate, not a grouping key — so this check is scoped to the text
+    # after GROUP BY.)
+    assert "GROUP BY gbs.strike" in strikes_cte
     assert "expiration" not in strikes_cte.split("GROUP BY")[1]
 
     # No collapse: the strikes CTE must not reduce to a single row per strike
@@ -271,6 +340,7 @@ def test_strikes_cte_sums_gamma_across_expirations_not_collapse():
     # one expiration per strike and reintroduce the shrink-on-add regression.
     assert "DISTINCT ON" not in strikes_cte
     assert "ORDER BY" not in strikes_cte
+    assert "AVG(" not in strikes_cte
 
 
 # ---------------------------------------------------------------------------
