@@ -21,7 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from zoneinfo import ZoneInfo
 
-from ..database import DatabaseManager
+from ..database import DatabaseManager, ReplayFramesUnavailable
 from .trade_signals import get_db
 
 router = APIRouter(prefix="/api/replay", tags=["Replay"])
@@ -282,9 +282,28 @@ async def get_replay_range(
     today_et = datetime.now(tz=ET).date()
     is_today = target == today_et
 
-    raw_frames = await db.get_gex_frames_for_session(
-        sym, target, strike_band_pct=strike_band_pct,
-    )
+    # A failed frames read is NOT an empty session.  The read raises rather
+    # than returning [] precisely so the two stay apart here: a 200 carrying
+    # ``count: 0`` is this endpoint asserting the session has no frames, and
+    # the page renders copy that says so ("the analytics engine didn't write
+    # that day").  Letting a timeout borrow that answer makes an outage look
+    # like a data gap to the visitor, and leaves whoever is asked why the
+    # replay is blank with a screenshot that rules nothing out.
+    try:
+        raw_frames = await db.get_gex_frames_for_session(
+            sym, target, strike_band_pct=strike_band_pct,
+        )
+    except ReplayFramesUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "frames_unavailable",
+                "message": (
+                    f"Replay frames for {sym} on {target.isoformat()} could not be "
+                    "read right now. This is a backend failure, not an empty session."
+                ),
+            },
+        ) from exc
     raw_candles = await db.get_underlying_candles_for_session(sym, target)
 
     # Per-(minute, strike) expiration mix for the expiry colour gradient. Kept

@@ -38,6 +38,26 @@ _ET = ZoneInfo("America/New_York")
 _UNSET: Any = object()
 
 
+class ReplayFramesUnavailable(RuntimeError):
+    """The replay frames read failed — as distinct from finding no rows.
+
+    Most read helpers here answer a failed query with ``[]`` so a page can
+    render an empty state instead of 500ing, and for a card on a crowded
+    dashboard that is the right trade.  A whole-session replay is not that
+    case: the page has nothing else on it, so an empty result is not a
+    degraded render but the entire answer, and the copy it prints
+    ("either the session predates GEX ingestion or the analytics engine
+    didn't write that day") states a cause the empty list does not
+    actually establish.  A timed-out query is then indistinguishable from
+    a genuinely dark session — to the visitor and to whoever is asked why
+    the replay is blank.
+
+    So the frames read raises this instead, and ``/api/replay/range``
+    answers 503.  ``[]`` keeps its literal meaning: the query ran and the
+    session has no rows.
+    """
+
+
 def _cache_weight(payload: Any) -> int:
     """Approximate element count for a cached payload — a cheap size proxy.
 
@@ -2263,8 +2283,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         call_gex/put_gex are the dollar-scaled call/put split (nullable on
         pre-gamma-column rows) that drives the scrubber's Split/Combined views.
 
-        Returns ``[]`` on any error so the endpoint can render an empty
-        state instead of crashing.
+        Returns ``[]`` only when the query ran and the session genuinely has
+        no rows.  A failed read (timeout, pool exhaustion, connection loss)
+        raises :class:`ReplayFramesUnavailable` rather than passing itself
+        off as an empty session — see that class for why this one read does
+        not swallow its errors.
         """
         et = ZoneInfo("America/New_York")
         utc = ZoneInfo("UTC")
@@ -2303,7 +2326,30 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
-            session_summary AS (
+            -- MATERIALIZED is load-bearing, not stylistic.  ``spot`` below is
+            -- a correlated sub-select over underlying_quotes: one lookup per
+            -- MINUTE is the whole intent, and the CTE is where that intent
+            -- lives.  Without the keyword PG inlines this CTE, which pushes
+            -- the sub-select down past the gex_by_strike join and substitutes
+            -- it once per REFERENCE -- and ``s.spot`` is referenced four times
+            -- (twice in each of the call_gex / put_gex expressions).  The
+            -- lookup then runs 4 x (minutes x strikes x expirations) times
+            -- instead of once per minute.
+            --
+            -- Measured on a seeded 5.6M-row gex_by_strike (one SPY session,
+            -- 391 minutes x 51 in-band strikes x 16 expirations): four
+            -- SubPlans at 319,056 loops each -- 1.28M executions, 3,867,893
+            -- buffers, 8,274 ms.  With MATERIALIZED: 391 loops, 40,394
+            -- buffers, 1,158 ms.  7.1x faster, 96x fewer buffers, and the
+            -- result set is byte-identical (19,941 rows, verified row for row).
+            --
+            -- It matters because the cost scales on the fan-out dimension
+            -- rather than the session: a chain with more live expirations
+            -- multiplies the loop count for the same 390-minute day, and the
+            -- pool runs with command_timeout=30 / statement_timeout=30000.
+            -- Past that ceiling asyncpg raises, and an empty replay reads to a
+            -- visitor as "the analytics engine did not write that day".
+            session_summary AS MATERIALIZED (
                 SELECT gs.timestamp, gs.gamma_flip_point AS gamma_flip,
                        gs.call_wall, gs.put_wall, gs.max_pain,
                        gs.pin_strike, gs.pin_confidence,
@@ -2349,6 +2395,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                      s.pin_strike, s.pin_confidence, gbs.strike
             ORDER BY s.timestamp ASC, gbs.strike ASC
         """
+        started = time_module.monotonic()
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(
@@ -2359,13 +2406,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     float(strike_band_pct),
                 )
         except Exception as e:
+            # Elapsed separates the two ways this read blows its budget, the
+            # same distinction the strike-profile timeseries logs: the pool
+            # runs command_timeout=30 / statement_timeout=30000, so ~30s is a
+            # slow QUERY while materially more is time spent queueing for a
+            # pool connection.  Both surface as an exception here.
             logger.warning(
-                "get_gex_frames_for_session(%s, %s) failed: %s",
+                "get_gex_frames_for_session(%s, %s) failed after %.1fs: %s",
                 symbol,
                 session_date,
+                time_module.monotonic() - started,
                 e,
             )
-            return []
+            raise ReplayFramesUnavailable(
+                f"Replay frames read failed for {symbol} on {session_date}: {e}"
+            ) from e
 
         # Group by timestamp preserving chronological order (dict insertion).
         frames: dict = {}
