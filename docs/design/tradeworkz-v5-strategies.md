@@ -446,6 +446,39 @@ its verdict should come from the config as-is.
   hard gate then dying at conviction because the quality scale saturated far
   above the floors — 13 and 3 conviction deaths respectively).
 
+### 7.2 Third screen (2026-08-18, 60d / 5m / 1 contract) — hold, accumulate
+
+Fleet trajectory across the three screens: **−$4,194 → +$96 → +$482**
+(34 trades, expectancy +$14.17). Every bot that traded is PF > 1.2:
+
+| Bot | Trades | PF | Expectancy | Read |
+|---|---:|---:|---:|---|
+| profile_shelf_breaker | 17 | 1.27 | +$17.62 | unchanged trade set — still 3 short of the bar |
+| settlement_flow_snap | 9 | 1.23 | +$2.38 | **the exit fix worked**: 3 straight losses → 4W/5L positive; same signal, correct exits |
+| dual_flip_dislocation | 5 | 1.45 | +$24.76 | **the quality-scale fix worked**: the 3 previously conviction-blocked crosses traded and went 3-1 (+$358 since the fix) |
+| weekly_charm_grind | 3 | — (3W/0L) | +$12.32 | unchanged; accumulating |
+| put_capitulation_credit_fade | 0 | — | — | the vol-relative gate opened the path (10 ticks reached the flow gates, vs 0 ever before) — the setup is genuinely ~monthly-rare by identity |
+
+**No changes this round — deliberately.** Every prior change was a bug fix,
+a mechanism correction, or a funnel-named calibration; nothing in this
+screen names a defect. From here the honest lever is sample accumulation:
+
+- The chain hot window now bounds every screen (`chain_min` = the window
+  start); it grows daily toward the 90-day retention cap, so each re-screen
+  adds sessions AND the `--days` can rise toward 90 by mid-September.
+- Two friction caveats to carry into any promotion decision: (1) this
+  harness models slippage but NO commissions — settlement's +$2.38/trade
+  is below a realistic ~$2.60 round-trip commission on a 2-leg vertical, so
+  it must widen with sample or it is breakeven in practice; (2) shelf's PF
+  is concentrated (2 large wins carry it, with a −$818 trough first) — at
+  20+ trades it must ALSO show positive expectancy in both halves of a
+  `tw_execution_sweep` train/test split before anyone moves it to
+  `DEFAULT_ROSTER`.
+
+**Pre-promotion checklist for profile_shelf_breaker** (the first bot likely
+to face it): ≥ 20 trades · PF ≥ 1.1 · positive expectancy · both-halves
+robustness · a sanity read of its `miss_reasons` funnel for drift.
+
 Re-screen with the same five-bot command:
 
 ```
@@ -453,7 +486,7 @@ make tradeworkz-backtest ARGS="--days 60 --interval-min 5 --bots settlement_flow
 ```
 
 Promotion criteria unchanged: PF ≥ 1.1, positive expectancy, ≥ 20 trades.
-Frequency reality after two screens: shelf reaches the bar soon;
+Frequency reality after three screens: shelf reaches the bar first;
 settlement / dual-flip / weekly / put-capitulation are low-frequency,
 regime-conditional setups that validate on accumulation (the
 vanna_vol_crush_rider posture) — the next lever for any of them is a
