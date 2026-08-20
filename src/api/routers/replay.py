@@ -204,7 +204,14 @@ async def list_replay_sessions(
 async def get_replay_frame(
     symbol: str = Query(default="SPY", max_length=10),
     ts: str = Query(..., description="ISO-8601 timestamp to render."),
-    strike_limit: int = Query(default=60, ge=10, le=200),
+    # The limit counts (strike, expiration) ROWS, not strikes — gex_by_strike is
+    # keyed per expiration, so one strike contributes as many rows as it has
+    # listed expirations (~10-40).  The default keeps the scrubber's payload
+    # small; the 4000 ceiling exists for the session-baseline use (the Pair
+    # Comparison ladder's Δ-since-open indicator fetches ONE frame per symbol
+    # per session and needs every expiration row across its ±20-strike window,
+    # which the old 200-row cap could not span on a dense chain).
+    strike_limit: int = Query(default=60, ge=10, le=4000),
     db: DatabaseManager = Depends(get_db),
 ):
     """Single per-minute replay frame at-or-before ``ts``.

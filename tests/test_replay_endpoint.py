@@ -109,6 +109,26 @@ def test_frame_returns_summary_plus_strikes(monkeypatch):
     assert all({"strike", "call_gex", "put_gex", "net_gex"} <= row.keys() for row in body["strikes"])
 
 
+def test_frame_accepts_session_baseline_strike_limit(monkeypatch):
+    """The Pair Comparison ladder's Δ-since-open indicator fetches one frame
+    per symbol per session with a large ``strike_limit`` — the limit counts
+    (strike, expiration) rows, so a dense chain needs far more than the old
+    200-row cap to span the ladder's ±20-strike window across expirations."""
+    app, dbmod = _build_app(monkeypatch)
+    frame_ts = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_summary_at_ts = AsyncMock(return_value=_summary(frame_ts))
+    dbmod.DatabaseManager.get_gex_by_strike_at_ts = AsyncMock(return_value=_strikes())
+    with TestClient(app) as client:
+        r = client.get("/api/replay/frame?symbol=SPY&ts=2026-06-29T13:30:00Z&strike_limit=4000")
+        assert r.status_code == 200, r.text
+        dbmod.DatabaseManager.get_gex_by_strike_at_ts.assert_awaited_with(
+            "SPY", frame_ts, limit=4000
+        )
+        # Above the ceiling still 422s — the cap moved, it didn't vanish.
+        r = client.get("/api/replay/frame?symbol=SPY&ts=2026-06-29T13:30:00Z&strike_limit=4001")
+        assert r.status_code == 422
+
+
 def test_frame_returns_404_when_no_data(monkeypatch):
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_gex_summary_at_ts = AsyncMock(return_value=None)
