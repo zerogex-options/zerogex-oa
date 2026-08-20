@@ -268,3 +268,147 @@ def test_clip_endpoint_returns_503_v1_status(monkeypatch):
     assert isinstance(detail, dict)
     assert detail["status"] == "not_implemented_v1"
     assert "MP4" in detail["message"]
+
+
+# ── Expiry colour gradient ───────────────────────────────────────────────────
+# The scrubber and the shareable snapshot colour-grade each strike bar by
+# time-to-expiry (nearest expiration boldest, fanning out to the faintest on
+# the furthest), the same ramp the GEX Strike Profile and the Gamma Chart's
+# rail draw. That needs the expiration dimension to survive the API — these
+# pin the two places it used to be dropped.
+
+
+def test_frame_strikes_carry_expiration(monkeypatch):
+    """/replay/frame must label each row with its expiration.
+
+    ``get_gex_by_strike_at_ts`` has always SELECTed ``g.expiration`` (the table
+    is keyed per (strike, expiration)), but the router's shaper dropped it, so
+    the snapshot chart received several rows for one strike with no way to tell
+    them apart and could only sum them.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    ts = datetime(2026, 6, 29, 14, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_summary_at_ts = AsyncMock(return_value=_summary(ts))
+    dbmod.DatabaseManager.get_gex_by_strike_at_ts = AsyncMock(return_value=[
+        {"strike": Decimal("600"), "expiration": date(2026, 6, 29),
+         "call_gex": Decimal("2000"), "put_gex": Decimal("-500"),
+         "net_gex": Decimal("1500"), "distance_from_spot": Decimal("0")},
+        # Same strike, later expiration — the row multiplicity the chart sees.
+        {"strike": Decimal("600"), "expiration": date(2026, 7, 17),
+         "call_gex": Decimal("1000"), "put_gex": Decimal("-250"),
+         "net_gex": Decimal("750"), "distance_from_spot": Decimal("0")},
+    ])
+    with TestClient(app) as client:
+        r = client.get(f"/api/replay/frame?symbol=SPY&ts={quote(ts.isoformat())}")
+    assert r.status_code == 200, r.text
+    strikes = r.json()["strikes"]
+    assert [s["expiration"] for s in strikes] == ["2026-06-29", "2026-07-17"]
+    # The existing fields are untouched.
+    assert strikes[0]["call_gex"] == pytest.approx(2000.0)
+
+
+def test_range_omits_expiration_mix_by_default(monkeypatch):
+    """The shares are opt-in: an unmodified caller's payload is unchanged.
+
+    The pair-comparison scrubber buffers a whole session and does not draw the
+    gradient, so it must not pay for a second session-wide scan.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[
+        {"timestamp": bar, "gamma_flip": Decimal("600.5"),
+         "call_wall": None, "put_wall": None, "max_pain": None,
+         "pin_strike": None, "pin_confidence": None,
+         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5"),
+                      "call_gex": Decimal("2000.5"), "put_gex": Decimal("-766.0")}]},
+    ])
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    shares = AsyncMock()
+    dbmod.DatabaseManager.get_gex_expiration_shares_for_session = shares
+    with TestClient(app) as client:
+        r = client.get("/api/replay/range?symbol=SPY&date=2026-06-29")
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert "expirations" not in body
+    s0 = body["frames"][0]["strikes"][0]
+    assert "call_shares" not in s0 and "put_shares" not in s0
+    # Not merely absent from the payload — never queried at all.
+    shares.assert_not_awaited()
+
+
+def test_range_attaches_expiration_shares_when_requested(monkeypatch):
+    """include_expirations=true adds the legend + per-strike shares.
+
+    Shares only SUBDIVIDE the call/put totals, so the aggregate bar values must
+    come back byte-identical to the default response.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[
+        {"timestamp": bar, "gamma_flip": Decimal("600.5"),
+         "call_wall": None, "put_wall": None, "max_pain": None,
+         "pin_strike": None, "pin_confidence": None,
+         "strikes": [
+             {"strike": Decimal("600"), "net_gex": Decimal("1234.5"),
+              "call_gex": Decimal("2000.5"), "put_gex": Decimal("-766.0")},
+             # A strike the shares lookup doesn't cover — must degrade to a
+             # plain bar rather than dropping out of the ladder.
+             {"strike": Decimal("605"), "net_gex": Decimal("10.0"),
+              "call_gex": Decimal("10.0"), "put_gex": Decimal("0.0")},
+         ]},
+    ])
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    dbmod.DatabaseManager.get_gex_expiration_shares_for_session = AsyncMock(return_value={
+        "expirations": ["2026-06-29", "2026-07-17"],
+        "far_bucket": True,
+        "rows": {(bar, 600.0): {"call": [0.6, 0.3, 0.1], "put": [0.5, 0.5, 0.0]}},
+    })
+    with TestClient(app) as client:
+        r = client.get(
+            "/api/replay/range?symbol=SPY&date=2026-06-29&include_expirations=true"
+        )
+    body = r.json()
+    assert r.status_code == 200, r.text
+    # Legend is nearest-first with the catch-all bucket last, so ranking by
+    # position puts the faintest shade on the furthest expirations.
+    assert body["expirations"] == ["2026-06-29", "2026-07-17", "far"]
+    s0, s1 = body["frames"][0]["strikes"]
+    assert s0["call_shares"] == [0.6, 0.3, 0.1]
+    assert sum(s0["call_shares"]) == pytest.approx(1.0)
+    assert s0["put_shares"] == [0.5, 0.5, 0.0]
+    # Totals untouched by the split.
+    assert s0["call_gex"] == pytest.approx(2000.5)
+    assert s0["net_gex"] == pytest.approx(1234.5)
+    # Uncovered strike keeps its bar, just without a split.
+    assert s1["strike"] == pytest.approx(605.0)
+    assert "call_shares" not in s1 and "put_shares" not in s1
+
+
+def test_range_survives_a_failed_shares_lookup(monkeypatch):
+    """A shares fetch that returns nothing degrades to plain bars.
+
+    ``get_gex_expiration_shares_for_session`` swallows its own errors and
+    returns empty structures; the replay payload must still render.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[
+        {"timestamp": bar, "gamma_flip": None,
+         "call_wall": None, "put_wall": None, "max_pain": None,
+         "pin_strike": None, "pin_confidence": None,
+         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5"),
+                      "call_gex": Decimal("2000.5"), "put_gex": Decimal("-766.0")}]},
+    ])
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    dbmod.DatabaseManager.get_gex_expiration_shares_for_session = AsyncMock(
+        return_value={"expirations": [], "far_bucket": False, "rows": {}}
+    )
+    with TestClient(app) as client:
+        r = client.get(
+            "/api/replay/range?symbol=SPY&date=2026-06-29&include_expirations=true"
+        )
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert body["expirations"] == []
+    assert body["frames"][0]["strikes"][0]["net_gex"] == pytest.approx(1234.5)
+    assert "call_shares" not in body["frames"][0]["strikes"][0]

@@ -69,6 +69,18 @@ def _f(value: Any) -> float | None:
         return None
 
 
+def _iso_date(value: Any) -> str | None:
+    """DATE/`datetime` column → "YYYY-MM-DD", or None when absent."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value)
+    return text[:10] if len(text) >= 10 else text
+
+
 def _shape_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
     """gex_summary row → frame headline dict."""
     if row is None:
@@ -99,6 +111,12 @@ def _shape_strikes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
             "strike": _f(r.get("strike")),
+            # ``gex_by_strike`` is keyed per (strike, expiration), so a strike
+            # appears once per expiration and the query already returns the
+            # column — it was simply dropped here. Carrying it lets the snapshot
+            # chart colour-grade each strike's bar by time-to-expiry (nearest
+            # expiration boldest) instead of only summing the rows together.
+            "expiration": _iso_date(r.get("expiration")),
             "call_gex": _f(r.get("call_gex")),
             "put_gex": _f(r.get("put_gex")),
             "net_gex": _f(r.get("net_gex")),
@@ -106,6 +124,32 @@ def _shape_strikes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for r in rows
     ]
+
+
+def _shape_range_strike(
+    row: dict[str, Any], shares: dict[str, list[float]] | None
+) -> dict[str, Any]:
+    """One ``/range`` strike bar, optionally carrying its expiration mix.
+
+    ``call_shares`` / ``put_shares`` are fractions summing to 1, aligned
+    positionally to the response's top-level ``expirations`` legend. They only
+    SUBDIVIDE ``call_gex`` / ``put_gex``; the totals are unchanged, so a client
+    that ignores them renders exactly what it always has. Omitted entirely when
+    a side has no expiration breakdown at this strike (the client then draws a
+    single solid bar for that side).
+    """
+    out = {
+        "strike": _f(row.get("strike")),
+        "net_gex": _f(row.get("net_gex")),
+        "call_gex": _f(row.get("call_gex")),
+        "put_gex": _f(row.get("put_gex")),
+    }
+    if shares:
+        if shares.get("call"):
+            out["call_shares"] = shares["call"]
+        if shares.get("put"):
+            out["put_shares"] = shares["put"]
+    return out
 
 
 def _shape_candle(row: dict[str, Any]) -> dict[str, Any]:
@@ -195,6 +239,15 @@ async def get_replay_range(
     ),
     timeframe: str = Query(default="1min", pattern="^(1min|5min|15min)$"),
     strike_band_pct: float = Query(default=0.04, ge=0.005, le=0.10),
+    include_expirations: bool = Query(
+        default=False,
+        description=(
+            "Attach the per-strike expiration mix (shares) so a client can "
+            "colour-grade each bar by time-to-expiry. Off by default: it is a "
+            "second session-wide scan and it grows the payload."
+        ),
+    ),
+    max_expirations: int = Query(default=6, ge=1, le=12),
     db: DatabaseManager = Depends(get_db),
 ):
     """All replay frames for one session — bundled for the playhead buffer.
@@ -212,6 +265,17 @@ async def get_replay_range(
     ``timeframe`` is accepted but currently ignored: we always return
     1-min frames. 5-min / 15-min down-sampling is a v2 optimization
     when payload size becomes a real problem.
+
+    ``include_expirations`` opts into the per-strike expiration mix that
+    drives the scrubber's expiry colour gradient. Each strike then also
+    carries ``call_shares`` / ``put_shares`` — fractions summing to 1,
+    aligned positionally to the response's top-level ``expirations`` legend
+    (nearest-first, with a trailing "far" slot when the chain runs deeper
+    than ``max_expirations``). Shares only ever SUBDIVIDE the call/put totals
+    already in the payload, so a client that ignores them renders exactly what
+    it renders today. Off by default because it costs a second session-wide
+    scan and grows the bundle; callers that only need the aggregate ladder
+    (e.g. the pair-comparison scrubber) should leave it off.
     """
     sym = symbol.upper()
     target = _parse_date(session_date)
@@ -222,6 +286,20 @@ async def get_replay_range(
         sym, target, strike_band_pct=strike_band_pct,
     )
     raw_candles = await db.get_underlying_candles_for_session(sym, target)
+
+    # Per-(minute, strike) expiration mix for the expiry colour gradient. Kept
+    # as a SEPARATE lookup rather than folded into the frames query so the
+    # aggregate ladder above is byte-for-byte what it has always been — an
+    # empty / failed shares fetch simply means the client draws plain bars.
+    exp_mix: dict[str, Any] = {"expirations": [], "far_bucket": False, "rows": {}}
+    if include_expirations:
+        exp_mix = await db.get_gex_expiration_shares_for_session(
+            sym,
+            target,
+            strike_band_pct=strike_band_pct,
+            max_expirations=max_expirations,
+        )
+    share_rows = exp_mix.get("rows") or {}
 
     frames = [
         {
@@ -252,19 +330,14 @@ async def get_replay_range(
             # like the Strike Profile chart; they're null on rows too old to
             # carry the gamma columns, and the frontend falls back to Net-only.
             "strikes": [
-                {
-                    "strike": _f(s.get("strike")),
-                    "net_gex": _f(s.get("net_gex")),
-                    "call_gex": _f(s.get("call_gex")),
-                    "put_gex": _f(s.get("put_gex")),
-                }
+                _shape_range_strike(s, share_rows.get((bar["timestamp"], _f(s.get("strike")))))
                 for s in (bar.get("strikes") or [])
             ],
         }
         for bar in raw_frames
     ]
     candles = [_shape_candle(row) for row in raw_candles]
-    return {
+    payload: dict[str, Any] = {
         "symbol": sym,
         "date": target.isoformat(),
         "timeframe": timeframe,
@@ -273,6 +346,17 @@ async def get_replay_range(
         "frames": frames,
         "candles": candles,
     }
+    if include_expirations:
+        # Nearest-first legend the per-strike share arrays index into. The
+        # trailing "far" label (present only when the chain runs deeper than
+        # max_expirations) is a catch-all bucket, not a date — clients rank by
+        # position, so it always sorts last, which is exactly where the faintest
+        # shade belongs.
+        legend = list(exp_mix.get("expirations") or [])
+        if exp_mix.get("far_bucket"):
+            legend.append("far")
+        payload["expirations"] = legend
+    return payload
 
 
 @router.get("/diff")

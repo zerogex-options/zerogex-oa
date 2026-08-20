@@ -2466,6 +2466,173 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             return []
 
+    async def get_gex_expiration_shares_for_session(
+        self,
+        symbol: str,
+        session_date: date,
+        strike_band_pct: float = 0.04,
+        max_expirations: int = 6,
+    ) -> Dict[str, Any]:
+        """Per-(minute, strike) expiration MIX for one session, as shares.
+
+        Powers the replay scrubber's expiry colour gradient (nearest
+        expiration boldest, fanning out to the faintest on the furthest) —
+        the same ramp the GEX Strike Profile and the Gamma Chart's rail draw.
+
+        Deliberately returns SHARES (fractions in 0..1 that sum to 1 per side),
+        not magnitudes. ``get_gex_frames_for_session`` already ships the
+        authoritative per-strike call/put/net totals; the renderer only needs
+        to know how to *subdivide* a bar it already has. Shares are ~4 bytes
+        each, they compress, and — more importantly — a bar can never be
+        distorted by this data: the segments always sum back to the real total.
+
+        Bounded two ways so a whole-session bundle stays shippable:
+        ``strike_band_pct`` mirrors ``get_gex_frames_for_session`` exactly (so
+        the strike sets agree), and only the ``max_expirations`` nearest
+        expirations get their own slot — everything further out folds into a
+        single trailing "far" bucket. A SPX session carries ~15-20 live
+        expirations; without the cap every strike-minute would carry that many
+        floats per side.
+
+        Returns ``{"expirations": [...], "far_bucket": bool, "rows": {...}}``
+        where ``expirations`` is the nearest-first legend (dates as
+        "YYYY-MM-DD"), ``far_bucket`` says whether a trailing catch-all slot
+        exists, and ``rows`` maps ``(timestamp, strike)`` to per-side share
+        lists aligned positionally to that legend.
+
+        Returns empty structures on any error so the caller can degrade to
+        plain aggregate bars instead of failing the whole replay payload.
+        """
+        et = ZoneInfo("America/New_York")
+        utc = ZoneInfo("UTC")
+        start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
+        end_et = datetime.combine(session_date, time(16, 1), tzinfo=et)
+        start_utc = start_et.astimezone(utc)
+        end_utc = end_et.astimezone(utc)
+
+        empty: Dict[str, Any] = {"expirations": [], "far_bucket": False, "rows": {}}
+
+        # Shares are scale-free: call_gex is call_gamma × 100 × spot² × 0.01 and
+        # that factor is identical for every expiration at a given minute, so a
+        # share of call_gamma IS a share of call_gex. No spot join needed here —
+        # session_spot is only used to reproduce the strike band.
+        #
+        # LEAST(rn, cap + 1) folds every expiration past the cap into one slot,
+        # so PG aggregates down to <= cap + 1 rows per (minute, strike) instead
+        # of one per expiration.
+        query = """
+            WITH session_spot AS (
+                SELECT close::numeric AS spot_close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp < $3
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            session_exps AS (
+                SELECT expiration,
+                       ROW_NUMBER() OVER (ORDER BY expiration ASC) AS rn
+                FROM (
+                    SELECT DISTINCT expiration
+                    FROM gex_by_strike
+                    WHERE underlying = $1
+                      AND timestamp >= $2
+                      AND timestamp < $3
+                      AND expiration >= $5
+                ) e
+            )
+            SELECT
+                gbs.timestamp,
+                gbs.strike,
+                LEAST(se.rn, $6 + 1) AS slot,
+                SUM(ABS(gbs.call_gamma)) AS call_mag,
+                SUM(ABS(gbs.put_gamma)) AS put_mag
+            FROM gex_by_strike gbs
+            JOIN session_exps se ON se.expiration = gbs.expiration
+            WHERE gbs.underlying = $1
+              AND gbs.timestamp >= $2
+              AND gbs.timestamp < $3
+              AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
+                  <= (SELECT spot_close FROM session_spot) * $4
+            GROUP BY gbs.timestamp, gbs.strike, LEAST(se.rn, $6 + 1)
+            ORDER BY gbs.timestamp ASC, gbs.strike ASC
+        """
+
+        exps_query = """
+            SELECT DISTINCT expiration
+            FROM gex_by_strike
+            WHERE underlying = $1
+              AND timestamp >= $2
+              AND timestamp < $3
+              AND expiration >= $4
+            ORDER BY expiration ASC
+        """
+
+        cap = max(1, int(max_expirations))
+        try:
+            async with self._acquire_connection() as conn:
+                exp_rows = await conn.fetch(
+                    exps_query, symbol, start_utc, end_utc, session_date
+                )
+                if not exp_rows:
+                    return empty
+                all_exps = [r["expiration"] for r in exp_rows]
+                rows = await conn.fetch(
+                    query,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                    float(strike_band_pct),
+                    session_date,
+                    cap,
+                )
+        except Exception as e:
+            logger.warning(
+                "get_gex_expiration_shares_for_session(%s, %s) failed: %s",
+                symbol,
+                session_date,
+                e,
+            )
+            return empty
+
+        legend = [d.isoformat() for d in all_exps[:cap]]
+        far_bucket = len(all_exps) > cap
+        slot_count = len(legend) + (1 if far_bucket else 0)
+        if slot_count <= 0:
+            return empty
+
+        # (timestamp, strike) -> per-slot magnitudes, then normalised to shares.
+        by_key: Dict[tuple, Dict[str, List[float]]] = {}
+        for r in rows:
+            slot = int(r["slot"])
+            if slot < 1 or slot > slot_count:
+                continue
+            key = (r["timestamp"], float(r["strike"]))
+            cell = by_key.get(key)
+            if cell is None:
+                cell = {
+                    "call": [0.0] * slot_count,
+                    "put": [0.0] * slot_count,
+                }
+                by_key[key] = cell
+            cell["call"][slot - 1] += float(r["call_mag"] or 0.0)
+            cell["put"][slot - 1] += float(r["put_mag"] or 0.0)
+
+        def _shares(mags: List[float]) -> List[float]:
+            total = sum(mags)
+            if total <= 0:
+                return []
+            # 4dp keeps a 1-in-10k segment visible while staying short on the
+            # wire; the renderer re-normalises anyway.
+            return [round(m / total, 4) for m in mags]
+
+        out_rows = {
+            key: {"call": _shares(cell["call"]), "put": _shares(cell["put"])}
+            for key, cell in by_key.items()
+        }
+        return {"expirations": legend, "far_bucket": far_bucket, "rows": out_rows}
+
     async def get_replay_session_dates(self, symbol: str, limit: int = 30) -> List[Dict[str, Any]]:
         """Distinct trading dates that have ``gex_summary`` rows, newest first.
 

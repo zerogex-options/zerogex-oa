@@ -92,6 +92,11 @@ def schema_db():
         for table in _TABLES:
             col_defs = ", ".join(f'"{c}"' for c in _columns_of(table))
             conn.execute(f"CREATE TABLE {table} ({col_defs})")
+        # Postgres scalar SQLite has no equivalent for. Registering it keeps
+        # this a *column-resolution* test: without it the prepare step would
+        # fail on the function name and never reach the column references,
+        # which is the only thing this file is here to check.
+        conn.create_function("LEAST", 2, min)
         yield conn
     finally:
         conn.close()
@@ -100,23 +105,49 @@ def schema_db():
 def _prepare(conn: sqlite3.Connection, sql: str) -> None:
     """Run the query against the empty schema mirror.
 
-    asyncpg ``$n`` placeholders are rewritten to SQLite ``?``. With empty
-    tables the query returns zero rows, so only column *resolution* runs —
-    an unknown column raises ``OperationalError`` at prepare time.
+    asyncpg ``$n`` placeholders are rewritten to SQLite ``?`` and Postgres
+    ``::type`` casts are stripped (SQLite has no cast operator and would choke
+    on the colons before ever resolving a column name). With empty tables the
+    query returns zero rows, so only column *resolution* runs — an unknown
+    column raises ``OperationalError`` at prepare time.
     """
     translated = re.sub(r"\$\d+", "?", sql)
+    translated = re.sub(r"::\s*[a-z_][a-z0-9_]*", "", translated)
     conn.execute(translated, [1] * translated.count("?")).fetchall()
 
 
-@pytest.mark.parametrize("method", ["get_gex_summary_at_ts", "get_gex_by_strike_at_ts"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "get_gex_summary_at_ts",
+        "get_gex_by_strike_at_ts",
+        # The expiry-gradient query for the replay scrubber: a second
+        # session-wide read of gex_by_strike, so it names columns on the same
+        # three tables and earns the same guard.
+        "get_gex_expiration_shares_for_session",
+    ],
+)
 def test_replay_at_ts_query_columns_exist(schema_db, method):
-    """Every column the replay at-ts queries name must exist on the tables.
+    """Every column the replay queries name must exist on the tables.
 
     Regression guard for the ``spot_price`` bug: before the fix this raised
     ``no such column: spot_price`` for ``get_gex_summary_at_ts`` and
     ``get_gex_by_strike_at_ts`` alike.
     """
     _prepare(schema_db, _extract_query(method))
+
+
+def test_expiration_shares_query_reads_the_expiration_column(schema_db):
+    """Guard the guard: the gradient query must actually key on expiration.
+
+    The whole feature is "split each bar by time-to-expiry", so a refactor that
+    quietly dropped the expiration dimension would still pass the column-
+    resolution test above (fewer columns always resolve) while silently
+    flattening the gradient back to one bucket.
+    """
+    sql = _extract_query("get_gex_expiration_shares_for_session")
+    assert "expiration" in sql
+    assert "call_gamma" in sql and "put_gamma" in sql
 
 
 def test_schema_mirror_rejects_phantom_gex_summary_spot_price(schema_db):
