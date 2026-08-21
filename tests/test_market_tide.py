@@ -97,7 +97,12 @@ def test_response_contract_accepts_calculator_output():
 
 
 def test_market_tide_endpoint_is_registered_with_response_contract():
+    # Resolve the model from the SAME import that produced ``app``. Several
+    # suites flush ``src.api.*`` from sys.modules to re-import under a
+    # different config, so the module-level ``MarketTideResponse`` above can
+    # be a stale class object with the same name — and this asserts identity.
     from src.api.main import MarketTideWindow, app
+    from src.api.models import MarketTideResponse
 
     route = next(
         route for route in app.routes if getattr(route, "path", None) == "/api/flow/market-tide"
@@ -367,7 +372,10 @@ def test_components_include_every_eligible_symbol():
 
 
 def test_market_tide_history_route_is_registered():
+    # Same-import rule as the route-contract test above: a sys.modules flush
+    # in another suite makes the module-level class a different object.
     from src.api.main import app
+    from src.api.models import MarketTideHistoryResponse
 
     route = next(
         r for r in app.routes if getattr(r, "path", None) == "/api/flow/market-tide/history"

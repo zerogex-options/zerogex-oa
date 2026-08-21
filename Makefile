@@ -1172,6 +1172,47 @@ tw-magnet-backtest: ## Backtest the PutWallMagnetReversal thesis. Vars: SYMBOLS=
 		--days $(or $(DAYS),60) \
 		--min-pctile $(or $(MINPCTILE),90)
 
+# =============================================================================
+# Market-Maker Attributed GEX — RESEARCH ONLY (research/mm_attributed_gex/).
+# Reads the production DB read-only; writes nothing to any production table and
+# changes no production metric.  See docs/design/market-maker-attributed-gex.md.
+# Requires Cboe C1 Open-Close files; MMGEX_FILES points at them.
+# =============================================================================
+MMGEX_PROFILE ?= research_output/cboe_profile.json
+MMGEX_OUT     ?= research_output
+
+.PHONY: mmgex-pipeline-check
+mmgex-pipeline-check: ## MM-GEX: synthetic end-to-end plumbing check (NOT a research result)
+	$(PY) -m research.mm_attributed_gex.cli pipeline-check
+
+.PHONY: mmgex-inspect
+mmgex-inspect: ## MM-GEX: propose a column mapping from a real Cboe file. Vars: MMGEX_FILE=path
+	$(PY) -m research.mm_attributed_gex.cli inspect-cboe $(MMGEX_FILE) --save $(MMGEX_PROFILE)
+
+.PHONY: mmgex-check-load
+mmgex-check-load: ## MM-GEX: parse files and report what came through. Vars: MMGEX_FILES=path MMGEX_PROFILE=path
+	$(PY) -m research.mm_attributed_gex.cli check-load $(MMGEX_FILES) --profile $(MMGEX_PROFILE)
+
+.PHONY: mmgex-reconstruct
+mmgex-reconstruct: ## MM-GEX: build MM inventory + reconciliation report. Vars: MMGEX_FILES=path
+	$(PY) -m research.mm_attributed_gex.cli reconstruct $(MMGEX_FILES) --profile $(MMGEX_PROFILE) --out $(MMGEX_OUT)/mm_inventory.json
+
+.PHONY: mmgex-dataset
+mmgex-dataset: ## MM-GEX: build the side-by-side dataset. Vars: MMGEX_FILES=path START=ISO END=ISO
+	$(PY) -m research.mm_attributed_gex.cli build-dataset $(MMGEX_FILES) \
+		--profile $(MMGEX_PROFILE) \
+		--start $(START) --end $(END) \
+		--out $(MMGEX_OUT)/mm_dataset.jsonl
+
+.PHONY: mmgex-backtest
+mmgex-backtest: ## MM-GEX: run the experiment battery and render the report
+	$(PY) -m research.mm_attributed_gex.cli backtest $(MMGEX_OUT)/mm_dataset.jsonl \
+		--out $(MMGEX_OUT)/mm_report.md
+
+.PHONY: mmgex-test
+mmgex-test: ## MM-GEX: run just the experiment's test suite
+	$(PY) -m pytest tests/ -k mm_attributed --no-cov -q
+
 # `ci` mirrors .github/workflows/ci.yml's bar: black --check and pytest are
 # BLOCKING; flake8 and mypy are ADVISORY (the workflow marks them
 # continue-on-error). The `-` prefix tells make to ignore their exit status so
