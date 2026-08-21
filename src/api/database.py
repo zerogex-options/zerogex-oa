@@ -112,8 +112,31 @@ def _strike_profile_ts_cache_key(
     stored under.  ``exp_filter`` must already be normalised (sorted, de-duped,
     empty collapsed to ``None``) — both callers do that before they get here.
     """
-    scope = ",".join(d.isoformat() for d in exp_filter) if exp_filter else "all"
-    return f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:{scope}"
+    return f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:{_exp_scope(exp_filter)}"
+
+
+def _exp_scope(exp_filter: Optional[List[date]]) -> str:
+    """Canonical expiration-scope fragment shared by both cache keys."""
+    return ",".join(d.isoformat() for d in exp_filter) if exp_filter else "all"
+
+
+def _strike_profile_bucket_cache_key(
+    symbol: str,
+    timeframe: str,
+    exp_filter: Optional[List[date]],
+    bucket_ts: Any,
+) -> str:
+    """Cache key for ONE closed bucket of the rewind-chart series.
+
+    Deliberately has no ``window_units`` in it: a closed bucket's contents do
+    not depend on how wide a window happened to ask for it, so a 78-bucket and
+    a 72-bucket request share the 72 buckets they have in common instead of
+    each paying for its own copy.
+    """
+    return (
+        f"strike_profile_bucket:{symbol}:{timeframe}:"
+        f"{_exp_scope(exp_filter)}:{bucket_ts.isoformat()}"
+    )
 
 
 # Default history depth for component score endpoints. Sized to span the two
@@ -561,6 +584,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # (bisect the endpoint); 24 was measured safe on 2026-08-21.
         self._strike_profile_timeseries_chunk_units: int = max(
             0, _getenv_int("STRIKE_PROFILE_TIMESERIES_CHUNK_UNITS", 0)
+        )
+        # Per-bucket cache TTL.  0 (default) disables per-bucket caching and
+        # every fetch re-reads the whole window.
+        #
+        # Every bucket in the window except the newest is CLOSED: its
+        # representative gex_summary row is fixed, its OHLC is final, and its
+        # per-strike aggregate cannot change.  Only the live bucket moves.  So
+        # a 1 Hz poll of a 78-bucket window re-aggregates 6.5 hours of settled
+        # history every second to learn one new bar.  Caching the closed
+        # buckets turns each poll into a read of the live bucket alone —
+        # O(window) becomes O(1) — and, because the key carries no window
+        # size, windows of different widths share the buckets they overlap on.
+        #
+        # The TTL bounds staleness if analytics ever rewrites history (a
+        # backfill, a replayed session); closed buckets are otherwise
+        # immutable, so it can be generous.  900s is a reasonable start.
+        self._strike_profile_bucket_cache_ttl_seconds: float = _getenv_float(
+            "STRIKE_PROFILE_TIMESERIES_BUCKET_CACHE_TTL_SECONDS", 0.0
         )
         # Fraction of spot used as the /api/gex/heatmap strike half-band
         # (validated + bounded in config). Proportional so the heatmap
@@ -3604,7 +3645,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             return []
 
-    async def _fetch_strike_profile_chunked(
+    async def _fetch_strike_profile_assembled(
         self,
         symbol: str,
         timeframe: str,
@@ -3612,29 +3653,57 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         exp_filter: Optional[List[date]],
         cache_key: str,
         chunk_units: int,
+        bucket_ttl: float,
     ) -> List[Dict[str, Any]]:
-        """Assemble a window from several bucket-aligned reads.
+        """Assemble a window from cached buckets plus the ones still needed.
 
-        The 15 s guard on the full read is per QUERY, so a window whose cost
-        exceeds it can never complete no matter how long the caller waits —
-        and since a timed-out read is not cached, the next poll repeats it.
-        Splitting the SAME window into chunks that each finish converts that
-        into a result: total DB work is unchanged, but it lands, and landing
-        is what populates the cache the rest of the TTL is served from.
+        Two independent savings, either of which can be off:
 
-        Chunks are cut on bucket boundaries taken from
-        ``_strike_profile_bucket_list``, never on wall-clock arithmetic, so a
-        bucket is always read whole — the wall fold builds each bucket's walls
-        from that bucket's own strikes and a split bucket would produce a
-        wrong wall rather than a slow one.
+        * ``bucket_ttl > 0`` serves every CLOSED bucket from cache, so a poll
+          reads only the live bucket instead of re-aggregating the whole
+          window.  This is where O(window) becomes O(1).
+        * ``chunk_units`` splits whatever IS fetched into reads that each fit
+          inside the 15 s guard, so window width never decides whether
+          anything completes.
+
+        Only the newest bucket is treated as live.  Every earlier one has a
+        fixed representative timestamp, final OHLC and a settled per-strike
+        aggregate, so it is safe to reuse; the live bucket is always re-read
+        and never written to the cache, because it is still filling.
+
+        Bucket boundaries come from ``_strike_profile_bucket_list``, never
+        from wall-clock arithmetic, so a bucket is always read whole — the
+        wall fold builds each bucket's walls from that bucket's own strikes
+        and a bucket split across two reads would get a wrong wall.
         """
         buckets = await self._strike_profile_bucket_list(symbol, timeframe, window_units)
         if not buckets:
             return []
 
-        assembled: List[Dict[str, Any]] = []
-        for start in range(0, len(buckets), chunk_units):
-            chunk = buckets[start : start + chunk_units]
+        live_ts = buckets[-1]
+        by_ts: Dict[Any, Dict[str, Any]] = {}
+        missing: List[Any] = []
+        for bucket_ts in buckets:
+            if bucket_ttl > 0 and bucket_ts != live_ts:
+                hit = self._cache_get(
+                    _strike_profile_bucket_cache_key(symbol, timeframe, exp_filter, bucket_ts)
+                )
+                if hit:
+                    # Stored as a 1-element list, not a bare dict: _cache_weight
+                    # scores a dict as a single unit whatever it holds, so a
+                    # bucket cached bare would count 1 against the cache's size
+                    # bound while actually holding a few hundred strikes.
+                    by_ts[bucket_ts] = hit[0]
+                    continue
+            missing.append(bucket_ts)
+
+        # ``missing`` always holds at least the live bucket, which is never
+        # served from cache — so the steady state is one small read, not none.
+        # The guard is belt-and-braces: if that ever stopped being true,
+        # ``step`` would be 0 and ``range`` would raise instead of no-opping.
+        step = chunk_units if chunk_units else len(missing)
+        for start in range(0, len(missing), step) if step else ():
+            chunk = missing[start : start + step]
             part = await self._get_strike_profile_timeseries_uncached(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -3644,23 +3713,49 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             if not part:
                 # The bucket list already established these buckets exist, so
-                # an empty chunk means that chunk did not finish (the read
-                # returns [] on its guard).  Assembling around the hole would
-                # silently drop history from the middle of a chart, which is
-                # worse than failing: fail the window and leave the cache
-                # untouched so the next poll retries cleanly.
+                # an empty result means that read hit its guard.  Assembling
+                # around the hole would silently drop history out of the
+                # MIDDLE of a chart, so fail the window and leave the caches
+                # untouched for a clean retry.
                 logger.warning(
-                    "strike-profile chunked assembly aborted for %s timeframe=%s "
-                    "window=%s: buckets %d-%d of %d returned no rows",
+                    "strike-profile assembly aborted for %s timeframe=%s window=%s: "
+                    "buckets %d-%d of %d returned no rows",
                     symbol,
                     timeframe,
                     window_units,
                     start,
                     start + len(chunk),
-                    len(buckets),
+                    len(missing),
                 )
                 return []
-            assembled.extend(part)
+            for row in part:
+                by_ts[row["timestamp"]] = row
+
+        assembled = [by_ts[b] for b in buckets if b in by_ts]
+        if len(assembled) != len(buckets):
+            # Every bucket the list named should have come back either from
+            # cache or from a read.  Serving a short window would look like a
+            # legitimately shorter session rather than a fault, so refuse.
+            logger.warning(
+                "strike-profile assembly incomplete for %s timeframe=%s window=%s: "
+                "%d of %d buckets resolved",
+                symbol,
+                timeframe,
+                window_units,
+                len(assembled),
+                len(buckets),
+            )
+            return []
+
+        if bucket_ttl > 0:
+            for bucket_ts in buckets[:-1]:  # never the live one
+                row = by_ts.get(bucket_ts)
+                if row is not None:
+                    self._cache_set(
+                        _strike_profile_bucket_cache_key(symbol, timeframe, exp_filter, bucket_ts),
+                        [row],
+                        bucket_ttl,
+                    )
 
         self._cache_set(cache_key, assembled, self._strike_profile_timeseries_cache_ttl_seconds)
         return assembled
@@ -3673,11 +3768,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         exp_filter: Optional[List[date]],
         cache_key: str,
     ) -> List[Dict[str, Any]]:
-        """Pick the single-query or chunked path for one window."""
+        """Pick the single-query or the assembled path for one window."""
         chunk_units = self._strike_profile_timeseries_chunk_units
-        if chunk_units and window_units > chunk_units:
-            return await self._fetch_strike_profile_chunked(
-                symbol, timeframe, window_units, exp_filter, cache_key, chunk_units
+        bucket_ttl = self._strike_profile_bucket_cache_ttl_seconds
+        needs_chunking = bool(chunk_units) and window_units > chunk_units
+        if bucket_ttl > 0 or needs_chunking:
+            return await self._fetch_strike_profile_assembled(
+                symbol,
+                timeframe,
+                window_units,
+                exp_filter,
+                cache_key,
+                chunk_units,
+                bucket_ttl,
             )
         return await self._get_strike_profile_timeseries_uncached(
             symbol=symbol,

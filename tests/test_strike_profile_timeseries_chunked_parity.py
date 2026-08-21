@@ -106,17 +106,20 @@ async def _teardown(conn) -> None:
     await conn.execute("DELETE FROM symbols WHERE symbol = $1", _SYMBOL)
 
 
-async def _fetch(conn, chunk_units, window_units, expirations=None):
+async def _fetch(conn, chunk_units, window_units, expirations=None, bucket_ttl=0.0):
     """Run the endpoint against ``conn`` with a given chunk size.
 
-    Returns ``(result, chunk_subsets)`` — the second is the bucket_subset each
-    underlying read was asked for, so a test can prove chunking really engaged
-    instead of silently falling through to the single-query path.
+    Returns ``(result, chunk_subsets, db)`` — the subsets are the
+    ``bucket_subset`` each underlying read was asked for, so a test can prove
+    chunking really engaged instead of silently falling through to the
+    single-query path; ``db`` is handed back so a test can expire the window
+    entry and exercise the per-bucket path behind it.
     """
     from src.api.database import DatabaseManager
 
     db = DatabaseManager()
     db._strike_profile_timeseries_chunk_units = chunk_units
+    db._strike_profile_bucket_cache_ttl_seconds = bucket_ttl
 
     @asynccontextmanager
     async def _acquire():
@@ -138,7 +141,7 @@ async def _fetch(conn, chunk_units, window_units, expirations=None):
         window_units=window_units,
         expirations=expirations,
     )
-    return result, subsets
+    return result, subsets, db
 
 
 @pytest.mark.skipif(_DSN is None, reason=_SKIP)
@@ -150,11 +153,11 @@ def test_chunked_assembly_equals_single_query(chunk_units):
         conn = await asyncpg.connect(_DSN)
         try:
             await _seed(conn)
-            mono, mono_subsets = await _fetch(conn, 0, _N_BUCKETS)
+            mono, mono_subsets, _ = await _fetch(conn, 0, _N_BUCKETS)
             assert mono_subsets == [None], "baseline must be the single-query path"
             assert len(mono) == _N_BUCKETS
 
-            chunked, subsets = await _fetch(conn, chunk_units, _N_BUCKETS)
+            chunked, subsets, _ = await _fetch(conn, chunk_units, _N_BUCKETS)
 
             # chunking actually happened, on the expected boundaries
             expected_chunks = -(-_N_BUCKETS // chunk_units)
@@ -184,8 +187,8 @@ def test_chunked_parity_holds_with_an_expiration_filter():
         conn = await asyncpg.connect(_DSN)
         try:
             await _seed(conn)
-            mono, _ = await _fetch(conn, 0, _N_BUCKETS, expirations=[_E0])
-            chunked, subsets = await _fetch(conn, 5, _N_BUCKETS, expirations=[_E0])
+            mono, _, _ = await _fetch(conn, 0, _N_BUCKETS, expirations=[_E0])
+            chunked, subsets, _ = await _fetch(conn, 5, _N_BUCKETS, expirations=[_E0])
             assert len(subsets) == 3
             assert chunked == mono
             assert len(chunked) == _N_BUCKETS
@@ -214,11 +217,100 @@ def test_chunked_parity_holds_for_a_cash_index():
         try:
             await _seed(conn)
             with patch.object(database_module, "is_cash_index", lambda s: s == _SYMBOL):
-                mono, _ = await _fetch(conn, 0, _N_BUCKETS)
-                chunked, subsets = await _fetch(conn, 5, _N_BUCKETS)
+                mono, _, _ = await _fetch(conn, 0, _N_BUCKETS)
+                chunked, subsets, _ = await _fetch(conn, 5, _N_BUCKETS)
             assert len(mono) == _N_BUCKETS, "session filter dropped the seeded buckets"
             assert len(subsets) == 3
             assert chunked == mono
+        finally:
+            await _teardown(conn)
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.skipif(_DSN is None, reason=_SKIP)
+def test_per_bucket_cache_returns_the_same_window_cold_and_warm():
+    """Serving closed buckets from cache must not change a single value.
+
+    The warm pass re-reads only the live bucket and takes the other eleven
+    from cache, so this is where a stale, mis-keyed or mis-ordered bucket
+    would show up as a chart that quietly differs from the uncached truth.
+    """
+    import asyncpg
+
+    from src.api.database import _strike_profile_ts_cache_key
+
+    async def _run():
+        conn = await asyncpg.connect(_DSN)
+        try:
+            await _seed(conn)
+            mono, _, _ = await _fetch(conn, 0, _N_BUCKETS)
+
+            cold, subsets, db = await _fetch(conn, 0, _N_BUCKETS, bucket_ttl=900.0)
+            assert cold == mono
+            # cold pass: nothing cached yet, so it reads every bucket
+            assert [len(s) for s in subsets] == [_N_BUCKETS]
+
+            # Expire the short-lived WINDOW entry, keep the long-lived bucket
+            # ones — the steady state a 1 Hz poll actually lands in.
+            db._cache_drop(_strike_profile_ts_cache_key(_SYMBOL, "5min", _N_BUCKETS, None))
+
+            subsets.clear()
+            warm = await db.get_strike_profile_timeseries(
+                symbol=_SYMBOL, timeframe="5min", window_units=_N_BUCKETS
+            )
+            assert warm == mono, "warm assembly diverged from the uncached window"
+            # and it cost exactly one bucket, not the window
+            assert [len(s) for s in subsets] == [1]
+        finally:
+            await _teardown(conn)
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.skipif(_DSN is None, reason=_SKIP)
+def test_the_live_bucket_is_never_served_stale():
+    """The one invariant per-bucket caching can break.
+
+    Closed buckets are reused across polls, so the whole scheme rests on the
+    newest bucket — the only one still filling — being re-read every time. A
+    parity check against static data cannot see this: both passes would agree
+    while quietly serving a frozen last bar, which on a live chart is the bar
+    the trader is actually watching. So mutate the live bucket between passes
+    and require the warm result to move with it, while a closed bucket does
+    not.
+    """
+    import asyncpg
+
+    from src.api.database import _strike_profile_ts_cache_key
+
+    async def _run():
+        conn = await asyncpg.connect(_DSN)
+        try:
+            await _seed(conn)
+            cold, _, db = await _fetch(conn, 0, _N_BUCKETS, bucket_ttl=900.0)
+            live_before = cold[-1]["strikes"][0]["call_gamma"]
+            closed_before = cold[0]["strikes"][0]["call_gamma"]
+
+            # New gamma lands in the newest bucket, as it would intraday.
+            await conn.execute(
+                "UPDATE gex_by_strike SET call_gamma = call_gamma * 3 "
+                "WHERE underlying = $1 AND timestamp = $2",
+                _SYMBOL,
+                _REP[-1],
+            )
+            db._cache_drop(_strike_profile_ts_cache_key(_SYMBOL, "5min", _N_BUCKETS, None))
+
+            warm = await db.get_strike_profile_timeseries(
+                symbol=_SYMBOL, timeframe="5min", window_units=_N_BUCKETS
+            )
+            assert (
+                warm[-1]["strikes"][0]["call_gamma"] != live_before
+            ), "live bucket was served from cache — the newest bar is frozen"
+            assert warm[0]["strikes"][0]["call_gamma"] == closed_before
+            assert len(warm) == _N_BUCKETS
         finally:
             await _teardown(conn)
             await conn.close()

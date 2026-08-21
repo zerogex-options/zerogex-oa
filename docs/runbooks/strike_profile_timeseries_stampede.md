@@ -160,6 +160,7 @@ not fit inside the read's 15 s guard. Chunking removes that constraint:
 
 ```
 STRIKE_PROFILE_TIMESERIES_CHUNK_UNITS=24
+STRIKE_PROFILE_TIMESERIES_BUCKET_CACHE_TTL_SECONDS=900
 STRIKE_PROFILE_TIMESERIES_MAX_WINDOW_UNITS=480
 ```
 
@@ -187,33 +188,50 @@ a cold fetch per TTL on 2 vCPU. Raise `CACHE_TTL_SECONDS` before reaching for
 an instance resize — at 5 min buckets a 30 s TTL is far shorter than the data
 actually changes.
 
-## The remaining inefficiency
+## Why the full window is affordable again
 
-Chunking makes the window *reachable*; it does not make it *cheap*. Every
-cold fetch still recomputes the entire window when only the newest bucket can
-have changed — at `window_units=78` and 5 min buckets, that is 6.5 hours of
-settled, immutable history re-aggregated on every cache miss.
+Per-bucket caching is what makes a wide window cheap rather than merely
+reachable. Every bucket except the newest is closed — fixed representative
+timestamp, final OHLC, settled per-strike aggregate — so re-aggregating them
+on every poll is pure waste. With
+`STRIKE_PROFILE_TIMESERIES_BUCKET_CACHE_TTL_SECONDS` set, a poll reads the
+live bucket and takes the rest from memory: O(window) becomes O(1).
 
-Three changes are in place, each doing a different job:
+The bucket key carries no window size, so windows of different widths share
+the buckets they overlap on instead of each paying for a private copy.
 
-* **Single-flight** (`DatabaseManager._single_flight`, 1ff3f5a) collapses
-  concurrent callers on one key to a single read. Confirmed working in
-  production — a follower was observed joining an in-flight read and
-  returning in 4.6 s having done no DB work. It only dedupes *identical*
-  keys, and the frontend polls at least five distinct ones.
-* **The window cap** (1d8eb15) keeps a single query inside the ceiling.
-  Superseded in practice by chunking; keep it as the incident tourniquet.
-* **Chunking** removes window size as the thing that decides whether a query
-  completes.
+**The live bucket is never cached and always re-read.** That is the invariant
+the whole scheme rests on — a cached live bucket freezes the newest bar,
+which is the one a trader is actually watching, and a parity check against
+static data cannot see it. `test_the_live_bucket_is_never_served_stale`
+mutates the newest bucket between passes specifically to catch that.
 
-What is left is per-bucket caching: cache each *closed* bucket under
-`spt:{symbol}:{timeframe}:{scope}:{bucket_ts}` with a long TTL — they are
-immutable — then assemble a response from cached buckets and query only the
-live one. Cost per poll goes O(window) → O(1), and window fragmentation
-disappears, since a 78-bucket and a 72-bucket request would share 72 entries.
+Three dials, three different jobs:
 
-The piece that used to block this is now built: `_strike_profile_bucket_list`
-already returns the window's bucket timestamps cheaply (gex_summary only), and
-the read already accepts an explicit `bucket_subset`. Per-bucket caching is
-therefore a caching layer over machinery that exists, not another SQL rewrite
-— fetch only the missing buckets instead of every chunk.
+* **Chunking** — decides whether a query *completes* (window size vs the 15 s
+  guard).
+* **Per-bucket TTL** — decides what a poll *costs* once it does.
+* **The cap** — the incident tourniquet. Leave it at 480 in normal operation.
+
+## Historical: how it got here
+
+Four changes, in the order they landed, each fixing something the previous
+one did not:
+
+1. **Single-flight** (`DatabaseManager._single_flight`, 1ff3f5a) — collapses
+   concurrent callers on one key to a single read. Confirmed in production: a
+   follower was observed joining an in-flight read and returning in 4.6 s
+   having done no DB work of its own. Not sufficient alone, for two reasons
+   worth remembering: it only dedupes *identical* keys (the frontend polls at
+   least five distinct ones), and removing duplicate work cannot make one
+   over-budget query cheaper.
+2. **The window cap** (1d8eb15) — the tourniquet that got charts rendering
+   the same afternoon, at reduced history depth.
+3. **Chunking** (d0016dc) — removes window size as the thing that decides
+   whether a query completes, which is what allowed the cap to come back off.
+4. **Per-bucket caching** — removes the per-poll cost, which is what makes a
+   full-session window affordable rather than merely possible.
+
+The measurements that drove each step are in the sections above; the short
+version is that the first three make the read *land* and only the fourth
+makes it *cheap*.
