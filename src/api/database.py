@@ -2456,8 +2456,53 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         Returns ``{"timestamp", "spot", "rows"}``; ``rows`` is empty when the
         symbol has no snapshot at or before ``at_ts``.
+
+        Cached and single-flighted, on the pattern the strike-profile read
+        established after the Aug-21 stampede (see
+        docs/runbooks/strike_profile_timeseries_stampede.md).  This one is a
+        smaller query, but it is called THREE times per Gamma Shift page view
+        (the regime-shift card reads two snapshots, the roll-off panel a
+        third) by every viewer on a poll — so uncoalesced it reproduces the
+        same shape of duplicate concurrent work on a new endpoint.
+
+        The cache key floors ``at_ts`` to the minute.  That is what makes the
+        guard effective at all: live callers pass ``datetime.now()``, which is
+        unique per request and would key every caller separately, so nothing
+        would ever share.  Flooring is well-matched to the data — ``gex_summary``
+        is written per minute and the query anchors at-or-before — and the
+        payload carries the resolved ``timestamp``, so a caller always knows
+        exactly which frame it got rather than being silently handed a stale
+        one.  Historical anchors (the "vs yesterday" A-snapshot every viewer
+        reads identically) are already minute-stable and cache outright.
         """
         symbol = symbol.upper()
+        max_rows = int(max_rows)
+        cache_key = (
+            f"gex_chain_at_ts:{symbol}:"
+            f"{at_ts.replace(second=0, microsecond=0).isoformat()}:{max_rows}"
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+        return await self._single_flight(
+            cache_key,
+            lambda: self._fetch_gex_chain_at_ts(symbol, at_ts, max_rows, cache_key),
+        )
+
+    async def _fetch_gex_chain_at_ts(
+        self,
+        symbol: str,
+        at_ts: datetime,
+        max_rows: int,
+        cache_key: str,
+    ) -> Dict[str, Any]:
+        """The uncoalesced read behind :meth:`get_gex_chain_at_ts`.
+
+        Split out so the guard wraps exactly one producer.  A failed or empty
+        read is deliberately NOT cached: a transient timeout must not pin an
+        empty chain for the whole TTL, which would turn one slow query into a
+        blank card for every viewer — the failure mode the runbook describes.
+        """
         query = """
             WITH anchor AS (
                 SELECT timestamp
@@ -2500,7 +2545,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, at_ts, int(max_rows))
+                rows = await conn.fetch(query, symbol, at_ts, max_rows)
         except Exception as e:
             logger.warning("get_gex_chain_at_ts(%s, %s) failed: %s", symbol, at_ts, e)
             return {"timestamp": None, "spot": None, "rows": []}
@@ -2508,11 +2553,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if not rows:
             return {"timestamp": None, "spot": None, "rows": []}
         first = rows[0]
-        return {
+        payload = {
             "timestamp": first["timestamp"],
             "spot": float(first["spot_price"]) if first["spot_price"] is not None else None,
             "rows": [dict(r) for r in rows],
         }
+        # NOTE on sizing: _cache_weight only walks lists/tuples, so this dict
+        # payload counts as one unit however many rows it holds — it does not
+        # pay its true weight against the shared unit budget.  What bounds it
+        # instead is the TTL: at ANALYTICS_CACHE_TTL_SECONDS (5s default) an
+        # entry lives seconds, and the key space is (symbol x minute), so only
+        # a handful are ever live at once.  Worth knowing if this TTL is ever
+        # raised substantially — then the payload should be weighed properly
+        # rather than leaning on expiry.
+        self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+        return payload
 
     async def get_regime_sessions(
         self,
