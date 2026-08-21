@@ -61,6 +61,7 @@ from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
+from .routers.gamma_shift import router as gamma_shift_router
 from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
 from .routers.forecast import router as forecast_router
@@ -458,6 +459,10 @@ app.include_router(vol_surface_router, dependencies=[_scope_gex])
 # vol surface.
 app.include_router(premium_surface_router, dependencies=[_scope_gex])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
+# Gamma Regime Shift — the derivative of the dealer-gamma surface (what
+# CHANGED between two snapshots, what expires next, and the classified read
+# stored per session). Same derived-GEX scope as the surfaces it differences.
+app.include_router(gamma_shift_router, dependencies=[_scope_gex])
 # Raw market data routers — per-contract option history (option_contract)
 # and the option-calculator (which embeds raw contract prices). Gated
 # behind MARKET_RAW so they are excluded from derived-only tiers.

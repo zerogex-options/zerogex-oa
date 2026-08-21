@@ -2938,3 +2938,126 @@ CREATE TRIGGER forecast_calibration_state_touch
     BEFORE UPDATE ON forecast_calibration_state
     FOR EACH ROW
     EXECUTE FUNCTION touch_forecast_calibration_state();
+
+-- =============================================================================
+-- Gamma Regime Shift — one stored read per session
+-- =============================================================================
+-- The Gamma Shift page answers "what changed, and what does it mean?".  The
+-- meaning half is two scores (see src/analytics/regime_shift.py):
+--
+--   lean_raw       supportive (+) vs capping (-) — WHERE the change landed
+--                  relative to spot.  A build below spot is a floor; the
+--                  identical build above spot is a ceiling.
+--   stability_raw  vol-suppressing (+) vs vol-amplifying (-) — how much
+--                  dealer gamma NEAR SPOT moved, signed.
+--
+-- Both are stored RAW (dollar GEX per 1%, never clamped) because the z-score
+-- denominator is the trailing standard deviation of these very columns:
+-- storing a normalized value would freeze each row against whatever history
+-- existed the day it was written, and a later backfill could never repair it.
+-- The z / state / magnitude columns alongside them are the read AS OF the
+-- last write, kept for cheap history rendering; anything that needs a
+-- currently-correct z recomputes it from the raw column against the trailing
+-- window.
+--
+-- Grain is one row per (underlying, session_date), upserted through the day
+-- by src/tools/regime_session_refresh.py with the SINCE-OPEN read.  So
+-- today's row always answers "how has today gone so far" and, once the
+-- session closes and the refresh stops finding new data, it freezes into
+-- "what that session was" — which is exactly what the history strip renders.
+-- Backfilling is idempotent: the upsert is keyed on the grain and every
+-- column is recomputed from gex_by_strike / gex_summary, which are immutable
+-- once written.
+--
+-- The rolloff_* columns record how much dealer gamma was sitting in the
+-- nearest expiration at the time of the read.  They live here rather than in
+-- their own table because "is tonight's roll-off large?" is answered by the
+-- percentile of rolloff_share against these same trailing rows — one table,
+-- one trailing window, both questions.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS gex_regime_session (
+    underlying VARCHAR(10) NOT NULL,
+    session_date DATE NOT NULL,
+
+    -- The two snapshots the read differenced.  open_ts is the session-open
+    -- anchor; close_ts is the freshest snapshot at write time (so it walks
+    -- forward through the day and stops at the last one of the session).
+    open_ts TIMESTAMPTZ,
+    close_ts TIMESTAMPTZ,
+    spot_open DOUBLE PRECISION,
+    spot_close DOUBLE PRECISION,
+
+    -- Raw two-axis scores + the unweighted totals behind the headline.
+    lean_raw DOUBLE PRECISION,
+    stability_raw DOUBLE PRECISION,
+    net_shift DOUBLE PRECISION,
+    gross_shift DOUBLE PRECISION,
+    -- Kernel width used, in price units.  Persisted so a read can be audited
+    -- (or recomputed) even after the default changes.
+    sigma_price DOUBLE PRECISION,
+
+    -- The classified read as of the last write.
+    lean_z DOUBLE PRECISION,
+    stability_z DOUBLE PRECISION,
+    magnitude DOUBLE PRECISION,
+    -- FIRMING | CAPPING | FRAGILE_BID | DETERIORATING | QUIET
+    state TEXT,
+    -- 'trailing' once there are enough stored sessions to trust their stdev,
+    -- 'proxy' while bootstrapping off gex_historical_stats, 'none' when
+    -- neither is available (the read then renders without a magnitude claim).
+    normalization TEXT,
+
+    -- Narrowest contiguous strike run carrying most of the change.
+    -- band_resolved is false when the change is too diffuse to name a level;
+    -- consumers must not quote low/high as a band in that case.
+    band_low NUMERIC(12, 4),
+    band_high NUMERIC(12, 4),
+    band_share DOUBLE PRECISION,
+    band_resolved BOOLEAN,
+
+    -- Dealer gamma sitting in the nearest expiration at close_ts.
+    -- rolloff_share is measured on ABSOLUTE gamma: a tranche that nets to
+    -- zero because a call wall offsets a put wall is still a large tranche,
+    -- because all of it leaves at the close.
+    rolloff_expiration DATE,
+    rolloff_net_gex DOUBLE PRECISION,
+    rolloff_abs_gex DOUBLE PRECISION,
+    rolloff_share DOUBLE PRECISION,
+    chain_abs_gex DOUBLE PRECISION,
+
+    -- Levels at both ends, so the history strip can explain a session
+    -- without refetching two frames per row.
+    gamma_flip_open DOUBLE PRECISION,
+    gamma_flip_close DOUBLE PRECISION,
+    call_wall_open NUMERIC(12, 4),
+    call_wall_close NUMERIC(12, 4),
+    put_wall_open NUMERIC(12, 4),
+    put_wall_close NUMERIC(12, 4),
+
+    -- Audit of what the diff actually compared.  expired_* is the tranche
+    -- that vanished between the two snapshots and was deliberately EXCLUDED
+    -- from the shift — booking it as a shed is the classic day-over-day GEX
+    -- error and this column is the receipt that we did not.
+    common_expiration_count INTEGER,
+    expired_expiration_count INTEGER,
+    expired_net_gex DOUBLE PRECISION,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, session_date)
+);
+
+-- The history strip and the trailing-sigma window both read
+-- "latest N sessions for one symbol", which this serves as a single
+-- backwards range scan.
+CREATE INDEX IF NOT EXISTS idx_gex_regime_session_symbol_date
+    ON gex_regime_session(underlying, session_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gex_regime_session_underlying') THEN
+        ALTER TABLE gex_regime_session
+        ADD CONSTRAINT fk_gex_regime_session_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;

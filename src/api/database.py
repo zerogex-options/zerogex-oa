@@ -9,7 +9,7 @@ import os
 import time as time_module
 import traceback
 from collections import OrderedDict
-from typing import List, Dict, Optional, Any, Tuple, Iterable
+from typing import List, Dict, Mapping, Optional, Any, Tuple, Iterable
 from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
@@ -2256,6 +2256,234 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 e,
             )
             return []
+
+    async def get_gex_chain_at_ts(
+        self,
+        symbol: str,
+        at_ts: datetime,
+        max_rows: int = 6000,
+    ) -> Dict[str, Any]:
+        """The WHOLE per-(strike, expiration) chain at one historical minute.
+
+        Distinct from :meth:`get_gex_by_strike_at_ts`, which returns the N
+        strikes nearest spot for a chart.  The Gamma Regime Shift needs every
+        row for two reasons the truncated read cannot serve:
+
+        * the expiry roll-off is a sum over ALL expirations, and a
+          nearest-to-spot cut silently drops the far-OTM tail that makes a
+          tranche large;
+        * a day-over-day diff must see the same universe on both sides, and
+          "nearest 60 to spot" is a *different* universe once spot has moved.
+
+        ``max_rows`` is a runaway guard, not a view: a normal chain is
+        ~40-60 strikes x ~10-25 expirations.  Rows come back ordered so a
+        truncated read is still expiration-complete for the near dates.
+
+        Returns ``{"timestamp", "spot", "rows"}``; ``rows`` is empty when the
+        symbol has no snapshot at or before ``at_ts``.
+        """
+        symbol = symbol.upper()
+        query = """
+            WITH anchor AS (
+                SELECT timestamp
+                FROM gex_summary
+                WHERE underlying = $1
+                  AND timestamp <= $2
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            anchor_spot AS (
+                SELECT
+                    a.timestamp,
+                    (SELECT uq.close
+                       FROM underlying_quotes uq
+                      WHERE uq.symbol = $1
+                        AND uq.timestamp <= a.timestamp
+                      ORDER BY uq.timestamp DESC
+                      LIMIT 1) AS spot_price
+                FROM anchor a
+            )
+            SELECT
+                a.timestamp,
+                a.spot_price,
+                g.strike,
+                g.expiration,
+                g.call_oi,
+                g.put_oi,
+                -- Canonical dollar GEX per 1% (γ × OI × 100 × S² × 0.01),
+                -- evaluated at the ANCHOR's spot so the numbers match every
+                -- other surface rendered for that minute.
+                (g.call_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS call_gex,
+                (-1 * g.put_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS put_gex,
+                ((g.call_gamma - g.put_gamma) * 100 * a.spot_price * a.spot_price * 0.01) AS net_gex
+            FROM gex_by_strike g
+            CROSS JOIN anchor_spot a
+            WHERE g.underlying = $1
+              AND g.timestamp = a.timestamp
+            ORDER BY g.expiration ASC, g.strike ASC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, at_ts, int(max_rows))
+        except Exception as e:
+            logger.warning("get_gex_chain_at_ts(%s, %s) failed: %s", symbol, at_ts, e)
+            return {"timestamp": None, "spot": None, "rows": []}
+
+        if not rows:
+            return {"timestamp": None, "spot": None, "rows": []}
+        first = rows[0]
+        return {
+            "timestamp": first["timestamp"],
+            "spot": float(first["spot_price"]) if first["spot_price"] is not None else None,
+            "rows": [dict(r) for r in rows],
+        }
+
+    async def get_regime_sessions(
+        self,
+        symbol: str,
+        limit: int = 60,
+        before_date: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Stored per-session regime reads, most recent first.
+
+        Serves both the history strip and the z-score denominator, so it is
+        deliberately un-cached at the DatabaseManager layer: the current
+        session's row is rewritten through the day and a stale window would
+        pin the normalization to whatever it looked like minutes ago.
+
+        ``before_date`` excludes that in-progress row when the caller is
+        building a *trailing* distribution — a session must not normalize
+        against itself.
+        """
+        symbol = symbol.upper()
+        if before_date is not None:
+            query = """
+                SELECT * FROM gex_regime_session
+                WHERE underlying = $1 AND session_date < $2
+                ORDER BY session_date DESC
+                LIMIT $3
+            """
+            args: tuple[Any, ...] = (symbol, before_date, int(limit))
+        else:
+            query = """
+                SELECT * FROM gex_regime_session
+                WHERE underlying = $1
+                ORDER BY session_date DESC
+                LIMIT $2
+            """
+            args = (symbol, int(limit))
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, *args)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning("get_regime_sessions(%s) failed: %s", symbol, e)
+            return []
+
+    async def upsert_regime_session(self, row: Mapping[str, Any]) -> None:
+        """Write (or rewrite) one session's regime read.
+
+        Idempotent on ``(underlying, session_date)`` — every column is
+        recomputed from immutable ``gex_by_strike`` / ``gex_summary`` history,
+        so re-running the refresh or backfilling over an existing row
+        converges rather than accumulating.
+        """
+        query = """
+            INSERT INTO gex_regime_session (
+                underlying, session_date, open_ts, close_ts, spot_open, spot_close,
+                lean_raw, stability_raw, net_shift, gross_shift, sigma_price,
+                lean_z, stability_z, magnitude, state, normalization,
+                band_low, band_high, band_share, band_resolved,
+                rolloff_expiration, rolloff_net_gex, rolloff_abs_gex, rolloff_share,
+                chain_abs_gex,
+                gamma_flip_open, gamma_flip_close,
+                call_wall_open, call_wall_close, put_wall_open, put_wall_close,
+                common_expiration_count, expired_expiration_count, expired_net_gex
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14, $15, $16,
+                $17, $18, $19, $20,
+                $21, $22, $23, $24,
+                $25,
+                $26, $27,
+                $28, $29, $30, $31,
+                $32, $33, $34
+            )
+            ON CONFLICT (underlying, session_date) DO UPDATE SET
+                open_ts = EXCLUDED.open_ts,
+                close_ts = EXCLUDED.close_ts,
+                spot_open = EXCLUDED.spot_open,
+                spot_close = EXCLUDED.spot_close,
+                lean_raw = EXCLUDED.lean_raw,
+                stability_raw = EXCLUDED.stability_raw,
+                net_shift = EXCLUDED.net_shift,
+                gross_shift = EXCLUDED.gross_shift,
+                sigma_price = EXCLUDED.sigma_price,
+                lean_z = EXCLUDED.lean_z,
+                stability_z = EXCLUDED.stability_z,
+                magnitude = EXCLUDED.magnitude,
+                state = EXCLUDED.state,
+                normalization = EXCLUDED.normalization,
+                band_low = EXCLUDED.band_low,
+                band_high = EXCLUDED.band_high,
+                band_share = EXCLUDED.band_share,
+                band_resolved = EXCLUDED.band_resolved,
+                rolloff_expiration = EXCLUDED.rolloff_expiration,
+                rolloff_net_gex = EXCLUDED.rolloff_net_gex,
+                rolloff_abs_gex = EXCLUDED.rolloff_abs_gex,
+                rolloff_share = EXCLUDED.rolloff_share,
+                chain_abs_gex = EXCLUDED.chain_abs_gex,
+                gamma_flip_open = EXCLUDED.gamma_flip_open,
+                gamma_flip_close = EXCLUDED.gamma_flip_close,
+                call_wall_open = EXCLUDED.call_wall_open,
+                call_wall_close = EXCLUDED.call_wall_close,
+                put_wall_open = EXCLUDED.put_wall_open,
+                put_wall_close = EXCLUDED.put_wall_close,
+                common_expiration_count = EXCLUDED.common_expiration_count,
+                expired_expiration_count = EXCLUDED.expired_expiration_count,
+                expired_net_gex = EXCLUDED.expired_net_gex,
+                updated_at = NOW()
+        """
+        async with self._acquire_connection() as conn:
+            await conn.execute(
+                query,
+                row["underlying"],
+                row["session_date"],
+                row.get("open_ts"),
+                row.get("close_ts"),
+                row.get("spot_open"),
+                row.get("spot_close"),
+                row.get("lean_raw"),
+                row.get("stability_raw"),
+                row.get("net_shift"),
+                row.get("gross_shift"),
+                row.get("sigma_price"),
+                row.get("lean_z"),
+                row.get("stability_z"),
+                row.get("magnitude"),
+                row.get("state"),
+                row.get("normalization"),
+                row.get("band_low"),
+                row.get("band_high"),
+                row.get("band_share"),
+                row.get("band_resolved"),
+                row.get("rolloff_expiration"),
+                row.get("rolloff_net_gex"),
+                row.get("rolloff_abs_gex"),
+                row.get("rolloff_share"),
+                row.get("chain_abs_gex"),
+                row.get("gamma_flip_open"),
+                row.get("gamma_flip_close"),
+                row.get("call_wall_open"),
+                row.get("call_wall_close"),
+                row.get("put_wall_open"),
+                row.get("put_wall_close"),
+                row.get("common_expiration_count"),
+                row.get("expired_expiration_count"),
+                row.get("expired_net_gex"),
+            )
 
     async def get_gex_frames_for_session(
         self,
