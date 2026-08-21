@@ -543,6 +543,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._strike_profile_timeseries_max_window_units: int = max(
             1, _getenv_int("STRIKE_PROFILE_TIMESERIES_MAX_WINDOW_UNITS", 480)
         )
+        # Fetch the window in bucket-aligned chunks of this many buckets
+        # instead of one query.  0 (default) keeps the single-query path
+        # exactly as it was.
+        #
+        # The read's 15 s guard is per QUERY, so a window whose cost exceeds
+        # it can never complete however long you wait — and a timed-out read
+        # is not cached, so nothing ever gets easier.  Splitting the same
+        # window into N queries that each finish converts "never succeeds"
+        # into "succeeds in N round trips": the total DB work is unchanged,
+        # but the result lands and the cache finally populates, after which
+        # the whole TTL window is served from memory.
+        #
+        # This is what lets MAX_WINDOW_UNITS go back up: with chunking on,
+        # the window size no longer decides whether a single query fits
+        # inside the ceiling.  Set it to a value that comfortably completes
+        # (bisect the endpoint); 24 was measured safe on 2026-08-21.
+        self._strike_profile_timeseries_chunk_units: int = max(
+            0, _getenv_int("STRIKE_PROFILE_TIMESERIES_CHUNK_UNITS", 0)
+        )
         # Fraction of spot used as the /api/gex/heatmap strike half-band
         # (validated + bounded in config). Proportional so the heatmap
         # fills the frontend's price-cropped y-axis for any underlying.
@@ -3492,12 +3511,179 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached  # type: ignore[no-any-return]
         return await self._single_flight(
             cache_key,
-            lambda: self._get_strike_profile_timeseries_uncached(
+            lambda: self._fetch_strike_profile_window(
+                symbol=symbol,
+                timeframe=timeframe,
+                window_units=window_units,
+                exp_filter=exp_filter,
+                cache_key=cache_key,
+            ),
+        )
+
+    async def _strike_profile_bucket_list(
+        self,
+        symbol: str,
+        timeframe: str,
+        window_units: int,
+    ) -> List[Any]:
+        """The bucket timestamps a window covers, ascending.
+
+        Reads ``gex_summary`` ONLY — one row per analytics cycle per
+        underlying — so it costs a small fraction of the full read, which
+        LATERAL-probes ``gex_by_strike`` at every one of these timestamps.
+
+        It exists so the chunk driver can split a window on real bucket
+        boundaries instead of deriving them from wall-clock arithmetic, which
+        would go wrong across holidays, half days, and any gap in the feed.
+        Anchoring, the bucket floor and the cash-index session filter all
+        mirror the full read exactly, so this returns the same bucket set that
+        read would surface for the same window.
+        """
+        symbol = symbol.upper()
+        window_units = max(1, min(window_units, 480))
+        bucket = _bucket_expr(timeframe)
+        params: List[Any] = [symbol, window_units]
+        session_latest = ""
+        session_bucketed = ""
+        if is_cash_index(symbol):
+            template = """
+                    AND EXTRACT(DOW FROM {ts} AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND ({ts} AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND ({ts} AT TIME ZONE 'America/New_York')::date <> ALL(${idx}::date[])
+            """
+            params.append(sorted(NYSE_HOLIDAYS))
+            session_latest = template.format(ts="timestamp", idx=len(params))
+            session_bucketed = template.format(ts="gs.timestamp", idx=len(params))
+
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+            extra_filter=session_latest,
+        )
+        query = f"""
+            WITH latest AS (
+                SELECT timestamp AS max_ts
+                FROM gex_summary
+                WHERE underlying = $1{session_latest}
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            bounds AS (
+                SELECT
+                    {bucket_floor} AS start_ts,
+                    max_ts AS end_ts
+                FROM latest
+            )
+            SELECT DISTINCT {bucket} AS bucket_ts
+            FROM gex_summary gs
+            WHERE gs.underlying = $1
+                AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                     AND (SELECT end_ts FROM bounds){session_bucketed}
+            ORDER BY bucket_ts ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(conn, query, *params, timeout=10.0),
+                    timeout=10.0,
+                )
+            return [r["bucket_ts"] for r in rows]
+        except asyncio.TimeoutError:
+            # Far cheaper than the read it plans, so a timeout here means the
+            # instance is in real trouble; say so rather than silently
+            # degrading to an empty chart.
+            logger.warning(
+                "strike-profile bucket list timed out for %s timeframe=%s window=%s",
+                symbol,
+                timeframe,
+                window_units,
+            )
+            return []
+
+    async def _fetch_strike_profile_chunked(
+        self,
+        symbol: str,
+        timeframe: str,
+        window_units: int,
+        exp_filter: Optional[List[date]],
+        cache_key: str,
+        chunk_units: int,
+    ) -> List[Dict[str, Any]]:
+        """Assemble a window from several bucket-aligned reads.
+
+        The 15 s guard on the full read is per QUERY, so a window whose cost
+        exceeds it can never complete no matter how long the caller waits —
+        and since a timed-out read is not cached, the next poll repeats it.
+        Splitting the SAME window into chunks that each finish converts that
+        into a result: total DB work is unchanged, but it lands, and landing
+        is what populates the cache the rest of the TTL is served from.
+
+        Chunks are cut on bucket boundaries taken from
+        ``_strike_profile_bucket_list``, never on wall-clock arithmetic, so a
+        bucket is always read whole — the wall fold builds each bucket's walls
+        from that bucket's own strikes and a split bucket would produce a
+        wrong wall rather than a slow one.
+        """
+        buckets = await self._strike_profile_bucket_list(symbol, timeframe, window_units)
+        if not buckets:
+            return []
+
+        assembled: List[Dict[str, Any]] = []
+        for start in range(0, len(buckets), chunk_units):
+            chunk = buckets[start : start + chunk_units]
+            part = await self._get_strike_profile_timeseries_uncached(
                 symbol=symbol,
                 timeframe=timeframe,
                 window_units=window_units,
                 expirations=exp_filter,
-            ),
+                bucket_subset=chunk,
+            )
+            if not part:
+                # The bucket list already established these buckets exist, so
+                # an empty chunk means that chunk did not finish (the read
+                # returns [] on its guard).  Assembling around the hole would
+                # silently drop history from the middle of a chart, which is
+                # worse than failing: fail the window and leave the cache
+                # untouched so the next poll retries cleanly.
+                logger.warning(
+                    "strike-profile chunked assembly aborted for %s timeframe=%s "
+                    "window=%s: buckets %d-%d of %d returned no rows",
+                    symbol,
+                    timeframe,
+                    window_units,
+                    start,
+                    start + len(chunk),
+                    len(buckets),
+                )
+                return []
+            assembled.extend(part)
+
+        self._cache_set(cache_key, assembled, self._strike_profile_timeseries_cache_ttl_seconds)
+        return assembled
+
+    async def _fetch_strike_profile_window(
+        self,
+        symbol: str,
+        timeframe: str,
+        window_units: int,
+        exp_filter: Optional[List[date]],
+        cache_key: str,
+    ) -> List[Dict[str, Any]]:
+        """Pick the single-query or chunked path for one window."""
+        chunk_units = self._strike_profile_timeseries_chunk_units
+        if chunk_units and window_units > chunk_units:
+            return await self._fetch_strike_profile_chunked(
+                symbol, timeframe, window_units, exp_filter, cache_key, chunk_units
+            )
+        return await self._get_strike_profile_timeseries_uncached(
+            symbol=symbol,
+            timeframe=timeframe,
+            window_units=window_units,
+            expirations=exp_filter,
         )
 
     async def _get_strike_profile_timeseries_uncached(
@@ -3506,6 +3692,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         timeframe: str = "1min",
         window_units: int = 78,
         expirations: Optional[List[date]] = None,
+        bucket_subset: Optional[List[Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
 
@@ -3565,9 +3752,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # have a single canonical shape for "no filter".
         exp_filter: Optional[List[date]] = sorted(set(expirations)) if expirations else None
         cache_key = _strike_profile_ts_cache_key(symbol, timeframe, window_units, exp_filter)
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached  # type: ignore[no-any-return]
+        # ``bucket_subset`` means this call is ONE CHUNK of a larger window
+        # (see ``_fetch_strike_profile_chunked``).  Its result is a slice, not
+        # the window, so it must neither be served from nor written to the
+        # window's cache entry — the chunk driver caches the assembled whole.
+        if bucket_subset is None:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
 
         bucket = _bucket_expr(timeframe)
 
@@ -3587,6 +3779,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             session_filter_latest = session_filter_template.format(ts="timestamp")
             session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
             params.append(sorted(NYSE_HOLIDAYS))
+
+        # Optional chunk restriction.  When the caller wants one slice of a
+        # larger window, pin ``bucket_reps`` to exactly that slice's buckets.
+        #
+        # The filter is on the bucket EXPRESSION rather than a narrowed time
+        # range on purpose: it makes chunk edges exactly bucket-aligned, so a
+        # bucket can never be split across two chunks.  That matters because
+        # the wall fold computes each bucket's call/put walls from that
+        # bucket's OWN strikes — a bucket seen half in one chunk and half in
+        # another would get walls built from a partial strike set, which is
+        # wrong rather than merely slow.
+        #
+        # ``bounds`` is deliberately left alone.  It only narrows the scan;
+        # the expensive part is the LATERAL probe into gex_by_strike, which is
+        # driven by the number of rep_ts rows, and that is what this cuts.
+        bucket_subset_filter = ""
+        if bucket_subset is not None:
+            params.append(list(bucket_subset))
+            bucket_subset_filter = (
+                f"\n                    AND {bucket} = ANY(${len(params)}::timestamptz[])"
+            )
 
         # Bucket-aware window floor — see get_historical_quotes for the
         # rationale.  Cash indices inherit the same session predicate the
@@ -3639,7 +3852,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                     AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
-                                         AND (SELECT end_ts FROM bounds){session_filter_bucketed}
+                                         AND (SELECT end_ts FROM bounds){session_filter_bucketed}{bucket_subset_filter}
                 ORDER BY {bucket}, gs.timestamp DESC
             ),
             -- OHLC bucketed against the SAME bucket expression. Uses the
@@ -3975,9 +4188,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # the window where rows and the finished payload are both live
                 # from spanning the cache write.
                 del rows, pending_inputs
-                self._cache_set(
-                    cache_key, result, self._strike_profile_timeseries_cache_ttl_seconds
-                )
+                if bucket_subset is None:
+                    self._cache_set(
+                        cache_key, result, self._strike_profile_timeseries_cache_ttl_seconds
+                    )
                 return result
         except asyncio.TimeoutError:
             # Carry the full request shape: timeframe and the expiration scope

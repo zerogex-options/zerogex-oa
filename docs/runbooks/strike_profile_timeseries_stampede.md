@@ -153,32 +153,67 @@ without new evidence:
 if `live` is fast and `deep` is slow, the API process is fine and the
 problem is past the DB connection.
 
-## The real fix
+## Raising the cap back
 
-The cap is a tourniquet. The endpoint recomputes the entire window on every
-poll, but only the newest bucket can have changed — at `window_units=78`
-and 5 min buckets, that is 6.5 hours of settled, immutable history
-re-aggregated once per second per client.
+`MAX_WINDOW_UNITS` is low because a single query for the full window could
+not fit inside the read's 15 s guard. Chunking removes that constraint:
 
-Two changes exist and are not enough on their own:
+```
+STRIKE_PROFILE_TIMESERIES_CHUNK_UNITS=24
+STRIKE_PROFILE_TIMESERIES_MAX_WINDOW_UNITS=480
+```
 
-* **Single-flight** (`DatabaseManager._single_flight`, 1ff3f5a) dedupes
-  concurrent callers on one key. It works — followers were observed
-  joining an in-flight read and returning with no DB work — but it only
-  dedupes *identical* keys, and the frontend polls at least five distinct
-  ones (SPX/NDX × 5min/1min × expiration filters).
-* **The window cap** (1d8eb15) keeps each query inside the ceiling so
-  *something* completes and caches.
+The window is then fetched as several bucket-aligned queries that each
+finish, so window size no longer decides whether anything completes. Total DB
+work per *cold* fetch is unchanged — this trades "never succeeds" for
+"succeeds in N round trips" — but the result lands, and landing is what
+populates the cache the rest of the TTL is served from.
 
-The repair is per-bucket caching: cache each closed bucket under
-`spt:{symbol}:{timeframe}:{scope}:{bucket_ts}` with a long TTL (they are
-immutable), then serve a request from cached buckets and query only the
+Chunk edges are cut on real bucket timestamps from
+`_strike_profile_bucket_list`, never wall-clock arithmetic, so a bucket is
+always read whole. Parity with the single-query result is pinned by
+`tests/test_strike_profile_timeseries_chunked_parity.py` (integration-marked;
+covers chunk sizes that divide evenly, leave a remainder, and leave a
+remainder of one, plus the expiration-filter and cash-index parameter-index
+shifts).
+
+**Order of operations.** Turn chunking on first, confirm the endpoint still
+returns a full payload and the warnings stay quiet, then raise the cap — one
+change at a time, so a regression is attributable.
+
+**If it still cannot keep up**, the constraint is throughput, not query size:
+several distinct keys (SPX/NDX x timeframes x expiration filters) each paying
+a cold fetch per TTL on 2 vCPU. Raise `CACHE_TTL_SECONDS` before reaching for
+an instance resize — at 5 min buckets a 30 s TTL is far shorter than the data
+actually changes.
+
+## The remaining inefficiency
+
+Chunking makes the window *reachable*; it does not make it *cheap*. Every
+cold fetch still recomputes the entire window when only the newest bucket can
+have changed — at `window_units=78` and 5 min buckets, that is 6.5 hours of
+settled, immutable history re-aggregated on every cache miss.
+
+Three changes are in place, each doing a different job:
+
+* **Single-flight** (`DatabaseManager._single_flight`, 1ff3f5a) collapses
+  concurrent callers on one key to a single read. Confirmed working in
+  production — a follower was observed joining an in-flight read and
+  returning in 4.6 s having done no DB work. It only dedupes *identical*
+  keys, and the frontend polls at least five distinct ones.
+* **The window cap** (1d8eb15) keeps a single query inside the ceiling.
+  Superseded in practice by chunking; keep it as the incident tourniquet.
+* **Chunking** removes window size as the thing that decides whether a query
+  completes.
+
+What is left is per-bucket caching: cache each *closed* bucket under
+`spt:{symbol}:{timeframe}:{scope}:{bucket_ts}` with a long TTL — they are
+immutable — then assemble a response from cached buckets and query only the
 live one. Cost per poll goes O(window) → O(1), and window fragmentation
-disappears because a 78-bucket and a 72-bucket request share 72 entries.
+disappears, since a 78-bucket and a 72-bucket request would share 72 entries.
 
-It needs the read split into a cheap bucket-list query plus an
-explicit-bucket fetch, preserving the LATERAL fence, the optimisation-fence
-CTEs, and the `ORDER BY` contiguity the wall fold depends on — so it wants
-`tests/test_strike_profile_timeseries_expiration_sum.py` (integration-
-marked, needs a scratch Postgres DSN) run for parity. Not a mid-session
-change.
+The piece that used to block this is now built: `_strike_profile_bucket_list`
+already returns the window's bucket timestamps cheaply (gex_summary only), and
+the read already accepts an explicit `bucket_subset`. Per-bucket caching is
+therefore a caching layer over machinery that exists, not another SQL rewrite
+— fetch only the missing buckets instead of every chunk.

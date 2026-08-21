@@ -71,7 +71,19 @@ RestartSec=10
 # Process management
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=30
+# Long enough for an in-flight request to finish and the worker to exit
+# cleanly. This was 30s, which is SHORTER than the read paths' own guards --
+# /api/gex/strike-profile-timeseries bounds a query at 15s and was routinely
+# observed at 20s+ once pool wait is counted, so every restart under cash-session
+# load hit this timeout and ended in SIGKILL (journal: "Main process exited,
+# code=killed, status=9/KILL" with result 'timeout' -- note that is a STOP
+# timeout, not an OOM, and the two are easy to confuse when reading the log).
+#
+# SIGKILL mid-query is survivable here (reads only, and asyncpg's server-side
+# statement timeout cleans up the backend), but it makes every deploy look like
+# a crash and gives an in-flight write no chance to unwind. 60s clears the
+# slowest bounded read with headroom.
+TimeoutStopSec=60
 SendSIGKILL=yes
 
 # Resource limits

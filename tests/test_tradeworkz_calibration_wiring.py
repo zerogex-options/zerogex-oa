@@ -27,7 +27,15 @@ from src.tradeworkz import engine
 from src.tradeworkz.ml import apply_auto_disable_guard, recalibrate_bot
 from src.tradeworkz.scheduler import _sweep_due
 
-NOW = datetime(2026, 7, 16, 18, 0, tzinfo=timezone.utc)
+# Anchored to the real clock, NOT a fixed date. ``recalibrate_bot`` windows
+# trades against ``datetime.now() - 30 days``, so a hard-coded timestamp
+# silently stops exercising the adaptive-threshold branch the moment it ages
+# past that lookback: ``win_30d`` goes None, the clamp never runs, and
+# ``confidence_threshold`` keeps its 0.55 dataclass default instead of the
+# 0.60 ceiling. This test did exactly that on 2026-08-21, 36 days after the
+# date below was written. Every use here is relative (trade ages, and
+# _sweep_due comparisons against NOW +/- a delta), so a live anchor is safe.
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 # ----------------------------------------------------------------------
