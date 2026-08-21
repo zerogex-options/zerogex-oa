@@ -1185,6 +1185,10 @@ MMGEX_OUT     ?= research_output
 mmgex-pipeline-check: ## MM-GEX: synthetic end-to-end plumbing check (NOT a research result)
 	$(PY) -m research.mm_attributed_gex.cli pipeline-check
 
+.PHONY: mmgex-sample
+mmgex-sample: ## MM-GEX: write SYNTHETIC Open-Close files to rehearse the workflow (not data)
+	$(PY) -m research.mm_attributed_gex.cli make-sample --out $(MMGEX_OUT)/sample
+
 .PHONY: mmgex-inspect
 mmgex-inspect: ## MM-GEX: propose a column mapping from a real Cboe file. Vars: MMGEX_FILE=path
 	$(PY) -m research.mm_attributed_gex.cli inspect-cboe $(MMGEX_FILE) --save $(MMGEX_PROFILE)

@@ -387,6 +387,43 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# make-sample
+# ---------------------------------------------------------------------------
+
+
+def cmd_make_sample(args: argparse.Namespace) -> int:
+    """Write a synthetic Open-Close file set so the workflow can be rehearsed.
+
+    Invented column names, random numbers. It exists so an operator can see
+    what every command prints before buying anything — never as data.
+    """
+    from research.mm_attributed_gex.sample import write_sample_files
+
+    paths = write_sample_files(
+        args.out,
+        n_sessions=args.sessions,
+        interval_minutes=args.interval_minutes,
+    )
+    print(f"wrote {len(paths)} synthetic session files to {args.out}/")
+    for path in paths:
+        print(f"  {path}  ({path.stat().st_size:,} bytes)")
+    print(
+        "\nSYNTHETIC — invented column names, random numbers. A real Cboe header\n"
+        "will differ, which is why inspect-cboe proposes a mapping instead of\n"
+        "assuming one. Nothing computed from these files is a finding.\n"
+        "\nRehearse the workflow:\n"
+        f"  python -m research.mm_attributed_gex.cli inspect-cboe {paths[0]} "
+        "--save research_output/sample_profile.json\n"
+        '  # then set "confirmed": true in that file\n'
+        f"  python -m research.mm_attributed_gex.cli check-load {args.out}/ "
+        "--profile research_output/sample_profile.json\n"
+        f"  python -m research.mm_attributed_gex.cli reconstruct {args.out}/ "
+        "--profile research_output/sample_profile.json --no-db"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # pipeline-check
 # ---------------------------------------------------------------------------
 
@@ -478,6 +515,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
     _add_common(p)
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser(
+        "make-sample",
+        help="write a SYNTHETIC Open-Close file set to rehearse the workflow (not data)",
+    )
+    p.add_argument("--out", default="research_output/sample")
+    p.add_argument("--sessions", type=int, default=5)
+    p.add_argument("--interval-minutes", type=int, default=10)
+    _add_common(p)
+    p.set_defaults(func=cmd_make_sample)
 
     p = sub.add_parser("pipeline-check", help="synthetic end-to-end plumbing check")
     _add_common(p)

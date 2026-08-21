@@ -321,3 +321,20 @@ def test_summarize_warns_when_no_market_maker_records_are_present():
     records = [_rec(ParticipantType.CUSTOMER, Side.BUY, PositionEffect.OPEN, 10)]
     report = summarize(records)
     assert any("MARKET_MAKER" in n for n in report.notes)
+
+
+def test_participant_coverage_is_reported_even_without_open_interest():
+    """Coverage is a property of the records, not of the open-interest check.
+
+    Deriving it only inside the OI branch made a run with no stored open
+    interest announce "no MARKET_MAKER records present" for a file that was
+    full of them — a false alarm on the exact check an operator relies on.
+    """
+    records = [
+        _rec(ParticipantType.MARKET_MAKER, Side.SELL, PositionEffect.OPEN, 200),
+        _rec(ParticipantType.CUSTOMER, Side.BUY, PositionEffect.OPEN, 200),
+    ]
+    report = summarize(records)
+    assert report.verdict == "no_open_interest_supplied"
+    assert report.participants_covered == ("CUSTOMER", "MARKET_MAKER")
+    assert not any("MARKET_MAKER" in n for n in report.notes)
