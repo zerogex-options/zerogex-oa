@@ -28,7 +28,9 @@ safe to sit in front of a live read:
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import date
+from unittest.mock import patch
 
 import pytest
 
@@ -270,3 +272,60 @@ def test_cancelled_leader_does_not_strand_its_followers():
     assert all(r == ["payload"] for r in outcomes[1:])
     assert len(prod.calls) == 1
     assert db._inflight == {}
+
+
+# ---------------------------------------------------------------------------
+# STRIKE_PROFILE_TIMESERIES_MAX_WINDOW_UNITS incident dial
+# ---------------------------------------------------------------------------
+
+
+def test_window_cap_is_inert_by_default():
+    """Unset, the request is served exactly as asked — this dial must not
+    quietly shorten anyone's chart until an operator turns it on."""
+    db = DatabaseManager()
+    assert db._strike_profile_timeseries_max_window_units == 480
+    prod = _Producer(result=[{"timestamp": "t"}])
+    prod.gate.set()
+    db._get_strike_profile_timeseries_uncached = prod
+    asyncio.run(db.get_strike_profile_timeseries(symbol="SPX", timeframe="5min", window_units=78))
+    assert prod.calls[0]["window_units"] == 78
+
+
+def test_window_cap_clamps_before_the_key_is_chosen():
+    """Two different requested windows that cap to the same value have to
+    share one cache entry and one flight.  Capping after the key was derived
+    would fragment them into separate reads of identical data — the opposite
+    of what the dial is for."""
+    with patch.dict(os.environ, {"STRIKE_PROFILE_TIMESERIES_MAX_WINDOW_UNITS": "32"}):
+        db = DatabaseManager()
+    prod = _Producer(result=[{"timestamp": "t"}])
+    db._get_strike_profile_timeseries_uncached = prod
+
+    async def main():
+        leader = asyncio.create_task(
+            db.get_strike_profile_timeseries(symbol="SPX", timeframe="5min", window_units=78)
+        )
+        await prod.started.wait()
+        follower = asyncio.create_task(
+            db.get_strike_profile_timeseries(symbol="SPX", timeframe="5min", window_units=64)
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        prod.gate.set()
+        return await asyncio.gather(leader, follower)
+
+    results = asyncio.run(main())
+    assert len(prod.calls) == 1
+    assert prod.calls[0]["window_units"] == 32
+    assert results[1] is results[0]
+
+
+def test_window_cap_never_raises_the_structural_ceiling():
+    """The dial can only ever tighten: 480 stays the hard bound."""
+    with patch.dict(os.environ, {"STRIKE_PROFILE_TIMESERIES_MAX_WINDOW_UNITS": "9999"}):
+        db = DatabaseManager()
+    prod = _Producer(result=[{"timestamp": "t"}])
+    prod.gate.set()
+    db._get_strike_profile_timeseries_uncached = prod
+    asyncio.run(db.get_strike_profile_timeseries(symbol="SPX", window_units=9999))
+    assert prod.calls[0]["window_units"] == 480

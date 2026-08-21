@@ -521,6 +521,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._strike_profile_timeseries_cache_ttl_seconds: float = _getenv_float(
             "STRIKE_PROFILE_TIMESERIES_CACHE_TTL_SECONDS", 30.0
         )
+        # Incident dial: an operator-set ceiling on ``window_units`` for this
+        # endpoint, applied at the entry point on top of the router's own
+        # ``le=480``.  Default 480, i.e. inert — the request is served exactly
+        # as asked and nothing changes.
+        #
+        # This read's cost grows with the window (the payload measures a flat
+        # ~12.4 KB per bucket at every size that completes), so once the
+        # instance is loaded enough that the requested window cannot finish
+        # inside the 15 s guard, EVERY poll times out and returns ``[]`` — and
+        # since a timed-out read is deliberately not cached, nothing ever
+        # populates the cache to relieve the pressure.  It does not recover on
+        # its own.  Measured mid-session 2026-08-21: window 32 finished in
+        # 13 s, window 40 and above did not finish at all.
+        #
+        # A blank chart is worth strictly less than a shorter one, so this
+        # buys back a rendering chart without a deploy.  Set it to the largest
+        # window that still completes (bisect the endpoint), and put it back
+        # to 480 once the per-poll cost is actually fixed — capping is a
+        # tourniquet, not a repair.
+        self._strike_profile_timeseries_max_window_units: int = max(
+            1, _getenv_int("STRIKE_PROFILE_TIMESERIES_MAX_WINDOW_UNITS", 480)
+        )
         # Fraction of spot used as the /api/gex/heatmap strike half-band
         # (validated + bounded in config). Proportional so the heatmap
         # fills the frontend's price-cropped y-axis for any underlying.
@@ -3457,7 +3479,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         caller that wants to bypass the guard).
         """
         symbol = symbol.upper()
-        window_units = max(1, min(window_units, 480))
+        # The operator cap is applied BEFORE the key is derived, so callers
+        # capped to the same window share one cache entry and one flight
+        # instead of fragmenting across the windows they asked for.
+        window_units = max(
+            1, min(window_units, self._strike_profile_timeseries_max_window_units, 480)
+        )
         exp_filter = sorted(set(expirations)) if expirations else None
         cache_key = _strike_profile_ts_cache_key(symbol, timeframe, window_units, exp_filter)
         cached = self._cache_get(cache_key)
