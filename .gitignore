@@ -212,3 +212,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Market-Maker Attributed GEX research artifacts (datasets, reports, profiles).
+# Research output is reproducible from the inputs; it does not belong in git.
+research_output/
