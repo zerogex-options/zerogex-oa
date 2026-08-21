@@ -9,7 +9,7 @@ import os
 import time as time_module
 import traceback
 from collections import OrderedDict
-from typing import List, Dict, Optional, Any, Tuple, Iterable
+from typing import Awaitable, Callable, List, Dict, Optional, Any, Tuple, Iterable
 from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
@@ -84,6 +84,36 @@ def _cache_weight(payload: Any) -> int:
                 if isinstance(value, (list, tuple)) and len(value) > widest_nested:
                     widest_nested = len(value)
     return n * (1 + widest_nested)
+
+
+def _consume_future_exception(fut: "asyncio.Future[Any]") -> None:
+    """Retrieve a shared future's exception so asyncio stops warning about it.
+
+    ``DatabaseManager._single_flight`` sets the exception on the shared future
+    so every follower re-raises it, but when a leader has NO followers nobody
+    ever retrieves it and asyncio logs "Future exception was never retrieved"
+    when the future is collected.  The leader still raises to its own caller,
+    so that warning is pure noise.
+    """
+    if not fut.cancelled():
+        fut.exception()
+
+
+def _strike_profile_ts_cache_key(
+    symbol: str,
+    timeframe: str,
+    window_units: int,
+    exp_filter: Optional[List[date]],
+) -> str:
+    """Read-cache key for ``/api/gex/strike-profile-timeseries``.
+
+    Shared by the public wrapper and the uncached read so the key the
+    stampede guard coalesces on can never drift from the key the result is
+    stored under.  ``exp_filter`` must already be normalised (sorted, de-duped,
+    empty collapsed to ``None``) — both callers do that before they get here.
+    """
+    scope = ",".join(d.isoformat() for d in exp_filter) if exp_filter else "all"
+    return f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:{scope}"
 
 
 # Default history depth for component score endpoints. Sized to span the two
@@ -603,6 +633,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._read_cache_max_units: int = max(1000, _getenv_int("READ_CACHE_MAX_UNITS", 250_000))
         self._read_cache: "OrderedDict[str, Tuple[float, Any, int]]" = OrderedDict()
         self._read_cache_units: int = 0
+        # In-flight producers, keyed exactly like ``_read_cache``.  See
+        # ``_single_flight``: a TTL cache only helps once a value EXISTS, so
+        # without this every concurrent miss on one key ran its own query.
+        self._inflight: "Dict[str, asyncio.Future[Any]]" = {}
         self._load_credentials()
 
     def _cache_drop(self, key: str) -> None:
@@ -655,6 +689,65 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 if oldest == key:
                     break
                 self._cache_drop(oldest)
+
+    async def _single_flight(
+        self,
+        key: str,
+        producer: "Callable[[], Awaitable[Any]]",
+    ) -> Any:
+        """Run ``producer`` once per ``key``, sharing its result with waiters.
+
+        The first caller for a key becomes the leader and runs ``producer``;
+        callers that arrive for the SAME key while it is still running await
+        the leader's result instead of starting a duplicate.
+
+        This is a duplicate-work guard, NOT a cache: the producer stays
+        responsible for reading and writing ``_read_cache``, so the existing
+        "a timed-out read is not cached" rule is untouched.  The two compose —
+        the cache collapses repeats across time, this collapses them across
+        concurrent callers, and neither covers the other's case.
+
+        Followers ``shield`` the shared future: one client disconnecting
+        cancels ITS task, and without the shield that cancellation would
+        propagate into the producer every other follower is still waiting on.
+
+        Per-process, like ``_read_cache``.  With ``--workers 2`` each worker
+        coalesces only its own callers, so this halves the duplicate work
+        rather than eliminating it; sharing across workers needs an
+        out-of-process cache and is a separate change.
+        """
+        leader = self._inflight.get(key)
+        if leader is not None:
+            return await asyncio.shield(leader)
+
+        fut: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+        fut.add_done_callback(_consume_future_exception)
+        self._inflight[key] = fut
+        # The producer runs as its own task rather than inline so that it is
+        # owned by the FLIGHT, not by whichever caller happened to arrive
+        # first.  A leader that disconnects mid-read is routine here (1 Hz
+        # poll, multi-second read), and if the work were inline that
+        # cancellation would take down every follower queued behind it —
+        # strictly worse than the un-coalesced behaviour this replaces.
+        task = asyncio.ensure_future(producer())
+
+        def _publish(done: "asyncio.Future[Any]") -> None:
+            # Retire the entry when the WORK settles, not when the leader's
+            # await ends, and only ever our own: a later leader for the same
+            # key must not be evicted by a straggler finishing late.
+            if self._inflight.get(key) is fut:
+                del self._inflight[key]
+            if fut.done():
+                return
+            if done.cancelled():
+                fut.cancel()
+            elif done.exception() is not None:
+                fut.set_exception(done.exception())
+            else:
+                fut.set_result(done.result())
+
+        task.add_done_callback(_publish)
+        return await asyncio.shield(task)
 
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
@@ -3340,6 +3433,53 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         window_units: int = 78,
         expirations: Optional[List[date]] = None,
     ) -> List[Dict[str, Any]]:
+        """Cache- and stampede-guarded entry point for the rewind-chart read.
+
+        The read itself is :meth:`_get_strike_profile_timeseries_uncached`;
+        this wrapper exists so that at most ONE of them runs per cache key at
+        a time.
+
+        The rewind chart polls at ~1 Hz and the frontend fans out over symbols
+        and expiration filters, so a cold key is asked for many times before
+        the first answer lands.  A TTL cache cannot absorb that on its own: it
+        only helps once a value exists, and nothing writes one until a query
+        finishes.  Under cash-session load that became self-sustaining — every
+        poll missed, every miss ran its own multi-second aggregate, the
+        instance spent its CPU on concurrent duplicates of a single query,
+        each copy then blew the 15 s guard in the uncached read and returned
+        ``[]`` *without* caching, so the next poll missed too.  Coalescing the
+        duplicates is what lets one of them finish, and finishing is what
+        finally populates the cache.
+
+        Normalisation happens here so the coalescing key is exactly the key
+        the result is stored under; the inner read re-normalises idempotently
+        so it stays correct when called directly (tests, and any future
+        caller that wants to bypass the guard).
+        """
+        symbol = symbol.upper()
+        window_units = max(1, min(window_units, 480))
+        exp_filter = sorted(set(expirations)) if expirations else None
+        cache_key = _strike_profile_ts_cache_key(symbol, timeframe, window_units, exp_filter)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+        return await self._single_flight(
+            cache_key,
+            lambda: self._get_strike_profile_timeseries_uncached(
+                symbol=symbol,
+                timeframe=timeframe,
+                window_units=window_units,
+                expirations=exp_filter,
+            ),
+        )
+
+    async def _get_strike_profile_timeseries_uncached(
+        self,
+        symbol: str = "SPY",
+        timeframe: str = "1min",
+        window_units: int = 78,
+        expirations: Optional[List[date]] = None,
+    ) -> List[Dict[str, Any]]:
         """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
 
         Returns ``window_units`` time buckets ASCENDING (most recent last)
@@ -3397,9 +3537,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # empty list back to None (All) so the cache key and SQL predicate
         # have a single canonical shape for "no filter".
         exp_filter: Optional[List[date]] = sorted(set(expirations)) if expirations else None
-        cache_key = f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:" + (
-            ",".join(d.isoformat() for d in exp_filter) if exp_filter else "all"
-        )
+        cache_key = _strike_profile_ts_cache_key(symbol, timeframe, window_units, exp_filter)
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
