@@ -459,6 +459,9 @@ and the wording says so.
 
 ## 8. Running it
 
+> Step-by-step operator's guide, including where to buy the data and how to read
+> the report: [`docs/runbooks/mm_attributed_gex_how_to_run.md`](../runbooks/mm_attributed_gex_how_to_run.md).
+
 ```bash
 # 1. Discover the real schema and confirm the mapping.
 python -m research.mm_attributed_gex.cli inspect-cboe data/cboe_oc_20260601.csv \

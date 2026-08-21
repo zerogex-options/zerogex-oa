@@ -4,7 +4,10 @@ Research-only experiment. **Changes no production behavior**: it imports from `s
 `src` imports nothing from here, every database statement is a `SELECT`, and outputs
 go to files.
 
-Full design, methodology and data requirements:
+**How to run it, where to get the data, and how to read the results:**
+[`docs/runbooks/mm_attributed_gex_how_to_run.md`](../../docs/runbooks/mm_attributed_gex_how_to_run.md).
+
+Design, methodology and full data requirements:
 [`docs/design/market-maker-attributed-gex.md`](../../docs/design/market-maker-attributed-gex.md).
 
 > The metric is **Market-Maker Attributed GEX**. Not "true dealer GEX" — exchange tags

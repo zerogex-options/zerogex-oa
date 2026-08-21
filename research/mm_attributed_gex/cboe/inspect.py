@@ -40,12 +40,15 @@ from research.mm_attributed_gex.schema import (
 
 __all__ = ["HeaderProposal", "read_header", "propose_profile", "render_proposal"]
 
-#: Customer order-size buckets Cboe reports separately.  Recognized so a
-#: size-split customer column is captured with its bucket rather than dropped.
+#: Cboe reports CUSTOMER and PROFESSIONAL_CUSTOMER volume split three ways by
+#: order size: fewer than 100 contracts, 100-199, and more than 199.  Recognized
+#: so a size-split column is captured WITH its bucket rather than dropped —
+#: the split carries no weight in the arithmetic (all three sum into the same
+#: participant) but losing it silently would hide part of the file.
 _SIZE_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("lt100", ("lt100", "under100", "less_than_100", "_1_99", "small")),
     ("100to199", ("100to199", "100_199", "mid", "medium")),
-    ("gte200", ("gte200", "over200", "200plus", "ge200", "large")),
+    ("gt199", ("gt199", "gte200", "over200", "200plus", "ge200", "large")),
 )
 
 

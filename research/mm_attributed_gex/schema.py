@@ -61,12 +61,12 @@ class Exchange(str, Enum):
 class ParticipantType(str, Enum):
     """Participant categories carried by exchange Open-Close products.
 
-    ``CUSTOMER`` covers public customers.  Cboe additionally reports customer
-    volume split by order size (<100 / 100-199 / 200+); loaders may aggregate
-    those into ``CUSTOMER`` or keep the size buckets in
-    :attr:`ParticipantActivity.attrs`.  ``PROFESSIONAL_CUSTOMER`` is the
-    separately reported "professional customer" category, distinct from
-    ``CUSTOMER``.
+    ``CUSTOMER`` covers public customers.  Cboe additionally splits customer
+    and professional-customer volume by order size (<100 / 100-199 / >199);
+    loaders aggregate those into one participant and keep the bucket in
+    :attr:`ParticipantActivity.attrs` as provenance.
+    ``PROFESSIONAL_CUSTOMER`` is the separately reported "professional
+    customer" category, distinct from ``CUSTOMER``.
 
     ``MARKET_MAKER`` is the category this experiment is about.  Everything
     else exists so the loader never has to silently discard a column and so
@@ -111,10 +111,17 @@ class PositionEffect(str, Enum):
 
 
 class Interval(str, Enum):
-    """Width of the reporting bucket a record covers."""
+    """Width of the reporting bucket a record covers.
+
+    ``MINUTE_1`` and ``MINUTE_10`` are the cadences Cboe's Open-Close Volume
+    Summary actually offers intraday; ``SESSION`` is its end-of-day form.
+    ``MINUTE_5`` and ``MINUTE_30`` exist so another venue's feed can be
+    described without inventing a new enum.
+    """
 
     MINUTE_1 = "1min"
     MINUTE_5 = "5min"
+    MINUTE_10 = "10min"
     MINUTE_30 = "30min"
     SESSION = "session"  # one row per trading day (end-of-day summary)
     UNKNOWN = "unknown"

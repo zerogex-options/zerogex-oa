@@ -68,8 +68,9 @@ class VolumeColumn:
     ``column`` is the header name in the file.  The triple
     ``(participant, side, position_effect)`` is what that column means.
     ``size_bucket`` carries Cboe's customer order-size split (``"lt100"``,
-    ``"100to199"``, ``"gte200"``) when the feed breaks customer volume out that
-    way; it is preserved as provenance and never changes the arithmetic.
+    ``"100to199"``, ``"gt199"``) when the feed breaks customer or professional-
+    customer volume out that way; it is preserved as provenance and never
+    changes the arithmetic, since all three buckets sum into one participant.
     """
 
     column: str
@@ -331,7 +332,11 @@ def builtin_profiles() -> dict[str, ColumnProfile]:
             name="cboe_open_close_v1",
             layout="wide",
             exchange=Exchange.CBOE_C1,
-            interval=Interval.MINUTE_30,
+            # Cboe delivers Open-Close as an end-of-day summary or as 1-minute
+            # / 10-minute intraday snapshots.  Left UNKNOWN so the operator
+            # states which one the delivered files are rather than inheriting
+            # a guess that would mislabel every record.
+            interval=Interval.UNKNOWN,
             confirmed=False,
             symbol_col="underlying_symbol",
             option_root_col="option_root",
