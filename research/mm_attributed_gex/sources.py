@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Iterator, Optional, Sequence
 
@@ -44,6 +45,8 @@ __all__ = [
     "fetch_vix_closes",
     "fetch_series_listing_dates",
     "fetch_open_interest_series",
+    "SampleAnchor",
+    "fetch_sample_anchor",
 ]
 
 
@@ -413,3 +416,139 @@ def fetch_open_interest_series(
         key: SeriesKey = (symbol, expiration, float(strike), option_type)
         out[(key, d)] = int(oi or 0)
     return out
+
+
+@dataclass(frozen=True)
+class SampleAnchor:
+    """Real series and sessions drawn from ZeroGEX's own chain history.
+
+    Used to anchor a synthetic Open-Close file to contracts that genuinely
+    exist in the database, so the dataset and backtest steps can be rehearsed
+    end to end before any Cboe data is purchased.  The MM *flow* over those
+    series is still invented — only the series identities, the sessions and
+    the market data around them are real.
+    """
+
+    symbol: str
+    sessions: tuple[date, ...]
+    expirations: tuple[date, ...]
+    strikes: tuple[float, ...]
+    start: datetime
+    end: datetime
+    spot: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "sessions": [d.isoformat() for d in self.sessions],
+            "expirations": [d.isoformat() for d in self.expirations],
+            "n_strikes": len(self.strikes),
+            "strike_range": [min(self.strikes), max(self.strikes)] if self.strikes else [],
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "spot": self.spot,
+        }
+
+
+def fetch_sample_anchor(
+    conn: Any,
+    symbol: str = "SPX",
+    *,
+    days: int = 5,
+    strike_band_pct: float = 0.03,
+    max_expirations: int = 3,
+    max_strikes: int = 15,
+) -> Optional[SampleAnchor]:
+    """Find real sessions, expirations and strikes to anchor a synthetic file to.
+
+    Deliberately bounded — a narrow strike band around spot, a handful of
+    expirations, a few sessions — because this runs against the production
+    database and a rehearsal is not worth an expensive scan.  Returns ``None``
+    when the window has no analytics rows to anchor to, which is itself useful:
+    it means the study window you were planning has no production comparand.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT MAX(timestamp) FROM gex_summary WHERE underlying = %(symbol)s
+            """,
+            {"symbol": symbol},
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        end: datetime = row[0]
+        start = end - timedelta(days=days * 2)
+
+        # Sessions that actually have analytics rows — the snapshots the
+        # dataset builder would iterate.
+        cur.execute(
+            """
+            SELECT DISTINCT (timestamp AT TIME ZONE 'America/New_York')::date AS d
+              FROM gex_summary
+             WHERE underlying = %(symbol)s
+               AND timestamp BETWEEN %(start)s AND %(end)s
+             ORDER BY d DESC
+             LIMIT %(days)s
+            """,
+            {"symbol": symbol, "start": start, "end": end, "days": days},
+        )
+        sessions = sorted(r[0] for r in cur.fetchall())
+        if not sessions:
+            return None
+
+        cur.execute(
+            """
+            SELECT close FROM underlying_quotes
+             WHERE symbol = %(symbol)s AND timestamp <= %(end)s
+             ORDER BY timestamp DESC LIMIT 1
+            """,
+            {"symbol": symbol, "end": end},
+        )
+        spot_row = cur.fetchone()
+        if not spot_row or not spot_row[0]:
+            return None
+        spot = float(spot_row[0])
+
+        lo, hi = spot * (1 - strike_band_pct), spot * (1 + strike_band_pct)
+        cur.execute(
+            """
+            SELECT DISTINCT expiration, strike
+              FROM option_chains
+             WHERE underlying = %(symbol)s
+               AND timestamp BETWEEN %(from_ts)s AND %(end)s
+               AND gamma IS NOT NULL
+               AND expiration >= %(first_session)s
+               AND strike BETWEEN %(lo)s AND %(hi)s
+             ORDER BY expiration, strike
+             LIMIT 2000
+            """,
+            {
+                "symbol": symbol,
+                "from_ts": end - timedelta(hours=6),
+                "end": end,
+                "first_session": sessions[0],
+                "lo": lo,
+                "hi": hi,
+            },
+        )
+        pairs = cur.fetchall()
+
+    if not pairs:
+        return None
+    expirations = sorted({p[0] for p in pairs})[:max_expirations]
+    strikes = sorted({float(p[1]) for p in pairs if p[0] in expirations})
+    # Thin evenly across the band rather than taking one end of it.
+    if len(strikes) > max_strikes:
+        step = len(strikes) / max_strikes
+        strikes = [strikes[int(i * step)] for i in range(max_strikes)]
+
+    return SampleAnchor(
+        symbol=symbol,
+        sessions=tuple(sessions),
+        expirations=tuple(expirations),
+        strikes=tuple(strikes),
+        start=start,
+        end=end,
+        spot=spot,
+    )
