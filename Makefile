@@ -3070,6 +3070,19 @@ regime-regrade-report: ## Backtest the corrected dealer-gamma regime vs stored h
 # (everything /api/flow/series can request).
 FLOW_SERIES_SYMBOLS ?= SPY
 
+.PHONY: futures-backfill
+futures-backfill: ## Backfill historical 1-min ES/NQ bars into futures_quotes. SYMBOLS=SPX,NDX START=YYYY-MM-DD END=YYYY-MM-DD [DRY_RUN=yes]
+	@echo "$(BLUE)=== Futures Backfill (futures_quotes) ===$(NC)"
+	@echo "$(YELLOW)SYMBOLS takes the CASH INDEX (SPX,NDX); the mapped future is$(NC)"
+	@echo "$(YELLOW)resolved via INDEX_FUTURES_MAP and rows land under the index key.$(NC)"
+	@echo "$(YELLOW)RAISE FUTURES_BARS_RETENTION_DAYS FIRST -- the ingester prunes past$(NC)"
+	@echo "$(YELLOW)it and cannot tell a backfilled bar from a streamed one.$(NC)"
+	@$(PY) -m src.tools.futures_backfill \
+		--symbols "$(or $(SYMBOLS),SPX,NDX)" \
+		--start $(START) \
+		--end $(END) \
+		$(if $(filter yes,$(DRY_RUN)),--dry-run)
+
 .PHONY: flow-series-backfill
 flow-series-backfill: ## Backfill flow_series_5min (current + prior session) before flipping FLOW_SERIES_USE_SNAPSHOT
 	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"

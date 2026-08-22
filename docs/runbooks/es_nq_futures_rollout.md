@@ -36,23 +36,33 @@ futures chart with nothing to mark it.
 
 | Surface | ES/NQ behaviour |
 |---|---|
-| `/api/gex/summary`, `/profile`, `/by-strike`, `/heatmap`, `/historical*`, `/strike-profile-timeseries`, `/expirations` | projected |
-| `/api/v1/levels/*`, `/api/technicals*`, `/api/max-pain/*` | projected |
+| GEX (`/api/gex/*` bar the two surfaces below), `/api/v1/levels`, `/api/technicals*`, `/api/max-pain/*` | projected |
+| `/api/signals/*`, `/api/forecast*`, `/api/forced-flow/*`, `/api/scorecard/*`, `/api/replay/*` | projected |
+| `/api/flow/buying-pressure`, `/api/flow/series`, `/api/flow/market-tide` | projected |
 | `/api/market/quote`, `/historical`, `/session-closes`, `/session-levels` | served natively from the future's own bars |
-| **everything else** | **400** with a message naming the backing index |
+| **per-contract surfaces** — `/api/option/*`, `/api/tools/option-calculator`, `/api/flow/by-contract`, `/api/flow/contracts`, `/api/flow/smart-money`, `/api/market/open-interest`, `/api/gex/premium_surface`, `/api/gex/vol_surface` | **400** |
 
-That last row is deliberate and includes `/api/signals/*`, `/api/forecast*`,
-`/api/flow/*`, `/api/forced-flow/*`, `/api/option/*`,
-`/api/tools/option-calculator`, `/api/backtest/*`, `/api/replay/*`. Those pages
-will show an error for ES/NQ; the options calculator renders an explicit
-"not available" panel instead.
+The refusals are the per-contract surfaces only, and they refuse for a reason
+that does not go away: an SPX contract with its strike multiplied by the basis
+is not a contract anyone can trade, and the strike no longer round-trips to the
+chain it came from. There is no ES chain to substitute. The Strategy Builder,
+Option Contracts and Smart Money pages render an explicit panel saying so.
 
-**To add an endpoint later:** read its response model (or its raw dict),
-classify every numeric field into `PRICE_FIELDS` or `NEVER_PROJECT` in
-`src/jobs/futures_projection.py`, then add the path prefix to
-`_PROJECTABLE_PREFIXES` in `src/api/futures_middleware.py`.
-`tests/test_futures_projection_coverage.py` imports that same tuple and will
-fail until every numeric field on the newly-added route is classified.
+**Prices quoted in prose are converted too.** Signal and forecast cards write
+narratives like `target $6,650.00`, and a card reading that beside a chart
+trading 6,694 is a number a trader could act on. Those narratives follow the
+codebase's own convention — an index price is `$`-prefixed, a score or a
+multiple is not — so `$`-amounts within ±half the index level are carried
+across and everything else (an option credit, an ATR offset, a percentage) is
+left alone. The response's `projection.narrative_prices_converted` flag records
+whether that ran.
+
+**To add an endpoint later:** classify every numeric field into `PRICE_FIELDS`
+or `NEVER_PROJECT` in `src/jobs/futures_projection.py`, then add the path prefix
+to `_PROJECTABLE_PREFIXES` in `src/api/futures_middleware.py`.
+`tests/test_futures_projection_coverage.py` imports both tuples and mirrors the
+middleware's dispatch, so it fails until every numeric field on the new route is
+classified.
 
 Reference: `src/jobs/futures_projection.py`, `src/api/futures_middleware.py`.
 
@@ -161,6 +171,8 @@ quote before its replacement is proven.
 | `FUTURES_BASIS_SAMPLES` | `15` | never |
 | `FUTURES_BASIS_FRESH_MINUTES` | `120` | never — 120 spans the 16:00–18:00 hold exactly |
 | `FUTURES_BASIS_CACHE_TTL_SECONDS` | `60` | basis reads show up hot in profiling |
+| `FUTURES_BARS_RETENTION_DAYS` | `7` | **raise before backfilling** — see the backfill section |
+| `FUTURES_QUOTE_STALE_MINUTES` | `5` | a quiet feed is being reported as closed too eagerly |
 
 ### Do NOT add ES/NQ to these
 
@@ -326,6 +338,44 @@ feed for both price and basis.
 Nothing this feature does is written to the database, so there is no data to
 unwind.
 
+## Backfilling ES/NQ history
+
+The live ingester only holds a rolling window (`FUTURES_BARS_RETENTION_DAYS`,
+default 7). That is enough for the basis and the intraday chart, and not enough
+for the daily/hourly candlestick timeframes, a basis history spanning a
+quarterly roll, or any replay over ES/NQ price action.
+
+**Raise retention first.** The prune cannot tell a backfilled row from a
+streamed one, so anything outside the window is deleted on the next cycle. The
+tool warns rather than letting that happen quietly, but it cannot stop it.
+
+```bash
+# 1. in .env — size this to the history you intend to keep
+FUTURES_BARS_RETENTION_DAYS=90
+sudo systemctl restart zerogex-oa-ingestion
+
+# 2. rehearse
+make futures-backfill SYMBOLS=SPX,NDX START=2026-06-01 END=2026-08-21 DRY_RUN=yes
+
+# 3. load it
+make futures-backfill SYMBOLS=SPX,NDX START=2026-06-01 END=2026-08-21
+```
+
+`SYMBOLS` takes the **cash index** (`SPX,NDX`) — rows are keyed by the index and
+the mapped future is resolved through `INDEX_FUTURES_MAP`, the same way the live
+ingester resolves it. Bars are stamped on their own minute, matching the live
+feed, so a backfilled bar is indistinguishable from a streamed one and pairs
+correctly in the basis join. Idempotent on `(index_symbol, timestamp)` — rerun a
+range safely.
+
+Two things the historical endpoint cannot give you: the Up/Down volume split
+(backfilled bars land 0/0; OHLC is exact) and anything your CME entitlement does
+not cover — an unentitled future returns an empty set rather than an error, so a
+silent zero-bar result means check the subscription, not the dates.
+
+Disk: one index-year of 1-minute futures bars is roughly 350k rows. Two indices
+over a year is well under a GB.
+
 ## Known limits
 
 - **Quarterly roll.** For a day or two around the roll the measured ratio can
@@ -336,7 +386,8 @@ unwind.
   runs slightly long during that window — only relevant if you are already on
   `carry`, which is itself a problem to fix.
 - **ES/NQ history is bounded by `FUTURES_BARS_RETENTION_DAYS` (7 days).**
-  Daily and hourly chart timeframes will look short until that is raised.
+  Daily and hourly chart timeframes look short until that is raised and a
+  backfill is run — see the backfill section above.
 - **A holiday-shortened week** can leave the basis `measured_stale` longer than
   usual. That is correct — nothing has measured it — and levels stay usable.
 - **ES/NQ inherit SPX/NDX's analytics cadence.** They are not fresher than the

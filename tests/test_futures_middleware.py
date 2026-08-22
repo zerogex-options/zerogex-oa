@@ -84,6 +84,16 @@ def _client() -> TestClient:
     async def option(request):  # pragma: no cover - must never be reached
         return JSONResponse({"strike": 6600.0})
 
+    async def card(request):
+        return JSONResponse(
+            {
+                "symbol": request.query_params.get("symbol"),
+                "spot_price": 6600.0,
+                "target_price": 6650.0,
+                "rationale": "Fade into the call wall; target $6,650.00. Credit $2.40.",
+            }
+        )
+
     async def text(request):
         return PlainTextResponse("not json")
 
@@ -96,9 +106,11 @@ def _client() -> TestClient:
             Route("/api/market/session-levels", native),
             Route("/api/option/quote", option),
             Route("/api/tools/option-calculator", option),
-            Route("/api/signals/action", option),
+            Route("/api/signals/action", card),
             Route("/api/flow/contracts", option),
-            Route("/api/forecast", option),
+            Route("/api/flow/smart-money", option),
+            Route("/api/gex/premium_surface", option),
+            Route("/api/forecast", card),
             Route("/api/technicals/text", text),
         ]
     )
@@ -142,9 +154,9 @@ def test_observed_price_endpoints_are_bypassed(path):
     [
         "/api/option/quote",  # an SPX contract with a scaled strike is untradable
         "/api/tools/option-calculator",
-        "/api/signals/action",  # rationale prose embeds SPX prices; unprojectable
         "/api/flow/contracts",  # per-contract strikes
-        "/api/forecast",  # mixes projected walls with unprojected range/actuals
+        "/api/flow/smart-money",
+        "/api/gex/premium_surface",  # an option premium, not an index level
     ],
 )
 def test_unaudited_endpoints_refuse_futures(path):
@@ -297,3 +309,24 @@ def test_spot_derived_deltas_are_reconciled_after_substitution():
     payload = {"max_pain": 6700.0, "underlying_price": LIVE_ES, "difference": 80.0}
     _reconcile_spot_derived(payload, LIVE_ES)
     assert payload["difference"] == pytest.approx(6700.0 - LIVE_ES)
+
+
+# --- narrative prose -------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/api/signals/action", "/api/forecast"])
+def test_signal_and_forecast_cards_are_now_served(path):
+    """These were refused while the allowlist was narrow. They are audited now."""
+    body = _client().get(f"{path}?symbol=ES").json()
+    assert body["symbol"] == "ES"
+    assert body["target_price"] == pytest.approx(6694.5)
+
+
+def test_prices_quoted_in_prose_are_carried_across_too():
+    """A card reading "target $6,650" beside a chart trading 6,694 is a number
+    a trader could act on. Index prices in the narrative move; a $2.40 credit
+    does not, because it is not on the index axis."""
+    body = _client().get("/api/signals/action?symbol=ES").json()
+    assert "$6,694.50" in body["rationale"]
+    assert "$2.40" in body["rationale"]
+    assert body["projection"]["narrative_prices_converted"] is True

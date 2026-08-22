@@ -109,7 +109,58 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "flow",
         "opt_flow",
         "flow_direction",
+        # --- greeks and their components ----------------------------------
+        "charm_baseline",
+        "charm_component",
+        "charm_deviation",
+        "charm_flow",
+        "gamma_component",
+        "vanna_component",
+        "atm_iv",
+        "call_iv",
+        "put_iv",
+        "skew",
+        "vol_change_pts",  # volatility points, not price points
+        "abs_dollar_gex",
+        "close_flow_usd",
+        "total_usd",
+        # --- backtest / calibration statistics ----------------------------
+        "baseline_rate",
+        "hit_rate",
+        "hit_rate_ci_high",
+        "hit_rate_ci_low",
+        "hits",
+        "edge",
+        "edge_p_value",
+        "signal_mean_return",
+        "signal_t_stat",
+        "return_pct",
+        "spot_move_pct",
+        "residual",
+        "predicted_dir",
+        "realized_dir",
+        "z",
+        "total",
+        "profiles",
+        "span_used",
+        "now_index",  # positional index into the session, not an index level
         # --- time and bookkeeping -----------------------------------------
+        "available_max_dte",
+        "available_strike_count",
+        "days",
+        "days_elapsed",
+        "horizon_days",
+        "horizons_days",
+        "lookback_days",
+        "session_days",
+        "times_days",
+        "evaluated_sessions",
+        "total_sessions",
+        "warmup_sessions",
+        "skew_seconds",
+        "min_to_close",
+        "now_min_to_close",
+        "session_open_min_to_close",
         "dte",
         "window_minutes",
         "data_age_seconds",
@@ -152,7 +203,7 @@ def _projectable_routes():
     import fastapi
 
     import src.api.main as main_module
-    from src.api.futures_middleware import _PROJECTABLE_PREFIXES
+    from src.api.futures_middleware import _PROJECTABLE_PREFIXES, _UNSUPPORTED_PREFIXES
 
     routes = list(main_module.app.routes)
     for value in vars(main_module).values():
@@ -168,6 +219,11 @@ def _projectable_routes():
     for route in routes:
         path = getattr(route, "path", None)
         if not path or path in seen_paths:
+            continue
+        # Mirror the middleware exactly: unsupported wins over projectable,
+        # in that order. Skipping this check here would make the test demand a
+        # classification for fields on routes that never get projected.
+        if path.startswith(_UNSUPPORTED_PREFIXES):
             continue
         if path.startswith(_PROJECTABLE_PREFIXES):
             seen_paths.add(path)
