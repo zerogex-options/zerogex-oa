@@ -19,8 +19,16 @@ History:
                so an underlying-quotes stall no longer freezes the chart
                while analytics is still writing rows.  ``underlying_quotes``
                remains the source of ``spot_close`` for the strike band.
+  v5         — move the gex_by_strike read into a correlated LATERAL with
+               its own GROUP BY, in a ``strikes`` CTE.  v3's rep_ts join
+               only *expressed* the ~window_units-probe plan; the planner
+               could still fall back to a hash/merge join, and the
+               redundant window bound that capped that fallback capped it
+               at the WINDOW, which is ~390x the rep set at timeframe=1day.
+               A lateral reference is evaluated per outer row and the
+               grouping blocks pull-up, so the bound is now structural.
 
-These tests pin v4 so a refactor can't regress to scanning the full
+These tests pin v5 so a refactor can't regress to scanning the full
 window of gex_by_strike or re-coupling the chart to underlying_quotes
 freshness.
 """
@@ -45,6 +53,20 @@ class _RecordingConn:
         return list(self._fetch_rows)
 
 
+def _sql_only(sql: str) -> str:
+    """Strip ``--`` comment lines so a structural assertion can only be
+    satisfied by executable SQL.
+
+    The strikes CTE carries a long comment explaining which read shapes are
+    forbidden and why — naming the plain join it replaced.  Asserting against
+    the raw query string let these guards pass on the prose alone, which is
+    exactly backwards for a regression test.
+    """
+    return "\n".join(
+        line.split("--", 1)[0] if "--" in line else line for line in sql.splitlines()
+    )
+
+
 def _install_conn(db, conn):
     @asynccontextmanager
     async def _acquire():
@@ -53,24 +75,36 @@ def _install_conn(db, conn):
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
 
-def test_heatmap_join_keyed_on_rep_ts_and_fenced_to_window():
-    """The core anti-regression: the gex_by_strike read must be BOUNDED.
+def test_heatmap_read_is_a_correlated_lateral_fenced_to_the_rep_timestamps():
+    """The core anti-regression: the gex_by_strike read must be BOUNDED to the
+    ~window_units bucket-representative timestamps, by construction.
 
-    The strikes join keys on the per-bucket representative timestamps
+    The read keys on the per-bucket representative timestamps
     (``g.timestamp = br.rep_ts``), so the *intended* plan is ~window_units
-    index point-lookups.  But ``time_window`` / ``bucket_reps`` are
-    optimisation-fence CTEs whose row counts the planner cannot estimate, so
-    under production stats it periodically abandons that nested loop for a
-    merge/hash join that reads the ENTIRE gex_by_strike table — the 15s
-    "GEX heatmap query timed out ... returning empty" path.
+    index point-lookups.  Expressed as a plain join, that was only an
+    intention: ``time_window`` / ``bucket_reps`` are optimisation-fence CTEs
+    whose row counts the planner cannot estimate, so under production stats it
+    periodically abandoned the nested loop for a merge/hash join reading the
+    ENTIRE gex_by_strike table — the 15s "GEX heatmap query timed out ...
+    returning empty" path.
 
-    The fix (mirroring get_strike_profile_timeseries, commit c4d6463) is a
-    logically-REDUNDANT window bound on the same JOIN
-    (``g.timestamp BETWEEN start_time AND end_time``): every ``rep_ts`` already
-    lies inside ``[start_time, end_time]`` (bucket_reps was filtered to exactly
-    that range) so the result set is byte-for-byte identical, but now even the
-    fallback plan range-scans only the window's rows.  So the join must be BOTH
-    keyed on rep_ts AND fenced to the window."""
+    A logically-redundant ``g.timestamp BETWEEN start_time AND end_time``
+    bound (commit 81586d8) capped that fallback at the window's rows.  Not
+    enough, because the window is not the rep set: each bucket contributes ONE
+    rep_ts out of every snapshot inside it, so the window holds ~1x the read's
+    timestamps at 1min but ~5x at 5min, ~60x at 1hr and ~390x at 1day — and
+    ``timeframe=1day&window_units=300`` is a request this endpoint accepts.
+    The strike band does not save it: the band caps how many rows SURVIVE, not
+    how many the fallback reads before filtering.
+
+    So the fence is structural now.  The read is a LATERAL subquery correlated
+    on ``br.rep_ts`` carrying its own GROUP BY: a lateral reference is
+    evaluated per outer row, and the grouping blocks subquery pull-up, so PG
+    cannot re-plan it as a hash/merge join over the window or the table.
+
+    Asserted against comment-stripped SQL — the CTE's comment names the join
+    shape this test forbids, so matching the raw string would pass on prose.
+    """
     db = DatabaseManager()
     conn = _RecordingConn(fetch_rows=[])
     _install_conn(db, conn)
@@ -78,7 +112,7 @@ def test_heatmap_join_keyed_on_rep_ts_and_fenced_to_window():
     asyncio.run(db.get_gex_heatmap("SPY", "1day", 10))
 
     assert conn.queries, "heatmap query was never executed"
-    sql = conn.queries[0]
+    sql = _sql_only(conn.queries[0])
 
     # Representative snapshot per bucket comes from the lightweight
     # gex_summary, not the per-strike table.
@@ -86,22 +120,57 @@ def test_heatmap_join_keyed_on_rep_ts_and_fenced_to_window():
     assert "FROM gex_summary" in sql
     assert "DISTINCT ON" in sql
 
-    assert "JOIN gex_by_strike g" in sql
-    gbs_idx = sql.index("gex_by_strike g")
-    tail = sql[gbs_idx:]
-    # Still keyed on the per-bucket representative (the point-lookup path)...
-    assert "g.timestamp = br.rep_ts" in tail
-    # ...AND fenced to the window so NO plan can scan the whole table. The
-    # bound must be a direct predicate on g.timestamp referencing time_window.
-    assert "g.timestamp BETWEEN" in tail
-    assert "start_time FROM time_window" in tail
-    assert "end_time FROM time_window" in tail
+    strikes_cte = sql[sql.index("strikes AS (") : sql.index(") cell")]
+
+    # Correlated LATERAL read: cannot be re-planned as a hash/merge join.
+    assert "CROSS JOIN LATERAL" in strikes_cte
+    assert "FROM gex_by_strike g" in strikes_cte
+    # Still keyed on the per-bucket representative (the point-lookup path).
+    assert "g.timestamp = br.rep_ts" in strikes_cte
+    # The lateral aggregates, which is what blocks PG from pulling it up into
+    # the parent and losing the nested loop.
+    assert "GROUP BY g.strike" in strikes_cte[strikes_cte.index("CROSS JOIN LATERAL") :]
+    # NOT re-planned back into a plain join on the table.
+    assert "JOIN gex_by_strike" not in strikes_cte.replace("CROSS JOIN LATERAL", "")
+
+    # Window bound retained as defence in depth.
+    assert "g.timestamp BETWEEN" in strikes_cte
+    assert "start_time FROM time_window" in strikes_cte
+    assert "end_time FROM time_window" in strikes_cte
 
     # The v1/v2 shapes must be gone.
     assert "recent_data AS" not in sql
     assert "filtered_data" not in sql
     assert "latest_price_timestamp AS" not in sql
     assert "latest_price AS" not in sql
+
+
+def test_heatmap_cells_stay_one_avg_per_bucket_strike():
+    """Cell values are unchanged by the lateral rewrite.
+
+    The cross-expiration combination per (bucket, strike) is still ``AVG`` over
+    that bucket's representative snapshot.  Grouping by strike *inside* the
+    lateral is identical to the old ``GROUP BY br.bucket_ts, g.strike``,
+    because ``bucket_reps`` is DISTINCT ON the bucket — one rep_ts per
+    bucket_ts — so the lateral runs against exactly one timestamp per group.
+
+    And unlike the strike-profile CTE, this one must NOT drop zero cells: a
+    zero is a real neutral cell on a heatmap, so a HAVING here would punch a
+    hole in the surface rather than trim a payload.
+    """
+    db = DatabaseManager()
+    conn = _RecordingConn(fetch_rows=[])
+    _install_conn(db, conn)
+    asyncio.run(db.get_gex_heatmap("SPY", "5min", 60))
+    sql = _sql_only(conn.queries[0])
+    strikes_cte = sql[sql.index("strikes AS (") : sql.index(") cell")]
+
+    assert "AVG(g.net_gex) AS net_gex" in strikes_cte
+    assert "GROUP BY g.strike" in strikes_cte
+    # One row per (bucket, strike): no second grouping key smuggled in.
+    assert "GROUP BY g.strike," not in strikes_cte
+    # No zero-cell filter.
+    assert "HAVING" not in strikes_cte
 
 
 def test_heatmap_anchor_is_gex_summary_not_underlying_quotes():
@@ -157,7 +226,7 @@ def test_heatmap_keeps_strike_band_around_underlying_spot():
     conn = _RecordingConn(fetch_rows=[])
     _install_conn(db, conn)
     asyncio.run(db.get_gex_heatmap("SPY", "5min", 60))
-    sql = conn.queries[0]
+    sql = _sql_only(conn.queries[0])
 
     assert "spot AS" in sql
     assert (
@@ -165,8 +234,12 @@ def test_heatmap_keeps_strike_band_around_underlying_spot():
         "<= (SELECT spot_close FROM spot) * 0.08" in sql
     )
     assert "<= 50" not in sql
+    # Applied inside the lateral, so the band prunes rows at the index probe
+    # rather than after the per-bucket read.
+    strikes_cte = sql[sql.index("strikes AS (") : sql.index(") cell")]
+    assert "ABS(g.strike - (SELECT spot_close FROM spot))" in strikes_cte
     # Newest-first, strike ascending — the documented row order.
-    assert "ORDER BY br.bucket_ts DESC, g.strike ASC" in sql
+    assert "ORDER BY s.bucket_ts DESC, s.strike ASC" in sql
 
 
 def test_heatmap_surfaces_gamma_flip_from_its_own_buckets():
@@ -180,7 +253,7 @@ def test_heatmap_surfaces_gamma_flip_from_its_own_buckets():
     conn = _RecordingConn(fetch_rows=[])
     _install_conn(db, conn)
     asyncio.run(db.get_gex_heatmap("SPX", "5min", 60))
-    sql = conn.queries[0]
+    sql = _sql_only(conn.queries[0])
 
     # gamma_flip_point is pulled from the representative gex_summary
     # snapshot selected inside bucket_reps.  (Since v4, gex_summary is
@@ -193,9 +266,13 @@ def test_heatmap_surfaces_gamma_flip_from_its_own_buckets():
     assert "gamma_flip_point AS gamma_flip" in reps
 
     # Emitted once per bucket (lowest strike), NULL on the other strikes.
-    assert "MIN(g.strike) OVER (PARTITION BY br.bucket_ts)" in sql
-    assert "THEN MAX(br.gamma_flip)" in sql
+    # The window function now runs over the strikes CTE, which is already one
+    # row per (bucket, strike) — so the flip is projected directly instead of
+    # being collapsed through a GROUP BY with MAX().
+    assert "MIN(s.strike) OVER (PARTITION BY s.bucket_ts)" in sql
+    assert "THEN s.gamma_flip" in sql
     assert "END AS gamma_flip" in sql
+    assert "THEN s.gamma_flip_span_used" in sql
 
 
 def test_heatmap_returns_mapped_rows():
@@ -280,7 +357,7 @@ def test_cash_index_heatmap_restricts_to_regular_session():
     bucket-floor subquery in time_window (so ``window_units`` counts only
     RTH buckets), and the per-bucket representatives (bucket_reps)."""
     captured = _run_and_capture("SPX")
-    sql = captured["query"]
+    sql = _sql_only(captured["query"])
 
     # Weekday + 09:30–16:00 ET band, mirroring get_session_closes.
     assert "EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5" in sql
@@ -290,8 +367,8 @@ def test_cash_index_heatmap_restricts_to_regular_session():
 
     # The session predicate is attached to all three gex_summary scans —
     # the latest_summary anchor, the bucket-floor subquery in time_window,
-    # and bucket_reps — but never to the gex_by_strike join.
-    join_idx = sql.index("JOIN gex_by_strike g")
+    # and bucket_reps — but never to the gex_by_strike read.
+    join_idx = sql.index("FROM gex_by_strike g")
     assert sql.count("EXTRACT(DOW") == 3
     extract_positions = [i for i in range(len(sql)) if sql.startswith("EXTRACT(DOW", i)]
     # All EXTRACT(DOW occurrences precede the join, none follow it.

@@ -7040,25 +7040,93 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window){session_filter}
                 ORDER BY {bucket}, timestamp DESC
+            ),
+            -- BOUNDED READ — the gex_by_strike probe is fenced to the
+            -- ~window_units bucket-representative timestamps by construction,
+            -- and no query plan can widen it.
+            --
+            -- This was a plain join on ``g.timestamp = br.rep_ts``, whose
+            -- intended plan is ~window_units index probes.  time_window /
+            -- bucket_reps are optimisation-fence CTEs, though, so the planner
+            -- cannot estimate how many rep_ts values the join probes and
+            -- periodically abandoned that nested loop for a merge/hash join
+            -- reading the ENTIRE gex_by_strike table -- the 15s "GEX heatmap
+            -- query timed out ... returning empty" path.  Commit 81586d8 added
+            -- a logically-redundant ``g.timestamp BETWEEN start_time AND
+            -- end_time`` bound to cap that fallback at the window's rows
+            -- rather than the table's.
+            --
+            -- Capping is not fixing, because the WINDOW is not the REP SET:
+            -- each bucket contributes ONE rep_ts out of every analytics
+            -- snapshot inside it, so the window holds ~``timeframe / cycle``
+            -- times more gex_by_strike timestamps than this read needs.  That
+            -- ratio is ~1x at 1min but ~5x at 5min, ~60x at 1hr and ~390x at
+            -- 1day -- and 1day x window_units=300 is a reachable request, so
+            -- this endpoint is far more exposed to the fallback than
+            -- get_strike_profile_timeseries was when the same gap put it into
+            -- the timeout log.  (The strike band caps how many rows SURVIVE,
+            -- not how many are read: the fallback scans the window off
+            -- idx_gex_by_strike_underlying_timestamp_strike and filters after.)
+            --
+            -- So the fence is structural now rather than another bound.  The
+            -- probe is a LATERAL subquery correlated on ``br.rep_ts``: a
+            -- lateral reference is evaluated per outer row, and this one
+            -- carries its own GROUP BY, which blocks subquery pull-up -- so PG
+            -- cannot re-plan it as a hash/merge join over the window or the
+            -- table.  The read is ~window_units equality probes whatever else
+            -- the planner does, flat in the window's span, so a 1day surface
+            -- costs what a 1min one costs.  The redundant window bound stays
+            -- as defence in depth but is no longer load-bearing.  Mirrors
+            -- get_strike_profile_timeseries.
+            --
+            -- Cells are unchanged: the cross-expiration combination per
+            -- (bucket, strike) is still AVG over that bucket's representative
+            -- snapshot, and grouping by strike inside the lateral is identical
+            -- to grouping by (bucket_ts, strike) -- bucket_reps is DISTINCT ON
+            -- the bucket, so bucket_ts <-> rep_ts is 1:1.  Unlike the
+            -- strike-profile CTE this one does NOT drop zero cells: a zero is
+            -- a real neutral cell on a heatmap, and dropping it would punch a
+            -- hole in the surface rather than trim a payload.
+            strikes AS (
+                SELECT
+                    br.bucket_ts,
+                    br.gamma_flip,
+                    br.gamma_flip_span_used,
+                    cell.strike,
+                    cell.net_gex
+                FROM bucket_reps br
+                CROSS JOIN LATERAL (
+                    SELECT
+                        g.strike,
+                        AVG(g.net_gex) AS net_gex
+                    FROM gex_by_strike g
+                    WHERE g.underlying = $1
+                      AND g.timestamp = br.rep_ts
+                      AND g.timestamp BETWEEN (SELECT start_time FROM time_window)
+                                          AND (SELECT end_time FROM time_window)
+                      AND ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
+                    GROUP BY g.strike
+                ) cell
             )
             SELECT
-                br.bucket_ts AS timestamp,
-                g.strike,
-                AVG(g.net_gex) AS net_gex,
+                s.bucket_ts AS timestamp,
+                s.strike,
+                s.net_gex,
                 -- gamma_flip is one value per bucket (the bucket's
                 -- representative gex_summary row), but rows here are
-                -- per-strike.  MAX() collapses that constant, and the
-                -- CASE emits it on only the lowest-strike row of each
-                -- bucket (NULL elsewhere) so it isn't repeated across
-                -- every strike.  The frontend keys the gamma-flip line
+                -- per-strike.  The CASE emits it on only the lowest-strike
+                -- row of each bucket (NULL elsewhere) so it isn't repeated
+                -- across every strike.  The frontend keys the gamma-flip line
                 -- by timestamp and skips NULLs, so one row per bucket is
-                -- enough — and because it now rides the heatmap's own
+                -- enough — and because it rides the heatmap's own
                 -- (RTH-filtered, over-fetched) timestamps the line spans
                 -- the full surface instead of the short /api/gex/historical
-                -- fallback window.
+                -- fallback window.  (It used to need MAX() to collapse the
+                -- constant through a GROUP BY; the strikes CTE now carries it
+                -- per row, so it is projected directly.)
                 CASE
-                    WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
-                    THEN MAX(br.gamma_flip)
+                    WHEN s.strike = MIN(s.strike) OVER (PARTITION BY s.bucket_ts)
+                    THEN s.gamma_flip
                 END AS gamma_flip,
                 -- Same broadcast pattern for the span the resolver
                 -- landed on (default rung vs expansion rung).  Frontend
@@ -7066,32 +7134,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 -- (live regime level) from an expansion-rung flip
                 -- (passed a looser bar — treat with caution).
                 CASE
-                    WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
-                    THEN MAX(br.gamma_flip_span_used)
+                    WHEN s.strike = MIN(s.strike) OVER (PARTITION BY s.bucket_ts)
+                    THEN s.gamma_flip_span_used
                 END AS gamma_flip_span_used
-            FROM bucket_reps br
-            JOIN gex_by_strike g
-                ON g.underlying = $1
-               AND g.timestamp = br.rep_ts
-               -- Logically REDUNDANT window bound (every br.rep_ts already lies
-               -- in [start_time, end_time] — bucket_reps was filtered to exactly
-               -- that range) but performance-critical: time_window / bucket_reps
-               -- are optimisation-fence CTEs, so the planner cannot estimate how
-               -- many rep_ts values the join probes and periodically abandons the
-               -- ~window_units-probe index nested loop for a merge/hash join that
-               -- reads the ENTIRE gex_by_strike table -- the 15s "GEX heatmap
-               -- query timed out ... returning empty" path.  With the bound, even
-               -- that fallback range-scans only the window's rows off
-               -- idx_gex_by_strike_underlying_timestamp_strike.  Mirrors the fix
-               -- in get_strike_profile_timeseries (commit c4d6463); this is the
-               -- fast-follow that commit flagged.
-               AND g.timestamp BETWEEN (SELECT start_time FROM time_window)
-                                   AND (SELECT end_time FROM time_window)
-            WHERE ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
-            GROUP BY br.bucket_ts, g.strike
-            ORDER BY br.bucket_ts DESC, g.strike ASC
+            FROM strikes s
+            ORDER BY s.bucket_ts DESC, s.strike ASC
         """
 
+        # Stamped before the pool acquire so the timeout log can tell the two
+        # ways this call can blow its budget apart: the 15s ceiling is on the
+        # fetch alone (asyncio.wait_for starts after a connection is in hand),
+        # so an elapsed of ~15s is a slow QUERY while anything materially above
+        # that is time spent queueing for a pool connection.
+        started = time_module.monotonic()
         try:
             async with self._acquire_connection() as conn:
                 rows = await asyncio.wait_for(
@@ -7128,8 +7183,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
         except asyncio.TimeoutError:
+            # Elapsed separates a slow query from pool starvation (see
+            # ``started`` above); timeframe already rides along and is what
+            # sets how wide the window is relative to the rep set.
             logger.warning(
-                f"GEX heatmap query timed out for {symbol} timeframe={timeframe} window={window_units}, returning empty"
+                "GEX heatmap query timed out after %.1fs for "
+                "%s timeframe=%s window=%s, returning empty",
+                time_module.monotonic() - started,
+                symbol,
+                timeframe,
+                window_units,
             )
             return []
         except Exception as e:
