@@ -148,11 +148,20 @@ and the report render *before* buying anything:
 
 ```bash
 make mmgex-sample-anchored          # synthetic FLOW over REAL contracts from your DB
-make mmgex-confirm REVIEWED=yes     # re-confirm (the file was regenerated)
+
+# The anchored files have NEW dates, so re-propose the mapping from one of them.
+# make-sample prints the exact command; the filename is in its output.
+make mmgex-inspect MMGEX_FILE=research_output/sample/SYNTHETIC_openclose_c1_<DATE>.csv
+make mmgex-confirm REVIEWED=yes
+
 make mmgex-dataset MMGEX_FILES=research_output/sample/ \
     START=<printed anchor start> END=<printed anchor end>
 make mmgex-backtest
 ```
+
+The re-inspect matters even though the columns happen to be identical: a profile
+carries the name of the file it was proposed from, and reusing one across deliveries is
+how a stale mapping survives a schema change. `mmgex-confirm` prints that provenance.
 
 `mmgex-sample-anchored` reads your database (read-only, bounded: a ±3% strike band, a
 few expirations, a few recent sessions) and prints exactly which contracts and sessions
@@ -383,7 +392,8 @@ regardless, under `universes` in the JSONL — a 0DTE-only conclusion never need
 | `No gex_summary timestamps for SPX in [...]` | study window predates ZeroGEX's own retention | pick a window ZeroGEX has data for, or use `option_chains_archive` depth |
 | `listing dates resolved for 0 series` | the Open-Close expirations/strikes do not exist in your chain | expected for the plain sample; with real Cboe files it means the chain history does not cover those contracts, and censoring falls back to the window heuristic |
 | `No SPX analytics rows found to anchor to` | no recent `gex_summary` rows for that symbol | check the analytics service is writing, or pass `SYMBOL=` |
-| Dataset build is slow | it re-prices the full chain twice per snapshot | raise `--step-minutes` (e.g. 15) for a first pass |
+| Dataset build is slow | it re-prices the full chain twice per snapshot | raise `--step-minutes` (default 15; try 30-60 on a first pass). The progress line reports a rate and an ETA |
+| `canceling statement due to statement timeout` | a setup query outgrew the pool ceiling | the timed `[phase]` lines name which one. Research reads get 5 min by default (`MMGEX_STATEMENT_TIMEOUT_MS`); if it is the listing-date scan, lower `--listing-lookback-days` |
 | `No profile file at '...'` | step 1 never produced it (or you skipped step 1) | run `mmgex-inspect` first; the error prints the exact command |
 | `[Errno 2] No such file or directory: '/path/to/...'` | a placeholder was run literally | substitute your real path, or use `make mmgex-sample` to rehearse |
 | `none of the N file(s) found matched profile` | wrong profile for this directory | re-run `mmgex-inspect` on a file from *this* delivery |
