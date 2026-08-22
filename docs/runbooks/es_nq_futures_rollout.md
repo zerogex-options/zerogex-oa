@@ -102,6 +102,19 @@ old overnight-only gate slept through. Set it `false` and ES/NQ silently fall
 back to theoretical cost-of-carry: the levels still render, they are just
 modelled rather than observed, and `basis_source` will read `carry`.
 
+### Strongly recommended
+
+```bash
+DIVIDEND_YIELD_BY_SYMBOL='{"SPX": 0.013, "NDX": 0.007}'
+```
+
+`DIVIDEND_YIELD` defaults to `0.0` — deliberately, because the Greeks engine
+wants it that way. The cost-of-carry FALLBACK reuses it, so with no per-symbol
+override it prices `e^(r·T)` with no dividend at all and overstates the basis
+by roughly a factor of two (on SPX ≈ 83 points instead of ≈ 44). That only
+bites while `basis_source` is `carry`, which is already a fault state — but it
+makes the fault much worse than it needs to be, and the override costs nothing.
+
 ### Leave alone for now
 
 ```bash
