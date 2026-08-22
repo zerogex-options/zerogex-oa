@@ -572,3 +572,51 @@ def test_sample_generator_never_closes_more_than_a_position_holds():
         position[1] -= int(row["market_maker_close_buy"])
         assert position[0] >= 0, "closing sells exceeded the long position"
         assert position[1] >= 0, "closing buys exceeded the short position"
+
+
+def test_sample_generator_clears_its_own_previous_output(tmp_path):
+    """A second run must not leave the first run's files behind.
+
+    Regenerating (or switching to --anchor-to-db) used to leave the earlier
+    files in place, and the loader consumed BOTH — producing one "delivery"
+    spanning two unrelated windows with a months-long hole in the middle.
+    """
+    from research.mm_attributed_gex.sample import write_sample_files
+
+    june = write_sample_files(
+        tmp_path,
+        sessions=[date(2026, 6, 1), date(2026, 6, 2)],
+        expirations=[date(2026, 6, 5)],
+        strikes=[6000.0, 6025.0],
+        interval_minutes=60,
+    )
+    assert all(p.exists() for p in june)
+
+    august = write_sample_files(
+        tmp_path,
+        sessions=[date(2026, 8, 17), date(2026, 8, 18)],
+        expirations=[date(2026, 8, 21)],
+        strikes=[7500.0, 7525.0],
+        interval_minutes=60,
+    )
+    assert all(p.exists() for p in august)
+    assert not any(p.exists() for p in june), "previous run was left behind"
+
+    remaining = sorted(p.name for p in tmp_path.glob("SYNTHETIC_openclose_c1_*.csv"))
+    assert remaining == sorted(p.name for p in august)
+
+
+def test_sample_generator_leaves_unrelated_files_alone(tmp_path):
+    """The cleanup is scoped to this generator's own filename prefix."""
+    from research.mm_attributed_gex.sample import write_sample_files
+
+    keeper = tmp_path / "real_cboe_delivery_20260817.csv"
+    keeper.write_text("do not delete me", encoding="utf-8")
+    write_sample_files(
+        tmp_path,
+        sessions=[date(2026, 8, 17)],
+        expirations=[date(2026, 8, 21)],
+        strikes=[7500.0],
+        interval_minutes=60,
+    )
+    assert keeper.read_text() == "do not delete me"

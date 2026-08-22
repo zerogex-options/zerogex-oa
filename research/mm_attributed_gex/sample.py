@@ -231,6 +231,21 @@ def write_sample_files(
     """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
+
+    # Clear this generator's own previous output.  Without it a second run —
+    # re-generating with different sessions, or switching to --anchor-to-db —
+    # leaves the earlier files in place, and the loader dutifully consumes
+    # BOTH.  The result is one "delivery" spanning two unrelated windows with a
+    # months-long hole in the middle, which is not a scenario any operator
+    # meant to create.  Scoped to the SYNTHETIC_ prefix this generator writes,
+    # so a directory holding real files alongside them is untouched.
+    removed = 0
+    for stale in sorted(directory.glob("SYNTHETIC_openclose_c1_*.csv")):
+        stale.unlink()
+        removed += 1
+    if removed:
+        print(f"  (removed {removed} file(s) from a previous sample run)")
+
     (directory / "README_SYNTHETIC.txt").write_text(_README, encoding="utf-8")
 
     if sessions is None:
