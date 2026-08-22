@@ -510,6 +510,38 @@ no result exists.** This section will hold the answer once real files are availa
 until then it deliberately holds nothing, because a fabricated or extrapolated figure
 here would be worse than an empty section.
 
+### Verified end to end against production infrastructure (2026-08-22)
+
+Every step ran on the live host against the production database — read-only — using
+synthetic Market Maker flow anchored to real SPX contracts (`make mmgex-sample-anchored`).
+The flow was invented, so no number below is a finding about the market; what it
+establishes is that the pipeline works on real infrastructure:
+
+| Step | Result |
+|---|---|
+| `check-load` | 107,264 records from 5 files, 0 skipped, 0 errors |
+| `reconstruct` | 90 series; 38 clean / 52 left-censored; zero-sum residual 0.0 |
+| `build-dataset` | 209 snapshots in 225s (~0.9/s); `data_completeness` 1.0, 0 session gaps |
+| `backtest` | 3,531 bars scored; verdict `INCONCLUSIVE_DATA` |
+
+The verdict is the important line. Coverage came out at 0.4% of the production gamma
+universe — the anchor deliberately samples a narrow slice (15 strikes in a ±3% band,
+3 expirations) so a rehearsal does not hammer the database — and the completeness gate
+fired *before* any effect was examined, which is the behavior §7 specifies. An
+under-reconstructed run cannot be mistaken for a negative result.
+
+Two things that run showed which are worth carrying into a real study:
+
+* **Left-censoring is the binding constraint, and it is visible immediately.**  Those
+  were real SPX contracts expiring 8/21–8/25, listed weeks before the 5-session window
+  opened; the listing-date lookup found them in the chain with a first appearance
+  before the window start and correctly classified 52 of 90 as
+  `listed_before_data_window`.  Five sessions of Open-Close against contracts listed
+  weeks earlier yields a minority of usable series — which is §4.3's history-depth
+  requirement, observed rather than argued.
+* **Cost.**  ~0.9 snapshots/second at `--step-minutes 15`, plus a one-off
+  ~40s listing-date scan.  A two-month study is a multi-hour run; start coarse.
+
 What has been established, without market data:
 
 * The experiment's gamma math is **bit-identical** to production's. The sign-encoding
