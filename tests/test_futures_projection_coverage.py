@@ -6,8 +6,11 @@ on the same chart as fields that did move.  Two incompatible price axes in
 one response is the worst failure mode this feature has, precisely because it
 looks plausible.
 
-So this test walks every response model registered on the API, collects every
-numeric field name, and asserts each one is deliberately classified as either
+Scope is the routes the middleware will actually project
+(``_PROJECTABLE_PREFIXES``) — the same tuple it tests at runtime, imported
+rather than restated so the two cannot drift. This test walks the response
+models on those routes, collects every numeric field name, and asserts each
+one is deliberately classified as either
 
   * projected           (``PRICE_FIELDS``),
   * explicitly denied   (``NEVER_PROJECT``), or
@@ -110,6 +113,7 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "dte",
         "window_minutes",
         "data_age_seconds",
+        "age_seconds",  # /api/v1/levels freshness, not a price
         "tod_bucket",
         "tod_bucket_used",
     }
@@ -136,9 +140,42 @@ def _nested_models(annotation):
                 yield inner
 
 
-def _collect_numeric_fields() -> set:
-    from src.api.main import app
+def _projectable_routes():
+    """Every route the middleware will actually project, models included.
 
+    ``app.routes`` alone is NOT enough: FastAPI materialises an included
+    APIRouter as an opaque route object, so 19 routers — and roughly
+    two-thirds of the response models — are invisible from there. An earlier
+    version of this test walked only ``app.routes`` and therefore checked 24
+    of 146 paths while claiming to be exhaustive.
+    """
+    import fastapi
+
+    import src.api.main as main_module
+    from src.api.futures_middleware import _PROJECTABLE_PREFIXES
+
+    routes = list(main_module.app.routes)
+    for value in vars(main_module).values():
+        if isinstance(value, fastapi.APIRouter):
+            routes.extend(value.routes)
+
+    # Router routes already carry their prefix on ``path``, so a plain
+    # startswith against the middleware's own tuple is the exact same test the
+    # middleware performs at runtime — which is the point: this must not drift
+    # from it.
+    seen_paths = set()
+    out = []
+    for route in routes:
+        path = getattr(route, "path", None)
+        if not path or path in seen_paths:
+            continue
+        if path.startswith(_PROJECTABLE_PREFIXES):
+            seen_paths.add(path)
+            out.append(route)
+    return out
+
+
+def _collect_numeric_fields() -> set:
     numeric: set = set()
     visited: set = set()
 
@@ -154,13 +191,19 @@ def _collect_numeric_fields() -> set:
             for nested in _nested_models(field.annotation):
                 walk(nested, depth + 1)
 
-    for route in app.routes:
+    for route in _projectable_routes():
         response_model = getattr(route, "response_model", None)
         if response_model is None:
             continue
         for model in _nested_models(response_model):
             walk(model)
     return numeric
+
+
+def test_the_walk_actually_reaches_the_projectable_routes():
+    """A silent zero here is how the previous version passed while blind."""
+    routes = _projectable_routes()
+    assert len(routes) >= 8, f"only matched {len(routes)} projectable routes: {routes}"
 
 
 def test_every_numeric_response_field_is_classified():

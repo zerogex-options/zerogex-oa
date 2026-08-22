@@ -24,9 +24,35 @@ at its 16:00 close, so a *projected* spot would report where ES stood at the
 bell rather than where it is trading. The levels stay correct in the same
 window, because the option book behind them likewise has not moved.
 
-Per-contract option endpoints (`/api/option/*`, `/api/tools/option-calculator`)
-answer **400** for ES/NQ. There is no ES chain, and an SPX contract with its
-strike scaled is not something anyone can trade.
+### Which endpoints serve ES/NQ
+
+The axis is chosen **per route from an allowlist**, never inferred. An audit
+showed a field-level allowlist cannot be made safe: price values also live in
+endpoints with no response model at all (raw dicts — nothing to check), arrive
+as JSON strings on models declaring `Decimal` without `json_encoders`, and on
+the signal and forecast cards are embedded in free-text `rationale` prose,
+which no projector can rewrite. A missed field draws a cash-index number on a
+futures chart with nothing to mark it.
+
+| Surface | ES/NQ behaviour |
+|---|---|
+| `/api/gex/summary`, `/profile`, `/by-strike`, `/heatmap`, `/historical*`, `/strike-profile-timeseries`, `/expirations` | projected |
+| `/api/v1/levels/*`, `/api/technicals*`, `/api/max-pain/*` | projected |
+| `/api/market/quote`, `/historical`, `/session-closes`, `/session-levels` | served natively from the future's own bars |
+| **everything else** | **400** with a message naming the backing index |
+
+That last row is deliberate and includes `/api/signals/*`, `/api/forecast*`,
+`/api/flow/*`, `/api/forced-flow/*`, `/api/option/*`,
+`/api/tools/option-calculator`, `/api/backtest/*`, `/api/replay/*`. Those pages
+will show an error for ES/NQ; the options calculator renders an explicit
+"not available" panel instead.
+
+**To add an endpoint later:** read its response model (or its raw dict),
+classify every numeric field into `PRICE_FIELDS` or `NEVER_PROJECT` in
+`src/jobs/futures_projection.py`, then add the path prefix to
+`_PROJECTABLE_PREFIXES` in `src/api/futures_middleware.py`.
+`tests/test_futures_projection_coverage.py` imports that same tuple and will
+fail until every numeric field on the newly-added route is classified.
 
 Reference: `src/jobs/futures_projection.py`, `src/api/futures_middleware.py`.
 

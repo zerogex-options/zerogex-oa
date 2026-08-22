@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, date as date_type
+from datetime import datetime, timedelta, timezone, date as date_type
 from enum import IntEnum
 import os
 from src.config import _getenv_str
@@ -1212,7 +1212,7 @@ from src.market_calendar import (  # noqa: E402
     is_futures_session_open,
     current_cash_close_reference,
 )
-from src.config import _getenv_bool  # noqa: E402
+from src.config import _getenv_bool, _getenv_float  # noqa: E402
 from src.symbols import resolve_futures_index, resolve_index_future  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
@@ -1243,6 +1243,12 @@ async def _native_futures_session_closes(futures_symbol: str, index_symbol: str)
     return SessionCloses(**{**data, "symbol": futures_symbol})
 
 
+# A futures bar older than this while CME is open means the feed is dead, not
+# that the market is quiet — 1-minute bars print continuously through the
+# session.
+_FUTURES_QUOTE_STALE_MINUTES = _getenv_float("FUTURES_QUOTE_STALE_MINUTES", 5.0)
+
+
 async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> UnderlyingQuote:
     """Latest observed bar for a first-class future (ES / NQ).
 
@@ -1262,7 +1268,20 @@ async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> Under
         in ("timestamp", "open", "high", "low", "close", "up_volume", "down_volume", "volume")
     }
     payload["symbol"] = futures_symbol
-    payload["session"] = "open" if is_futures_session_open() else "closed"
+
+    # Derive the session from DATA FRESHNESS, not the clock alone. If the
+    # futures ingester dies at 03:00 (stream-slot cap, expired refresh token —
+    # both paths just back off and retry, nothing raises), a clock-derived
+    # "open" would keep this frozen 03:00 bar flowing onto the live chart tip
+    # for hours with nothing to mark it stale. Reporting "closed" makes the
+    # frontend stop merging it (see isSessionLive) while still serving the
+    # last known price, which is more useful than a 404.
+    bar_ts = payload.get("timestamp")
+    stale = False
+    if bar_ts is not None:
+        age_minutes = (datetime.now(timezone.utc) - bar_ts).total_seconds() / 60.0
+        stale = age_minutes > _FUTURES_QUOTE_STALE_MINUTES
+    payload["session"] = "open" if is_futures_session_open() and not stale else "closed"
     return UnderlyingQuote(**payload)
 
 

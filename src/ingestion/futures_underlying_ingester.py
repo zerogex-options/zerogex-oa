@@ -55,7 +55,7 @@ from src.config import _getenv_int, _getenv_bool, _getenv_str, API_REQUEST_TIMEO
 from src.market_calendar import is_futures_ingest_window
 from src.symbols import resolve_index_future
 from src.utils import get_logger
-from src.validation import safe_float, safe_datetime
+from src.validation import bucket_timestamp, safe_float, safe_datetime
 
 logger = get_logger(__name__)
 
@@ -100,6 +100,14 @@ def _parse_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ts = safe_datetime(raw.get("TimeStamp"), field_name="TimeStamp")  # type: ignore[arg-type]
     if ts is None:
         return None
+    # Stamp the bar with its OWN minute, matching underlying_quotes (see
+    # main_engine.py, same expression and the same reason). TradeStation
+    # stamps a bar at its CLOSE, so storing it raw put futures_quotes one
+    # minute ahead of the contemporaneous underlying_quotes row — and the
+    # basis join then paired each futures bar with the NEXT minute's index
+    # print, biasing the measured ratio by a minute of drift whenever the
+    # market was trending. A bar stamped mid-interval floors unchanged.
+    ts = bucket_timestamp(ts - timedelta(seconds=1), 60)
     o = safe_float(raw.get("Open"), field_name="Open", default=None)
     h = safe_float(raw.get("High"), field_name="High", default=None)
     low = safe_float(raw.get("Low"), field_name="Low", default=None)

@@ -16,13 +16,14 @@ Every request falls into exactly one of four buckets:
    rewritten and the response is NOT projected: these endpoints carry
    OBSERVED prices, and projecting a frozen 16:00 SPX print would report
    where ES stood at the bell rather than where it is now.
-3. **Unsupported** (:data:`_UNSUPPORTED_PREFIXES`) — per-contract option
-   endpoints.  There is no ES option chain in ZeroGEX, so an SPX contract
-   relabelled ES would be a fabrication; these answer 400 instead.
-4. **Projected** — everything else: rewrite the symbol inbound, project the
-   allowlisted price fields outbound, relabel, attach a ``projection`` block
-   recording the ratio used, and substitute the observed futures print for
-   any spot-like field.
+3. **Projected** (:data:`_PROJECTABLE_PREFIXES`) — an endpoint whose payload
+   has been audited field by field: rewrite the symbol inbound, project the
+   allowlisted price fields outbound, relabel, substitute the observed futures
+   print for spot, reconcile the spot-derived deltas, and attach a
+   ``projection`` block recording the ratio used.
+4. **Everything else** — answered 400.  Projecting an unaudited payload is
+   how a cash-index number ends up drawn on a futures chart with nothing to
+   mark it, so the axis is chosen per route and never guessed.
 
 Why pure ASGI rather than ``BaseHTTPMiddleware``: the latter wraps every
 request in an anyio task group and buffers through a stream even when the
@@ -65,13 +66,33 @@ _NATIVE_PATHS = frozenset(
     }
 )
 
-# Per-contract option surfaces.  ZeroGEX ingests no options on futures, so
-# there is nothing truthful to return for ES / NQ here — an SPX contract with
-# its strike multiplied by the basis is not a contract anyone can trade, and
-# the strike would no longer round-trip back to the chain it came from.
-_UNSUPPORTED_PREFIXES = (
-    "/api/option/",
-    "/api/tools/option-calculator",
+# Endpoints whose payloads have been AUDITED field-by-field and are safe to
+# project.  This is an allowlist, and it is the single most important safety
+# property of the feature.
+#
+# The original design allowlisted FIELDS and projected any endpoint.  An audit
+# showed that cannot be made safe: price values also live in endpoints with no
+# response_model at all (raw dicts, so no schema to check), arrive as JSON
+# strings on models that declare Decimal without json_encoders, and — on the
+# signal and forecast cards — are embedded in free-text ``rationale`` prose,
+# which no projector can rewrite.  A missed field renders a cash-index number
+# on a futures chart with nothing to indicate it.
+#
+# So the axis is chosen per ROUTE.  Anything not listed here answers 400 for a
+# futures symbol rather than guessing.  To add an endpoint: read its response
+# model (or its raw dict), classify every numeric field, extend PRICE_FIELDS /
+# NEVER_PROJECT, then add the prefix.
+_PROJECTABLE_PREFIXES = (
+    "/api/gex/summary",
+    "/api/gex/profile",
+    "/api/gex/by-strike",
+    "/api/gex/heatmap",
+    "/api/gex/historical",  # also covers /historical-context
+    "/api/gex/strike-profile-timeseries",
+    "/api/gex/expirations",
+    "/api/max-pain/",
+    "/api/technicals",
+    "/api/v1/levels",
 )
 
 # Responses larger than this are projected anyway but logged: the walk is
@@ -169,6 +190,59 @@ def _db_manager():
     return db_manager
 
 
+# Deltas the analytics engine computed against the CASH spot. Once the observed
+# futures print is substituted for spot they describe the wrong reference, so
+# they are re-derived from the values now in the payload. Each entry is
+# (target, minuend, subtrahend); all three must be siblings for it to apply.
+_SPOT_DERIVED = (
+    ("difference", "max_pain", "underlying_price"),
+    ("difference_from_underlying", "max_pain", "underlying_price"),
+    ("distance_from_spot", "strike", "spot_price"),
+)
+
+
+def _as_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _reconcile_spot_derived(payload: Any, spot: float) -> None:
+    """Re-derive spot-relative deltas in place, after the spot substitution.
+
+    Without this, ``difference`` still says how far max pain sat from the
+    FROZEN cash close while ``underlying_price`` beside it reads the live
+    future — two numbers in one payload that no longer subtract to each other.
+    """
+    if isinstance(payload, dict):
+        for target, minuend, subtrahend in _SPOT_DERIVED:
+            if target not in payload:
+                continue
+            left = _as_number(payload.get(minuend))
+            right = _as_number(payload.get(subtrahend))
+            if right is None and subtrahend in ("underlying_price", "spot_price"):
+                right = spot
+            if left is None or right is None:
+                continue
+            payload[target] = (
+                str(left - right) if isinstance(payload[target], str) else left - right
+            )
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                _reconcile_spot_derived(value, spot)
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, (dict, list)):
+                _reconcile_spot_derived(item, spot)
+
+
 class FuturesProjectionMiddleware:
     """Answer ES / NQ requests from the SPX / NDX surfaces (pure ASGI)."""
 
@@ -187,26 +261,39 @@ class FuturesProjectionMiddleware:
             return
 
         futures_symbol, index_symbol = target
-        path = scope.get("path", "")
+
+        # Normalise the trailing slash before deciding anything. Starlette
+        # would otherwise 307 to the REWRITTEN scope, handing the caller a
+        # Location of ?symbol=SPX — un-projected cash levels under an ES
+        # request, which is the one outcome this whole design exists to
+        # prevent. It also made the exact-match native carve-out below miss
+        # "/api/market/quote/" entirely.
+        path = scope.get("path", "").rstrip("/") or "/"
+        if path != scope.get("path"):
+            scope["path"] = path
+            scope["raw_path"] = path.encode("latin-1")
 
         if path in _NATIVE_PATHS:
             await self.app(scope, receive, send)
             return
 
-        if path.startswith(_UNSUPPORTED_PREFIXES):
-            await self._reject(send, futures_symbol, index_symbol)
+        if not path.startswith(_PROJECTABLE_PREFIXES):
+            await self._reject(send, futures_symbol, index_symbol, path)
             return
 
         _rewrite_scope(scope, futures_symbol, index_symbol)
         await self._project_response(scope, receive, send, futures_symbol, index_symbol)
 
-    async def _reject(self, send, futures_symbol: str, index_symbol: str) -> None:
+    async def _reject(self, send, futures_symbol: str, index_symbol: str, path: str) -> None:
+        """Refuse rather than guess an axis for an unaudited endpoint."""
         body = json.dumps(
             {
                 "detail": (
-                    f"{futures_symbol} has no option chain of its own — its levels are "
-                    f"{index_symbol} option-derived. Per-contract option endpoints are "
-                    f"only available for {index_symbol}."
+                    f"{path} is not available for {futures_symbol}. "
+                    f"{futures_symbol} carries no option chain of its own — its levels are "
+                    f"{index_symbol} option-derived — and this endpoint has not been audited "
+                    f"for projection onto the futures price axis. Request it as "
+                    f"{index_symbol}."
                 )
             }
         ).encode("utf-8")
@@ -297,8 +384,11 @@ class FuturesProjectionMiddleware:
         await self.app(scope, receive, capture)
 
         if not started and status is not None:
-            # Body never arrived (empty response); relay what we have.
-            await self._passthrough(send, status, headers, b"")
+            # The app never sent a terminal body message. Relay whatever was
+            # buffered rather than manufacturing an empty 200 over the top of
+            # it — discarding the chunks here would turn a real response into
+            # a silent Content-Length: 0.
+            await self._passthrough(send, status, headers, b"".join(chunks))
 
     async def _passthrough(self, send, status, headers, body: bytes) -> None:
         out_headers = [
@@ -328,7 +418,10 @@ class FuturesProjectionMiddleware:
             if live is not None:
                 for spot_key in SPOT_FIELDS:
                     if spot_key in projected and projected[spot_key] is not None:
-                        projected[spot_key] = live
+                        projected[spot_key] = (
+                            str(live) if isinstance(projected[spot_key], str) else live
+                        )
+                _reconcile_spot_derived(projected, live)
 
         if isinstance(projected, dict):
             projected["projection"] = projection_metadata(basis)

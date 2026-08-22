@@ -405,12 +405,30 @@ def project_value(
 
     ``key`` is None for a list element with no projectable parent key, which
     correctly falls through to "leave it alone".
+
+    Numbers can arrive as JSON STRINGS.  Several response models declare
+    ``Decimal`` without the ``json_encoders`` config that converts it to a
+    float (max-pain, the flow points, momentum divergence), and Pydantic v2
+    serialises a bare ``Decimal`` as a string.  A type check for int/float
+    alone therefore skipped every price on those endpoints — they shipped raw
+    cash-index numbers under an ES label.  The string form is preserved on the
+    way out so the response schema does not change under clients.
     """
     if key is None or key in NEVER_PROJECT or key not in PRICE_FIELDS:
         return value
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or value is None:
         return value
-    return basis.project(float(value), tick=tick)
+    if isinstance(value, (int, float)):
+        return basis.project(float(value), tick=tick)
+    if isinstance(value, str):
+        try:
+            numeric = float(value)
+        except ValueError:
+            return value
+        if numeric != numeric or numeric in (float("inf"), float("-inf")):
+            return value
+        return str(basis.project(numeric, tick=tick))
+    return value
 
 
 def project_payload(

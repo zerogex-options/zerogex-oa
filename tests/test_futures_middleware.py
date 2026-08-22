@@ -9,9 +9,10 @@ number that looks plausible and is wrong:
 
 * a request naming no future must pass through completely untouched;
 * endpoints serving OBSERVED futures prices must be bypassed, not projected;
-* per-contract option endpoints must refuse rather than fabricate an ES
-  contract out of an SPX one;
-* everything else is projected, relabelled, and disclosed.
+* an UNAUDITED endpoint must refuse rather than guess an axis — the axis is
+  chosen per route from an allowlist, never inferred;
+* an audited endpoint is projected, relabelled, spot-substituted and
+  disclosed.
 
 Driven through a stub app rather than the real one, so the contract is pinned
 independently of any endpoint.
@@ -95,7 +96,10 @@ def _client() -> TestClient:
             Route("/api/market/session-levels", native),
             Route("/api/option/quote", option),
             Route("/api/tools/option-calculator", option),
-            Route("/api/text", text),
+            Route("/api/signals/action", option),
+            Route("/api/flow/contracts", option),
+            Route("/api/forecast", option),
+            Route("/api/technicals/text", text),
         ]
     )
     app.add_middleware(fm.FuturesProjectionMiddleware)
@@ -130,16 +134,26 @@ def test_observed_price_endpoints_are_bypassed(path):
     assert "projection" not in body
 
 
-# --- bucket 3: per-contract option endpoints refuse ------------------------
+# --- bucket 3: unaudited endpoints refuse ----------------------------------
 
 
-@pytest.mark.parametrize("path", ["/api/option/quote", "/api/tools/option-calculator"])
-def test_per_contract_option_endpoints_refuse_futures(path):
-    """An SPX contract with its strike scaled is not a tradable contract."""
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/option/quote",  # an SPX contract with a scaled strike is untradable
+        "/api/tools/option-calculator",
+        "/api/signals/action",  # rationale prose embeds SPX prices; unprojectable
+        "/api/flow/contracts",  # per-contract strikes
+        "/api/forecast",  # mixes projected walls with unprojected range/actuals
+    ],
+)
+def test_unaudited_endpoints_refuse_futures(path):
+    """Projecting an unaudited payload is how a cash number lands on an ES chart."""
     resp = _client().get(f"{path}?symbol=ES")
     assert resp.status_code == 400
     detail = resp.json()["detail"]
     assert "ES" in detail and "SPX" in detail
+    assert path in detail
 
 
 # --- bucket 4: projection --------------------------------------------------
@@ -196,7 +210,8 @@ def test_projection_metadata_and_header_disclose_the_derivation():
 
 
 def test_non_json_responses_are_left_alone():
-    resp = _client().get("/api/text?symbol=ES")
+    """Non-JSON on an ALLOWLISTED route still passes through unchanged."""
+    resp = _client().get("/api/technicals/text?symbol=ES")
     assert resp.status_code == 200
     assert resp.text == "not json"
 
@@ -239,3 +254,46 @@ def test_unrelated_query_params_survive_the_rewrite():
     assert q["expirations"] == ["all"]
     assert q["timeframe"] == ["5min"]
     assert q["window_units"] == ["192"]
+
+
+# --- round-2 regressions ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/gex/summary", "/api/market/quote", "/api/v1/levels/ES"],
+)
+def test_a_trailing_slash_never_leaks_the_backing_index(path):
+    """Starlette builds its 307 from the scope. Rewriting the scope BEFORE
+    routing therefore handed the caller a Location of ?symbol=SPX — raw cash
+    levels, no projection block, under an ES request."""
+    sep = "&" if "?" in path else "?"
+    query = "" if path.endswith("/ES") else f"{sep}symbol=ES"
+    resp = _client().get(f"{path}/{query}", follow_redirects=False)
+    assert resp.status_code != 307, f"{path} redirected: {resp.headers.get('location')}"
+    assert "symbol=SPX" not in (resp.headers.get("location") or "")
+
+
+def test_string_encoded_decimals_are_projected():
+    """Several models declare Decimal without json_encoders, so Pydantic v2
+    serialises them as JSON strings — which a plain int/float check skips."""
+    from src.jobs.futures_projection import project_payload, projection_tick
+
+    out = project_payload(
+        {"max_pain": "6620.0000", "call_notional": "1.0e8"},
+        BASIS,
+        tick=projection_tick("ES"),
+    )
+    assert isinstance(out["max_pain"], str), "the wire type must not change"
+    assert float(out["max_pain"]) == pytest.approx(6664.25)
+    assert out["call_notional"] == "1.0e8"  # exposure, untouched
+
+
+def test_spot_derived_deltas_are_reconciled_after_substitution():
+    """`difference` was computed against the frozen cash spot; once the live
+    futures print replaces underlying_price the two must still subtract."""
+    from src.api.futures_middleware import _reconcile_spot_derived
+
+    payload = {"max_pain": 6700.0, "underlying_price": LIVE_ES, "difference": 80.0}
+    _reconcile_spot_derived(payload, LIVE_ES)
+    assert payload["difference"] == pytest.approx(6700.0 - LIVE_ES)

@@ -5856,17 +5856,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         query = """
             WITH marks AS (
                 SELECT
-                    (timestamp AT TIME ZONE 'US/Eastern')::date AS et_date,
+                    (timestamp AT TIME ZONE 'America/New_York')::date AS et_date,
                     timestamp,
                     close,
                     ROW_NUMBER() OVER (
-                        PARTITION BY (timestamp AT TIME ZONE 'US/Eastern')::date
+                        PARTITION BY (timestamp AT TIME ZONE 'America/New_York')::date
                         ORDER BY timestamp DESC
                     ) AS rn
                 FROM futures_quotes
                 WHERE index_symbol = $1
-                  AND (timestamp AT TIME ZONE 'US/Eastern')::time
+                  AND timestamp <= NOW()
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time
                         BETWEEN TIME '09:30' AND TIME '16:00'
+                  -- Exclude the session still in progress. Without this the
+                  -- newest bar of a half-finished day is treated as "today's
+                  -- close", so the day change is measured against a price a
+                  -- few minutes old and ES/NQ reads ~0.00% all session.
+                  AND (
+                      (timestamp AT TIME ZONE 'America/New_York')::date
+                          < (NOW() AT TIME ZONE 'America/New_York')::date
+                      OR (NOW() AT TIME ZONE 'America/New_York')::time >= TIME '16:00'
+                  )
             )
             SELECT et_date, timestamp, close
             FROM marks
@@ -5883,6 +5893,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 "symbol": index_symbol,
                 "current_session_close": rows[0]["close"],
                 "current_session_close_ts": rows[0]["timestamp"],
+                # One completed session on record (cold deploy): repeat it rather
+                # than 404 the header, and accept that the day change reads 0.00%
+                # until a second session lands. The model requires both values.
                 "prior_session_close": (rows[1]["close"] if len(rows) > 1 else rows[0]["close"]),
                 "prior_session_close_ts": (
                     rows[1]["timestamp"] if len(rows) > 1 else rows[0]["timestamp"]
