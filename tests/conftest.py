@@ -36,6 +36,16 @@ os.environ["BULLETIN_TWEET_ARTIFACT_DIR"] = tempfile.mkdtemp(prefix="zerogex-tes
 _PINNED_DEFAULTS = {
     # src/api/database.py: DatabaseManager.__init__
     "FLOW_SERIES_USE_SNAPSHOT": "false",
+    # src/api/freshness.py cadence profiles. The v2 freshness envelope
+    # advertises the cadence the engines actually run on, so it reads these
+    # live rather than copying their defaults — which means an operator .env
+    # that retunes a poll interval changes what the envelope reports, and the
+    # cadence assertions in test_api_v2_freshness_envelope.py would fail on
+    # the server while CI (no .env) stayed green. Pin to the code defaults.
+    "ANALYTICS_INTERVAL": "60",  # src/config.py
+    "ANALYTICS_OFF_HOURS_INTERVAL_SECONDS": "300",  # src/analytics/main_engine.py
+    "MARKET_HOURS_POLL_INTERVAL": "5",  # src/config.py
+    "EXTENDED_HOURS_POLL_INTERVAL": "30",  # src/config.py
     # src/analytics/main_engine.py: AnalyticsEngine.__init__. These two flags
     # each add a DB round-trip to _get_snapshot (the cache query / the
     # extended-hours spot re-anchor fetchone). The snapshot tests mock an exact
