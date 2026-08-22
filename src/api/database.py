@@ -5778,7 +5778,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         earliest available bar's open is used.
         """
         index_symbol = index_symbol.upper()
-        cache_key = f"latest_future_quote:{index_symbol}"
+        # session_start belongs in the key: it selects ``reference_close``,
+        # so two callers passing different anchors must not share an entry.
+        # (The ES/NQ spot lookup passes None; the overnight SPX display swap
+        # passes the 16:00 anchor — sharing a key let one silently serve the
+        # other the wrong overnight change.)
+        cache_key = (
+            f"latest_future_quote:{index_symbol}:"
+            f"{session_start.isoformat() if session_start else 'none'}"
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -5827,6 +5835,65 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching latest future quote: {e!r}", exc_info=True)
             raise
 
+    async def get_futures_session_closes(self, index_symbol: str) -> Optional[Dict[str, Any]]:
+        """The future's two most recent cash-session (16:00 ET) closes.
+
+        The daily-change denominator for ES / NQ has to be the FUTURE's own
+        prior close.  Using the cash index's would put the headline percentage
+        out by the whole index-future basis — on ES that is tens of points,
+        which is a visibly wrong number on the first thing a trader looks at.
+
+        Bars are fenced to 09:30-16:00 ET so the mark is the cash-session
+        close a trader compares against, not an overnight print that happens
+        to be the day's last bar.  Reads ``futures_quotes`` only.
+        """
+        index_symbol = (index_symbol or "").upper()
+        cache_key = f"futures_session_closes:{index_symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH marks AS (
+                SELECT
+                    (timestamp AT TIME ZONE 'US/Eastern')::date AS et_date,
+                    timestamp,
+                    close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY (timestamp AT TIME ZONE 'US/Eastern')::date
+                        ORDER BY timestamp DESC
+                    ) AS rn
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                  AND (timestamp AT TIME ZONE 'US/Eastern')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+            )
+            SELECT et_date, timestamp, close
+            FROM marks
+            WHERE rn = 1
+            ORDER BY et_date DESC
+            LIMIT 2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, index_symbol)
+            if not rows:
+                return None
+            payload: Dict[str, Any] = {
+                "symbol": index_symbol,
+                "current_session_close": rows[0]["close"],
+                "current_session_close_ts": rows[0]["timestamp"],
+                "prior_session_close": (rows[1]["close"] if len(rows) > 1 else rows[0]["close"]),
+                "prior_session_close_ts": (
+                    rows[1]["timestamp"] if len(rows) > 1 else rows[0]["timestamp"]
+                ),
+            }
+            self._cache_set(cache_key, payload, self._session_closes_cache_ttl_seconds)
+            return payload
+        except Exception as e:
+            logger.error(f"Error fetching futures session closes: {e!r}", exc_info=True)
+            return None
+
     async def get_futures_basis_samples(
         self,
         index_symbol: str,
@@ -5842,12 +5909,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         — which is why the futures ingester now runs the whole CME session
         rather than the overnight window alone.
 
-        Each future bar is matched to the NEAREST index bar within +/-60s via
-        a LATERAL rather than an equality join on ``timestamp``: both feeds
-        are minute bars, but they come from different streams and a strict
-        join would silently yield nothing if either ever drifts off the
-        minute boundary.  Several samples are returned (not just the newest)
-        so the caller can take a median and shrug off a single bad print.
+        The LIMIT is applied AFTER the join, and that placement is the whole
+        point.  Taking the newest N futures bars first and joining afterwards
+        returns nothing outside 09:30-16:00 ET, because the newest futures
+        bars are overnight ones with no index counterpart — which would leave
+        the ratio permanently on its cost-of-carry fallback in exactly the
+        window ES/NQ exists to serve.  Joining first lets the scan walk back
+        through the overnight bars to the last cash-session minute that does
+        have a pair, which is what the multi-day lookback is for.
+
+        The lateral takes the most recent index print at or BEFORE the futures
+        bar, never after: ``ORDER BY timestamp DESC`` is index-orderable on
+        ``underlying_quotes(symbol, timestamp)`` (unlike ordering by a
+        distance expression), and it cannot pair a futures bar with an index
+        print from the future.  The 120s window absorbs up to a one-bar
+        labelling difference between the two feeds.
+
+        Several samples are returned, not just the newest, so the caller can
+        take a median and shrug off a single bad print.
 
         Reads ``futures_quotes`` + ``underlying_quotes`` only.
         """
@@ -5858,30 +5937,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached  # type: ignore[no-any-return]
 
         query = """
-            WITH fut AS (
-                SELECT timestamp, future_symbol, close
-                FROM futures_quotes
-                WHERE index_symbol = $1
-                  AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
-                ORDER BY timestamp DESC
-                LIMIT $3
-            )
             SELECT
                 f.timestamp        AS observed_at,
                 f.future_symbol    AS future_symbol,
                 f.close::float8    AS future_close,
                 u.close::float8    AS index_close
-            FROM fut f
+            FROM futures_quotes f
             JOIN LATERAL (
                 SELECT close
                 FROM underlying_quotes
                 WHERE symbol = $1
-                  AND timestamp BETWEEN f.timestamp - INTERVAL '60 seconds'
-                                    AND f.timestamp + INTERVAL '60 seconds'
-                ORDER BY ABS(EXTRACT(EPOCH FROM (timestamp - f.timestamp)))
+                  AND timestamp <= f.timestamp
+                  AND timestamp >= f.timestamp - INTERVAL '120 seconds'
+                ORDER BY timestamp DESC
                 LIMIT 1
             ) u ON TRUE
+            WHERE f.index_symbol = $1
+              AND f.timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
             ORDER BY f.timestamp DESC
+            LIMIT $3
         """
         try:
             async with self._acquire_connection() as conn:

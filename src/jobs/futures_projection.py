@@ -81,10 +81,11 @@ _LOOKBACK_MINUTES = _getenv_int("FUTURES_BASIS_LOOKBACK_MINUTES", 5760)  # 4 day
 _SAMPLE_COUNT = _getenv_int("FUTURES_BASIS_SAMPLES", 15)
 
 # Beyond this age a measurement is still used but labelled ``measured_stale``
-# so surfaces can disclose it.  90 minutes keeps it "fresh" through the
-# 16:00-18:00 evening hold; overnight and weekends read as stale, which is
-# accurate — nothing has measured the basis since the bell.
-_FRESH_MINUTES = _getenv_int("FUTURES_BASIS_FRESH_MINUTES", 90)
+# so surfaces can disclose it.  120 minutes spans the 16:00-18:00 evening
+# hold exactly, so the basis measured at the bell stays "fresh" right up to
+# the futures reopen; overnight and weekends then read as stale, which is
+# accurate — nothing has measured the basis since the close.
+_FRESH_MINUTES = _getenv_int("FUTURES_BASIS_FRESH_MINUTES", 120)
 
 _QUARTER_MONTHS = (3, 6, 9, 12)
 
@@ -98,6 +99,7 @@ PRICE_FIELDS: frozenset[str] = frozenset(
         "gamma_flip",
         "gamma_flip_point",
         "gamma_flip_raw",
+        "flip",  # gex_flip_horizon term structure / surface
         "call_wall",
         "put_wall",
         "max_pain",
@@ -105,36 +107,66 @@ PRICE_FIELDS: frozenset[str] = frozenset(
         "max_gamma_strike",
         "king_node",
         "hvl",
-        # per-strike profiles / ladders
+        # forced-flow levels — all drawable price levels
+        "charm_flip",
+        "vanna_flip",
+        "zero_flow_level",
+        "magnet",
+        "pivot",
+        # per-strike profiles, ladders and price axes
         "strike",
         "strikes",
+        "settlement_price",  # max-pain payoff curve x-axis
+        "grid",  # flip-surface price axis
+        "prices",  # forced-flow shared price axis
+        "spots",  # forced-flow per-column spot axis
+        # Spot-like fields.  Listed so an ES payload never carries a raw SPX
+        # number, but the middleware OVERRIDES them with the observed futures
+        # print wherever the feed has one — projecting spot is only the
+        # fallback for a cold feed.  See SPOT_FIELDS and the module docstring.
+        "spot",
+        "spot_price",
+        "underlying_price",
+        "current_price",
+        "price",
         # price series and session levels
         "open",
         "high",
         "low",
         "close",
-        "price",
-        "spot",
-        "spot_price",
-        "underlying_price",
         "previous_close",
         "prior_close",
+        "current_session_close",
+        "prior_session_close",
         "session_open",
         "session_high",
         "session_low",
+        "premarket_high",
+        "premarket_low",
+        "prev_session_high",
+        "prev_session_low",
         "vwap",
-        "opening_range_high",
-        "opening_range_low",
-        # distances are in price units too
-        "flip_distance",
+        "orb_high",
+        "orb_low",
+        # price CHANGES — same units as price, so they scale identically
+        "chg_5m",
+        "price_chg",
+        # distances measured in PRICE POINTS (contrast NEVER_PROJECT below)
+        "distance_from_spot",  # strike - spot
+        "difference",  # max_pain - underlying_price
+        "difference_from_underlying",
     }
 )
 
-# Fields that look price-ish but must NEVER be projected.  Kept as an
-# explicit denylist so that if one is ever added to PRICE_FIELDS by mistake
-# the contradiction is visible in review rather than silent in production.
+# Fields that look price-ish but must NEVER be projected.  Two classes live
+# here and both have burned someone: dollar EXPOSURES, where scaling invents
+# positioning nobody holds; and DIMENSIONLESS ratios — ``flip_distance`` is
+# ``(spot - flip) / spot``, a fraction, so multiplying it by a price ratio is
+# simply a units error.  Kept explicit so a mistaken addition to PRICE_FIELDS
+# shows up as a contradiction in review rather than silently in production.
 NEVER_PROJECT: frozenset[str] = frozenset(
     {
+        # dollar exposures
         "net_gex",
         "total_net_gex",
         "net_gex_at_spot",
@@ -146,11 +178,27 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         "put_wall_strength",
         "local_gex",
         "convexity_risk",
+        "call_notional",
+        "put_notional",
+        "total_notional",
+        # ALREADY on the futures axis — the overnight display swap puts the
+        # future's own price in these. Projecting them would apply the basis
+        # a second time.
+        "futures_close",
+        "futures_reference_close",
+        # OPTION premiums, not index levels. An SPX contract's bid does not
+        # move to the ES axis; the contract does not exist there at all.
+        "bid",
+        "ask",
+        # dimensionless ratios / fractions
+        "flip_distance",
+        "distance_to_flip",
         "put_call_ratio",
         "pin_score",
         "pin_confidence",
         "implied_volatility",
         "iv",
+        # greeks and counts
         "delta",
         "gamma",
         "vanna",
@@ -159,6 +207,13 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         "open_interest",
     }
 )
+
+# Keys whose VALUE is a symbol label, relabelled from the backing index to
+# the future during the same walk that projects the prices.
+LABEL_FIELDS: frozenset[str] = frozenset({"symbol", "underlying", "data_symbol"})
+
+# Spot-like keys the middleware replaces with the OBSERVED futures print.
+SPOT_FIELDS: frozenset[str] = frozenset({"spot", "spot_price", "underlying_price", "current_price"})
 
 
 @dataclass(frozen=True)
@@ -343,33 +398,70 @@ async def resolve_basis(
     )
 
 
-def project_value(key: str, value: Any, basis: FuturesBasis, *, tick: Optional[float]) -> Any:
-    """Project one field if it is a price, else return it unchanged."""
-    if key in NEVER_PROJECT or key not in PRICE_FIELDS:
+def project_value(
+    key: Optional[str], value: Any, basis: FuturesBasis, *, tick: Optional[float]
+) -> Any:
+    """Project one field if it is a price, else return it unchanged.
+
+    ``key`` is None for a list element with no projectable parent key, which
+    correctly falls through to "leave it alone".
+    """
+    if key is None or key in NEVER_PROJECT or key not in PRICE_FIELDS:
         return value
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
     return basis.project(float(value), tick=tick)
 
 
-def project_payload(payload: Any, basis: FuturesBasis, *, tick: Optional[float] = None) -> Any:
+def project_payload(
+    payload: Any,
+    basis: FuturesBasis,
+    *,
+    tick: Optional[float] = None,
+    key: Optional[str] = None,
+    relabel: Optional[tuple[str, str]] = None,
+) -> Any:
     """Recursively carry every price field in a JSON payload to the futures axis.
 
     Walks dicts and lists so nested shapes (a summary with an embedded strike
     ladder, a list of bars) are handled without each endpoint enumerating its
     own fields.  Only keys in :data:`PRICE_FIELDS` are touched.
+
+    ``key`` carries the PARENT key down into a list so a bare array of numbers
+    — ``{"strikes": [6600, 6650]}``, ``{"grid": [...]}``, forced flow's
+    ``prices`` axis — is projected too.  Without it those arrays silently keep
+    cash-index values while the scalars beside them move, and one response
+    ships two incompatible price axes.
+
+    ``relabel=(from_symbol, to_symbol)`` rewrites symbol labels in the SAME
+    pass, so a large payload is walked and rebuilt once rather than twice.
+    Only exact matches under :data:`LABEL_FIELDS` are touched, leaving prose
+    that happens to mention the index alone.
     """
     if isinstance(payload, dict):
-        return {
-            key: (
-                project_payload(value, basis, tick=tick)
-                if isinstance(value, (dict, list))
-                else project_value(key, value, basis, tick=tick)
-            )
-            for key, value in payload.items()
-        }
+        out: Dict[str, Any] = {}
+        for k, v in payload.items():
+            if isinstance(v, (dict, list)):
+                out[k] = project_payload(v, basis, tick=tick, key=k, relabel=relabel)
+            elif (
+                relabel is not None
+                and k in LABEL_FIELDS
+                and isinstance(v, str)
+                and v.upper() == relabel[0]
+            ):
+                out[k] = relabel[1]
+            else:
+                out[k] = project_value(k, v, basis, tick=tick)
+        return out
     if isinstance(payload, list):
-        return [project_payload(item, basis, tick=tick) for item in payload]
+        return [
+            (
+                project_payload(item, basis, tick=tick, key=key, relabel=relabel)
+                if isinstance(item, (dict, list))
+                else project_value(key, item, basis, tick=tick)
+            )
+            for item in payload
+        ]
     return payload
 
 

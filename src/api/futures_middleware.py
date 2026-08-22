@@ -4,30 +4,33 @@ A request for ``symbol=ES`` is answered by running the ordinary ``SPX``
 handler and carrying its price-space fields across on the way out.  Doing
 this once, in middleware, is what makes ES / NQ work across the *whole* API
 — including the routers (``/api/v1/levels``, forced flow, trade bias) —
-instead of requiring each of thirty-odd endpoints to grow its own futures
-branch and drift out of step with the others.
+instead of requiring each of seventy-odd symbol-taking endpoints to grow its
+own futures branch and drift out of step with the others.
 
-Flow per request:
+Every request falls into exactly one of four buckets:
 
-1. **Inbound** — if ``symbol`` / ``underlying`` (query) or the final path
-   segment names a first-class future, rewrite it to the backing cash index
-   so the handler runs completely unaware that futures exist.
-2. **Outbound** — resolve the basis, project the allowlisted price fields
-   (:mod:`src.jobs.futures_projection`), relabel the symbol back to the
-   future, and attach a ``projection`` block recording the ratio used.
+1. **Not a future** — passed straight through, untouched.  This is almost
+   every request, and it must cost nothing: hence pure ASGI (below).
+2. **Served natively** (:data:`_NATIVE_PATHS`) — the handler already reads
+   the future's own bars out of ``futures_quotes``.  The symbol is NOT
+   rewritten and the response is NOT projected: these endpoints carry
+   OBSERVED prices, and projecting a frozen 16:00 SPX print would report
+   where ES stood at the bell rather than where it is now.
+3. **Unsupported** (:data:`_UNSUPPORTED_PREFIXES`) — per-contract option
+   endpoints.  There is no ES option chain in ZeroGEX, so an SPX contract
+   relabelled ES would be a fabrication; these answer 400 instead.
+4. **Projected** — everything else: rewrite the symbol inbound, project the
+   allowlisted price fields outbound, relabel, attach a ``projection`` block
+   recording the ratio used, and substitute the observed futures print for
+   any spot-like field.
 
-Two deliberate carve-outs:
-
-* ``/api/market/quote`` and ``/api/market/historical`` are bypassed.  They
-  serve the future's OWN bars out of ``futures_quotes``, because projecting
-  a frozen 16:00 SPX print would report where ES was at the bell rather
-  than where it is now.  Levels may be projected; prices must be observed.
-* ``spot_price`` on a projected payload is likewise overridden with the live
-  futures print when one is available, and only falls back to the projected
-  value if the futures feed is empty.
-
-Requests that name no future are passed straight through untouched — no
-buffering, no parse, no added latency on the SPX/SPY/QQQ/NDX hot path.
+Why pure ASGI rather than ``BaseHTTPMiddleware``: the latter wraps every
+request in an anyio task group and buffers through a stream even when the
+middleware does nothing, which changes exception propagation and streaming
+behaviour for the entire application.  Every other middleware in this app is
+pure ASGI (see :mod:`src.api.middleware`); a futures feature has no business
+altering how SPX requests are served.  Here, a non-futures request costs one
+dict lookup and one string compare before ``self.app`` is called directly.
 """
 
 from __future__ import annotations
@@ -37,11 +40,8 @@ import logging
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
-
 from src.jobs.futures_projection import (
+    SPOT_FIELDS,
     project_payload,
     projection_metadata,
     projection_tick,
@@ -54,35 +54,50 @@ logger = logging.getLogger("zerogex.futures_middleware")
 # Query parameters that name the underlying across the API surface.
 _SYMBOL_PARAMS = ("symbol", "underlying")
 
-# Endpoints that resolve futures natively from ``futures_quotes`` and must
-# NOT have their observed prices overwritten by a projection.
-_BYPASS_PATHS = frozenset(
+# Endpoints that resolve futures natively from ``futures_quotes``.  Their
+# prices are OBSERVED, so they must not be rewritten or projected.
+_NATIVE_PATHS = frozenset(
     {
         "/api/market/quote",
         "/api/market/historical",
+        "/api/market/session-closes",
+        "/api/market/session-levels",
     }
 )
 
-# Keys whose *value* is a symbol label and should read as the future.
-_LABEL_KEYS = ("symbol", "underlying", "data_symbol")
+# Per-contract option surfaces.  ZeroGEX ingests no options on futures, so
+# there is nothing truthful to return for ES / NQ here — an SPX contract with
+# its strike multiplied by the basis is not a contract anyone can trade, and
+# the strike would no longer round-trip back to the chain it came from.
+_UNSUPPORTED_PREFIXES = (
+    "/api/option/",
+    "/api/tools/option-calculator",
+)
+
+# Responses larger than this are projected anyway but logged: the walk is
+# O(payload) on the event loop, and a very large one is worth knowing about.
+_LARGE_BODY_BYTES = 4 * 1024 * 1024
 
 
-def _futures_target(request: Request) -> Optional[tuple[str, str]]:
-    """Return ``(futures_symbol, index_symbol)`` this request is asking for.
+def _scope_query(scope: dict) -> list[tuple[str, str]]:
+    return parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
 
-    ``None`` when the request names no first-class future, which is the
-    overwhelmingly common case and the one that must stay free.
+
+def _futures_target(scope: dict) -> Optional[tuple[str, str]]:
+    """Return ``(futures_symbol, index_symbol)`` this request asks for.
+
+    ``None`` when the request names no first-class future — the overwhelmingly
+    common case, and the one that must stay free.
     """
-    for param in _SYMBOL_PARAMS:
-        raw = request.query_params.get(param)
-        if raw and is_futures_symbol(raw):
-            index = resolve_futures_index(raw)
+    for key, value in _scope_query(scope):
+        if key in _SYMBOL_PARAMS and value and is_futures_symbol(value):
+            index = resolve_futures_index(value)
             if index:
-                return raw.strip().upper(), index
+                return value.strip().upper(), index
 
     # Path-addressed symbols, e.g. /api/v1/levels/ES. Only the final segment
     # is considered, so an unrelated path can never be rewritten by accident.
-    tail = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+    tail = scope.get("path", "").rstrip("/").rsplit("/", 1)[-1]
     if tail and is_futures_symbol(tail):
         index = resolve_futures_index(tail)
         if index:
@@ -90,17 +105,25 @@ def _futures_target(request: Request) -> Optional[tuple[str, str]]:
     return None
 
 
-def _rewrite_scope(request: Request, futures_symbol: str, index_symbol: str) -> None:
-    """Point the request at the backing index, in place."""
-    scope = request.scope
+def _rewrite_scope(scope: dict, futures_symbol: str, index_symbol: str) -> None:
+    """Point the request at the backing index, in place.
 
-    query = parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+    The pre-rewrite path and the symbol the caller actually asked for are
+    stashed on the scope so the audit log can report what was requested rather
+    than what was routed — an ES request attributed to SPX in the audit trail
+    is a small lie that would be very annoying to debug later.
+    """
+    scope["zerogex_requested_symbol"] = futures_symbol
+    scope["zerogex_original_path"] = scope.get("path", "")
+
+    query = _scope_query(scope)
     if query:
-        rewritten = [
-            (key, index_symbol if key in _SYMBOL_PARAMS and is_futures_symbol(value) else value)
-            for key, value in query
-        ]
-        scope["query_string"] = urlencode(rewritten).encode("latin-1")
+        scope["query_string"] = urlencode(
+            [
+                (key, index_symbol if key in _SYMBOL_PARAMS and is_futures_symbol(value) else value)
+                for key, value in query
+            ]
+        ).encode("latin-1")
 
     path = scope.get("path", "")
     stripped = path.rstrip("/")
@@ -110,43 +133,28 @@ def _rewrite_scope(request: Request, futures_symbol: str, index_symbol: str) -> 
         scope["raw_path"] = scope["path"].encode("latin-1")
 
 
-def _relabel(payload: Any, index_symbol: str, futures_symbol: str) -> Any:
-    """Swap symbol labels from the backing index back to the future.
-
-    Only exact matches under known label keys are touched, so a strike list
-    or a free-text note that happens to mention the index is left alone.
-    """
-    if isinstance(payload, dict):
-        out = {}
-        for key, value in payload.items():
-            if key in _LABEL_KEYS and isinstance(value, str) and value.upper() == index_symbol:
-                out[key] = futures_symbol
-            else:
-                out[key] = _relabel(value, index_symbol, futures_symbol)
-        return out
-    if isinstance(payload, list):
-        return [_relabel(item, index_symbol, futures_symbol) for item in payload]
-    return payload
-
-
-def _db_manager():
-    """The live DatabaseManager, or None before startup.
-
-    Imported late (``src.api.main`` imports this module) and via a single
-    seam so tests can drive the middleware without standing up the app.
-    """
-    from src.api.main import db_manager
-
-    return db_manager
+def _header(headers: list, name: bytes) -> bytes:
+    for key, value in headers:
+        if key.lower() == name:
+            return value
+    return b""
 
 
 async def _live_futures_spot(index_symbol: str) -> Optional[float]:
-    """Latest observed futures close for ``index_symbol``, if the feed has one."""
+    """Latest OBSERVED futures close for ``index_symbol``, if the feed has one.
+
+    Passes the same cash-close anchor the quote endpoint uses so both callers
+    hit the same cache entry with the same meaning.
+    """
     try:
-        db_manager = _db_manager()
+        from src.api.main import db_manager
+        from src.market_calendar import current_cash_close_reference
+
         if db_manager is None:
             return None
-        quote = await db_manager.get_latest_future_quote(index_symbol)
+        quote = await db_manager.get_latest_future_quote(
+            index_symbol, current_cash_close_reference()
+        )
         if quote and quote.get("close") is not None:
             return float(quote["close"])
     except Exception as e:
@@ -154,77 +162,173 @@ async def _live_futures_spot(index_symbol: str) -> Optional[float]:
     return None
 
 
-class FuturesProjectionMiddleware(BaseHTTPMiddleware):
-    """Answer ES / NQ requests from the SPX / NDX surfaces."""
+def _db_manager():
+    """The live DatabaseManager, or None before startup."""
+    from src.api.main import db_manager
 
-    async def dispatch(self, request: Request, call_next):
-        target = _futures_target(request)
-        if target is None or request.url.path in _BYPASS_PATHS:
-            return await call_next(request)
+    return db_manager
+
+
+class FuturesProjectionMiddleware:
+    """Answer ES / NQ requests from the SPX / NDX surfaces (pure ASGI)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        target = _futures_target(scope)
+        if target is None:
+            # The hot path: no future named, nothing to do, no wrapping.
+            await self.app(scope, receive, send)
+            return
 
         futures_symbol, index_symbol = target
-        _rewrite_scope(request, futures_symbol, index_symbol)
+        path = scope.get("path", "")
 
-        response = await call_next(request)
+        if path in _NATIVE_PATHS:
+            await self.app(scope, receive, send)
+            return
 
-        content_type = response.headers.get("content-type", "")
-        if response.status_code != 200 or "application/json" not in content_type:
-            return response
+        if path.startswith(_UNSUPPORTED_PREFIXES):
+            await self._reject(send, futures_symbol, index_symbol)
+            return
 
-        body = b"".join([chunk async for chunk in response.body_iterator])
-        try:
-            payload = json.loads(body)
-        except (ValueError, UnicodeDecodeError):
-            return Response(
-                content=body,
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=content_type,
-            )
+        _rewrite_scope(scope, futures_symbol, index_symbol)
+        await self._project_response(scope, receive, send, futures_symbol, index_symbol)
 
-        try:
-            payload = await self._project(payload, futures_symbol, index_symbol)
-            body = json.dumps(payload).encode("utf-8")
-            projected = "1"
-        except Exception as e:
-            # A projection failure must not turn a good SPX answer into a
-            # 500 — but it must never ship un-projected cash levels under an
-            # ES label either, so the response is failed explicitly.
-            logger.error("futures projection failed for %s: %s", futures_symbol, e, exc_info=True)
-            return Response(
-                content=json.dumps(
-                    {"detail": f"Could not project {index_symbol} levels onto {futures_symbol}."}
-                ).encode("utf-8"),
-                status_code=503,
-                media_type="application/json",
-            )
-
-        headers = {
-            key: value
-            for key, value in response.headers.items()
-            if key.lower() not in ("content-length", "content-encoding")
-        }
-        headers["X-ZeroGEX-Projection"] = projected
-        return Response(
-            content=body,
-            status_code=response.status_code,
-            headers=headers,
-            media_type="application/json",
+    async def _reject(self, send, futures_symbol: str, index_symbol: str) -> None:
+        body = json.dumps(
+            {
+                "detail": (
+                    f"{futures_symbol} has no option chain of its own — its levels are "
+                    f"{index_symbol} option-derived. Per-contract option endpoints are "
+                    f"only available for {index_symbol}."
+                )
+            }
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("latin-1")),
+                ],
+            }
         )
+        await send({"type": "http.response.body", "body": body})
 
-    async def _project(self, payload: Any, futures_symbol: str, index_symbol: str) -> Any:
+    async def _project_response(
+        self, scope, receive, send, futures_symbol: str, index_symbol: str
+    ) -> None:
+        status: Optional[int] = None
+        headers: list = []
+        chunks: list[bytes] = []
+        started = False
+
+        async def capture(message):
+            nonlocal status, headers, started
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                headers = list(message.get("headers", []))
+                return
+            if message["type"] != "http.response.body":
+                await send(message)
+                return
+
+            chunks.append(message.get("body", b"") or b"")
+            if message.get("more_body"):
+                return
+
+            body = b"".join(chunks)
+            content_type = _header(headers, b"content-type").decode("latin-1", "ignore")
+            if status != 200 or "application/json" not in content_type:
+                await self._passthrough(send, status, headers, body)
+                started = True
+                return
+
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeDecodeError):
+                await self._passthrough(send, status, headers, body)
+                started = True
+                return
+
+            if len(body) > _LARGE_BODY_BYTES:
+                logger.info(
+                    "projecting a %d-byte %s response for %s",
+                    len(body),
+                    scope.get("zerogex_original_path", ""),
+                    futures_symbol,
+                )
+
+            try:
+                projected = await self._transform(payload, futures_symbol, index_symbol)
+                out = json.dumps(projected).encode("utf-8")
+            except Exception as e:
+                # Never ship un-projected cash levels under an ES label: that
+                # would be silently wrong on a chart. Fail visibly instead,
+                # keeping the upstream headers so CORS still applies.
+                logger.error(
+                    "futures projection failed for %s: %s", futures_symbol, e, exc_info=True
+                )
+                detail = json.dumps(
+                    {"detail": (f"Could not project {index_symbol} levels onto {futures_symbol}.")}
+                ).encode("utf-8")
+                await self._passthrough(send, 503, headers, detail)
+                started = True
+                return
+
+            out_headers = [
+                (key, value)
+                for key, value in headers
+                if key.lower() not in (b"content-length", b"content-encoding")
+            ]
+            out_headers.append((b"content-length", str(len(out)).encode("latin-1")))
+            out_headers.append((b"x-zerogex-projection", b"1"))
+            await send({"type": "http.response.start", "status": 200, "headers": out_headers})
+            await send({"type": "http.response.body", "body": out})
+            started = True
+
+        await self.app(scope, receive, capture)
+
+        if not started and status is not None:
+            # Body never arrived (empty response); relay what we have.
+            await self._passthrough(send, status, headers, b"")
+
+    async def _passthrough(self, send, status, headers, body: bytes) -> None:
+        out_headers = [
+            (key, value) for key, value in (headers or []) if key.lower() != b"content-length"
+        ]
+        out_headers.append((b"content-length", str(len(body)).encode("latin-1")))
+        await send({"type": "http.response.start", "status": status or 500, "headers": out_headers})
+        await send({"type": "http.response.body", "body": body})
+
+    async def _transform(self, payload: Any, futures_symbol: str, index_symbol: str) -> Any:
         basis = await resolve_basis(_db_manager(), futures_symbol)
         if basis is None:
             return payload
 
-        projected = project_payload(payload, basis, tick=projection_tick(futures_symbol))
-        projected = _relabel(projected, index_symbol, futures_symbol)
+        projected = project_payload(
+            payload,
+            basis,
+            tick=projection_tick(futures_symbol),
+            relabel=(index_symbol, futures_symbol),
+        )
 
-        # Prefer the observed futures print over a projected one for spot.
-        if isinstance(projected, dict) and "spot_price" in projected:
+        # Prefer the OBSERVED futures print over a projected one for spot.
+        # Only the top level is substituted: a nested per-row "spot" is that
+        # row's historical spot, not the live one, and must stay projected.
+        if isinstance(projected, dict) and any(k in projected for k in SPOT_FIELDS):
             live = await _live_futures_spot(index_symbol)
             if live is not None:
-                projected["spot_price"] = live
+                for spot_key in SPOT_FIELDS:
+                    if spot_key in projected and projected[spot_key] is not None:
+                        projected[spot_key] = live
 
         if isinstance(projected, dict):
             projected["projection"] = projection_metadata(basis)

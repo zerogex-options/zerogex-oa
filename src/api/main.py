@@ -379,6 +379,18 @@ if not allow_credentials:
         "CORS_ALLOW_ORIGINS contains '*'; disabling allow_credentials for standards compliance."
     )
 
+# ES / NQ projection. Registered FIRST, which makes it the INNERMOST
+# middleware (last add_middleware is outermost — see the ordering note
+# below). That placement matters twice over: it reads the raw JSON straight
+# off routing before GZip compresses it, and CORS ends up wrapping it, so the
+# 400/503 responses it synthesizes still carry Access-Control-* headers
+# instead of surfacing to a browser as an opaque CORS failure.
+#
+# It is pure ASGI, not BaseHTTPMiddleware: a request that names no future
+# calls straight through with no task group and no body buffering, so the
+# SPX/SPY/QQQ/NDX hot path is genuinely untouched by this feature.
+app.add_middleware(FuturesProjectionMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -400,13 +412,6 @@ app.add_middleware(
         "Accept",
     ],
 )
-
-# ES / NQ projection. Added BEFORE GZip so it ends up nested INSIDE it
-# (last add_middleware is outermost — see the ordering note below), which
-# means it reads and rewrites the raw JSON and GZip compresses the result.
-# Requests that don't name a future short-circuit immediately, so the
-# SPX/SPY/QQQ/NDX hot path never pays for the buffering this does.
-app.add_middleware(FuturesProjectionMiddleware)
 
 # Compress responses so that large JSON payloads from endpoints like
 # /api/flow/by-contract (which can return hundreds of thousands of rows for a
@@ -1223,6 +1228,21 @@ def _index_futures_display_enabled() -> bool:
     return _getenv_bool("INDEX_FUTURES_DISPLAY_ENABLED", False)
 
 
+async def _native_futures_session_closes(futures_symbol: str, index_symbol: str) -> SessionCloses:
+    """The future's own two most recent 16:00 ET closes.
+
+    Mirrors :func:`_native_futures_quote`: the daily-change denominator has to
+    be the future's own prior close, not the cash index's, or the headline
+    percentage is wrong by the whole basis.
+    """
+    data = await _db().get_futures_session_closes(index_symbol)
+    if not data or data.get("current_session_close") is None:
+        raise HTTPException(
+            status_code=404, detail=f"No {futures_symbol} session close data available"
+        )
+    return SessionCloses(**{**data, "symbol": futures_symbol})
+
+
 async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> UnderlyingQuote:
     """Latest observed bar for a first-class future (ES / NQ).
 
@@ -1476,6 +1496,13 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
       on the most recent completed trading day).
     - prior_session_close: the session close immediately before current.
     """
+    # ES / NQ close against their OWN 16:00 prints. Projecting SPX's cash
+    # closes here would put the headline daily change on the wrong basis —
+    # the number a futures trader checks first.
+    futures_index = resolve_futures_index(symbol)
+    if futures_index:
+        return await _native_futures_session_closes(symbol.strip().upper(), futures_index)
+
     data = await _db().get_session_closes(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No session close data available")
@@ -1509,6 +1536,12 @@ async def get_session_levels(symbol: str = Query(default="SPY")):
     Source of record is the ``session_levels`` capture job; the endpoint
     falls back to a live 1-min-bar aggregate when no captured row exists.
     """
+    # A future trades ~23h a day, so "pre-market high/low" describes nothing
+    # for ES / NQ. Return the empty shape rather than projecting SPX's levels,
+    # which would draw cash-index lines on a futures chart.
+    if resolve_futures_index(symbol):
+        return SessionLevels(symbol=symbol.strip().upper(), is_index=False)
+
     data = await _db().get_session_levels(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No session level data available")

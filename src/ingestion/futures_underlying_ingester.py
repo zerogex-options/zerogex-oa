@@ -392,6 +392,21 @@ class FuturesUnderlyingIngester:
                     self.index_symbol,
                 )
 
+    def _backoff(self, reason: str) -> None:
+        """Sleep the reconnect backoff, in 1s slices so shutdown stays prompt."""
+        if not self.running or not is_futures_ingest_window():
+            return
+        logger.warning(
+            "%s futures %s, reconnecting in %ds...",
+            self.index_symbol,
+            reason,
+            _RECONNECT_BACKOFF_SEC,
+        )
+        slept = 0
+        while slept < _RECONNECT_BACKOFF_SEC and self.running:
+            time.sleep(1)
+            slept += 1
+
     def run(self) -> None:
         logger.info("=" * 80)
         logger.info(
@@ -417,17 +432,18 @@ class FuturesUnderlyingIngester:
                 try:
                     self._read_stream()
                 except Exception as e:
+                    self._backoff(f"stream disconnected ({e})")
+                else:
+                    # A NORMAL return also needs the backoff. _read_stream
+                    # returns without raising when the connection is refused
+                    # for a reason that is not an exception here — a 401 that
+                    # triggers a token refresh, or an account stream-slot cap
+                    # that closes the connection immediately. Without a sleep
+                    # on this path the loop reconnects flat out, which turns a
+                    # transient cap exhaustion into a hot spin against
+                    # TradeStation.
                     if self.running and is_futures_ingest_window():
-                        logger.warning(
-                            "%s futures stream disconnected (%s), reconnecting in %ds...",
-                            self.index_symbol,
-                            e,
-                            _RECONNECT_BACKOFF_SEC,
-                        )
-                        slept = 0
-                        while slept < _RECONNECT_BACKOFF_SEC and self.running:
-                            time.sleep(1)
-                            slept += 1
+                        self._backoff("stream ended without an error")
         except Exception as e:
             logger.error(
                 "Fatal error in %s futures ingester: %s",
