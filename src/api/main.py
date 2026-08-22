@@ -311,8 +311,21 @@ async def lifespan(app: FastAPI):
 # and CI continue to work without credentials.
 app = FastAPI(
     title="ZeroGEX API",
-    description="Real-time options analytics API",
-    version="1.0.0",
+    description=(
+        "Real-time options analytics API.\n\n"
+        "**Two versions are served.**\n\n"
+        "* **v2 (recommended)** — `/api/v2/*`. Every endpoint returns "
+        '`{"data": ..., "freshness": {...}}`, where the `freshness` block '
+        "reports response evaluation time, the underlying data's source "
+        "timestamp, the market session, the expected update cadence, and a "
+        "rolled-up `freshness_status` — so endpoint health and data age are "
+        "separate, machine-readable facts on every response.\n"
+        "* **v1 (stable)** — `/api/*` and `/api/v1/levels/*`. Unchanged and "
+        "supported; `data` in a v2 response is byte-for-byte the v1 body.\n\n"
+        'See "API versions & the freshness envelope" in API_Guide.md for '
+        "the field contract and the per-endpoint cadence table."
+    ),
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -1797,6 +1810,30 @@ async def get_momentum_divergence(
 from .quote_broadcaster import get_broadcaster as _get_ws_broadcaster  # noqa: E402
 
 ws_router.register(app, get_broadcaster=_get_ws_broadcaster)
+
+
+# ============================================================================
+# API v2 — the freshness-envelope surface
+# ============================================================================
+
+# Mirrors every /api route above onto /api/v2 with a consistent freshness
+# envelope ({"data": ..., "freshness": {...}}). MUST stay below every route
+# registration in this module and every include_router() call: the mirror
+# reads the route table, so anything registered after it is not mirrored.
+# v1 is left untouched. See src/api/v2.py and src/api/freshness.py.
+from .v2 import mount_v2  # noqa: E402
+
+try:
+    mount_v2(app)
+except Exception:  # noqa: BLE001
+    # v2 is additive; v1 is the product. A mirroring failure must degrade the
+    # new surface, never stop the process from booting and take the whole API
+    # down with it. mount_v2 reads FastAPI internals to enumerate included
+    # routers, so the thing most likely to break here is a framework upgrade —
+    # exactly when you want v1 still serving. The parity test in
+    # tests/test_api_v2_freshness_envelope.py turns a partial mirror into a
+    # red CI run so this never degrades silently for long.
+    logger.exception("v2 mirror failed to mount; /api/v2 will be unavailable")
 
 
 # ============================================================================
