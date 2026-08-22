@@ -24,6 +24,7 @@ reader unions it in automatically when the requested window is old.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DatabaseUnavailable",
+    "RESEARCH_STATEMENT_TIMEOUT_MS",
     "research_connection",
     "fetch_chain_snapshot",
     "fetch_snapshot_timestamps",
@@ -58,27 +60,54 @@ class DatabaseUnavailable(RuntimeError):
     """
 
 
+#: Per-statement ceiling for research reads, in milliseconds.  The pool-wide
+#: ``DB_STATEMENT_TIMEOUT_MS`` is sized for sub-second API queries; a research
+#: sweep legitimately runs longer and is not on any latency path.  Raising it
+#: here is scoped to this connection and restored on exit, so nothing else that
+#: borrows the pooled connection inherits it.
+RESEARCH_STATEMENT_TIMEOUT_MS = int(os.getenv("MMGEX_STATEMENT_TIMEOUT_MS", "300000"))
+
+
 @contextmanager
-def research_connection() -> Iterator[Any]:
+def research_connection(*, statement_timeout_ms: Optional[int] = None) -> Iterator[Any]:
     """Yield a read-only production connection, or raise :class:`DatabaseUnavailable`.
 
     Wraps ``src.database.db_connection`` (the platform's pooled connection) and
     sets the session to READ ONLY, so a mistake in this package cannot write to
-    a production table even in principle.
+    a production table even in principle.  Also raises the per-statement
+    timeout for the duration (see :data:`RESEARCH_STATEMENT_TIMEOUT_MS`) and
+    restores the previous value afterwards.
     """
     try:
         from src.database import db_connection
     except Exception as exc:  # pragma: no cover - import guard
         raise DatabaseUnavailable(f"cannot import src.database: {exc}") from exc
 
+    timeout = (
+        RESEARCH_STATEMENT_TIMEOUT_MS if statement_timeout_ms is None else int(statement_timeout_ms)
+    )
     try:
         with db_connection() as conn:
+            previous_timeout: Optional[str] = None
             try:
                 with conn.cursor() as cur:
                     cur.execute("SET TRANSACTION READ ONLY")
+                    if timeout > 0:
+                        cur.execute("SHOW statement_timeout")
+                        row = cur.fetchone()
+                        previous_timeout = row[0] if row else None
+                        cur.execute(f"SET statement_timeout = {int(timeout)}")
             except Exception:  # pragma: no cover - some drivers/pools disallow
-                logger.debug("could not set READ ONLY on the research connection")
-            yield conn
+                logger.debug("could not configure the research connection")
+            try:
+                yield conn
+            finally:
+                if previous_timeout is not None:
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(f"SET statement_timeout = '{previous_timeout}'")
+                    except Exception:  # pragma: no cover
+                        logger.debug("could not restore statement_timeout")
     except DatabaseUnavailable:
         raise
     except Exception as exc:
@@ -127,7 +156,7 @@ def fetch_chain_snapshot(
     symbol: str,
     ts: datetime,
     *,
-    lookback_hours: float = 2.0,
+    lookback_hours: float = 0.5,
     include_archive: bool = True,
 ) -> list[ChainQuote]:
     """Latest quote per contract at or before ``ts``.
@@ -137,6 +166,15 @@ def fetch_chain_snapshot(
     within a bounded lookback, filtered to contracts that still have a gamma.
     Using the same read shape matters — a different contract universe would
     contaminate the comparison with a coverage difference.
+
+    The lookback defaults NARROWER than production's 2 hours, because the two
+    reads face different problems.  Production must survive a cold start where
+    the newest row may be days old; this read targets a specific historical
+    RTH minute where every active contract was quoted within a few minutes.
+    The rows scanned scale linearly with the window, and a research sweep
+    issues one of these per snapshot — hundreds of them — so a 4x wider
+    window than the data needs is 4x the work, repeated hundreds of times.
+    Widen it for a window that spans a market closure.
     """
     params = {
         "symbol": symbol,
@@ -339,34 +377,66 @@ def fetch_vix_closes(conn: Any, start: datetime, end: datetime) -> list[tuple[da
 
 
 def fetch_series_listing_dates(
-    conn: Any, symbol: str, expirations: Sequence[date]
+    conn: Any,
+    symbol: str,
+    expirations: Sequence[date],
+    *,
+    since: Optional[datetime] = None,
 ) -> dict[SeriesKey, date]:
     """First ET date each series appears in ZeroGEX's own chain history.
 
-    This is the independent evidence that upgrades a series' censoring verdict
-    from "first trade fell inside the data window" (a heuristic) to "observed
-    from listing" (a fact about when the contract started existing in our
-    data).  It is a lower bound on the true listing date — the contract cannot
-    have been quoted here before ZeroGEX first saw it — which is the
-    conservative direction: it can only ever mark a series as censored that was
-    in fact clean, never the reverse.
+    This is the independent evidence that upgrades a censoring verdict from
+    "first trade fell inside the data window" (a heuristic) to "observed from
+    listing" (a fact about when the contract started existing in our data).
+
+    ``since`` bounds the scan.  Without it this aggregates over the entire
+    retained history of ``option_chains`` for those expirations — tens of
+    millions of rows for a real SPX chain — and reliably exceeds the pool's
+    statement timeout.
+
+    **The bound cannot be applied naively.**  If the scan starts at ``since``,
+    then ``MIN(timestamp)`` for a contract that was already trading before it
+    equals ``since`` — and the series would look "listed at the window start"
+    and be marked cleanly reconstructable when it is in fact left-censored.
+    That is the one direction this experiment must never fail in, because it
+    manufactures confidence in an inventory that does not have it.
+
+    So a ``first_seen`` at the scan floor is treated as UNKNOWN and omitted:
+    "the contract was listed then" and "our scan started then" are
+    indistinguishable, and the caller falls back to the window heuristic, which
+    is the conservative reading.  Only a first appearance strictly inside the
+    scanned window is evidence of anything.
     """
     if not expirations:
         return {}
-    sql = """
+    params: dict[str, Any] = {"symbol": symbol, "expirations": list(expirations)}
+    floor_clause = ""
+    if since is not None:
+        floor_clause = "AND timestamp >= %(since)s"
+        params["since"] = since
+    sql = f"""
         SELECT strike, expiration, option_type, MIN(timestamp) AS first_seen
           FROM option_chains
          WHERE underlying = %(symbol)s
            AND expiration = ANY(%(expirations)s)
+           {floor_clause}
          GROUP BY strike, expiration, option_type
     """
     with conn.cursor() as cur:
-        cur.execute(sql, {"symbol": symbol, "expirations": list(expirations)})
+        cur.execute(sql, params)
         rows = cur.fetchall()
+
+    # A first appearance within this margin of the scan floor is not
+    # distinguishable from the floor itself (the chain is quoted per minute, so
+    # the very first bucket of the window is exactly where a pre-existing
+    # contract shows up).
+    floor_margin = timedelta(hours=12)
     out: dict[SeriesKey, date] = {}
     for strike, expiration, option_type, first_seen in rows:
         if first_seen is None:
             continue
+        if since is not None and first_seen <= since + floor_margin:
+            continue  # unknown, not "listed here"
         out[(symbol, expiration, float(strike), option_type)] = first_seen.date()
     return out
 

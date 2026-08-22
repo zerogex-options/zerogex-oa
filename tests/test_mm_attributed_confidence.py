@@ -338,3 +338,84 @@ def test_participant_coverage_is_reported_even_without_open_interest():
     assert report.verdict == "no_open_interest_supplied"
     assert report.participants_covered == ("CUSTOMER", "MARKET_MAKER")
     assert not any("MARKET_MAKER" in n for n in report.notes)
+
+
+# ---------------------------------------------------------------------------
+# Bounded listing-date lookup (the query that timed out on real data)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    """Records the SQL it was given and replays a canned result."""
+
+    def __init__(self, rows, captured):
+        self._rows = rows
+        self._captured = captured
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self._captured.append((sql, params))
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self.rows = rows
+        self.captured: list = []
+
+    def cursor(self):
+        return _FakeCursor(self.rows, self.captured)
+
+
+def test_listing_date_scan_is_bounded_when_a_floor_is_given():
+    """Unbounded, this aggregates all retained chain history and times out."""
+    from research.mm_attributed_gex.sources import fetch_series_listing_dates
+
+    conn = _FakeConn([])
+    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    fetch_series_listing_dates(conn, SYMBOL, [EXPIRATION], since=since)
+    sql, params = conn.captured[0]
+    assert "timestamp >= %(since)s" in sql
+    assert params["since"] == since
+
+
+def test_a_first_appearance_at_the_scan_floor_is_treated_as_unknown():
+    """The bound must not manufacture a listing date.
+
+    A contract already trading before the scan starts has MIN(timestamp) equal
+    to the floor. Reporting that as its listing date would mark a left-censored
+    series as cleanly reconstructable — inventing confidence in an inventory
+    that does not have it, which is the one direction this must never fail in.
+    """
+    from research.mm_attributed_gex.sources import fetch_series_listing_dates
+
+    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conn = _FakeConn(
+        [
+            # At the floor: indistinguishable from "our scan started here".
+            (6000.0, EXPIRATION, "C", since),
+            # Strictly inside the window: genuine evidence.
+            (6100.0, EXPIRATION, "C", datetime(2026, 3, 15, 14, tzinfo=timezone.utc)),
+        ]
+    )
+    out = fetch_series_listing_dates(conn, SYMBOL, [EXPIRATION], since=since)
+
+    assert (SYMBOL, EXPIRATION, 6000.0, "C") not in out  # unknown, not "listed"
+    assert out[(SYMBOL, EXPIRATION, 6100.0, "C")] == date(2026, 3, 15)
+
+
+def test_an_unbounded_scan_trusts_every_first_appearance():
+    """With no floor there is nothing to confuse a listing date with."""
+    from research.mm_attributed_gex.sources import fetch_series_listing_dates
+
+    conn = _FakeConn([(6000.0, EXPIRATION, "C", datetime(2026, 2, 2, tzinfo=timezone.utc))])
+    out = fetch_series_listing_dates(conn, SYMBOL, [EXPIRATION])
+    assert out[(SYMBOL, EXPIRATION, 6000.0, "C")] == date(2026, 2, 2)
+    assert "timestamp >= " not in conn.captured[0][0]

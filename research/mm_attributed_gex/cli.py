@@ -24,6 +24,8 @@ import argparse
 import json
 import logging
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -51,6 +53,23 @@ def _load_profile(name: str):
     from research.mm_attributed_gex.cboe.profiles import load_profile_file
 
     return load_profile_file(name)
+
+
+@contextmanager
+def _phase(label: str):
+    """Time one stage and print how long it took.
+
+    A research sweep issues a handful of setup queries and then hundreds of
+    per-snapshot ones. When it stalls, "which of those was it?" is the entire
+    diagnosis, and without this the answer is a stack trace pointing at the
+    connection wrapper.
+    """
+    started = time.monotonic()
+    print(f"  [{label}] ...", flush=True)
+    try:
+        yield
+    finally:
+        print(f"  [{label}] {time.monotonic() - started:.1f}s", flush=True)
 
 
 def _parse_dt(text: str) -> datetime:
@@ -101,9 +120,16 @@ def cmd_confirm_profile(args: argparse.Namespace) -> int:
 
     args.profile = getattr(args, "profile_path", None) or args.profile
     profile = load_profile_file(args.profile)
-    if profile.confirmed:
-        print(f"{args.profile} is already confirmed ({profile.name}).")
-        return 0
+    already = profile.confirmed
+    if already:
+        # Still print the mapping. A bare "already confirmed" hides the case
+        # that matters: the profile was proposed from a DIFFERENT file than the
+        # one now being loaded. The name carries that provenance, so show it.
+        print(f"ALREADY CONFIRMED — {args.profile}")
+        print(
+            "If this was proposed from a different delivery than the files you are "
+            "about to load, re-run inspect-cboe on one of THOSE files first.\n"
+        )
 
     print(f"Profile: {profile.name}   (layout: {profile.layout})")
     print(f"File:    {args.profile}")
@@ -126,6 +152,9 @@ def cmd_confirm_profile(args: argparse.Namespace) -> int:
     print(f"\nOther participant volume columns: {len(others)}")
     print(f"Interval (bucket width):          {profile.interval.value}")
     print(f"Strike scale:                     {profile.strike_scale}")
+
+    if already:
+        return 0
 
     if not args.reviewed:
         print(
@@ -284,9 +313,10 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
     end = _parse_dt(args.end)
 
     with research_connection() as conn:
-        stamps = fetch_snapshot_timestamps(
-            conn, args.symbol, start, end, step_minutes=args.step_minutes
-        )
+        with _phase("snapshot timestamps"):
+            stamps = fetch_snapshot_timestamps(
+                conn, args.symbol, start, end, step_minutes=args.step_minutes
+            )
         if not stamps:
             print(
                 f"No gex_summary timestamps for {args.symbol} in "
@@ -296,12 +326,31 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
             return 2
         print(f"{len(stamps)} snapshot timestamps")
 
-        summaries = fetch_production_summaries(conn, args.symbol, start, end)
-        composites = fetch_composite_scores(conn, args.symbol, start, end)
-        bars = fetch_underlying_bars(conn, args.symbol, start, end)
-        vix = dict(fetch_vix_closes(conn, start, end))
-        expirations = sorted({r.expiration for r in records_factory()})
-        listing_dates = fetch_series_listing_dates(conn, args.symbol, expirations)
+        with _phase("production summaries"):
+            summaries = fetch_production_summaries(conn, args.symbol, start, end)
+        with _phase("composite scores"):
+            composites = fetch_composite_scores(conn, args.symbol, start, end)
+        with _phase("underlying bars"):
+            bars = fetch_underlying_bars(conn, args.symbol, start, end)
+        with _phase("vix"):
+            vix = dict(fetch_vix_closes(conn, start, end))
+        with _phase("parse open-close files"):
+            expirations = sorted({r.expiration for r in records_factory()})
+        with _phase(f"listing dates ({len(expirations)} expirations)"):
+            # Bounded scan. Unbounded, this aggregates the whole retained
+            # history of option_chains for these expirations and blows past any
+            # statement timeout. See fetch_series_listing_dates for why the
+            # bound cannot simply be the study window.
+            listing_dates = fetch_series_listing_dates(
+                conn,
+                args.symbol,
+                expirations,
+                since=start - timedelta(days=args.listing_lookback_days),
+            )
+        print(
+            f"  listing dates established for {len(listing_dates)} series "
+            f"(the rest fall back to the window heuristic)"
+        )
 
         spot_by_ts = {ts: close for ts, _o, _h, _l, close in bars}
         sorted_bar_ts = sorted(spot_by_ts)
@@ -322,7 +371,9 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
         def chain_provider(ts: datetime):
             cached = chain_cache.get(ts)
             if cached is None:
-                cached = fetch_chain_snapshot(conn, args.symbol, ts)
+                cached = fetch_chain_snapshot(
+                    conn, args.symbol, ts, lookback_hours=args.chain_lookback_hours
+                )
                 chain_cache[ts] = cached
             return cached
 
@@ -348,9 +399,18 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
             use_net_flow_estimator=args.net_flow_estimator,
         )
 
+        build_started = time.monotonic()
+
         def progress(done: int, total: int) -> None:
-            if done % 50 == 0 or done == total:
-                print(f"  {done}/{total} snapshots", flush=True)
+            if done % 25 == 0 or done == total:
+                elapsed = time.monotonic() - build_started
+                rate = done / elapsed if elapsed > 0 else 0.0
+                remaining = (total - done) / rate if rate > 0 else 0.0
+                print(
+                    f"  {done}/{total} snapshots  ({elapsed:.0f}s elapsed, "
+                    f"{rate:.1f}/s, ~{remaining:.0f}s left)",
+                    flush=True,
+                )
 
         rows, provenance = build_dataset(
             records_factory,
@@ -595,7 +655,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start", required=True, help="ISO start timestamp")
     p.add_argument("--end", required=True, help="ISO end timestamp")
     p.add_argument("--out", default="research_output/mm_attributed_dataset.jsonl")
-    p.add_argument("--step-minutes", type=int, default=5)
+    p.add_argument(
+        "--step-minutes",
+        type=int,
+        default=15,
+        help="thin the snapshot grid. Each snapshot re-prices the whole chain twice, "
+        "so this is the main cost dial; start coarse (30-60) on a first pass",
+    )
+    p.add_argument(
+        "--chain-lookback-hours",
+        type=float,
+        default=0.5,
+        help="how far back each snapshot looks for the latest quote per contract. "
+        "Widen only for windows spanning a market closure",
+    )
+    p.add_argument(
+        "--listing-lookback-days",
+        type=int,
+        default=120,
+        help="how far before the study window to scan for each contract's first "
+        "appearance. Longer is better evidence but a more expensive query",
+    )
     p.add_argument("--headline-universe", default="near_term")
     p.add_argument(
         "--include-censored",
