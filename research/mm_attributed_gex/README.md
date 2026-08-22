@@ -32,6 +32,11 @@ python -m research.mm_attributed_gex.cli pipeline-check
 #     Invented columns, random numbers — for learning the workflow, never a result.
 python -m research.mm_attributed_gex.cli make-sample
 
+# 0c. Add --anchor-to-db to put that synthetic flow over REAL contracts from your
+#     database, so steps 3-4 below can be rehearsed too. Read-only. The flow is
+#     still invented, so every MM number it produces is meaningless.
+python -m research.mm_attributed_gex.cli make-sample --anchor-to-db
+
 # 1. Read a delivered Cboe file and PROPOSE a column mapping.
 python -m research.mm_attributed_gex.cli inspect-cboe <file> --save profile.json
 
@@ -110,7 +115,7 @@ between the two methodologies is the attribution.
 pytest tests/ -k mm_attributed -q
 ```
 
-170 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
+172 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
 outcomes, statistics, replay and verdict logic. Synthetic examples throughout, sized so
 the correct answer can be checked by hand. Synthetic data is never used as evidence
 about the methodology.

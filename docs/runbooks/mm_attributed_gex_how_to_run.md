@@ -139,6 +139,34 @@ header will differ, which is exactly why `inspect-cboe` proposes a mapping rathe
 assuming one. Nothing computed from the sample is a finding. Delete
 `research_output/sample/` once you have real files.
 
+### Step 0c — rehearse steps 4 and 5 as well
+
+The plain sample uses invented expirations and strikes, so it cannot exercise the
+dataset step: nothing in it matches your chain, and you will see
+`listing dates resolved for 0 series`. To shake out the database queries, the replay
+and the report render *before* buying anything:
+
+```bash
+make mmgex-sample-anchored          # synthetic FLOW over REAL contracts from your DB
+make mmgex-confirm REVIEWED=yes     # re-confirm (the file was regenerated)
+make mmgex-dataset MMGEX_FILES=research_output/sample/ \
+    START=<printed anchor start> END=<printed anchor end>
+make mmgex-backtest
+```
+
+`mmgex-sample-anchored` reads your database (read-only, bounded: a ±3% strike band, a
+few expirations, a few recent sessions) and prints exactly which contracts and sessions
+it anchored to. Use the `start`/`end` it prints for the dataset step.
+
+This exercises every remaining code path — the chain snapshot reads, the `gex_summary`
+join, bar loading, VIX and composite-score lookups, the two-pass replay, the statistics
+and the report render — against your real database and your real market data.
+
+**The Market Maker flow over those contracts is still invented, so every MM-attributed
+number it produces is meaningless.** The report will say `INCONCLUSIVE_*`. What you are
+checking is that it *runs*, how long it takes, and that your study window actually has
+production rows to compare against — not what it says.
+
 ### Step 1 — read a real file and propose a column mapping
 
 ```bash
@@ -353,6 +381,8 @@ regardless, under `universes` in the JSONL — a 0DTE-only conclusion never need
 | `clean_share` near 0 | history starts too late | buy more lead-in (§3) |
 | `INCONCLUSIVE_DATA` | coverage < 20% or confidence < 0.35 | same — more history |
 | `No gex_summary timestamps for SPX in [...]` | study window predates ZeroGEX's own retention | pick a window ZeroGEX has data for, or use `option_chains_archive` depth |
+| `listing dates resolved for 0 series` | the Open-Close expirations/strikes do not exist in your chain | expected for the plain sample; with real Cboe files it means the chain history does not cover those contracts, and censoring falls back to the window heuristic |
+| `No SPX analytics rows found to anchor to` | no recent `gex_summary` rows for that symbol | check the analytics service is writing, or pass `SYMBOL=` |
 | Dataset build is slow | it re-prices the full chain twice per snapshot | raise `--step-minutes` (e.g. 15) for a first pass |
 | `No profile file at '...'` | step 1 never produced it (or you skipped step 1) | run `mmgex-inspect` first; the error prints the exact command |
 | `[Errno 2] No such file or directory: '/path/to/...'` | a placeholder was run literally | substitute your real path, or use `make mmgex-sample` to rehearse |

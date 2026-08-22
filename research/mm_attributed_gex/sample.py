@@ -127,9 +127,17 @@ def sample_rows(
     """
     rng = np.random.default_rng(seed)
     buckets = _bucket_times(interval_minutes)
-    # Strikes in the back half of the list start trading on session index 2, so
-    # their inventory genuinely begins from zero inside the window.
+    # Strikes in the back half of the list start trading partway through the
+    # window, so their inventory genuinely begins from zero inside it and the
+    # run contains both censored and cleanly reconstructable series.
+    #
+    # The start index adapts to the window length.  A fixed index silently
+    # dropped those strikes entirely whenever the window was shorter than it —
+    # which matters most for an ANCHORED run, where the strikes were chosen
+    # because they exist in the database and half of them vanishing is the
+    # opposite of what the caller asked for.
     late_start = set(list(strikes)[len(strikes) // 2 :])
+    late_start_index = min(2, max(1, len(sessions) - 1))
 
     # Running MM inventory per series, so a closing bucket never retires more
     # than the position actually holds.  Drawing opens and closes independently
@@ -144,7 +152,7 @@ def sample_rows(
                 if expiration < session:
                     continue
                 for strike in strikes:
-                    if strike in late_start and session_index < 2:
+                    if strike in late_start and session_index < late_start_index:
                         continue
                     for option_type in ("C", "P"):
                         row: dict[str, Any] = {
@@ -202,22 +210,38 @@ def write_sample_files(
     start: Optional[date] = None,
     interval_minutes: int = 10,
     seed: int = 20260821,
+    sessions: Optional[Sequence[date]] = None,
+    expirations: Optional[Sequence[date]] = None,
+    strikes: Optional[Sequence[float]] = None,
+    symbol: str = "SPX",
+    option_root: str = "SPXW",
 ) -> list[Path]:
     """Write one CSV per session into ``out_dir``.  Returns the paths.
 
     One file per session matches how Open-Close data is normally delivered and
     exercises the loader's directory walk, which must consume files in
     chronological order.
+
+    ``sessions`` / ``expirations`` / ``strikes`` override the invented defaults.
+    Passing real ones (see
+    :func:`research.mm_attributed_gex.sources.fetch_sample_anchor`) anchors the
+    synthetic flow to contracts that exist in the database, which is what lets
+    the dataset and backtest steps be rehearsed before any data is bought.  The
+    flow is still invented either way.
     """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "README_SYNTHETIC.txt").write_text(_README, encoding="utf-8")
 
-    sessions = _sessions(start or date(2026, 6, 1), n_sessions)
-    # Two expirations: one inside the window (so contracts retire mid-study)
-    # and one just after it.
-    expirations = [sessions[-1], sessions[-1] + timedelta(days=7)]
-    strikes = [5900.0 + 25.0 * i for i in range(9)]
+    if sessions is None:
+        sessions = _sessions(start or date(2026, 6, 1), n_sessions)
+    sessions = list(sessions)
+    if expirations is None:
+        # Two expirations: one inside the window (so contracts retire
+        # mid-study) and one just after it.
+        expirations = [sessions[-1], sessions[-1] + timedelta(days=7)]
+    if strikes is None:
+        strikes = [5900.0 + 25.0 * i for i in range(9)]
 
     by_session: dict[str, list[dict[str, Any]]] = {s.isoformat(): [] for s in sessions}
     for row in sample_rows(
@@ -226,6 +250,8 @@ def write_sample_files(
         strikes=strikes,
         interval_minutes=interval_minutes,
         seed=seed,
+        symbol=symbol,
+        option_root=option_root,
     ):
         by_session[row["trade_date"]].append(row)
 

@@ -463,10 +463,33 @@ def cmd_make_sample(args: argparse.Namespace) -> int:
     """
     from research.mm_attributed_gex.sample import write_sample_files
 
+    anchor = None
+    if args.anchor_to_db:
+        from research.mm_attributed_gex.sources import fetch_sample_anchor, research_connection
+
+        with research_connection() as conn:
+            anchor = fetch_sample_anchor(conn, args.symbol, days=args.sessions)
+        if anchor is None:
+            print(
+                f"No {args.symbol} analytics rows found to anchor to. Either the "
+                "database has no recent gex_summary/option_chains data, or the "
+                "symbol is wrong. Falling back is not useful here — an unanchored "
+                "sample cannot exercise the dataset step.",
+                file=sys.stderr,
+            )
+            return 2
+        print("Anchored to real contracts from the database:")
+        print(json.dumps(anchor.as_dict(), indent=2, default=str))
+        print()
+
     paths = write_sample_files(
         args.out,
         n_sessions=args.sessions,
         interval_minutes=args.interval_minutes,
+        sessions=anchor.sessions if anchor else None,
+        expirations=anchor.expirations if anchor else None,
+        strikes=anchor.strikes if anchor else None,
+        symbol=anchor.symbol if anchor else args.symbol,
     )
     print(f"wrote {len(paths)} synthetic session files to {args.out}/")
     for path in paths:
@@ -476,7 +499,15 @@ def cmd_make_sample(args: argparse.Namespace) -> int:
     # profile file instead of quietly diverging.
     profile_path = "research_output/cboe_profile.json"
     print(
-        "\nSYNTHETIC — invented column names, random numbers. A real Cboe header\n"
+        (
+            "\nANCHORED TO REAL CONTRACTS — the series, sessions and the market data\n"
+            "around them are real; the Market Maker FLOW over them is invented. Every\n"
+            "MM-attributed number downstream is therefore meaningless. This exists to\n"
+            "shake out the database queries and the report render, nothing else.\n"
+            if args.anchor_to_db
+            else ""
+        )
+        + "\nSYNTHETIC — invented column names, random numbers. A real Cboe header\n"
         "will differ, which is why inspect-cboe proposes a mapping instead of\n"
         "assuming one. Nothing computed from these files is a finding.\n"
         "\nRehearse the workflow (or use the make targets: mmgex-inspect,\n"
@@ -606,6 +637,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="research_output/sample")
     p.add_argument("--sessions", type=int, default=5)
     p.add_argument("--interval-minutes", type=int, default=10)
+    p.add_argument(
+        "--anchor-to-db",
+        action="store_true",
+        help="generate the synthetic flow over REAL contracts from the database, so "
+        "build-dataset and backtest can be rehearsed too (read-only; flow is still invented)",
+    )
     _add_common(p)
     p.set_defaults(func=cmd_make_sample)
 

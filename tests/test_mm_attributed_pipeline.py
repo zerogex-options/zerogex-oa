@@ -519,3 +519,56 @@ def test_pipeline_check_runs_every_layer_and_labels_itself_synthetic():
     assert payload["rows_with_existing_gamma"] > 0
     assert payload["report_chars"] > 500
     assert "not evidence" in payload["warning"]
+
+
+def test_sample_generator_accepts_real_series_identities():
+    """Anchoring lets the dataset step be rehearsed against contracts that exist.
+
+    The flow stays invented; only the series, sessions and surrounding market
+    data are real. Verifying the override plumbing here means the anchored path
+    is covered without a database.
+    """
+    import tempfile
+
+    from research.mm_attributed_gex.sample import write_sample_files
+
+    sessions = [date(2026, 6, 15), date(2026, 6, 16)]
+    expirations = [date(2026, 6, 19)]
+    strikes = [6000.0, 6025.0]
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = write_sample_files(
+            tmp,
+            sessions=sessions,
+            expirations=expirations,
+            strikes=strikes,
+            interval_minutes=60,
+        )
+        assert len(paths) == 2
+        combined = "".join(p.read_text() for p in paths)
+        assert "2026-06-19" in combined  # the expiration we asked for
+        assert "2026-06-15" in combined
+        # Every requested strike must appear somewhere. A fixed late-start
+        # index used to drop the back half entirely on a short window.
+        for strike in ("6000", "6025"):
+            assert strike in combined, strike
+
+
+def test_sample_generator_never_closes_more_than_a_position_holds():
+    """Impossible flow would censor every series and teach the wrong lesson."""
+    from research.mm_attributed_gex.sample import sample_rows
+
+    held: dict[tuple, list[int]] = {}
+    for row in sample_rows(
+        sessions=[date(2026, 6, 15), date(2026, 6, 16)],
+        expirations=[date(2026, 6, 19)],
+        strikes=[6000.0],
+        interval_minutes=30,
+    ):
+        key = (row["expiration"], row["strike"], row["call_put"])
+        position = held.setdefault(key, [0, 0])
+        position[0] += int(row["market_maker_open_buy"])
+        position[1] += int(row["market_maker_open_sell"])
+        position[0] -= int(row["market_maker_close_sell"])
+        position[1] -= int(row["market_maker_close_buy"])
+        assert position[0] >= 0, "closing sells exceeded the long position"
+        assert position[1] >= 0, "closing buys exceeded the short position"
