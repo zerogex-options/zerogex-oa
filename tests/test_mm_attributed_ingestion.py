@@ -488,3 +488,79 @@ def test_inspector_proposal_can_be_saved_and_reloaded(tmp_path):
     # Once a human confirms it, the same mapping loads the file cleanly.
     confirmed = reloaded.with_confirmed(True)
     assert len(list(load_file(path, confirmed))) == 3
+
+
+# ---------------------------------------------------------------------------
+# Regressions found by walking the workflow by hand
+# ---------------------------------------------------------------------------
+
+
+def test_missing_profile_file_says_the_file_is_missing(tmp_path):
+    """A path that doesn't exist must not report as an unknown built-in NAME.
+
+    The fallback to the built-in lookup turned "you haven't created
+    profile.json yet" into "Unknown profile 'research_output/cboe_profile.json';
+    built-ins are [...]", which sends the reader hunting for a name that was
+    never the problem.
+    """
+    missing = tmp_path / "not_created_yet.json"
+    with pytest.raises(FileNotFoundError) as exc:
+        load_profile_file(missing)
+    message = str(exc.value)
+    assert "No profile file at" in message
+    assert "inspect-cboe" in message  # tells you how to create one
+    assert "built-ins are" not in message
+
+
+def test_a_bare_name_still_resolves_to_a_builtin():
+    """The built-in lookup still works for values that aren't path-shaped."""
+    assert load_profile_file("cboe_open_close_v1").name == "cboe_open_close_v1"
+
+
+def test_directory_walk_skips_readmes_and_still_loads_the_data(tmp_path):
+    """Real deliveries ship a readme next to the data; it is not a parse failure."""
+    _write_csv(tmp_path / "oc_20260615.csv", [_wide_row()])
+    (tmp_path / "README.txt").write_text("delivery notes", encoding="utf-8")
+    (tmp_path / "MANIFEST.txt").write_text("checksums", encoding="utf-8")
+
+    result = LoadResult()
+    records = list(load_paths([tmp_path], _confirmed_wide_profile(), result=result))
+    assert len(records) == 3
+    assert result.files == 1
+    assert result.files_skipped == 0  # documentation is filtered, not "skipped"
+
+
+def test_directory_walk_skips_a_non_matching_member_but_keeps_going(tmp_path):
+    """One stray CSV with a different header must not abort the whole run."""
+    _write_csv(tmp_path / "oc_20260615.csv", [_wide_row()])
+    with (tmp_path / "something_else.csv").open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["a", "b"])
+        writer.writeheader()
+        writer.writerow({"a": 1, "b": 2})
+
+    result = LoadResult()
+    records = list(load_paths([tmp_path], _confirmed_wide_profile(), result=result))
+    assert len(records) == 3
+    assert result.files == 1
+    assert result.files_skipped == 1
+    assert any("header mismatch" in e for e in result.errors)
+
+
+def test_directory_where_nothing_matches_raises_rather_than_yielding_nothing(tmp_path):
+    """Zero records must not look like a quiet day with no trading."""
+    with (tmp_path / "wrong.csv").open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["a", "b"])
+        writer.writeheader()
+        writer.writerow({"a": 1, "b": 2})
+    with pytest.raises(ProfileMismatch, match="none of the"):
+        list(load_paths([tmp_path], _confirmed_wide_profile()))
+
+
+def test_an_explicitly_named_file_still_fails_hard_on_mismatch(tmp_path):
+    """Naming a file asserts it is data, so a mismatch there is an error."""
+    with (tmp_path / "wrong.csv").open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["a", "b"])
+        writer.writeheader()
+        writer.writerow({"a": 1, "b": 2})
+    with pytest.raises(ProfileMismatch):
+        list(load_paths([tmp_path / "wrong.csv"], _confirmed_wide_profile()))

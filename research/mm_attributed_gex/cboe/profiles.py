@@ -470,12 +470,32 @@ def profile_from_dict(payload: Mapping[str, Any]) -> ColumnProfile:
 
 
 def load_profile_file(path: str | Path) -> ColumnProfile:
-    """Load a profile from JSON, or resolve a built-in name."""
+    """Load a profile from JSON, or resolve a built-in name.
+
+    A value that looks like a path (has a directory separator or a ``.json``
+    suffix) is only ever treated as a file. Falling back to the built-in
+    lookup for those produced a badly misleading error — a missing
+    ``profile.json`` reported as "unknown profile, built-ins are [...]", which
+    sends the reader hunting for a name when the real problem is that the file
+    was never created.
+    """
+    text = str(path)
     p = Path(path)
-    if not p.exists():
-        return get_profile(str(path))
-    with p.open("r", encoding="utf-8") as fh:
-        return profile_from_dict(json.load(fh))
+    looks_like_a_path = ("/" in text) or ("\\" in text) or p.suffix.lower() == ".json"
+
+    if p.exists():
+        with p.open("r", encoding="utf-8") as fh:
+            return profile_from_dict(json.load(fh))
+
+    if looks_like_a_path:
+        raise FileNotFoundError(
+            f"No profile file at {text!r}. Create one by inspecting a real "
+            f"Open-Close file:\n"
+            f"    python -m research.mm_attributed_gex.cli inspect-cboe "
+            f"<your-cboe-file.csv> --save {text}\n"
+            f'then review every mapping and set "confirmed": true in it.'
+        )
+    return get_profile(text)
 
 
 def save_profile_file(profile: ColumnProfile, path: str | Path) -> Path:

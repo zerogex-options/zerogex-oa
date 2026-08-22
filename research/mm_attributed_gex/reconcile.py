@@ -278,6 +278,12 @@ def summarize(
         if observed_oi
         else ReconciliationReport(verdict="no_open_interest_supplied")
     )
+    # Participant coverage is a property of the RECORDS, not of the
+    # open-interest check.  Deriving it only inside that branch made a run
+    # without stored OI report "no MARKET_MAKER records present" for a file
+    # that was full of them.
+    if not report.participants_covered:
+        report.participants_covered = tuple(sorted({r.participant.value for r in records}))
     _, total_abs, share = zero_sum_residual(records)
     report.zero_sum_residual_contracts = total_abs
     report.zero_sum_residual_share = share

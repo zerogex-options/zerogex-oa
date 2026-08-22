@@ -86,6 +86,7 @@ class LoadResult:
     """
 
     files: int = 0
+    files_skipped: int = 0
     rows_read: int = 0
     rows_skipped: int = 0
     records_emitted: int = 0
@@ -99,6 +100,7 @@ class LoadResult:
 
     def merge(self, other: "LoadResult") -> "LoadResult":
         self.files += other.files
+        self.files_skipped += other.files_skipped
         self.rows_read += other.rows_read
         self.rows_skipped += other.rows_skipped
         self.records_emitted += other.records_emitted
@@ -114,6 +116,7 @@ class LoadResult:
     def as_dict(self) -> dict[str, Any]:
         return {
             "files": self.files,
+            "files_skipped": self.files_skipped,
             "rows_read": self.rows_read,
             "rows_skipped": self.rows_skipped,
             "records_emitted": self.records_emitted,
@@ -473,13 +476,14 @@ def load_file(
         )
     p = Path(path)
     res = result if result is not None else LoadResult()
-    res.files += 1
+    counted = False
 
     if p.suffix.lower() == ".parquet":
         header, rows = _iter_parquet_rows(p)
         problems = profile.validate(header)
         if problems:
             raise ProfileMismatch(f"{p}: " + "; ".join(problems))
+        res.files += 1
         yield from records_from_rows(rows, profile, result=res, source=p.name, drop_zero=drop_zero)
         return
 
@@ -489,9 +493,25 @@ def load_file(
         problems = profile.validate(header)
         if problems:
             raise ProfileMismatch(f"{source}: " + "; ".join(problems))
+        if not counted:
+            # Count the FILE once, after its header validates — a zip with
+            # several members is still one file.
+            res.files += 1
+            counted = True
         yield from records_from_rows(
             reader, profile, result=res, source=source, drop_zero=drop_zero
         )
+
+
+#: Filenames a data directory routinely carries that are not data.  A real
+#: Open-Close delivery ships alongside a readme, a manifest and checksums; the
+#: walk must not treat those as files that failed to parse.
+_NON_DATA_STEMS = ("readme", "manifest", "checksum", "sha256", "md5", "license", "notice")
+
+
+def _looks_like_documentation(path: Path) -> bool:
+    stem = path.stem.lower()
+    return any(token in stem for token in _NON_DATA_STEMS)
 
 
 def load_paths(
@@ -507,27 +527,55 @@ def load_paths(
     Sorted order matters: the inventory recursion is a running sum over time,
     so files must be consumed chronologically.  Directory arguments expand to
     their supported members, also sorted.
+
+    Explicitly-named files and directory members are treated differently on a
+    header mismatch, and the asymmetry is deliberate.  Naming a file is a
+    statement that it *is* data, so a mismatch there is an error worth
+    stopping on.  A directory is a container that legitimately holds readmes,
+    manifests and checksums next to the data, so a member that does not match
+    the profile is skipped and counted rather than aborting the run.  If
+    *nothing* in the directory matched, that is a real failure and it raises —
+    silently yielding zero records would look exactly like a day with no
+    trading.
     """
     res = result if result is not None else LoadResult()
-    expanded: list[Path] = []
+    explicit: list[Path] = []
+    from_directory: list[Path] = []
     for raw in paths:
         p = Path(raw)
         if p.is_dir():
-            expanded.extend(
+            from_directory.extend(
                 sorted(
                     q
                     for q in p.rglob("*")
                     if q.is_file()
                     and q.suffix.lower() in (".csv", ".gz", ".zip", ".txt", ".parquet")
+                    and not _looks_like_documentation(q)
                 )
             )
         else:
-            expanded.append(p)
-    for p in sorted(expanded):
+            explicit.append(p)
+
+    mismatches: list[str] = []
+    loaded_from_directory = 0
+    for p in sorted(explicit):
         yield from load_file(
-            p,
-            profile,
-            allow_unconfirmed=allow_unconfirmed,
-            result=res,
-            drop_zero=drop_zero,
+            p, profile, allow_unconfirmed=allow_unconfirmed, result=res, drop_zero=drop_zero
+        )
+    for p in sorted(from_directory):
+        try:
+            yield from load_file(
+                p, profile, allow_unconfirmed=allow_unconfirmed, result=res, drop_zero=drop_zero
+            )
+            loaded_from_directory += 1
+        except ProfileMismatch as exc:
+            res.files_skipped += 1
+            mismatches.append(str(exc).split(";")[0])
+            if len(res.errors) < 200:
+                res.errors.append(f"skipped (header mismatch): {p.name}")
+
+    if from_directory and not explicit and loaded_from_directory == 0:
+        raise ProfileMismatch(
+            f"none of the {len(from_directory)} file(s) found matched profile "
+            f"{profile.name!r}. First mismatch: " + (mismatches[0] if mismatches else "unknown")
         )

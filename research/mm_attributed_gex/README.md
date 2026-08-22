@@ -21,9 +21,16 @@ commands below produce the dataset and the report.
 
 ## Quick start
 
+Run these **one at a time** — steps 1+ need real Cboe files, and step 1 has a manual
+edit in the middle of it.
+
 ```bash
 # 0. Nothing but plumbing — synthetic inputs, not a result.
 python -m research.mm_attributed_gex.cli pipeline-check
+
+# 0b. No Cboe files yet? Generate a synthetic set and rehearse steps 1-3 on it.
+#     Invented columns, random numbers — for learning the workflow, never a result.
+python -m research.mm_attributed_gex.cli make-sample
 
 # 1. Read a delivered Cboe file and PROPOSE a column mapping.
 python -m research.mm_attributed_gex.cli inspect-cboe <file> --save profile.json

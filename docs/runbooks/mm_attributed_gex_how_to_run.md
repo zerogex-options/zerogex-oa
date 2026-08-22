@@ -96,7 +96,11 @@ Your team's broader vendor analysis is in
 
 ## 4. Running it
 
-Everything runs from the repository root. Five commands.
+Everything runs from the repository root.
+
+> **Run these ONE AT A TIME, not as a pasted block.** Steps 1–5 need real Cboe files;
+> anything with `/path/to/...` in it is a placeholder that will fail until you replace
+> it. Step 1 also has a manual edit in the middle of it.
 
 ### Step 0 — prove the plumbing works (no data needed, 30 seconds)
 
@@ -109,10 +113,34 @@ Runs every layer on synthetic inputs. Expect `"ok": true` and a verdict of
 conclude anything. **Its numbers are properties of the generator, not the market. Never
 quote them.**
 
+### Step 0b — rehearse the whole workflow without buying anything
+
+If you don't have Cboe files yet, generate a synthetic set shaped like an Open-Close
+delivery and walk steps 1–3 against it. This is how to learn what each command prints
+and what a healthy reconstruction looks like before spending money.
+
+```bash
+make mmgex-sample
+make mmgex-inspect MMGEX_FILE=research_output/sample/SYNTHETIC_openclose_c1_20260601.csv
+#   → then edit research_output/cboe_profile.json: "confirmed": false → true
+make mmgex-check-load  MMGEX_FILES=research_output/sample/
+make mmgex-reconstruct MMGEX_FILES=research_output/sample/
+```
+
+Expected shape of the result: ~42,000 records parsed from 5 files, 36 series tracked,
+`clean_share` around 0.55, `zero_sum_residual_share` of 0.0, and no reconciliation
+notes. The mix of clean and censored series is deliberate — it is what a short window
+looks like, and it is the diagnostic you will be comparing a real delivery against.
+
+**The sample's column names are invented and its numbers are random.** A real Cboe
+header will differ, which is exactly why `inspect-cboe` proposes a mapping rather than
+assuming one. Nothing computed from the sample is a finding. Delete
+`research_output/sample/` once you have real files.
+
 ### Step 1 — read a real file and propose a column mapping
 
 ```bash
-make mmgex-inspect MMGEX_FILE=/path/to/cboe_openclose_20260601.csv
+make mmgex-inspect MMGEX_FILE=<YOUR-CBOE-FILE>.csv
 ```
 
 Prints the file's actual header, the mapping it inferred, and — the important part —
@@ -129,7 +157,7 @@ possible failure for this experiment, so it can't happen by accident.
 ### Step 2 — check the parse
 
 ```bash
-make mmgex-check-load MMGEX_FILES="/path/to/cboe/*.csv"
+make mmgex-check-load MMGEX_FILES=<YOUR-CBOE-DIRECTORY>/
 ```
 
 Prints row counts, records emitted, contracts parsed, MM contracts parsed, symbols seen,
@@ -139,7 +167,7 @@ the MM columns aren't mapped and nothing downstream will be meaningful.
 ### Step 3 — reconstruct inventory and validate it
 
 ```bash
-make mmgex-reconstruct MMGEX_FILES="/path/to/cboe/"
+make mmgex-reconstruct MMGEX_FILES=<YOUR-CBOE-DIRECTORY>/
 ```
 
 This is your go/no-go gate. It prints two blocks:
@@ -164,7 +192,7 @@ implies. Look at `verdict`:
 ### Step 4 — build the side-by-side dataset
 
 ```bash
-make mmgex-dataset MMGEX_FILES="/path/to/cboe/" \
+make mmgex-dataset MMGEX_FILES=<YOUR-CBOE-DIRECTORY>/ \
     START=2026-05-01T13:30:00Z END=2026-06-30T20:00:00Z
 ```
 
@@ -312,6 +340,10 @@ regardless, under `universes` in the JSONL — a 0DTE-only conclusion never need
 | `INCONCLUSIVE_DATA` | coverage < 20% or confidence < 0.35 | same — more history |
 | `No gex_summary timestamps for SPX in [...]` | study window predates ZeroGEX's own retention | pick a window ZeroGEX has data for, or use `option_chains_archive` depth |
 | Dataset build is slow | it re-prices the full chain twice per snapshot | raise `--step-minutes` (e.g. 15) for a first pass |
+| `No profile file at '...'` | step 1 never produced it (or you skipped step 1) | run `mmgex-inspect` first; the error prints the exact command |
+| `[Errno 2] No such file or directory: '/path/to/...'` | a placeholder was run literally | substitute your real path, or use `make mmgex-sample` to rehearse |
+| `none of the N file(s) found matched profile` | wrong profile for this directory | re-run `mmgex-inspect` on a file from *this* delivery |
+| `files_skipped` > 0 in check-load | some directory members had a different header | check the `errors` list; readmes/manifests are filtered out automatically, so a skip means a real header mismatch |
 
 ## 10. Tests
 
