@@ -1193,6 +1193,10 @@ mmgex-sample: ## MM-GEX: write SYNTHETIC Open-Close files to rehearse the workfl
 mmgex-inspect: ## MM-GEX: propose a column mapping from a real Cboe file. Vars: MMGEX_FILE=path
 	$(PY) -m research.mm_attributed_gex.cli inspect-cboe $(MMGEX_FILE) --save $(MMGEX_PROFILE)
 
+.PHONY: mmgex-confirm
+mmgex-confirm: ## MM-GEX: show a proposed column mapping; add REVIEWED=yes to confirm it
+	$(PY) -m research.mm_attributed_gex.cli confirm-profile $(MMGEX_PROFILE) $(if $(filter yes,$(REVIEWED)),--reviewed,)
+
 .PHONY: mmgex-check-load
 mmgex-check-load: ## MM-GEX: parse files and report what came through. Vars: MMGEX_FILES=path MMGEX_PROFILE=path
 	$(PY) -m research.mm_attributed_gex.cli check-load $(MMGEX_FILES) --profile $(MMGEX_PROFILE)

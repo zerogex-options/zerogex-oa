@@ -564,3 +564,37 @@ def test_an_explicitly_named_file_still_fails_hard_on_mismatch(tmp_path):
         writer.writerow({"a": 1, "b": 2})
     with pytest.raises(ProfileMismatch):
         list(load_paths([tmp_path / "wrong.csv"], _confirmed_wide_profile()))
+
+
+def test_confirming_a_profile_requires_an_explicit_review_flag(tmp_path, capsys):
+    """The gate must be a deliberate act, but not a hand-edit.
+
+    Leaving confirmation as "now edit this JSON by hand" made it the one step
+    in the sequence that silently does not happen — the operator then hits a
+    refusal they read as a bug. As a command it cannot be silently skipped,
+    and ``--reviewed`` keeps the act deliberate.
+    """
+    from research.mm_attributed_gex.cli import main
+
+    proposal = save_profile_file(
+        _confirmed_wide_profile().with_confirmed(False), tmp_path / "profile.json"
+    )
+
+    # Without the flag: prints the mapping, refuses, leaves the file alone.
+    assert main(["confirm-profile", str(proposal)]) == 2
+    captured = capsys.readouterr()
+    assert "market_maker_open_buy" in captured.out  # you see what you'd confirm
+    assert "NOT CONFIRMED" in captured.err
+    assert load_profile_file(proposal).confirmed is False
+
+    # With the flag: confirmed and usable.
+    assert main(["confirm-profile", str(proposal), "--reviewed"]) == 0
+    assert load_profile_file(proposal).confirmed is True
+
+
+def test_confirming_an_already_confirmed_profile_is_a_no_op(tmp_path):
+    from research.mm_attributed_gex.cli import main
+
+    path = save_profile_file(_confirmed_wide_profile(), tmp_path / "profile.json")
+    assert main(["confirm-profile", str(path)]) == 0
+    assert load_profile_file(path).confirmed is True

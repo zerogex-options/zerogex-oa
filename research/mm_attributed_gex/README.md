@@ -34,8 +34,11 @@ python -m research.mm_attributed_gex.cli make-sample
 
 # 1. Read a delivered Cboe file and PROPOSE a column mapping.
 python -m research.mm_attributed_gex.cli inspect-cboe <file> --save profile.json
-#    Review every mapping against Cboe's field docs, then set "confirmed": true.
-#    An unconfirmed profile refuses to load, by design.
+
+# 1b. Review the mapping against Cboe's field docs, then confirm it.
+#     Without --reviewed this prints the mapping and refuses; an unconfirmed
+#     profile refuses to load anywhere else, by design.
+python -m research.mm_attributed_gex.cli confirm-profile profile.json --reviewed
 
 # 2. Check the parse, then the reconstruction + its independent reconciliation.
 python -m research.mm_attributed_gex.cli check-load  <files...> --profile profile.json
@@ -107,7 +110,7 @@ between the two methodologies is the attribution.
 pytest tests/ -k mm_attributed -q
 ```
 
-161 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
+170 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
 outcomes, statistics, replay and verdict logic. Synthetic examples throughout, sized so
 the correct answer can be checked by hand. Synthetic data is never used as evidence
 about the methodology.
