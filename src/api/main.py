@@ -21,6 +21,7 @@ import pytz
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
+from .futures_middleware import FuturesProjectionMiddleware
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
 from .ratelimit import rate_limit
 from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
@@ -399,6 +400,13 @@ app.add_middleware(
         "Accept",
     ],
 )
+
+# ES / NQ projection. Added BEFORE GZip so it ends up nested INSIDE it
+# (last add_middleware is outermost — see the ordering note below), which
+# means it reads and rewrites the raw JSON and GZip compresses the result.
+# Requests that don't name a future short-circuit immediately, so the
+# SPX/SPY/QQQ/NDX hot path never pays for the buffering this does.
+app.add_middleware(FuturesProjectionMiddleware)
 
 # Compress responses so that large JSON payloads from endpoints like
 # /api/flow/by-contract (which can return hundreds of thousands of rows for a
@@ -1196,10 +1204,11 @@ from src.market_calendar import (  # noqa: E402
     ET as _ET,
     NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
     should_display_future,
+    is_futures_session_open,
     current_cash_close_reference,
 )
 from src.config import _getenv_bool  # noqa: E402
-from src.symbols import resolve_index_future  # noqa: E402
+from src.symbols import resolve_futures_index, resolve_index_future  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 
@@ -1212,6 +1221,29 @@ def _index_futures_display_enabled() -> bool:
     populated ``futures_quotes``.
     """
     return _getenv_bool("INDEX_FUTURES_DISPLAY_ENABLED", False)
+
+
+async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> UnderlyingQuote:
+    """Latest observed bar for a first-class future (ES / NQ).
+
+    ES and NQ take their PRICE from their own feed rather than from a
+    projection of the index: overnight the cash index is frozen at its 16:00
+    close, so a projected price would report where ES stood at the bell
+    instead of where it is trading now.  (Their dealer LEVELS are still
+    SPX/NDX-derived and projected — see ``src/api/futures_middleware.py``.)
+    """
+    fut = await _db().get_latest_future_quote(index_symbol, current_cash_close_reference())
+    if not fut or fut.get("close") is None:
+        raise HTTPException(status_code=404, detail=f"No {futures_symbol} quote data available")
+    payload = {
+        key: value
+        for key, value in fut.items()
+        if key
+        in ("timestamp", "open", "high", "low", "close", "up_volume", "down_volume", "volume")
+    }
+    payload["symbol"] = futures_symbol
+    payload["session"] = "open" if is_futures_session_open() else "closed"
+    return UnderlyingQuote(**payload)
 
 
 def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
@@ -1378,6 +1410,11 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     surface that reads ``quoteData.close``.
     """
     try:
+        # ES / NQ are first-class symbols served from their own bars.
+        futures_index = resolve_futures_index(symbol)
+        if futures_index:
+            return await _native_futures_quote(symbol.strip().upper(), futures_index)
+
         data = await _db().get_latest_quote(symbol)
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
@@ -1506,6 +1543,17 @@ async def get_historical_quotes(
         # Parse dates if provided
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
+
+        # ES / NQ: their own bar series, always — not gated on allow_futures
+        # or the overnight display window, because for a first-class future
+        # the futures series IS the price series at every hour.
+        futures_index = resolve_futures_index(symbol)
+        if futures_index:
+            label = symbol.strip().upper()
+            fut_rows = await _db().get_historical_futures(
+                futures_index, start_dt, end_dt, window_units, timeframe
+            )
+            return [UnderlyingQuote(**{**row, "symbol": label}) for row in fut_rows]
 
         # Index→future DISPLAY swap for the candlestick series — ONLY when the
         # caller opts in via allow_futures (the candle chart). Read-only from

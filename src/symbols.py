@@ -25,6 +25,22 @@ def _parse_alias_mapping(raw_mapping: str) -> Dict[str, str]:
     return mapping
 
 
+def _parse_float_mapping(raw_mapping: str) -> Dict[str, float]:
+    """Parse a KEY=FLOAT,KEY2=FLOAT2 env var, skipping unparseable entries.
+
+    A malformed value is dropped rather than raised on, so one bad operator
+    edit degrades to the built-in default for that key instead of taking the
+    process down at import time.
+    """
+    mapping: Dict[str, float] = {}
+    for key, value in _parse_alias_mapping(raw_mapping).items():
+        try:
+            mapping[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return mapping
+
+
 def get_symbol_aliases() -> Dict[str, str]:
     """Return alias mapping from env (SYMBOL_ALIASES)."""
     return _parse_alias_mapping(os.getenv("SYMBOL_ALIASES", ""))
@@ -126,6 +142,123 @@ def resolve_index_future(symbol: str) -> str | None:
     if not normalized:
         return None
     return get_index_futures().get(normalized)
+
+
+# ---------------------------------------------------------------------------
+# Futures as first-class underlyings (ES / NQ)
+# ---------------------------------------------------------------------------
+#
+# ``_DEFAULT_INDEX_FUTURES`` above answers "which future do I DISPLAY in
+# place of this index overnight".  This section answers the INVERSE — "which
+# index's option chain describes this future's dealer positioning" — and it
+# is what makes ES / NQ selectable symbols in their own right rather than a
+# night-time skin on SPX / NDX.
+#
+# ZeroGEX computes gamma from INDEX option chains (SPX, NDX) and never from
+# options on futures: ES and SPX track the same index, so it is the same
+# dealer book.  What differs is the price axis — ES trades at a cost-of-carry
+# premium to SPX.  Every ES / NQ surface is therefore the corresponding index
+# surface with its PRICE-SPACE fields (strikes, walls, flip, max pain, spot)
+# carried across by the live basis ratio.  The dollar exposures are NOT
+# rescaled: dealer exposure is a property of the option book, not of the axis
+# you plot it on.  The ratio itself lives in ``src/jobs/futures_projection.py``.
+#
+# Override with ``FUTURES_UNDERLYINGS_MAP`` (same KEY=VALUE format as
+# ``SYMBOL_ALIASES``), e.g. ``FUTURES_UNDERLYINGS_MAP=ES=SPX,NQ=NDX``.
+_DEFAULT_FUTURES_UNDERLYINGS: Dict[str, str] = {
+    "ES": "SPX",
+    "NQ": "NDX",
+    "RTY": "RUT",
+    "YM": "DJX",
+}
+
+# Minimum price increment of each future.  Projected levels are rounded to
+# this so a published level is a price a trader can actually work an order
+# at.  Override with ``FUTURES_TICK_SIZES`` (KEY=VALUE, float values).
+_DEFAULT_FUTURES_TICK_SIZES: Dict[str, float] = {
+    "ES": 0.25,
+    "NQ": 0.25,
+    "RTY": 0.10,
+    "YM": 1.0,
+}
+
+
+def get_futures_underlyings() -> Dict[str, str]:
+    """Return the future → backing cash-index mapping (env-overridable)."""
+    overrides = _parse_alias_mapping(os.getenv("FUTURES_UNDERLYINGS_MAP", ""))
+    merged = dict(_DEFAULT_FUTURES_UNDERLYINGS)
+    merged.update(overrides)
+    return merged
+
+
+def get_futures_tick_sizes() -> Dict[str, float]:
+    """Return the future → tick-size mapping (env-overridable)."""
+    overrides = _parse_float_mapping(os.getenv("FUTURES_TICK_SIZES", ""))
+    merged = dict(_DEFAULT_FUTURES_TICK_SIZES)
+    merged.update(overrides)
+    return merged
+
+
+def is_futures_symbol(symbol: str) -> bool:
+    """True when ``symbol`` is a first-class future (ES, NQ, …).
+
+    Note this is the CANONICAL alias (``ES``), not the TradeStation
+    continuous-contract symbol (``@ES``) that ``resolve_index_future``
+    returns — the two namespaces are deliberately distinct so a projected
+    ES surface can never be confused with the raw futures feed.
+    """
+    normalized = (symbol or "").strip().upper()
+    if not normalized:
+        return False
+    return normalized in get_futures_underlyings()
+
+
+def resolve_futures_index(symbol: str) -> str | None:
+    """Return the cash index whose options back ``symbol``, or None.
+
+    ``ES -> SPX``, ``NQ -> NDX``.  Returns None for anything that is not a
+    configured future, so callers can treat "not a future" and "a future
+    with no backing index" identically.
+    """
+    normalized = (symbol or "").strip().upper()
+    if not normalized:
+        return None
+    return get_futures_underlyings().get(normalized)
+
+
+def resolve_futures_alias(index_symbol: str) -> str | None:
+    """Inverse of :func:`resolve_futures_index`: ``SPX -> ES``, ``NDX -> NQ``.
+
+    Returns None when the index has no first-class future configured.  When
+    two futures map to the same index (a misconfiguration), the first in
+    map order wins deterministically.
+    """
+    normalized = (index_symbol or "").strip().upper()
+    if not normalized:
+        return None
+    for future, index in get_futures_underlyings().items():
+        if index == normalized:
+            return future
+    return None
+
+
+def resolve_futures_tick(symbol: str) -> float | None:
+    """Tick size for a first-class future, or None when unknown."""
+    normalized = (symbol or "").strip().upper()
+    if not normalized:
+        return None
+    return get_futures_tick_sizes().get(normalized)
+
+
+def round_to_tick(value: float, tick: float | None) -> float:
+    """Round ``value`` to the nearest multiple of ``tick``.
+
+    A non-positive or missing tick returns ``value`` unchanged, so callers
+    can pass an unknown symbol's tick straight through without branching.
+    """
+    if tick is None or tick <= 0:
+        return value
+    return round(round(value / tick) * tick, 10)
 
 
 def resolve_symbol(symbol_or_alias: str) -> str:

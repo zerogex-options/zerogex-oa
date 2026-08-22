@@ -6,14 +6,22 @@ from TradeStation's ``/stream/barcharts`` endpoint and upserts them into
 the ``futures_quotes`` table, keyed by the CASH INDEX the future stands in
 for (``SPX``, ``NDX``, …).
 
-This is the "flip" half of the index→futures DISPLAY swap: during the
-regular cash session the site shows the index (served from
-``underlying_quotes`` as always); during the overnight futures window
-(18:00 ET → next 09:30 ET, while CME is trading) this ingester keeps
-``futures_quotes`` fresh and ``/api/market/quote`` + ``/api/market/historical``
-read from it under the index label.  Outside that window the ingester
-sleeps — so it pulls the index during the day and the future at night,
-exactly as an operator would expect from a single "flip".
+``futures_quotes`` has two consumers, and between them they want the feed
+running for the WHOLE CME session (Sun 18:00 → Fri 17:00 ET, minus the
+daily 17:00-18:00 maintenance break — see
+:func:`src.market_calendar.is_futures_ingest_window`):
+
+* The **basis engine** (:mod:`src.jobs.futures_projection`), which makes
+  ES / NQ first-class symbols by carrying SPX / NDX levels across to the
+  futures price axis.  It measures the carry ratio by comparing an ES
+  print against the SPX print at the same minute — which is only possible
+  during the CASH session, precisely the window this ingester used to
+  sleep through.
+* The **overnight display swap**, the original consumer: during the
+  overnight window only, ``/api/market/quote`` + ``/api/market/historical``
+  attach the future's price under the index label.  That gate
+  (:func:`src.market_calendar.should_display_future`) is unchanged and
+  stays overnight-only — a wider ingest window does not widen the swap.
 
 Design mirrors :mod:`src.ingestion.volatility_index_ingester` (the VIX/VXN
 ingesters): one long-running child process per configured index, a
@@ -44,7 +52,7 @@ import requests as _requests
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
 from src.config import _getenv_int, _getenv_bool, _getenv_str, API_REQUEST_TIMEOUT
-from src.market_calendar import is_futures_display_window
+from src.market_calendar import is_futures_ingest_window
 from src.symbols import resolve_index_future
 from src.utils import get_logger
 from src.validation import safe_float, safe_datetime
@@ -222,9 +230,7 @@ class FuturesUnderlyingIngester:
                 conn.commit()
             return len(bars)
         except Exception as e:
-            logger.error(
-                "%s futures bar upsert failed: %s", self.index_symbol, e, exc_info=True
-            )
+            logger.error("%s futures bar upsert failed: %s", self.index_symbol, e, exc_info=True)
             return 0
 
     def _prune_old_bars(self) -> None:
@@ -342,7 +348,7 @@ class FuturesUnderlyingIngester:
 
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
-                if not self.running or not is_futures_display_window():
+                if not self.running or not is_futures_ingest_window():
                     break
                 if not raw_line:
                     continue
@@ -375,9 +381,9 @@ class FuturesUnderlyingIngester:
     # -- run loop ----------------------------------------------------------
 
     def _sleep_until_window(self) -> None:
-        """Sleep in short chunks until the futures display window opens."""
+        """Sleep in short chunks until the futures ingest window opens."""
         slept = 0
-        while self.running and not is_futures_display_window():
+        while self.running and not is_futures_ingest_window():
             time.sleep(1)
             slept += 1
             if slept % _WINDOW_POLL_SEC == 0:
@@ -389,8 +395,8 @@ class FuturesUnderlyingIngester:
     def run(self) -> None:
         logger.info("=" * 80)
         logger.info(
-            "%s FUTURES INGESTER — streaming %s %d-%s bars during the "
-            "overnight futures window (18:00-09:30 ET)",
+            "%s FUTURES INGESTER — streaming %s %d-%s bars for the whole "
+            "CME session (Sun 18:00 -> Fri 17:00 ET)",
             self.index_symbol,
             self.future_symbol,
             FUTURES_BAR_INTERVAL,
@@ -401,8 +407,9 @@ class FuturesUnderlyingIngester:
         self.running = True
         try:
             while self.running:
-                if not is_futures_display_window():
-                    # Flip back to the index: nothing to pull, wait it out.
+                if not is_futures_ingest_window():
+                    # CME is closed (weekend / maintenance break): nothing to
+                    # pull, wait it out.
                     self._seeded = False  # re-seed the window on next open
                     self._sleep_until_window()
                     continue
@@ -410,7 +417,7 @@ class FuturesUnderlyingIngester:
                 try:
                     self._read_stream()
                 except Exception as e:
-                    if self.running and is_futures_display_window():
+                    if self.running and is_futures_ingest_window():
                         logger.warning(
                             "%s futures stream disconnected (%s), reconnecting in %ds...",
                             self.index_symbol,

@@ -527,6 +527,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
             "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
         )
+        # index<->future carry ratio (src/jobs/futures_projection.py). Moves on
+        # the order of a point a day, so it is cached far longer than a quote;
+        # every ES/NQ request resolves it, hence caching it at all.
+        self._futures_basis_cache_ttl_seconds: float = _getenv_float(
+            "FUTURES_BASIS_CACHE_TTL_SECONDS", 60.0
+        )
         # TTL for analytics-derived endpoints (gex_by_strike, gex_walls, etc.)
         # that only change on the analytics cycle (~60s). A moderate TTL
         # eliminates redundant DB round-trips from rapid frontend polling.
@@ -852,9 +858,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # operator who already tuned DB_POOL_MAX higher keeps it, but the
         # request pool is never floored back down to the tiny background size.
         min_size = _getenv_int("API_DB_POOL_MIN", _getenv_int("DB_POOL_MIN", 1))
-        max_size = _getenv_int(
-            "API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12)
-        )
+        max_size = _getenv_int("API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12))
         statement_timeout_ms = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
@@ -1067,6 +1071,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         (``/api/health/live``) is DB-free and never reaches this path.
         """
         try:
+
             async def _probe() -> None:
                 async with self._acquire_connection() as conn:
                     await conn.fetchval("SELECT 1")
@@ -3085,9 +3090,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cap = max(1, int(max_expirations))
         try:
             async with self._acquire_connection() as conn:
-                exp_rows = await conn.fetch(
-                    exps_query, symbol, start_utc, end_utc, session_date
-                )
+                exp_rows = await conn.fetch(exps_query, symbol, start_utc, end_utc, session_date)
                 if not exp_rows:
                     return empty
                 all_exps = [r["expiration"] for r in exp_rows]
@@ -5824,6 +5827,72 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching latest future quote: {e!r}", exc_info=True)
             raise
 
+    async def get_futures_basis_samples(
+        self,
+        index_symbol: str,
+        *,
+        lookback_minutes: int = 5760,
+        limit: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """Concurrent future/index print pairs, newest first.
+
+        The raw material for the index->future carry ratio that makes ES / NQ
+        first-class symbols (see :mod:`src.jobs.futures_projection`).  A pair
+        can only exist while BOTH markets print, i.e. during the cash session
+        — which is why the futures ingester now runs the whole CME session
+        rather than the overnight window alone.
+
+        Each future bar is matched to the NEAREST index bar within +/-60s via
+        a LATERAL rather than an equality join on ``timestamp``: both feeds
+        are minute bars, but they come from different streams and a strict
+        join would silently yield nothing if either ever drifts off the
+        minute boundary.  Several samples are returned (not just the newest)
+        so the caller can take a median and shrug off a single bad print.
+
+        Reads ``futures_quotes`` + ``underlying_quotes`` only.
+        """
+        index_symbol = (index_symbol or "").upper()
+        cache_key = f"futures_basis_samples:{index_symbol}:{lookback_minutes}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH fut AS (
+                SELECT timestamp, future_symbol, close
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                  AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+                ORDER BY timestamp DESC
+                LIMIT $3
+            )
+            SELECT
+                f.timestamp        AS observed_at,
+                f.future_symbol    AS future_symbol,
+                f.close::float8    AS future_close,
+                u.close::float8    AS index_close
+            FROM fut f
+            JOIN LATERAL (
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp BETWEEN f.timestamp - INTERVAL '60 seconds'
+                                    AND f.timestamp + INTERVAL '60 seconds'
+                ORDER BY ABS(EXTRACT(EPOCH FROM (timestamp - f.timestamp)))
+                LIMIT 1
+            ) u ON TRUE
+            ORDER BY f.timestamp DESC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, index_symbol, int(lookback_minutes), int(limit))
+                payload = [dict(r) for r in rows]
+                self._cache_set(cache_key, payload, self._futures_basis_cache_ttl_seconds)
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching futures basis samples: {e!r}", exc_info=True)
+            return []
+
     async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
         Get the most recent 4:00 PM ET close price (previous trading day's close).
@@ -6058,9 +6127,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "prior_session_close": prior_close,
                     "prior_session_close_ts": prior_ts,
                 }
-                self._cache_set(
-                    cache_key, result, self._session_closes_cache_ttl_seconds
-                )
+                self._cache_set(cache_key, result, self._session_closes_cache_ttl_seconds)
                 return result
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}", exc_info=True)
