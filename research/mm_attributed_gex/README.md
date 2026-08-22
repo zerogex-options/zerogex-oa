@@ -15,9 +15,13 @@ Design, methodology and full data requirements:
 
 ## Status
 
-The pipeline is complete and tested. **No Cboe Open-Close file has been supplied**, so
-no historical comparison has been run and no result exists. Drop real files in and the
-commands below produce the dataset and the report.
+The pipeline is complete, tested, and verified end to end against the production
+database (read-only) using synthetic flow anchored to real SPX contracts — see §10 of
+the design doc for what that run established.
+
+**No Cboe Open-Close file has been supplied**, so no historical comparison has been run
+and no result about the methodology exists. Drop real files in and the commands below
+produce the dataset and the report.
 
 ## Quick start
 
@@ -115,7 +119,7 @@ between the two methodologies is the attribution.
 pytest tests/ -k mm_attributed -q
 ```
 
-172 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
+177 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
 outcomes, statistics, replay and verdict logic. Synthetic examples throughout, sized so
 the correct answer can be checked by hand. Synthetic data is never used as evidence
 about the methodology.
