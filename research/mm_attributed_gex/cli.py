@@ -80,6 +80,70 @@ def cmd_inspect_cboe(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# confirm-profile
+# ---------------------------------------------------------------------------
+
+
+def cmd_confirm_profile(args: argparse.Namespace) -> int:
+    """Flip a proposed profile to confirmed, after showing what is being confirmed.
+
+    The confirmation gate exists so a human checks the column mapping against
+    the vendor's field documentation before any result rests on it.  Leaving
+    that as "now hand-edit this JSON" was a mistake: a manual edit in the
+    middle of a command sequence is exactly the step that silently does not
+    happen, and the operator then hits a refusal they read as a bug.
+
+    So it is a command — but one that prints the full mapping and refuses
+    unless ``--reviewed`` is passed explicitly.  The deliberate act is
+    preserved; the silent omission is not possible.
+    """
+    from research.mm_attributed_gex.cboe.profiles import load_profile_file, save_profile_file
+
+    args.profile = getattr(args, "profile_path", None) or args.profile
+    profile = load_profile_file(args.profile)
+    if profile.confirmed:
+        print(f"{args.profile} is already confirmed ({profile.name}).")
+        return 0
+
+    print(f"Profile: {profile.name}   (layout: {profile.layout})")
+    print(f"File:    {args.profile}")
+    print("\nStructural columns:")
+    for label, column in (
+        ("symbol", profile.symbol_col),
+        ("option_root", profile.option_root_col),
+        ("trading_date", profile.trading_date_col),
+        ("interval_end", profile.interval_end_col),
+        ("expiration", profile.expiration_col),
+        ("strike", profile.strike_col),
+        ("option_type", profile.option_type_col),
+    ):
+        print(f"  {label:<14} <- {column}")
+    mm = profile.market_maker_columns()
+    print(f"\nMarket Maker volume columns ({len(mm)}):")
+    for vc in mm:
+        print(f"  {vc.column:<40} -> {vc.describe()}")
+    others = [vc for vc in profile.volume_columns if vc not in mm]
+    print(f"\nOther participant volume columns: {len(others)}")
+    print(f"Interval (bucket width):          {profile.interval.value}")
+    print(f"Strike scale:                     {profile.strike_scale}")
+
+    if not args.reviewed:
+        print(
+            "\nNOT CONFIRMED. Check every mapping above against the vendor's field\n"
+            "documentation (for Cboe, the Open-Close spec PDF from DataShop), then\n"
+            "re-run with --reviewed:\n"
+            f"    python -m research.mm_attributed_gex.cli confirm-profile "
+            f"{args.profile} --reviewed",
+            file=sys.stderr,
+        )
+        return 2
+
+    save_profile_file(profile.with_confirmed(True), args.profile)
+    print(f"\nCONFIRMED — {args.profile} is now usable for research.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # check-load
 # ---------------------------------------------------------------------------
 
@@ -407,18 +471,24 @@ def cmd_make_sample(args: argparse.Namespace) -> int:
     print(f"wrote {len(paths)} synthetic session files to {args.out}/")
     for path in paths:
         print(f"  {path}  ({path.stat().st_size:,} bytes)")
+    # The paths printed here match the Makefile's MMGEX_PROFILE default, so
+    # following the `make` route and the `python -m` route land on the same
+    # profile file instead of quietly diverging.
+    profile_path = "research_output/cboe_profile.json"
     print(
         "\nSYNTHETIC — invented column names, random numbers. A real Cboe header\n"
         "will differ, which is why inspect-cboe proposes a mapping instead of\n"
         "assuming one. Nothing computed from these files is a finding.\n"
-        "\nRehearse the workflow:\n"
+        "\nRehearse the workflow (or use the make targets: mmgex-inspect,\n"
+        "mmgex-confirm, mmgex-check-load, mmgex-reconstruct):\n"
         f"  python -m research.mm_attributed_gex.cli inspect-cboe {paths[0]} "
-        "--save research_output/sample_profile.json\n"
-        '  # then set "confirmed": true in that file\n'
+        f"--save {profile_path}\n"
+        f"  python -m research.mm_attributed_gex.cli confirm-profile {profile_path} "
+        "--reviewed\n"
         f"  python -m research.mm_attributed_gex.cli check-load {args.out}/ "
-        "--profile research_output/sample_profile.json\n"
+        f"--profile {profile_path}\n"
         f"  python -m research.mm_attributed_gex.cli reconstruct {args.out}/ "
-        "--profile research_output/sample_profile.json --no-db"
+        f"--profile {profile_path} --no-db"
     )
     return 0
 
@@ -463,6 +533,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save", help="write the proposed profile to this JSON path")
     _add_common(p)
     p.set_defaults(func=cmd_inspect_cboe)
+
+    p = sub.add_parser(
+        "confirm-profile",
+        help="review a proposed column mapping and mark it confirmed",
+    )
+    p.add_argument("profile_path", nargs="?", help="path to the profile JSON")
+    p.add_argument(
+        "--reviewed",
+        action="store_true",
+        help="you have checked every mapping against the vendor's field documentation",
+    )
+    _add_common(p)
+    p.set_defaults(func=cmd_confirm_profile)
 
     p = sub.add_parser("check-load", help="parse files and report what came through")
     p.add_argument("files", nargs="+")

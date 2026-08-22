@@ -122,15 +122,17 @@ and what a healthy reconstruction looks like before spending money.
 ```bash
 make mmgex-sample
 make mmgex-inspect MMGEX_FILE=research_output/sample/SYNTHETIC_openclose_c1_20260601.csv
-#   → then edit research_output/cboe_profile.json: "confirmed": false → true
+make mmgex-confirm                    # prints the mapping and REFUSES
+make mmgex-confirm REVIEWED=yes       # confirms it
 make mmgex-check-load  MMGEX_FILES=research_output/sample/
 make mmgex-reconstruct MMGEX_FILES=research_output/sample/
 ```
 
-Expected shape of the result: ~42,000 records parsed from 5 files, 36 series tracked,
-`clean_share` around 0.55, `zero_sum_residual_share` of 0.0, and no reconciliation
-notes. The mix of clean and censored series is deliberate — it is what a short window
-looks like, and it is the diagnostic you will be comparing a real delivery against.
+Expected shape of the result: 42,470 records parsed from 5 files, 36 series tracked,
+20 clean / 16 censored (`clean_share` 0.556), `zero_sum_residual_share` 0.0, and no
+reconciliation notes. The mix of clean and censored series is deliberate — it is what a
+short window looks like, and it is the diagnostic you will be comparing a real delivery
+against.
 
 **The sample's column names are invented and its numbers are random.** A real Cboe
 header will differ, which is exactly why `inspect-cboe` proposes a mapping rather than
@@ -147,12 +149,24 @@ Prints the file's actual header, the mapping it inferred, and — the important 
 every column it could **not** map. Writes a proposed profile to
 `research_output/cboe_profile.json`.
 
-**Now do the manual step:** open that JSON, check every mapping line against Cboe's spec
-PDF, then change `"confirmed": false` to `"confirmed": true`.
+### Step 1b — confirm the mapping
 
-Until you do, every other command refuses to run with `ProfileNotConfirmed`. That's
+```bash
+make mmgex-confirm
+```
+
+Prints the structural columns, all four Market Maker volume columns, the bucket width
+and the strike scale — then **refuses**. Check every line against Cboe's spec PDF. When
+it matches:
+
+```bash
+make mmgex-confirm REVIEWED=yes
+```
+
+Until you do, every other command refuses with `ProfileNotConfirmed`. That is
 intentional — a guessed column mapping that silently mis-attributes flow is the worst
-possible failure for this experiment, so it can't happen by accident.
+possible failure for this experiment, so it cannot happen by accident. `REVIEWED=yes`
+is the deliberate act; the two-step shape is what stops it being skipped by reflex.
 
 ### Step 2 — check the parse
 
