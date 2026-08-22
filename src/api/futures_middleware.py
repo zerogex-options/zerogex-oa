@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode
 
@@ -95,9 +96,45 @@ _PROJECTABLE_PREFIXES = (
     "/api/v1/levels",
 )
 
+
+def _unversioned(path: str) -> str:
+    """Drop a leading ``/api/v<N>`` segment so one table covers every version.
+
+    The API serves the same endpoints under ``/api/gex/summary`` (v1) and
+    ``/api/v2/gex/summary`` (v2, the freshness-envelope surface). Classifying
+    on the raw path meant a v2 request matched neither the native carve-out
+    nor the projectable list, so EVERY ES/NQ call to /api/v2/* was refused
+    with "this endpoint has not been audited" — while the identical v1 call
+    answered 200. Normalising both the request path and the tables below
+    keeps one audited list per endpoint rather than one per version, and
+    covers a future /api/v3 the day it ships.
+
+    Only classification is normalised. ``scope["path"]`` keeps its version,
+    so the request still routes to the handler the caller asked for.
+    """
+    return _API_VERSION_RE.sub("/api", path)
+
+
+_API_VERSION_RE = re.compile(r"^/api/v\d+(?=/|$)")
+
+# Canonical (version-stripped) forms of the two tables above. ``/api/v1/levels``
+# canonicalises to ``/api/levels``, which is what ``/api/v2/levels/ES`` reduces
+# to as well — the whole point of comparing on this axis.
+_NATIVE_PATHS_CANON = frozenset(_unversioned(p) for p in _NATIVE_PATHS)
+_PROJECTABLE_PREFIXES_CANON = tuple(_unversioned(p) for p in _PROJECTABLE_PREFIXES)
+
 # Responses larger than this are projected anyway but logged: the walk is
 # O(payload) on the event loop, and a very large one is worth knowing about.
 _LARGE_BODY_BYTES = 4 * 1024 * 1024
+
+
+def _is_v2_envelope(payload: Any) -> bool:
+    """True for a ``{"data": ..., "freshness": {...}}`` v2 response body."""
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"data", "freshness"}
+        and isinstance(payload.get("freshness"), dict)
+    )
 
 
 def _scope_query(scope: dict) -> list[tuple[str, str]]:
@@ -273,11 +310,15 @@ class FuturesProjectionMiddleware:
             scope["path"] = path
             scope["raw_path"] = path.encode("latin-1")
 
-        if path in _NATIVE_PATHS:
+        # Classify on the version-stripped path so /api/v2/* is graded by the
+        # same audited tables as its v1 twin (see _unversioned).
+        canon = _unversioned(path)
+
+        if canon in _NATIVE_PATHS_CANON:
             await self.app(scope, receive, send)
             return
 
-        if not path.startswith(_PROJECTABLE_PREFIXES):
+        if not canon.startswith(_PROJECTABLE_PREFIXES_CANON):
             await self._reject(send, futures_symbol, index_symbol, path)
             return
 
@@ -399,6 +440,22 @@ class FuturesProjectionMiddleware:
         await send({"type": "http.response.body", "body": body})
 
     async def _transform(self, payload: Any, futures_symbol: str, index_symbol: str) -> Any:
+        # A v2 response is {"data": <the v1 body>, "freshness": {...}}. Project
+        # INSIDE `data` and leave the envelope alone, for three reasons:
+        #   * the top-level spot substitution below keys on SPOT_FIELDS at the
+        #     top level, which on an envelope holds only `data`/`freshness` —
+        #     so ES would have shipped a PROJECTED spot instead of the observed
+        #     futures print, the exact failure this module exists to prevent;
+        #   * `projection` would attach beside `data` rather than inside it,
+        #     breaking v2's guarantee that `data` is byte-for-byte the v1 body;
+        #   * `freshness` describes when the data was observed, which is the
+        #     same instant whichever price axis it is rendered on — projecting
+        #     a price ratio onto it would be meaningless.
+        if _is_v2_envelope(payload):
+            out = dict(payload)
+            out["data"] = await self._transform(payload["data"], futures_symbol, index_symbol)
+            return out
+
         basis = await resolve_basis(_db_manager(), futures_symbol)
         if basis is None:
             return payload
