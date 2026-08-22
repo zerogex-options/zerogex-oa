@@ -527,6 +527,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
             "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
         )
+        # index<->future carry ratio (src/jobs/futures_projection.py). Moves on
+        # the order of a point a day, so it is cached far longer than a quote;
+        # every ES/NQ request resolves it, hence caching it at all.
+        self._futures_basis_cache_ttl_seconds: float = _getenv_float(
+            "FUTURES_BASIS_CACHE_TTL_SECONDS", 60.0
+        )
         # TTL for analytics-derived endpoints (gex_by_strike, gex_walls, etc.)
         # that only change on the analytics cycle (~60s). A moderate TTL
         # eliminates redundant DB round-trips from rapid frontend polling.
@@ -852,9 +858,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # operator who already tuned DB_POOL_MAX higher keeps it, but the
         # request pool is never floored back down to the tiny background size.
         min_size = _getenv_int("API_DB_POOL_MIN", _getenv_int("DB_POOL_MIN", 1))
-        max_size = _getenv_int(
-            "API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12)
-        )
+        max_size = _getenv_int("API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12))
         statement_timeout_ms = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
@@ -1067,6 +1071,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         (``/api/health/live``) is DB-free and never reaches this path.
         """
         try:
+
             async def _probe() -> None:
                 async with self._acquire_connection() as conn:
                     await conn.fetchval("SELECT 1")
@@ -3085,9 +3090,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cap = max(1, int(max_expirations))
         try:
             async with self._acquire_connection() as conn:
-                exp_rows = await conn.fetch(
-                    exps_query, symbol, start_utc, end_utc, session_date
-                )
+                exp_rows = await conn.fetch(exps_query, symbol, start_utc, end_utc, session_date)
                 if not exp_rows:
                     return empty
                 all_exps = [r["expiration"] for r in exp_rows]
@@ -5775,7 +5778,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         earliest available bar's open is used.
         """
         index_symbol = index_symbol.upper()
-        cache_key = f"latest_future_quote:{index_symbol}"
+        # session_start belongs in the key: it selects ``reference_close``,
+        # so two callers passing different anchors must not share an entry.
+        # (The ES/NQ spot lookup passes None; the overnight SPX display swap
+        # passes the 16:00 anchor — sharing a key let one silently serve the
+        # other the wrong overnight change.)
+        cache_key = (
+            f"latest_future_quote:{index_symbol}:"
+            f"{session_start.isoformat() if session_start else 'none'}"
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -5823,6 +5834,151 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching latest future quote: {e!r}", exc_info=True)
             raise
+
+    async def get_futures_session_closes(self, index_symbol: str) -> Optional[Dict[str, Any]]:
+        """The future's two most recent cash-session (16:00 ET) closes.
+
+        The daily-change denominator for ES / NQ has to be the FUTURE's own
+        prior close.  Using the cash index's would put the headline percentage
+        out by the whole index-future basis — on ES that is tens of points,
+        which is a visibly wrong number on the first thing a trader looks at.
+
+        Bars are fenced to 09:30-16:00 ET so the mark is the cash-session
+        close a trader compares against, not an overnight print that happens
+        to be the day's last bar.  Reads ``futures_quotes`` only.
+        """
+        index_symbol = (index_symbol or "").upper()
+        cache_key = f"futures_session_closes:{index_symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH marks AS (
+                SELECT
+                    (timestamp AT TIME ZONE 'America/New_York')::date AS et_date,
+                    timestamp,
+                    close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY (timestamp AT TIME ZONE 'America/New_York')::date
+                        ORDER BY timestamp DESC
+                    ) AS rn
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                  AND timestamp <= NOW()
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                  -- Exclude the session still in progress. Without this the
+                  -- newest bar of a half-finished day is treated as "today's
+                  -- close", so the day change is measured against a price a
+                  -- few minutes old and ES/NQ reads ~0.00% all session.
+                  AND (
+                      (timestamp AT TIME ZONE 'America/New_York')::date
+                          < (NOW() AT TIME ZONE 'America/New_York')::date
+                      OR (NOW() AT TIME ZONE 'America/New_York')::time >= TIME '16:00'
+                  )
+            )
+            SELECT et_date, timestamp, close
+            FROM marks
+            WHERE rn = 1
+            ORDER BY et_date DESC
+            LIMIT 2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, index_symbol)
+            if not rows:
+                return None
+            payload: Dict[str, Any] = {
+                "symbol": index_symbol,
+                "current_session_close": rows[0]["close"],
+                "current_session_close_ts": rows[0]["timestamp"],
+                # One completed session on record (cold deploy): repeat it rather
+                # than 404 the header, and accept that the day change reads 0.00%
+                # until a second session lands. The model requires both values.
+                "prior_session_close": (rows[1]["close"] if len(rows) > 1 else rows[0]["close"]),
+                "prior_session_close_ts": (
+                    rows[1]["timestamp"] if len(rows) > 1 else rows[0]["timestamp"]
+                ),
+            }
+            self._cache_set(cache_key, payload, self._session_closes_cache_ttl_seconds)
+            return payload
+        except Exception as e:
+            logger.error(f"Error fetching futures session closes: {e!r}", exc_info=True)
+            return None
+
+    async def get_futures_basis_samples(
+        self,
+        index_symbol: str,
+        *,
+        lookback_minutes: int = 5760,
+        limit: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """Concurrent future/index print pairs, newest first.
+
+        The raw material for the index->future carry ratio that makes ES / NQ
+        first-class symbols (see :mod:`src.jobs.futures_projection`).  A pair
+        can only exist while BOTH markets print, i.e. during the cash session
+        — which is why the futures ingester now runs the whole CME session
+        rather than the overnight window alone.
+
+        The LIMIT is applied AFTER the join, and that placement is the whole
+        point.  Taking the newest N futures bars first and joining afterwards
+        returns nothing outside 09:30-16:00 ET, because the newest futures
+        bars are overnight ones with no index counterpart — which would leave
+        the ratio permanently on its cost-of-carry fallback in exactly the
+        window ES/NQ exists to serve.  Joining first lets the scan walk back
+        through the overnight bars to the last cash-session minute that does
+        have a pair, which is what the multi-day lookback is for.
+
+        The lateral takes the most recent index print at or BEFORE the futures
+        bar, never after: ``ORDER BY timestamp DESC`` is index-orderable on
+        ``underlying_quotes(symbol, timestamp)`` (unlike ordering by a
+        distance expression), and it cannot pair a futures bar with an index
+        print from the future.  The 120s window absorbs up to a one-bar
+        labelling difference between the two feeds.
+
+        Several samples are returned, not just the newest, so the caller can
+        take a median and shrug off a single bad print.
+
+        Reads ``futures_quotes`` + ``underlying_quotes`` only.
+        """
+        index_symbol = (index_symbol or "").upper()
+        cache_key = f"futures_basis_samples:{index_symbol}:{lookback_minutes}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            SELECT
+                f.timestamp        AS observed_at,
+                f.future_symbol    AS future_symbol,
+                f.close::float8    AS future_close,
+                u.close::float8    AS index_close
+            FROM futures_quotes f
+            JOIN LATERAL (
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp <= f.timestamp
+                  AND timestamp >= f.timestamp - INTERVAL '120 seconds'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ) u ON TRUE
+            WHERE f.index_symbol = $1
+              AND f.timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+            ORDER BY f.timestamp DESC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, index_symbol, int(lookback_minutes), int(limit))
+                payload = [dict(r) for r in rows]
+                self._cache_set(cache_key, payload, self._futures_basis_cache_ttl_seconds)
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching futures basis samples: {e!r}", exc_info=True)
+            return []
 
     async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
@@ -6058,9 +6214,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "prior_session_close": prior_close,
                     "prior_session_close_ts": prior_ts,
                 }
-                self._cache_set(
-                    cache_key, result, self._session_closes_cache_ttl_seconds
-                )
+                self._cache_set(cache_key, result, self._session_closes_cache_ttl_seconds)
                 return result
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}", exc_info=True)

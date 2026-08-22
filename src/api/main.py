@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, date as date_type
+from datetime import datetime, timedelta, timezone, date as date_type
 from enum import IntEnum
 import os
 from src.config import _getenv_str
@@ -21,6 +21,7 @@ import pytz
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
+from .futures_middleware import FuturesProjectionMiddleware
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
 from .ratelimit import rate_limit
 from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
@@ -390,6 +391,18 @@ if not allow_credentials:
     logger.info(
         "CORS_ALLOW_ORIGINS contains '*'; disabling allow_credentials for standards compliance."
     )
+
+# ES / NQ projection. Registered FIRST, which makes it the INNERMOST
+# middleware (last add_middleware is outermost — see the ordering note
+# below). That placement matters twice over: it reads the raw JSON straight
+# off routing before GZip compresses it, and CORS ends up wrapping it, so the
+# 400/503 responses it synthesizes still carry Access-Control-* headers
+# instead of surfacing to a browser as an opaque CORS failure.
+#
+# It is pure ASGI, not BaseHTTPMiddleware: a request that names no future
+# calls straight through with no task group and no body buffering, so the
+# SPX/SPY/QQQ/NDX hot path is genuinely untouched by this feature.
+app.add_middleware(FuturesProjectionMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1209,10 +1222,11 @@ from src.market_calendar import (  # noqa: E402
     ET as _ET,
     NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
     should_display_future,
+    is_futures_session_open,
     current_cash_close_reference,
 )
-from src.config import _getenv_bool  # noqa: E402
-from src.symbols import resolve_index_future  # noqa: E402
+from src.config import _getenv_bool, _getenv_float  # noqa: E402
+from src.symbols import resolve_futures_index, resolve_index_future  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 
@@ -1225,6 +1239,63 @@ def _index_futures_display_enabled() -> bool:
     populated ``futures_quotes``.
     """
     return _getenv_bool("INDEX_FUTURES_DISPLAY_ENABLED", False)
+
+
+async def _native_futures_session_closes(futures_symbol: str, index_symbol: str) -> SessionCloses:
+    """The future's own two most recent 16:00 ET closes.
+
+    Mirrors :func:`_native_futures_quote`: the daily-change denominator has to
+    be the future's own prior close, not the cash index's, or the headline
+    percentage is wrong by the whole basis.
+    """
+    data = await _db().get_futures_session_closes(index_symbol)
+    if not data or data.get("current_session_close") is None:
+        raise HTTPException(
+            status_code=404, detail=f"No {futures_symbol} session close data available"
+        )
+    return SessionCloses(**{**data, "symbol": futures_symbol})
+
+
+# A futures bar older than this while CME is open means the feed is dead, not
+# that the market is quiet — 1-minute bars print continuously through the
+# session.
+_FUTURES_QUOTE_STALE_MINUTES = _getenv_float("FUTURES_QUOTE_STALE_MINUTES", 5.0)
+
+
+async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> UnderlyingQuote:
+    """Latest observed bar for a first-class future (ES / NQ).
+
+    ES and NQ take their PRICE from their own feed rather than from a
+    projection of the index: overnight the cash index is frozen at its 16:00
+    close, so a projected price would report where ES stood at the bell
+    instead of where it is trading now.  (Their dealer LEVELS are still
+    SPX/NDX-derived and projected — see ``src/api/futures_middleware.py``.)
+    """
+    fut = await _db().get_latest_future_quote(index_symbol, current_cash_close_reference())
+    if not fut or fut.get("close") is None:
+        raise HTTPException(status_code=404, detail=f"No {futures_symbol} quote data available")
+    payload = {
+        key: value
+        for key, value in fut.items()
+        if key
+        in ("timestamp", "open", "high", "low", "close", "up_volume", "down_volume", "volume")
+    }
+    payload["symbol"] = futures_symbol
+
+    # Derive the session from DATA FRESHNESS, not the clock alone. If the
+    # futures ingester dies at 03:00 (stream-slot cap, expired refresh token —
+    # both paths just back off and retry, nothing raises), a clock-derived
+    # "open" would keep this frozen 03:00 bar flowing onto the live chart tip
+    # for hours with nothing to mark it stale. Reporting "closed" makes the
+    # frontend stop merging it (see isSessionLive) while still serving the
+    # last known price, which is more useful than a 404.
+    bar_ts = payload.get("timestamp")
+    stale = False
+    if bar_ts is not None:
+        age_minutes = (datetime.now(timezone.utc) - bar_ts).total_seconds() / 60.0
+        stale = age_minutes > _FUTURES_QUOTE_STALE_MINUTES
+    payload["session"] = "open" if is_futures_session_open() and not stale else "closed"
+    return UnderlyingQuote(**payload)
 
 
 def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
@@ -1391,6 +1462,11 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     surface that reads ``quoteData.close``.
     """
     try:
+        # ES / NQ are first-class symbols served from their own bars.
+        futures_index = resolve_futures_index(symbol)
+        if futures_index:
+            return await _native_futures_quote(symbol.strip().upper(), futures_index)
+
         data = await _db().get_latest_quote(symbol)
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
@@ -1452,6 +1528,13 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
       on the most recent completed trading day).
     - prior_session_close: the session close immediately before current.
     """
+    # ES / NQ close against their OWN 16:00 prints. Projecting SPX's cash
+    # closes here would put the headline daily change on the wrong basis —
+    # the number a futures trader checks first.
+    futures_index = resolve_futures_index(symbol)
+    if futures_index:
+        return await _native_futures_session_closes(symbol.strip().upper(), futures_index)
+
     data = await _db().get_session_closes(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No session close data available")
@@ -1485,6 +1568,12 @@ async def get_session_levels(symbol: str = Query(default="SPY")):
     Source of record is the ``session_levels`` capture job; the endpoint
     falls back to a live 1-min-bar aggregate when no captured row exists.
     """
+    # A future trades ~23h a day, so "pre-market high/low" describes nothing
+    # for ES / NQ. Return the empty shape rather than projecting SPX's levels,
+    # which would draw cash-index lines on a futures chart.
+    if resolve_futures_index(symbol):
+        return SessionLevels(symbol=symbol.strip().upper(), is_index=False)
+
     data = await _db().get_session_levels(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No session level data available")
@@ -1519,6 +1608,17 @@ async def get_historical_quotes(
         # Parse dates if provided
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
+
+        # ES / NQ: their own bar series, always — not gated on allow_futures
+        # or the overnight display window, because for a first-class future
+        # the futures series IS the price series at every hour.
+        futures_index = resolve_futures_index(symbol)
+        if futures_index:
+            label = symbol.strip().upper()
+            fut_rows = await _db().get_historical_futures(
+                futures_index, start_dt, end_dt, window_units, timeframe
+            )
+            return [UnderlyingQuote(**{**row, "symbol": label}) for row in fut_rows]
 
         # Index→future DISPLAY swap for the candlestick series — ONLY when the
         # caller opts in via allow_futures (the candle chart). Read-only from

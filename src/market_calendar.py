@@ -441,6 +441,8 @@ def is_underlying_active_session(
 # bars, which the request-time fetch surfaces as a stale/last print — the
 # same graceful degradation as any other quiet period.
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
 _FUTURES_REOPEN = time(18, 0)  # Sunday open / daily reopen after maintenance
 _FUTURES_DAILY_CLOSE = time(17, 0)  # Friday close / daily maintenance start
 
@@ -481,6 +483,29 @@ def is_futures_display_window(dt: Optional[datetime] = None) -> bool:
     t = dt.time()
     in_overnight_window = t >= _FUTURES_REOPEN or t < time(9, 30)
     return in_overnight_window and is_futures_session_open(dt)
+
+
+def is_futures_ingest_window(dt: Optional[datetime] = None) -> bool:
+    """True when the futures ingester should be streaming bars.
+
+    Deliberately WIDER than :func:`is_futures_display_window`.  The display
+    swap only ever wants the future overnight, but the index->future basis
+    engine (``src/jobs/futures_projection.py``) has to observe ES and SPX
+    printing at the SAME instant to measure the carry ratio — and the only
+    time both print together is the cash session, exactly the window the
+    old overnight-only gate slept through.  So by default the ingester now
+    follows the whole CME session (Sun 18:00 -> Fri 17:00 ET, minus the
+    daily 17:00-18:00 maintenance break) and ``futures_quotes`` carries a
+    continuous series.
+
+    Cost is two 1-minute bar streams; ``FUTURES_BARS_RETENTION_DAYS`` still
+    bounds the table.  Set ``FUTURES_INGEST_FULL_SESSION=false`` to fall
+    back to the old overnight-only behaviour, which disables live basis
+    measurement and leaves the projection on its cost-of-carry fallback.
+    """
+    if os.getenv("FUTURES_INGEST_FULL_SESSION", "true").strip().lower() not in _TRUTHY:
+        return is_futures_display_window(dt)
+    return is_futures_session_open(dt)
 
 
 def should_display_future(symbol: Optional[str], dt: Optional[datetime] = None) -> bool:
