@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 # unambiguous. ``auto_error=False`` lets the dependency raise its own 401.
 _bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 
+
 # Endpoints intentionally exposed without authentication. Entries here are
 # checked before any auth logic runs, so they bypass every credential check.
 # Used by external probes (ELB / ALB health targets, systemd ExecStartPost,
@@ -54,7 +55,28 @@ _bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 # — critical for Phase 7 when API_KEY is removed from .env: the systemd
 # unit's ExecStartPost curl /api/health would otherwise 401 and trip the
 # service into a restart loop.
-_PUBLIC_PATHS: Set[str] = {"/api/health", "/api/health/live"}
+def _with_v2_twins(paths: Set[str]) -> Set[str]:
+    """Add each public path's ``/api/v2`` mirror to the allowlist.
+
+    The v2 surface re-serves every endpoint under a shifted path (see
+    ``src/api/v2.py``), and this allowlist is matched on the literal request
+    path — so without the twins, ``/api/v2/health/live`` would 401 while
+    ``/api/health/live`` stayed open. That is exactly the restart-loop this
+    allowlist exists to prevent, just one version along: an operator who
+    repoints an ALB target or the systemd ExecStartPost curl at the v2 probe
+    gets a 401 and a service that never comes up healthy.
+
+    Derived from ``v2_path_for`` rather than hardcoded so a public path added
+    later is covered on both versions automatically — the same one-rule
+    discipline the web tier gate needs for the same reason.
+    """
+    from .v2 import v2_path_for
+
+    twins = {v2 for v2 in (v2_path_for(p) for p in paths) if v2 is not None}
+    return paths | twins
+
+
+_PUBLIC_PATHS: Set[str] = _with_v2_twins({"/api/health", "/api/health/live"})
 
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
 _ENVIRONMENT: str = _getenv_str("ENVIRONMENT", "development").lower()

@@ -26,6 +26,27 @@ appears in ``/openapi.json`` and ``/docs`` with a real
 dependencies — including its scope gate, so v2 authorises identically to
 v1.
 
+Serialization: ``data`` uses v1's own encoder
+---------------------------------------------
+``data`` must come out byte-for-byte identical to v1, which means it has to
+go through *whichever* encoder v1 used for that route — and v1 uses two.
+A route with a ``response_model`` is serialized by pydantic; a route
+without one is serialized by ``jsonable_encoder``.  They disagree on
+exactly the types asyncpg returns: ``Decimal`` is a JSON number under
+``jsonable_encoder`` and a JSON *string* under pydantic, and a tz-aware
+``datetime`` renders ``+00:00`` vs ``Z``.  49 of the 125 mirrored routes
+(most of ``/api/signals/*`` and ``/api/technicals/*``) have no
+``response_model``, so wrapping them in a validating ``Envelope[Any]``
+silently turned every price and P&L into a string.
+
+So the mirror branches: ``Envelope[Model]`` when v1 declared a model, and
+``response_model=None`` when it did not — in which case FastAPI falls back
+to ``jsonable_encoder`` for the whole envelope, which is v1's encoder for
+``data`` and (because ``jsonable_encoder`` delegates to pydantic for a
+``BaseModel``) still the pydantic form for ``freshness``.  The envelope
+therefore stays byte-identical across all 125 routes while ``data`` tracks
+its own v1 route exactly.
+
 Deliberate v1 -> v2 differences
 -------------------------------
 * **Every declared field is always present.**  v1's
@@ -416,10 +437,20 @@ def mount_v2(app: FastAPI) -> List[str]:
         # mypy cannot type a subscript whose parameter is a runtime value;
         # the route table hands us the model as data, which is the whole
         # point of generating the surface rather than declaring it.
+        #
+        # response_model is left None when v1 had none, so FastAPI keeps
+        # v1's jsonable_encoder path for `data` (see "Serialization" above).
+        # The envelope shape is still published to OpenAPI via `responses`,
+        # so /docs documents these routes without pydantic touching the wire.
         envelope_model = (
             Envelope[response_model]  # type: ignore[valid-type]
             if response_model is not None
-            else Envelope[Any]
+            else None
+        )
+        extra_responses: Dict[Any, Dict[str, Any]] = (
+            {}
+            if response_model is not None
+            else {route.status_code or 200: {"model": Envelope[Any]}}
         )
 
         app.add_api_route(
@@ -427,6 +458,7 @@ def mount_v2(app: FastAPI) -> List[str]:
             _make_v2_endpoint(route.endpoint, profile),
             methods=methods,
             response_model=envelope_model,
+            responses=extra_responses,
             status_code=route.status_code,
             name=_operation_id(v2_path, methods),
             summary=route.summary,

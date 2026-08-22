@@ -61,10 +61,26 @@ def test_market_context_labels_the_session(when, expected_session, expected_mark
 
 
 def test_cadence_is_session_dependent_not_constant():
-    """The analytics cycle is 60s in-session and 300s off-hours. Advertising
-    a flat 60s would make every off-hours consumer read ``stale``."""
+    """The analytics cycle is 60s while the feed runs and unset once it stops.
+
+    Ingestion covers 04:00-20:00 ET and stops overnight, so between 20:00 and
+    04:00 every cycle recomputes the SAME 20:00 observation. Advertising a
+    cadence there (this asserted 300s, matching the engine's off-hours tick)
+    made every analytics endpoint report ``stale`` for eight hours a night on
+    a healthy system.
+    """
     assert fr.ANALYTICS_CYCLE.cadence_for(fr.SESSION_REGULAR, market_day=True) == 60.0
-    assert fr.ANALYTICS_CYCLE.cadence_for(fr.SESSION_CLOSED, market_day=True) == 300.0
+    assert fr.ANALYTICS_CYCLE.cadence_for(fr.SESSION_PRE_MARKET, market_day=True) == 60.0
+    assert fr.ANALYTICS_CYCLE.cadence_for(fr.SESSION_CLOSED, market_day=True) is None
+
+
+def test_no_feed_backed_profile_expects_updates_in_the_overnight_gap():
+    """The 20:00-04:00 ET window is a feed gap, not a slow period. Any
+    feed-backed profile claiming a cadence there re-creates the nightly
+    false page."""
+    for profile in fr.CADENCE_PROFILES.values():
+        if profile.feed_backed and not profile.session_scoped:
+            assert profile.cadence_for(fr.SESSION_CLOSED, market_day=True) is None, profile.name
 
 
 def test_no_cadence_is_advertised_on_a_non_market_day():

@@ -77,19 +77,11 @@ from src.config import (
     ANALYTICS_INTERVAL,
     EXTENDED_HOURS_POLL_INTERVAL,
     MARKET_HOURS_POLL_INTERVAL,
-    _getenv_int,
 )
 
 logger = logging.getLogger(__name__)
 
 _ET = pytz.timezone("US/Eastern")
-
-# The analytics engine reads this one locally rather than exporting it from
-# config (src/analytics/main_engine.py: AnalyticsEngine.off_hours_interval);
-# same key and same default so the two cannot disagree.
-_ANALYTICS_OFF_HOURS_INTERVAL = max(
-    ANALYTICS_INTERVAL, _getenv_int("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", 300)
-)
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +148,14 @@ class CadenceProfile:
     03:00 on a Sunday would be a lie, and a consumer that alerted on it
     would page every weekend.
 
-    ``closed_seconds`` is the cadence on a **weekday** outside 04:00–20:00
-    ET, where some engines (the signal engine's 24x5 run window) keep
-    working.  Weekends and NYSE holidays always resolve to "no updates
-    expected" regardless of this field, because the underlying market
-    data genuinely cannot change.
+    ``closed_seconds`` is the cadence on a **weekday** outside the feed
+    window (04:00–20:00 ET).  For anything derived from the market feed it
+    is ``None``: ingestion stops when after-hours closes at 20:00 ET and
+    resumes at 04:00, so no new observation can land in between and an
+    ageing payload is the correct answer rather than a late one.  A
+    non-``None`` value here means "this artifact really is still being
+    produced overnight".  Weekends and NYSE holidays always resolve to "no
+    updates expected" regardless of this field.
 
     ``stale_grace`` / ``stale_floor_seconds`` set how far past the cadence
     a payload may drift before it is called ``stale``.  Both exist because
@@ -180,6 +175,11 @@ class CadenceProfile:
     # than ``session_closed``: "this never goes stale" and "the market is
     # shut" are different facts and a consumer alerts on them differently.
     feed_backed: bool = True
+    # True for artifacts produced once per trading session. Their age is
+    # measured in SESSIONS, not wall-clock seconds: Friday's close is still
+    # the correct answer all through Monday morning, and a flat wall-clock
+    # window reported ``stale`` every Monday and after every holiday.
+    session_scoped: bool = False
     stale_grace: float = 2.5
     stale_floor_seconds: float = 15.0
 
@@ -231,7 +231,12 @@ ANALYTICS_CYCLE = CadenceProfile(
     ),
     regular_seconds=float(ANALYTICS_INTERVAL),
     extended_seconds=float(ANALYTICS_INTERVAL),
-    closed_seconds=float(_ANALYTICS_OFF_HOURS_INTERVAL),
+    # None, not the 300s off-hours cycle: the engine may still tick overnight
+    # but option_chains/underlying_quotes stop at 20:00 ET, so every cycle
+    # between 20:00 and 04:00 recomputes the SAME 20:00 observation. Claiming
+    # a 300s cadence there made every analytics endpoint report `stale` for
+    # eight hours a night — the false page this module exists to prevent.
+    closed_seconds=None,
     stale_grace=2.5,
     stale_floor_seconds=60.0,
 )
@@ -264,7 +269,10 @@ SIGNALS_CYCLE = CadenceProfile(
     # a 1s cadence would report ``stale`` on a healthy quiet tape.
     regular_seconds=15.0,
     extended_seconds=60.0,
-    closed_seconds=float(_ANALYTICS_OFF_HOURS_INTERVAL),
+    # The signal engine runs 24x5, but a scored row can never carry an
+    # observation newer than its inputs, and those stop with the feed at
+    # 20:00 ET. Same reasoning as ANALYTICS_CYCLE.
+    closed_seconds=None,
     stale_grace=3.0,
     stale_floor_seconds=60.0,
 )
@@ -279,6 +287,7 @@ DAILY_CYCLE = CadenceProfile(
     regular_seconds=86400.0,
     extended_seconds=86400.0,
     closed_seconds=86400.0,
+    session_scoped=True,
     stale_grace=1.5,
     stale_floor_seconds=3600.0,
 )
@@ -389,15 +398,46 @@ def audit_cadence_coverage(paths: Iterable[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _nyse_holidays() -> set[date]:
-    """NYSE holiday set, read through market_calendar so both layers agree."""
-    try:
-        from src.market_calendar import NYSE_HOLIDAYS
+def _calendar() -> Tuple[set, set, Any, Any, Any, Any]:
+    """NYSE calendar + session boundaries, read through market_calendar.
 
-        return NYSE_HOLIDAYS
+    Imported lazily and defensively: a broken calendar must degrade the
+    freshness verdict, never fail a response that already succeeded. The
+    fallbacks are the normal-session boundaries, which is the conservative
+    choice — it can only make us report a session as longer than it was.
+    """
+    try:
+        from src.market_calendar import (
+            NYSE_EXTENDED_END,
+            NYSE_HALF_DAY_CLOSE,
+            NYSE_HALF_DAY_EXTENDED_END,
+            NYSE_HALF_DAYS,
+            NYSE_HOLIDAYS,
+            NYSE_REGULAR_CLOSE,
+        )
+
+        return (
+            NYSE_HOLIDAYS,
+            NYSE_HALF_DAYS,
+            NYSE_REGULAR_CLOSE,
+            NYSE_HALF_DAY_CLOSE,
+            NYSE_EXTENDED_END,
+            NYSE_HALF_DAY_EXTENDED_END,
+        )
     except Exception:  # noqa: BLE001 - never fail a response over the calendar
-        logger.warning("freshness: NYSE holiday calendar unavailable", exc_info=True)
-        return set()
+        logger.warning("freshness: NYSE calendar unavailable", exc_info=True)
+        return set(), set(), _at(16, 0), _at(13, 0), _at(20, 0), _at(17, 0)
+
+
+def _is_market_day(d: date) -> bool:
+    holidays, _, _, _, _, _ = _calendar()
+    return d.weekday() < 5 and d not in holidays
+
+
+def session_close_for(d: date) -> Any:
+    """The ET regular-session close on ``d`` — 13:00 on an early-close day."""
+    _, half_days, regular, half, _, _ = _calendar()
+    return half if d in half_days else regular
 
 
 def market_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
@@ -405,22 +445,55 @@ def market_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
 
     ``market_day`` is False on weekends and NYSE holidays — the days on
     which no profile expects an update, whatever its ``closed_seconds``.
+
+    Early-close days are honoured: on a half day the regular session ends
+    at 13:00 ET and the extended feed at 17:00, so the 13:00–16:00 window
+    reports ``after-hours`` rather than pricing a 5-second quote cadence
+    against a tape that stopped three hours ago.
     """
     now_et = (now or datetime.now(timezone.utc)).astimezone(_ET)
-    market_day = now_et.weekday() < 5 and now_et.date() not in _nyse_holidays()
+    today = now_et.date()
+    _, half_days, regular_close, half_close, ext_end, half_ext_end = _calendar()
+    market_day = _is_market_day(today)
     if not market_day:
         return SESSION_CLOSED, False
+
+    is_half = today in half_days
+    close_t = half_close if is_half else regular_close
+    ext_t = half_ext_end if is_half else ext_end
 
     t = now_et.time()
     if t < _at(4, 0):
         return SESSION_CLOSED, True
     if t < _at(9, 30):
         return SESSION_PRE_MARKET, True
-    if t < _at(16, 0):
+    if t < close_t:
         return SESSION_REGULAR, True
-    if t < _at(20, 0):
+    if t < ext_t:
         return SESSION_AFTER_HOURS, True
     return SESSION_CLOSED, True
+
+
+def next_session_close_after(dt: datetime) -> datetime:
+    """The close of the first trading session strictly after ``dt``'s date.
+
+    Used to age once-per-session artifacts in trading days rather than
+    wall-clock seconds.  A Friday close is not late on Monday morning — the
+    next one is not due until Monday's close — and a flat 36-hour window
+    made every ``daily_cycle`` endpoint read ``stale`` every Monday and
+    after every holiday.
+    """
+    d = dt.astimezone(_ET).date()
+    # Bounded: a calendar that somehow marks 10 consecutive days non-trading
+    # falls back to the last candidate rather than looping forever.
+    for _ in range(10):
+        d = d + timedelta(days=1)
+        if _is_market_day(d):
+            break
+    close_t = session_close_for(d)
+    return _ET.localize(datetime(d.year, d.month, d.day, close_t.hour, close_t.minute)).astimezone(
+        timezone.utc
+    )
 
 
 def _at(hour: int, minute: int):
@@ -711,13 +784,31 @@ def build_freshness(
     cadence_seconds = profile.cadence_for(session, market_day=market_day)
     stale_after: Optional[datetime] = None
     if cadence_seconds is not None and source_timestamp is not None:
-        stale_after = source_timestamp + timedelta(seconds=profile.stale_window(cadence_seconds))
+        if profile.session_scoped:
+            # Due when the NEXT trading session's artifact should exist, plus
+            # the grace floor — so a Friday artifact is not "late" until well
+            # after Monday's close.
+            stale_after = next_session_close_after(source_timestamp) + timedelta(
+                seconds=profile.stale_floor_seconds
+            )
+        else:
+            stale_after = source_timestamp + timedelta(
+                seconds=profile.stale_window(cadence_seconds)
+            )
 
     if source_timestamp is None:
         status = FreshnessStatus.UNKNOWN
     elif cadence_seconds is None:
         # No update was due, so an old value is correct rather than late.
         status = FreshnessStatus.SESSION_CLOSED if profile.feed_backed else FreshnessStatus.STATIC
+    elif profile.session_scoped:
+        # Session-scoped artifacts are fresh right up to their stale_after;
+        # there is no meaningful "aging" band between two daily deliveries.
+        status = (
+            FreshnessStatus.FRESH
+            if stale_after is not None and evaluated_at <= stale_after
+            else FreshnessStatus.STALE
+        )
     elif age_seconds is not None and age_seconds <= cadence_seconds:
         status = FreshnessStatus.FRESH
     elif stale_after is not None and evaluated_at <= stale_after:
