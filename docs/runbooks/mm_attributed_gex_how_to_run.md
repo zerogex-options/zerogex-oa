@@ -171,6 +171,16 @@ This exercises every remaining code path — the chain snapshot reads, the `gex_
 join, bar loading, VIX and composite-score lookups, the two-pass replay, the statistics
 and the report render — against your real database and your real market data.
 
+**Read the provenance block before the report.** The two numbers that decide whether a
+run is usable are `data_completeness` and `session_gap_count`. A healthy run over a
+contiguous delivery shows completeness near 1.0 and no gaps. Anything else means the
+inventory was carried across days it never saw traded, and every level built on it is
+suspect regardless of what the statistics say. `build-dataset` prints a warning when it
+sees this, but the provenance block is the record — keep it with any result you share.
+
+Expect roughly 0.5–1 snapshot/second; the progress line reports a live rate and ETA.
+Raise `--step-minutes` (30 or 60) for a faster first pass.
+
 **The Market Maker flow over those contracts is still invented, so every MM-attributed
 number it produces is meaningless.** The report will say `INCONCLUSIVE_*`. What you are
 checking is that it *runs*, how long it takes, and that your study window actually has
@@ -392,6 +402,8 @@ regardless, under `universes` in the JSONL — a 0DTE-only conclusion never need
 | `No gex_summary timestamps for SPX in [...]` | study window predates ZeroGEX's own retention | pick a window ZeroGEX has data for, or use `option_chains_archive` depth |
 | `listing dates resolved for 0 series` | the Open-Close expirations/strikes do not exist in your chain | expected for the plain sample; with real Cboe files it means the chain history does not cover those contracts, and censoring falls back to the window heuristic |
 | `No SPX analytics rows found to anchor to` | no recent `gex_summary` rows for that symbol | check the analytics service is writing, or pass `SYMBOL=` |
+| `DATA COMPLETENESS` warning with many session gaps | the input directory holds files from two deliveries, or the delivery is missing days | list the directory. A reconstruction across a gap carries inventory it never saw traded |
+| `[listing dates]` phase is slow | it scans chain history back `--listing-lookback-days` | lower it. Shorter is faster but weaker evidence, and more series fall back to the window heuristic |
 | Dataset build is slow | it re-prices the full chain twice per snapshot | raise `--step-minutes` (default 15; try 30-60 on a first pass). The progress line reports a rate and an ETA |
 | `canceling statement due to statement timeout` | a setup query outgrew the pool ceiling | the timed `[phase]` lines name which one. Research reads get 5 min by default (`MMGEX_STATEMENT_TIMEOUT_MS`); if it is the listing-date scan, lower `--listing-lookback-days` |
 | `No profile file at '...'` | step 1 never produced it (or you skipped step 1) | run `mmgex-inspect` first; the error prints the exact command |
