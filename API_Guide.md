@@ -256,7 +256,7 @@ null-valued key, so you can index the envelope unconditionally.
 | `fresh` | `source_timestamp` is within one expected cadence. | No |
 | `aging` | Past one cadence, not yet past `stale_after` — the grace band absorbing normal cycle jitter. Seen routinely when you poll faster than the cadence. | No |
 | `stale` | Past `stale_after` **while an update was due**. The feed behind this endpoint is late. | **Yes** |
-| `session_closed` | A feed-backed endpoint whose feed is not due to produce anything (weekend, holiday, or a feed that only runs during the session). The payload is the last good value. | No |
+| `session_closed` | A feed-backed endpoint whose feed is not due to produce anything: a weekend, an NYSE holiday, an early-close afternoon, or the overnight gap (ingestion runs 04:00–20:00 ET). The payload is the last good value. | No |
 | `static` | Not feed-backed at all: completed history, or a result computed from your own inputs. Age carries no health meaning. | No |
 | `unknown` | No source timestamp could be resolved (an empty result set, a pure calculator). Fall back to `evaluated_at` for health; make no claim about data age. | No |
 
@@ -272,20 +272,43 @@ reflects the current session, so prefer reading it over hard-coding from
 this table. Weekends and NYSE holidays always report `null` — nothing
 upstream can change.
 
-| Profile | Endpoints | Regular | Extended | Weekday overnight |
+| Profile | Endpoints | Regular | Extended | Overnight |
 | --- | --- | --- | --- | --- |
 | `realtime_quote` | `/api/market/*`, `/api/option/*` | 5 s | 30 s | — |
-| `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | 300 s |
+| `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
 | `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
-| `signals_cycle` | `/api/signals/*`, `/api/tradeworkz/*` | 15 s | 60 s | 300 s |
-| `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | 24 h | 24 h | 24 h |
+| `signals_cycle` | `/api/signals/*`, `/api/tradeworkz/*` | 15 s | 60 s | — |
+| `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
 | `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
 
-A dash means no update is expected in that session, which surfaces as
+A dash means no update is expected, which surfaces as
 `freshness_status: session_closed` (feed-backed profiles) or `static`
-(the rest). Source of truth: `ENDPOINT_CADENCE` in
-`src/api/freshness.py`.
+(the rest).
+
+**Every feed-derived profile reports no cadence overnight.** Ingestion runs
+04:00–20:00 ET; between 20:00 and 04:00 the analytics engine may still tick
+but it recomputes the same 20:00 observation, so an ageing payload there is
+correct rather than late. The same holds on weekends, NYSE holidays, and
+after the 13:00 ET close on an early-close day.
+
+`daily_cycle` endpoints age in **trading sessions, not wall-clock hours**:
+Friday's session close is the correct answer all through Monday morning, and
+`stale_after` lands after the *next* session's artifact is due.
+
+Source of truth: `ENDPOINT_CADENCE` and the `CadenceProfile` definitions in
+`src/api/freshness.py`. Cadence numbers are read from the same config
+constants the engines run on (`ANALYTICS_INTERVAL`,
+`MARKET_HOURS_POLL_INTERVAL`, `AGGREGATION_BUCKET_SECONDS`), so retuning a
+poll interval changes what the envelope advertises.
+
+### Calendar configuration
+
+`NYSE_HOLIDAYS` and `NYSE_HALF_DAYS` (both comma-separated ISO dates, both
+honouring `NYSE_HOLIDAYS_STRICT`) drive the session model. An unset
+`NYSE_HALF_DAYS` means early closes are graded as full sessions, which
+reports `stale` for the three hours after a 13:00 ET close — keep it
+populated.
 
 ### Response headers
 
@@ -313,7 +336,22 @@ X-Market-Session: regular
    `freshness_status` / `stale_after`.
 
 Auth, scopes, tiers and rate limits are **identical** on both versions: a
-v2 route carries exactly the scope gate of the v1 route it mirrors.
+v2 route carries exactly the scope gate of the v1 route it mirrors, and the
+no-auth health probes are public on both.
+
+> **Before proxying v2 through the website BFF.** The consumer tier gate in
+> `zerogex-web` (`core/api/apiTierGate.ts`) matches literal `/api/...`
+> prefixes and is deliberately **fail-open**, and FastAPI enforces no
+> per-member entitlement — that gate is the entire browser paywall. A
+> `/api/v2/[...rest]` proxy added before the gate normalizes the version
+> segment would leave every premium prefix unmatched, and therefore
+> ungated. Normalize `^/api/v\d+/` to `/api/` there first.
+
+`data` is serialized with **whichever encoder v1 used for that route**, so
+numeric types and timestamp formats inside `data` are identical to v1 —
+`Decimal` stays a JSON number, and a route that emitted `+00:00` still
+emits `+00:00`. The `freshness` block always uses the same ISO-8601 `Z`
+form on every route, so you parse one format for it regardless of endpoint.
 
 Deliberate v1 → v2 differences:
 
@@ -324,8 +362,11 @@ Deliberate v1 → v2 differences:
   data arrives in the `X-Freshness-*` headers.
 * **Errors are not wrapped.** A v2 error is a v1 error — same status, same
   `{"detail": ...}` body. You do not need a second error parser.
-* **The admin control plane is not mirrored.** `/api/admin/*` and
-  `/api/tradeworkz/admin/*` are operator-only and stay v1.
+* **Control-plane surfaces are not mirrored.** `/api/admin/*`,
+  `/api/tradeworkz/admin/*` (operator-only) and
+  `/api/tradeworkz/internal/*` (drained by a systemd timer) stay v1 —
+  they mutate state, no customer versions against them, and "how fresh is
+  this data" is meaningless for them.
 
 ### Update cadence (background)
 

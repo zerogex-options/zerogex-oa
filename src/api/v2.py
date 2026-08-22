@@ -91,21 +91,56 @@ from .freshness import (
 
 logger = logging.getLogger(__name__)
 
+
+def _typed_signature(fn: Callable[..., Any]) -> inspect.Signature:
+    """``inspect.signature`` with string annotations resolved.
+
+    Router modules use ``from __future__ import annotations``, so annotations
+    arrive as strings and an identity check against a type never matches.
+    FastAPI resolves them the same way when it builds the real dependant;
+    ``eval_str`` is the stdlib equivalent. Falls back to the unresolved
+    signature if a name cannot be resolved — the wrapper still works, it just
+    injects its own Response as before.
+    """
+    try:
+        return inspect.signature(fn, eval_str=True)
+    except Exception:  # noqa: BLE001
+        return inspect.signature(fn)
+
+
+def _is_response_type(annotation: Any) -> bool:
+    """True when a parameter is annotated with Response or a subclass."""
+    return isinstance(annotation, type) and issubclass(annotation, Response)
+
+
 V2_PREFIX = "/api/v2"
+
+# Status codes whose responses must not carry a body (RFC 9110). FastAPI
+# asserts this when a response_model is attached, and that assert fires at
+# import time — see mount_v2.
+_NO_BODY_STATUS = frozenset({204, 205, 304})
+
+
+_CONTROL_PLANE_SEGMENTS = ("admin", "internal")
 
 
 def _is_control_plane(path: str) -> bool:
-    """True for operator-only control-plane routes.
+    """True for operator-only and machine-to-machine control-plane routes.
 
-    Both admin surfaces qualify — ``/api/admin/*`` (key management, the
-    X-post publisher) and ``/api/tradeworkz/admin/*`` (bot provisioning,
-    test-event injection, simulation). They mutate state, they are not part
-    of the vendor data contract customers version against, and "how fresh
-    is this data" is meaningless for them. Matched on the path segment
-    rather than a prefix list so a third admin surface added under some
-    other router is excluded automatically.
+    Three surfaces qualify: ``/api/admin/*`` (key management, the X-post
+    publisher), ``/api/tradeworkz/admin/*`` (bot provisioning, test-event
+    injection, simulation) and ``/api/tradeworkz/internal/*`` (the
+    notification queue a systemd timer drains, including a state-mutating
+    POST). They mutate state, no customer versions against them, and "how
+    fresh is this data" is meaningless for all of them.
+
+    Matched on whole path SEGMENTS rather than a prefix list, so a new admin
+    or internal surface under some other router is excluded automatically —
+    and so a legitimate path that merely contains the substring (an
+    ``/api/x/administration`` say) is not.
     """
-    return "/admin/" in path or path.endswith("/admin")
+    segments = path.split("/")
+    return any(seg in _CONTROL_PLANE_SEGMENTS for seg in segments)
 
 
 def v2_path_for(v1_path: str) -> Optional[str]:
@@ -176,14 +211,26 @@ def _build_signature(orig: Callable[..., Any]) -> Tuple[inspect.Signature, Optio
     original parameter order, and FastAPI invokes endpoints with keyword
     arguments throughout.
     """
-    sig = inspect.signature(orig)
+    # Resolved annotations, not raw ones: every router module here uses
+    # ``from __future__ import annotations``, so annotations arrive as STRINGS
+    # and a raw ``is Response`` identity check can never match. That made this
+    # branch dead — and worse, a future handler using the standard
+    # ``response: Response`` idiom would have had its own Response parameter
+    # left unfilled, 500ing on every v2 request while v1 stayed green.
+    sig = _typed_signature(orig)
     params = list(sig.parameters.values())
 
     for p in params:
-        if p.annotation is Response:
+        # Subclasses (JSONResponse, ...) count too — the same test FastAPI
+        # applies when deciding what to inject.
+        if _is_response_type(p.annotation):
             return sig.replace(return_annotation=inspect.Signature.empty), None
 
     injected = "_freshness_response"
+    # Collision-proof: a handler with a parameter of this name would otherwise
+    # have it silently swallowed before the call.
+    while any(p.name == injected for p in params):
+        injected = "_" + injected
     params.append(inspect.Parameter(injected, inspect.Parameter.KEYWORD_ONLY, annotation=Response))
     return (
         inspect.Signature(params, return_annotation=inspect.Signature.empty),
@@ -432,6 +479,21 @@ def mount_v2(app: FastAPI) -> List[str]:
             )
             continue
 
+        # A 204/205/304 response must not carry a body, and FastAPI asserts
+        # that when a response_model is attached. Mirroring such a route would
+        # raise at IMPORT time and stop uvicorn from booting v1 as well — so
+        # the envelope is simply not applied to them. There are none today;
+        # this exists so that adding the REST-conventional
+        # `@router.delete(..., status_code=204)` is not an outage.
+        if route.status_code in _NO_BODY_STATUS:
+            logger.warning(
+                "v2 mirror: %s returns %s (no response body permitted); " "not mirrored to %s",
+                route.path,
+                route.status_code,
+                v2_path,
+            )
+            continue
+
         profile = resolve_profile(route.path)
         response_model = route.response_model
         # mypy cannot type a subscript whose parameter is a runtime value;
@@ -477,6 +539,16 @@ def mount_v2(app: FastAPI) -> List[str]:
             seen[(v2_path, method)] = route.path
         created.append(v2_path)
         mirrored_v1_paths.append(route.path)
+
+    # Keep the no-auth probes reachable on v2. Registered here rather than
+    # imported into security.py so the dependency runs v2 -> security: if this
+    # module ever fails to import, auth is untouched and v1 keeps serving.
+    from .security import public_paths, register_public_path
+
+    for public in public_paths():
+        twin = v2_path_for(public)
+        if twin is not None:
+            register_public_path(twin)
 
     uncovered = audit_cadence_coverage(mirrored_v1_paths)
     if uncovered:

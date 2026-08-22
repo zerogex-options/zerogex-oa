@@ -55,28 +55,31 @@ _bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 # — critical for Phase 7 when API_KEY is removed from .env: the systemd
 # unit's ExecStartPost curl /api/health would otherwise 401 and trip the
 # service into a restart loop.
-def _with_v2_twins(paths: Set[str]) -> Set[str]:
-    """Add each public path's ``/api/v2`` mirror to the allowlist.
+# Mutable by design: :func:`register_public_path` lets the v2 mirror add its
+# own twins at mount time. The dependency runs that way round on purpose —
+# security must NEVER import the v2 module, because then a v2 import failure
+# would take authentication (and therefore the whole API) down with it, which
+# is exactly what the guard around mount_v2 in main.py exists to prevent.
+_PUBLIC_PATHS: Set[str] = {"/api/health", "/api/health/live"}
 
-    The v2 surface re-serves every endpoint under a shifted path (see
-    ``src/api/v2.py``), and this allowlist is matched on the literal request
-    path — so without the twins, ``/api/v2/health/live`` would 401 while
-    ``/api/health/live`` stayed open. That is exactly the restart-loop this
-    allowlist exists to prevent, just one version along: an operator who
-    repoints an ALB target or the systemd ExecStartPost curl at the v2 probe
-    gets a 401 and a service that never comes up healthy.
 
-    Derived from ``v2_path_for`` rather than hardcoded so a public path added
-    later is covered on both versions automatically — the same one-rule
-    discipline the web tier gate needs for the same reason.
+def public_paths() -> Set[str]:
+    """The current public allowlist (a copy; mutate via register_public_path)."""
+    return set(_PUBLIC_PATHS)
+
+
+def register_public_path(path: str) -> None:
+    """Add ``path`` to the no-auth allowlist.
+
+    Used by the v2 mirror so ``/api/v2/health/live`` is as reachable as
+    ``/api/health/live``: this allowlist is matched on the literal request
+    path, so without the twin an operator who repoints an ALB target or the
+    systemd ExecStartPost curl at the v2 probe gets a 401 and a service that
+    never comes up healthy — the restart loop this allowlist exists to
+    prevent, one version along.
     """
-    from .v2 import v2_path_for
+    _PUBLIC_PATHS.add(path)
 
-    twins = {v2 for v2 in (v2_path_for(p) for p in paths) if v2 is not None}
-    return paths | twins
-
-
-_PUBLIC_PATHS: Set[str] = _with_v2_twins({"/api/health", "/api/health/live"})
 
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
 _ENVIRONMENT: str = _getenv_str("ENVIRONMENT", "development").lower()

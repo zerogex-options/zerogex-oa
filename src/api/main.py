@@ -1823,7 +1823,17 @@ ws_router.register(app, get_broadcaster=_get_ws_broadcaster)
 # v1 is left untouched. See src/api/v2.py and src/api/freshness.py.
 from .v2 import mount_v2  # noqa: E402
 
-mount_v2(app)
+try:
+    mount_v2(app)
+except Exception:  # noqa: BLE001
+    # v2 is additive; v1 is the product. A mirroring failure must degrade the
+    # new surface, never stop the process from booting and take the whole API
+    # down with it. mount_v2 reads FastAPI internals to enumerate included
+    # routers, so the thing most likely to break here is a framework upgrade —
+    # exactly when you want v1 still serving. The parity test in
+    # tests/test_api_v2_freshness_envelope.py turns a partial mirror into a
+    # red CI run so this never degrades silently for long.
+    logger.exception("v2 mirror failed to mount; /api/v2 will be unavailable")
 
 
 # ============================================================================

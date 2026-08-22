@@ -64,10 +64,12 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Generic, Iterable, Optional, Tuple, TypeVar
+from itertools import chain
+from typing import Any, Deque, Generic, Iterable, Optional, Tuple, TypeVar
 
 import pytz
 from pydantic import BaseModel, Field
@@ -340,7 +342,11 @@ CADENCE_PROFILES = {
 ENDPOINT_CADENCE: Tuple[Tuple[str, CadenceProfile], ...] = (
     # --- specific overrides, before their broader family ------------------
     ("/api/health*", ON_DEMAND),
-    ("/api/gex/historical*", HISTORICAL),
+    # Exact, not a glob: /api/gex/historical-context returns the LIVE headline
+    # GEX metrics positioned against their rolling distributions, so a
+    # `historical` classification reported `static` — never stale — on one of
+    # the fourteen endpoints the documented public API product sells.
+    ("/api/gex/historical", HISTORICAL),
     ("/api/market/historical*", HISTORICAL),
     ("/api/market/session-closes*", DAILY_CYCLE),
     ("/api/market/session-levels*", DAILY_CYCLE),
@@ -509,7 +515,8 @@ def _at(hour: int, minute: int):
 # Keys that carry the instant a snapshot/computation was PRODUCED.
 _GENERATED_KEYS = ("generated_at", "evaluated_at", "as_of", "snapshot_time", "computed_at")
 
-# Keys that carry the instant of the UPSTREAM market observation.
+# Keys that carry the instant of the UPSTREAM market observation. These are
+# the only keys freshness is graded against when any of them is present.
 _SOURCE_KEYS = (
     "source_timestamp",
     "timestamp",
@@ -518,9 +525,22 @@ _SOURCE_KEYS = (
     "interval_timestamp",
     "bar_timestamp",
     "last_data_update",
+    "realized_at",
+)
+
+# Row-bookkeeping keys: when the row was WRITTEN, which is not when the market
+# was observed. option_chains rows are UPSERTed in 60-second buckets with
+# ``updated_at = NOW()`` on conflict (see src/api/database.py and
+# src/ingestion/main_engine.py), so a re-write of an OLD snapshot bumps
+# updated_at to now. Ranking these alongside the observation keys let a
+# 10-minute-stale chain report age_seconds=3.0 and ``fresh``.
+#
+# They are a fallback tier, consulted only when the payload carries no real
+# observation key anywhere — better than reporting ``unknown`` for a table
+# that only tracks write time, but never allowed to outrank a real stamp.
+_BOOKKEEPING_KEYS = (
     "last_update",
     "updated_at",
-    "realized_at",
     "created_at",
 )
 
@@ -553,6 +573,18 @@ _EXCLUDED_KEYS = frozenset(
 # at one end or the other.
 _MAX_DEPTH = 6
 _LIST_SAMPLE = 50
+# Hard ceiling on nodes visited. Depth and width bounds alone are NOT a bound:
+# they multiply. /api/gex/strike-profile-timeseries returns 78 buckets each
+# holding ~300 strikes, so a depth-first walk descended 7,800 strike dicts —
+# none of which carries a timestamp — for ~9 ms of pure CPU per request on an
+# endpoint the rewind chart polls at ~1 Hz.
+_MAX_NODES = 2000
+
+# A ``generated_at`` closer than this to the evaluation instant was minted
+# while building the response, so it says nothing about the data's age. One
+# second is comfortably above realistic handler latency and far below any
+# genuine compute cycle (the fastest here is the 5s quote poll).
+_REQUEST_TIME_STAMP_SECONDS = 1.0
 
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:
@@ -583,52 +615,100 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
 def _scan_timestamps(payload: Any, now: datetime) -> Tuple[Optional[datetime], Optional[datetime]]:
     """Walk ``payload`` and return ``(generated_at, latest_event_at)``.
 
-    Both are best-effort: the walk is depth- and width-bounded (see
-    ``_MAX_DEPTH`` / ``_LIST_SAMPLE``) so it stays cheap on very large
-    responses.  Future-dated values are ignored — they are forecast targets
-    or contract properties, never observations.
+    The walk is **breadth-first**, which is what makes the node ceiling safe
+    to enforce.  Every timestamp in this API's payloads lives at or near the
+    top of its object — a row's own stamp sits beside its data, not under
+    three more levels of nesting — so visiting level by level finds all of
+    them before descending into the wide, stamp-free leaf collections
+    (per-strike rows, per-contract quotes) that dominate the node count.
+    A depth-first walk with the same ceiling would spend the entire budget
+    inside the first row's children and miss the later rows' stamps, which
+    would silently change ``latest_event_at``.
+
+    Breadth-first also makes the "shallowest wins" rule for ``generated_at``
+    fall out of the traversal order instead of needing to be tracked.
+
+    Bounded three ways: ``_MAX_DEPTH`` (levels), ``_LIST_SAMPLE`` (head and
+    tail of each collection, since every time-bearing collection here is
+    time-ordered) and ``_MAX_NODES`` (total). Future-dated values are
+    ignored — they are forecast targets or contract properties, never
+    observations.
     """
     generated: Optional[datetime] = None
     generated_depth = _MAX_DEPTH + 1
     latest: Optional[datetime] = None
+    bookkeeping: Optional[datetime] = None
     # Small tolerance for clock skew between the DB writer and this process;
     # without it a stamp a few hundred ms in the future is silently dropped.
     horizon = now + timedelta(seconds=5)
 
-    def visit(node: Any, depth: int) -> None:
-        nonlocal generated, generated_depth, latest
+    queue: Deque[Tuple[Any, int]] = deque(((payload, 0),))
+    budget = _MAX_NODES
+    current_depth = 0
+
+    while queue and budget > 0:
+        node, depth = queue.popleft()
+        # A level boundary. Stop as soon as a completed level has yielded an
+        # observation stamp: these payloads carry their stamps at ONE level
+        # (a row's stamp sits beside its data), and everything below that is
+        # leaf detail — per-strike gamma, per-contract quotes — that costs
+        # thousands of nodes and can contribute nothing. This is what turns
+        # the walk from "bounded by a big ceiling" into "cheap on real
+        # payloads": strike-profile-timeseries now stops after ~80 nodes
+        # instead of grinding through 7,800 strike dicts.
+        if depth != current_depth:
+            if latest is not None:
+                break
+            current_depth = depth
+        budget -= 1
         if depth > _MAX_DEPTH:
-            return
+            continue
+
+        if isinstance(node, (list, tuple)):
+            # Index into the sequence rather than slicing it: a 500k-row body
+            # would otherwise be copied in full just to read 100 elements.
+            size = len(node)
+            if size > 2 * _LIST_SAMPLE:
+                indices: Iterable[int] = chain(
+                    range(_LIST_SAMPLE), range(size - _LIST_SAMPLE, size)
+                )
+            else:
+                indices = range(size)
+            for i in indices:
+                item = node[i]
+                if isinstance(item, (dict, list, tuple, BaseModel)):
+                    queue.append((item, depth + 1))
+            continue
+
         if isinstance(node, dict):
-            items = node.items()
+            items: Iterable[Tuple[Any, Any]] = node.items()
         elif isinstance(node, BaseModel):
             items = node.__dict__.items()
-        elif isinstance(node, (list, tuple)):
-            seq = list(node)
-            if len(seq) > 2 * _LIST_SAMPLE:
-                seq = seq[:_LIST_SAMPLE] + seq[-_LIST_SAMPLE:]
-            for item in seq:
-                visit(item, depth + 1)
-            return
         else:
-            return
+            continue
 
         for key, value in items:
             if isinstance(value, (dict, list, tuple, BaseModel)):
-                visit(value, depth + 1)
+                queue.append((value, depth + 1))
                 continue
             if not isinstance(key, str) or key in _EXCLUDED_KEYS:
                 continue
-            if key not in _GENERATED_KEYS and key not in _SOURCE_KEYS:
+            if (
+                key not in _GENERATED_KEYS
+                and key not in _SOURCE_KEYS
+                and key not in _BOOKKEEPING_KEYS
+            ):
                 continue
             dt = _coerce_datetime(value)
             if dt is None or dt > horizon:
                 continue
-            if key in _GENERATED_KEYS:
-                # The SHALLOWEST generated stamp wins: a nested row's own
-                # ``as_of`` describes that row, while the top-level one
-                # describes the response. Ties (sibling keys at the same
-                # depth) take the newest.
+            if key in _BOOKKEEPING_KEYS:
+                bookkeeping = dt if bookkeeping is None else max(bookkeeping, dt)
+            elif key in _GENERATED_KEYS:
+                # Breadth-first, so the first level to yield a generated stamp
+                # is the shallowest: a nested row's own ``as_of`` describes
+                # that row, while the top-level one describes the response.
+                # Ties at the same depth take the newest.
                 if depth < generated_depth:
                     generated, generated_depth = dt, depth
                 elif depth == generated_depth and generated is not None:
@@ -636,8 +716,8 @@ def _scan_timestamps(payload: Any, now: datetime) -> Tuple[Optional[datetime], O
             else:
                 latest = dt if latest is None else max(latest, dt)
 
-    visit(payload, 0)
-    return generated, latest
+    # Only fall back to write-time bookkeeping when nothing observed a market.
+    return generated, (latest if latest is not None else bookkeeping)
 
 
 # ---------------------------------------------------------------------------
@@ -773,10 +853,18 @@ def build_freshness(
         logger.warning("freshness: payload scan failed", exc_info=True)
         generated_at, latest_event_at = None, None
 
-    # source_timestamp is the upstream observation; when a payload carries
-    # only a computation stamp (a snapshot with no row-level stamps) that
-    # stamp is the best available proxy for it.
-    source_timestamp = latest_event_at or generated_at
+    # source_timestamp is the upstream observation. When a payload carries only
+    # a computation stamp (a snapshot with no row-level stamps) that stamp is
+    # the best available proxy — but ONLY if it describes an earlier
+    # computation. A handler that stamps datetime.now() as it builds the
+    # response (e.g. /api/news/headlines) would otherwise report age_seconds
+    # ~0 and `fresh` forever, including during a total upstream outage that
+    # returned zero items. A stamp minted during this request measures the
+    # request, not the data, so it is not evidence of freshness.
+    source_timestamp = latest_event_at
+    if source_timestamp is None and generated_at is not None:
+        minted_now = (evaluated_at - generated_at).total_seconds() < _REQUEST_TIME_STAMP_SECONDS
+        source_timestamp = None if minted_now else generated_at
     age_seconds = (
         round((evaluated_at - source_timestamp).total_seconds(), 3) if source_timestamp else None
     )

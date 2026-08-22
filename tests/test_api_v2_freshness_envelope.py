@@ -17,7 +17,7 @@ Three things a consumer of the vendor API pays for are pinned here:
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -451,17 +451,144 @@ def test_v2_routes_do_not_duplicate_the_app_level_dependencies(client: TestClien
             assert names.count(global_name) <= 1, f"{route.path} duplicates {global_name}"
 
 
-def test_v2_keeps_the_scope_gate_of_the_route_it_mirrors(client: TestClient):
-    """v2 must authorise identically to v1 — a mirror that dropped the scope
-    dependency would be a redistribution hole."""
+def _scope_gates(dependencies):
+    """``(qualname, required_scopes)`` for each dependency, scopes included.
+
+    ``require_scopes("market_raw")`` returns a closure over ``required_set``,
+    so every gate looks like the same function object from the outside.
+    Comparing only the function NAME is what made the original version of this
+    test vacuous: swapping every gate to the cheapest scope left it green.
+    Reach into the closure cell so the diff compares what is actually enforced.
+    """
+    out = []
+    for dep in dependencies:
+        fn = dep.dependency
+        scopes = frozenset()
+        code = getattr(fn, "__code__", None)
+        if code is not None and getattr(fn, "__closure__", None):
+            for name, cell in zip(code.co_freevars, fn.__closure__):
+                if name == "required_set":
+                    try:
+                        scopes = frozenset(cell.cell_contents)
+                    except Exception:  # noqa: BLE001
+                        pass
+        out.append((getattr(fn, "__qualname__", repr(fn)), scopes))
+    return sorted(out)
+
+
+def test_every_v2_route_enforces_exactly_its_v1_scopes(client: TestClient):
+    """v2 must authorise identically to v1 across the WHOLE surface.
+
+    ``market_raw`` is deliberately withheld from external/analytics-tier keys
+    (see src/api/scopes.py), so a v2 route that lost or downgraded its gate
+    would leak raw upstream market data to customers who did not buy it. This
+    diffs all ~118 pairs including the required-scope SETS, which is what
+    catches a downgrade rather than only a deletion.
+    """
     from fastapi.routing import APIRoute
 
     app = client.app
-    by_path = {
+    global_ids = {id(d) for d in app.router.dependencies}
+    v2_routes = {
         r.path: r for r in app.routes if isinstance(r, APIRoute) and r.path.startswith("/api/v2")
     }
-    route = by_path["/api/v2/levels/{symbol}"]
-    assert any(d.dependency.__name__ == "_dependency" for d in route.dependencies)
+
+    compared = 0
+    for spec in v2mod._iter_route_specs(app):
+        v2_path = v2mod.v2_path_for(spec.path)
+        if v2_path is None or v2_path not in v2_routes:
+            continue
+        expected = _scope_gates([d for d in spec.dependencies if id(d) not in global_ids])
+        actual = _scope_gates(
+            [d for d in v2_routes[v2_path].dependencies if id(d) not in global_ids]
+        )
+        assert actual == expected, f"{spec.path} -> {v2_path}: {actual} != {expected}"
+        compared += 1
+
+    assert compared > 100, f"only compared {compared} pairs"
+    # And the market_raw gates specifically survived, with that exact scope.
+    raw = _scope_gates(
+        [d for d in v2_routes["/api/v2/market/quote"].dependencies if id(d) not in global_ids]
+    )
+    assert any("market_raw" in scopes for _, scopes in raw), raw
+
+
+def test_v2_data_is_byte_identical_for_unmodelled_routes(client: TestClient):
+    """The migration contract, tested where it can actually break.
+
+    v1 serializes a route WITH a response_model through pydantic and one
+    WITHOUT through jsonable_encoder, and the two disagree on the types
+    asyncpg returns: Decimal is a number vs a string, datetime is +00:00 vs
+    Z. 49 of the mirrored routes have no response_model, and the original
+    payload-identity test only covered two routes that both had one — so it
+    could not see the divergence at all.
+    """
+    from decimal import Decimal
+
+    from src.api import database as dbmod
+
+    rows = [
+        {
+            "timestamp": datetime(2026, 8, 20, 14, 0, tzinfo=timezone.utc),
+            "volume": 1234,
+            "avg_volume": Decimal("987.65"),
+            "spike_ratio": Decimal("2.50"),
+        }
+    ]
+    dbmod.DatabaseManager.get_unusual_volume_spikes = AsyncMock(return_value=rows)
+
+    with client:
+        v1 = client.get("/api/technicals/volume-spikes?symbol=SPY")
+        v2 = client.get("/api/v2/technicals/volume-spikes?symbol=SPY")
+
+    assert v1.status_code == v2.status_code == 200
+    assert v2.json()["data"] == v1.json()
+    row = v2.json()["data"][0]
+    assert isinstance(row["avg_volume"], float), "Decimal must stay a JSON number"
+    assert row["timestamp"].endswith("+00:00"), "must keep v1's datetime form"
+    # The envelope itself stays on pydantic's form on EVERY route, so a
+    # consumer parses one timestamp format for freshness regardless of route.
+    assert v2.json()["freshness"]["evaluated_at"].endswith("Z")
+
+
+def test_serialization_path_matches_v1_on_every_route(client: TestClient):
+    """Structural guard behind the test above: a v2 route must declare a
+    response_model iff its v1 twin does. Any drift re-opens the encoder
+    divergence on whichever route drifted."""
+    from fastapi.routing import APIRoute
+
+    app = client.app
+    v2_routes = {
+        r.path: r for r in app.routes if isinstance(r, APIRoute) and r.path.startswith("/api/v2")
+    }
+    mismatched = []
+    for spec in v2mod._iter_route_specs(app):
+        v2_path = v2mod.v2_path_for(spec.path)
+        if v2_path is None or v2_path not in v2_routes:
+            continue
+        if (spec.response_model is None) != (v2_routes[v2_path].response_model is None):
+            mismatched.append(spec.path)
+    assert mismatched == []
+
+
+def test_v2_health_probes_are_public_like_their_v1_twins(client: TestClient):
+    """The allowlist is matched on the literal path, so the v2 twins have to
+    be registered or an operator repointing a probe at v2 gets a 401 and a
+    service that never comes up healthy."""
+    from src.api.security import public_paths
+
+    paths = public_paths()
+    assert "/api/v2/health" in paths
+    assert "/api/v2/health/live" in paths
+
+
+def test_control_plane_exclusion_matches_whole_segments(client: TestClient):
+    """Admin AND internal surfaces stay v1-only; a path that merely contains
+    the substring must still be mirrored."""
+    assert v2mod.v2_path_for("/api/tradeworkz/admin/reset-fleet") is None
+    assert v2mod.v2_path_for("/api/tradeworkz/internal/mark-notification") is None
+    assert v2mod.v2_path_for("/api/admin/api-keys") is None
+    assert v2mod.v2_path_for("/api/x/administration") == "/api/v2/x/administration"
 
 
 def test_v2_is_documented_in_openapi_with_the_envelope_schema(client: TestClient):
@@ -536,3 +663,258 @@ def test_json_response_handlers_are_still_enveloped(monkeypatch: pytest.MonkeyPa
     body = r.json()
     assert body["data"] == [{"timestamp": THU_REGULAR.isoformat(), "v": 1}]
     assert set(body["freshness"]) == set(fr.Freshness.model_fields)
+
+
+# ---------------------------------------------------------------------------
+# Timestamp precedence (write time is not observation time)
+# ---------------------------------------------------------------------------
+
+
+def test_row_write_time_never_outranks_the_market_observation():
+    """``option_chains`` rows are UPSERTed in 60s buckets with
+    ``updated_at = NOW()`` on conflict, so re-writing an OLD snapshot bumps
+    updated_at to now. Ranking it beside the observation keys let a chain
+    that was ten minutes stale report ``age_seconds`` of 3 and ``fresh`` —
+    the freshest-looking answer on the stalest data."""
+    payload = {
+        "contracts": [
+            {
+                "timestamp": THU_REGULAR - timedelta(minutes=10),
+                "updated_at": THU_REGULAR - timedelta(seconds=3),
+            }
+        ]
+    }
+    f = fr.build_freshness(payload, profile=fr.ANALYTICS_CYCLE, now=THU_REGULAR)
+    assert f.source_timestamp == THU_REGULAR - timedelta(minutes=10)
+    assert f.age_seconds == 600.0
+    assert f.freshness_status is fr.FreshnessStatus.STALE
+
+
+def test_write_time_is_still_used_when_nothing_observed_a_market():
+    """A table that only tracks write time should still get a usable answer —
+    the demotion is about precedence, not exclusion."""
+    f = fr.build_freshness(
+        {"rows": [{"updated_at": THU_REGULAR - timedelta(seconds=20)}]},
+        profile=fr.ANALYTICS_CYCLE,
+        now=THU_REGULAR,
+    )
+    assert f.source_timestamp == THU_REGULAR - timedelta(seconds=20)
+
+
+def test_a_stamp_minted_during_this_request_is_not_evidence_of_freshness():
+    """/api/news/headlines stamps ``generated_at`` as it builds the response
+    and returns an empty list when the upstream fetch fails. Treating that as
+    a source timestamp made it report ``fresh`` with ``age_seconds`` 0.0
+    during a total outage — an endpoint that could never say anything else."""
+    f = fr.build_freshness(
+        {"generated_at": THU_REGULAR, "headlines": []},
+        profile=fr.DAILY_CYCLE,
+        now=THU_REGULAR,
+    )
+    assert f.source_timestamp is None
+    assert f.freshness_status is fr.FreshnessStatus.UNKNOWN
+    # Endpoint health is still reported — that part was never in doubt.
+    assert f.generated_at == THU_REGULAR
+
+
+def test_an_earlier_compute_stamp_is_still_a_valid_source_proxy():
+    f = fr.build_freshness(
+        {"as_of": THU_REGULAR - timedelta(seconds=45)},
+        profile=fr.ANALYTICS_CYCLE,
+        now=THU_REGULAR,
+    )
+    assert f.source_timestamp == THU_REGULAR - timedelta(seconds=45)
+    assert f.freshness_status is fr.FreshnessStatus.FRESH
+
+
+# ---------------------------------------------------------------------------
+# Scan bounds
+# ---------------------------------------------------------------------------
+
+
+def test_wide_stampless_leaves_do_not_hide_the_level_that_has_the_stamps():
+    """/api/gex/strike-profile-timeseries is 78 buckets x ~300 strikes. The
+    strikes carry no timestamps, so a depth-first walk burned ~9 ms per
+    request descending 7,800 of them — on an endpoint the rewind chart polls
+    at ~1 Hz. The walk is breadth-first so the bucket level is read in full
+    first; this pins that the ANSWER is unchanged by that optimisation."""
+    payload = {
+        "buckets": [
+            {
+                "timestamp": THU_REGULAR - timedelta(minutes=i),
+                "strikes": [{"strike": 600 + j, "net_gex": 1.0} for j in range(300)],
+            }
+            for i in range(78, 0, -1)
+        ]
+    }
+    f = fr.build_freshness(payload, profile=fr.ANALYTICS_CYCLE, now=THU_REGULAR)
+    assert f.latest_event_at == THU_REGULAR - timedelta(minutes=1)
+
+
+def test_a_stamp_that_only_exists_deep_is_still_found():
+    """The level-wise early exit must not fire before anything was found, or
+    a payload whose only stamp is nested would report ``unknown``."""
+    deep = {"a": {"b": {"c": {"d": [{"timestamp": THU_REGULAR - timedelta(minutes=5)}]}}}}
+    generated, latest = fr._scan_timestamps(deep, THU_REGULAR)
+    assert latest == THU_REGULAR - timedelta(minutes=5)
+
+
+def test_huge_lists_are_not_copied_to_be_sampled():
+    """Slicing head+tail out of a 500k-row body allocated the whole list
+    again. Index into it instead — the scan should be effectively free."""
+    import tracemalloc
+
+    rows = [{"timestamp": THU_REGULAR - timedelta(seconds=500_000 - i)} for i in range(500_000)]
+    tracemalloc.start()
+    generated, latest = fr._scan_timestamps(rows, THU_REGULAR)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert latest == THU_REGULAR - timedelta(seconds=1)
+    assert peak < 500_000, f"scan allocated {peak} bytes"
+
+
+# ---------------------------------------------------------------------------
+# Mirror robustness
+# ---------------------------------------------------------------------------
+
+
+def test_a_no_body_status_route_does_not_break_the_mount():
+    """FastAPI asserts a 204 must carry no body when a response_model is
+    attached, and mount_v2 runs at import — so mirroring one would stop
+    uvicorn booting v1 as well. Adding the REST-conventional
+    ``@router.delete(..., status_code=204)`` must not be an outage."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    @app.delete("/api/runs/{run_id}", status_code=204)
+    async def delete_run(run_id: int):
+        return None
+
+    created = v2mod.mount_v2(app)  # must not raise
+    assert "/api/v2/runs/{run_id}" not in created
+    with TestClient(app) as c:
+        assert c.delete("/api/runs/7").status_code == 204
+
+
+def test_a_handler_taking_its_own_response_object_gets_a_working_twin():
+    """Router modules use ``from __future__ import annotations``, so a
+    ``response: Response`` parameter arrives as the STRING "Response" and an
+    identity check never matches. The wrapper then left the handler's own
+    parameter unfilled and every v2 request 500'd while v1 stayed green."""
+    from fastapi import FastAPI
+
+    module = (
+        "from __future__ import annotations\n"
+        "from fastapi import APIRouter, Response\n"
+        "router = APIRouter(prefix='/api/cached')\n"
+        "@router.get('/thing')\n"
+        "async def get_thing(response: Response, symbol: str = 'SPY'):\n"
+        "    response.headers['Cache-Control'] = 'public, max-age=5'\n"
+        "    return {'symbol': symbol, 'timestamp': '2026-08-20T14:00:00+00:00'}\n"
+    )
+    ns: dict = {}
+    exec(compile(module, "<router_mod>", "exec"), ns)  # noqa: S102
+    app = FastAPI()
+    app.include_router(ns["router"])
+    v2mod.mount_v2(app)
+
+    with TestClient(app) as c:
+        v1 = c.get("/api/cached/thing")
+        v2 = c.get("/api/v2/cached/thing")
+    assert v2.status_code == 200, v2.text
+    assert v2.json()["data"] == v1.json()
+    # The handler's own header must survive alongside the freshness ones.
+    assert v2.headers["Cache-Control"] == "public, max-age=5"
+    assert v2.headers["X-Freshness-Status"]
+
+
+# ---------------------------------------------------------------------------
+# Calendar
+# ---------------------------------------------------------------------------
+
+
+def test_early_close_days_do_not_manufacture_a_stale_afternoon(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """13:00-16:00 ET on the Friday after Thanksgiving is not a stalled feed."""
+    import src.market_calendar as mc
+
+    monkeypatch.setattr(mc, "NYSE_HALF_DAYS", {date(2026, 11, 27)})
+    half_day_afternoon = datetime(2026, 11, 27, 19, 0, tzinfo=timezone.utc)  # 14:00 ET
+    session, market_day = fr.market_context(half_day_afternoon)
+    assert market_day is True
+    assert session == fr.SESSION_CLOSED
+    f = fr.build_freshness(
+        {"timestamp": datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc)},  # 13:00 ET
+        profile=fr.ANALYTICS_CYCLE,
+        now=half_day_afternoon,
+    )
+    assert f.freshness_status is fr.FreshnessStatus.SESSION_CLOSED
+    # Before the early close it behaves like any other session.
+    morning = datetime(2026, 11, 27, 16, 0, tzinfo=timezone.utc)  # 11:00 ET
+    assert fr.market_context(morning)[0] == fr.SESSION_REGULAR
+
+
+def test_daily_artifacts_age_in_trading_sessions_not_wall_clock():
+    """Friday's close is the only possible answer until Monday's lands, so a
+    36-hour wall-clock window reported ``stale`` every Monday morning and
+    after every holiday."""
+    monday_morning = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)  # 08:00 ET Mon
+    friday_close = datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc)  # 16:00 ET Fri
+    f = fr.build_freshness({"timestamp": friday_close}, profile=fr.DAILY_CYCLE, now=monday_morning)
+    assert f.freshness_status is fr.FreshnessStatus.FRESH
+    # Genuinely missing several sessions is still late.
+    stale = fr.build_freshness(
+        {"timestamp": datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc)},
+        profile=fr.DAILY_CYCLE,
+        now=datetime(2026, 8, 24, 22, 0, tzinfo=timezone.utc),
+    )
+    assert stale.freshness_status is fr.FreshnessStatus.STALE
+
+
+def test_historical_context_is_graded_as_live_analytics():
+    """/api/gex/historical-context returns the LIVE headline metrics against
+    their rolling distributions. A ``historical`` classification reported
+    ``static`` — never stale — on one of the fourteen endpoints the
+    documented public API product sells."""
+    assert fr.resolve_profile("/api/gex/historical-context").name == "analytics_cycle"
+    assert fr.resolve_profile("/api/gex/historical").name == "historical"
+
+
+def test_the_scan_does_not_descend_into_stampless_leaf_collections():
+    """The performance fix, pinned deterministically rather than by a timer.
+
+    Correctness tests cannot see this: descending into 7,800 strike dicts
+    produces the SAME answer, just ~9 ms slower per request on an endpoint
+    polled at ~1 Hz. So assert the traversal itself — once the level holding
+    the timestamps has been read, the leaf level below it must never be
+    touched.
+    """
+
+    class CountingDict(dict):
+        """A dict that records every time the scan reads its members."""
+
+        visits = 0
+
+        def items(self):
+            CountingDict.visits += 1
+            return super().items()
+
+    payload = {
+        "buckets": [
+            {
+                "timestamp": THU_REGULAR - timedelta(minutes=i),
+                # The wide, stamp-free leaf level.
+                "strikes": [CountingDict(strike=600 + j, net_gex=1.0) for j in range(300)],
+            }
+            for i in range(78, 0, -1)
+        ]
+    }
+    generated, latest = fr._scan_timestamps(payload, THU_REGULAR)
+
+    assert latest == THU_REGULAR - timedelta(minutes=1), "answer must be unchanged"
+    assert CountingDict.visits == 0, (
+        f"scan descended into {CountingDict.visits} stampless leaf dicts; "
+        "the level-wise early exit is not working"
+    )
