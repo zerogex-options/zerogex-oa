@@ -171,7 +171,7 @@ quote before its replacement is proven.
 | `FUTURES_BASIS_SAMPLES` | `15` | never |
 | `FUTURES_BASIS_FRESH_MINUTES` | `120` | never — 120 spans the 16:00–18:00 hold exactly |
 | `FUTURES_BASIS_CACHE_TTL_SECONDS` | `60` | basis reads show up hot in profiling |
-| `FUTURES_BARS_RETENTION_DAYS` | `7` | **raise before backfilling** — see the backfill section |
+| `FUTURES_BARS_RETENTION_DAYS` | *(follows `DATA_RETENTION_DAYS`)* | only to keep futures LONGER than the index bars — see below |
 | `FUTURES_QUOTE_STALE_MINUTES` | `5` | a quiet feed is being reported as closed too eagerly |
 
 ### Do NOT add ES/NQ to these
@@ -338,6 +338,40 @@ feed for both price and basis.
 Nothing this feature does is written to the database, so there is no data to
 unwind.
 
+## How long ES/NQ history is kept
+
+`futures_quotes` now keeps the **same window as the SPY/QQQ/SPX/NDX bars** by
+default. You do not have to set anything.
+
+The equity and index bars in `underlying_quotes` are pruned by `make db-prune`
+at `DATA_RETENTION_DAYS` — code default 90, but **`.env.example` ships 60, so
+check what your `.env` actually says**:
+
+```bash
+grep '^DATA_RETENTION_DAYS=' /home/ubuntu/zerogex-oa/.env    # blank means the 90 default
+```
+
+The futures ingester now resolves its own retention to that same number.
+`FUTURES_BARS_RETENTION_DAYS` still overrides it, and the only reason to set it
+is to keep futures history *longer* than the index bars — which is what a deep
+backfill wants:
+
+```bash
+FUTURES_BARS_RETENTION_DAYS=365   # keep a year of ES/NQ, whatever DATA_RETENTION_DAYS says
+```
+
+Two things worth knowing about the split:
+
+- `futures_quotes` is **not** in `DB_MAINTAIN_TABLES`, so `make db-prune` never
+  deletes from it. The ingester is its only pruner. That is deliberate — it is
+  what lets a long backfill outlive `DATA_RETENTION_DAYS`.
+- It *is* in `DB_VACUUM_EXTRA_TABLES`, so `make db-maintain` still VACUUM FULLs
+  and REINDEXes it alongside its peers. A table taking constant upsert churn
+  needs that whether or not anything prunes it.
+
+Sizing, if you raise it: one index-year of 1-minute futures bars is roughly
+350k rows. Both indices for a year is well under a GB.
+
 ## Backfilling ES/NQ history
 
 The live ingester only holds a rolling window (`FUTURES_BARS_RETENTION_DAYS`,
@@ -375,6 +409,60 @@ silent zero-bar result means check the subscription, not the dates.
 
 Disk: one index-year of 1-minute futures bars is roughly 350k rows. Two indices
 over a year is well under a GB.
+
+## If you backfilled underlying bars before 2026-08-23
+
+`underlying_backfill.py` used to store TradeStation's raw bar timestamp, which
+is the bar's **close**, while the live ingester floors to the bar's own minute.
+A row backfilled before that was fixed therefore sits **one minute later** than
+the streamed row covering the same minute of market activity.
+
+Both tools now agree, so anything backfilled from here on is correct. The
+question is only whether you have older rows worth repairing.
+
+**Do you?** Backfilled bars carry no Up/Down volume split, which is a reliable
+signature for SPY/QQQ (a live bar in an active minute has volume):
+
+```sql
+SELECT symbol,
+       (timestamp AT TIME ZONE 'America/New_York')::date AS et_date,
+       count(*) FILTER (WHERE up_volume = 0 AND down_volume = 0) AS zero_vol,
+       count(*) AS bars
+FROM underlying_quotes
+WHERE symbol IN ('SPY','QQQ')
+GROUP BY 1, 2
+HAVING count(*) FILTER (WHERE up_volume = 0 AND down_volume = 0) = count(*)
+ORDER BY 2 DESC;
+```
+
+A day that comes back 100% zero-volume was backfilled. Cash indices (SPX/NDX)
+have no volume either way, so for those you need to know which ranges you ran.
+
+**Is it worth repairing?** Usually not urgently. The offset only matters where
+something joins `underlying_quotes` on timestamp — the analytics
+option/underlying pairing and the ES/NQ basis measurement — and both read
+recent data, which is live rather than backfilled. It matters if you backfilled
+a range you then measure across.
+
+**If you do repair it:** delete the affected range and re-run the backfill with
+the fixed tool. Do not try to shift timestamps in place — a `-1 minute` update
+collides with rows that already occupy the target minute.
+
+```sql
+-- Check first. Only delete a range you know was backfilled, not one that
+-- overlaps live streaming, or you will delete good rows.
+DELETE FROM underlying_quotes
+WHERE symbol = 'SPY'
+  AND timestamp >= '2026-06-01' AND timestamp < '2026-07-01';
+```
+
+```bash
+python -m src.tools.underlying_backfill --symbols SPY --start 2026-06-01 --end 2026-06-30
+```
+
+The upsert is idempotent on `(symbol, timestamp)`, so re-running a range is
+safe — it is only the *old* mis-stamped rows that need removing first, because
+they occupy different keys and would otherwise linger as duplicates.
 
 ## Known limits
 

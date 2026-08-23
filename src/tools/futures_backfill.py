@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from src.config import _getenv_int, _getenv_str
+from src.config import _getenv_str
 from src.database import db_connection, close_connection_pool
 from src.symbols import resolve_index_future
 from src.tools.underlying_backfill import _chunk_ranges, _et_span, _safe_bigint
@@ -206,7 +206,9 @@ def fetch_future(
 
 def _warn_if_retention_will_delete(start: date) -> None:
     """Loudly refuse to pretend a backfill outside retention will survive."""
-    retention_days = _getenv_int("FUTURES_BARS_RETENTION_DAYS", 7)
+    from src.ingestion.futures_underlying_ingester import _futures_retention_days
+
+    retention_days = _futures_retention_days()
     cutoff = date.today() - timedelta(days=retention_days)
     if start < cutoff:
         logger.warning(

@@ -142,3 +142,31 @@ def test_end_before_start_is_rejected_by_the_cli():
 @pytest.mark.parametrize("bad", ["not-a-date", "2026-13-01"])
 def test_malformed_dates_are_rejected_by_the_cli(bad):
     assert fb.main(["--symbols", "SPX", "--start", bad, "--end", "2026-08-21"]) == 2
+
+
+# --- one stamping convention across every writer ---------------------------
+
+
+def test_all_three_bar_writers_agree_on_the_timestamp():
+    """The live futures ingester, the futures backfill and the underlying
+    backfill must label the same bar identically.
+
+    They did not: TradeStation stamps a bar at its CLOSE, and underlying_backfill
+    stored that raw while the live ingester floored it to the bar's own minute.
+    A backfilled row therefore sat one minute ahead of the streamed row for the
+    same minute of market activity — two labels for one bar, and an off-by-one
+    against anything joining underlying_quotes on timestamp, including the
+    ES/NQ basis measurement.
+    """
+    from src.ingestion.futures_underlying_ingester import _parse_bar as live
+    from src.tools.underlying_backfill import _bar_to_row as underlying
+
+    raw = _bar("2026-08-19T14:31:00Z")
+    stamps = {
+        "live ingester": live(raw)["timestamp"],
+        "futures backfill": fb._bar_to_row(raw)["timestamp"],
+        "underlying backfill": underlying(raw)["timestamp"],
+    }
+    assert len(set(stamps.values())) == 1, stamps
+    # ...and it is the bar's own minute, not its close.
+    assert next(iter(stamps.values())) == datetime(2026, 8, 19, 14, 30, tzinfo=timezone.utc)
