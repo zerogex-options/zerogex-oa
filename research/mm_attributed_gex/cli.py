@@ -433,6 +433,28 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
     )
     print(json.dumps(provenance, indent=2, default=str))
     print(f"\n{len(rows)} rows -> {out} (+ .csv, + _provenance.json)")
+
+    # The provenance block carries the answer, but it is long and the numbers
+    # that invalidate a run sit in the middle of it.  Say them out loud.
+    recon = provenance.get("reconstruction") or {}
+    completeness = provenance.get("data_completeness") or 0.0
+    gaps = recon.get("session_gap_count") or 0
+    if completeness < 0.9 or gaps > 2:
+        print(
+            f"\n⚠  DATA COMPLETENESS {completeness:.1%} — {gaps} expected trading "
+            f"session(s) missing between {recon.get('window_start')} and "
+            f"{recon.get('window_end')}.\n"
+            "   The Open-Close files cover a window with holes in it. Usually this "
+            "means\n"
+            "   files from two different deliveries are sitting in the same "
+            "directory, or\n"
+            "   the delivery itself is missing days. Check the input directory "
+            "before\n"
+            "   reading anything downstream — a reconstruction across a gap carries "
+            "an\n"
+            "   inventory it never saw traded.",
+            file=sys.stderr,
+        )
     return 0 if rows else 2
 
 
