@@ -3070,6 +3070,19 @@ regime-regrade-report: ## Backtest the corrected dealer-gamma regime vs stored h
 # (everything /api/flow/series can request).
 FLOW_SERIES_SYMBOLS ?= SPY
 
+.PHONY: futures-backfill
+futures-backfill: ## Backfill historical 1-min ES/NQ bars into futures_quotes. SYMBOLS=SPX,NDX START=YYYY-MM-DD END=YYYY-MM-DD [DRY_RUN=yes]
+	@echo "$(BLUE)=== Futures Backfill (futures_quotes) ===$(NC)"
+	@echo "$(YELLOW)SYMBOLS takes the CASH INDEX (SPX,NDX); the mapped future is$(NC)"
+	@echo "$(YELLOW)resolved via INDEX_FUTURES_MAP and rows land under the index key.$(NC)"
+	@echo "$(YELLOW)RAISE FUTURES_BARS_RETENTION_DAYS FIRST -- the ingester prunes past$(NC)"
+	@echo "$(YELLOW)it and cannot tell a backfilled bar from a streamed one.$(NC)"
+	@$(PY) -m src.tools.futures_backfill \
+		--symbols "$(or $(SYMBOLS),SPX,NDX)" \
+		--start $(START) \
+		--end $(END) \
+		$(if $(filter yes,$(DRY_RUN)),--dry-run)
+
 .PHONY: flow-series-backfill
 flow-series-backfill: ## Backfill flow_series_5min (current + prior session) before flipping FLOW_SERIES_USE_SNAPSHOT
 	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"
@@ -3141,6 +3154,14 @@ DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
 	flow_smart_money trade_signals \
 	position_optimizer_signals
 
+# Tables that need the VACUUM FULL / REINDEX half of maintenance but NOT the
+# DATA_RETENTION_DAYS prune, because something else already owns their
+# retention. futures_quotes is pruned by the ingester itself (see
+# _futures_retention_days) so that a long ES/NQ backfill can outlive
+# DATA_RETENTION_DAYS when an operator asks for it — but it takes constant
+# upsert churn and would otherwise never be vacuumed.
+DB_VACUUM_EXTRA_TABLES = futures_quotes
+
 .PHONY: db-prune
 db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 	@echo "$(YELLOW)Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
@@ -3163,7 +3184,7 @@ db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with
 	@$(MAKE) db-prune
 	@echo ""
 	@echo "$(YELLOW)Step 2/3: Running VACUUM FULL + REINDEX per table (reclaims disk space)...$(NC)"
-	@for tbl in $(DB_MAINTAIN_TABLES); do \
+	@for tbl in $(DB_MAINTAIN_TABLES) $(DB_VACUUM_EXTRA_TABLES); do \
 		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
 			echo "  VACUUM FULL $$tbl ..."; \
 			$(PSQL) -c "VACUUM FULL ANALYZE $$tbl;" || echo "$(RED)  ⚠️  VACUUM FULL failed for $$tbl, continuing...$(NC)"; \

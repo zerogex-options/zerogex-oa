@@ -46,6 +46,7 @@ all continue to key on the cash index.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from math import exp
@@ -148,6 +149,74 @@ PRICE_FIELDS: frozenset[str] = frozenset(
         "vwap",
         "orb_high",
         "orb_low",
+        # forecast card: the projected range, its anchors and the realised
+        # outcome all live on the index price axis
+        "projected_low",
+        "projected_high",
+        "projected_close",
+        "raw_projected_low",
+        "raw_projected_high",
+        "actual_low",
+        "actual_high",
+        "actual_close",
+        "open_spot",
+        "gravity_center",
+        "close_at_horizon",
+        "close_at_timestamp",
+        "horizon_close",
+        "sigma_price",  # DEFAULT_SIGMA_PCT * spot — a width in points
+        # gamma-shift / regime session: the concentration band and its anchors
+        "band_low",
+        "band_high",
+        "spot_open",
+        "spot_close",
+        "gamma_flip_open",
+        "gamma_flip_close",
+        "call_wall_open",
+        "call_wall_close",
+        "put_wall_open",
+        "put_wall_close",
+        "prior_call_wall",
+        "prior_put_wall",
+        "prev_close",
+        "reference_close",
+        # advanced-signal detectors: every horizontal level they publish
+        "range_low",
+        "range_high",
+        "range_baseline",
+        "prior_range",
+        "intraday_range_low",
+        "intraday_range_high",
+        "envelope_low",
+        "envelope_high",
+        "opening_range",
+        "orb_range",
+        "broken_support_level",
+        "broken_resistance_level",
+        "confluence_level",  # mean of contributing price levels
+        "expected_target",
+        "gamma_anchor",
+        "gamma_vwap",
+        "gammaVWAP",
+        "pin_target",
+        "raw_pin_strike",
+        "distance_above_orb_high",
+        "distance_below_orb_low",
+        "recent_closes",
+        "recent_highs",
+        "recent_lows",
+        # trade cards and playbook legs
+        "ref_price",
+        "entry_price",
+        "exit_price",
+        "stop_price",
+        "target_price",
+        "wall_ref_price",
+        "target_offset",  # skew_intensity * atr * close — points
+        "long_call_strike",
+        "long_put_strike",
+        "short_call_strike",
+        "short_put_strike",
         # price CHANGES — same units as price, so they scale identically
         "chg_5m",
         "price_chg",
@@ -190,6 +259,17 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         # move to the ES axis; the contract does not exist there at all.
         "bid",
         "ask",
+        "premium",
+        # A VOLATILITY index level. Reads like a price and is not one — scaling
+        # VIX by the SPX carry ratio is meaningless.
+        "vix_level",
+        # Normalised 0..1 proximity/confluence scores that happen to be named
+        # after price features.
+        "flip_proximity",
+        "wall_pinch",
+        "price_vs_max_gamma",
+        "entry_conviction",
+        "open_msi",
         # dimensionless ratios / fractions
         "flip_distance",
         "distance_to_flip",
@@ -211,6 +291,61 @@ NEVER_PROJECT: frozenset[str] = frozenset(
 # Keys whose VALUE is a symbol label, relabelled from the backing index to
 # the future during the same walk that projects the prices.
 LABEL_FIELDS: frozenset[str] = frozenset({"symbol", "underlying", "data_symbol"})
+
+# Free-text fields that quote prices in prose. The signal playbook writes
+# things like "target ${target_ref:.2f}" and "at ${strike:.0f}", so an ES card
+# would otherwise read "target $6,620" beside a chart trading at 6,664 — a
+# number a trader could act on. No field walker can fix prose, but these
+# narratives follow a convention: a price is always $-prefixed, while scores
+# and multiples are not. That convention is what makes the rewrite below
+# tractable rather than a guess.
+NARRATIVE_FIELDS: frozenset[str] = frozenset(
+    {"rationale", "summary", "note", "description", "headline", "why", "read"}
+)
+
+# A $-prefixed number, with or without thousands separators.
+_NARRATIVE_PRICE = re.compile(r"\$(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
+
+# How far from the index level a $-amount may sit and still be treated as an
+# index price. Deliberately tight: an option premium, an ATR offset or a
+# dollar-risk figure falls outside it and is left alone, which is correct —
+# those either do not live on the index axis or scale by an amount well under
+# a tick.
+_NARRATIVE_BAND = (0.5, 2.0)
+
+
+def project_narrative(
+    text: str, basis: FuturesBasis, *, reference: Optional[float], tick: Optional[float] = None
+) -> tuple[str, int]:
+    """Carry $-prefixed index prices inside prose onto the futures axis.
+
+    Returns ``(text, replacements)``.  ``reference`` is the CASH-index level the
+    prose was written against; only amounts within :data:`_NARRATIVE_BAND` of it
+    are touched.  Without a reference nothing is rewritten — guessing which
+    dollar figures are index levels is exactly the mistake this bounds.
+    """
+    if not text or reference is None or reference <= 0:
+        return text, 0
+    low, high = reference * _NARRATIVE_BAND[0], reference * _NARRATIVE_BAND[1]
+    count = 0
+
+    def _replace(match: "re.Match[str]") -> str:
+        nonlocal count
+        raw = match.group(1)
+        try:
+            value = float(raw.replace(",", ""))
+        except ValueError:
+            return match.group(0)
+        if not low <= value <= high:
+            return match.group(0)
+        decimals = len(raw.split(".")[1]) if "." in raw else 0
+        projected = basis.project(value, tick=tick)
+        count += 1
+        grouped = "," in raw
+        return "$" + (f"{projected:,.{decimals}f}" if grouped else f"{projected:.{decimals}f}")
+
+    return _NARRATIVE_PRICE.sub(_replace, text), count
+
 
 # Spot-like keys the middleware replaces with the OBSERVED futures print.
 SPOT_FIELDS: frozenset[str] = frozenset({"spot", "spot_price", "underlying_price", "current_price"})
@@ -438,6 +573,7 @@ def project_payload(
     tick: Optional[float] = None,
     key: Optional[str] = None,
     relabel: Optional[tuple[str, str]] = None,
+    narrative_reference: Optional[float] = None,
 ) -> Any:
     """Recursively carry every price field in a JSON payload to the futures axis.
 
@@ -455,12 +591,23 @@ def project_payload(
     pass, so a large payload is walked and rebuilt once rather than twice.
     Only exact matches under :data:`LABEL_FIELDS` are touched, leaving prose
     that happens to mention the index alone.
+
+    ``narrative_reference`` is the cash-index level the prose was written
+    against; when given, $-prefixed index prices inside :data:`NARRATIVE_FIELDS`
+    are carried across too (see :func:`project_narrative`).
     """
     if isinstance(payload, dict):
         out: Dict[str, Any] = {}
         for k, v in payload.items():
             if isinstance(v, (dict, list)):
-                out[k] = project_payload(v, basis, tick=tick, key=k, relabel=relabel)
+                out[k] = project_payload(
+                    v,
+                    basis,
+                    tick=tick,
+                    key=k,
+                    relabel=relabel,
+                    narrative_reference=narrative_reference,
+                )
             elif (
                 relabel is not None
                 and k in LABEL_FIELDS
@@ -468,13 +615,22 @@ def project_payload(
                 and v.upper() == relabel[0]
             ):
                 out[k] = relabel[1]
+            elif k in NARRATIVE_FIELDS and isinstance(v, str):
+                out[k] = project_narrative(v, basis, reference=narrative_reference, tick=tick)[0]
             else:
                 out[k] = project_value(k, v, basis, tick=tick)
         return out
     if isinstance(payload, list):
         return [
             (
-                project_payload(item, basis, tick=tick, key=key, relabel=relabel)
+                project_payload(
+                    item,
+                    basis,
+                    tick=tick,
+                    key=key,
+                    relabel=relabel,
+                    narrative_reference=narrative_reference,
+                )
                 if isinstance(item, (dict, list))
                 else project_value(key, item, basis, tick=tick)
             )

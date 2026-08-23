@@ -84,16 +84,36 @@ _NATIVE_PATHS = frozenset(
 # model (or its raw dict), classify every numeric field, extend PRICE_FIELDS /
 # NEVER_PROJECT, then add the prefix.
 _PROJECTABLE_PREFIXES = (
-    "/api/gex/summary",
-    "/api/gex/profile",
-    "/api/gex/by-strike",
-    "/api/gex/heatmap",
-    "/api/gex/historical",  # also covers /historical-context
-    "/api/gex/strike-profile-timeseries",
-    "/api/gex/expirations",
-    "/api/max-pain/",
-    "/api/technicals",
+    "/api/gex/",  # summary, profile, by-strike, heatmap, flip surfaces, regime, surfaces
     "/api/v1/levels",
+    "/api/technicals",
+    "/api/max-pain/",
+    "/api/forced-flow/",
+    "/api/signals/",
+    "/api/forecast",
+    "/api/scorecard/",
+    "/api/replay/",
+    "/api/flow/buying-pressure",
+    "/api/flow/series",
+    "/api/flow/market-tide",
+)
+
+# PER-CONTRACT surfaces, checked BEFORE the allowlist above so a broader
+# prefix cannot accidentally admit one.  These enumerate individual option
+# contracts, and an SPX contract with its strike multiplied by the basis is
+# not a contract anyone can trade — the strike would no longer round-trip to
+# the chain it came from.  There is no ES chain to substitute, so they refuse.
+_UNSUPPORTED_PREFIXES = (
+    "/api/option/",
+    "/api/tools/option-calculator",
+    "/api/flow/by-contract",
+    "/api/flow/contracts",
+    "/api/flow/smart-money",
+    "/api/market/open-interest",
+    # Option-premium and IV surfaces: their value axis is a premium/IV on a
+    # real SPX contract, not an index level, so the axis does not carry.
+    "/api/gex/premium_surface",
+    "/api/gex/vol_surface",
 )
 
 
@@ -122,6 +142,7 @@ _API_VERSION_RE = re.compile(r"^/api/v\d+(?=/|$)")
 # to as well — the whole point of comparing on this axis.
 _NATIVE_PATHS_CANON = frozenset(_unversioned(p) for p in _NATIVE_PATHS)
 _PROJECTABLE_PREFIXES_CANON = tuple(_unversioned(p) for p in _PROJECTABLE_PREFIXES)
+_UNSUPPORTED_PREFIXES_CANON = tuple(_unversioned(p) for p in _UNSUPPORTED_PREFIXES)
 
 # Responses larger than this are projected anyway but logged: the walk is
 # O(payload) on the event loop, and a very large one is worth knowing about.
@@ -318,7 +339,9 @@ class FuturesProjectionMiddleware:
             await self.app(scope, receive, send)
             return
 
-        if not canon.startswith(_PROJECTABLE_PREFIXES_CANON):
+        if canon.startswith(_UNSUPPORTED_PREFIXES_CANON) or not canon.startswith(
+            _PROJECTABLE_PREFIXES_CANON
+        ):
             await self._reject(send, futures_symbol, index_symbol, path)
             return
 
@@ -460,11 +483,23 @@ class FuturesProjectionMiddleware:
         if basis is None:
             return payload
 
+        # The cash level the narrative prose was written against, read BEFORE
+        # anything is rewritten — the spot substitution below replaces it, and
+        # projecting prose against a futures level would double-apply carry.
+        narrative_reference: Optional[float] = None
+        if isinstance(payload, dict):
+            for spot_key in SPOT_FIELDS:
+                candidate = _as_number(payload.get(spot_key))
+                if candidate and candidate > 0:
+                    narrative_reference = candidate
+                    break
+
         projected = project_payload(
             payload,
             basis,
             tick=projection_tick(futures_symbol),
             relabel=(index_symbol, futures_symbol),
+            narrative_reference=narrative_reference,
         )
 
         # Prefer the OBSERVED futures print over a projected one for spot.
@@ -481,5 +516,7 @@ class FuturesProjectionMiddleware:
                 _reconcile_spot_derived(projected, live)
 
         if isinstance(projected, dict):
-            projected["projection"] = projection_metadata(basis)
+            meta = projection_metadata(basis)
+            meta["narrative_prices_converted"] = narrative_reference is not None
+            projected["projection"] = meta
         return projected

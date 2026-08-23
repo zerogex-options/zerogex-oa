@@ -465,6 +465,28 @@ class FuturesUnderlyingIngester:
             logger.info("%s futures ingester stopped", self.index_symbol)
 
 
+def _futures_retention_days() -> int:
+    """How many days of futures bars to keep.
+
+    Defaults to ``DATA_RETENTION_DAYS`` — the same knob that bounds
+    ``underlying_quotes`` for SPY / QQQ / SPX / NDX — so futures history
+    matches its index counterpart without an operator having to keep two
+    numbers in sync. ``FUTURES_BARS_RETENTION_DAYS`` still overrides it, which
+    is what a long backfill wants: see ``src/tools/futures_backfill.py``.
+    """
+    explicit = os.getenv("FUTURES_BARS_RETENTION_DAYS")
+    if explicit and explicit.strip():
+        try:
+            return max(1, int(explicit))
+        except ValueError:
+            logger.warning(
+                "FUTURES_BARS_RETENTION_DAYS=%r is not an integer; "
+                "falling back to DATA_RETENTION_DAYS",
+                explicit,
+            )
+    return _getenv_int("DATA_RETENTION_DAYS", 90)
+
+
 def run_futures_ingester(index_symbol: str) -> None:
     """Child-process entry point for one index's futures feed.
 
@@ -504,6 +526,6 @@ def run_futures_ingester(index_symbol: str) -> None:
         future_symbol=future_symbol,
         initial_barsback=_getenv_int("FUTURES_INITIAL_BARSBACK", 960),
         poll_barsback=_getenv_int("FUTURES_POLL_BARSBACK", 3),
-        retention_days=_getenv_int("FUTURES_BARS_RETENTION_DAYS", 7),
+        retention_days=_futures_retention_days(),
     )
     ingester.run()
