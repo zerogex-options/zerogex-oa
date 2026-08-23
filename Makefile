@@ -3561,40 +3561,10 @@ api-test: ## Test ALL API endpoints (V=2 tests the /api/v2 envelope surface)
 		echo ""; \
 		echo "$(BLUE)=== v$$VER envelope check ===$(NC)"; \
 		echo "$(YELLOW)A 2xx with the wrong body shape is the failure the table above cannot see.$(NC)"; \
-		BAD=0; \
-		for EP in "/api/v$$VER/health" "/api/v$$VER/gex/summary?symbol=$$SYMBOL" \
-		          "/api/v$$VER/levels/$$SYMBOL" "/api/v$$VER/flow/series?symbol=$$SYMBOL" \
-		          "/api/v$$VER/signals/score?underlying=$$SYMBOL"; do \
-			if [ -n "$$KEY" ]; then \
-				BODY=$$(curl -s -H "X-API-Key: $$KEY" "$$BASE_URL$$EP"); \
-			else \
-				BODY=$$(curl -s "$$BASE_URL$$EP"); \
-			fi; \
-			SHAPE=$$(printf '%s' "$$BODY" | $(PY) -c 'import json,sys;\
-try:\
-    b=json.load(sys.stdin)\
-except Exception:\
-    print("not-json");raise SystemExit\
-if not isinstance(b,dict) or set(b)!={"data","freshness"}:\
-    print("NOT-ENVELOPED");raise SystemExit\
-f=b["freshness"]\
-need={"evaluated_at","generated_at","source_timestamp","latest_event_at","age_seconds",\
-      "market_session_status","expected_update_cadence","expected_update_cadence_seconds",\
-      "cadence_profile","stale_after","freshness_status"}\
-missing=need-set(f)\
-print("MISSING:"+",".join(sorted(missing)) if missing else f["freshness_status"]+" / "+f["cadence_profile"])' 2>/dev/null); \
-			case "$$SHAPE" in \
-				NOT-ENVELOPED|MISSING:*|not-json|"") \
-					BAD=$$((BAD+1)); \
-					printf "  $(RED)%-46s %s$(NC)\n" "$$EP" "$${SHAPE:-empty}" ;; \
-				*) printf "  $(GREEN)%-46s$(NC) %s\n" "$$EP" "$$SHAPE" ;; \
-			esac; \
-		done; \
-		if [ "$$BAD" -gt 0 ]; then \
-			echo "$(RED)✗ $$BAD endpoint(s) did not return a well-formed freshness envelope.$(NC)"; \
-			exit 1; \
-		fi; \
-		echo "$(GREEN)✅ Envelope present and complete on every sampled endpoint$(NC)"; \
+		OPS_API_KEY="$$KEY" $(PY) -m src.tools.v2_envelope_check \
+			--base-url "$$BASE_URL" --version "$$VER" --symbol "$$SYMBOL" \
+			&& echo "$(GREEN)✅ Envelope present and complete on every sampled endpoint$(NC)" \
+			|| { echo "$(RED)✗ v$$VER responses are not well-formed envelopes — see above.$(NC)"; exit 1; }; \
 	fi
 
 .PHONY: calendar-check
