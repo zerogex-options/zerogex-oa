@@ -70,11 +70,62 @@ Reference: `src/jobs/futures_projection.py`, `src/api/futures_middleware.py`.
 
 ## Step 1 — Confirm the two things no config can fix
 
-**1a. CME market-data entitlement on the TradeStation account.**
-Futures data is a separate exchange subscription from equities/indices. If
-`@NQ` is not entitled the ingester connects and receives nothing — an empty
-`futures_quotes` for NDX with no error in the log. Check this first; it is a
-confusing way to lose an afternoon.
+**1a. CME market-data entitlement on the TradeStation account —
+REAL-TIME, not delayed.**
+
+Futures data is a separate exchange subscription from equities/indices, and it
+fails in two different ways.
+
+*Not entitled at all:* the ingester connects and receives nothing — an empty
+`futures_quotes` for that index, HTTP 200, no error in the log.
+
+*Entitled but DELAYED:* everything looks healthy — streams connect, bars
+arrive, the backfill works, the basis measures — and every ES/NQ price is
+simply 10 minutes old. This is the harder one, because nothing anywhere says
+so. It shipped once: on 2026-08-24 the account carried real-time equities and
+**delayed** CME, so ES/NQ ran a fixed ~10 minutes behind. With
+`FUTURES_QUOTE_STALE_MINUTES` at 5 the feed was permanently stale, ES/NQ
+permanently reported `session: "closed"`, and the header permanently showed
+Friday's cash close with Friday's day change.
+
+The two are distinguishable in one query — same client, same process, same
+code, so the only variable is the exchange:
+
+```sql
+SELECT 'futures' AS feed, index_symbol AS symbol,
+       MAX(timestamp) AT TIME ZONE 'America/New_York' AS latest,
+       ROUND(EXTRACT(EPOCH FROM (NOW() - MAX(timestamp)))/60, 1) AS min_old
+FROM futures_quotes GROUP BY index_symbol
+UNION ALL
+SELECT 'cash', symbol,
+       MAX(timestamp) AT TIME ZONE 'America/New_York',
+       ROUND(EXTRACT(EPOCH FROM (NOW() - MAX(timestamp)))/60, 1)
+FROM underlying_quotes WHERE symbol IN ('SPY','QQQ') GROUP BY symbol
+ORDER BY 1, 2;
+```
+
+Run it during the cash session, twice, a minute apart. SPY/QQQ are the
+real-time control — don't use SPX/NDX, which don't print before 09:30.
+
+| SPY/QQQ | ES/NQ | Reading |
+|---|---|---|
+| ~1 min | ~1 min | real-time CME. Correct. |
+| ~1 min | ~10 min, **holding** across both runs | entitled but delayed — buy real-time CME |
+| ~1 min | growing across both runs | the stream is dying, not delayed. See Step 2 |
+| ~1 min | no rows | not entitled |
+
+A delayed feed is not a code fault and there is no config that fixes it
+honestly: `FUTURES_QUOTE_STALE_MINUTES` can be raised above the delay to stop
+the flapping, but the terminal then presents 10-minute-old data as live, which
+is worth checking against the CME data agreement. Buy the real-time
+(non-professional) CME entitlement on the TradeStation account instead — then
+`FUTURES_QUOTE_STALE_MINUTES=5` goes back to meaning "the feed has died",
+which is what it is for.
+
+Nothing already stored needs re-loading if you were on the delayed feed:
+delayed bars carry the correct timestamp and the correct price, they just
+arrived late, so `futures_quotes` history and any measured basis from that
+period are accurate.
 
 **1b. `@ES` and `@NQ` must not be back-adjusted.**
 This is the one failure that would quietly corrupt every level. A
@@ -341,7 +392,8 @@ live 7677.25 print. `stale` is what keeps a dead feed off the live chart tip;
 it must never change which price is shown.
 
 If `stale` is persistently true while CME is open, the feed is the problem, not
-the quote — check the futures children:
+the quote. A *fixed* lag that tracks the clock is a delayed CME entitlement
+(Step 1a); a *growing* lag is a dying stream — check the futures children:
 
 ```bash
 journalctl -u zerogex-oa-ingestion --since '1 hour ago' | grep -i futures
