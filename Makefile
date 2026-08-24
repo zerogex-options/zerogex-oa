@@ -3069,7 +3069,7 @@ ci-parity: ## End-to-end flow-series parity: apply schema, seed deterministic fi
 .PHONY: vacuum
 vacuum: ## Vacuum analyze all tables
 	@echo "$(YELLOW)Running VACUUM ANALYZE on all tables...$(NC)"
-	@for tbl in $(DB_MAINTAIN_TABLES); do \
+	@for tbl in $(DB_MAINTAIN_TABLES) $(DB_EXPIRY_PRUNE_TABLES); do \
 		echo "  VACUUM ANALYZE $$tbl ..."; \
 		$(PSQL) -c "VACUUM ANALYZE $$tbl;" || echo "$(RED)  ⚠️  Failed for $$tbl, continuing...$(NC)"; \
 	done
@@ -3088,6 +3088,17 @@ DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
 	flow_smart_money trade_signals \
 	position_optimizer_signals
 
+# Helper: tables pruned by CONTRACT EXPIRATION rather than by row age.
+# option_chains_latest holds one row per contract, not a time series -- its
+# timestamp means "when this contract last ticked", so the
+# DATA_RETENTION_DAYS rule above is the wrong tool twice over: it would
+# delete a still-live but quietly-quoted contract, and it lets an expired
+# contract linger for 90 days after its last tick. Prune on expiration
+# instead; an expired contract's "latest quote" is meaningless and nothing
+# reads it. Left OUT of DB_MAINTAIN_TABLES deliberately so it never picks up
+# the timestamp DELETE.
+DB_EXPIRY_PRUNE_TABLES = option_chains_latest
+
 .PHONY: db-prune
 db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 	@echo "$(YELLOW)Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
@@ -3095,6 +3106,14 @@ db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 		echo "  Pruning $$tbl ..."; \
 		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
 			$(PSQL) -c "DELETE FROM $$tbl WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"; \
+		else \
+			echo "    ⚠️  Table $$tbl does not exist, skipping"; \
+		fi; \
+	done
+	@for tbl in $(DB_EXPIRY_PRUNE_TABLES); do \
+		echo "  Pruning expired contracts from $$tbl ..."; \
+		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
+			$(PSQL) -c "DELETE FROM $$tbl WHERE expiration < CURRENT_DATE;"; \
 		else \
 			echo "    ⚠️  Table $$tbl does not exist, skipping"; \
 		fi; \
@@ -3110,7 +3129,7 @@ db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with
 	@$(MAKE) db-prune
 	@echo ""
 	@echo "$(YELLOW)Step 2/3: Running VACUUM FULL + REINDEX per table (reclaims disk space)...$(NC)"
-	@for tbl in $(DB_MAINTAIN_TABLES); do \
+	@for tbl in $(DB_MAINTAIN_TABLES) $(DB_EXPIRY_PRUNE_TABLES); do \
 		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
 			echo "  VACUUM FULL $$tbl ..."; \
 			$(PSQL) -c "VACUUM FULL ANALYZE $$tbl;" || echo "$(RED)  ⚠️  VACUUM FULL failed for $$tbl, continuing...$(NC)"; \
