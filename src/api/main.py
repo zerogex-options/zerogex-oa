@@ -1282,19 +1282,29 @@ async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> Under
     }
     payload["symbol"] = futures_symbol
 
-    # Derive the session from DATA FRESHNESS, not the clock alone. If the
-    # futures ingester dies at 03:00 (stream-slot cap, expired refresh token —
-    # both paths just back off and retry, nothing raises), a clock-derived
-    # "open" would keep this frozen 03:00 bar flowing onto the live chart tip
-    # for hours with nothing to mark it stale. Reporting "closed" makes the
-    # frontend stop merging it (see isSessionLive) while still serving the
-    # last known price, which is more useful than a 404.
+    # ``session`` describes the MARKET, not the feed.
+    #
+    # This used to fold feed staleness into the session — a stale bar was
+    # reported "closed" so the frontend would stop merging it onto the live
+    # chart tip (see isSessionLive). That was the wrong lever: the frontend's
+    # "closed" branch does not merely stop merging, it REPLACES the headline
+    # price with ``current_session_close`` and its change with
+    # ``prior_session_close``. For a 23-hour instrument that means swapping a
+    # slightly-late ES print for the last 16:00 cash close and publishing that
+    # session's day change as today's. On 2026-08-24 the header read
+    # "ES $7692.00 +26.75 (+0.35%)" — Friday's close and Friday's change —
+    # while ES traded 7675.50 and the feed had a live 7677.25 print in hand.
+    #
+    # A late observed print is always closer to the truth than a three-day-old
+    # one. Serve it, label the session honestly, and describe the staleness
+    # separately so each consumer can make its own decision.
     bar_ts = payload.get("timestamp")
-    stale = False
+    age_seconds: Optional[int] = None
     if bar_ts is not None:
-        age_minutes = (datetime.now(timezone.utc) - bar_ts).total_seconds() / 60.0
-        stale = age_minutes > _FUTURES_QUOTE_STALE_MINUTES
-    payload["session"] = "open" if is_futures_session_open() and not stale else "closed"
+        age_seconds = max(0, int((datetime.now(timezone.utc) - bar_ts).total_seconds()))
+    payload["session"] = "open" if is_futures_session_open() else "closed"
+    payload["data_age_seconds"] = age_seconds
+    payload["stale"] = age_seconds is not None and age_seconds > _FUTURES_QUOTE_STALE_MINUTES * 60.0
     return UnderlyingQuote(**payload)
 
 
