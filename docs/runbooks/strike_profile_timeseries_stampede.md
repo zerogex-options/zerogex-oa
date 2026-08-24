@@ -188,6 +188,35 @@ a cold fetch per TTL on 2 vCPU. Raise `CACHE_TTL_SECONDS` before reaching for
 an instance resize — at 5 min buckets a 30 s TTL is far shorter than the data
 actually changes.
 
+## Confirmed in production (2026-08-24)
+
+Settings `CHUNK_UNITS=24`, `BUCKET_CACHE_TTL_SECONDS=900`,
+`MAX_WINDOW_UNITS=480`, measured 40 minutes into a live cash session on the
+same instance that failed on 2026-08-21:
+
+| | 2026-08-21 (broken) | 2026-08-24 (fixed) |
+|---|---|---|
+| `window_units=78`, 5min, all expirations | `[]` after 15-20 s, every poll | 943,717 B in **0.049 s** |
+| `window_units=47` (cold window key) | — | 560,084 B in **0.034 s** |
+| API timeout warnings | 779 in 80 min | **0** |
+
+Read the run-to-run shape, not just the best number:
+
+```
+run1 window=78  0.190s     <- second uvicorn worker still cold
+run1 window=47  0.712s
+run2 window=78  0.062s     <- both workers warm
+run3 window=78  0.049s
+```
+
+Caches are per-worker, so with `--workers 2` it takes a couple of requests
+after a restart before both are warm. A *fully* cold fetch of the 78-bucket
+window (immediately after a restart, both caches empty) took **24.8 s** — four
+chunks back to back. That is the worst case, it is bounded to roughly once per
+worker per `BUCKET_CACHE_TTL_SECONDS`, and single-flight means concurrent
+callers wait on it rather than each paying it. Note it *succeeded* at 24.8 s
+despite the 15 s guard: the guard is per QUERY, and no chunk exceeded it.
+
 ## Why the full window is affordable again
 
 Per-bucket caching is what makes a wide window cheap rather than merely
