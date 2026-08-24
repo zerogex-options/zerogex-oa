@@ -5846,6 +5846,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Bars are fenced to 09:30-16:00 ET so the mark is the cash-session
         close a trader compares against, not an overnight print that happens
         to be the day's last bar.  Reads ``futures_quotes`` only.
+
+        Which field is the 16:00 mark
+        -----------------------------
+        Bars are start-of-minute stamped (see ``_parse_bar`` in the futures
+        ingester), so the bar timestamped 16:00:00 spans 16:00:00-16:00:59 —
+        it OPENS at the cash close and CLOSES a full minute into post-close
+        futures trading.  ES and NQ trade 23 hours a day, so that minute is
+        live tape, not a settled level: taking the bar's ``close`` measured
+        the day change against 16:01, and the headline drifted by whatever
+        the future did in the first minute after the bell.
+
+        ``open`` of the 16:00 bar is the 16:00:00 print.  This is the same
+        rule :meth:`get_session_closes` applies to every cash symbol that
+        trades after hours, for the same reason; futures are simply its most
+        extreme case.  Any other bar - a half-day's 13:14 last bar, or the
+        15:59 bar when the 16:00 one is missing - uses ``close`` as usual,
+        which is already the 16:00:00 price.
         """
         index_symbol = (index_symbol or "").upper()
         cache_key = f"futures_session_closes:{index_symbol}"
@@ -5858,7 +5875,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     (timestamp AT TIME ZONE 'America/New_York')::date AS et_date,
                     timestamp,
-                    close,
+                    -- The 16:00 bar opens at the cash close and closes a
+                    -- minute into post-close futures tape: see the docstring.
+                    CASE
+                        WHEN (timestamp AT TIME ZONE 'America/New_York')::time
+                                = TIME '16:00'
+                        THEN open
+                        ELSE close
+                    END AS close,
                     ROW_NUMBER() OVER (
                         PARTITION BY (timestamp AT TIME ZONE 'America/New_York')::date
                         ORDER BY timestamp DESC
@@ -5866,6 +5890,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 FROM futures_quotes
                 WHERE index_symbol = $1
                   AND timestamp <= NOW()
+                  -- Sargable lower bound, as in get_session_closes: without
+                  -- it this TZ-converts, partitions and sorts the index's
+                  -- ENTIRE futures history for a 2-row result. The backfill
+                  -- grew that history from a rolling overnight window to
+                  -- every minute of every session inside DATA_RETENTION_DAYS.
+                  -- Two sessions is all this needs; 30 days covers any
+                  -- weekend, holiday or ingestion gap.
+                  AND timestamp >= NOW() - INTERVAL '30 days'
                   AND (timestamp AT TIME ZONE 'America/New_York')::time
                         BETWEEN TIME '09:30' AND TIME '16:00'
                   -- Exclude the session still in progress. Without this the

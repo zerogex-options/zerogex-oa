@@ -296,6 +296,30 @@ curl -s -H "X-API-Key: $KEY" "$API/api/market/session-closes?symbol=ES" | jq
 must be the future's own 16:00 marks — that pair is what the header's daily
 change is computed from.
 
+**The day change is anchored to 16:00:00, not 16:00:59.** Bars are
+start-of-minute stamped, so the bar timestamped 16:00 spans the first full
+minute *after* the bell. ES and NQ trade through it, so its `close` is live
+tape, not a settled level. `current_session_close` must equal that bar's
+**open**:
+
+```sql
+-- the mark the header divides into the live ES print
+SELECT timestamp AT TIME ZONE 'America/New_York' AS et, open, close
+FROM futures_quotes
+WHERE index_symbol = 'SPX'
+  AND (timestamp AT TIME ZONE 'America/New_York')::time = TIME '16:00'
+ORDER BY timestamp DESC LIMIT 1;
+```
+
+```bash
+curl -s -H "X-API-Key: $KEY" "$API/api/market/session-closes?symbol=ES" \
+  | jq '{current_session_close, current_session_close_ts}'
+```
+
+`current_session_close` must match the row's `open`. If it matches `close`
+instead, the headline change is off by whatever ES did in the minute after
+the bell — `tests/test_futures_session_closes.py` pins this.
+
 **Per-contract option endpoints refuse:**
 
 ```bash
