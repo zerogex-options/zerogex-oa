@@ -111,7 +111,10 @@ class AuditLogMiddleware:
                     "api_request method=%s path=%s status=%s caller_kind=%s "
                     "caller_user_id=%s end_user_id=%s duration_ms=%.1f",
                     scope.get("method", "-"),
-                    scope.get("path", "-"),
+                    # An ES/NQ request is routed to its backing index, but the
+                    # audit trail must record what the caller actually asked
+                    # for (FuturesProjectionMiddleware stashes it).
+                    scope.get("zerogex_original_path") or scope.get("path", "-"),
                     captured["status"],
                     caller_kind,
                     caller_user_id or "-",

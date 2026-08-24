@@ -64,6 +64,28 @@ def test_expiry_pruned_tables_are_still_vacuumed():
     assert "DB_EXPIRY_PRUNE_TABLES" in _recipe("db-maintain")
 
 
+def test_vacuum_only_tables_are_never_pruned():
+    """DB_VACUUM_EXTRA_TABLES own their own retention elsewhere.
+
+    futures_quotes is pruned by the ingester so a long ES/NQ backfill can
+    outlive DATA_RETENTION_DAYS. It must reach neither prune list -- the two
+    new table lists landed in the same Makefile slot from different branches,
+    so this is exactly what a bad conflict resolution would break.
+    """
+    vacuum_only = _make_var("DB_VACUUM_EXTRA_TABLES")
+    assert vacuum_only, "DB_VACUUM_EXTRA_TABLES unexpectedly empty"
+    for table in vacuum_only:
+        assert table not in _make_var("DB_MAINTAIN_TABLES")
+        assert table not in _make_var("DB_EXPIRY_PRUNE_TABLES")
+
+
+def test_full_maintenance_vacuums_every_list():
+    """The VACUUM FULL pass must cover all three lists, not two of three."""
+    recipe = _recipe("db-maintain")
+    for var in ("DB_MAINTAIN_TABLES", "DB_EXPIRY_PRUNE_TABLES", "DB_VACUUM_EXTRA_TABLES"):
+        assert var in recipe, f"{var} missing from db-maintain VACUUM FULL pass"
+
+
 def test_backtest_archive_stays_out_of_both_lists():
     """Documented invariant: it is the retention-exempt copy backtests read."""
     assert "option_chains_archive" not in _make_var("DB_MAINTAIN_TABLES")

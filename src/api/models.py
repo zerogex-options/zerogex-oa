@@ -262,6 +262,19 @@ class UnderlyingQuote(BaseModel):
     data_symbol: Optional[str] = None
     futures_close: Optional[Decimal] = None
     futures_reference_close: Optional[Decimal] = None
+    # FEED freshness, for the natively-served futures quote (ES / NQ).
+    # Deliberately separate from `session`, which describes the CME calendar:
+    # folding the two together made a stale feed read as a closed market, and
+    # the frontend answers "closed" by swapping the headline price for the
+    # last cash close — so a late ES print was published as Friday's close
+    # with Friday's day change. See _native_futures_quote.
+    #   stale:            newest bar older than FUTURES_QUOTE_STALE_MINUTES.
+    #                     Chart surfaces gate tip-candle merging on this so a
+    #                     dead feed still cannot paint ghost data on the tip.
+    #   data_age_seconds: age of that bar, for a "delayed" marker.
+    # Both absent on the cash index / ETF path.
+    stale: Optional[bool] = None
+    data_age_seconds: Optional[int] = None
 
     class Config:
         from_attributes = True

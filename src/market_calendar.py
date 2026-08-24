@@ -75,6 +75,61 @@ def load_nyse_holidays() -> set[date]:
 NYSE_HOLIDAYS: set[date] = load_nyse_holidays()
 
 
+def load_nyse_half_days() -> set[date]:
+    """Load early-close ("half day") dates from the ``NYSE_HALF_DAYS`` env var.
+
+    NYSE closes at 13:00 ET rather than 16:00 on a handful of days each year
+    (the Friday after Thanksgiving, Christmas Eve, July 3rd when it falls on a
+    weekday). Treating those as normal sessions makes every freshness check
+    report a late feed for the three hours after the real close, on a day when
+    nothing is wrong — see ``src/api/freshness.py``.
+
+    Same format, strictness flag and failure mode as :func:`load_nyse_holidays`
+    so an operator maintains both calendars the same way. Consumed today only
+    by the v2 freshness envelope; the session helpers below intentionally keep
+    their existing 16:00 boundary until each is reviewed for early-close
+    behaviour on its own terms.
+    """
+    raw = os.getenv("NYSE_HALF_DAYS", "")
+    strict = os.getenv("NYSE_HOLIDAYS_STRICT", "false").strip().lower() == "true"
+    half_days: set[date] = set()
+    invalid: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            half_days.add(date.fromisoformat(token))
+        except ValueError:
+            invalid.append(token)
+            logger.error("Invalid date in NYSE_HALF_DAYS env var: %r", token)
+    if invalid and strict:
+        raise ValueError(
+            f"NYSE_HALF_DAYS contains {len(invalid)} invalid token(s): {invalid!r}. "
+            "Fix the env var or set NYSE_HOLIDAYS_STRICT=false to tolerate."
+        )
+    return half_days
+
+
+NYSE_HALF_DAYS: set[date] = load_nyse_half_days()
+
+# The ET wall-clock close for a normal session and for an early-close day, and
+# the end of the extended (after-hours) feed window in each case.
+NYSE_REGULAR_CLOSE = time(16, 0)
+NYSE_HALF_DAY_CLOSE = time(13, 0)
+NYSE_EXTENDED_END = time(20, 0)
+# ASSUMPTION (flagged for operator review): on an early-close day the options
+# tape this platform ingests stops at the 13:00 ET close, so there is no
+# extended window to expect updates in. Equities may print until 17:00, but
+# every endpoint whose freshness we grade is options-derived. Set this to
+# time(17, 0) if the underlying feed is confirmed to run past the half-day
+# close — the cost of the conservative value is a genuine half-day-afternoon
+# stall reporting `session_closed` instead of `stale`; the cost of the wrong
+# permissive value is every endpoint paging for three hours on a normal
+# early-close day.
+NYSE_HALF_DAY_EXTENDED_END = NYSE_HALF_DAY_CLOSE
+
+
 # ---------------------------------------------------------------------------
 # Time-to-expiration
 # ---------------------------------------------------------------------------
@@ -386,6 +441,8 @@ def is_underlying_active_session(
 # bars, which the request-time fetch surfaces as a stale/last print — the
 # same graceful degradation as any other quiet period.
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
 _FUTURES_REOPEN = time(18, 0)  # Sunday open / daily reopen after maintenance
 _FUTURES_DAILY_CLOSE = time(17, 0)  # Friday close / daily maintenance start
 
@@ -426,6 +483,29 @@ def is_futures_display_window(dt: Optional[datetime] = None) -> bool:
     t = dt.time()
     in_overnight_window = t >= _FUTURES_REOPEN or t < time(9, 30)
     return in_overnight_window and is_futures_session_open(dt)
+
+
+def is_futures_ingest_window(dt: Optional[datetime] = None) -> bool:
+    """True when the futures ingester should be streaming bars.
+
+    Deliberately WIDER than :func:`is_futures_display_window`.  The display
+    swap only ever wants the future overnight, but the index->future basis
+    engine (``src/jobs/futures_projection.py``) has to observe ES and SPX
+    printing at the SAME instant to measure the carry ratio — and the only
+    time both print together is the cash session, exactly the window the
+    old overnight-only gate slept through.  So by default the ingester now
+    follows the whole CME session (Sun 18:00 -> Fri 17:00 ET, minus the
+    daily 17:00-18:00 maintenance break) and ``futures_quotes`` carries a
+    continuous series.
+
+    Cost is two 1-minute bar streams; ``FUTURES_BARS_RETENTION_DAYS`` still
+    bounds the table.  Set ``FUTURES_INGEST_FULL_SESSION=false`` to fall
+    back to the old overnight-only behaviour, which disables live basis
+    measurement and leaves the projection on its cost-of-carry fallback.
+    """
+    if os.getenv("FUTURES_INGEST_FULL_SESSION", "true").strip().lower() not in _TRUTHY:
+        return is_futures_display_window(dt)
+    return is_futures_session_open(dt)
 
 
 def should_display_future(symbol: Optional[str], dt: Optional[datetime] = None) -> bool:

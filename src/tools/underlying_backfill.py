@@ -9,9 +9,18 @@ paths can reach without any data purchase (the expensive half, historical
 option chains, is the separate vendor decision in
 ``docs/design/historical-options-data-vendors.md``).
 
-It reuses the same bar shape, validation, and ``underlying_quotes`` upsert as
-the live ingester (``src/ingestion/main_engine.py``), so a backfilled bar is
-indistinguishable from a streamed one. Idempotent on ``(symbol, timestamp)``.
+It reuses the same bar shape, validation, timestamp convention, and
+``underlying_quotes`` upsert as the live ingester
+(``src/ingestion/main_engine.py``), so a backfilled bar is indistinguishable
+from a streamed one. Idempotent on ``(symbol, timestamp)``.
+
+**Timestamps.** Bars are stamped on the bar's OWN minute
+(``bucket_timestamp(ts - 1s)``), matching the live ingester. TradeStation
+stamps a bar at its close, so before this normalisation a backfilled row sat
+one minute ahead of the streamed row for the same minute of market activity.
+If you backfilled a range BEFORE this was fixed, those rows are still a minute
+late — see the repair note in
+``docs/runbooks/es_nq_futures_rollout.md``.
 
 ``--symbols`` takes the canonical/DB symbols (``SPY``, ``SPX``, ``QQQ``,
 ``NDX``). Index symbols are resolved through ``SYMBOL_ALIASES`` for the
@@ -68,7 +77,8 @@ from zoneinfo import ZoneInfo
 
 from src.market_calendar import feed_session_window, load_nyse_holidays
 from src.symbols import resolve_symbol
-from src.validation import safe_datetime, safe_float
+from src.config import AGGREGATION_BUCKET_SECONDS
+from src.validation import bucket_timestamp, safe_datetime, safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +180,15 @@ def _bar_to_row(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ts = safe_datetime(raw.get("TimeStamp"), field_name="TimeStamp")  # type: ignore[arg-type]
     if ts is None:
         return None
+    # Stamp the bar on its OWN minute, the same expression main_engine.py uses
+    # and for the same reason. TradeStation stamps a bar at its CLOSE, so the
+    # raw value put a backfilled row one minute ahead of the streamed row for
+    # the same minute of market activity — two labels for one bar, and an
+    # off-by-one against anything that joins underlying_quotes on timestamp
+    # (the analytics option/underlying pairing, and the ES/NQ basis join).
+    # Without this the module docstring's claim that a backfilled bar is
+    # indistinguishable from a streamed one was simply false.
+    ts = bucket_timestamp(ts - timedelta(seconds=1), AGGREGATION_BUCKET_SECONDS)
     o = safe_float(raw.get("Open"), field_name="Open", default=None)
     h = safe_float(raw.get("High"), field_name="High", default=None)
     low = safe_float(raw.get("Low"), field_name="Low", default=None)

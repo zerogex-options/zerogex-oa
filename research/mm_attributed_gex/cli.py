@@ -1,0 +1,781 @@
+"""Command-line entry point for the MM-Attributed GEX experiment.
+
+Run from the repository root::
+
+    python -m research.mm_attributed_gex.cli <command> [options]
+
+Commands, in the order you would use them on real data::
+
+    inspect-cboe   read a delivered Cboe file and propose a column mapping
+    check-load     parse files with a profile and report what came through
+    reconstruct    build MM inventory and report completeness + reconciliation
+    build-dataset  produce the side-by-side existing-vs-MM research dataset
+    backtest       run the experiment battery over a dataset
+    report         render the research report from a backtest result
+    pipeline-check plumbing self-test on synthetic data (NOT a research result)
+
+Everything that touches the database is read-only.  No command writes to any
+production table.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+logger = logging.getLogger("mm_attributed_gex")
+
+
+def _add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--symbol", default="SPX", help="underlying (default: SPX)")
+    parser.add_argument(
+        "--profile",
+        default="cboe_open_close_v1",
+        help="built-in profile name or path to a saved JSON profile",
+    )
+    parser.add_argument(
+        "--allow-unconfirmed",
+        action="store_true",
+        help="parse with a profile that has not been confirmed against a real file "
+        "(exploratory only — results must not be reported)",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+
+
+def _load_profile(name: str):
+    from research.mm_attributed_gex.cboe.profiles import load_profile_file
+
+    return load_profile_file(name)
+
+
+@contextmanager
+def _phase(label: str):
+    """Time one stage and print how long it took.
+
+    A research sweep issues a handful of setup queries and then hundreds of
+    per-snapshot ones. When it stalls, "which of those was it?" is the entire
+    diagnosis, and without this the answer is a stack trace pointing at the
+    connection wrapper.
+    """
+    started = time.monotonic()
+    print(f"  [{label}] ...", flush=True)
+    try:
+        yield
+    finally:
+        print(f"  [{label}] {time.monotonic() - started:.1f}s", flush=True)
+
+
+def _parse_dt(text: str) -> datetime:
+    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# inspect-cboe
+# ---------------------------------------------------------------------------
+
+
+def cmd_inspect_cboe(args: argparse.Namespace) -> int:
+    from research.mm_attributed_gex.cboe.inspect import propose_profile, render_proposal
+    from research.mm_attributed_gex.cboe.profiles import save_profile_file
+
+    proposal = propose_profile(args.file, default_symbol=args.symbol)
+    print(render_proposal(proposal))
+    if proposal.profile and args.save:
+        path = save_profile_file(proposal.profile, args.save)
+        print(f"\nProposed profile written to {path}")
+        print(
+            "Review every mapping against the vendor's field documentation, then set "
+            '"confirmed": true in that file before using it for research.'
+        )
+    return 0 if proposal.usable else 2
+
+
+# ---------------------------------------------------------------------------
+# confirm-profile
+# ---------------------------------------------------------------------------
+
+
+def cmd_confirm_profile(args: argparse.Namespace) -> int:
+    """Flip a proposed profile to confirmed, after showing what is being confirmed.
+
+    The confirmation gate exists so a human checks the column mapping against
+    the vendor's field documentation before any result rests on it.  Leaving
+    that as "now hand-edit this JSON" was a mistake: a manual edit in the
+    middle of a command sequence is exactly the step that silently does not
+    happen, and the operator then hits a refusal they read as a bug.
+
+    So it is a command — but one that prints the full mapping and refuses
+    unless ``--reviewed`` is passed explicitly.  The deliberate act is
+    preserved; the silent omission is not possible.
+    """
+    from research.mm_attributed_gex.cboe.profiles import load_profile_file, save_profile_file
+
+    args.profile = getattr(args, "profile_path", None) or args.profile
+    profile = load_profile_file(args.profile)
+    already = profile.confirmed
+    if already:
+        # Still print the mapping. A bare "already confirmed" hides the case
+        # that matters: the profile was proposed from a DIFFERENT file than the
+        # one now being loaded. The name carries that provenance, so show it.
+        print(f"ALREADY CONFIRMED — {args.profile}")
+        print(
+            "If this was proposed from a different delivery than the files you are "
+            "about to load, re-run inspect-cboe on one of THOSE files first.\n"
+        )
+
+    print(f"Profile: {profile.name}   (layout: {profile.layout})")
+    print(f"File:    {args.profile}")
+    print("\nStructural columns:")
+    for label, column in (
+        ("symbol", profile.symbol_col),
+        ("option_root", profile.option_root_col),
+        ("trading_date", profile.trading_date_col),
+        ("interval_end", profile.interval_end_col),
+        ("expiration", profile.expiration_col),
+        ("strike", profile.strike_col),
+        ("option_type", profile.option_type_col),
+    ):
+        print(f"  {label:<14} <- {column}")
+    mm = profile.market_maker_columns()
+    print(f"\nMarket Maker volume columns ({len(mm)}):")
+    for vc in mm:
+        print(f"  {vc.column:<40} -> {vc.describe()}")
+    others = [vc for vc in profile.volume_columns if vc not in mm]
+    print(f"\nOther participant volume columns: {len(others)}")
+    print(f"Interval (bucket width):          {profile.interval.value}")
+    print(f"Strike scale:                     {profile.strike_scale}")
+
+    if already:
+        return 0
+
+    if not args.reviewed:
+        print(
+            "\nNOT CONFIRMED. Check every mapping above against the vendor's field\n"
+            "documentation (for Cboe, the Open-Close spec PDF from DataShop), then\n"
+            "re-run with --reviewed:\n"
+            f"    python -m research.mm_attributed_gex.cli confirm-profile "
+            f"{args.profile} --reviewed",
+            file=sys.stderr,
+        )
+        return 2
+
+    save_profile_file(profile.with_confirmed(True), args.profile)
+    print(f"\nCONFIRMED — {args.profile} is now usable for research.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# check-load
+# ---------------------------------------------------------------------------
+
+
+def cmd_check_load(args: argparse.Namespace) -> int:
+    from research.mm_attributed_gex.cboe.loader import LoadResult, load_paths
+
+    profile = _load_profile(args.profile)
+    result = LoadResult()
+    count = 0
+    sample: list[Any] = []
+    for rec in load_paths(
+        args.files, profile, allow_unconfirmed=args.allow_unconfirmed, result=result
+    ):
+        count += 1
+        if len(sample) < 5:
+            sample.append(rec)
+    print(json.dumps(result.as_dict(), indent=2))
+    print(f"\nrecords yielded: {count}")
+    if sample:
+        print("\nfirst records:")
+        for rec in sample:
+            print(
+                f"  {rec.trading_date} {rec.timestamp.isoformat()} "
+                f"{rec.symbol} {rec.expiration} {rec.strike:g}{rec.option_type} "
+                f"{rec.participant.value}/{rec.side.value}/{rec.position_effect.value} "
+                f"x{rec.contracts}"
+            )
+    if not result.mm_contracts_total:
+        print(
+            "\nNO Market Maker contracts were parsed. Either the file has no MM columns "
+            "or the profile does not map them — re-run inspect-cboe.",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# reconstruct
+# ---------------------------------------------------------------------------
+
+
+def cmd_reconstruct(args: argparse.Namespace) -> int:
+    from research.mm_attributed_gex.cboe.loader import load_paths
+    from research.mm_attributed_gex.inventory import InventoryReconstructor
+    from research.mm_attributed_gex import reconcile as reconcile_mod
+
+    profile = _load_profile(args.profile)
+    records = list(load_paths(args.files, profile, allow_unconfirmed=args.allow_unconfirmed))
+    if not records:
+        print("No records parsed; nothing to reconstruct.", file=sys.stderr)
+        return 2
+
+    listing_dates: dict = {}
+    observed_oi: dict = {}
+    if not args.no_db:
+        try:
+            from research.mm_attributed_gex.sources import (
+                fetch_open_interest_series,
+                fetch_series_listing_dates,
+                research_connection,
+            )
+
+            expirations = sorted({r.expiration for r in records})
+            sessions = sorted({r.trading_date for r in records})
+            with research_connection() as conn:
+                listing_dates = fetch_series_listing_dates(conn, args.symbol, expirations)
+                observed_oi = fetch_open_interest_series(
+                    conn, args.symbol, expirations, sessions[0], sessions[-1]
+                )
+            print(
+                f"listing dates resolved for {len(listing_dates)} series; "
+                f"{len(observed_oi)} open-interest observations loaded"
+            )
+        except Exception as exc:  # noqa: BLE001 - the DB is optional here
+            print(
+                f"proceeding without database evidence ({exc}); censoring falls back to "
+                "the window heuristic and the open-interest identity cannot be checked",
+                file=sys.stderr,
+            )
+
+    recon = InventoryReconstructor(symbol=args.symbol, listing_dates=listing_dates)
+    recon.consume(records).finalize()
+    summary = recon.summary()
+    reconciliation = reconcile_mod.summarize(records, observed_oi or None)
+
+    print(
+        json.dumps(
+            {"reconstruction": summary, "reconciliation": reconciliation.as_dict()},
+            indent=2,
+            default=str,
+        )
+    )
+    if args.out:
+        payload = {
+            "reconstruction": summary,
+            "reconciliation": reconciliation.as_dict(),
+            "positions": [p.as_dict() for p in recon.positions()],
+        }
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        print(f"\nwritten to {args.out}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# build-dataset
+# ---------------------------------------------------------------------------
+
+
+def cmd_build_dataset(args: argparse.Namespace) -> int:
+    from research.mm_attributed_gex.cboe.loader import load_paths
+    from research.mm_attributed_gex.dataset import (
+        DatasetSpec,
+        build_dataset,
+        write_csv,
+        write_jsonl,
+    )
+    from research.mm_attributed_gex.sources import (
+        fetch_chain_snapshot,
+        fetch_composite_scores,
+        fetch_production_summaries,
+        fetch_series_listing_dates,
+        fetch_snapshot_timestamps,
+        fetch_underlying_bars,
+        fetch_vix_closes,
+        research_connection,
+    )
+
+    profile = _load_profile(args.profile)
+    files = list(args.files)
+
+    def records_factory():
+        return load_paths(files, profile, allow_unconfirmed=args.allow_unconfirmed)
+
+    start = _parse_dt(args.start)
+    end = _parse_dt(args.end)
+
+    with research_connection() as conn:
+        with _phase("snapshot timestamps"):
+            stamps = fetch_snapshot_timestamps(
+                conn, args.symbol, start, end, step_minutes=args.step_minutes
+            )
+        if not stamps:
+            print(
+                f"No gex_summary timestamps for {args.symbol} in "
+                f"[{args.start}, {args.end}] — nothing to compare against.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"{len(stamps)} snapshot timestamps")
+
+        with _phase("production summaries"):
+            summaries = fetch_production_summaries(conn, args.symbol, start, end)
+        with _phase("composite scores"):
+            composites = fetch_composite_scores(conn, args.symbol, start, end)
+        with _phase("underlying bars"):
+            bars = fetch_underlying_bars(conn, args.symbol, start, end)
+        with _phase("vix"):
+            vix = dict(fetch_vix_closes(conn, start, end))
+        with _phase("parse open-close files"):
+            expirations = sorted({r.expiration for r in records_factory()})
+        with _phase(f"listing dates ({len(expirations)} expirations)"):
+            # Bounded scan. Unbounded, this aggregates the whole retained
+            # history of option_chains for these expirations and blows past any
+            # statement timeout. See fetch_series_listing_dates for why the
+            # bound cannot simply be the study window.
+            listing_dates = fetch_series_listing_dates(
+                conn,
+                args.symbol,
+                expirations,
+                since=start - timedelta(days=args.listing_lookback_days),
+            )
+        print(
+            f"  listing dates established for {len(listing_dates)} series "
+            f"(the rest fall back to the window heuristic)"
+        )
+
+        spot_by_ts = {ts: close for ts, _o, _h, _l, close in bars}
+        sorted_bar_ts = sorted(spot_by_ts)
+
+        def spot_provider(ts: datetime) -> Optional[float]:
+            import bisect
+
+            i = bisect.bisect_right(sorted_bar_ts, ts) - 1
+            if i < 0:
+                return None
+            found = sorted_bar_ts[i]
+            if (ts - found) > timedelta(minutes=15):
+                return None
+            return spot_by_ts[found]
+
+        chain_cache: dict[datetime, list] = {}
+
+        def chain_provider(ts: datetime):
+            cached = chain_cache.get(ts)
+            if cached is None:
+                cached = fetch_chain_snapshot(
+                    conn, args.symbol, ts, lookback_hours=args.chain_lookback_hours
+                )
+                chain_cache[ts] = cached
+            return cached
+
+        def summary_provider(ts: datetime):
+            return summaries.get(ts)
+
+        def composite_provider(ts: datetime):
+            return composites.get(ts)
+
+        sorted_vix = sorted(vix)
+
+        def vix_provider(ts: datetime) -> Optional[float]:
+            import bisect
+
+            i = bisect.bisect_right(sorted_vix, ts) - 1
+            return vix[sorted_vix[i]] if i >= 0 else None
+
+        spec = DatasetSpec(
+            symbol=args.symbol,
+            headline_universe=args.headline_universe,
+            clean_only=not args.include_censored,
+            apply_horizon_weighting=not args.raw_positioning,
+            use_net_flow_estimator=args.net_flow_estimator,
+        )
+
+        build_started = time.monotonic()
+
+        def progress(done: int, total: int) -> None:
+            if done % 25 == 0 or done == total:
+                elapsed = time.monotonic() - build_started
+                rate = done / elapsed if elapsed > 0 else 0.0
+                remaining = (total - done) / rate if rate > 0 else 0.0
+                print(
+                    f"  {done}/{total} snapshots  ({elapsed:.0f}s elapsed, "
+                    f"{rate:.1f}/s, ~{remaining:.0f}s left)",
+                    flush=True,
+                )
+
+        rows, provenance = build_dataset(
+            records_factory,
+            stamps,
+            chain_provider,
+            spot_provider,
+            spec=spec,
+            summary_provider=summary_provider,
+            composite_provider=composite_provider,
+            vix_provider=vix_provider,
+            listing_dates=listing_dates,
+            progress=progress,
+        )
+
+    out = Path(args.out)
+    write_jsonl(rows, out)
+    write_csv(rows, out.with_suffix(".csv"))
+    out.with_name(out.stem + "_provenance.json").write_text(
+        json.dumps(provenance, indent=2, default=str), encoding="utf-8"
+    )
+    print(json.dumps(provenance, indent=2, default=str))
+    print(f"\n{len(rows)} rows -> {out} (+ .csv, + _provenance.json)")
+
+    # The provenance block carries the answer, but it is long and the numbers
+    # that invalidate a run sit in the middle of it.  Say them out loud.
+    recon = provenance.get("reconstruction") or {}
+    completeness = provenance.get("data_completeness") or 0.0
+    gaps = recon.get("session_gap_count") or 0
+    if completeness < 0.9 or gaps > 2:
+        print(
+            f"\n⚠  DATA COMPLETENESS {completeness:.1%} — {gaps} expected trading "
+            f"session(s) missing between {recon.get('window_start')} and "
+            f"{recon.get('window_end')}.\n"
+            "   The Open-Close files cover a window with holes in it. Usually this "
+            "means\n"
+            "   files from two different deliveries are sitting in the same "
+            "directory, or\n"
+            "   the delivery itself is missing days. Check the input directory "
+            "before\n"
+            "   reading anything downstream — a reconstruction across a gap carries "
+            "an\n"
+            "   inventory it never saw traded.",
+            file=sys.stderr,
+        )
+    return 0 if rows else 2
+
+
+# ---------------------------------------------------------------------------
+# backtest
+# ---------------------------------------------------------------------------
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    from research.mm_attributed_gex.backtest import ExperimentConfig, run_experiment
+    from research.mm_attributed_gex.dataset import read_jsonl
+    from research.mm_attributed_gex.outcomes import Bar, BarSeries
+    from research.mm_attributed_gex.report import write_report
+    from research.mm_attributed_gex.sources import fetch_underlying_bars, research_connection
+
+    rows = read_jsonl(args.dataset)
+    if not rows:
+        print(f"{args.dataset} is empty", file=sys.stderr)
+        return 2
+    stamps = [datetime.fromisoformat(r["timestamp"]) for r in rows]
+    start, end = min(stamps) - timedelta(days=1), max(stamps) + timedelta(days=3)
+
+    with research_connection() as conn:
+        raw_bars = fetch_underlying_bars(conn, args.symbol, start, end)
+    series = BarSeries([Bar(ts, o, h, low, c) for ts, o, h, low, c in raw_bars])
+    print(f"{len(series)} underlying bars loaded")
+
+    provenance_path = Path(args.dataset).with_name(Path(args.dataset).stem + "_provenance.json")
+    provenance = (
+        json.loads(provenance_path.read_text(encoding="utf-8"))
+        if provenance_path.exists()
+        else None
+    )
+
+    config = ExperimentConfig(
+        horizons=tuple(int(h) for h in args.horizons.split(",")),
+        n_boot=args.n_boot,
+    )
+    result = run_experiment(rows, series, config=config, sampling_minutes=args.step_minutes)
+    path = write_report(result, args.out, provenance=provenance)
+    print(f"\nreport -> {path}\nresult  -> {path.with_suffix('.json')}")
+    from research.mm_attributed_gex.report import decide
+
+    verdict = decide(result)
+    print(f"\nVERDICT: {verdict.label}")
+    for reason in verdict.rationale:
+        print(f"  - {reason}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    from research.mm_attributed_gex.backtest import ExperimentResult
+    from research.mm_attributed_gex.report import render_markdown
+
+    payload = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    raw = payload.get("result", payload)
+    result = ExperimentResult(
+        **{k: v for k, v in raw.items() if k in ExperimentResult.__annotations__}
+    )
+    text = render_markdown(
+        result,
+        provenance=payload.get("provenance"),
+        reconciliation=payload.get("reconciliation"),
+    )
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"report -> {args.out}")
+    else:
+        print(text)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# make-sample
+# ---------------------------------------------------------------------------
+
+
+def cmd_make_sample(args: argparse.Namespace) -> int:
+    """Write a synthetic Open-Close file set so the workflow can be rehearsed.
+
+    Invented column names, random numbers. It exists so an operator can see
+    what every command prints before buying anything — never as data.
+    """
+    from research.mm_attributed_gex.sample import write_sample_files
+
+    anchor = None
+    if args.anchor_to_db:
+        from research.mm_attributed_gex.sources import fetch_sample_anchor, research_connection
+
+        with research_connection() as conn:
+            anchor = fetch_sample_anchor(conn, args.symbol, days=args.sessions)
+        if anchor is None:
+            print(
+                f"No {args.symbol} analytics rows found to anchor to. Either the "
+                "database has no recent gex_summary/option_chains data, or the "
+                "symbol is wrong. Falling back is not useful here — an unanchored "
+                "sample cannot exercise the dataset step.",
+                file=sys.stderr,
+            )
+            return 2
+        print("Anchored to real contracts from the database:")
+        print(json.dumps(anchor.as_dict(), indent=2, default=str))
+        print()
+
+    paths = write_sample_files(
+        args.out,
+        n_sessions=args.sessions,
+        interval_minutes=args.interval_minutes,
+        sessions=anchor.sessions if anchor else None,
+        expirations=anchor.expirations if anchor else None,
+        strikes=anchor.strikes if anchor else None,
+        symbol=anchor.symbol if anchor else args.symbol,
+    )
+    print(f"wrote {len(paths)} synthetic session files to {args.out}/")
+    for path in paths:
+        print(f"  {path}  ({path.stat().st_size:,} bytes)")
+    # The paths printed here match the Makefile's MMGEX_PROFILE default, so
+    # following the `make` route and the `python -m` route land on the same
+    # profile file instead of quietly diverging.
+    profile_path = "research_output/cboe_profile.json"
+    print(
+        (
+            "\nANCHORED TO REAL CONTRACTS — the series, sessions and the market data\n"
+            "around them are real; the Market Maker FLOW over them is invented. Every\n"
+            "MM-attributed number downstream is therefore meaningless. This exists to\n"
+            "shake out the database queries and the report render, nothing else.\n"
+            if args.anchor_to_db
+            else ""
+        )
+        + "\nSYNTHETIC — invented column names, random numbers. A real Cboe header\n"
+        "will differ, which is why inspect-cboe proposes a mapping instead of\n"
+        "assuming one. Nothing computed from these files is a finding.\n"
+        "\nRehearse the workflow (or use the make targets: mmgex-inspect,\n"
+        "mmgex-confirm, mmgex-check-load, mmgex-reconstruct):\n"
+        f"  python -m research.mm_attributed_gex.cli inspect-cboe {paths[0]} "
+        f"--save {profile_path}\n"
+        f"  python -m research.mm_attributed_gex.cli confirm-profile {profile_path} "
+        "--reviewed\n"
+        f"  python -m research.mm_attributed_gex.cli check-load {args.out}/ "
+        f"--profile {profile_path}\n"
+        f"  python -m research.mm_attributed_gex.cli reconstruct {args.out}/ "
+        f"--profile {profile_path} --no-db"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# pipeline-check
+# ---------------------------------------------------------------------------
+
+
+def cmd_pipeline_check(args: argparse.Namespace) -> int:
+    """End-to-end plumbing check on synthetic data.
+
+    This proves the pipeline runs and the layers fit together.  It says
+    NOTHING about whether MM-attributed GEX works — the inputs are invented.
+    The output is labelled accordingly and must never be quoted as a result.
+    """
+    from research.mm_attributed_gex.selftest import run_pipeline_check
+
+    payload = run_pipeline_check(symbol=args.symbol)
+    print(json.dumps(payload, indent=2, default=str))
+    print(
+        "\nPLUMBING CHECK ONLY — inputs are synthetic. This is not evidence "
+        "about the methodology's value."
+    )
+    return 0 if payload.get("ok") else 1
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m research.mm_attributed_gex.cli",
+        description="Market-Maker Attributed GEX research experiment (research-only).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("inspect-cboe", help="propose a column mapping from a real file")
+    p.add_argument("file")
+    p.add_argument("--save", help="write the proposed profile to this JSON path")
+    _add_common(p)
+    p.set_defaults(func=cmd_inspect_cboe)
+
+    p = sub.add_parser(
+        "confirm-profile",
+        help="review a proposed column mapping and mark it confirmed",
+    )
+    p.add_argument("profile_path", nargs="?", help="path to the profile JSON")
+    p.add_argument(
+        "--reviewed",
+        action="store_true",
+        help="you have checked every mapping against the vendor's field documentation",
+    )
+    _add_common(p)
+    p.set_defaults(func=cmd_confirm_profile)
+
+    p = sub.add_parser("check-load", help="parse files and report what came through")
+    p.add_argument("files", nargs="+")
+    _add_common(p)
+    p.set_defaults(func=cmd_check_load)
+
+    p = sub.add_parser("reconstruct", help="build MM inventory and report completeness")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--out", help="write full positions JSON here")
+    p.add_argument("--no-db", action="store_true", help="skip database evidence")
+    _add_common(p)
+    p.set_defaults(func=cmd_reconstruct)
+
+    p = sub.add_parser("build-dataset", help="produce the side-by-side research dataset")
+    p.add_argument("files", nargs="+", help="Cboe Open-Close files or directories")
+    p.add_argument("--start", required=True, help="ISO start timestamp")
+    p.add_argument("--end", required=True, help="ISO end timestamp")
+    p.add_argument("--out", default="research_output/mm_attributed_dataset.jsonl")
+    p.add_argument(
+        "--step-minutes",
+        type=int,
+        default=15,
+        help="thin the snapshot grid. Each snapshot re-prices the whole chain twice, "
+        "so this is the main cost dial; start coarse (30-60) on a first pass",
+    )
+    p.add_argument(
+        "--chain-lookback-hours",
+        type=float,
+        default=0.5,
+        help="how far back each snapshot looks for the latest quote per contract. "
+        "Widen only for windows spanning a market closure",
+    )
+    p.add_argument(
+        "--listing-lookback-days",
+        type=int,
+        default=120,
+        help="how far before the study window to scan for each contract's first "
+        "appearance. Longer is better evidence but a more expensive query",
+    )
+    p.add_argument("--headline-universe", default="near_term")
+    p.add_argument(
+        "--include-censored",
+        action="store_true",
+        help="include left-censored series in the headline numbers (partial-data arm)",
+    )
+    p.add_argument(
+        "--raw-positioning",
+        action="store_true",
+        help="drop ZeroGEX's horizon-occupancy weighting (raw MM positioning arm)",
+    )
+    p.add_argument(
+        "--net-flow-estimator",
+        action="store_true",
+        help="use buys−sells ignoring the open/close flag",
+    )
+    _add_common(p)
+    p.set_defaults(func=cmd_build_dataset)
+
+    p = sub.add_parser("backtest", help="run the experiment battery over a dataset")
+    p.add_argument("dataset")
+    p.add_argument("--out", default="research_output/mm_attributed_report.md")
+    p.add_argument("--horizons", default="5,15,30,60")
+    p.add_argument("--step-minutes", type=int, default=5)
+    p.add_argument("--n-boot", type=int, default=2000)
+    _add_common(p)
+    p.set_defaults(func=cmd_backtest)
+
+    p = sub.add_parser("report", help="render a report from a saved result JSON")
+    p.add_argument("result")
+    p.add_argument("--out")
+    _add_common(p)
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser(
+        "make-sample",
+        help="write a SYNTHETIC Open-Close file set to rehearse the workflow (not data)",
+    )
+    p.add_argument("--out", default="research_output/sample")
+    p.add_argument("--sessions", type=int, default=5)
+    p.add_argument("--interval-minutes", type=int, default=10)
+    p.add_argument(
+        "--anchor-to-db",
+        action="store_true",
+        help="generate the synthetic flow over REAL contracts from the database, so "
+        "build-dataset and backtest can be rehearsed too (read-only; flow is still invented)",
+    )
+    _add_common(p)
+    p.set_defaults(func=cmd_make_sample)
+
+    p = sub.add_parser("pipeline-check", help="synthetic end-to-end plumbing check")
+    _add_common(p)
+    p.set_defaults(func=cmd_pipeline_check)
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+    # The production analytics kernels log one INFO line per resolved gamma
+    # flip. That is right for a once-a-minute service and useless here, where
+    # the same kernel runs thousands of times per research run. Raising the
+    # level on
+    # THIS process's logger changes no production configuration.
+    if not getattr(args, "verbose", False):
+        logging.getLogger("src.analytics.main_engine").setLevel(logging.WARNING)
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:  # pragma: no cover
+        return 130
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        logger.error("%s", exc, exc_info=getattr(args, "verbose", False))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -4,6 +4,23 @@ Complete reference for all currently available API endpoints.
 
 Base URL: `http://your-server:8000`
 
+**Two versions are served.** New integrations should build on **v2**; v1 is
+unchanged and stays supported.
+
+| | Path | Response shape |
+| --- | --- | --- |
+| **v2** (recommended) | `/api/v2/...` | `{"data": <v1 body>, "freshness": {...}}` |
+| **v1** (stable) | `/api/...`, `/api/v1/levels/...` | the bare body |
+
+Every v2 response carries a **freshness envelope** that separates endpoint
+health, response evaluation time, and underlying data age into distinct
+machine-readable fields. See
+[API versions & the freshness envelope](#api-versions--the-freshness-envelope).
+
+Endpoints below are documented at their v1 paths. To call any of them on
+v2, replace the leading `/api` (or `/api/v1`) with `/api/v2` and read the
+payload from `data`.
+
 ---
 
 ## Authentication
@@ -175,7 +192,183 @@ BFF and **withheld from every external customer** — the derived scopes are
 broadly redistributable, raw upstream market data is not. A third-party
 charting integration is issued an **`analytics`-tier key**.
 
-## Data freshness & update cadence
+## API versions & the freshness envelope
+
+### Why v2 exists
+
+v1 answers "what is the data" but leaves "how current is it" to be
+inferred from whichever `timestamp`-shaped field an endpoint happened to
+carry — and those fields mean different things on different endpoints. A
+consumer could not distinguish, from a v1 response alone:
+
+* the API answered promptly but the feed behind it is stalled, from
+* the API answered promptly and the market is simply closed, from
+* the data is genuinely current.
+
+**v2 makes those separate, machine-readable facts on every endpoint.** It
+is not a rewrite: `data` is byte-for-byte the v1 body, including every
+event timestamp v1 already carried. Migrating is "unwrap `data`".
+
+```
+GET /api/v2/levels/SPY
+
+{
+  "data": { ...exactly the /api/v1/levels/SPY body... },
+  "freshness": {
+    "evaluated_at": "2026-08-20T14:32:07.881Z",
+    "generated_at": "2026-08-20T14:31:42.010Z",
+    "source_timestamp": "2026-08-20T14:31:38.500Z",
+    "latest_event_at": "2026-08-20T14:31:38.500Z",
+    "age_seconds": 29.381,
+    "market_session_status": "regular",
+    "expected_update_cadence": "PT1M",
+    "expected_update_cadence_seconds": 60.0,
+    "cadence_profile": "analytics_cycle",
+    "stale_after": "2026-08-20T14:34:08.500Z",
+    "freshness_status": "fresh"
+  }
+}
+```
+
+### Envelope fields
+
+| Field | Concept | Meaning |
+| --- | --- | --- |
+| `evaluated_at` | **endpoint health** | When the API evaluated *this response*. Advances on every request even when the data is frozen — so "the API is answering" is observable independently of "the data is moving". Always present. |
+| `generated_at` | **compute time** | When the served data was computed. The snapshot's own stamp for cycle-backed endpoints; equal to `evaluated_at` for endpoints computed on demand. |
+| `source_timestamp` | **data freshness** | The upstream market observation the payload derives from. This is what `freshness_status` is measured against. |
+| `latest_event_at` | **data freshness** | Newest event timestamp in the payload (last bar, last trade, last scored row). Usually equals `source_timestamp` for a single snapshot; for a series it is the last row. |
+| `age_seconds` | derived | `evaluated_at − source_timestamp`. |
+| `market_session_status` | **context** | `pre-market` \| `regular` \| `after-hours` \| `closed` (US/Eastern). Same vocabulary as the `session` field on `/api/market/quote`. |
+| `expected_update_cadence` | **contract** | ISO-8601 duration for how often this endpoint's data is expected to change **right now**. `null` means no update is due. |
+| `expected_update_cadence_seconds` | **contract** | The same value as a number, so clients need no duration parser. |
+| `cadence_profile` | **contract** | The cadence class this endpoint belongs to (table below). Stable across releases; the seconds behind it may be retuned. |
+| `stale_after` | **contract** | The instant after which this payload should be treated as stale. Published so you set a timer instead of guessing a threshold. `null` when no update is due. |
+| `freshness_status` | **verdict** | The rolled-up read (below). |
+
+Every field is present on every v2 response — v2 never omits a
+null-valued key, so you can index the envelope unconditionally.
+
+### `freshness_status`
+
+| Value | Meaning | Should you alert? |
+| --- | --- | --- |
+| `fresh` | `source_timestamp` is within one expected cadence. | No |
+| `aging` | Past one cadence, not yet past `stale_after` — the grace band absorbing normal cycle jitter. Seen routinely when you poll faster than the cadence. | No |
+| `stale` | Past `stale_after` **while an update was due**. The feed behind this endpoint is late. | **Yes** |
+| `session_closed` | A feed-backed endpoint whose feed is not due to produce anything: a weekend, an NYSE holiday, an early-close afternoon, or the overnight gap (ingestion runs 04:00–20:00 ET). The payload is the last good value. | No |
+| `static` | Not feed-backed at all: completed history, or a result computed from your own inputs. Age carries no health meaning. | No |
+| `unknown` | No source timestamp could be resolved (an empty result set, a pure calculator). Fall back to `evaluated_at` for health; make no claim about data age. | No |
+
+The `session_closed` / `stale` split is the point of carrying
+`market_session_status`: an overnight consumer polling a closed market is
+not observing a fault, and a flat "data is 14 hours old" would page every
+weekend.
+
+### Cadence profiles
+
+Cadence is **session-dependent**. `expected_update_cadence` already
+reflects the current session, so prefer reading it over hard-coding from
+this table. Weekends and NYSE holidays always report `null` — nothing
+upstream can change.
+
+| Profile | Endpoints | Regular | Extended | Overnight |
+| --- | --- | --- | --- | --- |
+| `realtime_quote` | `/api/market/*`, `/api/option/*` | 5 s | 30 s | — |
+| `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
+| `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
+| `signals_cycle` | `/api/signals/*`, `/api/tradeworkz/*` | 15 s | 60 s | — |
+| `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
+| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical` | — | — | — |
+| `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
+
+A dash means no update is expected, which surfaces as
+`freshness_status: session_closed` (feed-backed profiles) or `static`
+(the rest).
+
+**Every feed-derived profile reports no cadence overnight.** Ingestion runs
+04:00–20:00 ET; between 20:00 and 04:00 the analytics engine may still tick
+but it recomputes the same 20:00 observation, so an ageing payload there is
+correct rather than late. The same holds on weekends, NYSE holidays, and
+after the 13:00 ET close on an early-close day.
+
+`daily_cycle` endpoints age in **trading sessions, not wall-clock hours**:
+Friday's session close is the correct answer all through Monday morning, and
+`stale_after` lands after the *next* session's artifact is due.
+
+Source of truth: `ENDPOINT_CADENCE` and the `CadenceProfile` definitions in
+`src/api/freshness.py`. Cadence numbers are read from the same config
+constants the engines run on (`ANALYTICS_INTERVAL`,
+`MARKET_HOURS_POLL_INTERVAL`, `AGGREGATION_BUCKET_SECONDS`), so retuning a
+poll interval changes what the envelope advertises.
+
+### Calendar configuration
+
+`NYSE_HOLIDAYS` and `NYSE_HALF_DAYS` (both comma-separated ISO dates, both
+honouring `NYSE_HOLIDAYS_STRICT`) drive the session model. An unset
+`NYSE_HALF_DAYS` means early closes are graded as full sessions, which
+reports `stale` for the three hours after a 13:00 ET close — keep it
+populated.
+
+### Response headers
+
+Every v2 response also carries the envelope as headers, so a proxy, CDN or
+uptime monitor can act on staleness without parsing a body:
+
+```
+X-Freshness-Status: fresh
+X-Freshness-Evaluated-At: 2026-08-20T14:32:07.881+00:00
+X-Freshness-Source-Timestamp: 2026-08-20T14:31:38.500+00:00
+X-Freshness-Age-Seconds: 29.381
+X-Freshness-Stale-After: 2026-08-20T14:34:08.500+00:00
+X-Freshness-Expected-Cadence: PT1M
+X-Freshness-Cadence-Profile: analytics_cycle
+X-Market-Session: regular
+```
+
+### Migrating from v1
+
+1. Change the path: `/api/gex/summary` → `/api/v2/gex/summary`;
+   `/api/v1/levels/SPY` → `/api/v2/levels/SPY`. One version segment,
+   always in the same position.
+2. Read your existing payload from `data` — unchanged, field for field.
+3. Optionally drop your own staleness heuristics in favour of
+   `freshness_status` / `stale_after`.
+
+Auth, scopes, tiers and rate limits are **identical** on both versions: a
+v2 route carries exactly the scope gate of the v1 route it mirrors, and the
+no-auth health probes are public on both.
+
+> **Before proxying v2 through the website BFF.** The consumer tier gate in
+> `zerogex-web` (`core/api/apiTierGate.ts`) matches literal `/api/...`
+> prefixes and is deliberately **fail-open**, and FastAPI enforces no
+> per-member entitlement — that gate is the entire browser paywall. A
+> `/api/v2/[...rest]` proxy added before the gate normalizes the version
+> segment would leave every premium prefix unmatched, and therefore
+> ungated. Normalize `^/api/v\d+/` to `/api/` there first.
+
+`data` is serialized with **whichever encoder v1 used for that route**, so
+numeric types and timestamp formats inside `data` are identical to v1 —
+`Decimal` stays a JSON number, and a route that emitted `+00:00` still
+emits `+00:00`. The `freshness` block always uses the same ISO-8601 `Z`
+form on every route, so you parse one format for it regardless of endpoint.
+
+Deliberate v1 → v2 differences:
+
+* **No key is omitted.** v1's `/api/market/quote` drops null fields; v2
+  always emits every declared field, on both `data` and `freshness`.
+* **CSV downloads are not wrapped.** `/api/v2/backtest/runs/{id}/trades.csv`
+  and the TradeWorkz audit export stream CSV unchanged; their freshness
+  data arrives in the `X-Freshness-*` headers.
+* **Errors are not wrapped.** A v2 error is a v1 error — same status, same
+  `{"detail": ...}` body. You do not need a second error parser.
+* **Control-plane surfaces are not mirrored.** `/api/admin/*`,
+  `/api/tradeworkz/admin/*` (operator-only) and
+  `/api/tradeworkz/internal/*` (drained by a systemd timer) stay v1 —
+  they mutate state, no customer versions against them, and "how fresh is
+  this data" is meaningless for them.
+
+### Update cadence (background)
 
 The derived analytics (GEX, walls, flip, max pain, per-strike profile) are
 recomputed on the **~60-second analytics cycle** and served from a short
@@ -183,7 +376,8 @@ TTL cache (GEX summary ~1.5 s; by-strike / profile ~5 s). This is
 **snapshot-poll, not a stream** — clients re-issue the GET at whatever
 cadence they want (1–5 s is effectively free against the cache). The only
 realtime push channel, `WS /ws`, carries **underlying quotes only**; it
-does not carry GEX / wall / flip.
+does not carry GEX / wall / flip. The WebSocket is not mirrored on v2:
+each pushed message carries its own stamp.
 
 Levels and summary responses carry the snapshot time so a consumer can
 reason about staleness; `/api/v1/levels` additionally returns

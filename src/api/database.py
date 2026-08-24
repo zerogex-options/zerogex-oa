@@ -9,7 +9,7 @@ import os
 import time as time_module
 import traceback
 from collections import OrderedDict
-from typing import Awaitable, Callable, List, Dict, Optional, Any, Tuple, Iterable
+from typing import Awaitable, Callable, List, Dict, Mapping, Optional, Any, Tuple, Iterable
 from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
@@ -527,6 +527,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
             "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
         )
+        # index<->future carry ratio (src/jobs/futures_projection.py). Moves on
+        # the order of a point a day, so it is cached far longer than a quote;
+        # every ES/NQ request resolves it, hence caching it at all.
+        self._futures_basis_cache_ttl_seconds: float = _getenv_float(
+            "FUTURES_BASIS_CACHE_TTL_SECONDS", 60.0
+        )
         # TTL for analytics-derived endpoints (gex_by_strike, gex_walls, etc.)
         # that only change on the analytics cycle (~60s). A moderate TTL
         # eliminates redundant DB round-trips from rapid frontend polling.
@@ -852,9 +858,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # operator who already tuned DB_POOL_MAX higher keeps it, but the
         # request pool is never floored back down to the tiny background size.
         min_size = _getenv_int("API_DB_POOL_MIN", _getenv_int("DB_POOL_MIN", 1))
-        max_size = _getenv_int(
-            "API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12)
-        )
+        max_size = _getenv_int("API_DB_POOL_MAX", max(_getenv_int("DB_POOL_MAX", 12), 12))
         statement_timeout_ms = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
@@ -1067,6 +1071,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         (``/api/health/live``) is DB-free and never reaches this path.
         """
         try:
+
             async def _probe() -> None:
                 async with self._acquire_connection() as conn:
                     await conn.fetchval("SELECT 1")
@@ -2432,6 +2437,289 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             return []
 
+    async def get_gex_chain_at_ts(
+        self,
+        symbol: str,
+        at_ts: datetime,
+        max_rows: int = 6000,
+    ) -> Dict[str, Any]:
+        """The WHOLE per-(strike, expiration) chain at one historical minute.
+
+        Distinct from :meth:`get_gex_by_strike_at_ts`, which returns the N
+        strikes nearest spot for a chart.  The Gamma Regime Shift needs every
+        row for two reasons the truncated read cannot serve:
+
+        * the expiry roll-off is a sum over ALL expirations, and a
+          nearest-to-spot cut silently drops the far-OTM tail that makes a
+          tranche large;
+        * a day-over-day diff must see the same universe on both sides, and
+          "nearest 60 to spot" is a *different* universe once spot has moved.
+
+        ``max_rows`` is a runaway guard, not a view: a normal chain is
+        ~40-60 strikes x ~10-25 expirations.  Rows come back ordered so a
+        truncated read is still expiration-complete for the near dates.
+
+        Returns ``{"timestamp", "spot", "rows"}``; ``rows`` is empty when the
+        symbol has no snapshot at or before ``at_ts``.
+
+        Cached and single-flighted, on the pattern the strike-profile read
+        established after the Aug-21 stampede (see
+        docs/runbooks/strike_profile_timeseries_stampede.md).  This one is a
+        smaller query, but it is called THREE times per Gamma Shift page view
+        (the regime-shift card reads two snapshots, the roll-off panel a
+        third) by every viewer on a poll — so uncoalesced it reproduces the
+        same shape of duplicate concurrent work on a new endpoint.
+
+        The cache key floors ``at_ts`` to the minute.  That is what makes the
+        guard effective at all: live callers pass ``datetime.now()``, which is
+        unique per request and would key every caller separately, so nothing
+        would ever share.  Flooring is well-matched to the data — ``gex_summary``
+        is written per minute and the query anchors at-or-before — and the
+        payload carries the resolved ``timestamp``, so a caller always knows
+        exactly which frame it got rather than being silently handed a stale
+        one.  Historical anchors (the "vs yesterday" A-snapshot every viewer
+        reads identically) are already minute-stable and cache outright.
+        """
+        symbol = symbol.upper()
+        max_rows = int(max_rows)
+        cache_key = (
+            f"gex_chain_at_ts:{symbol}:"
+            f"{at_ts.replace(second=0, microsecond=0).isoformat()}:{max_rows}"
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+        return await self._single_flight(
+            cache_key,
+            lambda: self._fetch_gex_chain_at_ts(symbol, at_ts, max_rows, cache_key),
+        )
+
+    async def _fetch_gex_chain_at_ts(
+        self,
+        symbol: str,
+        at_ts: datetime,
+        max_rows: int,
+        cache_key: str,
+    ) -> Dict[str, Any]:
+        """The uncoalesced read behind :meth:`get_gex_chain_at_ts`.
+
+        Split out so the guard wraps exactly one producer.  A failed or empty
+        read is deliberately NOT cached: a transient timeout must not pin an
+        empty chain for the whole TTL, which would turn one slow query into a
+        blank card for every viewer — the failure mode the runbook describes.
+        """
+        query = """
+            WITH anchor AS (
+                SELECT timestamp
+                FROM gex_summary
+                WHERE underlying = $1
+                  AND timestamp <= $2
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            anchor_spot AS (
+                SELECT
+                    a.timestamp,
+                    (SELECT uq.close
+                       FROM underlying_quotes uq
+                      WHERE uq.symbol = $1
+                        AND uq.timestamp <= a.timestamp
+                      ORDER BY uq.timestamp DESC
+                      LIMIT 1) AS spot_price
+                FROM anchor a
+            )
+            SELECT
+                a.timestamp,
+                a.spot_price,
+                g.strike,
+                g.expiration,
+                g.call_oi,
+                g.put_oi,
+                -- Canonical dollar GEX per 1% (γ × OI × 100 × S² × 0.01),
+                -- evaluated at the ANCHOR's spot so the numbers match every
+                -- other surface rendered for that minute.
+                (g.call_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS call_gex,
+                (-1 * g.put_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS put_gex,
+                ((g.call_gamma - g.put_gamma) * 100 * a.spot_price * a.spot_price * 0.01) AS net_gex
+            FROM gex_by_strike g
+            CROSS JOIN anchor_spot a
+            WHERE g.underlying = $1
+              AND g.timestamp = a.timestamp
+            ORDER BY g.expiration ASC, g.strike ASC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, at_ts, max_rows)
+        except Exception as e:
+            logger.warning("get_gex_chain_at_ts(%s, %s) failed: %s", symbol, at_ts, e)
+            return {"timestamp": None, "spot": None, "rows": []}
+
+        if not rows:
+            return {"timestamp": None, "spot": None, "rows": []}
+        first = rows[0]
+        payload = {
+            "timestamp": first["timestamp"],
+            "spot": float(first["spot_price"]) if first["spot_price"] is not None else None,
+            "rows": [dict(r) for r in rows],
+        }
+        # NOTE on sizing: _cache_weight only walks lists/tuples, so this dict
+        # payload counts as one unit however many rows it holds — it does not
+        # pay its true weight against the shared unit budget.  What bounds it
+        # instead is the TTL: at ANALYTICS_CACHE_TTL_SECONDS (5s default) an
+        # entry lives seconds, and the key space is (symbol x minute), so only
+        # a handful are ever live at once.  Worth knowing if this TTL is ever
+        # raised substantially — then the payload should be weighed properly
+        # rather than leaning on expiry.
+        self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+        return payload
+
+    async def get_regime_sessions(
+        self,
+        symbol: str,
+        limit: int = 60,
+        before_date: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Stored per-session regime reads, most recent first.
+
+        Serves both the history strip and the z-score denominator, so it is
+        deliberately un-cached at the DatabaseManager layer: the current
+        session's row is rewritten through the day and a stale window would
+        pin the normalization to whatever it looked like minutes ago.
+
+        ``before_date`` excludes that in-progress row when the caller is
+        building a *trailing* distribution — a session must not normalize
+        against itself.
+        """
+        symbol = symbol.upper()
+        if before_date is not None:
+            query = """
+                SELECT * FROM gex_regime_session
+                WHERE underlying = $1 AND session_date < $2
+                ORDER BY session_date DESC
+                LIMIT $3
+            """
+            args: tuple[Any, ...] = (symbol, before_date, int(limit))
+        else:
+            query = """
+                SELECT * FROM gex_regime_session
+                WHERE underlying = $1
+                ORDER BY session_date DESC
+                LIMIT $2
+            """
+            args = (symbol, int(limit))
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, *args)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning("get_regime_sessions(%s) failed: %s", symbol, e)
+            return []
+
+    async def upsert_regime_session(self, row: Mapping[str, Any]) -> None:
+        """Write (or rewrite) one session's regime read.
+
+        Idempotent on ``(underlying, session_date)`` — every column is
+        recomputed from immutable ``gex_by_strike`` / ``gex_summary`` history,
+        so re-running the refresh or backfilling over an existing row
+        converges rather than accumulating.
+        """
+        query = """
+            INSERT INTO gex_regime_session (
+                underlying, session_date, open_ts, close_ts, spot_open, spot_close,
+                lean_raw, stability_raw, net_shift, gross_shift, sigma_price,
+                lean_z, stability_z, magnitude, state, normalization,
+                band_low, band_high, band_share, band_resolved,
+                rolloff_expiration, rolloff_net_gex, rolloff_abs_gex, rolloff_share,
+                chain_abs_gex,
+                gamma_flip_open, gamma_flip_close,
+                call_wall_open, call_wall_close, put_wall_open, put_wall_close,
+                common_expiration_count, expired_expiration_count, expired_net_gex
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14, $15, $16,
+                $17, $18, $19, $20,
+                $21, $22, $23, $24,
+                $25,
+                $26, $27,
+                $28, $29, $30, $31,
+                $32, $33, $34
+            )
+            ON CONFLICT (underlying, session_date) DO UPDATE SET
+                open_ts = EXCLUDED.open_ts,
+                close_ts = EXCLUDED.close_ts,
+                spot_open = EXCLUDED.spot_open,
+                spot_close = EXCLUDED.spot_close,
+                lean_raw = EXCLUDED.lean_raw,
+                stability_raw = EXCLUDED.stability_raw,
+                net_shift = EXCLUDED.net_shift,
+                gross_shift = EXCLUDED.gross_shift,
+                sigma_price = EXCLUDED.sigma_price,
+                lean_z = EXCLUDED.lean_z,
+                stability_z = EXCLUDED.stability_z,
+                magnitude = EXCLUDED.magnitude,
+                state = EXCLUDED.state,
+                normalization = EXCLUDED.normalization,
+                band_low = EXCLUDED.band_low,
+                band_high = EXCLUDED.band_high,
+                band_share = EXCLUDED.band_share,
+                band_resolved = EXCLUDED.band_resolved,
+                rolloff_expiration = EXCLUDED.rolloff_expiration,
+                rolloff_net_gex = EXCLUDED.rolloff_net_gex,
+                rolloff_abs_gex = EXCLUDED.rolloff_abs_gex,
+                rolloff_share = EXCLUDED.rolloff_share,
+                chain_abs_gex = EXCLUDED.chain_abs_gex,
+                gamma_flip_open = EXCLUDED.gamma_flip_open,
+                gamma_flip_close = EXCLUDED.gamma_flip_close,
+                call_wall_open = EXCLUDED.call_wall_open,
+                call_wall_close = EXCLUDED.call_wall_close,
+                put_wall_open = EXCLUDED.put_wall_open,
+                put_wall_close = EXCLUDED.put_wall_close,
+                common_expiration_count = EXCLUDED.common_expiration_count,
+                expired_expiration_count = EXCLUDED.expired_expiration_count,
+                expired_net_gex = EXCLUDED.expired_net_gex,
+                updated_at = NOW()
+        """
+        async with self._acquire_connection() as conn:
+            await conn.execute(
+                query,
+                row["underlying"],
+                row["session_date"],
+                row.get("open_ts"),
+                row.get("close_ts"),
+                row.get("spot_open"),
+                row.get("spot_close"),
+                row.get("lean_raw"),
+                row.get("stability_raw"),
+                row.get("net_shift"),
+                row.get("gross_shift"),
+                row.get("sigma_price"),
+                row.get("lean_z"),
+                row.get("stability_z"),
+                row.get("magnitude"),
+                row.get("state"),
+                row.get("normalization"),
+                row.get("band_low"),
+                row.get("band_high"),
+                row.get("band_share"),
+                row.get("band_resolved"),
+                row.get("rolloff_expiration"),
+                row.get("rolloff_net_gex"),
+                row.get("rolloff_abs_gex"),
+                row.get("rolloff_share"),
+                row.get("chain_abs_gex"),
+                row.get("gamma_flip_open"),
+                row.get("gamma_flip_close"),
+                row.get("call_wall_open"),
+                row.get("call_wall_close"),
+                row.get("put_wall_open"),
+                row.get("put_wall_close"),
+                row.get("common_expiration_count"),
+                row.get("expired_expiration_count"),
+                row.get("expired_net_gex"),
+            )
+
     async def get_gex_frames_for_session(
         self,
         symbol: str,
@@ -2802,9 +3090,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cap = max(1, int(max_expirations))
         try:
             async with self._acquire_connection() as conn:
-                exp_rows = await conn.fetch(
-                    exps_query, symbol, start_utc, end_utc, session_date
-                )
+                exp_rows = await conn.fetch(exps_query, symbol, start_utc, end_utc, session_date)
                 if not exp_rows:
                     return empty
                 all_exps = [r["expiration"] for r in exp_rows]
@@ -5492,7 +5778,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         earliest available bar's open is used.
         """
         index_symbol = index_symbol.upper()
-        cache_key = f"latest_future_quote:{index_symbol}"
+        # session_start belongs in the key: it selects ``reference_close``,
+        # so two callers passing different anchors must not share an entry.
+        # (The ES/NQ spot lookup passes None; the overnight SPX display swap
+        # passes the 16:00 anchor — sharing a key let one silently serve the
+        # other the wrong overnight change.)
+        cache_key = (
+            f"latest_future_quote:{index_symbol}:"
+            f"{session_start.isoformat() if session_start else 'none'}"
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -5540,6 +5834,183 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching latest future quote: {e!r}", exc_info=True)
             raise
+
+    async def get_futures_session_closes(self, index_symbol: str) -> Optional[Dict[str, Any]]:
+        """The future's two most recent cash-session (16:00 ET) closes.
+
+        The daily-change denominator for ES / NQ has to be the FUTURE's own
+        prior close.  Using the cash index's would put the headline percentage
+        out by the whole index-future basis — on ES that is tens of points,
+        which is a visibly wrong number on the first thing a trader looks at.
+
+        Bars are fenced to 09:30-16:00 ET so the mark is the cash-session
+        close a trader compares against, not an overnight print that happens
+        to be the day's last bar.  Reads ``futures_quotes`` only.
+
+        Which field is the 16:00 mark
+        -----------------------------
+        Bars are start-of-minute stamped (see ``_parse_bar`` in the futures
+        ingester), so the bar timestamped 16:00:00 spans 16:00:00-16:00:59 —
+        it OPENS at the cash close and CLOSES a full minute into post-close
+        futures trading.  ES and NQ trade 23 hours a day, so that minute is
+        live tape, not a settled level: taking the bar's ``close`` measured
+        the day change against 16:01, and the headline drifted by whatever
+        the future did in the first minute after the bell.
+
+        ``open`` of the 16:00 bar is the 16:00:00 print.  This is the same
+        rule :meth:`get_session_closes` applies to every cash symbol that
+        trades after hours, for the same reason; futures are simply its most
+        extreme case.  Any other bar - a half-day's 13:14 last bar, or the
+        15:59 bar when the 16:00 one is missing - uses ``close`` as usual,
+        which is already the 16:00:00 price.
+        """
+        index_symbol = (index_symbol or "").upper()
+        cache_key = f"futures_session_closes:{index_symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH marks AS (
+                SELECT
+                    (timestamp AT TIME ZONE 'America/New_York')::date AS et_date,
+                    timestamp,
+                    -- The 16:00 bar opens at the cash close and closes a
+                    -- minute into post-close futures tape: see the docstring.
+                    CASE
+                        WHEN (timestamp AT TIME ZONE 'America/New_York')::time
+                                = TIME '16:00'
+                        THEN open
+                        ELSE close
+                    END AS close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY (timestamp AT TIME ZONE 'America/New_York')::date
+                        ORDER BY timestamp DESC
+                    ) AS rn
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                  AND timestamp <= NOW()
+                  -- Sargable lower bound, as in get_session_closes: without
+                  -- it this TZ-converts, partitions and sorts the index's
+                  -- ENTIRE futures history for a 2-row result. The backfill
+                  -- grew that history from a rolling overnight window to
+                  -- every minute of every session inside DATA_RETENTION_DAYS.
+                  -- Two sessions is all this needs; 30 days covers any
+                  -- weekend, holiday or ingestion gap.
+                  AND timestamp >= NOW() - INTERVAL '30 days'
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                  -- Exclude the session still in progress. Without this the
+                  -- newest bar of a half-finished day is treated as "today's
+                  -- close", so the day change is measured against a price a
+                  -- few minutes old and ES/NQ reads ~0.00% all session.
+                  AND (
+                      (timestamp AT TIME ZONE 'America/New_York')::date
+                          < (NOW() AT TIME ZONE 'America/New_York')::date
+                      OR (NOW() AT TIME ZONE 'America/New_York')::time >= TIME '16:00'
+                  )
+            )
+            SELECT et_date, timestamp, close
+            FROM marks
+            WHERE rn = 1
+            ORDER BY et_date DESC
+            LIMIT 2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, index_symbol)
+            if not rows:
+                return None
+            payload: Dict[str, Any] = {
+                "symbol": index_symbol,
+                "current_session_close": rows[0]["close"],
+                "current_session_close_ts": rows[0]["timestamp"],
+                # One completed session on record (cold deploy): repeat it rather
+                # than 404 the header, and accept that the day change reads 0.00%
+                # until a second session lands. The model requires both values.
+                "prior_session_close": (rows[1]["close"] if len(rows) > 1 else rows[0]["close"]),
+                "prior_session_close_ts": (
+                    rows[1]["timestamp"] if len(rows) > 1 else rows[0]["timestamp"]
+                ),
+            }
+            self._cache_set(cache_key, payload, self._session_closes_cache_ttl_seconds)
+            return payload
+        except Exception as e:
+            logger.error(f"Error fetching futures session closes: {e!r}", exc_info=True)
+            return None
+
+    async def get_futures_basis_samples(
+        self,
+        index_symbol: str,
+        *,
+        lookback_minutes: int = 5760,
+        limit: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """Concurrent future/index print pairs, newest first.
+
+        The raw material for the index->future carry ratio that makes ES / NQ
+        first-class symbols (see :mod:`src.jobs.futures_projection`).  A pair
+        can only exist while BOTH markets print, i.e. during the cash session
+        — which is why the futures ingester now runs the whole CME session
+        rather than the overnight window alone.
+
+        The LIMIT is applied AFTER the join, and that placement is the whole
+        point.  Taking the newest N futures bars first and joining afterwards
+        returns nothing outside 09:30-16:00 ET, because the newest futures
+        bars are overnight ones with no index counterpart — which would leave
+        the ratio permanently on its cost-of-carry fallback in exactly the
+        window ES/NQ exists to serve.  Joining first lets the scan walk back
+        through the overnight bars to the last cash-session minute that does
+        have a pair, which is what the multi-day lookback is for.
+
+        The lateral takes the most recent index print at or BEFORE the futures
+        bar, never after: ``ORDER BY timestamp DESC`` is index-orderable on
+        ``underlying_quotes(symbol, timestamp)`` (unlike ordering by a
+        distance expression), and it cannot pair a futures bar with an index
+        print from the future.  The 120s window absorbs up to a one-bar
+        labelling difference between the two feeds.
+
+        Several samples are returned, not just the newest, so the caller can
+        take a median and shrug off a single bad print.
+
+        Reads ``futures_quotes`` + ``underlying_quotes`` only.
+        """
+        index_symbol = (index_symbol or "").upper()
+        cache_key = f"futures_basis_samples:{index_symbol}:{lookback_minutes}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            SELECT
+                f.timestamp        AS observed_at,
+                f.future_symbol    AS future_symbol,
+                f.close::float8    AS future_close,
+                u.close::float8    AS index_close
+            FROM futures_quotes f
+            JOIN LATERAL (
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp <= f.timestamp
+                  AND timestamp >= f.timestamp - INTERVAL '120 seconds'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ) u ON TRUE
+            WHERE f.index_symbol = $1
+              AND f.timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+            ORDER BY f.timestamp DESC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, index_symbol, int(lookback_minutes), int(limit))
+                payload = [dict(r) for r in rows]
+                self._cache_set(cache_key, payload, self._futures_basis_cache_ttl_seconds)
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching futures basis samples: {e!r}", exc_info=True)
+            return []
 
     async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
@@ -5775,9 +6246,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "prior_session_close": prior_close,
                     "prior_session_close_ts": prior_ts,
                 }
-                self._cache_set(
-                    cache_key, result, self._session_closes_cache_ttl_seconds
-                )
+                self._cache_set(cache_key, result, self._session_closes_cache_ttl_seconds)
                 return result
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}", exc_info=True)
@@ -6757,25 +7226,93 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window){session_filter}
                 ORDER BY {bucket}, timestamp DESC
+            ),
+            -- BOUNDED READ — the gex_by_strike probe is fenced to the
+            -- ~window_units bucket-representative timestamps by construction,
+            -- and no query plan can widen it.
+            --
+            -- This was a plain join on ``g.timestamp = br.rep_ts``, whose
+            -- intended plan is ~window_units index probes.  time_window /
+            -- bucket_reps are optimisation-fence CTEs, though, so the planner
+            -- cannot estimate how many rep_ts values the join probes and
+            -- periodically abandoned that nested loop for a merge/hash join
+            -- reading the ENTIRE gex_by_strike table -- the 15s "GEX heatmap
+            -- query timed out ... returning empty" path.  Commit 81586d8 added
+            -- a logically-redundant ``g.timestamp BETWEEN start_time AND
+            -- end_time`` bound to cap that fallback at the window's rows
+            -- rather than the table's.
+            --
+            -- Capping is not fixing, because the WINDOW is not the REP SET:
+            -- each bucket contributes ONE rep_ts out of every analytics
+            -- snapshot inside it, so the window holds ~``timeframe / cycle``
+            -- times more gex_by_strike timestamps than this read needs.  That
+            -- ratio is ~1x at 1min but ~5x at 5min, ~60x at 1hr and ~390x at
+            -- 1day -- and 1day x window_units=300 is a reachable request, so
+            -- this endpoint is far more exposed to the fallback than
+            -- get_strike_profile_timeseries was when the same gap put it into
+            -- the timeout log.  (The strike band caps how many rows SURVIVE,
+            -- not how many are read: the fallback scans the window off
+            -- idx_gex_by_strike_underlying_timestamp_strike and filters after.)
+            --
+            -- So the fence is structural now rather than another bound.  The
+            -- probe is a LATERAL subquery correlated on ``br.rep_ts``: a
+            -- lateral reference is evaluated per outer row, and this one
+            -- carries its own GROUP BY, which blocks subquery pull-up -- so PG
+            -- cannot re-plan it as a hash/merge join over the window or the
+            -- table.  The read is ~window_units equality probes whatever else
+            -- the planner does, flat in the window's span, so a 1day surface
+            -- costs what a 1min one costs.  The redundant window bound stays
+            -- as defence in depth but is no longer load-bearing.  Mirrors
+            -- get_strike_profile_timeseries.
+            --
+            -- Cells are unchanged: the cross-expiration combination per
+            -- (bucket, strike) is still AVG over that bucket's representative
+            -- snapshot, and grouping by strike inside the lateral is identical
+            -- to grouping by (bucket_ts, strike) -- bucket_reps is DISTINCT ON
+            -- the bucket, so bucket_ts <-> rep_ts is 1:1.  Unlike the
+            -- strike-profile CTE this one does NOT drop zero cells: a zero is
+            -- a real neutral cell on a heatmap, and dropping it would punch a
+            -- hole in the surface rather than trim a payload.
+            strikes AS (
+                SELECT
+                    br.bucket_ts,
+                    br.gamma_flip,
+                    br.gamma_flip_span_used,
+                    cell.strike,
+                    cell.net_gex
+                FROM bucket_reps br
+                CROSS JOIN LATERAL (
+                    SELECT
+                        g.strike,
+                        AVG(g.net_gex) AS net_gex
+                    FROM gex_by_strike g
+                    WHERE g.underlying = $1
+                      AND g.timestamp = br.rep_ts
+                      AND g.timestamp BETWEEN (SELECT start_time FROM time_window)
+                                          AND (SELECT end_time FROM time_window)
+                      AND ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
+                    GROUP BY g.strike
+                ) cell
             )
             SELECT
-                br.bucket_ts AS timestamp,
-                g.strike,
-                AVG(g.net_gex) AS net_gex,
+                s.bucket_ts AS timestamp,
+                s.strike,
+                s.net_gex,
                 -- gamma_flip is one value per bucket (the bucket's
                 -- representative gex_summary row), but rows here are
-                -- per-strike.  MAX() collapses that constant, and the
-                -- CASE emits it on only the lowest-strike row of each
-                -- bucket (NULL elsewhere) so it isn't repeated across
-                -- every strike.  The frontend keys the gamma-flip line
+                -- per-strike.  The CASE emits it on only the lowest-strike
+                -- row of each bucket (NULL elsewhere) so it isn't repeated
+                -- across every strike.  The frontend keys the gamma-flip line
                 -- by timestamp and skips NULLs, so one row per bucket is
-                -- enough — and because it now rides the heatmap's own
+                -- enough — and because it rides the heatmap's own
                 -- (RTH-filtered, over-fetched) timestamps the line spans
                 -- the full surface instead of the short /api/gex/historical
-                -- fallback window.
+                -- fallback window.  (It used to need MAX() to collapse the
+                -- constant through a GROUP BY; the strikes CTE now carries it
+                -- per row, so it is projected directly.)
                 CASE
-                    WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
-                    THEN MAX(br.gamma_flip)
+                    WHEN s.strike = MIN(s.strike) OVER (PARTITION BY s.bucket_ts)
+                    THEN s.gamma_flip
                 END AS gamma_flip,
                 -- Same broadcast pattern for the span the resolver
                 -- landed on (default rung vs expansion rung).  Frontend
@@ -6783,32 +7320,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 -- (live regime level) from an expansion-rung flip
                 -- (passed a looser bar — treat with caution).
                 CASE
-                    WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
-                    THEN MAX(br.gamma_flip_span_used)
+                    WHEN s.strike = MIN(s.strike) OVER (PARTITION BY s.bucket_ts)
+                    THEN s.gamma_flip_span_used
                 END AS gamma_flip_span_used
-            FROM bucket_reps br
-            JOIN gex_by_strike g
-                ON g.underlying = $1
-               AND g.timestamp = br.rep_ts
-               -- Logically REDUNDANT window bound (every br.rep_ts already lies
-               -- in [start_time, end_time] — bucket_reps was filtered to exactly
-               -- that range) but performance-critical: time_window / bucket_reps
-               -- are optimisation-fence CTEs, so the planner cannot estimate how
-               -- many rep_ts values the join probes and periodically abandons the
-               -- ~window_units-probe index nested loop for a merge/hash join that
-               -- reads the ENTIRE gex_by_strike table -- the 15s "GEX heatmap
-               -- query timed out ... returning empty" path.  With the bound, even
-               -- that fallback range-scans only the window's rows off
-               -- idx_gex_by_strike_underlying_timestamp_strike.  Mirrors the fix
-               -- in get_strike_profile_timeseries (commit c4d6463); this is the
-               -- fast-follow that commit flagged.
-               AND g.timestamp BETWEEN (SELECT start_time FROM time_window)
-                                   AND (SELECT end_time FROM time_window)
-            WHERE ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
-            GROUP BY br.bucket_ts, g.strike
-            ORDER BY br.bucket_ts DESC, g.strike ASC
+            FROM strikes s
+            ORDER BY s.bucket_ts DESC, s.strike ASC
         """
 
+        # Stamped before the pool acquire so the timeout log can tell the two
+        # ways this call can blow its budget apart: the 15s ceiling is on the
+        # fetch alone (asyncio.wait_for starts after a connection is in hand),
+        # so an elapsed of ~15s is a slow QUERY while anything materially above
+        # that is time spent queueing for a pool connection.
+        started = time_module.monotonic()
         try:
             async with self._acquire_connection() as conn:
                 rows = await asyncio.wait_for(
@@ -6845,8 +7369,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
         except asyncio.TimeoutError:
+            # Elapsed separates a slow query from pool starvation (see
+            # ``started`` above); timeframe already rides along and is what
+            # sets how wide the window is relative to the rep set.
             logger.warning(
-                f"GEX heatmap query timed out for {symbol} timeframe={timeframe} window={window_units}, returning empty"
+                "GEX heatmap query timed out after %.1fs for "
+                "%s timeframe=%s window=%s, returning empty",
+                time_module.monotonic() - started,
+                symbol,
+                timeframe,
+                window_units,
             )
             return []
         except Exception as e:

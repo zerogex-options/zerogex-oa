@@ -916,7 +916,8 @@ help: ## Show this help message
 	@echo "  make api-enable          - Enable API service to start on boot"
 	@echo "  make api-disable         - Disable API service from starting on boot"
 	@echo "  make api-health          - Show API service health and recent errors"
-	@echo "  make api-test            - Test API endpoints"
+	@echo "  make api-test            - Test API endpoints (V=2 for the /api/v2 surface)"
+	@echo "  make calendar-check      - Verify the NYSE calendar has runway (MONTHS=N)"
 	@echo "  make api-install-service - Install API as systemd service"
 	@echo "  make api-keys-create USER=<id> NAME=<label> - Issue a per-user API key"
 	@echo "  make api-keys-list [USER=<id>] [ACTIVE=yes] - List per-user API keys"
@@ -1171,6 +1172,59 @@ tw-magnet-backtest: ## Backtest the PutWallMagnetReversal thesis. Vars: SYMBOLS=
 		--symbols $(or $(SYMBOLS),SPY QQQ IWM) \
 		--days $(or $(DAYS),60) \
 		--min-pctile $(or $(MINPCTILE),90)
+
+# =============================================================================
+# Market-Maker Attributed GEX — RESEARCH ONLY (research/mm_attributed_gex/).
+# Reads the production DB read-only; writes nothing to any production table and
+# changes no production metric.  See docs/design/market-maker-attributed-gex.md.
+# Requires Cboe C1 Open-Close files; MMGEX_FILES points at them.
+# =============================================================================
+MMGEX_PROFILE ?= research_output/cboe_profile.json
+MMGEX_OUT     ?= research_output
+
+.PHONY: mmgex-pipeline-check
+mmgex-pipeline-check: ## MM-GEX: synthetic end-to-end plumbing check (NOT a research result)
+	$(PY) -m research.mm_attributed_gex.cli pipeline-check
+
+.PHONY: mmgex-sample
+mmgex-sample: ## MM-GEX: write SYNTHETIC Open-Close files to rehearse the workflow (not data)
+	$(PY) -m research.mm_attributed_gex.cli make-sample --out $(MMGEX_OUT)/sample
+
+.PHONY: mmgex-sample-anchored
+mmgex-sample-anchored: ## MM-GEX: SYNTHETIC flow over REAL contracts, so dataset+backtest can be rehearsed too
+	$(PY) -m research.mm_attributed_gex.cli make-sample --out $(MMGEX_OUT)/sample --anchor-to-db --symbol $(or $(SYMBOL),SPX)
+
+.PHONY: mmgex-inspect
+mmgex-inspect: ## MM-GEX: propose a column mapping from a real Cboe file. Vars: MMGEX_FILE=path
+	$(PY) -m research.mm_attributed_gex.cli inspect-cboe $(MMGEX_FILE) --save $(MMGEX_PROFILE)
+
+.PHONY: mmgex-confirm
+mmgex-confirm: ## MM-GEX: show a proposed column mapping; add REVIEWED=yes to confirm it
+	$(PY) -m research.mm_attributed_gex.cli confirm-profile $(MMGEX_PROFILE) $(if $(filter yes,$(REVIEWED)),--reviewed,)
+
+.PHONY: mmgex-check-load
+mmgex-check-load: ## MM-GEX: parse files and report what came through. Vars: MMGEX_FILES=path MMGEX_PROFILE=path
+	$(PY) -m research.mm_attributed_gex.cli check-load $(MMGEX_FILES) --profile $(MMGEX_PROFILE)
+
+.PHONY: mmgex-reconstruct
+mmgex-reconstruct: ## MM-GEX: build MM inventory + reconciliation report. Vars: MMGEX_FILES=path
+	$(PY) -m research.mm_attributed_gex.cli reconstruct $(MMGEX_FILES) --profile $(MMGEX_PROFILE) --out $(MMGEX_OUT)/mm_inventory.json
+
+.PHONY: mmgex-dataset
+mmgex-dataset: ## MM-GEX: build the side-by-side dataset. Vars: MMGEX_FILES=path START=ISO END=ISO
+	$(PY) -m research.mm_attributed_gex.cli build-dataset $(MMGEX_FILES) \
+		--profile $(MMGEX_PROFILE) \
+		--start $(START) --end $(END) \
+		--out $(MMGEX_OUT)/mm_dataset.jsonl
+
+.PHONY: mmgex-backtest
+mmgex-backtest: ## MM-GEX: run the experiment battery and render the report
+	$(PY) -m research.mm_attributed_gex.cli backtest $(MMGEX_OUT)/mm_dataset.jsonl \
+		--out $(MMGEX_OUT)/mm_report.md
+
+.PHONY: mmgex-test
+mmgex-test: ## MM-GEX: run just the experiment's test suite
+	$(PY) -m pytest tests/ -k mm_attributed --no-cov -q
 
 # `ci` mirrors .github/workflows/ci.yml's bar: black --check and pytest are
 # BLOCKING; flake8 and mypy are ADVISORY (the workflow marks them
@@ -3017,6 +3071,19 @@ regime-regrade-report: ## Backtest the corrected dealer-gamma regime vs stored h
 # (everything /api/flow/series can request).
 FLOW_SERIES_SYMBOLS ?= SPY
 
+.PHONY: futures-backfill
+futures-backfill: ## Backfill historical 1-min ES/NQ bars into futures_quotes. SYMBOLS=SPX,NDX START=YYYY-MM-DD END=YYYY-MM-DD [DRY_RUN=yes]
+	@echo "$(BLUE)=== Futures Backfill (futures_quotes) ===$(NC)"
+	@echo "$(YELLOW)SYMBOLS takes the CASH INDEX (SPX,NDX); the mapped future is$(NC)"
+	@echo "$(YELLOW)resolved via INDEX_FUTURES_MAP and rows land under the index key.$(NC)"
+	@echo "$(YELLOW)RAISE FUTURES_BARS_RETENTION_DAYS FIRST -- the ingester prunes past$(NC)"
+	@echo "$(YELLOW)it and cannot tell a backfilled bar from a streamed one.$(NC)"
+	@$(PY) -m src.tools.futures_backfill \
+		--symbols "$(or $(SYMBOLS),SPX,NDX)" \
+		--start $(START) \
+		--end $(END) \
+		$(if $(filter yes,$(DRY_RUN)),--dry-run)
+
 .PHONY: flow-series-backfill
 flow-series-backfill: ## Backfill flow_series_5min (current + prior session) before flipping FLOW_SERIES_USE_SNAPSHOT
 	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"
@@ -3099,6 +3166,17 @@ DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
 # the timestamp DELETE.
 DB_EXPIRY_PRUNE_TABLES = option_chains_latest
 
+# Tables that need the VACUUM FULL / REINDEX half of maintenance but NOT the
+# DATA_RETENTION_DAYS prune, because something else already owns their
+# retention. futures_quotes is pruned by the ingester itself (see
+# _futures_retention_days) so that a long ES/NQ backfill can outlive
+# DATA_RETENTION_DAYS when an operator asks for it — but it takes constant
+# upsert churn and would otherwise never be vacuumed.
+#
+# Distinct from DB_EXPIRY_PRUNE_TABLES above: these are vacuumed only, while
+# those are ALSO pruned by db-prune on their expiration column.
+DB_VACUUM_EXTRA_TABLES = futures_quotes
+
 .PHONY: db-prune
 db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 	@echo "$(YELLOW)Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
@@ -3129,7 +3207,7 @@ db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with
 	@$(MAKE) db-prune
 	@echo ""
 	@echo "$(YELLOW)Step 2/3: Running VACUUM FULL + REINDEX per table (reclaims disk space)...$(NC)"
-	@for tbl in $(DB_MAINTAIN_TABLES) $(DB_EXPIRY_PRUNE_TABLES); do \
+	@for tbl in $(DB_MAINTAIN_TABLES) $(DB_EXPIRY_PRUNE_TABLES) $(DB_VACUUM_EXTRA_TABLES); do \
 		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
 			echo "  VACUUM FULL $$tbl ..."; \
 			$(PSQL) -c "VACUUM FULL ANALYZE $$tbl;" || echo "$(RED)  ⚠️  VACUUM FULL failed for $$tbl, continuing...$(NC)"; \
@@ -3370,9 +3448,10 @@ api-prod: ## Run API server in production mode
 # and api-health are generated by SERVICE_TARGETS macro and health section above.
 
 .PHONY: api-test
-api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned table
+api-test: ## Test ALL API endpoints (V=2 tests the /api/v2 envelope surface)
 	@BASE_URL="http://localhost:8000"; \
 	SYMBOL="SPY"; \
+	VER="$(V)"; \
 	TIMEFRAMES="1min 5min 15min 1hr 1day"; \
 	KEY=$$(grep -E '^OPS_API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
 	KEY_SRC="OPS_API_KEY"; \
@@ -3380,7 +3459,12 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 		KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
 		KEY_SRC="API_KEY (break-glass)"; \
 	fi; \
-	echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"; \
+	if [ -z "$$VER" ] || [ "$$VER" = "1" ]; then \
+		echo "$(BLUE)=== Testing All API Endpoints (v1) ===$(NC)"; \
+	else \
+		echo "$(BLUE)=== Testing All API Endpoints (v$$VER) ===$(NC)"; \
+		echo "$(YELLOW)Paths are rewritten to /api/v$$VER/*; bodies are the {data,freshness} envelope.$(NC)"; \
+	fi; \
 	if [ -n "$$KEY" ]; then \
 		echo "$(YELLOW)Auth: sending X-API-Key from $$KEY_SRC (length=$${#KEY})$(NC)"; \
 	else \
@@ -3394,19 +3478,23 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 	printf "%-4s  %9s  %12s  %s\n" "HTTP" "TIME(s)" "SIZE(B)" "ENDPOINT"; \
 	printf "%-4s  %9s  %12s  %s\n" "----" "---------" "------------" "--------------------------------------------------"; \
 	hit() { \
+		p="$$1"; \
+		if [ -n "$$VER" ] && [ "$$VER" != "1" ]; then \
+			p=$$(printf '%s' "$$p" | sed -E "s|^/api/v1/|/api/v$$VER/|; t; s|^/api/|/api/v$$VER/|"); \
+		fi; \
 		if [ -n "$$KEY" ]; then \
-			out=$$(curl -s -o /dev/null -w "%{http_code}\t%{time_total}\t%{size_download}" -H "X-API-Key: $$KEY" "$$BASE_URL$$1"); \
+			out=$$(curl -s -o /dev/null -w "%{http_code}\t%{time_total}\t%{size_download}" -H "X-API-Key: $$KEY" "$$BASE_URL$$p"); \
 		else \
-			out=$$(curl -s -o /dev/null -w "%{http_code}\t%{time_total}\t%{size_download}" "$$BASE_URL$$1"); \
+			out=$$(curl -s -o /dev/null -w "%{http_code}\t%{time_total}\t%{size_download}" "$$BASE_URL$$p"); \
 		fi; \
 		code=$$(printf '%s' "$$out" | cut -f1); \
 		ttot=$$(printf '%s' "$$out" | cut -f2); \
 		size=$$(printf '%s' "$$out" | cut -f3); \
 		ttot_fmt=$$(awk -v t="$$ttot" 'BEGIN{printf "%.3f", (t==""?0:t)}'); \
-		printf "%s\t%s\t%s\t%s\n" "$$code" "$$ttot_fmt" "$$size" "$$1" >> "$$LOG"; \
+		printf "%s\t%s\t%s\t%s\n" "$$code" "$$ttot_fmt" "$$size" "$$p" >> "$$LOG"; \
 		case "$$code" in \
-			2*) printf "$(GREEN)%-4s$(NC)  %9s  %12s  %s\n" "$$code" "$$ttot_fmt" "$$size" "$$1" ;; \
-			*)  printf "$(RED)%-4s$(NC)  %9s  %12s  %s\n" "$$code" "$$ttot_fmt" "$$size" "$$1" ;; \
+			2*) printf "$(GREEN)%-4s$(NC)  %9s  %12s  %s\n" "$$code" "$$ttot_fmt" "$$size" "$$p" ;; \
+			*)  printf "$(RED)%-4s$(NC)  %9s  %12s  %s\n" "$$code" "$$ttot_fmt" "$$size" "$$p" ;; \
 		esac; \
 	}; \
 	hit "/api/health"; \
@@ -3414,6 +3502,7 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 	hit "/api/gex/by-strike?symbol=$$SYMBOL&limit=10&sort_by=distance"; \
 	hit "/api/gex/by-strike?symbol=$$SYMBOL&limit=10&sort_by=impact"; \
 	hit "/api/gex/vol_surface?symbol=$$SYMBOL"; \
+	hit "/api/v1/levels/$$SYMBOL"; \
 	hit "/api/market/quote?symbol=$$SYMBOL"; \
 	hit "/api/market/session-closes?symbol=$$SYMBOL"; \
 	hit "/api/market/volatility?ticker=VIX"; \
@@ -3489,7 +3578,25 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 		echo "$(RED)✗ $$FAILED endpoint(s) returned non-2xx — see table above.$(NC)"; \
 		exit 1; \
 	fi; \
-	echo "$(GREEN)✅ All endpoints returned 2xx$(NC)"
+	echo "$(GREEN)✅ All endpoints returned 2xx$(NC)"; \
+	if [ -n "$$VER" ] && [ "$$VER" != "1" ]; then \
+		echo ""; \
+		echo "$(BLUE)=== v$$VER envelope check ===$(NC)"; \
+		echo "$(YELLOW)A 2xx with the wrong body shape is the failure the table above cannot see.$(NC)"; \
+		OPS_API_KEY="$$KEY" $(PY) -m src.tools.v2_envelope_check \
+			--base-url "$$BASE_URL" --version "$$VER" --symbol "$$SYMBOL" \
+			&& echo "$(GREEN)✅ Envelope present and complete on every sampled endpoint$(NC)" \
+			|| { echo "$(RED)✗ v$$VER responses are not well-formed envelopes — see above.$(NC)"; exit 1; }; \
+	fi
+
+.PHONY: calendar-check
+calendar-check: ## Verify the NYSE calendar has runway and its half days are real
+	@echo "$(BLUE)=== NYSE calendar healthcheck ===$(NC)"
+	@$(PY) -m src.tools.nyse_calendar_healthcheck $(if $(MONTHS),--months $(MONTHS),) \
+		&& echo "$(GREEN)✅ Calendar OK$(NC)" \
+		|| (echo "$(RED)✗ Calendar needs attention — see above.$(NC)"; \
+		    echo "$(YELLOW)  NYSE_HOLIDAYS / NYSE_HALF_DAYS live in .env; .env.example carries a current list.$(NC)"; \
+		    exit 1)
 
 .PHONY: staging-smoke
 staging-smoke: ## Run post-deploy staging smoke checklist

@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, date as date_type
+from datetime import datetime, timedelta, timezone, date as date_type
 from enum import IntEnum
 import os
 from src.config import _getenv_str
@@ -21,6 +21,7 @@ import pytz
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
+from .futures_middleware import FuturesProjectionMiddleware
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
 from .ratelimit import rate_limit
 from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
@@ -61,6 +62,7 @@ from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
+from .routers.gamma_shift import router as gamma_shift_router
 from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
 from .routers.forecast import router as forecast_router
@@ -310,8 +312,21 @@ async def lifespan(app: FastAPI):
 # and CI continue to work without credentials.
 app = FastAPI(
     title="ZeroGEX API",
-    description="Real-time options analytics API",
-    version="1.0.0",
+    description=(
+        "Real-time options analytics API.\n\n"
+        "**Two versions are served.**\n\n"
+        "* **v2 (recommended)** — `/api/v2/*`. Every endpoint returns "
+        '`{"data": ..., "freshness": {...}}`, where the `freshness` block '
+        "reports response evaluation time, the underlying data's source "
+        "timestamp, the market session, the expected update cadence, and a "
+        "rolled-up `freshness_status` — so endpoint health and data age are "
+        "separate, machine-readable facts on every response.\n"
+        "* **v1 (stable)** — `/api/*` and `/api/v1/levels/*`. Unchanged and "
+        "supported; `data` in a v2 response is byte-for-byte the v1 body.\n\n"
+        'See "API versions & the freshness envelope" in API_Guide.md for '
+        "the field contract and the per-endpoint cadence table."
+    ),
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -376,6 +391,18 @@ if not allow_credentials:
     logger.info(
         "CORS_ALLOW_ORIGINS contains '*'; disabling allow_credentials for standards compliance."
     )
+
+# ES / NQ projection. Registered FIRST, which makes it the INNERMOST
+# middleware (last add_middleware is outermost — see the ordering note
+# below). That placement matters twice over: it reads the raw JSON straight
+# off routing before GZip compresses it, and CORS ends up wrapping it, so the
+# 400/503 responses it synthesizes still carry Access-Control-* headers
+# instead of surfacing to a browser as an opaque CORS failure.
+#
+# It is pure ASGI, not BaseHTTPMiddleware: a request that names no future
+# calls straight through with no task group and no body buffering, so the
+# SPX/SPY/QQQ/NDX hot path is genuinely untouched by this feature.
+app.add_middleware(FuturesProjectionMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -458,6 +485,10 @@ app.include_router(vol_surface_router, dependencies=[_scope_gex])
 # vol surface.
 app.include_router(premium_surface_router, dependencies=[_scope_gex])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
+# Gamma Regime Shift — the derivative of the dealer-gamma surface (what
+# CHANGED between two snapshots, what expires next, and the classified read
+# stored per session). Same derived-GEX scope as the surfaces it differences.
+app.include_router(gamma_shift_router, dependencies=[_scope_gex])
 # Raw market data routers — per-contract option history (option_contract)
 # and the option-calculator (which embeds raw contract prices). Gated
 # behind MARKET_RAW so they are excluded from derived-only tiers.
@@ -1191,10 +1222,11 @@ from src.market_calendar import (  # noqa: E402
     ET as _ET,
     NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
     should_display_future,
+    is_futures_session_open,
     current_cash_close_reference,
 )
-from src.config import _getenv_bool  # noqa: E402
-from src.symbols import resolve_index_future  # noqa: E402
+from src.config import _getenv_bool, _getenv_float  # noqa: E402
+from src.symbols import resolve_futures_index, resolve_index_future  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 
@@ -1207,6 +1239,73 @@ def _index_futures_display_enabled() -> bool:
     populated ``futures_quotes``.
     """
     return _getenv_bool("INDEX_FUTURES_DISPLAY_ENABLED", False)
+
+
+async def _native_futures_session_closes(futures_symbol: str, index_symbol: str) -> SessionCloses:
+    """The future's own two most recent 16:00 ET closes.
+
+    Mirrors :func:`_native_futures_quote`: the daily-change denominator has to
+    be the future's own prior close, not the cash index's, or the headline
+    percentage is wrong by the whole basis.
+    """
+    data = await _db().get_futures_session_closes(index_symbol)
+    if not data or data.get("current_session_close") is None:
+        raise HTTPException(
+            status_code=404, detail=f"No {futures_symbol} session close data available"
+        )
+    return SessionCloses(**{**data, "symbol": futures_symbol})
+
+
+# A futures bar older than this while CME is open means the feed is dead, not
+# that the market is quiet — 1-minute bars print continuously through the
+# session.
+_FUTURES_QUOTE_STALE_MINUTES = _getenv_float("FUTURES_QUOTE_STALE_MINUTES", 5.0)
+
+
+async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> UnderlyingQuote:
+    """Latest observed bar for a first-class future (ES / NQ).
+
+    ES and NQ take their PRICE from their own feed rather than from a
+    projection of the index: overnight the cash index is frozen at its 16:00
+    close, so a projected price would report where ES stood at the bell
+    instead of where it is trading now.  (Their dealer LEVELS are still
+    SPX/NDX-derived and projected — see ``src/api/futures_middleware.py``.)
+    """
+    fut = await _db().get_latest_future_quote(index_symbol, current_cash_close_reference())
+    if not fut or fut.get("close") is None:
+        raise HTTPException(status_code=404, detail=f"No {futures_symbol} quote data available")
+    payload = {
+        key: value
+        for key, value in fut.items()
+        if key
+        in ("timestamp", "open", "high", "low", "close", "up_volume", "down_volume", "volume")
+    }
+    payload["symbol"] = futures_symbol
+
+    # ``session`` describes the MARKET, not the feed.
+    #
+    # This used to fold feed staleness into the session — a stale bar was
+    # reported "closed" so the frontend would stop merging it onto the live
+    # chart tip (see isSessionLive). That was the wrong lever: the frontend's
+    # "closed" branch does not merely stop merging, it REPLACES the headline
+    # price with ``current_session_close`` and its change with
+    # ``prior_session_close``. For a 23-hour instrument that means swapping a
+    # slightly-late ES print for the last 16:00 cash close and publishing that
+    # session's day change as today's. On 2026-08-24 the header read
+    # "ES $7692.00 +26.75 (+0.35%)" — Friday's close and Friday's change —
+    # while ES traded 7675.50 and the feed had a live 7677.25 print in hand.
+    #
+    # A late observed print is always closer to the truth than a three-day-old
+    # one. Serve it, label the session honestly, and describe the staleness
+    # separately so each consumer can make its own decision.
+    bar_ts = payload.get("timestamp")
+    age_seconds: Optional[int] = None
+    if bar_ts is not None:
+        age_seconds = max(0, int((datetime.now(timezone.utc) - bar_ts).total_seconds()))
+    payload["session"] = "open" if is_futures_session_open() else "closed"
+    payload["data_age_seconds"] = age_seconds
+    payload["stale"] = age_seconds is not None and age_seconds > _FUTURES_QUOTE_STALE_MINUTES * 60.0
+    return UnderlyingQuote(**payload)
 
 
 def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
@@ -1373,6 +1472,11 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     surface that reads ``quoteData.close``.
     """
     try:
+        # ES / NQ are first-class symbols served from their own bars.
+        futures_index = resolve_futures_index(symbol)
+        if futures_index:
+            return await _native_futures_quote(symbol.strip().upper(), futures_index)
+
         data = await _db().get_latest_quote(symbol)
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
@@ -1434,6 +1538,13 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
       on the most recent completed trading day).
     - prior_session_close: the session close immediately before current.
     """
+    # ES / NQ close against their OWN 16:00 prints. Projecting SPX's cash
+    # closes here would put the headline daily change on the wrong basis —
+    # the number a futures trader checks first.
+    futures_index = resolve_futures_index(symbol)
+    if futures_index:
+        return await _native_futures_session_closes(symbol.strip().upper(), futures_index)
+
     data = await _db().get_session_closes(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No session close data available")
@@ -1467,6 +1578,12 @@ async def get_session_levels(symbol: str = Query(default="SPY")):
     Source of record is the ``session_levels`` capture job; the endpoint
     falls back to a live 1-min-bar aggregate when no captured row exists.
     """
+    # A future trades ~23h a day, so "pre-market high/low" describes nothing
+    # for ES / NQ. Return the empty shape rather than projecting SPX's levels,
+    # which would draw cash-index lines on a futures chart.
+    if resolve_futures_index(symbol):
+        return SessionLevels(symbol=symbol.strip().upper(), is_index=False)
+
     data = await _db().get_session_levels(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No session level data available")
@@ -1501,6 +1618,17 @@ async def get_historical_quotes(
         # Parse dates if provided
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
+
+        # ES / NQ: their own bar series, always — not gated on allow_futures
+        # or the overnight display window, because for a first-class future
+        # the futures series IS the price series at every hour.
+        futures_index = resolve_futures_index(symbol)
+        if futures_index:
+            label = symbol.strip().upper()
+            fut_rows = await _db().get_historical_futures(
+                futures_index, start_dt, end_dt, window_units, timeframe
+            )
+            return [UnderlyingQuote(**{**row, "symbol": label}) for row in fut_rows]
 
         # Index→future DISPLAY swap for the candlestick series — ONLY when the
         # caller opts in via allow_futures (the candle chart). Read-only from
@@ -1792,6 +1920,30 @@ async def get_momentum_divergence(
 from .quote_broadcaster import get_broadcaster as _get_ws_broadcaster  # noqa: E402
 
 ws_router.register(app, get_broadcaster=_get_ws_broadcaster)
+
+
+# ============================================================================
+# API v2 — the freshness-envelope surface
+# ============================================================================
+
+# Mirrors every /api route above onto /api/v2 with a consistent freshness
+# envelope ({"data": ..., "freshness": {...}}). MUST stay below every route
+# registration in this module and every include_router() call: the mirror
+# reads the route table, so anything registered after it is not mirrored.
+# v1 is left untouched. See src/api/v2.py and src/api/freshness.py.
+from .v2 import mount_v2  # noqa: E402
+
+try:
+    mount_v2(app)
+except Exception:  # noqa: BLE001
+    # v2 is additive; v1 is the product. A mirroring failure must degrade the
+    # new surface, never stop the process from booting and take the whole API
+    # down with it. mount_v2 reads FastAPI internals to enumerate included
+    # routers, so the thing most likely to break here is a framework upgrade —
+    # exactly when you want v1 still serving. The parity test in
+    # tests/test_api_v2_freshness_envelope.py turns a partial mirror into a
+    # red CI run so this never degrades silently for long.
+    logger.exception("v2 mirror failed to mount; /api/v2 will be unavailable")
 
 
 # ============================================================================

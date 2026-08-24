@@ -6,14 +6,22 @@ from TradeStation's ``/stream/barcharts`` endpoint and upserts them into
 the ``futures_quotes`` table, keyed by the CASH INDEX the future stands in
 for (``SPX``, ``NDX``, …).
 
-This is the "flip" half of the index→futures DISPLAY swap: during the
-regular cash session the site shows the index (served from
-``underlying_quotes`` as always); during the overnight futures window
-(18:00 ET → next 09:30 ET, while CME is trading) this ingester keeps
-``futures_quotes`` fresh and ``/api/market/quote`` + ``/api/market/historical``
-read from it under the index label.  Outside that window the ingester
-sleeps — so it pulls the index during the day and the future at night,
-exactly as an operator would expect from a single "flip".
+``futures_quotes`` has two consumers, and between them they want the feed
+running for the WHOLE CME session (Sun 18:00 → Fri 17:00 ET, minus the
+daily 17:00-18:00 maintenance break — see
+:func:`src.market_calendar.is_futures_ingest_window`):
+
+* The **basis engine** (:mod:`src.jobs.futures_projection`), which makes
+  ES / NQ first-class symbols by carrying SPX / NDX levels across to the
+  futures price axis.  It measures the carry ratio by comparing an ES
+  print against the SPX print at the same minute — which is only possible
+  during the CASH session, precisely the window this ingester used to
+  sleep through.
+* The **overnight display swap**, the original consumer: during the
+  overnight window only, ``/api/market/quote`` + ``/api/market/historical``
+  attach the future's price under the index label.  That gate
+  (:func:`src.market_calendar.should_display_future`) is unchanged and
+  stays overnight-only — a wider ingest window does not widen the swap.
 
 Design mirrors :mod:`src.ingestion.volatility_index_ingester` (the VIX/VXN
 ingesters): one long-running child process per configured index, a
@@ -44,10 +52,10 @@ import requests as _requests
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
 from src.config import _getenv_int, _getenv_bool, _getenv_str, API_REQUEST_TIMEOUT
-from src.market_calendar import is_futures_display_window
+from src.market_calendar import is_futures_ingest_window
 from src.symbols import resolve_index_future
 from src.utils import get_logger
-from src.validation import safe_float, safe_datetime
+from src.validation import bucket_timestamp, safe_float, safe_datetime
 
 logger = get_logger(__name__)
 
@@ -92,6 +100,14 @@ def _parse_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ts = safe_datetime(raw.get("TimeStamp"), field_name="TimeStamp")  # type: ignore[arg-type]
     if ts is None:
         return None
+    # Stamp the bar with its OWN minute, matching underlying_quotes (see
+    # main_engine.py, same expression and the same reason). TradeStation
+    # stamps a bar at its CLOSE, so storing it raw put futures_quotes one
+    # minute ahead of the contemporaneous underlying_quotes row — and the
+    # basis join then paired each futures bar with the NEXT minute's index
+    # print, biasing the measured ratio by a minute of drift whenever the
+    # market was trending. A bar stamped mid-interval floors unchanged.
+    ts = bucket_timestamp(ts - timedelta(seconds=1), 60)
     o = safe_float(raw.get("Open"), field_name="Open", default=None)
     h = safe_float(raw.get("High"), field_name="High", default=None)
     low = safe_float(raw.get("Low"), field_name="Low", default=None)
@@ -222,9 +238,7 @@ class FuturesUnderlyingIngester:
                 conn.commit()
             return len(bars)
         except Exception as e:
-            logger.error(
-                "%s futures bar upsert failed: %s", self.index_symbol, e, exc_info=True
-            )
+            logger.error("%s futures bar upsert failed: %s", self.index_symbol, e, exc_info=True)
             return 0
 
     def _prune_old_bars(self) -> None:
@@ -342,7 +356,7 @@ class FuturesUnderlyingIngester:
 
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
-                if not self.running or not is_futures_display_window():
+                if not self.running or not is_futures_ingest_window():
                     break
                 if not raw_line:
                     continue
@@ -375,9 +389,9 @@ class FuturesUnderlyingIngester:
     # -- run loop ----------------------------------------------------------
 
     def _sleep_until_window(self) -> None:
-        """Sleep in short chunks until the futures display window opens."""
+        """Sleep in short chunks until the futures ingest window opens."""
         slept = 0
-        while self.running and not is_futures_display_window():
+        while self.running and not is_futures_ingest_window():
             time.sleep(1)
             slept += 1
             if slept % _WINDOW_POLL_SEC == 0:
@@ -386,11 +400,26 @@ class FuturesUnderlyingIngester:
                     self.index_symbol,
                 )
 
+    def _backoff(self, reason: str) -> None:
+        """Sleep the reconnect backoff, in 1s slices so shutdown stays prompt."""
+        if not self.running or not is_futures_ingest_window():
+            return
+        logger.warning(
+            "%s futures %s, reconnecting in %ds...",
+            self.index_symbol,
+            reason,
+            _RECONNECT_BACKOFF_SEC,
+        )
+        slept = 0
+        while slept < _RECONNECT_BACKOFF_SEC and self.running:
+            time.sleep(1)
+            slept += 1
+
     def run(self) -> None:
         logger.info("=" * 80)
         logger.info(
-            "%s FUTURES INGESTER — streaming %s %d-%s bars during the "
-            "overnight futures window (18:00-09:30 ET)",
+            "%s FUTURES INGESTER — streaming %s %d-%s bars for the whole "
+            "CME session (Sun 18:00 -> Fri 17:00 ET)",
             self.index_symbol,
             self.future_symbol,
             FUTURES_BAR_INTERVAL,
@@ -401,8 +430,9 @@ class FuturesUnderlyingIngester:
         self.running = True
         try:
             while self.running:
-                if not is_futures_display_window():
-                    # Flip back to the index: nothing to pull, wait it out.
+                if not is_futures_ingest_window():
+                    # CME is closed (weekend / maintenance break): nothing to
+                    # pull, wait it out.
                     self._seeded = False  # re-seed the window on next open
                     self._sleep_until_window()
                     continue
@@ -410,17 +440,18 @@ class FuturesUnderlyingIngester:
                 try:
                     self._read_stream()
                 except Exception as e:
-                    if self.running and is_futures_display_window():
-                        logger.warning(
-                            "%s futures stream disconnected (%s), reconnecting in %ds...",
-                            self.index_symbol,
-                            e,
-                            _RECONNECT_BACKOFF_SEC,
-                        )
-                        slept = 0
-                        while slept < _RECONNECT_BACKOFF_SEC and self.running:
-                            time.sleep(1)
-                            slept += 1
+                    self._backoff(f"stream disconnected ({e})")
+                else:
+                    # A NORMAL return also needs the backoff. _read_stream
+                    # returns without raising when the connection is refused
+                    # for a reason that is not an exception here — a 401 that
+                    # triggers a token refresh, or an account stream-slot cap
+                    # that closes the connection immediately. Without a sleep
+                    # on this path the loop reconnects flat out, which turns a
+                    # transient cap exhaustion into a hot spin against
+                    # TradeStation.
+                    if self.running and is_futures_ingest_window():
+                        self._backoff("stream ended without an error")
         except Exception as e:
             logger.error(
                 "Fatal error in %s futures ingester: %s",
@@ -432,6 +463,28 @@ class FuturesUnderlyingIngester:
         finally:
             close_connection_pool()
             logger.info("%s futures ingester stopped", self.index_symbol)
+
+
+def _futures_retention_days() -> int:
+    """How many days of futures bars to keep.
+
+    Defaults to ``DATA_RETENTION_DAYS`` — the same knob that bounds
+    ``underlying_quotes`` for SPY / QQQ / SPX / NDX — so futures history
+    matches its index counterpart without an operator having to keep two
+    numbers in sync. ``FUTURES_BARS_RETENTION_DAYS`` still overrides it, which
+    is what a long backfill wants: see ``src/tools/futures_backfill.py``.
+    """
+    explicit = os.getenv("FUTURES_BARS_RETENTION_DAYS")
+    if explicit and explicit.strip():
+        try:
+            return max(1, int(explicit))
+        except ValueError:
+            logger.warning(
+                "FUTURES_BARS_RETENTION_DAYS=%r is not an integer; "
+                "falling back to DATA_RETENTION_DAYS",
+                explicit,
+            )
+    return _getenv_int("DATA_RETENTION_DAYS", 90)
 
 
 def run_futures_ingester(index_symbol: str) -> None:
@@ -473,6 +526,6 @@ def run_futures_ingester(index_symbol: str) -> None:
         future_symbol=future_symbol,
         initial_barsback=_getenv_int("FUTURES_INITIAL_BARSBACK", 960),
         poll_barsback=_getenv_int("FUTURES_POLL_BARSBACK", 3),
-        retention_days=_getenv_int("FUTURES_BARS_RETENTION_DAYS", 7),
+        retention_days=_futures_retention_days(),
     )
     ingester.run()
