@@ -320,6 +320,36 @@ curl -s -H "X-API-Key: $KEY" "$API/api/market/session-closes?symbol=ES" \
 instead, the headline change is off by whatever ES did in the minute after
 the bell — `tests/test_futures_session_closes.py` pins this.
 
+**The session describes the market; staleness is separate.** ES and NQ trade
+nearly 23 hours, so `session` reads `open` through the whole CME session and
+the header computes live-vs-the-last-16:00-mark. Feed freshness rides its own
+fields:
+
+```bash
+curl -s -H "X-API-Key: $KEY" "$API/api/market/quote?symbol=ES" \
+  | jq '{close, session, timestamp, stale, data_age_seconds}'
+```
+
+`session` must be `open` whenever CME is trading — even when `stale` is true.
+The two were briefly folded together, so a feed that fell a few minutes behind
+reported `closed`, and the frontend answers `closed` by swapping the headline
+price for `current_session_close` and its change for `prior_session_close`.
+The result was the last cash close published as the live price with that
+session's day change: on 2026-08-24 the ES header read `$7692.00 +26.75
+(+0.35%)` — Friday's numbers — while ES traded 7675.50 and this endpoint had a
+live 7677.25 print. `stale` is what keeps a dead feed off the live chart tip;
+it must never change which price is shown.
+
+If `stale` is persistently true while CME is open, the feed is the problem, not
+the quote — check the futures children:
+
+```bash
+journalctl -u zerogex-oa-ingestion --since '1 hour ago' | grep -i futures
+```
+
+Repeated `stream ended without an error` means the TradeStation stream-slot cap
+(Step 2), not a code fault.
+
 **Per-contract option endpoints refuse:**
 
 ```bash
