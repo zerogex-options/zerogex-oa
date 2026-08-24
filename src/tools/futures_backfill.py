@@ -1,9 +1,10 @@
 """Backfill historical 1-minute futures bars into ``futures_quotes``.
 
 The live futures ingester only ever holds a rolling window — it streams the
-current session and prunes past ``FUTURES_BARS_RETENTION_DAYS`` (default 7).
-That is enough for the basis measurement and the intraday chart, and not
-enough for anything else ES/NQ want:
+current session and prunes past its retention, which defaults to
+``DATA_RETENTION_DAYS`` (the same window ``make db-prune`` applies to
+``underlying_quotes``). That is enough for the basis measurement and the
+intraday chart, and not enough for anything else ES/NQ want:
 
 * the **daily and hourly** candlestick timeframes, which request up to 576
   buckets and today render as a near-empty strip for a future;
@@ -17,21 +18,20 @@ so a backfilled bar is indistinguishable from a streamed one. Idempotent on
 ``(index_symbol, timestamp)``.
 
 **Retention is the thing to get right first.** The ingester prunes
-``futures_quotes`` on its own schedule, and it does not know which rows came
-from a backfill — so anything you load outside the retention window is deleted
-on the next prune. Raise ``FUTURES_BARS_RETENTION_DAYS`` to cover the range you
-intend to keep BEFORE running this, or the work is thrown away. The tool warns
-when the requested range exceeds the configured retention rather than letting
-that happen quietly.
+``futures_quotes`` on its own schedule and cannot tell a backfilled row from a
+streamed one, so anything loaded outside the retention window is deleted on the
+next prune. Retention defaults to ``DATA_RETENTION_DAYS``; to keep MORE history
+than that, set ``FUTURES_BARS_RETENTION_DAYS`` explicitly and restart ingestion
+BEFORE running this. The tool warns when the requested range exceeds the
+resolved retention rather than letting the work vanish quietly.
 
 **Stamping.** Bars are stamped on their own minute —
-``bucket_timestamp(ts - 1s)`` — matching the live futures ingester and
-``underlying_quotes``. TradeStation stamps a bar at its CLOSE, so writing the
-raw timestamp would put backfilled bars one minute ahead of live ones and
-mis-pair the index/future basis join. (Note ``underlying_backfill.py`` does
-NOT apply this normalisation, so its rows sit a minute ahead of the live
-underlying feed; that is a pre-existing inconsistency in that tool, not
-something this one inherits.)
+``bucket_timestamp(ts - 1s)`` — matching the live futures ingester,
+``underlying_backfill.py`` and the live underlying feed. TradeStation stamps a
+bar at its CLOSE, so writing the raw timestamp would put backfilled bars one
+minute ahead of live ones and mis-pair the index/future basis join. All four
+writers are pinned to this one convention by
+``tests/test_futures_backfill.py::test_all_three_bar_writers_agree_on_the_timestamp``.
 
 **Symbols.** ``--symbols`` takes the CASH INDEX (``SPX``, ``NDX``) — the same
 key the rows are written under and the same key the API reads. The continuous
@@ -44,11 +44,14 @@ the ingester would have written.
 
 Usage::
 
-    # Keep 90 days first, or the backfill is pruned away.
-    #   FUTURES_BARS_RETENTION_DAYS=90   in .env, then restart ingestion.
+    # Within DATA_RETENTION_DAYS, nothing else to set:
+    make futures-backfill SYMBOLS=SPX,NDX START=2026-07-01 END=2026-08-22
 
+    # To keep MORE than DATA_RETENTION_DAYS, raise retention and restart
+    # ingestion first, or the prune deletes the extra:
+    #   FUTURES_BARS_RETENTION_DAYS=365   in .env
     python -m src.tools.futures_backfill --symbols SPX,NDX \\
-        --start 2026-06-01 --end 2026-08-21
+        --start 2025-09-01 --end 2026-08-22
 
     make futures-backfill SYMBOLS=SPX,NDX START=2026-06-01 END=2026-08-21
 """
