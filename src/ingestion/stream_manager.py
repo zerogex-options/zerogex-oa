@@ -290,6 +290,36 @@ def _log_concurrency_budget(label: str, response: Any) -> Optional[Dict[str, Any
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 
+# Fields carried forward when a strike recalibration swaps in a fresh
+# OptionStreamAccumulator.  All three settle on a per-session (not per-tick)
+# cadence -- OI and IV update once daily, Volume is cumulative daily -- so a
+# value observed before the swap is still the best known value after it.
+#
+# Prices and timestamps are deliberately EXCLUDED.  A carried Bid/Ask would
+# be re-emitted stamped with the receive-time fallback in
+# _yield_option_snapshot and land in option_chains as a fresh quote carrying
+# stale prices -- the exact failure that fallback's comment warns about.
+_STICKY_CARRY_FIELDS = ("DailyOpenInterest", "OpenInterest", "Volume") + _IV_FIELD_NAMES
+
+
+def _has_positive_oi(raw: Dict[str, Any]) -> bool:
+    """True when a raw stream/REST quote carries a positive open-interest value.
+
+    Mirrors the accumulator's positive-only OI merge rule: TradeStation
+    sends 0 (or omits the field) on most stream deltas, and only a genuine
+    positive reading counts as "we know this contract's OI".
+    """
+    for key in ("DailyOpenInterest", "OpenInterest"):
+        val = raw.get(key)
+        if val is None:
+            continue
+        try:
+            if int(val) > 0:
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
 
 class _DecodeErrorTracker:
     """Counts stream JSON-decode failures and triggers a reconnect when sustained.
@@ -521,6 +551,65 @@ class OptionStreamAccumulator:
         with self._lock:
             return {k: dict(v) for k, v in self._state.items()}
 
+    def sticky_state(self) -> Dict[str, Dict[str, Any]]:
+        """Export session-durable fields so a successor accumulator can inherit them.
+
+        Strike recalibration constructs a BRAND NEW accumulator
+        (``_start_accumulators``) and, with ``OPTION_REST_SEED_ON_RECALC``
+        at its default of false, starts it without a REST seed.  Open
+        interest only ever arrives from that seed -- stream deltas send 0
+        and are dropped by the positive-only merge rule -- so without a
+        hand-off OI is gone for the remainder of the session, every
+        ``option_chains`` row written afterwards carries NULL open_interest,
+        and every gamma-exposure query that multiplies by
+        ``COALESCE(oc.open_interest, 0)`` silently reads zero.
+
+        Only symbols with at least one known sticky value are returned.
+        """
+        with self._lock:
+            carried: Dict[str, Dict[str, Any]] = {}
+            for symbol, raw in self._state.items():
+                kept = {f: raw[f] for f in _STICKY_CARRY_FIELDS if raw.get(f) is not None}
+                if kept:
+                    carried[symbol] = kept
+            return carried
+
+    def carry_sticky_state(self, carried: Dict[str, Dict[str, Any]]) -> int:
+        """Adopt sticky fields exported by a predecessor accumulator.
+
+        Call BEFORE :meth:`start` so that a REST seed, when one runs, merges
+        on top through the normal positive-only rules rather than being
+        overwritten by staler carried values.
+
+        Two deliberate constraints:
+
+        * Symbols outside this accumulator's tracked set are skipped, so a
+          recalibration that drops strikes doesn't resurrect them and the
+          carried set can't grow without bound across a trending session.
+        * The dirty set is NOT touched.  Carried state holds no price or
+          timestamp, so publishing it on the next drain would yield a
+          contract with nothing to quote; it becomes visible only once the
+          contract genuinely ticks and the stream supplies live prices.
+
+        Returns the number of symbols that inherited state.
+        """
+        if not carried:
+            return 0
+        tracked = set(self._symbols)
+        adopted = 0
+        with self._lock:
+            for symbol, kept in carried.items():
+                if symbol not in tracked:
+                    continue
+                prior = self._state.get(symbol)
+                if prior is None:
+                    prior = {"Symbol": symbol}
+                    self._state[symbol] = prior
+                for field, value in kept.items():
+                    prior.setdefault(field, value)
+                adopted += 1
+        return adopted
+
     def drain(self) -> Dict[str, Dict[str, Any]]:
         """Return state for contracts updated since last drain and clear the dirty set.
 
@@ -537,12 +626,35 @@ class OptionStreamAccumulator:
 
     # -- internal ----------------------------------------------------------
 
-    def _seed_from_rest(self):
-        """Fetch one full REST snapshot to populate OI, IV, and prices."""
-        logger.info(f"Seeding option state from REST ({len(self._symbols)} symbols)...")
+    def seed_new_symbols_from_rest(self, known: Set[str]) -> int:
+        """REST-seed only the contracts that have no inherited state.
+
+        The sticky carry covers every strike that survives a recalibration,
+        but a strike that ENTERS the band has nothing to inherit and would
+        otherwise carry NULL open_interest until the next process restart --
+        the same defect the carry fixes, just narrowed to new arrivals.
+
+        Seeding only the arrivals keeps the cost proportional to how much
+        the band actually moved (typically a handful of strikes) instead of
+        re-fetching the whole universe the way OPTION_REST_SEED_ON_RECALC
+        does. Returns the number of symbols targeted.
+        """
+        missing = [sym for sym in self._symbols if sym not in known]
+        if missing:
+            self._seed_from_rest(symbols=missing)
+        return len(missing)
+
+    def _seed_from_rest(self, symbols: Optional[List[str]] = None):
+        """Fetch a REST snapshot to populate OI, IV, and prices.
+
+        ``symbols`` restricts the seed to a subset (see
+        :meth:`seed_new_symbols_from_rest`); the default seeds everything.
+        """
+        targets = self._symbols if symbols is None else list(symbols)
+        logger.info(f"Seeding option state from REST ({len(targets)} symbols)...")
         seeded = 0
-        for i in range(0, len(self._symbols), OPTION_BATCH_SIZE):
-            batch = self._symbols[i : i + OPTION_BATCH_SIZE]
+        for i in range(0, len(targets), OPTION_BATCH_SIZE):
+            batch = targets[i : i + OPTION_BATCH_SIZE]
             try:
                 data = self._client.get_option_quotes(batch)
                 for q in data.get("Quotes", []):
@@ -1352,6 +1464,10 @@ class StreamManager:
         # every STRIKE_RECALC_INTERVAL ~60s) so volume coverage reflects the
         # whole session rather than just trades since the last recalc reset.
         self._session_volume_symbols: Set[str] = set()
+        # Same treatment for OI: the accumulator that holds it is rebuilt
+        # without a REST re-seed on every strike recalibration, so a
+        # per-cycle count measures the rebuild, not the data.
+        self._session_oi_symbols: Set[str] = set()
         self._session_volume_date: Optional[date] = None
 
         logger.info(f"Initialized StreamManager for {underlying}")
@@ -1766,6 +1882,69 @@ class StreamManager:
         logger.info(f"Built {len(option_symbols)} option symbols to track")
         return option_symbols
 
+    def _ensure_session_day(self, now_et: Optional[datetime] = None) -> date:
+        """Roll the per-session coverage sets over at the ET day boundary.
+
+        Shared by the volume and OI coverage paths so the reset -- and the
+        :meth:`_on_session_day_rollover` side effects it triggers -- happen
+        exactly once per ET day no matter which metric observes the boundary
+        first.  ``_session_volume_date`` is the single marker for both sets;
+        the name predates the OI set and is kept as-is because it is part of
+        the surface existing tests assert against.
+        """
+        et_date = (now_et or datetime.now(ET)).date()
+        if self._session_volume_date != et_date:
+            self._session_volume_symbols = set()
+            self._session_oi_symbols = set()
+            # Day rollover side-effects centralised here so future per-day
+            # resets have one obvious place to land.
+            self._on_session_day_rollover(prev_date=self._session_volume_date, new_date=et_date)
+            self._session_volume_date = et_date
+        return et_date
+
+    def _update_session_oi_coverage(
+        self,
+        changed_state: Dict[str, Dict[str, Any]],
+        tracked_total: int,
+        now_et: Optional[datetime] = None,
+    ) -> float:
+        """Session-cumulative fraction of the CURRENT tracked universe with known OI.
+
+        Mirrors :meth:`_update_session_volume_coverage`, and for the same
+        underlying reason.  The naive form this replaces --
+        ``contracts with OI>0 / contracts drained this cycle`` -- had two
+        independent faults:
+
+        * The denominator was the per-cycle changed subset, so the ratio
+          swung on how many contracts happened to tick rather than on data
+          quality.  A quiet cycle draining three contracts reported 0% or
+          100% with equal ease.
+        * The numerator read accumulator state that strike recalibration
+          resets roughly every 60s, and OI is only ever repopulated by a
+          REST seed that ``OPTION_REST_SEED_ON_RECALC`` disables by default.
+
+        The sticky carry in :meth:`_start_accumulators` fixes the second at
+        source.  Measuring cumulatively against the tracked universe fixes
+        the first, and keeps the alert honest for strikes that enter the
+        band mid-session and legitimately have no seeded OI yet.
+
+        As with volume, the union is intersected with the CURRENT tracked
+        set so symbols that drift out of the band can't pin the numerator
+        at 100% mid-trend, and so the set stays bounded.
+        """
+        self._ensure_session_day(now_et)
+
+        tracked_set = set(self.tracked_option_symbols)
+        self._session_oi_symbols &= tracked_set
+        self._session_oi_symbols.update(
+            sym
+            for sym, raw in changed_state.items()
+            if sym in tracked_set and _has_positive_oi(raw)
+        )
+        if tracked_total <= 0:
+            return 0.0
+        return min(1.0, len(self._session_oi_symbols) / tracked_total)
+
     def _update_session_volume_coverage(
         self,
         changed_state: Dict[str, Dict[str, Any]],
@@ -1793,13 +1972,7 @@ class StreamManager:
         coverage was poor, rendering the alert useless mid-trend. Pruning to the
         current universe also bounds the set's memory.
         """
-        et_date = (now_et or datetime.now(ET)).date()
-        if self._session_volume_date != et_date:
-            self._session_volume_symbols = set()
-            # Day rollover side-effects centralised here so future per-day
-            # resets have one obvious place to land.
-            self._on_session_day_rollover(prev_date=self._session_volume_date, new_date=et_date)
-            self._session_volume_date = et_date
+        self._ensure_session_day(now_et)
 
         tracked_set = set(self.tracked_option_symbols)
         # Prune drifted-out symbols so they don't inflate the numerator.
@@ -1817,9 +1990,9 @@ class StreamManager:
         """Fire when the ET calendar day rolls over.
 
         Centralised so per-day resets stay co-located with day-rollover
-        detection.  Called from ``_update_session_volume_coverage`` AFTER
-        the volume-symbol set has been cleared but BEFORE the date marker
-        is advanced -- the previous date is passed in for logging.
+        detection.  Called from ``_ensure_session_day`` AFTER the volume and
+        OI symbol sets have been cleared but BEFORE the date marker is
+        advanced -- the previous date is passed in for logging.
 
         Currently invalidates the TradeStation strikes cache: overnight,
         new weekly expirations are listed and the prior day's cached
@@ -1947,7 +2120,20 @@ class StreamManager:
         """
         # Stop existing option accumulator (always — its symbol set may have
         # changed) and the underlying only when explicitly asked to.
+        #
+        # Harvest its session-durable fields FIRST. OI/IV/Volume only enter
+        # accumulator state via a REST seed, and this swap runs with
+        # seed_option_rest=OPTION_REST_SEED_ON_RECALC (default false), so
+        # without the hand-off every recalibration permanently blanks OI for
+        # the rest of the session. See OptionStreamAccumulator.sticky_state.
+        carried_sticky: Dict[str, Dict[str, Any]] = {}
         if self._accumulator is not None:
+            try:
+                carried_sticky = self._accumulator.sticky_state()
+            except Exception as e:
+                # Never let the hand-off break a stream restart; losing the
+                # carry costs data quality, failing here costs the feed.
+                logger.warning("Sticky option-state hand-off failed: %s", e)
             self._accumulator.stop()
         if restart_underlying and self._underlying_accumulator is not None:
             self._underlying_accumulator.stop()
@@ -1976,6 +2162,31 @@ class StreamManager:
             symbols=self.tracked_option_symbols,
             wakeup=self._wakeup,
         )
+        # Adopt before start() so a REST seed (when enabled) merges over the
+        # carry rather than the other way round. Unconditional: even with
+        # seeding on, a partially failed seed batch leaves holes the carry
+        # fills.
+        if carried_sticky:
+            adopted = self._accumulator.carry_sticky_state(carried_sticky)
+            arrivals = 0
+            if not seed_option_rest:
+                # start() is about to skip the REST seed, so strikes that just
+                # entered the band have no OI source at all. Seed just those --
+                # bounded by how far spot moved, not by universe size. Never
+                # let it break the restart: blank OI on a few new strikes is
+                # recoverable, a dead option feed is not.
+                try:
+                    arrivals = self._accumulator.seed_new_symbols_from_rest(set(carried_sticky))
+                except Exception as e:
+                    logger.warning("REST seed of newly-tracked contracts failed: %s", e)
+            logger.info(
+                "Carried sticky option state (OI/IV/volume) for %d of %d tracked "
+                "contracts across stream restart (REST seed %s, %d new contracts seeded).",
+                adopted,
+                len(self.tracked_option_symbols),
+                "enabled" if seed_option_rest else "disabled",
+                arrivals,
+            )
         self._accumulator.start(seed_from_rest=seed_option_rest)
 
     def request_stop(self):
@@ -2477,12 +2688,17 @@ class StreamManager:
                             _total_option_batches += 1
                             _total_options_yielded += option_count
 
-                            option_with_oi = sum(
-                                1 for o in option_results if (o.get("open_interest") or 0) > 0
-                            )
-
                             tracked_total = len(self.tracked_option_symbols)
-                            oi_coverage = option_with_oi / option_count
+                            # OI coverage is session-cumulative over the tracked
+                            # universe for the same reason volume is: the
+                            # accumulator holding OI is rebuilt without a REST
+                            # re-seed on every strike recalibration, and the old
+                            # per-cycle ratio (OI>0 / drained this cycle) measured
+                            # that rebuild rather than the data. See
+                            # _update_session_oi_coverage.
+                            oi_coverage = self._update_session_oi_coverage(
+                                changed, tracked_total
+                            )
 
                             # Volume coverage = session-cumulative fraction of the
                             # tracked universe that has traded. Tracked on the
