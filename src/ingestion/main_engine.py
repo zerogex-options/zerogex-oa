@@ -342,6 +342,11 @@ class IngestionEngine:
         self.underlying_bars_stored = 0
         self.option_quotes_stored = 0
         self.greeks_calculated = 0
+        # One-shot latch for the "no underlying price yet" warning. NOT
+        # greeks_calculated: that counter only advances on the first
+        # SUCCESSFUL Greek, so gating on it logged once per contract per
+        # batch for the whole window before the underlying feed opened.
+        self._greeks_no_price_warned = False
         self.last_flush_time = datetime.now(ET)
         self.errors_count = 0
 
@@ -931,6 +936,9 @@ class IngestionEngine:
                     data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
                 else:
                     data = enriched_data
+                    # Price is back; re-arm so a LATER outage warns again
+                    # instead of failing silently.
+                    self._greeks_no_price_warned = False
                     self.greeks_calculated += 1
                     if self.greeks_calculated % 100 == 0:
                         logger.info(f"Calculated Greeks for {self.greeks_calculated} options")
@@ -946,10 +954,18 @@ class IngestionEngine:
                 )
                 data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
         elif self.greeks_calculator and not self.latest_underlying_price:
-            if self.greeks_calculated == 0:
+            # Log once per outage, not once per contract. Option quotes drain
+            # before the first underlying bar arrives, so every restart hit
+            # this path for the entire tracked universe -- ~1,500 warnings in
+            # a 14s burst, onto a root volume that runs near full. The rows
+            # still write with NULL gamma, which COALESCE(oc.gamma, 0) reads
+            # as zero exposure downstream; that part is bounded by
+            # time-to-first-bar and is not what the warning is for.
+            if not self._greeks_no_price_warned:
                 logger.warning(
                     "⚠️  Skipping Greeks calculation - no underlying price available yet"
                 )
+                self._greeks_no_price_warned = True
             data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
         else:
             data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
