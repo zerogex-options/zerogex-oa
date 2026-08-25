@@ -86,6 +86,10 @@ _DEFAULT_TOLERANCE_MIN = 10
 # Below this trade count a per-bot verdict is "insufficient" rather than a
 # confident edge/no-edge call — a handful of round-trips proves nothing.
 _MIN_TRADES_FOR_VERDICT = 20
+# Soft floor per half for the train/test robustness flag (matches the
+# execution sweep's guard): fewer trades in either half means the split
+# cannot certify robustness, whatever the numbers say.
+_MIN_TRADES_PER_HALF = 6
 
 
 # ===========================================================================
@@ -706,7 +710,8 @@ def run_fleet_backtest(
         bot_base.set_backtest_clock(None)
         _CLOCK["now"] = _CLOCK_EPOCH
 
-    bot_reports = [summarize_bot(r) for r in runners]
+    split_at = start + (end - start) / 2
+    bot_reports = [summarize_bot(r, split_at=split_at) for r in runners]
     bot_reports.sort(key=lambda b: (b["n_trades"] > 0, b["expectancy"]), reverse=True)
     return {
         "window": {"start": _iso(start), "end": _iso(end)},
@@ -736,7 +741,51 @@ def run_fleet_backtest(
 # ===========================================================================
 
 
-def summarize_bot(runner: _BotRunner) -> Dict[str, Any]:
+def _half_metrics(trades: List[SimTrade]) -> Dict[str, Any]:
+    """Compact metrics for one half of a train/test split."""
+    n = len(trades)
+    gross_win = sum(t.pnl_dollars for t in trades if t.pnl_dollars > 0)
+    gross_loss = -sum(t.pnl_dollars for t in trades if t.pnl_dollars < 0)
+    total = sum(t.pnl_dollars for t in trades)
+    pf = (gross_win / gross_loss) if gross_loss > 0 else None
+    return {
+        "n_trades": n,
+        "total_pnl": round(total, 2),
+        "expectancy": round(total / n, 2) if n else 0.0,
+        "profit_factor": round(pf, 3) if pf is not None else None,
+    }
+
+
+def _split_report(
+    trades: List[SimTrade],
+    split_at: Optional[datetime],
+    full_verdict: str,
+) -> Optional[Dict[str, Any]]:
+    """Window-midpoint TRAIN/TEST split — the promotion overfitting guard.
+
+    Same semantics as ``tw_execution_sweep``: trades are assigned to halves by
+    entry time against the WINDOW midpoint (not by trade count, so a burst of
+    late trades cannot masquerade as an even split), and ``robust`` requires
+    the full-window verdict to be "edge" AND positive expectancy in BOTH
+    halves AND at least ``_MIN_TRADES_PER_HALF`` trades in each. A config that
+    shines in one half and dies in the other is noise, not edge — and is not
+    promotable regardless of its full-window profit factor.
+    """
+    if split_at is None:
+        return None
+    train = [t for t in trades if t.opened_at < split_at]
+    test = [t for t in trades if t.opened_at >= split_at]
+    train_m, test_m = _half_metrics(train), _half_metrics(test)
+    robust = (
+        full_verdict == "edge"
+        and train_m["expectancy"] > 0
+        and test_m["expectancy"] > 0
+        and min(train_m["n_trades"], test_m["n_trades"]) >= _MIN_TRADES_PER_HALF
+    )
+    return {"at": _iso(split_at), "train": train_m, "test": test_m, "robust": robust}
+
+
+def summarize_bot(runner: _BotRunner, split_at: Optional[datetime] = None) -> Dict[str, Any]:
     """Per-bot expectancy / profit factor / win rate at one contract."""
     trades = runner.trades
     n = len(trades)
@@ -783,6 +832,7 @@ def summarize_bot(runner: _BotRunner) -> Dict[str, Any]:
             )
         ),
         "verdict": _verdict(n, pf, expectancy),
+        "split": _split_report(trades, split_at, _verdict(n, pf, expectancy)),
         "equity_curve": _equity_curve(trades),
     }
 
@@ -873,6 +923,16 @@ def format_report(result: Dict[str, Any]) -> str:
             f"{pf:>7}{b['expectancy']:>9.1f}{b['total_pnl']:>10.1f}"
             f"{b['avg_hold_min']:>7.0f}  {b['verdict']}{flag}"
         )
+        split = b.get("split")
+        if split and b["n_trades"]:
+            tr, te = split["train"], split["test"]
+            lines.append(
+                f"{'  └ split':<26}{'':>7}{'':>7}{'':>7}"
+                f"{'':>9}{'':>10}{'':>7}  "
+                f"train {tr['n_trades']}t/{tr['expectancy']:+.0f}$ | "
+                f"test {te['n_trades']}t/{te['expectancy']:+.0f}$ | "
+                f"{'ROBUST' if split['robust'] else 'not robust'}"
+            )
     f = result.get("fleet", {})
     lines.append("-" * 92)
     lines.append(

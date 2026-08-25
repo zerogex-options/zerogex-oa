@@ -22,7 +22,6 @@ import src.tradeworkz.backtest as bt
 from src.tradeworkz.bots import base as bot_base
 from src.tradeworkz.models import ExitDecision, Leg, OpenPosition, TradeSignal
 
-
 # ---------------------------------------------------------------------------
 # Fake DB plumbing
 # ---------------------------------------------------------------------------
@@ -168,8 +167,8 @@ def test_no_quote_open_returns_none():
 
 def test_rth_timesteps_endpoints_and_interval():
     steps = bt.rth_timesteps(
-        datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc),   # 08:00 ET
-        datetime(2026, 8, 5, 21, 0, tzinfo=timezone.utc),   # 17:00 ET
+        datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc),  # 08:00 ET
+        datetime(2026, 8, 5, 21, 0, tzinfo=timezone.utc),  # 17:00 ET
         30,
     )
     et = [s.astimezone(bt._ET).strftime("%H:%M") for s in steps]
@@ -179,7 +178,7 @@ def test_rth_timesteps_endpoints_and_interval():
 
 def test_rth_timesteps_skips_weekend():
     steps = bt.rth_timesteps(
-        datetime(2026, 8, 8, 13, 0, tzinfo=timezone.utc),   # Saturday
+        datetime(2026, 8, 8, 13, 0, tzinfo=timezone.utc),  # Saturday
         datetime(2026, 8, 8, 20, 0, tzinfo=timezone.utc),
         30,
     )
@@ -188,8 +187,8 @@ def test_rth_timesteps_skips_weekend():
 
 def test_rth_timesteps_clamps_to_window():
     steps = bt.rth_timesteps(
-        datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc),   # 10:00 ET
-        datetime(2026, 8, 5, 18, 0, tzinfo=timezone.utc),   # 14:00 ET
+        datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc),  # 10:00 ET
+        datetime(2026, 8, 5, 18, 0, tzinfo=timezone.utc),  # 14:00 ET
         30,
     )
     et = [s.astimezone(bt._ET).strftime("%H:%M") for s in steps]
@@ -233,11 +232,25 @@ def test_opens_allowed_gates_session_and_cap():
 
 def _pos(**over: Any) -> OpenPosition:
     base = dict(
-        id=-1, bot_id="b", underlying="SPY", opened_at=_AT, direction="bullish",
-        strategy_type="single", legs=[_leg()], entry_price=1.0, current_price=1.0,
-        quantity_open=1, unrealized_pnl=0.0, stop_price=None, target_price=None,
-        time_stop_at=None, min_hold_until=None, wall_ref_price=None,
-        wall_ref_side=None, entry_conviction=0.5, components_at_entry={},
+        id=-1,
+        bot_id="b",
+        underlying="SPY",
+        opened_at=_AT,
+        direction="bullish",
+        strategy_type="single",
+        legs=[_leg()],
+        entry_price=1.0,
+        current_price=1.0,
+        quantity_open=1,
+        unrealized_pnl=0.0,
+        stop_price=None,
+        target_price=None,
+        time_stop_at=None,
+        min_hold_until=None,
+        wall_ref_price=None,
+        wall_ref_side=None,
+        entry_conviction=0.5,
+        components_at_entry={},
     )
     base.update(over)
     return OpenPosition(**base)
@@ -295,38 +308,54 @@ def _runner_with(bot: _StubBot, enabled: bool = True) -> bt._BotRunner:
 
 def _signal() -> TradeSignal:
     return TradeSignal(
-        bot_id="stub_bot", underlying="SPY", direction="bullish", strategy_type="single",
-        legs=[Leg(option_symbol="SPY 260805C640", side="long", option_type="call",
-                  strike=640.0, expiration="2026-08-05")],
-        entry_price=1.0, conviction=0.6, target_price=650.0, stop_price=630.0,
-        time_stop_at=None, components_at_entry={"origin": "live"},
+        bot_id="stub_bot",
+        underlying="SPY",
+        direction="bullish",
+        strategy_type="single",
+        legs=[
+            Leg(
+                option_symbol="SPY 260805C640",
+                side="long",
+                option_type="call",
+                strike=640.0,
+                expiration="2026-08-05",
+            )
+        ],
+        entry_price=1.0,
+        conviction=0.6,
+        target_price=650.0,
+        stop_price=630.0,
+        time_stop_at=None,
+        components_at_entry={"origin": "live"},
     )
 
 
 def test_runner_open_then_exit_round_trip(monkeypatch):
     prices = {"open": 1.00, "close": 1.50}
     monkeypatch.setattr(
-        bt, "historical_spread_price",
+        bt,
+        "historical_spread_price",
         lambda conn, legs, *, at, action, slippage_pct=None, tolerance_min=10: prices[action],
     )
     runner = _runner_with(_StubBot(_signal()))
     snap = SimpleNamespace(spot=640.0)
     t0 = _AT
     t1 = _AT + timedelta(minutes=5)
-    runner.step(None, "SPY", snap, t0, opens_allowed=True)   # opens
+    runner.step(None, "SPY", snap, t0, opens_allowed=True)  # opens
     assert "SPY" in runner.open_by_underlying
-    runner.step(None, "SPY", snap, t1, opens_allowed=True)   # marks + exits
+    runner.step(None, "SPY", snap, t1, opens_allowed=True)  # marks + exits
     assert "SPY" not in runner.open_by_underlying
     assert len(runner.trades) == 1
     tr = runner.trades[0]
     assert tr.outcome == "win"
-    assert abs(tr.pnl_dollars - 50.0) < 1e-6   # (1.50 − 1.00) × 100
+    assert abs(tr.pnl_dollars - 50.0) < 1e-6  # (1.50 − 1.00) × 100
     assert tr.reason == "test_exit"
 
 
 def test_runner_respects_bias_veto(monkeypatch):
     monkeypatch.setattr(
-        bt, "historical_spread_price",
+        bt,
+        "historical_spread_price",
         lambda *a, **k: 1.0,
     )
     runner = _runner_with(_StubBot(_signal(), veto=True))
@@ -346,17 +375,26 @@ def test_runner_min_premium_floor_blocks_thin_entry(monkeypatch):
     monkeypatch.setattr(bt, "historical_spread_price", lambda *a, **k: 0.0)
     runner = _runner_with(_StubBot(_signal()))
     runner.step(None, "SPY", SimpleNamespace(spot=640.0), _AT, opens_allowed=True)
-    assert runner.open_by_underlying == {}   # entry_net <= 0 → no fill
+    assert runner.open_by_underlying == {}  # entry_net <= 0 → no fill
 
 
 def _mk_trade(pnl: float) -> bt.SimTrade:
     return bt.SimTrade(
-        bot_id="b", underlying="SPY", direction="bullish", strategy_type="single",
-        opened_at=_AT, closed_at=_AT + timedelta(minutes=10), hold_minutes=10.0,
-        entry_net=1.0, exit_net=1.0 + pnl / 100.0, max_loss_per_share=1.0,
-        pnl_dollars=pnl, pnl_pct=pnl / 100.0,
+        bot_id="b",
+        underlying="SPY",
+        direction="bullish",
+        strategy_type="single",
+        opened_at=_AT,
+        closed_at=_AT + timedelta(minutes=10),
+        hold_minutes=10.0,
+        entry_net=1.0,
+        exit_net=1.0 + pnl / 100.0,
+        max_loss_per_share=1.0,
+        pnl_dollars=pnl,
+        pnl_pct=pnl / 100.0,
         outcome="win" if pnl > 0 else "loss" if pnl < 0 else "scratch",
-        reason="x", conviction=0.5,
+        reason="x",
+        conviction=0.5,
     )
 
 
@@ -367,15 +405,83 @@ def test_summarize_bot_math():
     assert rep["n_trades"] == 4
     assert rep["wins"] == 2 and rep["losses"] == 2
     assert abs(rep["win_rate"] - 0.5) < 1e-9
-    assert abs(rep["profit_factor"] - 2.0) < 1e-9   # 200 / 100
+    assert abs(rep["profit_factor"] - 2.0) < 1e-9  # 200 / 100
     assert abs(rep["total_pnl"] - 100.0) < 1e-9
     assert abs(rep["expectancy"] - 25.0) < 1e-9
     assert rep["equity_curve"] == [100.0, 200.0, 150.0, 100.0]
 
 
 def test_verdict_thresholds():
-    assert bt._verdict(5, 3.0, 100.0) == "insufficient"     # too few trades
-    assert bt._verdict(40, 1.5, 50.0) == "edge"             # PF>=1.1 & +expectancy
-    assert bt._verdict(40, 0.95, -5.0) == "marginal"        # PF in [0.9,1.1)
-    assert bt._verdict(40, 0.5, -100.0) == "no-edge"        # PF<0.9
-    assert bt._verdict(40, None, 10.0) == "edge"            # no losses, +expectancy
+    assert bt._verdict(5, 3.0, 100.0) == "insufficient"  # too few trades
+    assert bt._verdict(40, 1.5, 50.0) == "edge"  # PF>=1.1 & +expectancy
+    assert bt._verdict(40, 0.95, -5.0) == "marginal"  # PF in [0.9,1.1)
+    assert bt._verdict(40, 0.5, -100.0) == "no-edge"  # PF<0.9
+    assert bt._verdict(40, None, 10.0) == "edge"  # no losses, +expectancy
+
+
+def _mk_trade_at(pnl: float, at: datetime) -> bt.SimTrade:
+    t = _mk_trade(pnl)
+    t.opened_at = at
+    t.closed_at = at + timedelta(minutes=10)
+    return t
+
+
+def test_split_report_robust_when_both_halves_positive():
+    mid = _AT + timedelta(days=10)
+    early, late = _AT, mid + timedelta(days=1)
+    # 6+ trades per half (the soft floor), both halves net-positive.
+    trades = (
+        [_mk_trade_at(60, early) for _ in range(4)]
+        + [_mk_trade_at(-20, early) for _ in range(3)]
+        + [_mk_trade_at(50, late) for _ in range(4)]
+        + [_mk_trade_at(-25, late) for _ in range(3)]
+    )
+    rep = bt._split_report(trades, mid, full_verdict="edge")
+    assert rep is not None
+    assert rep["train"]["n_trades"] == 7 and rep["test"]["n_trades"] == 7
+    assert rep["train"]["expectancy"] > 0 and rep["test"]["expectancy"] > 0
+    assert rep["robust"] is True
+
+
+def test_split_report_not_robust_when_one_half_dies():
+    """A config that shines in one half and dies in the other is noise, not
+    edge — the exact pattern the guard exists to catch (e.g. a PF carried by
+    two large wins clustered in one half of the window)."""
+    mid = _AT + timedelta(days=10)
+    early, late = _AT, mid + timedelta(days=1)
+    trades = [_mk_trade_at(400, early) for _ in range(6)] + [  # all the profit early
+        _mk_trade_at(-40, late) for _ in range(6)
+    ]  # steady bleed late
+    rep = bt._split_report(trades, mid, full_verdict="edge")
+    assert rep["train"]["expectancy"] > 0
+    assert rep["test"]["expectancy"] < 0
+    assert rep["robust"] is False
+
+
+def test_split_report_thin_half_cannot_certify():
+    mid = _AT + timedelta(days=10)
+    trades = [_mk_trade_at(50, _AT) for _ in range(2)] + [
+        _mk_trade_at(50, mid + timedelta(days=1)) for _ in range(18)
+    ]
+    rep = bt._split_report(trades, mid, full_verdict="edge")
+    assert rep["train"]["n_trades"] == 2  # below the per-half floor
+    assert rep["robust"] is False
+
+
+def test_split_report_requires_full_window_edge():
+    mid = _AT + timedelta(days=10)
+    trades = [_mk_trade_at(10, _AT) for _ in range(10)] + [
+        _mk_trade_at(10, mid + timedelta(days=1)) for _ in range(10)
+    ]
+    assert bt._split_report(trades, mid, full_verdict="insufficient")["robust"] is False
+    assert bt._split_report(trades, mid, full_verdict="edge")["robust"] is True
+    assert bt._split_report(trades, None, full_verdict="edge") is None
+
+
+def test_summarize_bot_carries_the_split():
+    runner = _runner_with(_StubBot(None))
+    runner.trades = [_mk_trade_at(100, _AT), _mk_trade_at(-50, _AT + timedelta(days=2))]
+    rep = bt.summarize_bot(runner, split_at=_AT + timedelta(days=1))
+    assert rep["split"]["train"]["n_trades"] == 1
+    assert rep["split"]["test"]["n_trades"] == 1
+    assert rep["split"]["robust"] is False  # insufficient full-window verdict

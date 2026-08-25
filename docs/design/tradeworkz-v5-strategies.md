@@ -493,6 +493,36 @@ vanna_vol_crush_rider posture) — the next lever for any of them is a
 `tw_execution_sweep` grid with the train/test split, not further ad-hoc
 loosening.
 
+### 7.3 Path to live — the promotion runbook
+
+The screen now reports the overfitting guard directly: every per-bot result
+carries a `split` block — the window-midpoint TRAIN/TEST halves with per-half
+trades/expectancy/PF and a `robust` flag (same semantics as the execution
+sweep: full-window "edge" verdict AND positive expectancy in BOTH halves AND
+≥ 6 trades per half). One command now answers the whole checklist.
+
+A bot goes live when — and only when — on the longest available window:
+
+1. `verdict == "edge"` (PF ≥ 1.1, positive expectancy, ≥ 20 trades), and
+2. `split.robust == true` (a PF carried by a lucky cluster in one half is
+   noise, not edge, whatever the headline number says), and
+3. its expectancy clears realistic friction the harness omits (~$2.60
+   round-trip commissions on a 2-leg vertical) with room to spare.
+
+**Mechanics** (unchanged from the v4 gate): move the bot's spec from
+`CANDIDATE_SPECS` into `DEFAULT_ROSTER` in `src/tradeworkz/registry.py`
+(leave it out of `RETIRED_BOT_IDS`) — the engine provisions it on the next
+boot with its capital sleeve, and every live guardrail applies from the
+first tick: the premium stop, the structural/time stops, the bias veto, the
+daily-kill basis, and the auto-disable circuit breaker on a sustained
+losing streak.
+
+**After promotion:** the screen's verdict is a hypothesis the live engine
+now tests forward. Watch live PF vs the screen's PF in `tradeworkz-review`
+for the first ~2 weeks; a live read far below the screen is the
+auto-disable's job, not a reason to re-tune the entry. Promote ONE bot at a
+time so its live record is attributable.
+
 ---
 
 ## 8. What shipped with this doc
