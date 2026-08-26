@@ -132,12 +132,33 @@ arrive, prices are simply old.
 make ts-whoami
 ```
 
-Prints the username the deployment is authenticated as (decoded from the
-access token's claims; the token itself is never printed). Match it against
-the username carrying the entitlement. If they differ, restarting will not
-move the entitlement across — re-run the OAuth authorisation flow signed in as
-the entitled username and replace `TRADESTATION_REFRESH_TOKEN` with the new
-value.
+Prints the username behind each credential (decoded from the access token's
+claims; the token itself is never printed). Match the futures one against the
+username carrying the CME entitlement.
+
+If they differ, restarting will not move the entitlement across — and
+**repointing `TRADESTATION_REFRESH_TOKEN` at the entitled username is the wrong
+fix.** That one token also drives option chains, equity and index bars,
+VIX/VXN, session levels and every backfill tool, so it would trade a ten-minute
+ES delay for silently unentitled option ingestion: the same invisible failure,
+across everything instead of two symbols.
+
+Give the futures feeds their own identity instead:
+
+```bash
+# 1. mint a token while signed in as the CME-entitled username
+python setup/app/get_tradestation_tokens.py     # do NOT let it overwrite .env
+
+# 2. in .env — read only by the futures ingester and futures backfill
+TRADESTATION_FUTURES_REFRESH_TOKEN=<the new token>
+
+# 3. confirm both identities, then restart
+make ts-whoami && make services-restart
+```
+
+Unset, it falls back to the main credential and nothing changes, so this costs
+single-username deployments nothing. It also splits the load across two
+per-account stream caps, which buys back the two slots Step 2 spends.
 
 If they match, the entitlement simply has not propagated yet. TradeStation's
 own guidance is to sign out and back in after 10–15 minutes; the API

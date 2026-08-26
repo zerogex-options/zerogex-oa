@@ -68,7 +68,7 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from src.config import _getenv_str
+from src.config import _getenv_str, futures_tradestation_credentials
 from src.database import db_connection, close_connection_pool
 from src.symbols import resolve_index_future
 from src.tools.underlying_backfill import _chunk_ranges, _et_span, _safe_bigint
@@ -247,11 +247,10 @@ def backfill(
     session_template = session_template or _getenv_str("FUTURES_SESSION_TEMPLATE", "Default")
     _warn_if_retention_will_delete(start)
 
-    client = TradeStationClient(
-        os.getenv("TRADESTATION_CLIENT_ID", ""),
-        os.getenv("TRADESTATION_CLIENT_SECRET", ""),
-        os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
-    )
+    # Same credential the live futures ingester uses, so a backfill cannot
+    # silently run under a username with a different CME entitlement than the
+    # stream it is filling gaps for.
+    client = TradeStationClient(*futures_tradestation_credentials())
 
     written = 0
     for index_symbol in index_symbols:

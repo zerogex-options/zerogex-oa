@@ -63,3 +63,86 @@ def test_the_report_never_contains_the_token():
 def test_expiry_is_rendered_as_a_readable_instant():
     out = describe(decode_jwt_payload(_jwt({"exp": 1787000000})))
     assert "2026-" in out
+
+
+# --- two usernames, two entitlements ---------------------------------------
+#
+# The account holder runs two TradeStation usernames against one API app,
+# deliberately, to split the per-account stream cap. Entitlements followed the
+# usernames rather than the app: real-time CME landed on one, while the equity
+# / index / OPRA entitlements the rest of the platform depends on stayed on the
+# other. One global refresh token cannot see both.
+
+
+def test_the_futures_feeds_fall_back_to_the_main_credential(monkeypatch):
+    """The single-username deployment must be unchanged by any of this."""
+    from src.config import futures_credentials_are_separate, futures_tradestation_credentials
+
+    monkeypatch.setenv("TRADESTATION_CLIENT_ID", "app")
+    monkeypatch.setenv("TRADESTATION_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("TRADESTATION_REFRESH_TOKEN", "main-token")
+    monkeypatch.delenv("TRADESTATION_FUTURES_REFRESH_TOKEN", raising=False)
+
+    assert futures_tradestation_credentials() == ("app", "secret", "main-token")
+    assert futures_credentials_are_separate() is False
+
+
+def test_only_the_refresh_token_has_to_be_overridden(monkeypatch):
+    """Both usernames sit under the SAME API application, so the id/secret are
+    shared and the second identity is one extra line in .env."""
+    from src.config import futures_credentials_are_separate, futures_tradestation_credentials
+
+    monkeypatch.setenv("TRADESTATION_CLIENT_ID", "app")
+    monkeypatch.setenv("TRADESTATION_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("TRADESTATION_REFRESH_TOKEN", "main-token")
+    monkeypatch.setenv("TRADESTATION_FUTURES_REFRESH_TOKEN", "cme-token")
+
+    assert futures_tradestation_credentials() == ("app", "secret", "cme-token")
+    assert futures_credentials_are_separate() is True
+
+
+def test_a_separate_api_application_is_also_supported(monkeypatch):
+    """Less common, but each field falls back independently rather than
+    forcing all-or-nothing."""
+    from src.config import futures_tradestation_credentials
+
+    monkeypatch.setenv("TRADESTATION_CLIENT_ID", "app")
+    monkeypatch.setenv("TRADESTATION_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("TRADESTATION_REFRESH_TOKEN", "main-token")
+    monkeypatch.setenv("TRADESTATION_FUTURES_CLIENT_ID", "app2")
+    monkeypatch.setenv("TRADESTATION_FUTURES_REFRESH_TOKEN", "cme-token")
+
+    assert futures_tradestation_credentials() == ("app2", "secret", "cme-token")
+
+
+def test_the_same_token_repeated_is_not_treated_as_separate(monkeypatch):
+    """Pasting the main token into the futures var is a no-op, not a second
+    account — it would otherwise report two identities that are one."""
+    from src.config import futures_credentials_are_separate
+
+    monkeypatch.setenv("TRADESTATION_REFRESH_TOKEN", "same")
+    monkeypatch.setenv("TRADESTATION_FUTURES_REFRESH_TOKEN", "same")
+    assert futures_credentials_are_separate() is False
+
+
+def test_a_blank_futures_token_falls_back_rather_than_authenticating_as_nobody(monkeypatch):
+    """An empty var in .env must not blank the credential and take ES/NQ down."""
+    from src.config import futures_credentials_are_separate, futures_tradestation_credentials
+
+    monkeypatch.setenv("TRADESTATION_CLIENT_ID", "app")
+    monkeypatch.setenv("TRADESTATION_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("TRADESTATION_REFRESH_TOKEN", "main-token")
+    monkeypatch.setenv("TRADESTATION_FUTURES_REFRESH_TOKEN", "")
+
+    assert futures_tradestation_credentials() == ("app", "secret", "main-token")
+    assert futures_credentials_are_separate() is False
+
+
+def test_the_username_is_found_under_a_namespaced_claim():
+    """TradeStation carries it as http://tradestation.com/username, which is
+    how this deployment turned out to be running as the wrong account."""
+    from src.tools.tradestation_whoami import username_of
+
+    assert username_of({"http://tradestation.com/username": "mikejb124"}) == "mikejb124"
+    assert username_of({"preferred_username": "mikejb124b"}) == "mikejb124b"
+    assert username_of({"sub": "auth0|1"}) is None
