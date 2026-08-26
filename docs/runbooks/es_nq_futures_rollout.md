@@ -114,6 +114,37 @@ real-time control — don't use SPX/NDX, which don't print before 09:30.
 | ~1 min | growing across both runs | the stream is dying, not delayed. See Step 2 |
 | ~1 min | no rows | not entitled |
 
+**Entitlements attach to a USERNAME, not to the API application.** OAuth splits
+the two, and the split is easy to miss:
+
+```
+TRADESTATION_CLIENT_ID / _SECRET   identify the APP
+TRADESTATION_REFRESH_TOKEN         identifies the USER who authorised it
+```
+
+An account holder with two TradeStation usernames can therefore add real-time
+CME to one of them, restart everything, and keep receiving delayed quotes
+indefinitely — because the refresh token in `.env` was minted by the *other*
+username. Nothing in the API's behaviour says so: streams connect, bars
+arrive, prices are simply old.
+
+```bash
+make ts-whoami
+```
+
+Prints the username the deployment is authenticated as (decoded from the
+access token's claims; the token itself is never printed). Match it against
+the username carrying the entitlement. If they differ, restarting will not
+move the entitlement across — re-run the OAuth authorisation flow signed in as
+the entitled username and replace `TRADESTATION_REFRESH_TOKEN` with the new
+value.
+
+If they match, the entitlement simply has not propagated yet. TradeStation's
+own guidance is to sign out and back in after 10–15 minutes; the API
+equivalent is a fresh ACCESS token, which the auth layer mints from the
+refresh token roughly every 20 minutes anyway — so waiting is usually enough,
+and `make services-restart` forces it immediately.
+
 A delayed feed is not a code fault and there is no config that fixes it
 honestly: `FUTURES_QUOTE_STALE_MINUTES` can be raised above the delay to stop
 the flapping, but the terminal then presents 10-minute-old data as live, which
