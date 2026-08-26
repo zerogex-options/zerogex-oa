@@ -3083,6 +3083,11 @@ futures-backfill: ## Backfill historical 1-min ES/NQ bars into futures_quotes. S
 		--end $(END) \
 		$(if $(filter yes,$(DRY_RUN)),--dry-run)
 
+.PHONY: ts-whoami
+ts-whoami: ## Which TradeStation USERNAME is TRADESTATION_REFRESH_TOKEN for? (market-data entitlements attach to the user, not the app)
+	@echo "$(BLUE)=== TradeStation identity ===$(NC)"
+	@$(PY) -m src.tools.tradestation_whoami
+
 .PHONY: flow-series-backfill
 flow-series-backfill: ## Backfill flow_series_5min (current + prior session) before flipping FLOW_SERIES_USE_SNAPSHOT
 	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"
