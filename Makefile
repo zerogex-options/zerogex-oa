@@ -3150,7 +3150,14 @@ DATA_RETENTION_DAYS ?= 90
 # retention-exempt copy that backs the backtesting platform (see
 # src/tools/backtest_archive.py and docs/design/backtesting-platform.md). Do
 # NOT add it here; doing so would delete exactly the history backtests rely on.
-DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
+# NOTE: underlying_quotes and gex_summary are ALSO retention-exempt (removed
+# 2026-08-25). They are the two snapshot sources the TradeWorkz screen rebuilds
+# history from, and pruning them capped every screen at a rolling ~90 days —
+# candidate bots were losing validated trades off the back of the window as
+# fast as new sessions accrued, so low-frequency strategies could never reach
+# a verdict. Both tables are tiny (~1 row/min/symbol ≈ a few hundred K rows a
+# year); the bulky per-contract/per-strike tables below stay pruned.
+DB_MAINTAIN_TABLES = option_chains gex_by_strike \
 	flow_contract_facts flow_by_contract \
 	flow_smart_money trade_signals \
 	position_optimizer_signals
