@@ -3089,7 +3089,8 @@ probe-option-batches: ## Find the option-quote batch size TradeStation still ans
 	@$(PY) -m src.tools.probe_option_quote_batches \
 		--underlying $(or $(UNDERLYING),SPY) \
 		$(if $(SIZES),--sizes $(SIZES),) \
-		$(if $(REPEAT),--repeat $(REPEAT),)
+		$(if $(REPEAT),--repeat $(REPEAT),) \
+		$(if $(CREDENTIAL),--credential $(CREDENTIAL),)
 
 .PHONY: ts-whoami
 ts-whoami: ## Which TradeStation USERNAME is TRADESTATION_REFRESH_TOKEN for? (market-data entitlements attach to the user, not the app)

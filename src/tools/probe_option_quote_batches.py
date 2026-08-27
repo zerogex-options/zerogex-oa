@@ -97,6 +97,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--underlying", default="SPY")
     parser.add_argument("--sizes", default=_DEFAULT_SIZES)
     parser.add_argument("--repeat", type=int, default=1, help="Rounds, to spot flakiness")
+    parser.add_argument(
+        "--credential",
+        choices=("main", "futures"),
+        default="main",
+        help="Which TradeStation identity to probe with. Running BOTH separates "
+        "'their infrastructure is degraded' from 'something changed on one of my "
+        "accounts' — the two look identical from a single account.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -117,19 +125,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"No recent {args.underlying} contracts in option_chains.", file=sys.stderr)
         return 1
 
-    # The MAIN credential — the one option ingestion uses. Deliberately not the
-    # futures credential: this is about the option quote endpoint.
     from src.ingestion.tradestation_client import TradeStationClient
+    from src.config import futures_tradestation_credentials
     import os
 
-    client = TradeStationClient(
-        os.getenv("TRADESTATION_CLIENT_ID", ""),
-        os.getenv("TRADESTATION_CLIENT_SECRET", ""),
-        os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
-    )
+    if args.credential == "futures":
+        creds = futures_tradestation_credentials()
+    else:
+        creds = (
+            os.getenv("TRADESTATION_CLIENT_ID", ""),
+            os.getenv("TRADESTATION_CLIENT_SECRET", ""),
+            os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
+        )
+    client = TradeStationClient(*creds)
+
+    # Name the account being probed. A 504 rate that differs between two
+    # identities on the SAME application, same endpoint, same minute is an
+    # account-level fact; an identical rate is an infrastructure one.
+    try:
+        from src.tools.tradestation_whoami import decode_jwt_payload, username_of
+
+        who = username_of(decode_jwt_payload(client.auth.get_access_token()))
+    except Exception:
+        who = None
 
     print("=" * 68)
     print(f"Option quote probe — {args.underlying}, {args.repeat} round(s)")
+    print(f"credential: {args.credential}   username: {who or '(unknown)'}")
     print("=" * 68)
 
     # Every size, every round. An earlier version stopped climbing at the first
