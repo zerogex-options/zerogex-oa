@@ -3084,6 +3084,14 @@ futures-backfill: ## Backfill historical 1-min ES/NQ bars into futures_quotes. S
 		--end $(END) \
 		$(if $(filter yes,$(DRY_RUN)),--dry-run)
 
+.PHONY: probe-option-batches
+probe-option-batches: ## Find the option-quote batch size TradeStation still answers. UNDERLYING=SPY SIZES=1,10,50,100 REPEAT=1
+	@echo "$(BLUE)=== Option quote batch probe ===$(NC)"
+	@$(PY) -m src.tools.probe_option_quote_batches \
+		--underlying $(or $(UNDERLYING),SPY) \
+		$(if $(SIZES),--sizes $(SIZES),) \
+		$(if $(REPEAT),--repeat $(REPEAT),)
+
 .PHONY: ts-whoami
 ts-whoami: ## Which TradeStation USERNAME is TRADESTATION_REFRESH_TOKEN for? (market-data entitlements attach to the user, not the app)
 	@echo "$(BLUE)=== TradeStation identity ===$(NC)"
