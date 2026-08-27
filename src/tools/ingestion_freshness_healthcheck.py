@@ -201,20 +201,36 @@ def _fetch_last_chain_writes(symbols: List[str]) -> dict:
     out = {symbol: None for symbol in symbols}
     if not symbols:
         return out
+    # One bounded lookup per symbol, NOT `GROUP BY underlying` with a MAX over
+    # a date range. The grouped form blew the 90s statement timeout on its
+    # first production run -- fired seconds after a services-restart, so four
+    # workers were re-seeding into the same table.
+    #
+    # Its cost scales with the range: option_chains holds every contract of
+    # every underlying for every minute inside DATA_RETENTION_DAYS, and a
+    # 7-day window over that is a lot of index to walk before aggregating.
+    # (A 400k-row reproduction did NOT reproduce the timeout -- Postgres used
+    # the index and finished in under a millisecond -- so the exact trigger is
+    # production scale, write contention, or both.)
+    #
+    # This form sidesteps the question rather than tuning it: ORDER BY
+    # timestamp DESC LIMIT 1 against idx_option_chains_underlying_timestamp
+    # touches one index entry and stops, whatever the table holds.
     with db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT underlying, MAX(timestamp)
-                FROM option_chains
-                WHERE underlying = ANY(%s)
-                  AND timestamp > NOW() - INTERVAL '7 days'
-                GROUP BY underlying
-                """,
-                (symbols,),
-            )
-            for symbol, last_ts in cursor.fetchall():
-                out[symbol] = last_ts
+            for symbol in symbols:
+                cursor.execute(
+                    """
+                    SELECT timestamp
+                    FROM option_chains
+                    WHERE underlying = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                )
+                row = cursor.fetchone()
+                out[symbol] = row[0] if row else None
     return out
 
 
@@ -244,20 +260,24 @@ def _fetch_last_futures_bars(index_symbols: List[str]) -> dict:
     out = {symbol: None for symbol in index_symbols}
     if not index_symbols:
         return out
+    # Same shape as the chains lookup, and for the same reason: futures_quotes
+    # now carries every minute of every CME session inside DATA_RETENTION_DAYS,
+    # where it used to hold a rolling overnight window.
     with db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT index_symbol, MAX(timestamp)
-                FROM futures_quotes
-                WHERE index_symbol = ANY(%s)
-                  AND timestamp > NOW() - INTERVAL '7 days'
-                GROUP BY index_symbol
-                """,
-                (index_symbols,),
-            )
-            for symbol, last_ts in cursor.fetchall():
-                out[symbol] = last_ts
+            for symbol in index_symbols:
+                cursor.execute(
+                    """
+                    SELECT timestamp
+                    FROM futures_quotes
+                    WHERE index_symbol = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                )
+                row = cursor.fetchone()
+                out[symbol] = row[0] if row else None
     return out
 
 
