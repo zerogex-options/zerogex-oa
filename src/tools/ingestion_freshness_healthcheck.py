@@ -113,7 +113,17 @@ def evaluate_feed(
             anchor = last_bar_et
 
     stale = now_et - anchor
-    stale_minutes = round(stale.total_seconds() / 60.0, 1)
+    # Clamp at zero: a bar can legitimately be stamped in the FUTURE. vix_bars
+    # and vxn_bars store TradeStation's raw TimeStamp, which is the bar's
+    # CLOSE, on a 5-minute interval -- so the 09:30-09:35 bar is stamped 09:35
+    # and reads as -3.1 minutes old at 09:31. Reporting a negative staleness is
+    # nonsense on its face and undermines every other line in the report.
+    #
+    # The cost is that this feed's staleness is understated by up to one bar
+    # interval, so a dead VIX stream is caught within ~20 minutes rather than
+    # the nominal 15. Acceptable; over-reporting freshness by one interval is
+    # far better than a report an operator learns to distrust.
+    stale_minutes = max(0.0, round(stale.total_seconds() / 60.0, 1))
     return FeedFreshness(
         feed, symbol, "stale" if stale > max_stale else "fresh", _iso(last_bar), stale_minutes
     )
