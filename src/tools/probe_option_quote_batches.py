@@ -154,33 +154,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         median = times[len(times) // 2] if times else 0.0
         print(f"{size:>6} {len(oks)}/{len(runs):>6} {median:>10.2f} {max(times, default=0):>10.2f}")
 
+    # Recommend from the DISTRIBUTION, not from where the ladder first tripped.
+    # A single failure at one size says nothing; a size that answered every
+    # time across every round is a number you can set.
+    reliable = [size for size in sizes if all(r["ok"] for r in results[size])]
     every = [r for runs in results.values() for r in runs]
     ok_rate = sum(1 for r in every if r["ok"]) / max(1, len(every))
-    fast = [r["seconds"] for r in every if r["ok"] and r["seconds"] < 2]
     slow = [r["seconds"] for r in every if r["seconds"] >= 2]
 
     print("=" * 68)
-    if ok_rate == 1.0 and not slow:
-        print("Every request answered promptly — the endpoint is healthy.")
+    if len(reliable) == len(sizes) and not slow:
+        print("Every size answered promptly — the endpoint is healthy.")
         print("Leave OPTION_BATCH_SIZE alone.")
-    elif not fast:
-        print("Nothing answered promptly — the endpoint is down, not overloaded.")
-        print("No OPTION_BATCH_SIZE helps. Check https://status.tradestation.com;")
-        print("the client's retry/backoff picks it up on recovery.")
+    elif not reliable:
+        print(f"No size answered reliably ({ok_rate:.0%} overall).")
+        print("The endpoint is down rather than overloaded, so no batch size")
+        print("helps. Check https://status.tradestation.com; the client's")
+        print("retry/backoff picks it up on recovery.")
     else:
-        print(f"INTERMITTENT: {ok_rate:.0%} of requests answered.")
-        print(f"  answered      : {len(fast)} requests, all under 2s")
-        print(f"  timed out/slow: {len(slow)} requests, {min(slow):.1f}-{max(slow):.1f}s")
+        best = max(reliable)
+        print(f"Largest size that answered EVERY time: {best}")
+        print(f"Overall success across all sizes: {ok_rate:.0%}")
         print()
-        print("Requests either answer in well under a second or hang on a fixed")
-        print("server-side deadline — there is no middle. That is a degraded")
-        print("upstream, not a size limit, so shrinking OPTION_BATCH_SIZE mostly")
-        print("multiplies the number of requests that can hang.")
+        print(f"    OPTION_BATCH_SIZE={best}       # in .env, then make services-restart")
         print()
-        print("The useful lever is failing FASTER, so a hung request costs seconds")
-        print("instead of tens of seconds:")
-        print("    API_REQUEST_TIMEOUT=8      # currently 30; nothing succeeds slowly")
-        print("Re-run with --repeat 5 for a firmer rate before changing anything.")
+        print("This is a WORKAROUND for a degraded upstream, not a permanent")
+        print("setting: smaller batches mean proportionally more requests. Re-run")
+        print("this probe once the endpoint recovers and restore the larger size.")
     print("=" * 68)
     return 0
 
