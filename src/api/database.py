@@ -2746,6 +2746,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         call_gex/put_gex are the dollar-scaled call/put split (nullable on
         pre-gamma-column rows) that drives the scrubber's Split/Combined views.
 
+        Cost is flat in the size of ``gex_by_strike``: the per-minute ladder is
+        a correlated LATERAL, so the read is ~390 index probes no matter how
+        much history the table holds.  That is load-bearing, not incidental —
+        see the comment on the join for the retention-scaling read it replaced
+        and the timeout it produced.
+
         Returns ``[]`` only when the query ran and the session genuinely has
         no rows.  A failed read (timeout, pool exhaustion, connection loss)
         raises :class:`ReplayFramesUnavailable` rather than passing itself
@@ -2789,29 +2795,32 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
-            -- MATERIALIZED is load-bearing, not stylistic.  ``spot`` below is
-            -- a correlated sub-select over underlying_quotes: one lookup per
+            -- MATERIALIZED, kept as defence in depth.  ``spot`` below is a
+            -- correlated sub-select over underlying_quotes: one lookup per
             -- MINUTE is the whole intent, and the CTE is where that intent
-            -- lives.  Without the keyword PG inlines this CTE, which pushes
-            -- the sub-select down past the gex_by_strike join and substitutes
-            -- it once per REFERENCE -- and ``s.spot`` is referenced four times
-            -- (twice in each of the call_gex / put_gex expressions).  The
-            -- lookup then runs 4 x (minutes x strikes x expirations) times
-            -- instead of once per minute.
+            -- lives.  Without the keyword PG inlines this CTE and substitutes
+            -- the sub-select once per REFERENCE -- and ``s.spot`` is referenced
+            -- four times (twice in each of the call_gex / put_gex expressions).
             --
-            -- Measured on a seeded 5.6M-row gex_by_strike (one SPY session,
-            -- 391 minutes x 51 in-band strikes x 16 expirations): four
-            -- SubPlans at 319,056 loops each -- 1.28M executions, 3,867,893
-            -- buffers, 8,274 ms.  With MATERIALIZED: 391 loops, 40,394
-            -- buffers, 1,158 ms.  7.1x faster, 96x fewer buffers, and the
-            -- result set is byte-identical (19,941 rows, verified row for row).
+            -- When the ladder below was a plain join, inlining pushed those
+            -- four copies BELOW it, so the lookup ran 4 x (minutes x strikes x
+            -- expirations) times instead of once per minute.  Measured then, on
+            -- a seeded 5.6M-row gex_by_strike (one SPY session, 391 minutes x
+            -- 51 in-band strikes x 16 expirations): four SubPlans at 319,056
+            -- loops each -- 1.28M executions, 3,867,893 buffers, 8,274 ms.
+            -- With MATERIALIZED: 391 loops, 40,394 buffers, 1,158 ms.
             --
-            -- It matters because the cost scales on the fan-out dimension
-            -- rather than the session: a chain with more live expirations
-            -- multiplies the loop count for the same 390-minute day, and the
-            -- pool runs with command_timeout=30 / statement_timeout=30000.
-            -- Past that ceiling asyncpg raises, and an empty replay reads to a
-            -- visitor as "the analytics engine did not write that day".
+            -- The ladder is a LATERAL now, and that shape defends the same
+            -- ground from the other side: the sub-select is correlated on the
+            -- OUTER row, so the lateral's own GROUP BY keeps it above the
+            -- gex_by_strike scan and it cannot be pushed under the fan-out even
+            -- when the CTE inlines.  Re-measured on the current shape with the
+            -- keyword stripped: four InitPlans at 391 loops each, 94 ms vs
+            -- 96 ms -- i.e. no longer the thing standing between this read and
+            -- the blow-up.  It stays because it still pins the intent (one
+            -- lookup per minute) at the place the intent is written, and
+            -- because the pool runs command_timeout=30 / statement_timeout=
+            -- 30000 with no margin to spend on rediscovering this.
             session_summary AS MATERIALIZED (
                 SELECT gs.timestamp, gs.gamma_flip_point AS gamma_flip,
                        gs.call_wall, gs.put_wall, gs.max_pain,
@@ -2835,28 +2844,81 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.max_pain,
                 s.pin_strike,
                 s.pin_confidence,
-                gbs.strike,
-                AVG(gbs.net_gex) AS net_gex,
-                AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
-                AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex
+                ladder.strike,
+                ladder.net_gex,
+                ladder.call_gex,
+                ladder.put_gex
             FROM session_summary s
-            LEFT JOIN gex_by_strike gbs
-              ON gbs.underlying = $1
-             AND gbs.timestamp = s.timestamp
-             -- Strike band centered on the session's closing spot; filter
-             -- in SQL so we don't ship every strike (~40k for SPX) over the
-             -- wire.  Missing session_spot (rare — index with no cash quotes
-             -- yet) short-circuits to no-band, matching get_gex_heatmap.
-             AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
-                 <= (SELECT spot_close FROM session_spot) * $4
-            -- call_wall / put_wall / max_pain / pin_strike / pin_confidence are
-            -- functionally dependent on timestamp (one gex_summary row per
-            -- minute) but must be listed in GROUP BY because they're not
-            -- aggregated.  s.spot is likewise per-timestamp; it only appears
-            -- inside AVG(...) so it needs no GROUP BY entry.
-            GROUP BY s.timestamp, s.gamma_flip, s.call_wall, s.put_wall, s.max_pain,
-                     s.pin_strike, s.pin_confidence, gbs.strike
-            ORDER BY s.timestamp ASC, gbs.strike ASC
+            -- The per-minute strike ladder is a LATERAL probe, not a join, and
+            -- that is structural rather than stylistic.
+            --
+            -- ``session_summary`` is an optimisation fence (MATERIALIZED, see
+            -- above), so the planner cannot see through it to learn that the
+            -- join key is ~390 consecutive minutes of ONE session.  Written as
+            -- a plain ``LEFT JOIN gex_by_strike ON gbs.timestamp = s.timestamp``
+            -- it therefore periodically abandons the intended ~390 index probes
+            -- for a hash/merge join that reads every row this underlying has in
+            -- gex_by_strike -- the whole DATA_RETENTION_DAYS window, because the
+            -- session bound lived only behind the fence.  That is the shape
+            -- behind ``get_gex_frames_for_session(NDX, ...) failed after 31.9s``:
+            -- the read scales with retention, not with the session, so it gets
+            -- slower every day the table grows and it blows command_timeout=30
+            -- on the underlyings with the most stored rows first.  Same
+            -- structural gap, same fallback, same fix as
+            -- get_strike_profile_timeseries (28a2c33) and get_gex_heatmap
+            -- (15cb6c3) -- this read was the last one still carrying it.
+            --
+            -- A lateral reference is evaluated per outer row, and this one
+            -- carries its own GROUP BY, which blocks subquery pull-up: PG cannot
+            -- re-plan it as a hash/merge join over the table or the window.  The
+            -- read is ~390 equality probes whatever else the planner decides.
+            --
+            -- Measured on a seeded 8.4M-row gex_by_strike (90 sessions x 391
+            -- minutes x 40 strikes x 3 expirations, for each of two underlyings)
+            -- with the nested loop forced off -- i.e. the production fallback --
+            -- rows read from gex_by_strike drop from 4,222,800 (every NDX row in
+            -- the table) to 120 x 391, and the read goes 2,204 ms -> 459 ms.
+            -- Under free planning it is also faster: 122 ms -> 93 ms, because
+            -- the aggregate now groups 120 rows per minute instead of sorting
+            -- 46,920 rows under an eight-column group key.  Byte-for-byte
+            -- identical output either way, verified row for row.
+            --
+            -- LEFT JOIN ... ON TRUE, not CROSS JOIN LATERAL: a minute whose
+            -- ladder is empty (no in-band strikes, or gex_by_strike missing for
+            -- that cycle) must still emit its frame, because the frame also
+            -- carries the level lines -- flip, walls, max pain, pin -- and those
+            -- come from gex_summary.  CROSS would drop the minute entirely and
+            -- punch a hole in the scrubber's level path.
+            LEFT JOIN LATERAL (
+                SELECT
+                    gbs.strike,
+                    AVG(gbs.net_gex) AS net_gex,
+                    AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
+                    AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex
+                FROM gex_by_strike gbs
+                WHERE gbs.underlying = $1
+                  AND gbs.timestamp = s.timestamp
+                  -- Logically redundant (every s.timestamp came out of the same
+                  -- [$2, $3) window) and kept as defence in depth: if a future
+                  -- refactor ever makes the lateral pull-uppable, this bound
+                  -- still caps the fallback at the session's rows instead of
+                  -- the retention window's.
+                  AND gbs.timestamp >= $2
+                  AND gbs.timestamp < $3
+                  -- Strike band centered on the session's closing spot; filter
+                  -- in SQL so we don't ship every strike (~40k for SPX) over the
+                  -- wire.  Missing session_spot (rare — index with no cash quotes
+                  -- yet) short-circuits to no-band, matching get_gex_heatmap.
+                  AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
+                      <= (SELECT spot_close FROM session_spot) * $4
+                -- One row per strike, AVG across that minute's expirations --
+                -- identical to the old GROUP BY (s.timestamp, ..., gbs.strike),
+                -- since the lateral only ever sees one timestamp.  The summary
+                -- columns no longer need to ride along in a GROUP BY just to
+                -- survive the aggregate; they are projected straight from s.
+                GROUP BY gbs.strike
+            ) ladder ON TRUE
+            ORDER BY s.timestamp ASC, ladder.strike ASC
         """
         started = time_module.monotonic()
         try:
