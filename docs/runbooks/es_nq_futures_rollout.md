@@ -123,6 +123,69 @@ real-time control — don't use SPX/NDX, which don't print before 09:30.
 | ~1 min | growing across both runs | the stream is dying, not delayed. See Step 2 |
 | ~1 min | no rows | not entitled |
 
+**Entitlements attach to a USERNAME, not to the API application.** OAuth splits
+the two, and the split is easy to miss:
+
+```
+TRADESTATION_CLIENT_ID / _SECRET   identify the APP
+TRADESTATION_REFRESH_TOKEN         identifies the USER who authorised it
+```
+
+An account holder with two TradeStation usernames can therefore add real-time
+CME to one of them, restart everything, and keep receiving delayed quotes
+indefinitely — because the refresh token in `.env` was minted by the *other*
+username. Nothing in the API's behaviour says so: streams connect, bars
+arrive, prices are simply old.
+
+```bash
+make ts-whoami
+```
+
+Prints the username behind each credential (decoded from the access token's
+claims; the token itself is never printed). Match the futures one against the
+username carrying the CME entitlement.
+
+If they differ, restarting will not move the entitlement across — and
+**repointing `TRADESTATION_REFRESH_TOKEN` at the entitled username is the wrong
+fix.** That one token also drives option chains, equity and index bars,
+VIX/VXN, session levels and every backfill tool, so it would trade a ten-minute
+ES delay for silently unentitled option ingestion: the same invisible failure,
+across everything instead of two symbols.
+
+Give the futures feeds their own identity instead:
+
+```bash
+# 1. Sign into TradeStation IN YOUR BROWSER as the CME-entitled username
+#    FIRST. The script has no idea which session you are logged into — it
+#    just opens an authorise URL, and whichever username is signed in is the
+#    one the token belongs to.
+#
+#    --var is what keeps the MAIN credential out of the blast radius. Without
+#    it the script rewrites TRADESTATION_REFRESH_TOKEN, which drives option
+#    chains, equity bars and every backfill.
+python setup/app/get_tradestation_tokens.py --var TRADESTATION_FUTURES_REFRESH_TOKEN
+
+# It prints the username it just authorised — check it before going further,
+# and it writes a timestamped .env backup either way.
+
+# 2. confirm both identities, then restart
+make ts-whoami && make services-restart
+```
+
+Expect `ts-whoami` to report two different usernames, one per credential. If
+both read the same, the browser was signed in as the wrong account — re-run
+step 1 after signing in as the other one.
+
+Unset, it falls back to the main credential and nothing changes, so this costs
+single-username deployments nothing. It also splits the load across two
+per-account stream caps, which buys back the two slots Step 2 spends.
+
+If they match, the entitlement simply has not propagated yet. TradeStation's
+own guidance is to sign out and back in after 10–15 minutes; the API
+equivalent is a fresh ACCESS token, which the auth layer mints from the
+refresh token roughly every 20 minutes anyway — so waiting is usually enough,
+and `make services-restart` forces it immediately.
+
 A delayed feed is not a code fault and there is no config that fixes it
 honestly: `FUTURES_QUOTE_STALE_MINUTES` can be raised above the delay to stop
 the flapping, but the terminal then presents 10-minute-old data as live, which

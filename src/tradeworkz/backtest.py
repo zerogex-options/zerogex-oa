@@ -612,11 +612,29 @@ def _load_backtest_bots(conn: Any, bot_ids: Optional[List[str]]) -> List[BotSpec
 
 
 def _chain_window(conn: Any) -> Tuple[Optional[datetime], Optional[datetime]]:
-    """Min / max option_chains timestamp — the quotable coverage window."""
+    """Quotable coverage window: hot ∪ archive option-chain timestamps.
+
+    The leg pricer already falls back to ``option_chains_archive`` per quote,
+    but the replay window used to clamp to the HOT table only — so the 90-day
+    prune capped every screen at a rolling window and low-frequency candidates
+    lost trades off the back as fast as they accrued new ones. The clamp now
+    spans both tables; steps where the *snapshot* sources are thin still show
+    up honestly as un-priceable in ``steps_with_data`` (a bot never trades on
+    absent data).
+    """
     cur = conn.cursor()
     cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM option_chains")
     row = cur.fetchone()
-    return (row[0], row[1]) if row else (None, None)
+    lo, hi = (row[0], row[1]) if row else (None, None)
+    if _archive_available(conn):
+        cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM option_chains_archive")
+        arow = cur.fetchone()
+        alo, ahi = (arow[0], arow[1]) if arow else (None, None)
+        if alo is not None:
+            lo = alo if lo is None else min(lo, alo)
+        if ahi is not None:
+            hi = ahi if hi is None else max(hi, ahi)
+    return (lo, hi)
 
 
 def run_fleet_backtest(

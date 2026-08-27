@@ -478,6 +478,21 @@ def test_split_report_requires_full_window_edge():
     assert bt._split_report(trades, None, full_verdict="edge") is None
 
 
+def test_chain_window_spans_hot_and_archive():
+    t0, t1 = _AT - timedelta(days=200), _AT - timedelta(days=80)
+    t2, t3 = _AT - timedelta(days=90), _AT
+    # Archive reaches further back than the pruned hot table: the clamp must
+    # span both so screens are not capped at the hot table's rolling window.
+    conn = _Conn(_Cur(archive=True, live_row=(t2, t3), archive_row=(t0, t1)))
+    assert bt._chain_window(conn) == (t0, t3)
+
+
+def test_chain_window_hot_only_when_no_archive():
+    t2, t3 = _AT - timedelta(days=90), _AT
+    conn = _Conn(_Cur(archive=False, live_row=(t2, t3), archive_row=(None, None)))
+    assert bt._chain_window(conn) == (t2, t3)
+
+
 def test_summarize_bot_carries_the_split():
     runner = _runner_with(_StubBot(None))
     runner.trades = [_mk_trade_at(100, _AT), _mk_trade_at(-50, _AT + timedelta(days=2))]

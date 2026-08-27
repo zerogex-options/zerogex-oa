@@ -3084,6 +3084,20 @@ futures-backfill: ## Backfill historical 1-min ES/NQ bars into futures_quotes. S
 		--end $(END) \
 		$(if $(filter yes,$(DRY_RUN)),--dry-run)
 
+.PHONY: probe-option-batches
+probe-option-batches: ## Find the option-quote batch size TradeStation still answers. UNDERLYING=SPY SIZES=1,10,50,100 REPEAT=1
+	@echo "$(BLUE)=== Option quote batch probe ===$(NC)"
+	@$(PY) -m src.tools.probe_option_quote_batches \
+		--underlying $(or $(UNDERLYING),SPY) \
+		$(if $(SIZES),--sizes $(SIZES),) \
+		$(if $(REPEAT),--repeat $(REPEAT),) \
+		$(if $(CREDENTIAL),--credential $(CREDENTIAL),)
+
+.PHONY: ts-whoami
+ts-whoami: ## Which TradeStation USERNAME is TRADESTATION_REFRESH_TOKEN for? (market-data entitlements attach to the user, not the app)
+	@echo "$(BLUE)=== TradeStation identity ===$(NC)"
+	@$(PY) -m src.tools.tradestation_whoami
+
 .PHONY: flow-series-backfill
 flow-series-backfill: ## Backfill flow_series_5min (current + prior session) before flipping FLOW_SERIES_USE_SNAPSHOT
 	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"
@@ -3150,7 +3164,14 @@ DATA_RETENTION_DAYS ?= 90
 # retention-exempt copy that backs the backtesting platform (see
 # src/tools/backtest_archive.py and docs/design/backtesting-platform.md). Do
 # NOT add it here; doing so would delete exactly the history backtests rely on.
-DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
+# NOTE: underlying_quotes and gex_summary are ALSO retention-exempt (removed
+# 2026-08-25). They are the two snapshot sources the TradeWorkz screen rebuilds
+# history from, and pruning them capped every screen at a rolling ~90 days —
+# candidate bots were losing validated trades off the back of the window as
+# fast as new sessions accrued, so low-frequency strategies could never reach
+# a verdict. Both tables are tiny (~1 row/min/symbol ≈ a few hundred K rows a
+# year); the bulky per-contract/per-strike tables below stay pruned.
+DB_MAINTAIN_TABLES = option_chains gex_by_strike \
 	flow_contract_facts flow_by_contract \
 	flow_smart_money trade_signals \
 	position_optimizer_signals

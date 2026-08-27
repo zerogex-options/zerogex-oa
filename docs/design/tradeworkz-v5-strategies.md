@@ -523,6 +523,54 @@ for the first ~2 weeks; a live read far below the screen is the
 auto-disable's job, not a reason to re-tune the entry. Promote ONE bot at a
 time so its live record is attributable.
 
+### 7.4 Fourth screen (2026-08-25) — the split flag vetoes a promotion; the rolling window becomes the binding constraint
+
+First screen with the split block, and it vetoed a promotion the headline
+would have allowed: `profile_shelf_breaker` reached 18 trades at PF 1.23 /
++$267, but split as train **0.70 PF / −$274** vs test **3.09 PF / +$541** —
+`robust: false`. The equity curve says why: essentially the entire edge is
+one +$799 cascade. Sixteen small losses and two big wins is not yet evidence
+that the cascades systematically repay the bleed; it is evidence the sample
+needs more cascades. **No promotion.** (`dual_flip` also split negative on
+its test half; `settlement`'s rolling trade set went back underwater —
+its ~$0-expectancy is honest for a bot whose wins are spread-sized.)
+
+**The deeper finding is in the window bounds.** `chain_min` across the four
+screens: 06-15 → 06-18 → 06-22 → 06-26 — the 90-day prune was deleting
+history as fast as new sessions accrued, so every screen was a rolling ~60
+days FOREVER and a low-frequency candidate could never accumulate to a
+verdict (shelf gained one net trade in a week: new sessions in, old trades
+off the back). Two changes land with this note:
+
+1. `underlying_quotes` and `gex_summary` are now retention-exempt (removed
+   from `DB_MAINTAIN_TABLES`) — they are the two snapshot sources the screen
+   rebuilds history from, and both are tiny (~1 row/min/symbol). The bulky
+   per-contract tables stay pruned.
+2. The replay clamp (`_chain_window`) now spans hot ∪ archive option-chain
+   coverage — the leg pricer always could read the archive; the window
+   bounds now agree with it.
+
+From today, screen windows GROW instead of rolling: option quotes persist
+via the nightly archive, and the snapshot sources persist in place. Bots
+whose fetchers read the still-pruned bulky tables (`gex_by_strike` buckets,
+`flow_contract_facts` microstructure) simply read None beyond 90 days and
+abstain — thin coverage, never false edge.
+
+**The strategic unlock is still the vendor data purchase**
+(`docs/design/historical-options-data-vendors.md`): one backfill of
+`option_chains_archive` plus the underlying/gex backfills turns an
+18-trades-per-60-days bot into a 100+-trade, multi-regime verdict in a
+single run — the difference between months of forward waiting and one
+afternoon. It is the highest-leverage spend available toward a live,
+publicly-credible bot.
+
+**Meanwhile, the weekly re-screen IS the forward validation.** The harness
+replays the frozen configs' exact decisions as-of each instant, so every
+re-screen's new sessions are genuine out-of-sample results — a shadow
+track record accumulating without risking a public stumble. Keep the
+cadence; promote when a bot clears all three §7.3 conditions on a window
+long enough to mean it.
+
 ---
 
 ## 8. What shipped with this doc
