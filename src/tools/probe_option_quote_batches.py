@@ -44,18 +44,30 @@ _DEFAULT_SIZES = "1,5,10,25,50,75,100"
 
 
 def fetch_symbols(underlying: str, needed: int) -> List[str]:
-    """Real contract symbols the ingester would actually request."""
+    """LIVE contract symbols the ingester would actually request.
+
+    ``expiration >= CURRENT_DATE`` is the whole point. Ordering by
+    ``option_symbol`` alone sorts by the date embedded in the symbol, so the
+    alphabetically-first rows are the OLDEST expiries in the table — already
+    dead, and rejected with ``FAILED, INVALID SYMBOL``. A probe built to
+    measure endpoint health was measuring its own bad input, and reported it
+    as "their backend is struggling".
+
+    Nearest live expiry first: that is the most liquid part of the chain and
+    the part the seed spends most of its requests on.
+    """
     from src.database import db_connection
 
     with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT DISTINCT option_symbol
+            SELECT DISTINCT option_symbol, expiration
             FROM option_chains
             WHERE underlying = %s
               AND timestamp > NOW() - INTERVAL '3 days'
-            ORDER BY option_symbol
+              AND expiration >= CURRENT_DATE
+            ORDER BY expiration ASC, option_symbol
             LIMIT %s
             """,
             (underlying.upper(), needed),
@@ -192,8 +204,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     refused = [r for r in every if not r["ok"] and r["seconds"] < 2]
     timed_out = [r for r in every if not r["ok"] and r["seconds"] >= 2]
 
+    invalid = [r for r in every if "INVALID SYMBOL" in r["detail"].upper()]
+
     print("=" * 68)
-    if refused and not timed_out:
+    if invalid:
+        print(f"{len(invalid)} request(s) were rejected as INVALID SYMBOL.")
+        print("These contracts have expired, so this measures the probe's own")
+        print("input rather than the endpoint. Nothing is wrong with the feed.")
+        print("Re-run — fetch_symbols now filters to expiration >= CURRENT_DATE.")
+        print(f"First error: {invalid[0]['detail'][:160]}")
+    elif refused and not timed_out:
         print(f"Every request was REFUSED in under two seconds ({len(refused)} of them).")
         print("That is a rejection, not a timeout — the server never tried. The")
         print("usual cause is this credential lacking the market-data entitlement")
