@@ -73,28 +73,30 @@ Reference: `src/jobs/futures_projection.py`, `src/api/futures_middleware.py`.
 **1a. CME market-data entitlement on the TradeStation account —
 REAL-TIME, not delayed.**
 
-> **Status: real-time CME purchased (2026-08-27).** The rollout ran on the
-> delayed package. `FUTURES_REALTIME_PENDING` in
-> `frontend/core/futuresDataStatus.ts` (zerogex-web) is `false` to match, so
-> the site no longer discloses a standing delay.
+> **Status: real-time CME live and confirmed (2026-08-27).** The rollout ran
+> on the delayed package; ES/NQ now print in real time.
+> `FUTURES_REALTIME_PENDING` in `frontend/core/futuresDataStatus.ts`
+> (zerogex-web) is `false` to match, so the site no longer discloses a standing
+> delay.
 >
-> **Buying the entitlement is not the same as receiving it**, and this section
-> is largely about the gap between the two. Confirm all three before treating
-> the cutover as done:
+> Everything below is now a DIAGNOSTIC path rather than a rollout step — read
+> it if ES/NQ ever start lagging again, in this order:
 >
 > 1. `make ts-whoami` — the FUTURES credential must report the username that
->    carries the CME entitlement. An entitlement added to the *other* username
->    of the same account changes nothing, silently (see below).
+>    carries the CME entitlement. Entitlements attach to a username, so one
+>    added to the account's *other* username changes nothing, silently.
 > 2. The freshness query below, run twice during the cash session — ES/NQ
 >    should read ~1 min, not a fixed ~10.
-> 3. No deployed `.env` still raises `FUTURES_QUOTE_STALE_MINUTES` above `5`.
->    If one was bumped to stop the flapping on the delayed feed, it now hides a
->    real outage: with real-time entitled, `stale` means the feed has DIED.
+> 3. `FUTURES_QUOTE_STALE_MINUTES` must stay at `5` in every deployed `.env`.
+>    Raising it was a way to stop the flapping on the delayed feed; now that
+>    real-time is live it would only hide a real outage, because `stale` has
+>    gone back to meaning the feed has DIED.
 >
-> Until 1 and 2 hold, the site is claiming real-time over a delayed feed. That
-> is not silent — the delay badge is measured from each quote's own age, so it
-> still appears — but it will name the wrong cause, reporting a stalled feed
-> where the truth is an unentitled credential.
+> Note the asymmetry that makes step 1 first: a lagging feed and an unentitled
+> credential look identical from the API, and only `ts-whoami` separates them.
+> The delay badge still fires either way (it is measured from each quote's own
+> age), but with the flag false it now attributes the lag to a stalled feed —
+> correct for an outage, misleading for an entitlement that lapsed.
 
 Futures data is a separate exchange subscription from equities/indices, and it
 fails in two different ways.
