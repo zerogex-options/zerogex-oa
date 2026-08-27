@@ -146,15 +146,26 @@ across everything instead of two symbols.
 Give the futures feeds their own identity instead:
 
 ```bash
-# 1. mint a token while signed in as the CME-entitled username
-python setup/app/get_tradestation_tokens.py     # do NOT let it overwrite .env
+# 1. Sign into TradeStation IN YOUR BROWSER as the CME-entitled username
+#    FIRST. The script has no idea which session you are logged into — it
+#    just opens an authorise URL, and whichever username is signed in is the
+#    one the token belongs to.
+#
+#    --var is what keeps the MAIN credential out of the blast radius. Without
+#    it the script rewrites TRADESTATION_REFRESH_TOKEN, which drives option
+#    chains, equity bars and every backfill.
+python setup/app/get_tradestation_tokens.py --var TRADESTATION_FUTURES_REFRESH_TOKEN
 
-# 2. in .env — read only by the futures ingester and futures backfill
-TRADESTATION_FUTURES_REFRESH_TOKEN=<the new token>
+# It prints the username it just authorised — check it before going further,
+# and it writes a timestamped .env backup either way.
 
-# 3. confirm both identities, then restart
+# 2. confirm both identities, then restart
 make ts-whoami && make services-restart
 ```
+
+Expect `ts-whoami` to report two different usernames, one per credential. If
+both read the same, the browser was signed in as the wrong account — re-run
+step 1 after signing in as the other one.
 
 Unset, it falls back to the main credential and nothing changes, so this costs
 single-username deployments nothing. It also splits the load across two
