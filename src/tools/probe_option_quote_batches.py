@@ -131,32 +131,56 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("=" * 68)
     print(f"Option quote probe — {args.underlying}, {args.repeat} round(s)")
     print("=" * 68)
-    print(f"{'batch':>6}  {'result':<8} {'seconds':>8} {'quotes':>7}  detail")
 
-    worst_ok = 0
-    for _ in range(max(1, args.repeat)):
+    # Every size, every round. An earlier version stopped climbing at the first
+    # failure and reported that size as a threshold — but these failures are
+    # INTERMITTENT, so one unlucky request read as a cliff and produced a
+    # confident, wrong recommendation. A rate needs more than one sample.
+    results: dict = {size: [] for size in sizes}
+    for round_no in range(1, max(1, args.repeat) + 1):
         for size in sizes:
             r = probe(client, symbols, size)
-            status = "OK" if r["ok"] else "FAILED"
-            print(
-                f"{r['size']:>6}  {status:<8} {r['seconds']:>8.2f} {r['quotes']:>7}  {r['detail']}"
-            )
-            if r["ok"]:
-                worst_ok = max(worst_ok, size)
-            else:
-                break  # bigger sizes will not do better
+            results[size].append(r)
+            status = "OK" if r["ok"] else "FAIL"
+            print(f"  round {round_no}  batch {size:>4}  {status:<5} {r['seconds']:>7.2f}s")
             time.sleep(0.3)
 
+    print()
+    print(f"{'batch':>6} {'ok':>8} {'median s':>10} {'slowest s':>10}")
+    for size in sizes:
+        runs = results[size]
+        oks = [r for r in runs if r["ok"]]
+        times = sorted(r["seconds"] for r in runs)
+        median = times[len(times) // 2] if times else 0.0
+        print(f"{size:>6} {len(oks)}/{len(runs):>6} {median:>10.2f} {max(times, default=0):>10.2f}")
+
+    every = [r for runs in results.values() for r in runs]
+    ok_rate = sum(1 for r in every if r["ok"]) / max(1, len(every))
+    fast = [r["seconds"] for r in every if r["ok"] and r["seconds"] < 2]
+    slow = [r["seconds"] for r in every if r["seconds"] >= 2]
+
     print("=" * 68)
-    if worst_ok == 0:
-        print("Every size failed — the quote endpoint is down, not overloaded.")
-        print("No OPTION_BATCH_SIZE helps. Check https://status.tradestation.com")
-        print("and re-run. The ingester's retry/backoff will pick it up on recovery.")
+    if ok_rate == 1.0 and not slow:
+        print("Every request answered promptly — the endpoint is healthy.")
+        print("Leave OPTION_BATCH_SIZE alone.")
+    elif not fast:
+        print("Nothing answered promptly — the endpoint is down, not overloaded.")
+        print("No OPTION_BATCH_SIZE helps. Check https://status.tradestation.com;")
+        print("the client's retry/backoff picks it up on recovery.")
     else:
-        print(f"Largest size that answered: {worst_ok}")
-        print(f"Set in .env, then restart:   OPTION_BATCH_SIZE={worst_ok}")
-        print("Smaller batches mean more requests; raise DELAY_BETWEEN_BATCHES")
-        print("(default 0.5s) if that starts drawing rate limits.")
+        print(f"INTERMITTENT: {ok_rate:.0%} of requests answered.")
+        print(f"  answered      : {len(fast)} requests, all under 2s")
+        print(f"  timed out/slow: {len(slow)} requests, {min(slow):.1f}-{max(slow):.1f}s")
+        print()
+        print("Requests either answer in well under a second or hang on a fixed")
+        print("server-side deadline — there is no middle. That is a degraded")
+        print("upstream, not a size limit, so shrinking OPTION_BATCH_SIZE mostly")
+        print("multiplies the number of requests that can hang.")
+        print()
+        print("The useful lever is failing FASTER, so a hung request costs seconds")
+        print("instead of tens of seconds:")
+        print("    API_REQUEST_TIMEOUT=8      # currently 30; nothing succeeds slowly")
+        print("Re-run with --repeat 5 for a firmer rate before changing anything.")
     print("=" * 68)
     return 0
 
