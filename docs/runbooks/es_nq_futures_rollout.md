@@ -73,14 +73,28 @@ Reference: `src/jobs/futures_projection.py`, `src/api/futures_middleware.py`.
 **1a. CME market-data entitlement on the TradeStation account —
 REAL-TIME, not delayed.**
 
-> **Status: real-time CME provisioned (2026-08-27).** The rollout ran on the
-> delayed package; the real-time entitlement is now live, and
-> `FUTURES_REALTIME_PENDING` in `frontend/core/futuresDataStatus.ts`
-> (zerogex-web) is `false` to match. `FUTURES_QUOTE_STALE_MINUTES=5` therefore
-> means "the feed has died" again rather than "the entitlement is delayed" —
-> confirm no deployed `.env` still carries a raised override from the delayed
-> period, or a real outage will read as normal. Re-run the query below if ES/NQ
-> ever start reporting a fixed multi-minute lag again.
+> **Status: real-time CME purchased (2026-08-27).** The rollout ran on the
+> delayed package. `FUTURES_REALTIME_PENDING` in
+> `frontend/core/futuresDataStatus.ts` (zerogex-web) is `false` to match, so
+> the site no longer discloses a standing delay.
+>
+> **Buying the entitlement is not the same as receiving it**, and this section
+> is largely about the gap between the two. Confirm all three before treating
+> the cutover as done:
+>
+> 1. `make ts-whoami` — the FUTURES credential must report the username that
+>    carries the CME entitlement. An entitlement added to the *other* username
+>    of the same account changes nothing, silently (see below).
+> 2. The freshness query below, run twice during the cash session — ES/NQ
+>    should read ~1 min, not a fixed ~10.
+> 3. No deployed `.env` still raises `FUTURES_QUOTE_STALE_MINUTES` above `5`.
+>    If one was bumped to stop the flapping on the delayed feed, it now hides a
+>    real outage: with real-time entitled, `stale` means the feed has DIED.
+>
+> Until 1 and 2 hold, the site is claiming real-time over a delayed feed. That
+> is not silent — the delay badge is measured from each quote's own age, so it
+> still appears — but it will name the wrong cause, reporting a stalled feed
+> where the truth is an unentitled credential.
 
 Futures data is a separate exchange subscription from equities/indices, and it
 fails in two different ways.
