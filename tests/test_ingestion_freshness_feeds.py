@@ -141,3 +141,42 @@ def test_the_feed_name_travels_with_the_result():
     the operator needs to know WHICH stream to go restart."""
     assert _feed(None, anchor=NOW, name=FEED_CHAINS).feed == FEED_CHAINS
     assert _feed(None, anchor=NOW, name=FEED_FUTURES).feed == FEED_FUTURES
+
+
+# --- bars stamped in the future --------------------------------------------
+
+
+def test_a_close_stamped_bar_never_reports_negative_staleness():
+    """vix_bars/vxn_bars store TradeStation's raw TimeStamp — the bar's CLOSE —
+    on a 5-minute interval, so the 09:30-09:35 bar is stamped 09:35 and is
+    genuinely 'in the future' at 09:31. Production printed
+    'VIX: fresh (-3.1 min since last write)', which reads as broken and
+    undermines every other line in the report."""
+    now = _et(2026, 8, 27, 9, 31)
+    result = evaluate_feed(
+        FEED_VOLATILITY,
+        "VIX",
+        _et(2026, 8, 27, 9, 35),  # bar close, four minutes ahead of now
+        now,
+        expected=True,
+        session_anchor=_et(2026, 8, 27, 9, 30),
+        max_stale=MAX_STALE,
+    )
+    assert result.status == "fresh"
+    assert result.stale_minutes == 0.0
+
+
+def test_clamping_does_not_hide_a_genuinely_dead_feed():
+    """The clamp must apply to the future case only — a feed silent for hours
+    still has to alert."""
+    result = evaluate_feed(
+        FEED_VOLATILITY,
+        "VIX",
+        _et(2026, 8, 27, 9, 35),
+        _et(2026, 8, 27, 13, 0),  # three and a half hours later
+        expected=True,
+        session_anchor=_et(2026, 8, 27, 9, 30),
+        max_stale=MAX_STALE,
+    )
+    assert result.status == "stale"
+    assert result.stale_minutes == 205.0
