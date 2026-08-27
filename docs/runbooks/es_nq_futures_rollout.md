@@ -73,6 +73,15 @@ Reference: `src/jobs/futures_projection.py`, `src/api/futures_middleware.py`.
 **1a. CME market-data entitlement on the TradeStation account —
 REAL-TIME, not delayed.**
 
+> **Status: real-time CME provisioned (2026-08-27).** The rollout ran on the
+> delayed package; the real-time entitlement is now live, and
+> `FUTURES_REALTIME_PENDING` in `frontend/core/futuresDataStatus.ts`
+> (zerogex-web) is `false` to match. `FUTURES_QUOTE_STALE_MINUTES=5` therefore
+> means "the feed has died" again rather than "the entitlement is delayed" —
+> confirm no deployed `.env` still carries a raised override from the delayed
+> period, or a real outage will read as normal. Re-run the query below if ES/NQ
+> ever start reporting a fixed multi-minute lag again.
+
 Futures data is a separate exchange subscription from equities/indices, and it
 fails in two different ways.
 
