@@ -164,7 +164,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             r = probe(client, symbols, size)
             results[size].append(r)
             status = "OK" if r["ok"] else "FAIL"
-            print(f"  round {round_no}  batch {size:>4}  {status:<5} {r['seconds']:>7.2f}s")
+            note = "" if r["ok"] else f"  {r['detail'][:90]}"
+            print(f"  round {round_no}  batch {size:>4}  {status:<5} {r['seconds']:>7.2f}s{note}")
             time.sleep(0.3)
 
     print()
@@ -183,20 +184,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     every = [r for runs in results.values() for r in runs]
     ok_rate = sum(1 for r in every if r["ok"]) / max(1, len(every))
     slow = [r["seconds"] for r in every if r["seconds"] >= 2]
+    # HOW a request fails is the diagnosis, not THAT it failed. A request the
+    # server accepts and then abandons on its deadline is a struggling backend;
+    # one refused in a tenth of a second was never processed at all — wrong
+    # entitlement, wrong symbol format, bad credential. Reporting both as
+    # "failed" once led this tool to call an unentitled account an outage.
+    refused = [r for r in every if not r["ok"] and r["seconds"] < 2]
+    timed_out = [r for r in every if not r["ok"] and r["seconds"] >= 2]
 
     print("=" * 68)
-    if len(reliable) == len(sizes) and not slow:
+    if refused and not timed_out:
+        print(f"Every request was REFUSED in under two seconds ({len(refused)} of them).")
+        print("That is a rejection, not a timeout — the server never tried. The")
+        print("usual cause is this credential lacking the market-data entitlement")
+        print("for these symbols (equity options need OPRA; a futures-only")
+        print("username will refuse every one of them). Batch size is irrelevant.")
+        print("Confirm which username this ran as with: make ts-whoami")
+        detail = next((r["detail"] for r in refused if r["detail"]), "")
+        if detail:
+            print(f"First error: {detail[:200]}")
+    elif len(reliable) == len(sizes) and not slow:
         print("Every size answered promptly — the endpoint is healthy.")
         print("Leave OPTION_BATCH_SIZE alone.")
     elif not reliable:
         print(f"No size answered reliably ({ok_rate:.0%} overall).")
-        print("The endpoint is down rather than overloaded, so no batch size")
-        print("helps. Check https://status.tradestation.com; the client's")
-        print("retry/backoff picks it up on recovery.")
+        print(f"{len(timed_out)} request(s) were accepted and then timed out —")
+        print("their backend is struggling rather than refusing you. No batch")
+        print("size helps at this rate. Check https://status.tradestation.com;")
+        print("the client's retry/backoff picks it up on recovery.")
     else:
         best = max(reliable)
         print(f"Largest size that answered EVERY time: {best}")
         print(f"Overall success across all sizes: {ok_rate:.0%}")
+        if timed_out:
+            print(f"{len(timed_out)} request(s) accepted then abandoned on a server")
+            print("deadline — a struggling backend, not a rejection.")
         print()
         print(f"    OPTION_BATCH_SIZE={best}       # in .env, then make services-restart")
         print()
