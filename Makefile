@@ -3752,7 +3752,7 @@ normalizer-cache-healthcheck-strict: ## Healthcheck that also fails on missing r
 INGEST_FRESHNESS_MAX_STALE_MINUTES ?= 15
 
 .PHONY: ingestion-freshness-healthcheck
-ingestion-freshness-healthcheck: ## Alert if a symbol stopped writing bars mid-session (0=ok, 1=stale, 2=db error)
+ingestion-freshness-healthcheck: ## Alert if ANY TradeStation stream stopped writing (bars, chains, VIX/VXN, ES/NQ). 0=ok 1=stale 2=db error
 	@$(PY) -m src.tools.ingestion_freshness_healthcheck \
 		--max-stale-minutes $(INGEST_FRESHNESS_MAX_STALE_MINUTES) \
 		$(if $(JSON),--json)
