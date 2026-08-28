@@ -274,7 +274,8 @@ upstream can change.
 
 | Profile | Endpoints | Regular | Extended | Overnight |
 | --- | --- | --- | --- | --- |
-| `realtime_quote` | `/api/market/*`, `/api/option/*` | 5 s | 30 s | — |
+| `realtime_quote` | `/api/market/*`, `/api/option/*` | 60 s | 60 s | — |
+| `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
 | `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
 | `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
 | `signals_cycle` | `/api/signals/*`, `/api/tradeworkz/*` | 15 s | 60 s | — |
@@ -291,6 +292,24 @@ A dash means no update is expected, which surfaces as
 but it recomputes the same 20:00 observation, so an ageing payload there is
 correct rather than late. The same holds on weekends, NYSE holidays, and
 after the 13:00 ET close on an early-close day.
+
+Cadence describes how often a new observation can be **stored**, not how
+often ingestion polls. The quote tape is polled every few seconds but written
+in 60-second buckets, so 60 s is the fastest a new value can appear; VIX/VXN
+are 5-minute bars.
+
+**ES and NQ are graded on the CME calendar**, not the NYSE one — they trade
+Sunday 18:00 to Friday 17:00 ET. A futures symbol therefore reports
+`market_session_status: regular` (and a real `stale` verdict) through the
+overnight hours when the cash market is shut, so a stalled futures feed is
+visible rather than hidden behind `session_closed`. Cash symbols are
+unaffected.
+
+`stale_after` is anchored to the later of `source_timestamp` and the instant
+the current feed window opened, so a payload one second into a new window
+gets a full grace period before it is called late — nothing can be late
+before anything has had time to arrive. `age_seconds` still measures the true
+age from the observation.
 
 `daily_cycle` endpoints age in **trading sessions, not wall-clock hours**:
 Friday's session close is the correct answer all through Monday morning, and
