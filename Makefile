@@ -827,6 +827,22 @@ flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contr
 	@echo "  • $(RED)Index size >> table size$(NC) in [1] AND $(RED)low idx_scan$(NC) in [4] → consider DROP."
 	@echo "  • $(RED)High dead_pct$(NC) in [2] AND large idx size in [4] → REINDEX CONCURRENTLY may shrink the index."
 
+.PHONY: replay-frames-explain
+replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced to the session or scaling with retention? Vars: SYMBOL=NDX DATE=YYYY-MM-DD [BAND=0.04]. Read-only.
+	@if [ -z "$(DATE)" ]; then \
+		echo "$(RED)DATE is required — use the session date from the warning, e.g.$(NC)"; \
+		echo "$(YELLOW)  make replay-frames-explain SYMBOL=NDX DATE=2026-07-24$(NC)"; \
+		exit 2; \
+	fi
+	@echo "$(BLUE)=== Replay frames read: query planner diagnosis ===$(NC)"
+	@echo "$(YELLOW)The failure this checks for is PLAN-dependent, so 'it was fast just now'$(NC)"
+	@echo "$(YELLOW)proves nothing. Step [4] forces the fallback plan — that is the real test.$(NC)"
+	@$(PY) -m src.tools.replay_frames_explain \
+		--symbol "$(or $(SYMBOL),NDX)" \
+		--date "$(DATE)" \
+		$(if $(BAND),--band $(BAND)) \
+		| $(PSQL) -v ON_ERROR_STOP=0
+
 .PHONY: flow-index-prune
 flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner doesn't use it). Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Pruning idx_flow_by_contract_symbol_ts_strike ===$(NC)"
@@ -1077,6 +1093,7 @@ help: ## Show this help message
 	@echo "  make db-tail-api-calls            - Last 50 rows from tradestation_api_calls"
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
+	@echo "  make replay-frames-explain        - EXPLAIN ANALYZE the /api/replay/range frames read (SYMBOL=NDX DATE=YYYY-MM-DD)"
 	@echo "  make flow-index-prune             - Drop idx_flow_by_contract_symbol_ts_strike (CONFIRM=yes)"
 	@echo "  make flow-series-drop-covering-index - DISABLED (index retained; see target)"
 	@echo ""
