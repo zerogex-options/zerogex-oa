@@ -528,9 +528,18 @@ _SOURCE_KEYS = (
     "signal_timestamp",
     "interval_timestamp",
     "bar_timestamp",
-    "last_data_update",
     "realized_at",
 )
+
+# Deliberately NOT a source key: ``last_data_update`` is /api/health's own
+# REPORT about data freshness, not a timestamp OF the health payload. Treating
+# another endpoint's freshness report as our observation is a category error,
+# and it produced a wrong answer on the one endpoint whose job is reporting
+# data age: /api/v2/health carried a three-hour-old quote stamp and graded it
+# `static` — "this never goes stale" — because health is an on-demand,
+# non-feed-backed profile. It now reports `unknown`, which is the honest
+# answer: the endpoint makes no freshness claim of its own, and its body's
+# `data_age_seconds` remains the signal to read.
 
 # Row-bookkeeping keys: when the row was WRITTEN, which is not when the market
 # was observed. option_chains rows are UPSERTed in 60-second buckets with

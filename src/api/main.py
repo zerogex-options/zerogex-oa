@@ -424,6 +424,27 @@ app.add_middleware(
         "Content-Type",
         "Accept",
     ],
+    # Headers a cross-origin browser client may READ. Without this list the
+    # browser strips them from the response before JS sees them, however
+    # correctly the server sets them — so the v2 freshness headers and the
+    # correlation id were reaching curl and server-side consumers but were
+    # invisible to any browser integration, which is precisely the audience
+    # a charting widget serves.
+    #
+    # Kept in step with v2._freshness_headers by a test; add a header there
+    # and CI fails until it is listed here.
+    expose_headers=[
+        "X-Freshness-Status",
+        "X-Freshness-Evaluated-At",
+        "X-Freshness-Source-Timestamp",
+        "X-Freshness-Age-Seconds",
+        "X-Freshness-Stale-After",
+        "X-Freshness-Expected-Cadence",
+        "X-Freshness-Cadence-Profile",
+        "X-Market-Session",
+        # Echoed by RequestIdMiddleware for correlation; same problem.
+        "X-Request-Id",
+    ],
 )
 
 # Compress responses so that large JSON payloads from endpoints like

@@ -313,7 +313,9 @@ populated.
 ### Response headers
 
 Every v2 response also carries the envelope as headers, so a proxy, CDN or
-uptime monitor can act on staleness without parsing a body:
+uptime monitor can act on staleness without parsing a body. All of them are
+listed in `Access-Control-Expose-Headers`, so a cross-origin browser client
+can read them too (alongside `X-Request-Id` for correlation):
 
 ```
 X-Freshness-Status: fresh

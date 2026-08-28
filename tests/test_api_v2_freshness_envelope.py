@@ -918,3 +918,57 @@ def test_the_scan_does_not_descend_into_stampless_leaf_collections():
         f"scan descended into {CountingDict.visits} stampless leaf dicts; "
         "the level-wise early exit is not working"
     )
+
+
+def test_health_makes_no_freshness_claim_it_cannot_support():
+    """/api/health publishes `last_data_update` — its own REPORT about data
+    freshness, not a timestamp of the health payload. Reading it as our
+    observation graded a three-hour-old quote stamp as `static`, i.e. "never
+    goes stale", on the one endpoint whose job is reporting data age. The
+    honest answer is `unknown`: no claim, read `data_age_seconds` in the body.
+    """
+    payload = {
+        "status": "healthy",
+        "database_connected": True,
+        "last_data_update": THU_REGULAR - timedelta(hours=3),
+        "data_age_seconds": 10800,
+    }
+    f = fr.build_freshness(payload, profile=fr.resolve_profile("/api/health"), now=THU_REGULAR)
+    assert f.freshness_status is fr.FreshnessStatus.UNKNOWN
+    assert f.source_timestamp is None
+    # Endpoint health is still observable — that part was never in doubt.
+    assert f.evaluated_at == THU_REGULAR
+
+
+def test_cors_exposes_every_freshness_header_the_server_sets(client: TestClient):
+    """A header the browser strips is a header that does not exist for a
+    cross-origin client, however correctly the server sets it. The v2 headers
+    are a documented feature, so the two lists have to stay in step: add one
+    to _freshness_headers without listing it here and this fails.
+    """
+    from starlette.middleware.cors import CORSMiddleware
+
+    app = client.app
+    cors = next(
+        (m for m in app.user_middleware if m.cls is CORSMiddleware),
+        None,
+    )
+    assert cors is not None, "CORS middleware not installed"
+    exposed = {h.lower() for h in (cors.kwargs.get("expose_headers") or [])}
+
+    # Every header _freshness_headers can emit, with all optionals populated.
+    full = fr.Freshness(
+        evaluated_at=THU_REGULAR,
+        generated_at=THU_REGULAR,
+        source_timestamp=THU_REGULAR,
+        latest_event_at=THU_REGULAR,
+        age_seconds=1.0,
+        market_session_status=fr.SESSION_REGULAR,
+        expected_update_cadence="PT1M",
+        expected_update_cadence_seconds=60.0,
+        cadence_profile="analytics_cycle",
+        stale_after=THU_REGULAR,
+        freshness_status=fr.FreshnessStatus.FRESH,
+    )
+    emitted = {h.lower() for h in v2mod._freshness_headers(full)}
+    assert emitted <= exposed, f"not readable cross-origin: {sorted(emitted - exposed)}"
