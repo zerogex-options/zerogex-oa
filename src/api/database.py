@@ -5599,7 +5599,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 score,
                 notional_class,
                 size_class,
-                underlying_price
+                underlying_price,
+                -- Session-wide recency of the underlying flow data.
+                --
+                -- This result is a TOP-N-BY-SIZE leaderboard, not a recency
+                -- window: ORDER BY ABS(notional) means the newest `timestamp`
+                -- among the returned rows is whichever of the biggest prints
+                -- happened last, which for the index names is usually the
+                -- opening burst. A consumer taking MAX(timestamp) over the
+                -- response therefore reads a healthy midday leaderboard as
+                -- hours stale — reported from the field by an integrator whose
+                -- automated review flagged SPX/SPY/QQQ every afternoon.
+                --
+                -- A window function is evaluated BEFORE ORDER BY and LIMIT, so
+                -- this is the max across the whole filtered session, not just
+                -- the fifty rows that survive truncation, and it costs nothing
+                -- extra — the rows are already scanned.
+                MAX(timestamp) OVER () AS session_latest_at
             FROM scored
             ORDER BY ABS(notional) DESC, score DESC, timestamp DESC
             LIMIT $4

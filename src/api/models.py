@@ -448,6 +448,11 @@ class SmartMoneyFlowPoint(BaseModel):
     notional_class: str
     size_class: str
     underlying_price: Optional[Decimal] = None
+    # Newest flow event in the whole session, not just among the rows returned.
+    # These rows are ranked by notional, so their own timestamps say when the
+    # BIGGEST prints landed, not how current the feed is; this is the recency
+    # signal. Additive, so existing v1 consumers are unaffected.
+    session_latest_at: Optional[datetime] = None
 
 
 class MomentumDivergencePoint(BaseModel):

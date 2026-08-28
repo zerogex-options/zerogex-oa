@@ -519,6 +519,10 @@ _GENERATED_KEYS = ("generated_at", "evaluated_at", "as_of", "snapshot_time", "co
 # the only keys freshness is graded against when any of them is present.
 _SOURCE_KEYS = (
     "source_timestamp",
+    # Ranked/top-N responses expose this so freshness is graded on the feed's
+    # recency rather than on which selected row happens to be newest. It is
+    # always >= any row timestamp, so the max() below picks it up naturally.
+    "session_latest_at",
     "timestamp",
     "quote_timestamp",
     "signal_timestamp",

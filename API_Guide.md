@@ -553,6 +553,17 @@ Unusual-activity / smart-money flow — 1-minute intervals (session 07:15–16:1
 - `session` (optional): `current` | `prior`, default `current`
 - `limit` (optional): max `50`, default `50`
 
+
+**Ranked, not chronological.** This returns the largest-notional prints of
+the session ordered by size, so the newest `timestamp` among the rows is
+whichever of the biggest prints landed last — usually the opening burst on
+the index names. Do **not** take `MAX(timestamp)` over the rows as a
+freshness signal; it will read a healthy midday response as hours stale.
+Use `session_latest_at` instead, which every row carries: the newest flow
+event in the whole session, not just among the rows returned. On v2 this is
+already what the envelope grades, so `freshness.source_timestamp` and
+`freshness.freshness_status` are correct without any special handling.
+
 ### GET /api/flow/buying-pressure
 Underlying buying/selling pressure.
 
