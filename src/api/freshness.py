@@ -385,8 +385,17 @@ ENDPOINT_CADENCE: Tuple[Tuple[str, CadenceProfile], ...] = (
     # Ahead of the /api/market/* glob below: 5-minute bars, not the 1s tape.
     ("/api/market/volatility*", VOLATILITY_BAR),
     ("/api/max-pain/timeseries*", HISTORICAL),
+    # Open positions are marked to market every engine cycle, so this is a
+    # live view, not completed history. Under the trades* glob below it
+    # reported `static` — "never a fault" — while the engine was dead.
+    ("/api/signals/trades-live", SIGNALS_CYCLE),
     ("/api/signals/trades*", HISTORICAL),
-    ("/api/signals/events*", HISTORICAL),
+    # The realised-outcome history hangs off the component name
+    # (/api/signals/{signal_name}/events), so the old "/api/signals/events*"
+    # pattern matched NOTHING and these fell through to the live signals
+    # cadence — which grades sparse, triggered events on recency and calls a
+    # quiet tape stale.
+    ("/api/signals/*/events*", HISTORICAL),
     ("/api/tools/*", ON_DEMAND),
     # --- families ---------------------------------------------------------
     ("/api/v1/levels*", ANALYTICS_CYCLE),
@@ -628,6 +637,12 @@ _SOURCE_KEYS = (
     # recency rather than on which selected row happens to be newest. It is
     # always >= any row timestamp, so the max() below picks it up naturally.
     "session_latest_at",
+    # Response-level "when was this view last refreshed", for payloads whose
+    # rows carry only an ENTRY or selection instant. /api/signals/trades-live
+    # is the case: its rows are stamped when the position opened, so a
+    # position held since the open read hours stale on a healthy engine.
+    # Same max() precedence — a refresh is never older than what it refreshed.
+    "last_refreshed_at",
     "timestamp",
     "quote_timestamp",
     "signal_timestamp",

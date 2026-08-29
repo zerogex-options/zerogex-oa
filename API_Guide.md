@@ -278,9 +278,9 @@ upstream can change.
 | `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
 | `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
 | `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
-| `signals_cycle` | `/api/signals/*`, `/api/tradeworkz/*` | 15 s | 60 s | — |
+| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 15 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
-| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical` | — | — | — |
+| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
 
 A dash means no update is expected, which surfaces as
@@ -844,6 +844,21 @@ purpose.
   remaining patterns land in PR-3+.
 - `GET /api/signals/trades-history` — realized trade ideas with P&L / hit rate.
 - `GET /api/signals/trades-live` — open trade ideas derived from current signal state.
+
+**Grade this on `last_refreshed_at`, not on the row timestamps.** Every row's
+`signal_timestamp` and `opened_at` are the instant the position was *entered*,
+so a position held since the open reads hours old at midday on a perfectly
+healthy engine. The response carries a top-level `last_refreshed_at`: the
+newest mark-to-market write across the open book, which the reconcile loop
+bumps on every open position every cycle. It is `null` when the book is empty
+— an engine holding nothing and a dead engine holding nothing produce the same
+payload, so no claim is made. On v2 this is already what the envelope grades,
+so `freshness.source_timestamp` and `freshness.freshness_status` are correct
+without any special handling.
+
+Unlike `trades-history`, this is a live view: it is graded on the
+`signals_cycle` cadence, so a stopped signal engine reports `stale` rather
+than `static`.
 
 ### Advanced Signals (7, triggered + hysteresis)
 
