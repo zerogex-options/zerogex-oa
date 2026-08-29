@@ -193,9 +193,29 @@ async def get_live_signals(db: DatabaseManager = Depends(get_db)):
     (unrealized), MSI-at-entry vs latest delta with a color arrow.
     """
     rows = await db.get_live_signal_trades()
+    # When this view was last refreshed, at the RESPONSE level.
+    #
+    # Every row carries `signal_timestamp` and `opened_at` — both the ENTRY
+    # instant — and a freshness consumer reading those sees a position held
+    # since the open as hours stale while the engine is perfectly healthy.
+    # The reconcile loop marks every open position to market each cycle and
+    # bumps `updated_at` doing it (portfolio_engine._update_trade_mark), so
+    # the newest `updated_at` across the open book is this view's heartbeat
+    # and its only real recency signal. Computed from rows already fetched —
+    # no extra query.
+    #
+    # It does go stale while the process lives if `_update_trade_mark` keeps
+    # early-returning on an unresolvable mark. That is the right answer, not
+    # a false alarm: the P&L columns really have stopped moving.
+    #
+    # Null when the book is empty: a healthy engine holding nothing and a dead
+    # engine holding nothing produce the same payload, so the honest answer is
+    # to make no claim (the v2 envelope then reports freshness_status=unknown).
+    refreshed = [r["updated_at"] for r in rows if r.get("updated_at")]
     return {
         "trades": rows,
         "count": len(rows),
+        "last_refreshed_at": max(refreshed) if refreshed else None,
     }
 
 
