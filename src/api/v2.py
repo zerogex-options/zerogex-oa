@@ -197,6 +197,28 @@ def _freshness_headers(freshness: Freshness) -> Dict[str, str]:
     return headers
 
 
+_SYMBOL_PARAMS = ("symbol", "underlying", "ticker")
+
+
+def _request_symbol(kwargs: Dict[str, Any]) -> Optional[str]:
+    """The instrument this request is about, from the resolved handler args.
+
+    Freshness is graded on a market calendar, and ES/NQ do not keep the NYSE
+    one — they trade the CME session. Without the symbol the envelope reported
+    ``session_closed`` for every hour CME trades and NYSE does not, hiding a
+    dead overnight futures feed behind "no update was due".
+
+    Covers both shapes the API uses: a query parameter (``?symbol=ES``) and a
+    path parameter (``/api/v2/levels/ES``). Returns None when the endpoint is
+    not symbol-scoped, which grades on the cash calendar as before.
+    """
+    for name in _SYMBOL_PARAMS:
+        value = kwargs.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _build_signature(orig: Callable[..., Any]) -> Tuple[inspect.Signature, Optional[str]]:
     """Return the wrapper's signature and the name of an injected ``Response``.
 
@@ -261,9 +283,9 @@ def _make_v2_endpoint(orig: Callable[..., Any], profile: CadenceProfile) -> Call
         result = await orig(**kwargs) if is_async else await run_in_threadpool(orig, **kwargs)
 
         if isinstance(result, Response):
-            return _wrap_response_object(result, profile)
+            return _wrap_response_object(result, profile, symbol=_request_symbol(kwargs))
 
-        freshness = build_freshness(result, profile=profile)
+        freshness = build_freshness(result, profile=profile, symbol=_request_symbol(kwargs))
         if response is not None:
             response.headers.update(_freshness_headers(freshness))
         return {"data": result, "freshness": freshness}
@@ -283,7 +305,9 @@ def _find_response(kwargs: Dict[str, Any]) -> Optional[Response]:
     return None
 
 
-def _wrap_response_object(result: Response, profile: CadenceProfile) -> Response:
+def _wrap_response_object(
+    result: Response, profile: CadenceProfile, symbol: Optional[str] = None
+) -> Response:
     """Envelope a handler that returned a ``Response`` rather than a value.
 
     ``JSONResponse`` bodies are decoded and re-emitted inside the envelope
@@ -298,7 +322,7 @@ def _wrap_response_object(result: Response, profile: CadenceProfile) -> Response
             logger.warning("v2: could not decode JSONResponse body; passing through")
             payload = None
         else:
-            freshness = build_freshness(payload, profile=profile)
+            freshness = build_freshness(payload, profile=profile, symbol=symbol)
             enveloped = JSONResponse(
                 content={"data": payload, "freshness": _jsonable_freshness(freshness)},
                 status_code=result.status_code,
@@ -311,7 +335,7 @@ def _wrap_response_object(result: Response, profile: CadenceProfile) -> Response
             enveloped.headers.update(_freshness_headers(freshness))
             return enveloped
 
-    freshness = build_freshness(None, profile=profile)
+    freshness = build_freshness(None, profile=profile, symbol=symbol)
     result.headers.update(_freshness_headers(freshness))
     return result
 

@@ -77,8 +77,6 @@ from pydantic import BaseModel, Field
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     ANALYTICS_INTERVAL,
-    EXTENDED_HOURS_POLL_INTERVAL,
-    MARKET_HOURS_POLL_INTERVAL,
 )
 
 logger = logging.getLogger(__name__)
@@ -209,18 +207,51 @@ class CadenceProfile:
 # copied from their defaults. An operator who retunes ANALYTICS_INTERVAL in
 # .env would otherwise have the API keep advertising 60s while the engine
 # ran on something else — publishing a cadence contract we then miss.
+# The quote tape is POLLED every few seconds but STORED in one-minute buckets:
+# _store_underlying floors each bar to bucket_timestamp(ts-1s,
+# AGGREGATION_BUCKET_SECONDS) and overwrites the in-progress minute in place
+# (src/ingestion/main_engine.py), and option_chains uses the same bucket. So the
+# freshest row that can exist is 0-60s old, and grading against the 5s poll
+# interval declared a healthy tape late for most of every minute — measured at
+# fresh/aging/stale = 6/15/39 seconds per bucket, i.e. `stale` for 65% of the
+# cash session on /api/market/quote, /api/option/* and open-interest.
+#
+# Cadence must describe the OBSERVATION granularity, not the collection rate.
 REALTIME_QUOTE = CadenceProfile(
     name="realtime_quote",
     description=(
-        "Underlying quote/bar tape. Polled on the ingestion loop "
-        "(config.MARKET_HOURS_POLL_INTERVAL=5s cash session, "
-        "EXTENDED_HOURS_POLL_INTERVAL=30s extended)."
+        "Underlying quote/bar tape and per-contract option quotes. Stored in "
+        "config.AGGREGATION_BUCKET_SECONDS=60s buckets, so a new observation "
+        "can appear at most once a minute however often ingestion polls."
     ),
-    regular_seconds=float(MARKET_HOURS_POLL_INTERVAL),
-    extended_seconds=float(EXTENDED_HOURS_POLL_INTERVAL),
+    regular_seconds=float(AGGREGATION_BUCKET_SECONDS),
+    extended_seconds=float(AGGREGATION_BUCKET_SECONDS),
     closed_seconds=None,
-    stale_grace=3.0,
-    stale_floor_seconds=20.0,
+    stale_grace=2.5,
+    # Two empty buckets. Extended-hours tape is thin enough that a minute with
+    # no prints writes no row at all, which is not a fault.
+    stale_floor_seconds=120.0,
+)
+
+# VIX/VXN are 5-minute bars (VOLATILITY_BAR_INTERVAL in
+# src/ingestion/volatility_index_ingester.py), not the 1-minute tape, so they
+# need their own profile — on the shared realtime_quote cadence they read
+# `stale` for 91% of the session. Pinned to that constant by test.
+VOLATILITY_BAR_SECONDS = 5 * 60
+
+VOLATILITY_BAR = CadenceProfile(
+    name="volatility_bar",
+    description=(
+        "CBOE volatility-index bars (VIX, VXN) on a 5-minute cadence. The "
+        "in-progress bar is close-stamped in the future and is deliberately "
+        "ignored, so the observation is the last COMPLETED boundary and is "
+        "legitimately up to one full bar old."
+    ),
+    regular_seconds=float(VOLATILITY_BAR_SECONDS),
+    extended_seconds=float(VOLATILITY_BAR_SECONDS),
+    closed_seconds=None,
+    stale_grace=2.0,
+    stale_floor_seconds=float(2 * VOLATILITY_BAR_SECONDS),
 )
 
 ANALYTICS_CYCLE = CadenceProfile(
@@ -325,6 +356,7 @@ CADENCE_PROFILES = {
     p.name: p
     for p in (
         REALTIME_QUOTE,
+        VOLATILITY_BAR,
         ANALYTICS_CYCLE,
         FLOW_AGGREGATE,
         SIGNALS_CYCLE,
@@ -350,6 +382,8 @@ ENDPOINT_CADENCE: Tuple[Tuple[str, CadenceProfile], ...] = (
     ("/api/market/historical*", HISTORICAL),
     ("/api/market/session-closes*", DAILY_CYCLE),
     ("/api/market/session-levels*", DAILY_CYCLE),
+    # Ahead of the /api/market/* glob below: 5-minute bars, not the 1s tape.
+    ("/api/market/volatility*", VOLATILITY_BAR),
     ("/api/max-pain/timeseries*", HISTORICAL),
     ("/api/signals/trades*", HISTORICAL),
     ("/api/signals/events*", HISTORICAL),
@@ -446,6 +480,45 @@ def session_close_for(d: date) -> Any:
     return half if d in half_days else regular
 
 
+def _is_futures(symbol: Optional[str]) -> bool:
+    """True when ``symbol`` is a first-class future (ES/NQ)."""
+    if not symbol:
+        return False
+    try:
+        from src.symbols import is_futures_symbol
+
+        return bool(is_futures_symbol(symbol))
+    except Exception:  # noqa: BLE001 - never fail a response over symbol lookup
+        return False
+
+
+def futures_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
+    """``(market_session_status, market_day)`` on the CME calendar.
+
+    ES and NQ are served natively from ``futures_quotes`` and trade Sun 18:00
+    to Fri 17:00 ET, minus the daily maintenance break — roughly 23 hours a
+    day. Grading them on the NYSE cash calendar made the envelope report
+    ``session_closed`` for every hour CME trades and NYSE does not, so a dead
+    overnight futures feed was invisible: the v1 body said
+    ``stale: true, data_age_seconds: 2701`` while the v2 envelope beside it
+    said no update was due. A monitor built on the envelope — the thing v2
+    exists to sell — stayed silent through the whole outage.
+
+    ``is_futures_session_open`` is the same helper the quote endpoint already
+    uses to label the payload's own ``session`` field, so the two can no
+    longer disagree.
+    """
+    try:
+        from src.market_calendar import is_futures_session_open
+
+        live = is_futures_session_open(now)
+    except Exception:  # noqa: BLE001
+        logger.warning("freshness: futures calendar unavailable", exc_info=True)
+        return market_context(now)
+    # The CME session has no pre/after-hours split; it is open or it is not.
+    return (SESSION_REGULAR, True) if live else (SESSION_CLOSED, False)
+
+
 def market_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
     """Return ``(market_session_status, market_day)`` for ``now``.
 
@@ -478,6 +551,38 @@ def market_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
     if t < ext_t:
         return SESSION_AFTER_HOURS, True
     return SESSION_CLOSED, True
+
+
+def feed_window_open(profile: CadenceProfile, now: datetime) -> Optional[datetime]:
+    """The instant the CURRENT feed window opened, for ``now``.
+
+    ``stale_after`` was computed purely as ``source_timestamp + window``. Across
+    a feed-window boundary that anchor sits in the PREVIOUS window and is
+    already hours old, so the moment ``cadence_for`` starts returning a number
+    the payload is instantly past its threshold: at 04:00:00 ET the newest
+    observation is still the prior evening's 19:59 bar, and every feed-backed
+    endpoint flipped ``session_closed -> stale`` in one second with the whole
+    ``aging`` grace band unreachable. The grace mechanism was structurally dead
+    exactly where it was designed to apply.
+
+    Anchoring to ``max(source_timestamp, window_open)`` gives a payload one
+    second into a new window a full grace period before it is called late,
+    which is the honest reading: nothing can be late yet, because nothing has
+    had time to arrive.
+
+    Cash-session-only profiles (``extended_seconds is None`` — flow accrues
+    only 09:30-16:00) open at 09:30 ET; everything else opens with ingestion
+    at 04:00 ET. Returns ``None`` when the profile expects nothing.
+    """
+    if profile.regular_seconds is None:
+        return None
+    now_et = now.astimezone(_ET)
+    open_t = _at(9, 30) if profile.extended_seconds is None else _at(4, 0)
+    if now_et.time() < open_t:
+        return None
+    return _ET.localize(
+        datetime(now_et.year, now_et.month, now_et.day, open_t.hour, open_t.minute)
+    ).astimezone(timezone.utc)
 
 
 def next_session_close_after(dt: datetime) -> datetime:
@@ -849,6 +954,7 @@ def build_freshness(
     *,
     profile: CadenceProfile,
     now: Optional[datetime] = None,
+    symbol: Optional[str] = None,
 ) -> Freshness:
     """Compute the freshness envelope for one response payload.
 
@@ -858,7 +964,11 @@ def build_freshness(
     ``FreshnessStatus.UNKNOWN``.
     """
     evaluated_at = now or datetime.now(timezone.utc)
-    session, market_day = market_context(evaluated_at)
+    # ES/NQ keep their own calendar; everything else is graded on NYSE cash.
+    if _is_futures(symbol):
+        session, market_day = futures_context(evaluated_at)
+    else:
+        session, market_day = market_context(evaluated_at)
 
     try:
         generated_at, latest_event_at = _scan_timestamps(payload, evaluated_at)
@@ -893,9 +1003,13 @@ def build_freshness(
                 seconds=profile.stale_floor_seconds
             )
         else:
-            stale_after = source_timestamp + timedelta(
-                seconds=profile.stale_window(cadence_seconds)
-            )
+            # Never start the clock before the window that could produce the
+            # next observation actually opened (see feed_window_open).
+            window_open = feed_window_open(profile, evaluated_at)
+            anchor = source_timestamp
+            if window_open is not None and window_open > anchor:
+                anchor = window_open
+            stale_after = anchor + timedelta(seconds=profile.stale_window(cadence_seconds))
 
     if source_timestamp is None:
         status = FreshnessStatus.UNKNOWN

@@ -972,3 +972,213 @@ def test_cors_exposes_every_freshness_header_the_server_sets(client: TestClient)
     )
     emitted = {h.lower() for h in v2mod._freshness_headers(full)}
     assert emitted <= exposed, f"not readable cross-origin: {sorted(emitted - exposed)}"
+
+
+# ---------------------------------------------------------------------------
+# Cadence must describe what is STORED, not how often we poll
+# ---------------------------------------------------------------------------
+
+# Thursday 13:00:00 ET — mid cash session, the window every earlier test missed.
+THU_MIDSESSION = datetime(2026, 8, 20, 17, 0, tzinfo=timezone.utc)
+
+
+def test_a_healthy_minute_bucketed_tape_is_never_stale():
+    """The quote tape is polled every few seconds but STORED in 60s buckets
+    (``_store_underlying`` floors to AGGREGATION_BUCKET_SECONDS), so the
+    freshest row that can exist is up to a minute old. Grading against the 5s
+    poll interval declared a healthy tape late for 39 of every 60 seconds."""
+    profile = fr.resolve_profile("/api/market/quote")
+    bucket = THU_MIDSESSION  # the in-progress minute's bar
+    statuses = {
+        fr.build_freshness(
+            {"timestamp": bucket}, profile=profile, now=bucket + timedelta(seconds=s)
+        ).freshness_status
+        for s in range(60)
+    }
+    assert statuses == {fr.FreshnessStatus.FRESH}, statuses
+
+
+def test_realtime_cadence_tracks_the_storage_bucket_not_the_poll_rate():
+    """Drift guard. If someone re-anchors this to MARKET_HOURS_POLL_INTERVAL
+    the endpoint goes back to reporting stale most of the session."""
+    from src.config import AGGREGATION_BUCKET_SECONDS, MARKET_HOURS_POLL_INTERVAL
+
+    assert fr.REALTIME_QUOTE.regular_seconds == float(AGGREGATION_BUCKET_SECONDS)
+    assert fr.REALTIME_QUOTE.regular_seconds != float(MARKET_HOURS_POLL_INTERVAL)
+
+
+def test_volatility_bars_are_graded_on_their_own_five_minute_cadence():
+    """VIX/VXN are 5-minute bars, not the 1-minute tape. On the shared quote
+    profile they read stale for most of every bar."""
+    profile = fr.resolve_profile("/api/market/volatility")
+    assert profile.name == "volatility_bar"
+    assert profile.regular_seconds == 300.0
+    statuses = {
+        fr.build_freshness(
+            {"timestamp": THU_MIDSESSION},
+            profile=profile,
+            now=THU_MIDSESSION + timedelta(seconds=s),
+        ).freshness_status
+        for s in range(0, 300, 10)
+    }
+    assert fr.FreshnessStatus.STALE not in statuses, statuses
+    # It must sit ahead of the broad /api/market/* glob to win.
+    assert fr.resolve_profile("/api/market/quote").name == "realtime_quote"
+
+
+def test_no_feed_backed_profile_calls_a_healthy_mid_session_payload_stale():
+    """The class guard for this whole family of bug.
+
+    Every check before this ran outside market hours, where `session_closed`
+    masks any cadence mismatch — which is exactly how a profile grading a
+    healthy tape as stale for 65% of the session shipped unnoticed. This
+    exercises mid-session explicitly: an observation one cadence old is the
+    freshest thing that profile can ever see, so it must never be `stale`.
+    """
+    for profile in fr.CADENCE_PROFILES.values():
+        cadence = profile.cadence_for(fr.SESSION_REGULAR, market_day=True)
+        if cadence is None or profile.session_scoped:
+            continue
+        freshest_possible = THU_MIDSESSION - timedelta(seconds=cadence)
+        status = fr.build_freshness(
+            {"timestamp": freshest_possible}, profile=profile, now=THU_MIDSESSION
+        ).freshness_status
+        assert status is not fr.FreshnessStatus.STALE, (
+            f"{profile.name}: an observation exactly one cadence "
+            f"({cadence}s) old — the freshest this profile can ever "
+            f"see — is graded {status.value}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# A window cannot be late the instant it opens
+# ---------------------------------------------------------------------------
+
+
+def test_a_feed_window_does_not_open_straight_into_stale():
+    """stale_after anchored on source_timestamp put the clock in the PREVIOUS
+    window, so at 04:00:00 ET every feed-backed endpoint flipped
+    session_closed -> stale in one second and the `aging` grace band was
+    structurally unreachable at exactly the boundary it exists for."""
+    last_night = datetime(2026, 8, 19, 23, 59, tzinfo=timezone.utc)  # 19:59 ET
+    before = datetime(2026, 8, 20, 7, 59, 59, tzinfo=timezone.utc)  # 03:59:59 ET
+    after = datetime(2026, 8, 20, 8, 0, 1, tzinfo=timezone.utc)  # 04:00:01 ET
+
+    for name in ("realtime_quote", "analytics_cycle", "signals_cycle"):
+        profile = fr.CADENCE_PROFILES[name]
+        assert (
+            fr.build_freshness(
+                {"timestamp": last_night}, profile=profile, now=before
+            ).freshness_status
+            is fr.FreshnessStatus.SESSION_CLOSED
+        ), name
+        opened = fr.build_freshness(
+            {"timestamp": last_night}, profile=profile, now=after
+        ).freshness_status
+        assert opened is not fr.FreshnessStatus.STALE, f"{name} opened straight into stale"
+
+
+def test_a_window_that_stays_empty_still_goes_stale():
+    """The anchor must delay the verdict, not suppress it."""
+    last_night = datetime(2026, 8, 19, 23, 59, tzinfo=timezone.utc)
+    ten_past = datetime(2026, 8, 20, 8, 10, tzinfo=timezone.utc)  # 04:10 ET
+    f = fr.build_freshness({"timestamp": last_night}, profile=fr.REALTIME_QUOTE, now=ten_past)
+    assert f.freshness_status is fr.FreshnessStatus.STALE
+    # age is still measured honestly from the observation, not the anchor
+    assert f.age_seconds > 8 * 3600
+
+
+# ---------------------------------------------------------------------------
+# ES/NQ keep their own calendar
+# ---------------------------------------------------------------------------
+
+# Friday 01:16 ET — CME trading, NYSE shut.
+FRI_OVERNIGHT = datetime(2026, 8, 21, 5, 16, tzinfo=timezone.utc)
+
+
+def test_futures_are_graded_on_the_cme_session_not_the_nyse_one():
+    """ES/NQ trade ~23 hours a day. On the cash calendar a dead overnight
+    futures feed reported `session_closed` — no update due — while the same
+    response body said `stale: true, data_age_seconds: 2701`. A monitor built
+    on the envelope stayed silent through the entire outage."""
+    profile = fr.resolve_profile("/api/market/quote")
+    dead = fr.build_freshness(
+        {"timestamp": FRI_OVERNIGHT - timedelta(seconds=2701)},
+        profile=profile,
+        now=FRI_OVERNIGHT,
+        symbol="ES",
+    )
+    assert dead.freshness_status is fr.FreshnessStatus.STALE
+    assert dead.market_session_status == fr.SESSION_REGULAR
+
+    healthy = fr.build_freshness(
+        {"timestamp": FRI_OVERNIGHT - timedelta(seconds=30)},
+        profile=profile,
+        now=FRI_OVERNIGHT,
+        symbol="ES",
+    )
+    assert healthy.freshness_status is fr.FreshnessStatus.FRESH
+
+
+def test_cash_symbols_are_unaffected_by_the_futures_path():
+    """SPY overnight is genuinely closed and must stay session_closed."""
+    f = fr.build_freshness(
+        {"timestamp": FRI_OVERNIGHT - timedelta(seconds=2701)},
+        profile=fr.resolve_profile("/api/market/quote"),
+        now=FRI_OVERNIGHT,
+        symbol="SPY",
+    )
+    assert f.freshness_status is fr.FreshnessStatus.SESSION_CLOSED
+    # And with no symbol at all, behaviour is exactly as before.
+    assert (
+        fr.build_freshness(
+            {"timestamp": FRI_OVERNIGHT - timedelta(seconds=2701)},
+            profile=fr.resolve_profile("/api/market/quote"),
+            now=FRI_OVERNIGHT,
+        ).freshness_status
+        is fr.FreshnessStatus.SESSION_CLOSED
+    )
+
+
+def test_the_v2_wrapper_finds_the_symbol_in_both_request_shapes():
+    assert v2mod._request_symbol({"symbol": "ES", "limit": 10}) == "ES"
+    assert v2mod._request_symbol({"underlying": "NQ"}) == "NQ"
+    assert v2mod._request_symbol({"ticker": "VIX"}) == "VIX"
+    assert v2mod._request_symbol({"limit": 5}) is None
+
+
+def test_the_symbol_actually_reaches_build_freshness_through_a_real_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Asserting on _request_symbol alone is vacuous: the wrapper could stop
+    passing its result and that test stays green, silently disabling futures
+    grading everywhere. Spy on the real call instead — a query parameter and
+    a path parameter must both arrive.
+    """
+    from fastapi import FastAPI
+
+    seen: list = []
+    real = v2mod.build_freshness
+
+    def spy(payload, *, profile, now=None, symbol=None):
+        seen.append(symbol)
+        return real(payload, profile=profile, now=now, symbol=symbol)
+
+    monkeypatch.setattr(v2mod, "build_freshness", spy)
+
+    app = FastAPI()
+
+    @app.get("/api/market/quote")
+    async def quote(symbol: str = "SPY"):
+        return {"symbol": symbol, "timestamp": "2026-08-20T17:00:00+00:00"}
+
+    @app.get("/api/v1/levels/{symbol}")
+    async def levels(symbol: str):
+        return {"symbol": symbol, "timestamp": "2026-08-20T17:00:00+00:00"}
+
+    v2mod.mount_v2(app)
+    with TestClient(app) as c:
+        assert c.get("/api/v2/market/quote?symbol=ES").status_code == 200
+        assert c.get("/api/v2/levels/NQ").status_code == 200
+
+    assert seen == ["ES", "NQ"], f"symbol did not reach build_freshness: {seen}"
