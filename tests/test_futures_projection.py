@@ -42,8 +42,10 @@ class _FakeDB:
     def __init__(self, rows=None, raises=False):
         self._rows = rows or []
         self._raises = raises
+        self.calls: list[dict] = []
 
     async def get_futures_basis_samples(self, index_symbol, **kwargs):
+        self.calls.append({"index_symbol": index_symbol, **kwargs})
         if self._raises:
             raise RuntimeError("db down")
         return self._rows
@@ -149,6 +151,56 @@ def test_dead_db_degrades_to_carry_rather_than_raising():
 def test_non_projectable_symbol_returns_none():
     assert asyncio.run(resolve_basis(_FakeDB([]), "SPY")) is None
     assert asyncio.run(resolve_basis(_FakeDB([]), "")) is None
+
+
+# --- as-of (historical) basis ---------------------------------------------
+#
+# Basis walks down through each quarterly cycle toward expiry, so projecting a
+# past frame with TODAY's ratio offsets every level by however much it has
+# moved since — invisible on a chart, corrupting in a backtest. These pin that
+# a historical caller's timestamp actually reaches the sample read.
+
+
+def test_asof_is_passed_through_to_the_sample_read():
+    """The whole point: a historical read must not sample today's tape."""
+    at = datetime(2026, 5, 14, 18, 30, tzinfo=timezone.utc)
+    db = _FakeDB(_pairs())
+    asyncio.run(resolve_basis(db, "ES", at=at))
+    assert db.calls[0]["at"] == at
+
+
+def test_live_read_leaves_the_anchor_unset():
+    """None keeps the live path on NOW(), and on its own cache entry."""
+    db = _FakeDB(_pairs())
+    asyncio.run(resolve_basis(db, "ES"))
+    assert db.calls[0]["at"] is None
+
+
+def test_asof_measures_staleness_against_the_anchor_not_wall_clock():
+    """Prints beside a past anchor are fresh FOR it, however old they are now."""
+    at = datetime.now(timezone.utc) - timedelta(days=90)
+    rows = [
+        {
+            "observed_at": at - timedelta(minutes=i),
+            "future_symbol": "@ES",
+            "index_close": 6600.0 + i,
+            "future_close": (6600.0 + i) * 1.0067,
+        }
+        for i in range(5)
+    ]
+    basis = asyncio.run(resolve_basis(_FakeDB(rows), "ES", at=at))
+    assert basis.source == "measured"
+    assert basis.ratio == pytest.approx(1.0067, rel=1e-6)
+
+
+def test_asof_carry_fallback_prices_to_the_expiry_in_force_then():
+    """With no prints, the fallback must not use today's quarterly either."""
+    at = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
+    basis = asyncio.run(resolve_basis(_FakeDB([]), "ES", at=at))
+    assert basis.source == "carry"
+    assert basis.ratio == pytest.approx(theoretical_ratio("SPX", at), rel=1e-9)
+    # The March expiry, not whichever quarter today happens to sit in.
+    assert next_quarterly_expiry(at).month == 3
 
 
 def test_next_quarterly_expiry_is_a_third_friday():

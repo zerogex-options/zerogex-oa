@@ -406,6 +406,37 @@ reason about staleness; `/api/v1/levels` additionally returns
 paid = realtime) is a timestamp gate on these fields, not a streaming
 change.
 
+### ES / NQ and the basis a response is projected on
+
+ES and NQ are answered from the SPX / NDX option chains — ZeroGEX never
+computes gamma from options on futures. ES and SPX track the same index, so
+it is the same dealer book; only the price axis differs, by cost of carry.
+Every price-space field (strikes, walls, flip, max pain, pin, spot) is carried
+onto the futures axis by the **basis**, and rounded to the contract tick.
+Dollar exposures (net GEX, wall strength, OI, volume) are **not** rescaled —
+exposure belongs to the option book, not to the axis you plot it on.
+
+Which basis is used depends on what you asked for, and this matters if you
+are backtesting:
+
+| Request | Basis applied |
+| --- | --- |
+| Live (no time named) | measured off the current tape |
+| Pinned to an instant (`ts=`) | the basis in force at that instant |
+| Pinned to a session (`date=`, `end_date=`) | the basis in force that session |
+| A timestamped series (e.g. `/api/gex/historical`) | **per row**, each on its own session's basis |
+
+A series is projected row by row rather than under one ratio because basis
+walks down through each quarterly cycle toward expiry. Over a single session
+that drift is ~0.003% — below the tick a level is published at. Over a quarter
+it is ~0.5%, which on ES is tens of points: enough to move every level in a
+backtest without anything in the payload indicating it. Each row therefore
+carries its own `projection` block naming the ratio it was projected on.
+
+Historical responses also keep their **projected** spot rather than taking the
+live futures print — today's price stamped on a past frame would state
+something false about that frame.
+
 > **Authoritative source.** This guide is the curated derived/charting
 > surface. The live, complete, always-current endpoint list is the
 > OpenAPI schema at `/openapi.json` (rendered at `/docs`); when the two

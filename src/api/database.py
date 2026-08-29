@@ -6023,6 +6023,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         *,
         lookback_minutes: int = 5760,
         limit: int = 15,
+        at: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Concurrent future/index print pairs, newest first.
 
@@ -6051,10 +6052,31 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Several samples are returned, not just the newest, so the caller can
         take a median and shrug off a single bad print.
 
+        ``at`` anchors the window: samples are the newest pairs at or BEFORE
+        that instant, rather than the newest pairs outright.  This is what
+        makes a HISTORICAL projection honest — the basis a caller wants for a
+        frame from three months ago is the basis that stood then, not today's.
+        Carry walks down through each quarterly cycle toward expiry, so
+        anchoring at ``NOW()`` for a past timestamp offsets every projected
+        level by however much the basis has moved since.  ``None`` keeps the
+        live behaviour (anchor at ``NOW()``), which is the common path.
+
         Reads ``futures_quotes`` + ``underlying_quotes`` only.
         """
         index_symbol = (index_symbol or "").upper()
-        cache_key = f"futures_basis_samples:{index_symbol}:{lookback_minutes}:{limit}"
+        # A naive anchor is read as UTC by the driver, which silently shifts
+        # the window by the local offset on any box that isn't UTC. Stamp it
+        # explicitly so the column's timezone and the parameter's agree.
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        # The anchor is part of the identity of the result: a cache keyed only
+        # on symbol/window would serve a historical read from the live entry
+        # (or vice versa), which is the precise bug this parameter exists to
+        # fix. ``None`` keeps the original key shape for the live path.
+        anchor_key = at.isoformat() if at is not None else "now"
+        cache_key = (
+            f"futures_basis_samples:{index_symbol}:{lookback_minutes}:{limit}:{anchor_key}"
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -6076,13 +6098,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 LIMIT 1
             ) u ON TRUE
             WHERE f.index_symbol = $1
-              AND f.timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+              AND f.timestamp <= COALESCE($4::timestamptz, NOW())
+              AND f.timestamp >= COALESCE($4::timestamptz, NOW())
+                                - ($2::int * INTERVAL '1 minute')
             ORDER BY f.timestamp DESC
             LIMIT $3
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, index_symbol, int(lookback_minutes), int(limit))
+                rows = await conn.fetch(
+                    query, index_symbol, int(lookback_minutes), int(limit), at
+                )
                 payload = [dict(r) for r in rows]
                 self._cache_set(cache_key, payload, self._futures_basis_cache_ttl_seconds)
                 return payload

@@ -18,8 +18,9 @@ Driven through a stub app rather than the real one, so the contract is pinned
 independently of any endpoint.
 """
 
+import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from starlette.applications import Starlette
@@ -330,3 +331,205 @@ def test_prices_quoted_in_prose_are_carried_across_too():
     assert "$6,694.50" in body["rationale"]
     assert "$2.40" in body["rationale"]
     assert body["projection"]["narrative_prices_converted"] is True
+
+
+# --- historical (as-of) basis ----------------------------------------------
+#
+# A request pinned to a past instant must be projected with the basis that
+# stood THEN. Anchoring it at NOW() offsets every level by however much carry
+# has moved since — invisible on a chart, and corrupting in a backtest.
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("ts=2026-05-14T18:30:00Z", datetime(2026, 5, 14, 18, 30, tzinfo=timezone.utc)),
+        ("ts=2026-05-14T18:30:00+00:00", datetime(2026, 5, 14, 18, 30, tzinfo=timezone.utc)),
+        # A bare trading day anchors at its cash close, not midnight: every
+        # frame in the session sits after 09:30 ET, so midnight would push the
+        # basis read a full day back.
+        ("date=2026-05-14", datetime(2026, 5, 14, 20, 0, tzinfo=timezone.utc)),
+        ("end_date=2026-05-14", datetime(2026, 5, 14, 20, 0, tzinfo=timezone.utc)),
+    ],
+)
+def test_asof_is_read_from_the_request(query, expected):
+    scope = {"query_string": query.encode("latin-1"), "path": "/api/replay/frame"}
+    assert fm._request_asof(scope) == expected
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",                        # a live request
+        "symbol=ES",               # no time named
+        "ts=not-a-timestamp",      # unparseable: live, never a crash
+        "date=2026-13-99",         # impossible date
+        "start_date=2026-01-02",   # the FAR end of a range, never the anchor
+    ],
+)
+def test_requests_without_a_usable_anchor_stay_live(query):
+    scope = {"query_string": query.encode("latin-1"), "path": "/api/gex/historical"}
+    assert fm._request_asof(scope) is None
+
+
+def test_a_future_dated_anchor_is_treated_as_live():
+    """Asking for today mid-session must read the current tape, not an empty
+    window ending before the session's own prints."""
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+    scope = {"query_string": f"date={tomorrow}".encode("latin-1"), "path": "/api/replay/range"}
+    assert fm._request_asof(scope) is None
+
+
+def test_the_most_specific_anchor_wins():
+    """``ts`` pins an instant; ``date`` only pins a session."""
+    scope = {
+        "query_string": b"date=2026-05-14&ts=2026-05-14T14:05:00Z",
+        "path": "/api/replay/frame",
+    }
+    assert fm._request_asof(scope) == datetime(2026, 5, 14, 14, 5, tzinfo=timezone.utc)
+
+
+def test_historical_request_resolves_the_basis_at_that_instant(monkeypatch):
+    """End to end: the anchor reaches resolve_basis rather than being dropped."""
+    seen: dict = {}
+
+    async def capturing_resolve_basis(db, symbol, **kwargs):
+        seen["at"] = kwargs.get("at")
+        return BASIS
+
+    monkeypatch.setattr(fm, "resolve_basis", capturing_resolve_basis)
+    _client().get("/api/gex/summary?symbol=ES&ts=2026-05-14T18:30:00Z")
+    assert seen["at"] == datetime(2026, 5, 14, 18, 30, tzinfo=timezone.utc)
+
+
+def test_live_request_resolves_the_basis_with_no_anchor(monkeypatch):
+    seen: dict = {"at": "unset"}
+
+    async def capturing_resolve_basis(db, symbol, **kwargs):
+        seen["at"] = kwargs.get("at")
+        return BASIS
+
+    monkeypatch.setattr(fm, "resolve_basis", capturing_resolve_basis)
+    _client().get("/api/gex/summary?symbol=ES")
+    assert seen["at"] is None
+
+
+def test_the_anchor_survives_the_v2_envelope(monkeypatch):
+    """v2 unwraps to `data` and recurses; the anchor must ride along or every
+    /api/v2 historical read silently reverts to today's basis."""
+    seen: dict = {"at": "unset"}
+
+    async def capturing_resolve_basis(db, symbol, **kwargs):
+        seen["at"] = kwargs.get("at")
+        return BASIS
+
+    monkeypatch.setattr(fm, "resolve_basis", capturing_resolve_basis)
+    middleware = fm.FuturesProjectionMiddleware(app=None)
+    envelope = {
+        "data": {"spot_price": 6600.0, "call_wall": 6700.0},
+        "freshness": {"freshness_status": "fresh", "age_seconds": 3.0},
+    }
+    at = datetime(2026, 5, 14, 18, 30, tzinfo=timezone.utc)
+    asyncio.run(middleware._transform(envelope, "ES", "SPX", at))
+    assert seen["at"] == at
+
+
+def test_a_historical_frame_never_takes_the_live_spot(monkeypatch):
+    """Today's ES print stamped on a past frame states something false about
+    that frame. The projected value is the honest one."""
+    called: dict = {"live": False}
+
+    async def fake_live_spot(index_symbol):
+        called["live"] = True
+        return LIVE_ES
+
+    monkeypatch.setattr(fm, "_live_futures_spot", fake_live_spot)
+    middleware = fm.FuturesProjectionMiddleware(app=None)
+    at = datetime(2026, 5, 14, 18, 30, tzinfo=timezone.utc)
+    out = asyncio.run(middleware._transform({"spot_price": 6600.0}, "ES", "SPX", at))
+    assert called["live"] is False
+    assert out["spot_price"] == pytest.approx(6600.0 * BASIS.ratio, abs=0.25)
+
+
+def test_a_live_request_still_prefers_the_observed_print():
+    """The guard above must not disturb the live path."""
+    body = _client().get("/api/gex/summary?symbol=ES").json()
+    assert body["spot_price"] == LIVE_ES
+
+
+# --- per-row basis on a series ---------------------------------------------
+
+
+def _basis_at(ratio):
+    return FuturesBasis(
+        index_symbol="SPX",
+        futures_symbol="ES",
+        ratio=ratio,
+        source="measured",
+        observed_at=None,
+        sample_count=5,
+        feed_symbol="@ES",
+    )
+
+
+def test_a_multi_month_series_uses_each_row_s_own_basis(monkeypatch):
+    """One ratio across a quarter offsets the far end by the whole carry cycle.
+    Each row must be projected on the basis that stood in its own session."""
+    # Carry decays toward expiry, so an older row sits at a wider basis.
+    ratios = {"2026-02-13": 1.0090, "2026-05-14": 1.0050, "2026-08-14": 1.0010}
+    seen: list = []
+
+    async def by_anchor(db, symbol, **kwargs):
+        at = kwargs.get("at")
+        seen.append(at)
+        return _basis_at(ratios[at.astimezone(fm.ET).date().isoformat()])
+
+    monkeypatch.setattr(fm, "resolve_basis", by_anchor)
+    middleware = fm.FuturesProjectionMiddleware(app=None)
+    rows = [
+        {"timestamp": f"{day}T18:30:00Z", "call_wall": 6000.0}
+        for day in ("2026-02-13", "2026-05-14", "2026-08-14")
+    ]
+    out = asyncio.run(middleware._transform(rows, "ES", "SPX", None))
+
+    assert [r["call_wall"] for r in out] == [
+        pytest.approx(6054.0, abs=0.25),
+        pytest.approx(6030.0, abs=0.25),
+        pytest.approx(6006.0, abs=0.25),
+    ]
+    # Three sessions, three anchors — not one ratio smeared across the range.
+    assert len({a.date() for a in seen}) == 3
+
+
+def test_rows_in_one_session_share_a_single_basis_read(monkeypatch):
+    """Per-row must not mean per-minute: a session's rows resolve once."""
+    calls: list = []
+
+    async def counting(db, symbol, **kwargs):
+        calls.append(kwargs.get("at"))
+        return _basis_at(1.0067)
+
+    monkeypatch.setattr(fm, "resolve_basis", counting)
+    middleware = fm.FuturesProjectionMiddleware(app=None)
+    rows = [
+        {"timestamp": f"2026-05-14T{14 + i // 60:02d}:{i % 60:02d}:00Z", "call_wall": 6000.0}
+        for i in range(120)
+    ]
+    asyncio.run(middleware._transform(rows, "ES", "SPX", None))
+    assert len(calls) == 1
+
+
+def test_a_row_without_a_timestamp_falls_back_to_the_request_anchor(monkeypatch):
+    seen: list = []
+
+    async def capturing(db, symbol, **kwargs):
+        seen.append(kwargs.get("at"))
+        return _basis_at(1.0067)
+
+    monkeypatch.setattr(fm, "resolve_basis", capturing)
+    middleware = fm.FuturesProjectionMiddleware(app=None)
+    at = datetime(2026, 5, 14, 18, 30, tzinfo=timezone.utc)
+    rows = [{"timestamp": "2026-05-14T18:30:00Z", "call_wall": 6000.0}, {"call_wall": 6100.0}]
+    out = asyncio.run(middleware._transform(rows, "ES", "SPX", at))
+    assert at in seen
+    assert out[1]["call_wall"] == pytest.approx(6100.0 * 1.0067, abs=0.25)
