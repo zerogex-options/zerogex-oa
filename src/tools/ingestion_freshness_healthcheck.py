@@ -49,6 +49,8 @@ from src.market_calendar import (
     current_futures_session_start,
     feed_session_window,
     is_futures_session_open,
+    option_chain_feed_expected,
+    option_chain_feed_window,
     underlying_feed_expected,
 )
 from src.symbols import get_canonical_symbol, parse_underlyings
@@ -297,6 +299,12 @@ def _session_anchor(session_template: str, symbol: str, now_et: datetime) -> dat
     return ET.localize(datetime.combine(now_et.date(), open_t))
 
 
+def _chain_anchor(symbol: str, now_et: datetime) -> datetime:
+    """Today's OPTION-chain open (09:30 ET), in ET."""
+    open_t, _close_t = option_chain_feed_window(symbol, now_et.date())
+    return ET.localize(datetime.combine(now_et.date(), open_t))
+
+
 def collect_feeds(
     symbols: List[str],
     session_template: str,
@@ -307,16 +315,32 @@ def collect_feeds(
     results: List[FeedFreshness] = []
 
     # --- underlying bars + option chains -------------------------------
-    # Chains share their underlying's window: feed_session_window already
-    # clamps cash indexes to 09:30-16:00, which is exactly why SPX and NDX
-    # chains stop at 15:59 while SPY and QQQ run to 20:00 -- Greeks are
-    # refused once the index stops printing, so no rows are written.
+    # The two do NOT share a window. Bars follow the session template
+    # (04:00-20:00 under USEQ24Hour); chains follow the OPTIONS session,
+    # 09:30-16:15, because a chain row is only written when an option quote
+    # ticks. Grading chains against the bar window alerted every pre-market
+    # and every evening -- real 16-45 minute quote gaps in tails where the
+    # options market is shut -- which is the "cries wolf" failure this check
+    # cannot afford. Cash indexes stop at 16:00 either way: Greeks are refused
+    # once the index stops printing, so no rows are written.
     bars = _fetch_last_bars(symbols)
     chains = _fetch_last_chain_writes(symbols)
     for symbol in symbols:
-        expected = underlying_feed_expected(now_et, session_template, symbol)
-        anchor = _session_anchor(session_template, symbol, now_et)
-        for feed, source in ((FEED_UNDERLYING, bars), (FEED_CHAINS, chains)):
+        graded = (
+            (
+                FEED_UNDERLYING,
+                bars,
+                underlying_feed_expected(now_et, session_template, symbol),
+                _session_anchor(session_template, symbol, now_et),
+            ),
+            (
+                FEED_CHAINS,
+                chains,
+                option_chain_feed_expected(now_et, symbol),
+                _chain_anchor(symbol, now_et),
+            ),
+        )
+        for feed, source, expected, anchor in graded:
             results.append(
                 evaluate_feed(
                     feed,

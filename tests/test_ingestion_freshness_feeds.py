@@ -15,6 +15,7 @@ import datetime as dt
 
 import pytz
 
+from src.market_calendar import option_chain_feed_expected
 from src.tools.ingestion_freshness_healthcheck import (
     FEED_CHAINS,
     FEED_FUTURES,
@@ -180,3 +181,73 @@ def test_clamping_does_not_hide_a_genuinely_dead_feed():
     )
     assert result.status == "stale"
     assert result.stale_minutes == 205.0
+
+
+# --- the option-chain window ------------------------------------------------
+#
+# Chains were originally graded against the underlying's delivery window
+# (04:00-20:00 under USEQ24Hour). Option quotes only tick while options trade,
+# so both tails of that window are full of legitimate multi-minute gaps: on
+# 2026-08-28 production logged QQQ chains "STALE - nothing written for 18.4
+# min" at 19:40 ET and 28.3 min at 19:50, and the same shape appears every
+# pre-market. Each firing emailed, every 10 minutes, for a feed that was fine.
+
+
+def _chain_expected(when, symbol="SPY"):
+    return option_chain_feed_expected(when, symbol)
+
+
+def test_chains_are_not_graded_before_the_options_open():
+    """04:00-09:30: the bar feed is live, the options market is not."""
+    assert _chain_expected(_et(2026, 8, 27, 4, 15)) is False
+    assert _chain_expected(_et(2026, 8, 27, 9, 29)) is False
+
+
+def test_chains_are_not_graded_after_the_options_close():
+    """The 19:40 ET page that started this: real gap, shut market."""
+    assert _chain_expected(_et(2026, 8, 28, 16, 30)) is False
+    assert _chain_expected(_et(2026, 8, 28, 19, 40)) is False
+
+
+def test_chains_are_graded_through_the_options_session():
+    assert _chain_expected(_et(2026, 8, 27, 9, 30)) is True
+    assert _chain_expected(_et(2026, 8, 27, 12, 0)) is True
+    assert _chain_expected(_et(2026, 8, 27, 16, 15)) is True
+
+
+def test_cash_index_chains_stop_at_the_index_close():
+    """SPX/NDX chains stop at 16:00: no underlying print, no Greeks, no rows."""
+    assert option_chain_feed_expected(_et(2026, 8, 27, 16, 10), "SPX") is False
+    assert option_chain_feed_expected(_et(2026, 8, 27, 15, 59), "SPX") is True
+
+
+def test_chains_never_graded_at_weekends_or_holidays(monkeypatch):
+    """NYSE_HOLIDAYS is env-loaded, so pin it rather than testing the box."""
+    import src.market_calendar as mc
+
+    assert _chain_expected(_et(2026, 8, 29, 12, 0)) is False  # Saturday
+    monkeypatch.setattr(mc, "NYSE_HOLIDAYS", {dt.date(2026, 9, 7)})
+    assert mc.option_chain_feed_expected(_et(2026, 9, 7, 12, 0), "SPY") is False  # Labor Day
+
+
+def test_half_day_chains_stop_at_the_early_close(monkeypatch):
+    """An early close must not page for the three hours after it."""
+    import src.market_calendar as mc
+
+    monkeypatch.setattr(mc, "NYSE_HALF_DAYS", {dt.date(2026, 11, 27)})
+    assert mc.option_chain_feed_expected(_et(2026, 11, 27, 12, 0), "SPY") is True
+    assert mc.option_chain_feed_expected(_et(2026, 11, 27, 14, 0), "SPY") is False
+
+
+def test_a_chain_stream_dead_inside_the_session_is_still_stale():
+    """The narrowing must not blind the check to the failure it exists for."""
+    result = evaluate_feed(
+        FEED_CHAINS,
+        "QQQ",
+        _et(2026, 8, 27, 9, 35),
+        _et(2026, 8, 27, 14, 0),
+        expected=option_chain_feed_expected(_et(2026, 8, 27, 14, 0), "QQQ"),
+        session_anchor=_et(2026, 8, 27, 9, 30),
+        max_stale=MAX_STALE,
+    )
+    assert result.status == "stale"

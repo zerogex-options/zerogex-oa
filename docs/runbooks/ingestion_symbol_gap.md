@@ -158,6 +158,18 @@ for cash indices before 09:30 / after 16:00 ET.
   are diagnosing something intermittent, raise the cap **first**, then wait for
   a recurrence. Check `df -h /` before raising it; the root volume runs hot.
 - The freshness check pages every 10 minutes while a symbol is stale. That is
-  intentional for data loss, but it means a long known outage is noisy.
+  intentional for data loss, but it means a long known outage is noisy. There
+  is no cooldown on the email path (only the PagerDuty backend sets a
+  `dedup_key`), so every firing is one more mail.
+- **Option chains are graded on the OPTIONS session (09:30-16:15 ET), not the
+  underlying's window.** A chain row is written only when an option quote
+  ticks, so outside that session the gaps are minutes to hours wide and mean
+  nothing. Grading them against the bar feed's 04:00-20:00 template window
+  paged ~12 times a day on healthy feeds (21 of the 69 >15-minute chain gaps
+  in a 3-day sample). If a chain stream dies after 16:15, the check stays
+  quiet until 09:30 — the worker's underlying bar stream is still watched to
+  20:00, so a dead *worker* is caught either way; only a chains-only stall
+  overnight is invisible, and nothing is lost while the options market is
+  shut.
 - Nothing here detects a child that is alive, streaming, and writing
   *wrong* data — only absence.
