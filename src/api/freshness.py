@@ -640,7 +640,9 @@ def market_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
     return SESSION_CLOSED, True
 
 
-def feed_window_open(profile: CadenceProfile, now: datetime) -> Optional[datetime]:
+def feed_window_open(
+    profile: CadenceProfile, now: datetime, symbol: Optional[str] = None
+) -> Optional[datetime]:
     """The instant the CURRENT feed window opened, for ``now``.
 
     ``stale_after`` was computed purely as ``source_timestamp + window``. Across
@@ -660,10 +662,23 @@ def feed_window_open(profile: CadenceProfile, now: datetime) -> Optional[datetim
     Cash-session-only profiles (``extended_seconds is None`` — flow accrues
     only 09:30-16:00) open at 09:30 ET; everything else opens with ingestion
     at 04:00 ET. Returns ``None`` when the profile expects nothing.
+
+    ES/NQ take the CME boundary instead. Their grading moved to the futures
+    calendar but this anchor did not, so a futures feed dead since 03:00 got
+    a free grace period at 04:00 — an NYSE ingestion boundary that means
+    nothing to a market which had been trading all night. CME reopens daily
+    at 18:00 ET after the maintenance break, and that is the only instant
+    where a futures payload genuinely cannot be late yet.
     """
     if profile.regular_seconds is None:
         return None
     now_et = now.astimezone(_ET)
+    if _is_futures(symbol):
+        reopen = _at(18, 0)
+        day = now_et.date() if now_et.time() >= reopen else now_et.date() - timedelta(days=1)
+        return _ET.localize(
+            datetime(day.year, day.month, day.day, reopen.hour, reopen.minute)
+        ).astimezone(timezone.utc)
     open_t = profile.feed_opens_et or (
         _at(9, 30) if profile.extended_seconds is None else _at(4, 0)
     )
@@ -1110,7 +1125,7 @@ def build_freshness(
         else:
             # Never start the clock before the window that could produce the
             # next observation actually opened (see feed_window_open).
-            window_open = feed_window_open(profile, evaluated_at)
+            window_open = feed_window_open(profile, evaluated_at, symbol)
             anchor = source_timestamp
             if window_open is not None and window_open > anchor:
                 anchor = window_open
