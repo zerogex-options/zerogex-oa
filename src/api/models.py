@@ -627,6 +627,19 @@ class StrikeProfileBucket(BaseModel):
     ``expirations=<YYYY-MM-DD>`` yields walls scoped to that
     expiration's gamma alone.  ``call_wall`` / ``put_wall`` are
     ``None`` when the bucket has no strikes or no underlying close.
+    ``pin_strike`` / ``pin_confidence`` are the Pin Strike (the reachable
+    0DTE strike with the strongest modeled positive/restoring dealer gamma
+    into expiration — see :mod:`src.analytics.pin_strike`) and its 0..1
+    dominance over the other viable pins, as of this bucket's close.  They
+    are read verbatim from the bucket's representative ``gex_summary`` row
+    and, unlike the walls and the flip, are NOT scoped by ``expirations``:
+    the pin is 0DTE-by-construction and whole-chain by definition, so it
+    reads the same in every expiration scope — matching the live surfaces,
+    where the pin does not move when the Expiry selector changes.  Both are
+    ``None`` when the bucket has no active pin and on rows written before
+    the pin columns shipped; a ``None`` pin is drawn as no line, never as
+    ``0``.
+
     ``strikes`` is the per-strike payload; one row per strike
     available in this bucket's snapshot universe (after the optional
     expiration filter).
@@ -641,6 +654,11 @@ class StrikeProfileBucket(BaseModel):
     gamma_flip: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
+    pin_strike: Optional[Decimal] = None
+    # DOUBLE PRECISION in gex_summary (a 0..1 ratio, not a price), so it
+    # stays a float rather than joining the NUMERIC price fields above —
+    # no Decimal round-trip for a value that is never money.
+    pin_confidence: Optional[float] = None
     strikes: list[StrikeProfileStrike]
 
     class Config:

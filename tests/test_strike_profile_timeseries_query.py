@@ -287,6 +287,59 @@ def test_expiration_filter_is_fixed_shape_predicate():
 
 
 # ---------------------------------------------------------------------------
+# Pin Strike is whole-chain: the expiration filter must not reach it
+# ---------------------------------------------------------------------------
+
+
+def test_pin_read_from_gex_summary_outside_the_expiration_filter():
+    """``pin_strike`` / ``pin_confidence`` must come from the bucket's
+    ``gex_summary`` representative row, never from the filtered strikes.
+
+    Pin Strike is 0DTE-by-construction — it models dealer hedging into
+    expiration — so it is whole-chain by definition and reads the same in
+    every expiration scope.  That is deliberately UNLIKE the walls (always)
+    and the flip (under a filter), which are recomputed from the
+    expiration-filtered strikes.  The live surfaces already hold the pin
+    fixed when the Expiry selector changes; the rewind chart draws the same
+    level from this endpoint, so if the pin were ever sourced from the
+    ``strikes`` CTE the one line would mean two different things depending
+    on the mode.
+
+    The structural guarantee is where it is READ, so that is what this pins:
+    selected in ``bucket_reps`` (which the filter cannot see) and projected
+    from ``br``, with nothing pin-shaped anywhere inside the ``strikes`` CTE
+    that the ``expiration = ANY($3)`` predicate lives in.
+    """
+    sql = _sql_only(_run("SPY")["query"])
+
+    bucket_reps = sql[sql.index("bucket_reps AS") : sql.index("ohlc AS")]
+    assert "gs.pin_strike" in bucket_reps
+    assert "gs.pin_confidence" in bucket_reps
+
+    # Projected off the bucket-rep alias, not off the strikes join.
+    final_select = sql[sql.rindex("            SELECT") :]
+    assert "br.pin_strike" in final_select
+    assert "br.pin_confidence" in final_select
+
+    # The strikes CTE is the only expiration-filtered part of the query —
+    # the pin must be nowhere inside it.
+    strikes_cte = sql[sql.index("strikes AS") : sql.rindex("            SELECT")]
+    assert "expiration = ANY(" in strikes_cte, "fixture drifted: filter left the strikes CTE"
+    assert "pin" not in strikes_cte
+
+
+def test_pin_selection_is_identical_across_expiration_scopes():
+    """Belt-and-braces on the above: 'all' and a filtered set must produce
+    the same SQL (already pinned upstream), so the pin they read is the same
+    stored value in both — the filter changes only the bound ``date[]``."""
+    all_sql = _run("SPY", expirations=None)["query"]
+    set_sql = _run("SPY", expirations=[date(2026, 6, 20)])["query"]
+
+    assert all_sql == set_sql
+    assert all_sql.count("gs.pin_strike") == 1
+
+
+# ---------------------------------------------------------------------------
 # Per-strike gamma is SUMMED across expirations (never collapsed to one)
 # ---------------------------------------------------------------------------
 
@@ -378,7 +431,7 @@ def test_query_orders_ascending_by_bucket_time():
 
 def test_response_groups_flat_rows_into_per_bucket_dicts():
     """Flat (timestamp, strike, ...) SQL rows must be grouped into one
-    dict per timestamp, carrying OHLC / flip / walls once and a
+    dict per timestamp, carrying OHLC / flip / walls / pin once and a
     ``strikes`` array of the per-row gamma values."""
     rows = [
         {
@@ -388,6 +441,8 @@ def test_response_groups_flat_rows_into_per_bucket_dicts():
             "low": 511.85,
             "close": 512.80,
             "gamma_flip": 510.0,
+            "pin_strike": 512.0,
+            "pin_confidence": 0.61,
             "strike": 505.0,
             "call_gamma_raw": 0.0,
             "put_gamma_raw": 80.0,
@@ -404,6 +459,8 @@ def test_response_groups_flat_rows_into_per_bucket_dicts():
             "low": 511.85,
             "close": 512.80,
             "gamma_flip": 510.0,
+            "pin_strike": 512.0,
+            "pin_confidence": 0.61,
             "strike": 515.0,
             "call_gamma_raw": 50.0,
             "put_gamma_raw": 0.0,
@@ -424,6 +481,10 @@ def test_response_groups_flat_rows_into_per_bucket_dicts():
     assert bucket["open"] == 512.30
     assert bucket["close"] == 512.80
     assert bucket["gamma_flip"] == 510.0
+    # Pin Strike (+ confidence) is carried once per bucket alongside the
+    # flip, straight from the bucket's representative gex_summary row.
+    assert bucket["pin_strike"] == 512.0
+    assert bucket["pin_confidence"] == 0.61
     # Walls are computed from the bucket's own (filtered, summed) gamma
     # rows against the bucket's close (512.80) — the only call_gamma_raw
     # above spot sits at 515; the only put_gamma_raw below spot sits at
@@ -456,6 +517,8 @@ def test_response_omits_strikes_with_zero_values_only():
             "low": 1.0,
             "close": 1.0,
             "gamma_flip": None,
+            "pin_strike": None,
+            "pin_confidence": None,
             "strike": 500.0,
             "call_gamma_raw": 0.0,
             "put_gamma_raw": 0.0,
@@ -472,6 +535,8 @@ def test_response_omits_strikes_with_zero_values_only():
             "low": 1.0,
             "close": 1.0,
             "gamma_flip": None,
+            "pin_strike": None,
+            "pin_confidence": None,
             "strike": 510.0,
             "call_gamma_raw": 1.0,
             "put_gamma_raw": 0.0,
@@ -509,6 +574,8 @@ def test_response_keeps_buckets_with_no_strikes():
             "low": 99.0,
             "close": 100.5,
             "gamma_flip": 100.0,
+            "pin_strike": None,
+            "pin_confidence": None,
             "strike": None,
             "call_gamma_raw": None,
             "put_gamma_raw": None,
@@ -553,6 +620,8 @@ def test_walls_per_bucket_follow_the_summed_gamma_basis():
         "low": 100.0,
         "close": 100.0,
         "gamma_flip": None,
+        "pin_strike": None,
+        "pin_confidence": None,
         "call_oi": 0,
         "put_oi": 0,
     }
@@ -602,6 +671,8 @@ def test_walls_use_bucket_close_as_spot():
             "low": 100.0,
             "close": 100.0,
             "gamma_flip": None,
+            "pin_strike": None,
+            "pin_confidence": None,
             "strike": 99.0,
             "call_gamma_raw": 50.0,
             "put_gamma_raw": 40.0,
@@ -618,6 +689,8 @@ def test_walls_use_bucket_close_as_spot():
             "low": 100.0,
             "close": 100.0,
             "gamma_flip": None,
+            "pin_strike": None,
+            "pin_confidence": None,
             "strike": 101.0,
             "call_gamma_raw": 30.0,
             "put_gamma_raw": 70.0,
@@ -651,6 +724,8 @@ def test_walls_null_when_close_is_missing():
             "low": None,
             "close": None,
             "gamma_flip": None,
+            "pin_strike": None,
+            "pin_confidence": None,
             "strike": 100.0,
             "call_gamma_raw": 50.0,
             "put_gamma_raw": 50.0,
@@ -694,6 +769,8 @@ def _flip_rows():
                 "low": 100.0,
                 "close": 100.0,
                 "gamma_flip": 510.0,
+                "pin_strike": None,
+                "pin_confidence": None,
                 "strike": strike,
                 "call_gamma_raw": cg,
                 "put_gamma_raw": pg,
@@ -739,6 +816,8 @@ def test_flip_scoped_subset_null_when_curve_one_signed():
                 "low": 100.0,
                 "close": 100.0,
                 "gamma_flip": 510.0,
+                "pin_strike": None,
+                "pin_confidence": None,
                 "strike": strike,
                 "call_gamma_raw": cg,
                 "put_gamma_raw": pg,

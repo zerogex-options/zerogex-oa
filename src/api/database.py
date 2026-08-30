@@ -4155,6 +4155,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
           * ``call_wall`` / ``put_wall`` computed live for the bucket from
             the same (filtered, summed-by-strike) gamma rows the bucket's
             bars render (see below);
+          * ``pin_strike`` / ``pin_confidence`` as of the bucket's close,
+            read verbatim from the representative ``gex_summary`` row and
+            NEVER expiration-scoped — see the pin-scope rules below;
           * every strike's gamma exposure in the same dollar-GEX units
             ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
             evaluated against the bucket's own ``close`` so the surface
@@ -4191,6 +4194,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             (cumulative net-GEX zero crossing), against the bucket's own
             close.  ``None`` when that curve is one-signed / the bucket has
             no close.
+
+        Pin scope — deliberately NOT the wall/flip rule:
+
+          The pin is whole-chain in EVERY expiration scope.  Unlike the
+          walls and the flip, which describe the currently-selected
+          expiration set and are therefore recomputed from the filtered
+          strikes, Pin Strike is 0DTE-by-construction: it models dealer
+          hedging into expiration, so restricting it to a subset of
+          expirations would not narrow it, it would make it a different
+          metric wearing the same name.  ``expirations`` therefore does not
+          reach it — ``pin_strike`` and ``pin_confidence`` are the stored
+          ``gex_summary`` values for the bucket's representative row in
+          both modes.  This is what the live surfaces already do (the pin
+          does not move when the Expiry selector changes), and the rewind
+          chart reads the same level from here, so the two agree.
+
+          Bucket semantics follow ``close``: the representative row is the
+          LAST ``gex_summary`` row in the bucket, so the pin is the pin as
+          of the bucket's close, not an average or a max across it.
+
+          ``None`` for buckets whose rows predate the pin columns and for
+          cycles that found no active pin; consumers draw no line rather
+          than a zero.
 
         Cash-index session filter is applied to both the window anchor
         and the bucket-rep CTE — same shape ``get_historical_gex`` uses —
@@ -4295,11 +4321,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- consistent with the bars rendered in the same bucket
             -- (e.g. ``expirations=2026-06-13`` → walls scoped to 2026-06-13
             -- gamma only) and routes every consumer through one helper.
+            -- Pin Strike rides along verbatim from the bucket's
+            -- representative gex_summary row, and is deliberately NOT
+            -- recomputed or expiration-scoped below.  The pin is
+            -- 0DTE-by-construction (it models into-expiration hedging) and
+            -- whole-chain by definition, so it must read the same in every
+            -- expiration scope — matching the live surfaces, where the pin
+            -- does not move when the Expiry selector changes.  DISTINCT ON
+            -- ... ORDER BY gs.timestamp DESC makes this the pin AS OF THE
+            -- BUCKET'S CLOSE, the same "last row wins" rule ``close`` uses,
+            -- rather than an average or a max across the bucket.  NULL on
+            -- buckets whose rows predate the pin columns, and on cycles that
+            -- found no active pin (pin_strike_reason then carries the
+            -- REASON_* code, which this endpoint does not surface).
             bucket_reps AS (
                 SELECT DISTINCT ON ({bucket})
                     {bucket} AS bucket_ts,
                     gs.timestamp AS rep_ts,
-                    gs.gamma_flip_point AS gamma_flip
+                    gs.gamma_flip_point AS gamma_flip,
+                    gs.pin_strike,
+                    gs.pin_confidence
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                     AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
@@ -4442,6 +4483,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 o.low,
                 o.close,
                 br.gamma_flip,
+                br.pin_strike,
+                br.pin_confidence,
                 s.strike,
                 -- Raw summed gamma at this (bucket, strike) — used by the
                 -- Python wall computation below.  Not exposed in the
@@ -4558,6 +4601,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "low": r["low"],
                             "close": r["close"],
                             "gamma_flip": r["gamma_flip"],
+                            # Pin Strike as of the bucket's close, straight
+                            # from the representative gex_summary row. Unlike
+                            # the walls (and the flip under a filter) it is
+                            # never recomputed in _finalize_bucket: the pin is
+                            # whole-chain 0DTE by definition and must not move
+                            # with the expirations filter. None on buckets
+                            # older than the pin columns and on cycles with no
+                            # active pin — consumers draw no line for None
+                            # rather than a zero.
+                            "pin_strike": r["pin_strike"],
+                            "pin_confidence": r["pin_confidence"],
                             # Filled in below, after the bucket's strikes
                             # are known.
                             "call_wall": None,
