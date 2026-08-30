@@ -66,7 +66,7 @@ import fnmatch
 import logging
 from collections import deque
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from itertools import chain
 from typing import Any, Deque, Generic, Iterable, Optional, Tuple, TypeVar
@@ -182,6 +182,14 @@ class CadenceProfile:
     session_scoped: bool = False
     stale_grace: float = 2.5
     stale_floor_seconds: float = 15.0
+    # ET instant this profile's feed starts writing, when it is neither of
+    # the two shapes ``feed_window_open`` infers (cash-session-only profiles
+    # open 09:30, everything else opens with ingestion at 04:00). The option
+    # chain is the case: it opens at 09:30 like a cash-session feed but runs
+    # 15 minutes past the close, so it must keep ``extended_seconds`` set and
+    # cannot be recognised by that shape. Leaving this None keeps the inferred
+    # behaviour for every other profile.
+    feed_opens_et: Optional[time] = None
 
     def cadence_for(self, session: str, *, market_day: bool) -> Optional[float]:
         """Expected cadence in this session, or ``None`` if no updates are due.
@@ -231,6 +239,44 @@ REALTIME_QUOTE = CadenceProfile(
     # Two empty buckets. Extended-hours tape is thin enough that a minute with
     # no prints writes no row at all, which is not a fault.
     stale_floor_seconds=120.0,
+)
+
+# Option chains ride the SAME 60-second bucket as the tape, but on a very
+# different WINDOW. A chain row is only written when an option quote ticks,
+# and options trade 09:30-16:15 ET -- while the underlying bar feed under
+# USEQ24Hour runs 04:00-20:00. Grading chains on the underlying's window made
+# /api/option/quote, /api/option/contract and /api/market/open-interest report
+# `stale` from 04:00-09:30 and 16:15-20:00 on a perfectly healthy system:
+# 9h15m of false alarm per weekday against 6h45m in which they could be right.
+#
+# The ops-side freshness check hit the same premise from the other direction
+# and measured it in production: 21 of 69 gaps over 15 minutes in
+# option_chains fell OUTSIDE the options session, up to 45 minutes wide, and
+# every one of them paged (see src/tools/ingestion_freshness_healthcheck.py).
+# Both now read the window from the same helper, so they cannot drift apart.
+#
+# extended_seconds stays SET, unlike the cash-session-only flow profile: the
+# window runs 15 minutes past the 16:00 close, which market_context labels
+# `after-hours`, and a None there would go blind over that tail. The window is
+# enforced instead by option_chain_market_day() below, which is symbol- and
+# calendar-aware in ways a session label is not: cash-index chains stop at
+# 16:00 with the index they price, and every chain stops at the early close on
+# a half day.
+OPTION_CHAIN = CadenceProfile(
+    name="option_chain",
+    description=(
+        "Per-contract option quotes and open interest. Stored in the same "
+        "config.AGGREGATION_BUCKET_SECONDS=60s buckets as the tape, but "
+        "written only while options trade: 09:30-16:15 ET (16:00 for cash "
+        "indices, and the early close on a half day). Outside that window no "
+        "update is due, however active the underlying tape is."
+    ),
+    regular_seconds=float(AGGREGATION_BUCKET_SECONDS),
+    extended_seconds=float(AGGREGATION_BUCKET_SECONDS),
+    closed_seconds=None,
+    stale_grace=2.5,
+    stale_floor_seconds=120.0,
+    feed_opens_et=time(9, 30),
 )
 
 # VIX/VXN are 5-minute bars (VOLATILITY_BAR_INTERVAL in
@@ -356,6 +402,7 @@ CADENCE_PROFILES = {
     p.name: p
     for p in (
         REALTIME_QUOTE,
+        OPTION_CHAIN,
         VOLATILITY_BAR,
         ANALYTICS_CYCLE,
         FLOW_AGGREGATE,
@@ -384,6 +431,9 @@ ENDPOINT_CADENCE: Tuple[Tuple[str, CadenceProfile], ...] = (
     ("/api/market/session-levels*", DAILY_CYCLE),
     # Ahead of the /api/market/* glob below: 5-minute bars, not the 1s tape.
     ("/api/market/volatility*", VOLATILITY_BAR),
+    # Open interest is an option_chains read wearing a /api/market/ path, so
+    # it needs the chain window, not the tape's. Ahead of the family glob.
+    ("/api/market/open-interest*", OPTION_CHAIN),
     ("/api/max-pain/timeseries*", HISTORICAL),
     # Open positions are marked to market every engine cycle, so this is a
     # live view, not completed history. Under the trades* glob below it
@@ -405,7 +455,7 @@ ENDPOINT_CADENCE: Tuple[Tuple[str, CadenceProfile], ...] = (
     ("/api/forced-flow/*", ANALYTICS_CYCLE),
     ("/api/technicals*", ANALYTICS_CYCLE),
     ("/api/flow/*", FLOW_AGGREGATE),
-    ("/api/option/*", REALTIME_QUOTE),
+    ("/api/option/*", OPTION_CHAIN),
     ("/api/market/*", REALTIME_QUOTE),
     ("/api/signals/*", SIGNALS_CYCLE),
     ("/api/forecast*", DAILY_CYCLE),
@@ -528,6 +578,34 @@ def futures_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
     return (SESSION_REGULAR, True) if live else (SESSION_CLOSED, False)
 
 
+def option_chain_market_day(now: datetime, symbol: Optional[str] = None) -> bool:
+    """Is the OPTION-CHAIN feed due to write rows at ``now``?
+
+    Gates ``market_day`` rather than replacing the session label. The two are
+    different questions and the envelope answers both: ``market_session_status``
+    must keep reporting the true NYSE session — a consumer reads it alongside
+    ``/api/market/quote``'s own ``session`` field and they cannot disagree —
+    while the cadence must go silent the moment options stop trading, which is
+    four hours before the equity tape does.
+
+    Delegates to the same ``option_chain_feed_expected`` the ingestion
+    freshness check uses, so "when should a chain row exist" has exactly one
+    definition. That helper knows the three things a session label cannot: the
+    16:15 late session, the 16:00 close for cash indices whose chains stop when
+    the index stops printing, and the early close on a half day.
+
+    Fails OPEN on a calendar error — better to grade a chain that may not be
+    due than to hide a real outage behind a broken calendar.
+    """
+    try:
+        from src.market_calendar import option_chain_feed_expected
+
+        return option_chain_feed_expected(now, symbol)
+    except Exception:  # noqa: BLE001
+        logger.warning("freshness: option-chain calendar unavailable", exc_info=True)
+        return True
+
+
 def market_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
     """Return ``(market_session_status, market_day)`` for ``now``.
 
@@ -586,7 +664,9 @@ def feed_window_open(profile: CadenceProfile, now: datetime) -> Optional[datetim
     if profile.regular_seconds is None:
         return None
     now_et = now.astimezone(_ET)
-    open_t = _at(9, 30) if profile.extended_seconds is None else _at(4, 0)
+    open_t = profile.feed_opens_et or (
+        _at(9, 30) if profile.extended_seconds is None else _at(4, 0)
+    )
     if now_et.time() < open_t:
         return None
     return _ET.localize(
@@ -984,6 +1064,16 @@ def build_freshness(
         session, market_day = futures_context(evaluated_at)
     else:
         session, market_day = market_context(evaluated_at)
+
+    # Option chains are written only while options trade, which ends four
+    # hours before the equity tape does. Narrow the "is an update due" answer
+    # without touching the reported session — see option_chain_market_day.
+    # Consulted directly rather than behind ``market_day``: the chain calendar
+    # is the single source of truth for this window and answers weekends and
+    # holidays itself, so pre-filtering it with a different calendar's answer
+    # would put two authorities in front of one question.
+    if profile is OPTION_CHAIN:
+        market_day = option_chain_market_day(evaluated_at, symbol) and market_day
 
     try:
         generated_at, latest_event_at = _scan_timestamps(payload, evaluated_at)

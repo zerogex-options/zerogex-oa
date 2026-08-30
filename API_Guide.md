@@ -274,7 +274,8 @@ upstream can change.
 
 | Profile | Endpoints | Regular | Extended | Overnight |
 | --- | --- | --- | --- | --- |
-| `realtime_quote` | `/api/market/*`, `/api/option/*` | 60 s | 60 s | — |
+| `realtime_quote` | `/api/market/quote` and the rest of `/api/market/*` | 60 s | 60 s | — |
+| `option_chain` | `/api/option/*`, `/api/market/open-interest` | 60 s | 60 s (to 16:15 only) | — |
 | `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
 | `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
 | `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
@@ -292,6 +293,19 @@ A dash means no update is expected, which surfaces as
 but it recomputes the same 20:00 observation, so an ageing payload there is
 correct rather than late. The same holds on weekends, NYSE holidays, and
 after the 13:00 ET close on an early-close day.
+
+**`option_chain` is narrower still: 09:30–16:15 ET.** A chain row is written
+when an option quote ticks, and options trade only during the cash session
+plus the 15-minute late session — while the underlying bar feed runs
+04:00–20:00. So `/api/option/*` and `/api/market/open-interest` report
+`session_closed` from 16:15 to 09:30 the next morning even though
+`/api/market/quote` beside them is still updating, and even though
+`market_session_status` still reads `pre-market` or `after-hours`. Those two
+fields answer different questions: the session label is what the *equity
+market* is doing, and `freshness_status` is whether *this endpoint's* feed
+owes you an update. Two narrower cases the calendar also handles: cash-index
+chains (SPX, NDX) stop at 16:00 with the index they price, and every chain
+stops at the early close on a half day.
 
 Cadence describes how often a new observation can be **stored**, not how
 often ingestion polls. The quote tape is polled every few seconds but written
@@ -710,6 +724,16 @@ Most recent quote for a single option contract.
 - `strike` (optional): strike price
 - `expiration` (optional): `YYYY-MM-DD`
 - `type` (optional): `C` (call) or `P` (put)
+
+**These read `option_chains`, so they keep the options session, not the
+tape's.** `/api/market/open-interest`, `/api/option/quote` and
+`/api/option/contract` are graded on the `option_chain` cadence profile:
+09:30–16:15 ET (16:00 for SPX/NDX, the early close on a half day). Outside
+that they report `session_closed`, not `stale` — no chain row can be written
+when no option is trading, so the last snapshot before the close is the
+correct answer all evening. `/api/market/quote` sits beside them on the wider
+04:00–20:00 tape window and will still be updating; that difference is real,
+not an inconsistency.
 
 ---
 
