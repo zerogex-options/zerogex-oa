@@ -19,6 +19,7 @@ they had already corrupted a month of history:
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -331,6 +332,62 @@ class TestTrailingSigmas:
         )
 
 
+    def test_a_session_never_normalizes_against_itself(self):
+        """Including the in-progress row would drag its own z toward zero
+        exactly when the move is large — the worst possible time."""
+        sessions = [
+            _stored(DAY - timedelta(days=i + 1), float(i), float(i))
+            for i in range(rs.MIN_SESSIONS_FOR_SIGMA + 2)
+        ]
+        sessions.append(_stored(DAY, 1e9, 1e9))  # today, a huge outlier
+        db = FakeDb({}, sessions=sessions)
+
+        lean_sigma, _stab, norm, _n = asyncio.run(
+            rsess.trailing_sigmas(db, "SPY", before=DAY)
+        )
+
+        assert norm == "trailing"
+        assert lean_sigma < 100  # the outlier is excluded
+
+    def test_a_motionless_axis_borrows_the_other_axis_sigma(self):
+        """Zero would make that axis's z infinite on the next real move."""
+        sessions = [
+            _stored(DAY - timedelta(days=i + 1), 0.0, float(i + 1))
+            for i in range(rs.MIN_SESSIONS_FOR_SIGMA + 2)
+        ]
+        db = FakeDb({}, sessions=sessions)
+
+        lean_sigma, stab_sigma, norm, _n = asyncio.run(
+            rsess.trailing_sigmas(db, "SPY", before=DAY)
+        )
+
+        assert norm == "trailing"
+        assert lean_sigma == stab_sigma and lean_sigma > 0
+
+    def test_a_constant_axis_is_no_longer_degenerate(self):
+        """The sigma is measured about ZERO, so a chain that shifts by the
+        same amount every session has a perfectly good scale — and a typical
+        session on it reads as typical rather than borrowing another axis's.
+
+        Under a mean-centred estimator this axis had no dispersion at all,
+        which is how a steady, repeated, entirely real shift got reported as
+        nothing happening.
+        """
+        sessions = [
+            _stored(DAY - timedelta(days=i + 1), 5.0, float(i + 1))
+            for i in range(rs.MIN_SESSIONS_FOR_SIGMA + 2)
+        ]
+        db = FakeDb({}, sessions=sessions)
+
+        lean_sigma, stab_sigma, norm, _n = asyncio.run(
+            rsess.trailing_sigmas(db, "SPY", before=DAY)
+        )
+
+        assert norm == "trailing"
+        assert lean_sigma != stab_sigma
+        assert lean_sigma == pytest.approx(5.0 * math.sqrt(math.pi / 2))
+
+
 # --------------------------------------------------------------------------- #
 # rth_hours_between
 # --------------------------------------------------------------------------- #
@@ -363,38 +420,6 @@ class TestRthHoursBetween:
         assert rsess.rth_hours_between(
             _et(DAY, 12, 0), _et(DAY, 10, 0)
         ) == pytest.approx(2.0)
-
-    def test_a_session_never_normalizes_against_itself(self):
-        """Including the in-progress row would drag its own z toward zero
-        exactly when the move is large — the worst possible time."""
-        sessions = [
-            _stored(DAY - timedelta(days=i + 1), float(i), float(i))
-            for i in range(rs.MIN_SESSIONS_FOR_SIGMA + 2)
-        ]
-        sessions.append(_stored(DAY, 1e9, 1e9))  # today, a huge outlier
-        db = FakeDb({}, sessions=sessions)
-
-        lean_sigma, _stab, norm, _n = asyncio.run(
-            rsess.trailing_sigmas(db, "SPY", before=DAY)
-        )
-
-        assert norm == "trailing"
-        assert lean_sigma < 100  # the outlier is excluded
-
-    def test_a_constant_axis_borrows_the_other_axis_sigma(self):
-        """Zero would make that axis's z infinite on the next real move."""
-        sessions = [
-            _stored(DAY - timedelta(days=i + 1), 5.0, float(i))
-            for i in range(rs.MIN_SESSIONS_FOR_SIGMA + 2)
-        ]
-        db = FakeDb({}, sessions=sessions)
-
-        lean_sigma, stab_sigma, norm, _n = asyncio.run(
-            rsess.trailing_sigmas(db, "SPY", before=DAY)
-        )
-
-        assert norm == "trailing"
-        assert lean_sigma == stab_sigma and lean_sigma > 0
 
 
 # --------------------------------------------------------------------------- #

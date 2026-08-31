@@ -18,6 +18,7 @@ produce OPPOSITE leans — is :func:`test_lean_flips_sign_across_spot`.
 from __future__ import annotations
 
 import math
+import random
 from datetime import date
 
 import pytest
@@ -453,6 +454,99 @@ class TestNormalization:
 
     def test_stdev_ignores_non_finite_values(self):
         assert rs.stdev([2.0, 4.0, float("nan"), float("inf")]) == pytest.approx(1.0)
+
+    def test_robust_scale_agrees_with_stdev_on_gaussian_data(self):
+        """It has to be a no-op where the standard deviation was already
+        right, or fixing one chain would move every other one."""
+        rng = random.Random(7)
+        sample = [rng.gauss(0, 1) for _ in range(4000)]
+        assert rs.robust_scale(sample) == pytest.approx(rs.stdev(sample), rel=0.02)
+
+    def test_robust_scale_is_measured_about_zero_not_about_the_mean(self):
+        """The numerator is the RAW score, never ``raw - mean``, so the
+        denominator has to describe spread about the same origin.
+
+        It is also the right null on its own terms: a chain that sheds gamma
+        every session IS deteriorating every session, and a mean-centred
+        denominator would define that away as normal-for-this-symbol and
+        report QUIET straight through it.
+        """
+        drifting = [10.0, 10.2, 9.8, 10.1, 9.9, 10.0, 10.1, 9.9, 10.0, 10.0]
+
+        # About the mean this is a near-constant series with no dispersion;
+        # about zero it is a real, steady, repeated shift.
+        assert rs.stdev(drifting) < 0.3
+        assert rs.robust_scale(drifting) == pytest.approx(
+            10.0 * math.sqrt(math.pi / 2), rel=0.02
+        )
+        # So a typical day reads as typical rather than as a 30-sigma event.
+        assert abs(rs.zscore(10.0, rs.robust_scale(drifting))) == pytest.approx(
+            0.8, abs=0.05
+        )
+
+    def test_a_heavy_tail_stops_setting_the_scale_for_the_ordinary_days(self):
+        """The regression this exists for, reproduced at the shape it was
+        measured at in production.
+
+        SPY and SPX track the SAME index, so their reads should mostly agree.
+        Over one 42-session window they did not: the standard deviation put
+        48% of SPX's sessions in QUIET against 17% of SPY's, because SPX's
+        denominator was set by its tail rather than by its ordinary days.
+
+        Two chains below, same typical shift, differing only in tail weight.
+        The standard deviation splits their QUIET rates the way production
+        split SPY from SPX; the robust scale brings them back together.
+        """
+        rng = random.Random(11)
+        gaussian = [rng.gauss(0, 1) for _ in range(60)]
+        heavy = [
+            rng.gauss(0, 1) * (9.0 if rng.random() < 0.08 else 1.0) for _ in range(60)
+        ]
+
+        def quiet_rate(chain, estimator):
+            sigma = estimator(chain)
+            pairs = list(zip(chain[::2], chain[1::2]))
+            quiet = sum(
+                1
+                for lean, stab in pairs
+                if rs.classify(
+                    rs.zscore(lean, sigma), rs.zscore(stab, sigma)
+                ).state
+                == "QUIET"
+            )
+            return quiet / len(pairs)
+
+        # Both chains have a comparable ordinary session...
+        assert sorted(abs(v) for v in heavy)[30] == pytest.approx(
+            sorted(abs(v) for v in gaussian)[30], rel=0.45
+        )
+
+        # ...but the standard deviation calls one of them quiet twice as often.
+        assert quiet_rate(heavy, rs.stdev) > 2 * quiet_rate(gaussian, rs.stdev)
+        # The robust scale keeps two comparable chains comparable.
+        assert quiet_rate(heavy, rs.robust_scale) < 1.7 * quiet_rate(
+            gaussian, rs.robust_scale
+        )
+        # And it only ever moves a read OUT of QUIET, never into it.
+        assert quiet_rate(heavy, rs.robust_scale) < quiet_rate(heavy, rs.stdev)
+
+    def test_robust_scale_has_no_scale_only_when_nothing_moved(self):
+        """Zero would make the next real move's z infinite, so the caller is
+        routed to its bootstrap proxy instead."""
+        assert rs.robust_scale([]) is None
+        assert rs.robust_scale([1.0]) is None
+        assert rs.robust_scale([0.0, 0.0, 0.0]) is None
+        # A CONSTANT series is not degenerate here, unlike for stdev:
+        # measured about zero it has a perfectly good scale.
+        assert rs.stdev([5.0, 5.0, 5.0]) is None
+        assert rs.robust_scale([5.0, 5.0, 5.0]) == pytest.approx(
+            5.0 * math.sqrt(math.pi / 2)
+        )
+
+    def test_robust_scale_ignores_non_finite_values(self):
+        assert rs.robust_scale([2.0, 4.0, float("nan"), float("inf")]) == pytest.approx(
+            3.0 * math.sqrt(math.pi / 2)
+        )
 
     def test_percentile_of(self):
         pop = [1.0, 2.0, 3.0, 4.0]
