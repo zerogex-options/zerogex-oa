@@ -140,6 +140,40 @@ BAND_MAX_WIDTH_PCT = 0.035
 #: must label the read accordingly (see ``normalization`` on the API payload).
 MIN_SESSIONS_FOR_SIGMA = 10
 
+#: Length of a regular cash session, in hours.  The stored per-session reads
+#: are all SINCE-OPEN measurements, so this is the horizon every trailing
+#: sigma is implicitly measured over — see :func:`horizon_factor`.
+SESSION_HOURS = 6.5
+
+#: Bootstrap denominator, as a fraction of the near-spot dealer-gamma STOCK.
+#:
+#: The proxy has one job: stand in for "how big is a typical session's shift
+#: for this symbol" before enough sessions are stored to answer it properly.
+#: The scale it borrows therefore has to be a scale of the same KIND — a
+#: proximity-weighted dollar change.  The obvious cheap sources are not:
+#: the dispersion of ``net_gex_at_spot`` (what this used to borrow) is the
+#: spread of a LEVEL read at a single point on the spot-shift curve, while
+#: lean/stability are signed sums across ~30 weighted strikes.  Nothing ties
+#: those two magnitudes together, so the ratio was arbitrary — and in
+#: practice large enough to push every z toward zero, which is why a
+#: freshly-deployed symbol read QUIET on every session regardless of what
+#: the book did.
+#:
+#: A fraction of the near-spot stock is the same kind of quantity as the
+#: score (same weights, same units, same strikes), so the ratio is a real
+#: "how much of the book near spot got re-worked".  12% is the bootstrap
+#: guess for one session's worth of that; it is deliberately a single named
+#: number because it stops mattering the moment ``MIN_SESSIONS_FOR_SIGMA``
+#: sessions exist and the trailing sigma takes over.
+PROXY_SHIFT_FRACTION = 0.12
+
+#: Clamp on :func:`horizon_factor`.  Below 0.35 (~48 minutes) and above 2.5
+#: (~40 hours, eight sessions) the square-root rule stops being a useful
+#: approximation, and an unclamped factor would let a 30-minute window
+#: manufacture sigma out of a tiny denominator.
+_HORIZON_MIN = 0.35
+_HORIZON_MAX = 2.5
+
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -200,6 +234,17 @@ class ShiftDiff:
     #: counting it would book brand-new listings as dealer repositioning.
     added_expirations: tuple[date, ...]
     added_net_gex: float
+    #: How many strikes saw their call or put open interest actually change
+    #: between the two snapshots.
+    #:
+    #: This is what makes the "repositioning" lens honest.  Open interest is
+    #: a once-a-day settlement figure: the feed republishes the same number
+    #: all session, so an INTRADAY A->B pair has zero OI change at every
+    #: strike and ``positioning`` is identically 0 by construction — not
+    #: because dealers sat on their hands.  Reported so the surface can say
+    #: "this window cannot answer that question" instead of drawing a flat
+    #: line that reads as "nothing happened".
+    oi_moved_strikes: int = 0
 
 
 @dataclass(frozen=True)
@@ -216,6 +261,12 @@ class ShiftScores:
     gross_shift: float
     #: Kernel width actually used, in price units (for display + audit).
     sigma_price: float
+    #: Proximity-weighted |dealer gamma| present across the two snapshots —
+    #: the STOCK the change happened against, in the same weights and units
+    #: as ``lean``/``stability``.  Not a score: it is the only scale available
+    #: before any session history exists, and :func:`proxy_sigma` turns it
+    #: into the bootstrap z-score denominator.
+    near_spot_stock: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -430,6 +481,7 @@ def shift_rows(
 
     zero = StrikeAgg()
     rows: list[ShiftRow] = []
+    oi_moved = 0
     for strike in sorted(set(agg_a) | set(agg_b)):
         a = agg_a.get(strike, zero)
         b = agg_b.get(strike, zero)
@@ -437,6 +489,8 @@ def shift_rows(
         positioning = _positioning_leg(
             a.call_gex, a.call_oi, b.call_gex, b.call_oi
         ) + _positioning_leg(a.put_gex, a.put_oi, b.put_gex, b.put_oi)
+        if a.call_oi != b.call_oi or a.put_oi != b.put_oi:
+            oi_moved += 1
         rows.append(
             ShiftRow(
                 strike=strike,
@@ -463,6 +517,7 @@ def shift_rows(
         expired_abs_gex=sum(abs(_row_net(r)) for r in expired_rows),
         added_expirations=tuple(sorted(added)),
         added_net_gex=sum(_row_net(r) for r in added_rows),
+        oi_moved_strikes=oi_moved,
     )
 
 
@@ -593,6 +648,7 @@ def weighted_scores(
     stability = 0.0
     net_shift = 0.0
     gross_shift = 0.0
+    near_spot_stock = 0.0
     for row in rows:
         value = row.positioning if use_positioning else row.d_net
         net_shift += value
@@ -605,6 +661,12 @@ def weighted_scores(
         # A strike exactly at spot is neither and contributes nothing to lean.
         side = 0.0 if row.strike == spot else (1.0 if row.strike < spot else -1.0)
         lean += side * w * value
+        # The book the change is measured against, under the SAME kernel, so
+        # it can act as the bootstrap denominator.  Averaged over the two
+        # snapshots rather than taken from either end: anchoring on A alone
+        # would scale a day-over-day read against a book that has since
+        # expired, and on B alone against one that did not exist at A.
+        near_spot_stock += w * (abs(row.net_a) + abs(row.net_b)) / 2.0
 
     return ShiftScores(
         lean=lean,
@@ -612,6 +674,7 @@ def weighted_scores(
         net_shift=net_shift,
         gross_shift=gross_shift,
         sigma_price=sigma_price,
+        near_spot_stock=near_spot_stock,
     )
 
 
@@ -741,6 +804,53 @@ def zscore(raw: float, sigma: Optional[float]) -> float:
     if not math.isfinite(z):
         return 0.0
     return max(-6.0, min(6.0, z))
+
+
+def proxy_sigma(scores: ShiftScores) -> Optional[float]:
+    """Bootstrap z-score denominator, derived from the chain itself.
+
+    Returns ``None`` when the snapshot carries no near-spot gamma at all, so
+    the caller degrades to "direction measured, magnitude not" rather than
+    dividing by a number it invented.
+
+    Used only until :data:`MIN_SESSIONS_FOR_SIGMA` sessions are stored; every
+    surface that renders a read built on it must label the magnitude
+    provisional (``normalization == "proxy"``).  See
+    :data:`PROXY_SHIFT_FRACTION` for why the scale is a fraction of the
+    near-spot stock rather than the dispersion of some stored level.
+    """
+    stock = scores.near_spot_stock
+    if not math.isfinite(stock) or stock <= 0:
+        return None
+    sigma = PROXY_SHIFT_FRACTION * stock
+    return sigma if sigma > 0 else None
+
+
+def horizon_factor(hours: float) -> float:
+    """Rescale a session-length sigma to a window of ``hours`` trading hours.
+
+    Every stored session read is a SINCE-OPEN measurement, so the trailing
+    sigma answers "how big is a full session's shift".  The live card applies
+    it to windows that are nothing like a full session: a 1h lookback, or a
+    "since open" read taken at 09:45.  Comparing a 15-minute change against a
+    6.5-hour yardstick makes the morning read QUIET every day and the weekly
+    one read dramatic every week — the denominator is measuring the clock, not
+    the book.
+
+    Repositioning accumulates roughly like a random walk, so the yardstick
+    scales with the square root of elapsed trading time.  That is a
+    first-order rule and it is wrong in the details (dealer gamma churns
+    hardest at the open and into the close), but it is right about the shape,
+    and being right about the shape is the difference between a magnitude
+    that means something across lookbacks and one that does not.  Clamped at
+    both ends — see :data:`_HORIZON_MIN`.
+    """
+    if not math.isfinite(hours) or hours <= 0:
+        return 1.0
+    factor = math.sqrt(hours / SESSION_HOURS)
+    if not math.isfinite(factor):
+        return 1.0
+    return max(_HORIZON_MIN, min(_HORIZON_MAX, factor))
 
 
 def stdev(values: Sequence[float]) -> Optional[float]:

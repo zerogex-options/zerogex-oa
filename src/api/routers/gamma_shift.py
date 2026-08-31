@@ -331,8 +331,14 @@ async def get_regime_shift(
     )
 
     session = _session_date_of(chain_b["timestamp"])
+    # The window this read actually spans, in trading hours.  Every stored
+    # session read is a full since-open measurement, so without this a 1h
+    # lookback is measured against a 6.5h yardstick (and reads QUIET however
+    # violent it was), while "vs last week" is measured against a fifth of
+    # its own horizon.
+    window_hours = rsess.rth_hours_between(chain_a["timestamp"], chain_b["timestamp"])
     lean_sigma, stab_sigma, normalization, n_sessions = await rsess.trailing_sigmas(
-        db, symbol, before=session
+        db, symbol, before=session, scores=scores, hours=window_hours
     )
     read = rs.classify(
         rs.zscore(scores.lean, lean_sigma), rs.zscore(scores.stability, stab_sigma)
@@ -382,6 +388,22 @@ async def get_regime_shift(
             "net_shift": scores.net_shift,
             "gross_shift": scores.gross_shift,
             "sigma_price": scores.sigma_price,
+            "near_spot_stock": scores.near_spot_stock,
+            "window_hours": window_hours,
+        },
+        # Whether the 'positioning' lens can answer anything in THIS window.
+        #
+        # Open interest is a once-a-day settlement figure — the feed
+        # republishes the same number all session — so an intraday A->B pair
+        # has an identical OI at every strike and the OI-driven component is
+        # zero by construction.  Rendering that as a flat line at every
+        # strike says "dealers did nothing", which is a claim the data cannot
+        # support; the surface needs to say "this window cannot see that"
+        # instead, and point at the cross-session lookbacks that can.
+        "positioning": {
+            "resolved": diff.oi_moved_strikes > 0,
+            "oi_moved_strikes": diff.oi_moved_strikes,
+            "strike_count": len(diff.rows),
         },
         "band": {
             "low": band.low,

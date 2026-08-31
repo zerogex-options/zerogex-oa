@@ -122,6 +122,16 @@ TIMER_UNITS=(
     # /api/market/session-levels and the frontend chart level overlays.
     # See src/jobs/session_levels.py.
     "zerogex-oa-session-levels"
+    # Gamma Regime per-session reads (every 15 min through the cash session,
+    # RTH-gated in-process).  Writes one gex_regime_session row per trading
+    # day: the Gamma Shift page's Session History strip renders those rows,
+    # and the same rows are the trailing z-score denominator behind the live
+    # Gamma Regime Shift card.  Nothing else produces them -- with the timer
+    # missing the strip reads "No stored sessions yet" indefinitely and the
+    # card never gets past its provisional bootstrap magnitude.  Seed the
+    # trailing window once after deploy with `make regime-session-backfill`.
+    # See src/tools/regime_session_refresh.py.
+    "zerogex-oa-regime-session-refresh"
     # Per-symbol ingestion freshness (every 10 min, all day): alerts when a
     # configured underlying stops writing bars inside its delivery window.
     # This is the ONLY check that sees a single dead per-symbol worker --
