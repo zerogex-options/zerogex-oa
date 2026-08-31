@@ -95,6 +95,31 @@ def _client() -> TestClient:
             }
         )
 
+    async def vol_surface(request):
+        """Mirrors the real VolSurfaceResponse: a strike axis plus an IV axis."""
+        return JSONResponse(
+            {
+                "symbol": request.query_params.get("symbol"),
+                "spot_price": 6600.0,
+                "timestamp": "2026-08-21T20:00:00+00:00",
+                "expirations": ["2026-09-18"],
+                "strikes": [6500.0, 6600.0, 6700.0],
+                "surface": [
+                    {
+                        "expiration": "2026-09-18",
+                        "dte": 28,
+                        "ivs": [
+                            {"strike": 6500.0, "call_iv": 0.152, "put_iv": 0.171},
+                            {"strike": 6600.0, "call_iv": 0.141, "put_iv": 0.149},
+                            {"strike": 6700.0, "call_iv": 0.133, "put_iv": 0.138},
+                        ],
+                    }
+                ],
+                "atm_term_structure": [{"dte": 28, "atm_iv": 0.145}],
+                "skew_25d": [{"dte": 28, "skew": 0.021}],
+            }
+        )
+
     async def text(request):
         return PlainTextResponse("not json")
 
@@ -111,6 +136,7 @@ def _client() -> TestClient:
             Route("/api/flow/contracts", option),
             Route("/api/flow/smart-money", option),
             Route("/api/gex/premium_surface", option),
+            Route("/api/gex/vol_surface", vol_surface),
             Route("/api/forecast", card),
             Route("/api/technicals/text", text),
         ]
@@ -217,6 +243,69 @@ def test_projection_metadata_and_header_disclose_the_derivation():
     assert meta["derived_from"] == "SPX"
     assert meta["basis_source"] == "measured"
     assert meta["basis_ratio"] == pytest.approx(1.0067)
+
+
+# --- bucket 4: the vol surface carries two axes at once ---------------------
+#
+# /api/gex/vol_surface was refused as an "IV surface" alongside
+# premium_surface, which left the /volatility page's skew chart answering 400
+# for ES and NQ.  The two are not alike, and these tests pin the difference:
+# the STRIKE ladder is an ordinary index price axis and must move, while the
+# IV values are dimensionless rates that must not — shipping one without the
+# other is what would put the skew smile over the wrong strikes.
+
+
+def test_vol_surface_is_served_for_futures():
+    """The regression: this answered 400 while the GEX ladders beside it
+    rendered from the same SPX chain."""
+    resp = _client().get("/api/gex/vol_surface?symbol=ES&underlying=ES")
+    assert resp.status_code == 200
+    assert resp.headers.get("X-ZeroGEX-Projection") == "1"
+    assert resp.json()["symbol"] == "ES"
+
+
+def test_vol_surface_strike_axis_is_projected():
+    """Both the top-level ladder and the per-slice strikes, or the smile is
+    drawn against an axis it was not computed on."""
+    body = _client().get("/api/gex/vol_surface?symbol=ES").json()
+    assert body["strikes"] == [
+        pytest.approx(6543.5),
+        pytest.approx(6644.25),
+        pytest.approx(6745.0),
+    ]
+    slice_strikes = [p["strike"] for p in body["surface"][0]["ivs"]]
+    assert slice_strikes == [
+        pytest.approx(6543.5),
+        pytest.approx(6644.25),
+        pytest.approx(6745.0),
+    ]
+
+
+def test_vol_surface_ivs_are_not_projected():
+    """An implied vol is a dimensionless rate — the same number on either
+    axis. Scaling it by the basis would report a volatility nobody quoted."""
+    body = _client().get("/api/gex/vol_surface?symbol=ES").json()
+    ivs = body["surface"][0]["ivs"]
+    assert [p["call_iv"] for p in ivs] == [0.152, 0.141, 0.133]
+    assert [p["put_iv"] for p in ivs] == [0.171, 0.149, 0.138]
+    assert body["atm_term_structure"][0]["atm_iv"] == 0.145
+    # 25-delta skew is a difference of two IVs: vol points, not price points.
+    assert body["skew_25d"][0]["skew"] == 0.021
+
+
+def test_vol_surface_dte_survives_projection():
+    """A day count is not a price."""
+    body = _client().get("/api/gex/vol_surface?symbol=ES").json()
+    assert body["surface"][0]["dte"] == 28
+    assert body["atm_term_structure"][0]["dte"] == 28
+    assert body["surface"][0]["expiration"] == "2026-09-18"
+
+
+def test_vol_surface_spot_is_the_live_futures_print():
+    """The skew chart reads ATM off spot, so a frozen SPX close here would
+    place the ATM marker away from where ES actually trades."""
+    body = _client().get("/api/gex/vol_surface?symbol=ES").json()
+    assert body["spot_price"] == LIVE_ES
 
 
 # --- failure modes ---------------------------------------------------------

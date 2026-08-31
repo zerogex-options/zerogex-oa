@@ -112,10 +112,23 @@ _UNSUPPORTED_PREFIXES = (
     "/api/flow/contracts",
     "/api/flow/smart-money",
     "/api/market/open-interest",
-    # Option-premium and IV surfaces: their value axis is a premium/IV on a
-    # real SPX contract, not an index level, so the axis does not carry.
+    # Option PREMIUMS: the value axis is a dollar premium on a real SPX
+    # contract.  It is not an index level, so the basis ratio is not the
+    # transform that carries it, and there is no ES premium to substitute.
+    #
+    # Contrast /api/gex/vol_surface, which is NOT listed here and so is
+    # projected by the /api/gex/ prefix in the allowlist above.  It was
+    # grouped here originally as an "IV surface" on the same reasoning, but
+    # the two are not alike: an IV is DIMENSIONLESS, so it does not need to
+    # be carried at all — it is the same number on either axis and passes
+    # through untouched (call_iv / put_iv / atm_iv / skew are in
+    # NEVER_PROJECT).  What vol_surface does put on the price axis is its
+    # STRIKE ladder, and that is the ordinary /api/gex/ strike projection the
+    # allowlist above already performs for every other surface.  Refusing it
+    # left the /volatility page's skew chart answering 400 for ES and NQ
+    # while the GEX ladders beside it — same SPX chain, same strikes —
+    # rendered fine.
     "/api/gex/premium_surface",
-    "/api/gex/vol_surface",
 )
 
 

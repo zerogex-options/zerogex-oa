@@ -278,6 +278,15 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         "pin_confidence",
         "implied_volatility",
         "iv",
+        # The /api/gex/vol_surface axes. An implied vol is a dimensionless
+        # rate, not a level: it is the SAME number on the cash and futures
+        # axes, so it ships untouched while the strike ladder beside it moves.
+        # ``skew`` is the 25-delta put-minus-call spread — a difference of two
+        # of them, so vol points rather than price points.
+        "call_iv",
+        "put_iv",
+        "atm_iv",
+        "skew",
         # greeks and counts
         "delta",
         "gamma",
