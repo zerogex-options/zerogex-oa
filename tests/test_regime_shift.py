@@ -171,6 +171,36 @@ class TestPositioningSplit:
 
         assert row.positioning == 0.0
 
+    def test_an_unchanged_oi_window_reports_that_it_cannot_see_positioning(self):
+        """Open interest is a once-a-day settlement figure, so an INTRADAY
+        A->B pair carries the identical number at every strike and the
+        positioning component is zero by construction — not because dealers
+        sat still.
+
+        Without this count the surface draws a flat line at every strike and
+        the reader takes it as "nothing was traded", which is a claim the
+        data cannot support.
+        """
+        a = [_row(k, 100.0, call_oi=1000, call_gex=100.0) for k in (99, 100, 101)]
+        b = [_row(k, 140.0, call_oi=1000, call_gex=140.0) for k in (99, 100, 101)]
+
+        diff = rs.shift_rows(a, b)
+
+        assert diff.oi_moved_strikes == 0
+        assert all(r.positioning == 0.0 for r in diff.rows)
+        # ...and the total change is real: it is all re-pricing.
+        assert all(r.d_net == pytest.approx(40.0) for r in diff.rows)
+
+    def test_counts_only_the_strikes_whose_open_interest_actually_moved(self):
+        a = [_row(k, 100.0, call_oi=1000, call_gex=100.0) for k in (99, 100, 101)]
+        b = [
+            _row(99, 100.0, call_oi=1000, call_gex=100.0),
+            _row(100, 120.0, call_oi=1200, call_gex=120.0),
+            _row(101, 100.0, call_oi=1000, call_gex=100.0),
+        ]
+
+        assert rs.shift_rows(a, b).oi_moved_strikes == 1
+
 
 # --------------------------------------------------------------------------- #
 # 2. The roll-off
@@ -432,6 +462,84 @@ class TestNormalization:
 
     def test_percentile_of_an_empty_population_is_none(self):
         assert rs.percentile_of(1.0, []) is None
+
+
+# --------------------------------------------------------------------------- #
+# The bootstrap denominator and the horizon it is measured over
+# --------------------------------------------------------------------------- #
+class TestProxySigma:
+    def _scores(self, rows, spot):
+        return rs.weighted_scores(rows, spot)
+
+    def test_the_proxy_scales_with_the_book_it_is_measured_against(self):
+        """Same shift shape on a book ten times the size needs a denominator
+        ten times the size, or the bigger symbol reads as a bigger event
+        purely for being bigger."""
+        small = rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=100.0)
+        large = rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=1000.0)
+
+        assert rs.proxy_sigma(large) == pytest.approx(rs.proxy_sigma(small) * 10)
+
+    def test_an_empty_book_has_no_proxy_rather_than_a_made_up_one(self):
+        assert rs.proxy_sigma(rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=0.0)) is None
+        assert (
+            rs.proxy_sigma(rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=float("nan")))
+            is None
+        )
+
+    def test_near_spot_stock_is_weighted_like_the_scores_are(self):
+        """It has to be the same kind of quantity as lean/stability or the
+        ratio between them means nothing."""
+        rows = _diff_rows({100: 0.0, 130: 0.0}, {100: 10.0, 130: 10.0})
+        scores = rs.weighted_scores(rows, 100.0)
+
+        # Strike 130 is ~30 kernel widths out on a spot of 100 — it carries
+        # essentially no weight in the score, so it must carry essentially
+        # none of the stock either.
+        near = rs.weighted_scores(_diff_rows({100: 0.0}, {100: 10.0}), 100.0)
+        assert scores.near_spot_stock == pytest.approx(near.near_spot_stock)
+        assert scores.near_spot_stock > 0
+
+    def test_a_read_off_a_real_shift_is_not_quiet(self):
+        """The regression this exists for: a genuine repositioning printing
+        QUIET because the bootstrap denominator was borrowed from a
+        different kind of quantity entirely."""
+        rows = _diff_rows(
+            {99: 0.0, 100: 0.0, 101: 0.0},
+            {99: 400.0, 100: 300.0, 101: 200.0},
+        )
+        scores = rs.weighted_scores(rows, 101.0)
+        sigma = rs.proxy_sigma(scores)
+
+        read = rs.classify(
+            rs.zscore(scores.lean, sigma), rs.zscore(scores.stability, sigma)
+        )
+        assert read.state != "QUIET"
+
+
+class TestHorizonFactor:
+    def test_a_full_session_is_the_unit(self):
+        assert rs.horizon_factor(rs.SESSION_HOURS) == pytest.approx(1.0)
+
+    def test_shorter_windows_get_a_shorter_yardstick(self):
+        assert rs.horizon_factor(1.0) < 1.0
+        assert rs.horizon_factor(0.5) < rs.horizon_factor(2.0) < 1.0
+
+    def test_longer_windows_get_a_longer_one(self):
+        assert rs.horizon_factor(rs.SESSION_HOURS * 5) > 1.0
+
+    def test_square_root_of_time(self):
+        assert rs.horizon_factor(rs.SESSION_HOURS * 4) == pytest.approx(2.0)
+
+    @pytest.mark.parametrize("hours", [0.0, -3.0, float("nan"), float("inf")])
+    def test_a_nonsense_horizon_leaves_the_yardstick_alone(self, hours):
+        assert rs.horizon_factor(hours) == 1.0
+
+    def test_clamped_at_both_ends(self):
+        """An unclamped factor would let a 1-minute window manufacture sigma
+        out of a denominator near zero."""
+        assert rs.horizon_factor(1 / 3600) == rs._HORIZON_MIN
+        assert rs.horizon_factor(10_000.0) == rs._HORIZON_MAX
 
 
 # --------------------------------------------------------------------------- #

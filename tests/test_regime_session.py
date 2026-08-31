@@ -239,20 +239,61 @@ class TestTrailingSigmas:
         assert stab_sigma == pytest.approx(lean_sigma * 2)
 
     def test_falls_back_to_the_proxy_while_bootstrapping(self):
-        db = FakeDb(
-            {},
-            sessions=[_stored(DAY - timedelta(days=1), 1.0, 2.0)],
-            historical_context={
-                "metrics": {"net_gex_at_spot": {"windows": {"30d": {"std": 250.0}}}}
-            },
+        db = FakeDb({}, sessions=[_stored(DAY - timedelta(days=1), 1.0, 2.0)])
+        scores = rs.ShiftScores(
+            lean=0.0,
+            stability=0.0,
+            net_shift=0.0,
+            gross_shift=0.0,
+            sigma_price=1.0,
+            near_spot_stock=1000.0,
         )
 
         lean_sigma, stab_sigma, norm, _n = asyncio.run(
-            rsess.trailing_sigmas(db, "SPY", before=DAY)
+            rsess.trailing_sigmas(db, "SPY", before=DAY, scores=scores)
         )
 
         assert norm == "proxy"
-        assert lean_sigma == stab_sigma == 250.0
+        assert lean_sigma == stab_sigma
+        assert lean_sigma == pytest.approx(rs.PROXY_SHIFT_FRACTION * 1000.0)
+
+    def test_the_proxy_is_a_change_scale_not_a_level_scale(self):
+        """The bootstrap denominator must be the same KIND of quantity as the
+        score it divides.
+
+        It used to borrow the dispersion of ``net_gex_at_spot`` — the spread
+        of a LEVEL read at one point on the spot-shift curve — to normalize a
+        proximity-weighted sum of CHANGES across ~30 strikes.  Nothing ties
+        those magnitudes together, and in practice the borrowed number was
+        large enough to push every z toward zero, so a freshly-deployed
+        symbol printed QUIET on every session whatever the book did.
+        """
+        db = FakeDb(
+            {},
+            sessions=[],
+            historical_context={
+                "metrics": {"net_gex_at_spot": {"windows": {"30d": {"std": 1e12}}}}
+            },
+        )
+        scores = rs.ShiftScores(
+            lean=60.0,
+            stability=60.0,
+            net_shift=0.0,
+            gross_shift=0.0,
+            sigma_price=1.0,
+            near_spot_stock=500.0,
+        )
+
+        lean_sigma, _stab, norm, _n = asyncio.run(
+            rsess.trailing_sigmas(db, "SPY", before=DAY, scores=scores)
+        )
+
+        assert norm == "proxy"
+        # Scaled off the chain, not off the (deliberately absurd) stored level.
+        assert lean_sigma == pytest.approx(rs.PROXY_SHIFT_FRACTION * 500.0)
+        assert rs.classify(
+            rs.zscore(scores.lean, lean_sigma), rs.zscore(scores.stability, lean_sigma)
+        ).state != "QUIET"
 
     def test_reports_none_when_neither_source_is_available(self):
         db = FakeDb({}, sessions=[], historical_context=None)
@@ -260,6 +301,68 @@ class TestTrailingSigmas:
             rsess.trailing_sigmas(db, "SPY", before=DAY)
         )
         assert (lean_sigma, stab_sigma, norm, n) == (None, None, "none", 0)
+
+    def test_a_short_window_is_measured_against_a_short_yardstick(self):
+        """A 1h lookback against a full-session sigma reads QUIET every time.
+
+        Every stored read is a since-open session, so the trailing sigma
+        answers "how big is a full session's shift".  Applying it unscaled to
+        a one-hour window measures the clock rather than the book.
+        """
+        sessions = [
+            _stored(DAY - timedelta(days=i + 1), float(i), float(i))
+            for i in range(rs.MIN_SESSIONS_FOR_SIGMA + 2)
+        ]
+        db = FakeDb({}, sessions=sessions)
+
+        full, _s, _n, _c = asyncio.run(
+            rsess.trailing_sigmas(db, "SPY", before=DAY, hours=rs.SESSION_HOURS)
+        )
+        hour, _s2, _n2, _c2 = asyncio.run(
+            rsess.trailing_sigmas(db, "SPY", before=DAY, hours=1.0)
+        )
+        week, _s3, _n3, _c3 = asyncio.run(
+            rsess.trailing_sigmas(db, "SPY", before=DAY, hours=rs.SESSION_HOURS * 5)
+        )
+
+        assert hour < full < week
+        assert full == pytest.approx(
+            hour / rs.horizon_factor(1.0), rel=1e-9
+        )
+
+
+# --------------------------------------------------------------------------- #
+# rth_hours_between
+# --------------------------------------------------------------------------- #
+class TestRthHoursBetween:
+    def test_counts_only_the_cash_session(self):
+        # 15:00 Thursday -> 11:00 Friday: 1h Thursday + 1.5h Friday.
+        start = _et(date(2026, 8, 20), 15, 0)
+        end = _et(date(2026, 8, 21), 11, 0)
+        assert rsess.rth_hours_between(start, end) == pytest.approx(2.5)
+
+    def test_drops_the_weekend(self):
+        # Friday close -> Monday open is zero trading time, not 65 hours.
+        start = _et(date(2026, 8, 21), 16, 0)
+        end = _et(date(2026, 8, 24), 9, 30)
+        assert rsess.rth_hours_between(start, end) == pytest.approx(0.0)
+
+    def test_an_intraday_window_is_its_own_length(self):
+        start = _et(DAY, 10, 0)
+        end = _et(DAY, 11, 30)
+        assert rsess.rth_hours_between(start, end) == pytest.approx(1.5)
+
+    def test_a_partial_since_open_window_is_partial(self):
+        """"Since open" at 09:45 is a quarter hour, not a session."""
+        assert rsess.rth_hours_between(_et(DAY, 9, 30), _et(DAY, 9, 45)) == pytest.approx(
+            0.25
+        )
+
+    def test_tolerates_missing_or_reversed_bounds(self):
+        assert rsess.rth_hours_between(None, _et(DAY, 10, 0)) == 0.0
+        assert rsess.rth_hours_between(
+            _et(DAY, 12, 0), _et(DAY, 10, 0)
+        ) == pytest.approx(2.0)
 
     def test_a_session_never_normalizes_against_itself(self):
         """Including the in-progress row would drag its own z toward zero
@@ -408,3 +511,64 @@ class TestDefaultSymbols:
     ):
         monkeypatch.setenv("BULLETIN_TWEET_SYMBOLS", "  ,  ")
         assert tool.default_symbols() == ["SPY"]
+
+
+# --------------------------------------------------------------------------- #
+# The refresh tool's calendar gate and failure signal
+# --------------------------------------------------------------------------- #
+class TestRefreshWindow:
+    def test_open_inside_the_cash_session(self):
+        assert tool.within_refresh_window(
+            datetime.combine(DAY, time(12, 0), tzinfo=ET)
+        )
+
+    def test_closed_before_there_is_anything_to_compare(self):
+        """The read is SINCE THE OPEN, so at 09:31 there is no second
+        snapshot and every symbol logs a skip."""
+        assert not tool.within_refresh_window(
+            datetime.combine(DAY, time(9, 31), tzinfo=ET)
+        )
+
+    def test_open_past_the_bell_so_the_last_write_lands(self):
+        assert tool.within_refresh_window(
+            datetime.combine(DAY, time(16, 15), tzinfo=ET)
+        )
+        assert not tool.within_refresh_window(
+            datetime.combine(DAY, time(17, 0), tzinfo=ET)
+        )
+
+    def test_closed_at_the_weekend(self):
+        saturday = date(2026, 8, 22)
+        assert saturday.weekday() == 5
+        assert not tool.within_refresh_window(
+            datetime.combine(saturday, time(12, 0), tzinfo=ET)
+        )
+
+    def test_a_run_that_writes_nothing_inside_the_window_fails(self):
+        """The bug this guards is not a crash — it is a job that exits 0
+        having written nothing, every day, so the history strip stays empty
+        and nobody is told.  The calendar gate above has already excluded the
+        days where writing nothing is correct."""
+        db = FakeDb({})  # no snapshots: every session is skipped
+
+        code = asyncio.run(
+            tool._run(["SPY"], backfill=5, dry_run=False, as_of=DAY, db=db)
+        )
+
+        assert code == 1
+        assert db.written == []
+
+    def test_a_run_that_writes_something_succeeds(self):
+        db = FakeDb(
+            {
+                _et(DAY, 9, 30): (100.0, _chain({99: 0.0, 100: 0.0})),
+                _et(DAY, 16, 0): (100.0, _chain({99: 500.0, 100: 0.0})),
+            }
+        )
+
+        code = asyncio.run(
+            tool._run(["SPY"], backfill=1, dry_run=False, as_of=DAY, db=db)
+        )
+
+        assert code == 0
+        assert [r["session_date"] for r in db.written] == [DAY]
