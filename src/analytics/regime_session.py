@@ -130,8 +130,8 @@ async def trailing_sigmas(
     scale = rs.horizon_factor(hours) if hours is not None else 1.0
 
     if len(leans) >= rs.MIN_SESSIONS_FOR_SIGMA:
-        lean_sigma = rs.stdev(leans)
-        stab_sigma = rs.stdev(stabs)
+        lean_sigma = rs.robust_scale(leans)
+        stab_sigma = rs.robust_scale(stabs)
         if lean_sigma or stab_sigma:
             # A degenerate axis (constant across the whole window) borrows the
             # other's sigma rather than falling to zero, which would make its

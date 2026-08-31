@@ -587,8 +587,12 @@ async def get_regime_history(
 
     leans = [v for v in (_f(s.get("lean_raw")) for s in sessions) if v is not None]
     stabs = [v for v in (_f(s.get("stability_raw")) for s in sessions) if v is not None]
-    lean_sigma = rs.stdev(leans)
-    stab_sigma = rs.stdev(stabs)
+    # The SAME estimator trailing_sigmas uses, not merely a similar one: the
+    # strip sits directly under the card, and a denominator that differed
+    # even slightly would put a bar on screen disagreeing with the headline
+    # above it every day.
+    lean_sigma = rs.robust_scale(leans)
+    stab_sigma = rs.robust_scale(stabs)
     normalization = (
         "trailing" if len(leans) >= rs.MIN_SESSIONS_FOR_SIGMA and lean_sigma else "none"
     )
