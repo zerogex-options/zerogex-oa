@@ -44,6 +44,14 @@ class GEXSummary(BaseModel):
     max_pain: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
+    # GEX King — the strike carrying the largest |net dealer gamma| with the
+    # per-strike totals aggregated across ALL expirations (the SpotGamma /
+    # SqueezeMetrics convention; see ``_calculate_gex_summary``).  Whole-chain
+    # by construction, so it is the heavy, slow structural node — deliberately
+    # NOT the 0DTE Pin Strike below, which is reachability-weighted and
+    # same-day.  Already stored on ``gex_summary``; surfaced here so the chart
+    # can draw it beside the walls/flip/pin.  Nullable — hide, don't zero.
+    max_gamma_strike: Optional[Decimal] = None
     total_call_oi: Optional[int] = None
     total_put_oi: Optional[int] = None
     put_call_ratio: Optional[Decimal] = None

@@ -1861,6 +1861,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.net_gex_at_spot,
                     gs.call_wall AS stored_call_wall,
                     gs.put_wall  AS stored_put_wall,
+                    gs.max_gamma_strike,
                     gs.gamma_flip_span_used,
                     gs.pin_strike,
                     gs.pin_score,
@@ -1955,6 +1956,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.max_pain,
                 COALESCE(ls.stored_call_wall, fcw.call_wall) AS call_wall,
                 COALESCE(ls.stored_put_wall,  fpw.put_wall)  AS put_wall,
+                -- GEX King — largest |net GEX| strike aggregated across ALL
+                -- expirations (argmax_strike |sum_expirations net_gex|, written
+                -- by ``_calculate_gex_summary``).  Nullable, and deliberately
+                -- WITHOUT a recompute fallback like the walls have: the walls
+                -- need one because their columns post-date a backfill, whereas
+                -- a NULL King is simply hidden by the client (hide-don't-zero),
+                -- which costs one level on old rows rather than adding a third
+                -- aggregation path that could disagree with the engine's.
+                ls.max_gamma_strike,
                 ls.total_call_oi,
                 ls.total_put_oi,
                 ls.put_call_ratio,
