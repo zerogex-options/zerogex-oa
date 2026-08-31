@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
-from typing import Any, TYPE_CHECKING
+import threading
+import time
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from src.config import SIGNALS_PORTFOLIO_SIZE
+from src.config import SIGNALS_PORTFOLIO_SIZE, _getenv_float
 
 from ..database import DatabaseManager
 
@@ -297,6 +299,52 @@ def _get_playbook_engine() -> "PlaybookEngine":
     return _PLAYBOOK_ENGINE
 
 
+# Response cache for the Action Card.
+#
+# A Card is a pure function of the latest PERSISTED signal state, and that
+# state only advances on the analytics cycle (ANALYTICS_INTERVAL, 60s). Every
+# request arriving between two cycles therefore rebuilt an identical Card from
+# scratch — several queries plus the engine evaluation — and, before the write
+# moved behind this cache, re-attempted the same idempotent insert each time.
+#
+# The TTL is deliberately shorter than the cycle it shadows: a caller polling
+# at 1 Hz sees a new Card within a few seconds of one existing, while the
+# repeated work between cycles collapses to a dict lookup.
+_ACTION_CACHE_TTL_SECONDS = _getenv_float("ACTION_CARD_CACHE_TTL_SECONDS", 20.0)
+_ACTION_CACHE_MAX_ENTRIES = 64
+_ACTION_CACHE: Dict[str, Tuple[float, Any]] = {}
+_ACTION_CACHE_LOCK = threading.Lock()
+
+
+def _action_cache_get(symbol: str) -> Optional[Any]:
+    if _ACTION_CACHE_TTL_SECONDS <= 0:
+        return None
+    now = time.monotonic()
+    with _ACTION_CACHE_LOCK:
+        entry = _ACTION_CACHE.get(symbol)
+        if entry and now - entry[0] < _ACTION_CACHE_TTL_SECONDS:
+            return entry[1]
+        # Drop it here rather than leaving a stale entry to be overwritten:
+        # a symbol that stops being requested should not pin its payload.
+        _ACTION_CACHE.pop(symbol, None)
+    return None
+
+
+def _action_cache_put(symbol: str, payload: Any) -> None:
+    if _ACTION_CACHE_TTL_SECONDS <= 0:
+        return
+    with _ACTION_CACHE_LOCK:
+        _ACTION_CACHE[symbol] = (time.monotonic(), payload)
+        # Insertion-order eviction. The key space is the symbol universe, so
+        # this ceiling is never reached in practice — it exists so a caller
+        # passing arbitrary symbols cannot grow the dict without bound.
+        while len(_ACTION_CACHE) > _ACTION_CACHE_MAX_ENTRIES:
+            oldest = next(iter(_ACTION_CACHE))
+            if oldest == symbol:
+                break
+            _ACTION_CACHE.pop(oldest, None)
+
+
 @router.get("/action")
 async def get_action_card(
     underlying: str = Query(default="SPY"),
@@ -372,6 +420,10 @@ async def get_action_card(
     from src.signals.playbook.context_builder import build_playbook_context
 
     sym = underlying.upper()
+    cached = _action_cache_get(sym)
+    if cached is not None:
+        return cached
+
     ctx = await build_playbook_context(db=db, underlying=sym)
     if ctx is None:
         raise HTTPException(
@@ -390,6 +442,10 @@ async def get_action_card(
     card_id = await db.insert_action_card(payload)
     if card_id is not None:
         payload["id"] = card_id
+    # Cache AFTER the id is attached so a cache hit is byte-identical to the
+    # miss that filled it — a client must not see the permalink id appear and
+    # disappear depending on which side of the TTL its poll landed on.
+    _action_cache_put(sym, payload)
     return payload
 
 
