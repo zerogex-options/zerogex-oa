@@ -105,3 +105,51 @@ def test_last_write_at_reads_what_the_check_would_have_read():
     assert _last_write_at(writes, _et(9, 40)) == _et(9, 40), "inclusive at the tick"
     assert _last_write_at(writes, _et(9, 0)) is None
     assert _last_write_at([], _et(9, 45)) is None
+
+
+# --- the defect the first production run exposed ---------------------------
+#
+# Every test above replays a PAST day, where "walk all 24 hours" and "walk the
+# elapsed hours" are the same walk — so none of them caught that a replay of
+# TODAY grades ticks that have not happened yet. No write can exist for a
+# future tick, so each one reads as a dead stream: the first real run, at
+# 16:53 ET, reported 104 pages and all 104 were after the clock.
+
+
+def test_a_replay_of_today_stops_at_the_clock():
+    """The 16:53 run: healthy all day, and it must say so."""
+    now = _et(16, 53)
+    specs = [
+        FeedSpec(FEED_CHAINS, "QQQ", _every_minute(9, 30, 16, 15), "chains"),
+        FeedSpec(FEED_UNDERLYING, "SPY", _every_minute(4, 0, 16, 52), "bars"),
+    ]
+    pages, graded = _replay(specs, until=now)
+    assert pages == []
+    assert graded[(FEED_CHAINS, "QQQ")] > 0
+    assert graded[(FEED_UNDERLYING, "SPY")] > 0
+
+
+def test_the_same_replay_unclamped_invents_an_outage():
+    """What the bug looked like: pages, all of them in the future."""
+    now = _et(16, 53)
+    spec = FeedSpec(FEED_UNDERLYING, "SPY", _every_minute(4, 0, 16, 52), "bars")
+    pages, _ = _replay([spec], until=_et(23, 59))
+    assert pages, "control: without the clamp the future reads as an outage"
+    assert all(p.at > now for p in pages)
+
+
+def test_the_clamp_never_hides_an_elapsed_outage():
+    """Clamping must cost nothing: a stream dead before now still pages."""
+    spec = FeedSpec(FEED_UNDERLYING, "SPY", _every_minute(4, 0, 10, 0), "bars")
+    pages, _ = _replay([spec], until=_et(16, 53))
+    assert pages
+    assert min(p.at for p in pages).strftime("%H:%M") == "10:20"
+
+
+def test_a_past_day_is_walked_end_to_end():
+    """The clamp must not truncate a finished session."""
+    spec = FeedSpec(FEED_CHAINS, "QQQ", _every_minute(9, 30, 16, 15), "chains")
+    _, graded = replay_day(
+        [spec], MONDAY, "USEQ24Hour", MAX_STALE, until=_et(12, 0, dt.date(2026, 9, 4))
+    )
+    assert graded[(FEED_CHAINS, "QQQ")] == 41, "09:30-16:15 inclusive on a 10-min grid"

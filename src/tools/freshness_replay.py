@@ -122,19 +122,28 @@ def replay_day(
     *,
     legacy_chain_window: bool = False,
     tick_minutes: int = TICK_MINUTES,
+    until: Optional[datetime] = None,
 ) -> Tuple[List[Page], Dict[Tuple[str, str], int]]:
     """Walk the timer over ``day``. Returns (pages, ticks-graded per stream).
 
     The second value is the guard against a silent win: a window narrowed too
     far also produces zero pages, and only the graded-tick count tells the two
     apart.
+
+    ``until`` stops the walk, defaulting to now. A tick that has not happened
+    yet finds no write and reads as a dead stream, so an unclamped replay of
+    the current day reports the whole rest of the evening as an outage -- the
+    exact false alarm this tool exists to detect, and it fired on the first
+    production run: 104 "pages", every one of them after the clock. A replay
+    may only grade time that has actually elapsed.
     """
     pages: List[Page] = []
     graded_ticks: Dict[Tuple[str, str], int] = {(s.feed, s.symbol): 0 for s in specs}
 
     tick = ET.localize(datetime.combine(day, time(0, 0)))
     end = tick + timedelta(days=1)
-    while tick < end:
+    horizon = min(end, (until or datetime.now(ET)) + timedelta(seconds=1))
+    while tick < horizon:
         for spec in specs:
             expected, anchor = _grade(spec, tick, session_template, legacy_chain_window)
             if not expected:
@@ -291,6 +300,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info(
         "Replay of %s under the %s rule, threshold %.0f min", day, rule, args.max_stale_minutes
     )
+    now_et = datetime.now(ET)
+    if now_et.date() == day:
+        logger.info(
+            "Day still in progress — graded through %s only; "
+            "re-run after 20:00 ET for the whole day.",
+            now_et.strftime("%H:%M ET"),
+        )
     logger.info("Ticks graded per stream (0 = never checked all day — a blind spot, not a pass):")
     for (feed, symbol), count in sorted(graded.items()):
         writes = next(s.writes for s in specs if s.feed == feed and s.symbol == symbol)
