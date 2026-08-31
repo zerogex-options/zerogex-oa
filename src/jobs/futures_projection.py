@@ -278,6 +278,15 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         "pin_confidence",
         "implied_volatility",
         "iv",
+        # The /api/gex/vol_surface axes. An implied vol is a dimensionless
+        # rate, not a level: it is the SAME number on the cash and futures
+        # axes, so it ships untouched while the strike ladder beside it moves.
+        # ``skew`` is the 25-delta put-minus-call spread — a difference of two
+        # of them, so vol points rather than price points.
+        "call_iv",
+        "put_iv",
+        "atm_iv",
+        "skew",
         # greeks and counts
         "delta",
         "gamma",
@@ -460,6 +469,16 @@ async def resolve_basis(
     fails outright and never silently falls back to a ratio of 1.0 (which
     would publish cash levels on a futures chart).
 
+    ``at`` is the instant the basis is wanted FOR, and it anchors both halves
+    of the answer: the measured path reads the newest print pairs at or before
+    it, and the carry fallback prices to the quarterly expiry in force then.
+    Omit it for "right now" — the live path, and the common one.  Passing it
+    is what makes a historical read honest: basis walks down through each
+    contract cycle toward expiry, so projecting a frame from three months ago
+    with today's ratio offsets every level by however much it has moved since.
+    That silent offset is invisible on a chart and corrupts a backtest, which
+    is why a historical caller must pass the frame's own timestamp.
+
     Requires ``db`` to expose ``get_futures_basis_samples`` — the
     ``DatabaseManager`` used by the API does.
     """
@@ -471,7 +490,10 @@ async def resolve_basis(
     samples: list[Dict[str, Any]] = []
     try:
         samples = await db.get_futures_basis_samples(
-            index_symbol, lookback_minutes=_LOOKBACK_MINUTES, limit=_SAMPLE_COUNT
+            index_symbol,
+            lookback_minutes=_LOOKBACK_MINUTES,
+            limit=_SAMPLE_COUNT,
+            at=at,
         )
     except Exception as e:  # a dead read must degrade, not 500 the endpoint
         logger.warning("basis sample read failed for %s: %s", index_symbol, e)

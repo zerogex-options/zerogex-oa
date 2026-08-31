@@ -3935,6 +3935,62 @@ market-tide-refresh-status: ## Show Market Tide refresh timer status + last/next
 	@sudo journalctl -u zerogex-oa-market-tide-refresh -n 30 --no-pager || true
 
 # =============================================================================
+# Gamma Regime per-session reads (Gamma Shift page)
+# =============================================================================
+# One row per trading day in gex_regime_session.  Two surfaces need them and
+# nothing else produces them:
+#
+#   * the Session History strip on /gamma-shift renders one bar per stored
+#     session — with no rows it renders "No stored sessions yet", forever;
+#   * the same rows are the trailing z-score denominator that lets the live
+#     Gamma Regime Shift card say "dramatically" and mean it.  Under
+#     MIN_SESSIONS_FOR_SIGMA (10) rows the card bootstraps off the chain and
+#     labels its magnitude provisional.
+#
+# So a fresh deploy wants BOTH: `regime-session-backfill` once to seed the
+# window, then the 15-min timer to keep today's row current.  Override the
+# symbol set with SYMBOLS or the $BULLETIN_TWEET_SYMBOLS env var.
+.PHONY: regime-session-refresh
+regime-session-refresh: ## Recompute today's Gamma Regime session read (every 15 min via timer; RTH-gated)
+	@echo "$(BLUE)=== Refreshing Gamma Regime session read ===$(NC)"
+	@$(PY) -m src.tools.regime_session_refresh \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(REGIME_SESSION_FORCE),--force)
+
+# Seed / repair the stored window.  60 weekdays takes a symbol straight from
+# the provisional bootstrap magnitude to the strong trailing claim.
+.PHONY: regime-session-backfill
+regime-session-backfill: ## Seed gex_regime_session from history (default: last 60 weekdays)
+	@echo "$(BLUE)=== Backfilling Gamma Regime session reads ===$(NC)"
+	@$(PY) -m src.tools.regime_session_refresh \
+		--backfill $(or $(REGIME_SESSION_DAYS),60) \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(REGIME_SESSION_AS_OF),--as-of $(REGIME_SESSION_AS_OF)) \
+		$(if $(DRY_RUN),--dry-run)
+
+.PHONY: regime-session-refresh-install
+regime-session-refresh-install: ## Install the 15-min Gamma Regime session refresh timer (cash session)
+	@echo "$(BLUE)=== Installing Gamma Regime Session Refresh Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-regime-session-refresh.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-regime-session-refresh.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-regime-session-refresh.timer
+	@echo "$(GREEN)✅ Regime-session-refresh timer (every 15 min, cash session) installed and started$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-regime-session-refresh.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-regime-session-refresh$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-regime-session-refresh.service$(NC)"
+	@echo "$(YELLOW)Backfill:    make regime-session-backfill$(NC)"
+
+.PHONY: regime-session-refresh-status
+regime-session-refresh-status: ## Show Gamma Regime session refresh timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Gamma Regime Session Refresh Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-regime-session-refresh.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-regime-session-refresh.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-regime-session-refresh -n 30 --no-pager || true
+
+# =============================================================================
 # Yesterday's Scorecard auto-tweet (16:15 ET weekdays)
 # =============================================================================
 # Daily one-line recap of Action Cards emitted + per-signal flip P&L, posted to

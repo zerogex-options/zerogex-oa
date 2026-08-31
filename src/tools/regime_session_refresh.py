@@ -39,18 +39,30 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import date, datetime
-from typing import List, Optional, Sequence
+from datetime import date, datetime, time
+from typing import Any, List, Optional, Sequence
 
 from zoneinfo import ZoneInfo
 
 from src.analytics import regime_session as rsess
 from src.api.database import DatabaseManager
+from src.market_calendar import NYSE_HOLIDAYS
 
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
+
+#: Earliest ET time the intraday refresh has anything to say.  The read is
+#: "since the open", so before there is a second snapshot to compare against
+#: there is no read — running earlier just logs a skip per symbol.
+_REFRESH_OPEN = time(9, 45)
+
+#: Latest ET time the intraday refresh runs.  The analytics engine keeps
+#: writing for a few minutes past 16:00 and the last row it writes is the one
+#: that should freeze into the session's read, so the final fire sits after
+#: that rather than on the bell.
+_REFRESH_CLOSE_GRACE = time(16, 20)
 
 #: Default symbol set.  Reuses the bulletin's ticker list (the symbols the
 #: site actually publishes reads for) so a new underlying does not need two
@@ -129,15 +141,60 @@ async def refresh_symbol(
     return written, skipped
 
 
+def within_refresh_window(now_et: datetime) -> bool:
+    """True when the intraday refresh has a session to read.
+
+    Self-gating on the calendar, the way ``market_tide_refresh`` does, is what
+    lets the timer fire on a fixed schedule while the tool stays silent on
+    weekends and holidays — and, more importantly, is what makes "this run
+    wrote nothing" a real failure worth marking the unit on, instead of the
+    normal state of every non-trading day.
+    """
+    if now_et.weekday() > 4 or now_et.date() in NYSE_HOLIDAYS:
+        return False
+    return _REFRESH_OPEN <= now_et.time() <= _REFRESH_CLOSE_GRACE
+
+
 async def _run(
-    symbols: Sequence[str], backfill: int, dry_run: bool, as_of: Optional[date]
+    symbols: Sequence[str],
+    backfill: int,
+    dry_run: bool,
+    as_of: Optional[date],
+    *,
+    force: bool = False,
+    db: Optional[Any] = None,
 ) -> int:
-    db = DatabaseManager()
-    try:
-        await db.connect()
-    except Exception:
-        logger.exception("regime refresh: database connect failed")
-        return 1
+    """Run the refresh and return the process exit code.
+
+    ``db`` is the same duck-typed seam :mod:`src.analytics.regime_session`
+    uses: pass one and this drives it as-is (the tests supply an in-memory
+    stub), leave it out and a real :class:`DatabaseManager` is opened and
+    closed around the run.
+    """
+    # Only the intraday mode (backfill=1, no explicit --as-of) is gated: a
+    # backfill is a deliberate catch-up and must run whenever it is asked to,
+    # including at 3am on a Sunday after a deploy.
+    intraday = backfill == 1 and as_of is None
+    if intraday and not force:
+        now_et = datetime.now(UTC).astimezone(ET)
+        if not within_refresh_window(now_et):
+            logger.info(
+                "regime refresh: %s ET is outside the cash session "
+                "(%s-%s, Mon-Fri, non-holiday) — nothing to do",
+                now_et.strftime("%Y-%m-%d %H:%M:%S"),
+                _REFRESH_OPEN.strftime("%H:%M"),
+                _REFRESH_CLOSE_GRACE.strftime("%H:%M"),
+            )
+            return 0
+
+    owns_db = db is None
+    if owns_db:
+        db = DatabaseManager()
+        try:
+            await db.connect()
+        except Exception:
+            logger.exception("regime refresh: database connect failed")
+            return 1
 
     today = as_of or datetime.now(UTC).astimezone(ET).date()
     # recent_sessions returns newest-first; refresh_symbol wants oldest-first.
@@ -170,12 +227,25 @@ async def _run(
         logger.info(
             "regime refresh complete: %d written, %d skipped", total_written, total_skipped
         )
+        if total_written == 0:
+            # The failure that produced an empty history strip for months is
+            # not a crash — it is a run that exits 0 having written nothing,
+            # every day, unnoticed.  Inside the trading window that is always
+            # wrong: the calendar gate above has already excluded the days
+            # where writing nothing is correct.
+            logger.error(
+                "regime refresh wrote no sessions for %s — the history strip "
+                "and the z-score denominator both stay empty",
+                list(symbols),
+            )
+            return 1
         return 0
     except Exception:
         logger.exception("regime refresh: unexpected failure")
         return 1
     finally:
-        await db.disconnect()
+        if owns_db:
+            await db.disconnect()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -206,6 +276,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Compute and log the reads without writing them.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Run the intraday refresh even outside the cash session.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Log level (DEBUG, INFO, WARNING, ERROR).",
@@ -233,7 +308,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.warning("No symbols to refresh")
         return 0
 
-    return asyncio.run(_run(symbols, args.backfill, args.dry_run, as_of))
+    return asyncio.run(
+        _run(symbols, args.backfill, args.dry_run, as_of, force=args.force)
+    )
 
 
 if __name__ == "__main__":

@@ -70,6 +70,8 @@ def _sample_bucket(ts: str, strike: float = 505.0) -> dict:
         "gamma_flip": 510.0,
         "call_wall": 515.0,
         "put_wall": 505.0,
+        "pin_strike": 512.0,
+        "pin_confidence": 0.61,
         "strikes": [
             {
                 "strike": strike,
@@ -116,6 +118,8 @@ def test_response_shape_is_list_of_buckets(monkeypatch: pytest.MonkeyPatch):
         "gamma_flip",
         "call_wall",
         "put_wall",
+        "pin_strike",
+        "pin_confidence",
         "strikes",
     ):
         assert field in bucket, field
@@ -124,6 +128,13 @@ def test_response_shape_is_list_of_buckets(monkeypatch: pytest.MonkeyPatch):
     # json_encoders).  The chart relies on this to skip a Decimal shim.
     assert isinstance(bucket["close"], float)
     assert bucket["close"] == 512.80
+
+    # Pin Strike + confidence survive the model round-trip as plain JSON
+    # numbers (pin_strike is NUMERIC → Decimal → float; pin_confidence is a
+    # DOUBLE PRECISION 0..1 ratio and stays a float throughout).  The rewind
+    # chart reads these directly, so an exact value is worth pinning.
+    assert bucket["pin_strike"] == 512.0
+    assert bucket["pin_confidence"] == 0.61
 
     # Strikes shape uses exactly the names the frontend type-checks
     # against (call_gamma / put_gamma / net_gamma, not call_gex et al.).

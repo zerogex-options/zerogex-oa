@@ -39,8 +39,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import date, datetime, time, timezone
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode
+from zoneinfo import ZoneInfo
 
 from src.jobs.futures_projection import (
     SPOT_FIELDS,
@@ -110,10 +112,23 @@ _UNSUPPORTED_PREFIXES = (
     "/api/flow/contracts",
     "/api/flow/smart-money",
     "/api/market/open-interest",
-    # Option-premium and IV surfaces: their value axis is a premium/IV on a
-    # real SPX contract, not an index level, so the axis does not carry.
+    # Option PREMIUMS: the value axis is a dollar premium on a real SPX
+    # contract.  It is not an index level, so the basis ratio is not the
+    # transform that carries it, and there is no ES premium to substitute.
+    #
+    # Contrast /api/gex/vol_surface, which is NOT listed here and so is
+    # projected by the /api/gex/ prefix in the allowlist above.  It was
+    # grouped here originally as an "IV surface" on the same reasoning, but
+    # the two are not alike: an IV is DIMENSIONLESS, so it does not need to
+    # be carried at all — it is the same number on either axis and passes
+    # through untouched (call_iv / put_iv / atm_iv / skew are in
+    # NEVER_PROJECT).  What vol_surface does put on the price axis is its
+    # STRIKE ladder, and that is the ordinary /api/gex/ strike projection the
+    # allowlist above already performs for every other surface.  Refusing it
+    # left the /volatility page's skew chart answering 400 for ES and NQ
+    # while the GEX ladders beside it — same SPX chain, same strikes —
+    # rendered fine.
     "/api/gex/premium_surface",
-    "/api/gex/vol_surface",
 )
 
 
@@ -160,6 +175,104 @@ def _is_v2_envelope(payload: Any) -> bool:
 
 def _scope_query(scope: dict) -> list[tuple[str, str]]:
     return parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+
+
+ET = ZoneInfo("America/New_York")
+
+# A bare trading day, e.g. the ``date`` a replay session is addressed by.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# A UTC-offset whose ``+`` was eaten by query-string decoding: " 00:00".
+_SPACE_OFFSET_RE = re.compile(r"\s(\d{2}:\d{2})$")
+
+# Query parameters that pin a request to a PAST instant, most specific first.
+# A request carrying one of these is asking "what did this look like then",
+# and its basis must be the basis that stood then — see ``_request_asof``.
+# ``start_date`` is deliberately absent: on a range request it is the FAR end,
+# and anchoring a whole series to its oldest point is as wrong as anchoring it
+# to now, just in the other direction. Range payloads are handled per-row by
+# ``_asof_for_row`` instead.
+_ASOF_PARAMS = ("ts", "end_date", "session_date", "date")
+
+
+def _parse_asof(raw: str) -> Optional[datetime]:
+    """Parse an as-of query value into an aware UTC datetime, or None.
+
+    Accepts both an instant (``2026-05-14T18:30:00Z``) and a bare trading day
+    (``2026-05-14``). A bare day resolves to its CASH CLOSE rather than
+    midnight: a session's frames all sit inside 09:30-16:00 ET, and midnight ET
+    precedes every one of them, so anchoring there would push the basis read a
+    full day back and miss the session entirely on a Monday.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    # ``+`` is a space in a query string, so a caller who sends a literal
+    # ``+00:00`` offset instead of ``%2B00:00`` arrives here with " 00:00".
+    # Clients get this wrong constantly, and the failure mode is the one this
+    # whole function exists to prevent: an unparsed anchor falls back to live
+    # and silently projects a past frame on today's basis. Put the sign back.
+    text = _SPACE_OFFSET_RE.sub(r"+\1", text)
+    try:
+        if _DATE_ONLY_RE.match(text):
+            day = date.fromisoformat(text)
+            return datetime.combine(day, time(16, 0), tzinfo=ET).astimezone(timezone.utc)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+# Fields a time-series row carries its own instant in, most specific first.
+_ROW_TS_FIELDS = ("timestamp", "bucket_ts", "frame_ts", "ts", "date")
+
+
+def _row_anchor(row: Any) -> Optional[datetime]:
+    """The basis anchor for one row of a series, or None if it carries no time.
+
+    Rounded to the row's SESSION rather than its own minute, for two reasons.
+    One basis per trading day keeps a 90-day series to 90 cached basis reads
+    instead of one per minute. And the precision lost is below the tick a level
+    is published at: basis moves ~0.5% across a whole quarterly cycle, so
+    within one session it moves ~0.003% — about 0.2 points on ES, which rounds
+    away against the 0.25 tick. The months-scale drift this exists to remove is
+    two orders of magnitude larger.
+    """
+    if not isinstance(row, dict):
+        return None
+    for key in _ROW_TS_FIELDS:
+        raw = row.get(key)
+        if not isinstance(raw, str):
+            continue
+        parsed = _parse_asof(raw)
+        if parsed is not None:
+            session = parsed.astimezone(ET).date()
+            return datetime.combine(session, time(16, 0), tzinfo=ET).astimezone(timezone.utc)
+    return None
+
+
+def _request_asof(scope: dict) -> Optional[datetime]:
+    """The instant this request is asking about, or None for "now".
+
+    Read from the query string BEFORE the scope is rewritten — the rewrite
+    only touches symbol parameters, but reading first keeps the two concerns
+    from having to know about each other.
+
+    A future-dated anchor is treated as live: a caller asking for today's
+    session mid-session should get the current basis, not an empty window.
+    """
+    now = datetime.now(timezone.utc)
+    query = _scope_query(scope)
+    for param in _ASOF_PARAMS:
+        for key, value in query:
+            if key != param:
+                continue
+            parsed = _parse_asof(value)
+            if parsed is not None:
+                return None if parsed >= now else parsed
+    return None
 
 
 def _futures_target(scope: dict) -> Optional[tuple[str, str]]:
@@ -345,8 +458,14 @@ class FuturesProjectionMiddleware:
             await self._reject(send, futures_symbol, index_symbol, path)
             return
 
+        # Read the as-of BEFORE the rewrite, while the scope still holds the
+        # query exactly as the caller sent it.
+        asof = _request_asof(scope)
+
         _rewrite_scope(scope, futures_symbol, index_symbol)
-        await self._project_response(scope, receive, send, futures_symbol, index_symbol)
+        await self._project_response(
+            scope, receive, send, futures_symbol, index_symbol, asof
+        )
 
     async def _reject(self, send, futures_symbol: str, index_symbol: str, path: str) -> None:
         """Refuse rather than guess an axis for an unaudited endpoint."""
@@ -374,7 +493,13 @@ class FuturesProjectionMiddleware:
         await send({"type": "http.response.body", "body": body})
 
     async def _project_response(
-        self, scope, receive, send, futures_symbol: str, index_symbol: str
+        self,
+        scope,
+        receive,
+        send,
+        futures_symbol: str,
+        index_symbol: str,
+        asof: Optional[datetime] = None,
     ) -> None:
         status: Optional[int] = None
         headers: list = []
@@ -418,7 +543,9 @@ class FuturesProjectionMiddleware:
                 )
 
             try:
-                projected = await self._transform(payload, futures_symbol, index_symbol)
+                projected = await self._transform(
+                    payload, futures_symbol, index_symbol, asof
+                )
                 out = json.dumps(projected).encode("utf-8")
             except Exception as e:
                 # Never ship un-projected cash levels under an ES label: that
@@ -462,7 +589,49 @@ class FuturesProjectionMiddleware:
         await send({"type": "http.response.start", "status": status or 500, "headers": out_headers})
         await send({"type": "http.response.body", "body": body})
 
-    async def _transform(self, payload: Any, futures_symbol: str, index_symbol: str) -> Any:
+    async def _transform_series(
+        self,
+        rows: list,
+        futures_symbol: str,
+        index_symbol: str,
+        asof: Optional[datetime] = None,
+    ) -> list:
+        """Project a timestamped series, each row on its own session's basis.
+
+        Bases are resolved once per distinct session and reused, so a 90-day
+        series costs 90 reads rather than one per row (and the DB layer caches
+        them besides). A row with no readable timestamp falls back to the
+        request-level anchor, which is the behaviour it had before.
+        """
+        cache: dict[Optional[datetime], Any] = {}
+        tick = projection_tick(futures_symbol)
+        out = []
+        for row in rows:
+            anchor = _row_anchor(row) or asof
+            if anchor not in cache:
+                cache[anchor] = await resolve_basis(_db_manager(), futures_symbol, at=anchor)
+            basis = cache[anchor]
+            if basis is None:
+                out.append(row)
+                continue
+            projected = project_payload(
+                row,
+                basis,
+                tick=tick,
+                relabel=(index_symbol, futures_symbol),
+            )
+            if isinstance(projected, dict):
+                projected["projection"] = projection_metadata(basis)
+            out.append(projected)
+        return out
+
+    async def _transform(
+        self,
+        payload: Any,
+        futures_symbol: str,
+        index_symbol: str,
+        asof: Optional[datetime] = None,
+    ) -> Any:
         # A v2 response is {"data": <the v1 body>, "freshness": {...}}. Project
         # INSIDE `data` and leave the envelope alone, for three reasons:
         #   * the top-level spot substitution below keys on SPOT_FIELDS at the
@@ -476,10 +645,21 @@ class FuturesProjectionMiddleware:
         #     a price ratio onto it would be meaningless.
         if _is_v2_envelope(payload):
             out = dict(payload)
-            out["data"] = await self._transform(payload["data"], futures_symbol, index_symbol)
+            out["data"] = await self._transform(
+                payload["data"], futures_symbol, index_symbol, asof
+            )
             return out
 
-        basis = await resolve_basis(_db_manager(), futures_symbol)
+        # A bare list of timestamped rows is a SERIES, and one ratio cannot
+        # describe it: /api/gex/historical can span months, over which basis
+        # walks through whole quarterly cycles. Anchoring the series at either
+        # end leaves the other end offset by that drift — tens of points on ES,
+        # and a backtest reading those levels has no way to see it. Project
+        # each row on the basis that stood in its own session instead.
+        if isinstance(payload, list) and any(_row_anchor(row) is not None for row in payload):
+            return await self._transform_series(payload, futures_symbol, index_symbol, asof)
+
+        basis = await resolve_basis(_db_manager(), futures_symbol, at=asof)
         if basis is None:
             return payload
 
@@ -505,7 +685,22 @@ class FuturesProjectionMiddleware:
         # Prefer the OBSERVED futures print over a projected one for spot.
         # Only the top level is substituted: a nested per-row "spot" is that
         # row's historical spot, not the live one, and must stay projected.
-        if isinstance(projected, dict) and any(k in projected for k in SPOT_FIELDS):
+        #
+        # A request pinned to a past instant takes NO live substitution at all:
+        # the live print is today's price, and stamping it on a frame from
+        # three months ago states something false about that frame. The
+        # projected value — that session's index spot carried by that session's
+        # basis — is the honest answer. No historical endpoint currently ships
+        # a top-level spot (replay nests it under `summary`, /gex/historical
+        # returns a list), so this is a guard on shape rather than a fix for a
+        # live bug: the substitution keys on payload shape, and the next
+        # historical endpoint that happens to expose one would inherit today's
+        # price silently.
+        if (
+            asof is None
+            and isinstance(projected, dict)
+            and any(k in projected for k in SPOT_FIELDS)
+        ):
             live = await _live_futures_spot(index_symbol)
             if live is not None:
                 for spot_key in SPOT_FIELDS:

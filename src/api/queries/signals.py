@@ -283,6 +283,86 @@ class SignalsQueriesMixin:
         """
         return await self.get_advanced_signal(symbol=symbol, signal_name=signal_name)
 
+    async def get_component_signals_bulk(
+        self,
+        symbol: str = "SPY",
+        signal_names: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Latest row for EVERY name in ``signal_names``, in ONE round trip.
+
+        :meth:`get_advanced_signal` answers for a single component, and a
+        caller that wants the whole board (the playbook context builder wants
+        all 13) previously looped it — 13 connection acquisitions, and 13 MORE
+        queries because each call also fetches that component's score history.
+        Under contention those acquisitions queue behind each other and the
+        cost compounds: on 2026-08-31 this loop was the single worst endpoint
+        on the API, with individual requests past 150 seconds.
+
+        ``DISTINCT ON (component_name)`` with a matching ``ORDER BY`` prefix
+        walks ``idx_signal_component_scores_underlying_component_ts`` and stops
+        at the first (newest) row per component, so the whole board costs about
+        what one component used to.
+
+        **Deliberately omits ``score_history``.** The per-call history in
+        :meth:`get_advanced_signal` is the other half of that waste: the
+        playbook's ``_snapshot_from_row`` never reads it, so 13 history reads
+        were issued and discarded on every request, after which the three
+        series the patterns actually aggregate over were fetched again by
+        name. A caller that needs history asks for it explicitly via
+        :meth:`get_signal_history`.
+
+        Returns ``{component_name: row}``; a name with no rows is simply
+        absent, which is how the single-component method's ``None`` reads at
+        the call site. Returns ``{}`` on a read failure rather than raising —
+        the same degrade-to-empty contract the per-name method has, though
+        note this is now all-or-nothing where it used to be per-signal (one
+        query cannot half-succeed).
+        """
+        names = [n for n in (signal_names or []) if n]
+        if not names:
+            return {}
+
+        query = """
+            SELECT DISTINCT ON (scs.component_name)
+                scs.component_name,
+                scs.underlying,
+                scs.timestamp,
+                scs.clamped_score,
+                scs.weighted_score,
+                scs.weight,
+                scs.context_values,
+                CASE
+                    WHEN scs.clamped_score > 0 THEN 'bullish'
+                    WHEN scs.clamped_score < 0 THEN 'bearish'
+                    ELSE 'neutral'
+                END AS direction
+            FROM signal_component_scores scs
+            WHERE scs.underlying = $1
+              AND scs.component_name = ANY($2::text[])
+            ORDER BY scs.component_name, scs.timestamp DESC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, names)
+        except Exception as e:
+            logger.error(f"get_component_signals_bulk failed ({symbol}): {e!r}")
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            d = dict(row)
+            raw = d.get("clamped_score") or 0.0
+            d["score"] = round(float(raw) * 100.0, 2)
+            ctx = d.get("context_values") or {}
+            if isinstance(ctx, str):
+                try:
+                    ctx = json.loads(ctx)
+                except ValueError:
+                    ctx = {}
+            d["context_values"] = ctx
+            out[d["component_name"]] = d
+        return out
+
     async def get_signal_events(
         self,
         symbol: str = "SPY",

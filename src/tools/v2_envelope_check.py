@@ -110,6 +110,12 @@ def default_paths(version: str, symbol: str) -> list[str]:
     contract with a path parameter, a JSONResponse-returning route, and a
     route with no response_model (the class where the encoder divergence
     lived).
+
+    ``option/quote`` is here for the cadence profile rather than the response
+    shape: it is the only sampled endpoint on the option-chain window
+    (09:30-16:15 ET), so it is the only one whose ``freshness_status`` differs
+    from the rest between 16:15 and 20:00. Without it the sample covered every
+    profile but that one.
     """
     v = f"/api/v{version}"
     return [
@@ -118,6 +124,7 @@ def default_paths(version: str, symbol: str) -> list[str]:
         f"{v}/levels/{symbol}",
         f"{v}/flow/series?symbol={symbol}",
         f"{v}/signals/score?underlying={symbol}",
+        f"{v}/option/quote?underlying={symbol}&type=C",
     ]
 
 

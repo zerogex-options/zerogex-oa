@@ -1,0 +1,25 @@
+[Unit]
+Description=Recurring trigger for the ZeroGEX Gamma Regime session read (every 15 min, cash session)
+
+[Timer]
+# Server timezone is America/New_York (deploy/steps/010.setup), so these
+# calendar expressions are ET.
+#
+# Every 15 minutes across the 09:00-16:45 ET hours on weekdays.  The tool
+# self-gates to 09:45-16:20 ET (weekends and NYSE holidays are skipped
+# in-process), so the fires either side of that are cheap no-ops.
+#
+# Fifteen minutes rather than five: the row is a SINCE-OPEN read that only
+# moves as the book does, and each fire re-reads two chain snapshots.  The
+# fire that matters is the last one after the close, which freezes the
+# session -- running to 16:45 leaves several attempts past the bell so a late
+# final analytics write still lands in today's row.
+OnCalendar=Mon..Fri *-*-* 09..16:00/15:00
+RandomizedDelaySec=30
+# Do NOT replay missed intraday slots after downtime: a catch-up fire would
+# only recompute the same since-open read.  `make regime-session-backfill`
+# is the right way to repair a gap of whole sessions.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

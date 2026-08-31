@@ -36,17 +36,34 @@ futures chart with nothing to mark it.
 
 | Surface | ES/NQ behaviour |
 |---|---|
-| GEX (`/api/gex/*` bar the two surfaces below), `/api/v1/levels`, `/api/technicals*`, `/api/max-pain/*` | projected |
+| GEX (`/api/gex/*` bar the premium surface below), `/api/v1/levels`, `/api/technicals*`, `/api/max-pain/*` | projected |
 | `/api/signals/*`, `/api/forecast*`, `/api/forced-flow/*`, `/api/scorecard/*`, `/api/replay/*` | projected |
 | `/api/flow/buying-pressure`, `/api/flow/series`, `/api/flow/market-tide` | projected |
 | `/api/market/quote`, `/historical`, `/session-closes`, `/session-levels` | served natively from the future's own bars |
-| **per-contract surfaces** — `/api/option/*`, `/api/tools/option-calculator`, `/api/flow/by-contract`, `/api/flow/contracts`, `/api/flow/smart-money`, `/api/market/open-interest`, `/api/gex/premium_surface`, `/api/gex/vol_surface` | **400** |
+| **per-contract surfaces** — `/api/option/*`, `/api/tools/option-calculator`, `/api/flow/by-contract`, `/api/flow/contracts`, `/api/flow/smart-money`, `/api/market/open-interest`, `/api/gex/premium_surface` | **400** |
 
 The refusals are the per-contract surfaces only, and they refuse for a reason
 that does not go away: an SPX contract with its strike multiplied by the basis
 is not a contract anyone can trade, and the strike no longer round-trips to the
 chain it came from. There is no ES chain to substitute. The Strategy Builder,
 Option Contracts and Smart Money pages render an explicit panel saying so.
+
+`/api/gex/premium_surface` refuses on the same grounds one step removed: its
+value axis is a dollar premium on an SPX contract, so the basis ratio is not
+the transform that carries it and there is no ES premium to substitute.
+
+**`/api/gex/vol_surface` is projected**, and was mistakenly grouped with the
+premium surface in the first rollout — which left the `/volatility` page's
+"Put vs Call IV — Skew" chart answering 400 for ES and NQ while the GEX
+ladders beside it, off the same SPX chain, rendered fine. The two surfaces are
+not alike. An implied vol is **dimensionless**: it is the same number on the
+cash and the futures axis, so it is not carried at all — `call_iv`, `put_iv`,
+`atm_iv` and the 25-delta `skew` are in `NEVER_PROJECT` and ship untouched.
+What that endpoint puts on the price axis is its **strike ladder**, and that is
+the ordinary `/api/gex/` strike projection every other surface already
+performs, so the smile lands over the ES strikes it was computed against.
+`spot_price` takes the observed futures print like everywhere else, which is
+what keeps the chart's ATM read where ES actually trades.
 
 **Prices quoted in prose are converted too.** Signal and forecast cards write
 narratives like `target $6,650.00`, and a card reading that beside a chart

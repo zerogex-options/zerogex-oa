@@ -142,6 +142,29 @@ def _empty_signal_row():
     return None
 
 
+def _bulk_stub(adv=None, basic=None):
+    """Adapt per-name signal stubs to ``get_component_signals_bulk``.
+
+    ``build_playbook_context`` asks for every component in ONE query now, so
+    these tests keep describing the board the way they always did — which name
+    yields which row — and this assembles the ``{name: row}`` mapping the bulk
+    reader returns. A name with no row is absent from the mapping, which is
+    what the real query does and what ``signal_rows.get(name)`` expects.
+    """
+
+    async def _bulk(symbol, names):
+        out = {}
+        for name in names:
+            row = await adv(symbol, name) if adv is not None else None
+            if row is None and basic is not None:
+                row = await basic(symbol, name)
+            if row is not None:
+                out[name] = row
+        return out
+
+    return _bulk
+
+
 def test_action_endpoint_returns_404_when_no_score_row(monkeypatch: pytest.MonkeyPatch):
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=None)
@@ -156,8 +179,7 @@ def test_action_endpoint_returns_stand_down_when_triggers_unmet(
     """call_wall_fade can't match because no advanced signal corroborates."""
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
-    dbmod.DatabaseManager.get_advanced_signal = AsyncMock(return_value=_empty_signal_row())
-    dbmod.DatabaseManager.get_basic_signal = AsyncMock(return_value=_empty_signal_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(return_value={})
 
     with TestClient(app) as client:
         r = client.get("/api/signals/action?underlying=SPY")
@@ -201,8 +223,9 @@ def test_action_endpoint_returns_trade_card_when_call_wall_fade_triggers(
             return {"clamped_score": -0.10, "score": -10.0, "context_values": {}}
         return None
 
-    dbmod.DatabaseManager.get_advanced_signal = AsyncMock(side_effect=_adv)
-    dbmod.DatabaseManager.get_basic_signal = AsyncMock(side_effect=_basic)
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_adv, basic=_basic)
+    )
 
     with TestClient(app) as client:
         r = client.get("/api/signals/action?underlying=SPY")
@@ -240,8 +263,7 @@ def test_stand_down_card_is_not_persisted(monkeypatch: pytest.MonkeyPatch):
     # internally and returns None, so the response must not carry an ``id``.
     dbmod.DatabaseManager.insert_action_card = AsyncMock(return_value=None)
     dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
-    dbmod.DatabaseManager.get_advanced_signal = AsyncMock(return_value=None)
-    dbmod.DatabaseManager.get_basic_signal = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(return_value={})
 
     with TestClient(app) as client:
         r = client.get("/api/signals/action?underlying=SPY")
@@ -391,8 +413,9 @@ def test_recently_emitted_blocks_re_emission_via_hysteresis(monkeypatch: pytest.
             return {"clamped_score": -0.30, "score": -30.0, "context_values": {}}
         return None
 
-    dbmod.DatabaseManager.get_advanced_signal = AsyncMock(side_effect=_adv)
-    dbmod.DatabaseManager.get_basic_signal = AsyncMock(side_effect=_basic)
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_adv, basic=_basic)
+    )
 
     # Simulate call_wall_fade having fired 2 minutes ago — well inside the
     # 5-minute 0DTE dwell window.  The score row's timestamp is 2026-05-01
@@ -417,3 +440,87 @@ def test_recently_emitted_blocks_re_emission_via_hysteresis(monkeypatch: pytest.
         nm["pattern"] == "call_wall_fade" and any("hysteresis" in m for m in nm["missing"])
         for nm in body["near_misses"]
     )
+
+
+# --- request cost --------------------------------------------------------
+#
+# The Action Card was the slowest endpoint on the API: it rebuilt an identical
+# Card on every poll, and built it from one query per signal. These pin both
+# halves of that fix, because both are invisible in the response body — a
+# regression would look perfectly correct and simply be slow again.
+
+
+def test_action_card_is_cached_between_requests(monkeypatch: pytest.MonkeyPatch):
+    """A Card only advances on the 60s analytics cycle, so a second poll
+    inside the TTL must be served without rebuilding it."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(return_value={})
+
+    with TestClient(app) as client:
+        first = client.get("/api/signals/action?underlying=SPY")
+        second = client.get("/api/signals/action?underlying=SPY")
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json() == second.json()
+    assert dbmod.DatabaseManager.get_latest_signal_score.await_count == 1
+    assert dbmod.DatabaseManager.get_component_signals_bulk.await_count == 1
+
+
+def test_action_card_cache_does_not_cross_symbols(monkeypatch: pytest.MonkeyPatch):
+    """A cache keyed too loosely would serve SPY's Card on a QQQ chart."""
+    app, dbmod = _build_app(monkeypatch)
+
+    async def _score(symbol, *args, **kwargs):
+        row = _score_row()
+        row["underlying"] = symbol
+        return row
+
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(side_effect=_score)
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(return_value={})
+
+    with TestClient(app) as client:
+        spy = client.get("/api/signals/action?underlying=SPY").json()
+        qqq = client.get("/api/signals/action?underlying=QQQ").json()
+
+    assert spy["underlying"] == "SPY"
+    assert qqq["underlying"] == "QQQ"
+    assert dbmod.DatabaseManager.get_latest_signal_score.await_count == 2
+
+
+def test_action_card_cache_can_be_disabled(monkeypatch: pytest.MonkeyPatch):
+    """TTL 0 turns it off, so an operator can rule the cache out during an
+    incident without shipping code."""
+    monkeypatch.setenv("ACTION_CARD_CACHE_TTL_SECONDS", "0")
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(return_value={})
+
+    with TestClient(app) as client:
+        client.get("/api/signals/action?underlying=SPY")
+        client.get("/api/signals/action?underlying=SPY")
+
+    assert dbmod.DatabaseManager.get_latest_signal_score.await_count == 2
+
+
+def test_context_build_reads_every_signal_in_one_query(monkeypatch: pytest.MonkeyPatch):
+    """One bulk read for the whole board, not one per component. The per-name
+    readers must not be reached at all — each also fetches a score history the
+    playbook never looks at."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(return_value={})
+    dbmod.DatabaseManager.get_advanced_signal = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.get_basic_signal = AsyncMock(return_value=None)
+
+    with TestClient(app) as client:
+        assert client.get("/api/signals/action?underlying=SPY").status_code == 200
+
+    assert dbmod.DatabaseManager.get_component_signals_bulk.await_count == 1
+    dbmod.DatabaseManager.get_advanced_signal.assert_not_awaited()
+    dbmod.DatabaseManager.get_basic_signal.assert_not_awaited()
+
+    # And it asked for the whole board in that one call.
+    _, names = dbmod.DatabaseManager.get_component_signals_bulk.await_args.args
+    assert "trap_detection" in names and "tape_flow_bias" in names
+    assert len(names) >= 13

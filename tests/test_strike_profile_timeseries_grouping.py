@@ -19,6 +19,8 @@ These tests mock the connection and pin the fold's observable contract:
   * a bucket with no underlying close leaves both walls ``None``
   * ``expirations=None`` keeps the persisted ``gamma_flip``; a filtered set
     replaces it with the recomputed cumulative-net-GEX crossing
+  * ``pin_strike`` / ``pin_confidence`` ride through per bucket and are
+    INVARIANT under the expiration filter (unlike the walls and the flip)
   * the result is served from the process-local cache on the second call
 """
 
@@ -56,6 +58,8 @@ def _row(
     call_raw=0.0,
     put_raw=0.0,
     gamma_flip=Decimal("505.5"),
+    pin_strike=None,
+    pin_confidence=None,
     call_gex=None,
     put_gex=None,
     net_gex=None,
@@ -71,6 +75,8 @@ def _row(
         "low": None if close is None else Decimal(str(close)) - 1,
         "close": None if close is None else Decimal(str(close)),
         "gamma_flip": gamma_flip,
+        "pin_strike": pin_strike,
+        "pin_confidence": pin_confidence,
         "strike": None if strike is None else Decimal(str(strike)),
         "call_gamma_raw": Decimal(str(call_raw)),
         "put_gamma_raw": Decimal(str(put_raw)),
@@ -310,3 +316,87 @@ def test_distinct_expiration_sets_do_not_share_a_cache_entry():
     asyncio.run(db.get_strike_profile_timeseries("SPY", "5min", 40, [date(2026, 8, 18)]))
 
     assert conn.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# Pin Strike
+# ---------------------------------------------------------------------------
+#
+# The rewind chart draws Pin Strike from these buckets, so the fold has to
+# carry it per bucket AND leave it alone.  The pin is 0DTE-by-construction and
+# whole-chain by definition: it must read identically in every expiration
+# scope, or the same line would mean two different things depending on the
+# Expiry selector.  That is the opposite of the wall/flip rule directly above,
+# which is exactly why it gets its own tests.
+
+
+def _pinned(rows, pin, confidence):
+    """Copy of ``rows`` with a pin stamped on every row of the set.
+
+    The SQL carries the bucket's pin on each of its flat (bucket, strike)
+    rows — one value repeated — so the fixtures mirror that shape.
+    """
+    return [{**r, "pin_strike": pin, "pin_confidence": confidence} for r in rows]
+
+
+def test_pin_rides_through_per_bucket():
+    """Each bucket carries its OWN pin, taken from its representative row."""
+    rows = _pinned(_BUCKET1, Decimal("505.0"), 0.72) + _pinned(_BUCKET2, Decimal("510.0"), 0.44)
+    result, _conn, _db = _run(rows)
+
+    assert [b["pin_strike"] for b in result] == [Decimal("505.0"), Decimal("510.0")]
+    assert [b["pin_confidence"] for b in result] == [0.72, 0.44]
+
+
+def test_pin_is_invariant_under_the_expiration_filter():
+    """The expirations filter must NOT reach the pin.
+
+    Walls (always) and the flip (under a filter) are recomputed from the
+    filtered strikes, so they are expiration-scoped by design.  The pin is
+    not: it models into-expiration hedging across the whole chain, and the
+    live surfaces already hold it fixed when the Expiry selector changes.
+    Rewind has to match, so this asserts the pin is byte-identical across the
+    two scopes *while the flip actually moves* — a fold that ever started
+    scoping the pin would fail here rather than silently shipping a level
+    that means one thing live and another in rewind.
+    """
+    rows = _pinned(_ROWS, Decimal("507.5"), 0.58)
+
+    unfiltered, _c1, _d1 = _run(rows)
+    filtered, _c2, _d2 = _run(rows, expirations=[date(2026, 8, 17)])
+
+    assert [b["pin_strike"] for b in unfiltered] == [Decimal("507.5"), Decimal("507.5")]
+    assert [b["pin_strike"] for b in filtered] == [Decimal("507.5"), Decimal("507.5")]
+    assert [b["pin_confidence"] for b in filtered] == [0.58, 0.58]
+    # Guard the guard: the filter has to be doing something, or the equality
+    # above would hold for a trivially broken reason.
+    assert [b["gamma_flip"] for b in filtered] != [b["gamma_flip"] for b in unfiltered]
+
+
+def test_pin_stays_none_when_there_is_no_active_pin():
+    """A bucket with no pin keeps ``None`` — never 0, never a coerced value.
+
+    Covers both ways the column comes back NULL: a cycle that found no
+    qualifying pin, and rows written before the pin columns shipped.  The
+    frontend draws no line for ``None``; a zero would render a bogus level
+    at the bottom of the axis.
+    """
+    result, _conn, _db = _run(_ROWS)  # the shared fixtures carry no pin
+
+    assert [b["pin_strike"] for b in result] == [None, None]
+    assert [b["pin_confidence"] for b in result] == [None, None]
+
+
+def test_bucket_without_strikes_still_carries_its_pin():
+    """The pin comes from gex_summary, not from the strikes.
+
+    So a bucket whose gex_by_strike probe came back empty — NULL walls, empty
+    strikes array — must still draw its pin line.
+    """
+    rows = _pinned([_row(_TS3, 507.0, strike=None)], Decimal("508.0"), 0.5)
+    result, _conn, _db = _run(rows)
+
+    assert result[0]["strikes"] == []
+    assert result[0]["call_wall"] is None
+    assert result[0]["pin_strike"] == Decimal("508.0")
+    assert result[0]["pin_confidence"] == 0.5

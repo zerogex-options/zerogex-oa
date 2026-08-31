@@ -126,10 +126,11 @@ def test_projection_applies_inside_data_and_leaves_freshness_alone():
     middleware = fm.FuturesProjectionMiddleware(app=None)
     real_transform = fm.FuturesProjectionMiddleware._transform
 
-    async def inner(self, payload, futures_symbol, index_symbol):
-        # Stand in for the real projection on the unwrapped body.
+    async def inner(self, payload, futures_symbol, index_symbol, asof=None):
+        # Stand in for the real projection on the unwrapped body. ``asof`` is
+        # the historical basis anchor, carried through the envelope unchanged.
         if fm._is_v2_envelope(payload):
-            return await real_transform(self, payload, futures_symbol, index_symbol)
+            return await real_transform(self, payload, futures_symbol, index_symbol, asof)
         out = dict(payload)
         out["spot"] = 6830.0
         out["projection"] = {"ratio": 1.0, "offset": 30.0}

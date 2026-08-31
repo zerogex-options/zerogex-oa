@@ -274,13 +274,14 @@ upstream can change.
 
 | Profile | Endpoints | Regular | Extended | Overnight |
 | --- | --- | --- | --- | --- |
-| `realtime_quote` | `/api/market/*`, `/api/option/*` | 60 s | 60 s | — |
+| `realtime_quote` | `/api/market/quote` and the rest of `/api/market/*` | 60 s | 60 s | — |
+| `option_chain` | `/api/option/*`, `/api/market/open-interest` | 60 s | 60 s (to 16:15 only) | — |
 | `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
 | `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
 | `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
-| `signals_cycle` | `/api/signals/*`, `/api/tradeworkz/*` | 15 s | 60 s | — |
+| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 15 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
-| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical` | — | — | — |
+| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
 
 A dash means no update is expected, which surfaces as
@@ -292,6 +293,19 @@ A dash means no update is expected, which surfaces as
 but it recomputes the same 20:00 observation, so an ageing payload there is
 correct rather than late. The same holds on weekends, NYSE holidays, and
 after the 13:00 ET close on an early-close day.
+
+**`option_chain` is narrower still: 09:30–16:15 ET.** A chain row is written
+when an option quote ticks, and options trade only during the cash session
+plus the 15-minute late session — while the underlying bar feed runs
+04:00–20:00. So `/api/option/*` and `/api/market/open-interest` report
+`session_closed` from 16:15 to 09:30 the next morning even though
+`/api/market/quote` beside them is still updating, and even though
+`market_session_status` still reads `pre-market` or `after-hours`. Those two
+fields answer different questions: the session label is what the *equity
+market* is doing, and `freshness_status` is whether *this endpoint's* feed
+owes you an update. Two narrower cases the calendar also handles: cash-index
+chains (SPX, NDX) stop at 16:00 with the index they price, and every chain
+stops at the early close on a half day.
 
 Cadence describes how often a new observation can be **stored**, not how
 often ingestion polls. The quote tape is polled every few seconds but written
@@ -405,6 +419,37 @@ reason about staleness; `/api/v1/levels` additionally returns
 `age_seconds`. A future delayed-vs-live tier split (free = delayed / EOD,
 paid = realtime) is a timestamp gate on these fields, not a streaming
 change.
+
+### ES / NQ and the basis a response is projected on
+
+ES and NQ are answered from the SPX / NDX option chains — ZeroGEX never
+computes gamma from options on futures. ES and SPX track the same index, so
+it is the same dealer book; only the price axis differs, by cost of carry.
+Every price-space field (strikes, walls, flip, max pain, pin, spot) is carried
+onto the futures axis by the **basis**, and rounded to the contract tick.
+Dollar exposures (net GEX, wall strength, OI, volume) are **not** rescaled —
+exposure belongs to the option book, not to the axis you plot it on.
+
+Which basis is used depends on what you asked for, and this matters if you
+are backtesting:
+
+| Request | Basis applied |
+| --- | --- |
+| Live (no time named) | measured off the current tape |
+| Pinned to an instant (`ts=`) | the basis in force at that instant |
+| Pinned to a session (`date=`, `end_date=`) | the basis in force that session |
+| A timestamped series (e.g. `/api/gex/historical`) | **per row**, each on its own session's basis |
+
+A series is projected row by row rather than under one ratio because basis
+walks down through each quarterly cycle toward expiry. Over a single session
+that drift is ~0.003% — below the tick a level is published at. Over a quarter
+it is ~0.5%, which on ES is tens of points: enough to move every level in a
+backtest without anything in the payload indicating it. Each row therefore
+carries its own `projection` block naming the ratio it was projected on.
+
+Historical responses also keep their **projected** spot rather than taking the
+live futures print — today's price stamped on a past frame would state
+something false about that frame.
 
 > **Authoritative source.** This guide is the curated derived/charting
 > surface. The live, complete, always-current endpoint list is the
@@ -680,6 +725,16 @@ Most recent quote for a single option contract.
 - `expiration` (optional): `YYYY-MM-DD`
 - `type` (optional): `C` (call) or `P` (put)
 
+**These read `option_chains`, so they keep the options session, not the
+tape's.** `/api/market/open-interest`, `/api/option/quote` and
+`/api/option/contract` are graded on the `option_chain` cadence profile:
+09:30–16:15 ET (16:00 for SPX/NDX, the early close on a half day). Outside
+that they report `session_closed`, not `stale` — no chain row can be written
+when no option is trading, so the last snapshot before the close is the
+correct answer all evening. `/api/market/quote` sits beside them on the wider
+04:00–20:00 tape window and will still be updating; that difference is real,
+not an inconsistency.
+
 ---
 
 ## Max Pain
@@ -844,6 +899,21 @@ purpose.
   remaining patterns land in PR-3+.
 - `GET /api/signals/trades-history` — realized trade ideas with P&L / hit rate.
 - `GET /api/signals/trades-live` — open trade ideas derived from current signal state.
+
+**Grade this on `last_refreshed_at`, not on the row timestamps.** Every row's
+`signal_timestamp` and `opened_at` are the instant the position was *entered*,
+so a position held since the open reads hours old at midday on a perfectly
+healthy engine. The response carries a top-level `last_refreshed_at`: the
+newest mark-to-market write across the open book, which the reconcile loop
+bumps on every open position every cycle. It is `null` when the book is empty
+— an engine holding nothing and a dead engine holding nothing produce the same
+payload, so no claim is made. On v2 this is already what the envelope grades,
+so `freshness.source_timestamp` and `freshness.freshness_status` are correct
+without any special handling.
+
+Unlike `trades-history`, this is a live view: it is graded on the
+`signals_cycle` cadence, so a stopped signal engine reports `stale` rather
+than `static`.
 
 ### Advanced Signals (7, triggered + hysteresis)
 

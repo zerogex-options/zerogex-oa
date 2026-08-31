@@ -836,6 +836,14 @@ async def get_strike_profile_timeseries(
         the cross-expiration aggregate walls (matches
         ``/api/gex/summary``); a specific set yields walls scoped to
         that set's gamma alone;
+      * ``pin_strike`` / ``pin_confidence`` as of the bucket's close,
+        from the representative ``gex_summary`` row.  Unlike the walls
+        and the flip these are NOT scoped by ``expirations``: the pin is
+        0DTE-by-construction and whole-chain by definition, so it reads
+        the same in every expiration scope (matching the live surfaces,
+        where the pin does not move with the Expiry selector).  Both are
+        ``null`` when the bucket has no active pin and on rows written
+        before the pin columns shipped — draw no line, never a zero;
       * every strike's gamma exposure in the same dollar-GEX units
         ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
         evaluated against the bucket's own ``close`` so the surface
