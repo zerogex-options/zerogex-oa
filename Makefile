@@ -3833,6 +3833,13 @@ ingestion-freshness-healthcheck: ## Alert if ANY TradeStation stream stopped wri
 		--max-stale-minutes $(INGEST_FRESHNESS_MAX_STALE_MINUTES) \
 		$(if $(JSON),--json)
 
+.PHONY: freshness-replay
+freshness-replay: ## Replay the freshness check over a session from the DB (DATE=YYYY-MM-DD)
+	@$(PY) -m src.tools.freshness_replay \
+		$(if $(DATE),--date $(DATE)) \
+		$(if $(LEGACY),--legacy-chain-window) \
+		$(if $(JSON),--json)
+
 .PHONY: normalizer-cache-healthcheck-json
 normalizer-cache-healthcheck-json: ## Healthcheck output as JSON (for monitoring scrapers)
 	@$(PY) -m src.tools.normalizer_cache_healthcheck \
