@@ -62,6 +62,26 @@ def _frames_query() -> str:
     return match.group(1)
 
 
+def _echo(text: str) -> str:
+    """A psql ``\\echo`` line, refusing text psql would mis-lex.
+
+    psql parses a meta-command's arguments, so an apostrophe in prose opens a
+    quoted string that never closes: psql prints ``unterminated quoted string``
+    and eats the rest of the line plus the next one.  It cost the tail of this
+    script's own PASS/FAIL legend the first time it ran against production --
+    the guidance an operator reads to interpret the result is exactly the text
+    that must not be silently truncated.  Rephrase rather than escape: this is
+    prose, and "the minute count for the session" reads as well as the
+    possessive.
+    """
+    if "'" in text:
+        raise ValueError(
+            f"psql \\echo cannot carry an apostrophe (it opens a quoted "
+            f"string psql never closes) -- rephrase: {text!r}"
+        )
+    return f"\\echo {text}"
+
+
 def _session_bounds(session_date: date_cls) -> tuple[datetime, datetime]:
     """09:30-16:01 ET as UTC — mirrors the method's own window exactly."""
     start_et = datetime.combine(session_date, time(9, 30), tzinfo=_ET)
@@ -91,14 +111,14 @@ def build_script(symbol: str, session_date: date_cls, band: float, timeout_ms: i
     ).strip()
 
     lines = [
-        f"\\echo === replay frames read: {symbol} {session_date.isoformat()} ===",
-        f"\\echo window {start_utc.isoformat()} .. {end_utc.isoformat()} (band {band})",
+        _echo(f"=== replay frames read: {symbol} {session_date.isoformat()} ==="),
+        _echo(f"window {start_utc.isoformat()} .. {end_utc.isoformat()} (band {band})"),
         f"SET statement_timeout = {timeout_ms};",
         "",
         "\\echo",
-        "\\echo [1/4] How much history does this underlying have here?",
-        "\\echo       session_rows / total_rows is the amplification an unfenced",
-        "\\echo       read pays: it reads total_rows to return session_rows.",
+        _echo("[1/4] How much history does this underlying have here?"),
+        _echo("      session_rows / total_rows is the amplification an unfenced"),
+        _echo("      read pays: it reads total_rows to return session_rows."),
         "SELECT",
         "    (SELECT COUNT(*) FROM gex_by_strike",
         f"      WHERE underlying = '{symbol}') AS total_rows,",
@@ -109,33 +129,33 @@ def build_script(symbol: str, session_date: date_cls, band: float, timeout_ms: i
         "    pg_size_pretty(pg_total_relation_size('gex_by_strike')) AS table_size;",
         "",
         "\\echo",
-        "\\echo [2/4] Planner stats freshness (a stale ANALYZE is how plans flip)",
+        _echo("[2/4] Planner stats freshness (a stale ANALYZE is how plans flip)"),
         "SELECT relname, n_live_tup, n_dead_tup, last_autovacuum, last_autoanalyze",
         "  FROM pg_stat_user_tables WHERE relname IN ('gex_by_strike','gex_summary');",
         "",
         "\\echo",
-        "\\echo [3/4] EXPLAIN ANALYZE — planner free (the plan production usually gets)",
+        _echo("[3/4] EXPLAIN ANALYZE — planner free (the plan production usually gets)"),
         f"EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) {flat};",
         "",
         "\\echo",
-        "\\echo [4/4] EXPLAIN ANALYZE — nested loop DISABLED (the fallback the fence exists for)",
-        "\\echo       THIS IS THE DECISIVE RUN. Unfenced, it reads every row the",
-        "\\echo       underlying has; fenced, it stays a per-minute probe.",
+        _echo("[4/4] EXPLAIN ANALYZE — nested loop DISABLED (the fallback the fence exists for)"),
+        _echo("      THIS IS THE DECISIVE RUN. Unfenced, it reads every row the"),
+        _echo("      underlying has; fenced, it stays a per-minute probe."),
         "SET enable_nestloop = off;",
         f"EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) {flat};",
         "RESET enable_nestloop;",
         "RESET statement_timeout;",
         "",
         "\\echo",
-        "\\echo --- how to read [3] and [4] ---",
-        "\\echo PASS: the gex_by_strike node reads a few hundred rows per loop with",
-        "\\echo       loops ~= the session's minute count (~390), under a Nested Loop",
-        "\\echo       Left Join. Both runs look like this once the fence is in.",
-        "\\echo FAIL: the gex_by_strike node shows loops=1 and rows in the millions",
-        "\\echo       (matching total_rows from [1]) under a Hash/Merge Join. That is",
-        "\\echo       the unfenced read, and it is what times out at 30s.",
-        "\\echo NOTE: [4] failing while [3] passes is still a FAIL — it means the",
-        "\\echo       read is one planner mood away from the timeout.",
+        _echo("--- how to read [3] and [4] ---"),
+        _echo("PASS: the gex_by_strike node reads a few hundred rows per loop with"),
+        _echo("      loops ~= the minute count for the session (~390), under a"),
+        _echo("      Nested Loop Left Join. Both runs look like this once fenced."),
+        _echo("FAIL: the gex_by_strike node shows loops=1 and rows in the millions"),
+        _echo("      (matching total_rows from [1]) under a Hash/Merge Join. That is"),
+        _echo("      the unfenced read, and it is what times out at 30s."),
+        _echo("NOTE: [4] failing while [3] passes is still a FAIL — it means the"),
+        _echo("      read is one planner mood away from the timeout."),
     ]
     return "\n".join(lines) + "\n"
 
