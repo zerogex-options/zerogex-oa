@@ -385,7 +385,7 @@ class TestTrailingSigmas:
 
         assert norm == "trailing"
         assert lean_sigma != stab_sigma
-        assert lean_sigma == pytest.approx(5.0 * math.sqrt(math.pi / 2))
+        assert lean_sigma == pytest.approx(5.0 * 1.4826)
 
 
 # --------------------------------------------------------------------------- #

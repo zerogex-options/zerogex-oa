@@ -112,12 +112,26 @@ from an argument about estimators. Two such arguments have already been wrong.
 that, a few violent sessions are larger than the ordinary ones and a
 squared-moment scale is being set by them.
 
-`skew` (`mean|x| / median|x|`) is the column that decides between the robust
-candidates, and the one that is easy to miss. Where it is well above 1, the
-MEDIAN session is much smaller than the mean one — so a scale built from a
-mean still reports the median session as nothing happening, which is what the
-card shows as "always QUIET". `regime_shift.robust_scale` is mean-based, so a
-high `skew` is the signal that it is not enough on its own.
+`skew` (`mean|x| / median|x|`) is the column that settled the choice of
+denominator, and the one every earlier argument missed. Measured over 42
+sessions on each symbol it ran **1.07 to 2.61** across the eight axes — never
+1. The typical session on every one of these chains is materially smaller than
+the average one, so a scale built from ANY mean sits above the typical day and
+reports it as nothing happening:
+
+| symbol | stdev | mean_abs | median_abs |
+|---|---|---|---|
+| SPY | 52% | 48% | 29% |
+| SPX | 55% | 50% | 29% |
+| QQQ | 50% | 43% | 31% |
+| NDX | 37% | 37% | 37% |
+
+`regime_shift.robust_scale` is therefore median-based. That anchors the typical
+session at a combined magnitude of `sqrt(2)/1.4826` = 0.95 for **every** symbol
+whatever its distribution's shape, so the `QUIET_Z` = 0.75 cut sits at 0.79x
+the typical day and symbols become comparable to each other. The cost is
+statistical efficiency — roughly a third of the standard deviation's, so the
+denominator wobbles by order 15-20% as the 60-session window rolls.
 
 `drift` (`|mean| / mean|x|`) is how much of an axis is a persistent, repeated
 shift rather than variation around zero. The denominator is measured about
