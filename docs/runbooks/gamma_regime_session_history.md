@@ -99,21 +99,34 @@ if it is absent, `make regime-session-refresh-install`.
 be soft — run the backfill. On `trailing`, check the chain's tail weight before
 concluding the market was quiet:
 
-```sql
-SELECT underlying,
-       COUNT(*) FILTER (WHERE state = 'QUIET')::float / COUNT(*) AS quiet_rate,
-       STDDEV_POP(lean_raw) / AVG(ABS(lean_raw))                 AS tail_weight
-FROM gex_regime_session
-GROUP BY underlying
-ORDER BY tail_weight DESC;
+```bash
+make regime-scale-report          # read-only; add SYMBOLS="SPY SPX" to narrow
 ```
 
-`tail_weight` is `sqrt(pi/2)` = **1.2533** for any Gaussian-shaped chain. Well
-above that means a few violent sessions are much larger than the ordinary ones.
-The z-score denominator (`regime_shift.robust_scale`) is built from the first
-absolute moment precisely so that stops setting the scale, so a reading up to
-~1.5 is handled; far beyond it, the chain's shifts are heavy-tailed enough to
-be worth looking at directly rather than trusting the summary.
+It reports, per symbol and per axis, the shape of the stored shift
+distribution and the QUIET rate each candidate z-score denominator would have
+produced over that history — so the cut is chosen from measurement rather than
+from an argument about estimators. Two such arguments have already been wrong.
+
+`sd/mean|x|` is `sqrt(pi/2)` = **1.2533** for any Gaussian-shaped chain; above
+that, a few violent sessions are larger than the ordinary ones and a
+squared-moment scale is being set by them.
+
+`skew` (`mean|x| / median|x|`) is the column that decides between the robust
+candidates, and the one that is easy to miss. Where it is well above 1, the
+MEDIAN session is much smaller than the mean one — so a scale built from a
+mean still reports the median session as nothing happening, which is what the
+card shows as "always QUIET". `regime_shift.robust_scale` is mean-based, so a
+high `skew` is the signal that it is not enough on its own.
+
+`drift` (`|mean| / mean|x|`) is how much of an axis is a persistent, repeated
+shift rather than variation around zero. The denominator is measured about
+zero, so a high-drift axis is charged for that drift: its typical day becomes
+its own yardstick. That is deliberate — a chain that sheds gamma every session
+IS deteriorating every session, and the state's SIGN comes from the raw score,
+so mean-centring would report a below-average shedding day as FIRMING — but it
+does push a high-drift symbol toward QUIET, and it is worth knowing which
+effect you are looking at before changing anything.
 
 `quiet_rate` should land near **25%** — the fraction of a bivariate normal
 inside the `QUIET_Z` = 0.75 ring. A symbol far above that whose `tail_weight`

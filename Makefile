@@ -4035,6 +4035,17 @@ regime-session-refresh-install: ## Install the 15-min Gamma Regime session refre
 	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-regime-session-refresh.service$(NC)"
 	@echo "$(YELLOW)Backfill:    make regime-session-backfill$(NC)"
 
+# Which z-score denominator the QUIET cut should use, measured rather than
+# argued.  Read-only: it reports the shape of each symbol's stored shift
+# distribution and the QUIET rate each candidate scale would have produced.
+# `quiet%` should land near 25%; SPY against SPX is the cross-check that
+# settles a disagreement, since they track the same index.
+.PHONY: regime-scale-report
+regime-scale-report: ## Compare candidate z-score denominators against the stored regime history (read-only)
+	@$(PY) -m src.tools.regime_scale_report \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(REGIME_SCALE_JSON),--json $(REGIME_SCALE_JSON))
+
 .PHONY: regime-session-refresh-status
 regime-session-refresh-status: ## Show Gamma Regime session refresh timer status + last/next fire + recent log
 	@echo "$(BLUE)=== Gamma Regime Session Refresh Timer ===$(NC)"
