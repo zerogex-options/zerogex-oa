@@ -118,3 +118,23 @@ def test_default_paths_span_the_shapes_that_can_break():
 def test_version_is_parameterised_not_hardcoded():
     assert all(p.startswith("/api/v3/") for p in ec.default_paths("3", "QQQ"))
     assert any("QQQ" in p for p in ec.default_paths("3", "QQQ"))
+
+
+def test_the_sample_covers_every_cadence_profile():
+    """A profile with no representative here is a window the smoke check
+    cannot see, and every one of the false-stale bugs was a window bug. The
+    option-chain profile shipped with no sampled endpoint, so the tool ran
+    green through the whole 9h15m/day it was wrong; the tape had none either,
+    so the post-close contrast that makes such a bug obvious — chains closed,
+    tape still fresh — could not appear on the board.
+    """
+    from src.api import freshness as fr
+    from src.tools.v2_envelope_check import default_paths
+
+    sampled = set()
+    for raw in default_paths("2", "SPY"):
+        v1 = raw.split("?")[0].replace("/api/v2", "/api", 1)
+        sampled.add(fr.resolve_profile(v1).name)
+
+    missing = sorted(set(fr.CADENCE_PROFILES) - sampled)
+    assert not missing, f"cadence profiles with no sampled endpoint: {missing}"

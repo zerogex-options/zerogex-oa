@@ -106,25 +106,35 @@ def check_body(body: Any, *, fields: frozenset[str]) -> tuple[bool, str]:
 def default_paths(version: str, symbol: str) -> list[str]:
     """A spread across cadence profiles and response shapes.
 
-    One from each of: on-demand, the analytics snapshot, the consolidated
-    contract with a path parameter, a JSONResponse-returning route, and a
-    route with no response_model (the class where the encoder divergence
-    lived).
+    Two things are being spread across, and both matter.
 
-    ``option/quote`` is here for the cadence profile rather than the response
-    shape: it is the only sampled endpoint on the option-chain window
-    (09:30-16:15 ET), so it is the only one whose ``freshness_status`` differs
-    from the rest between 16:15 and 20:00. Without it the sample covered every
-    profile but that one.
+    **Response shapes** — the class where the v1/v2 encoder divergence lived:
+    a route with no response_model, a JSONResponse-returning route, and the
+    consolidated contract with a path parameter.
+
+    **Cadence profiles** — one endpoint per profile, which is the property
+    ``test_the_sample_covers_every_cadence_profile`` enforces. This is not
+    decoration: each profile keeps a different feed window, so the same clock
+    produces different verdicts across this list, and a run is only meaningful
+    if every window is represented. After 16:15 ET a correct board shows
+    ``option/quote`` and ``flow/series`` closed while ``market/quote`` and the
+    analytics pair are still fresh — the contrast is the check. The sample
+    previously carried two analytics endpoints and no tape endpoint, so that
+    contrast was invisible and the option-chain window had no representative
+    at all.
     """
     v = f"/api/v{version}"
     return [
-        f"{v}/health",
-        f"{v}/gex/summary?symbol={symbol}",
-        f"{v}/levels/{symbol}",
-        f"{v}/flow/series?symbol={symbol}",
-        f"{v}/signals/score?underlying={symbol}",
-        f"{v}/option/quote?underlying={symbol}&type=C",
+        f"{v}/health",  # on_demand
+        f"{v}/market/quote?symbol={symbol}",  # realtime_quote (04:00-20:00)
+        f"{v}/option/quote?underlying={symbol}&type=C",  # option_chain (09:30-16:15)
+        f"{v}/market/volatility?ticker=VIX",  # volatility_bar (5-min bars)
+        f"{v}/gex/summary?symbol={symbol}",  # analytics_cycle
+        f"{v}/levels/{symbol}",  # analytics_cycle, via a path parameter
+        f"{v}/flow/series?symbol={symbol}",  # flow_aggregate (09:30-16:00)
+        f"{v}/signals/score?underlying={symbol}",  # signals_cycle
+        f"{v}/market/session-closes?symbol={symbol}",  # daily_cycle
+        f"{v}/signals/trades-history?limit=5",  # historical -> static
     ]
 
 
