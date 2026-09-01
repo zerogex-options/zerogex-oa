@@ -25,6 +25,8 @@ import pytest
 
 from src.analytics import regime_shift as rs
 
+QUIET_CUT = rs.QUIET_Z
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -460,75 +462,81 @@ class TestNormalization:
         right, or fixing one chain would move every other one."""
         rng = random.Random(7)
         sample = [rng.gauss(0, 1) for _ in range(4000)]
-        assert rs.robust_scale(sample) == pytest.approx(rs.stdev(sample), rel=0.02)
+        assert rs.robust_scale(sample) == pytest.approx(rs.stdev(sample), rel=0.05)
+        assert rs.mean_abs_scale(sample) == pytest.approx(rs.stdev(sample), rel=0.05)
 
     def test_robust_scale_is_measured_about_zero_not_about_the_mean(self):
         """The numerator is the RAW score, never ``raw - mean``, so the
         denominator has to describe spread about the same origin.
 
-        It is also the right null on its own terms: a chain that sheds gamma
-        every session IS deteriorating every session, and a mean-centred
-        denominator would define that away as normal-for-this-symbol and
-        report QUIET straight through it.
+        It is also the right null on its own terms: the STATE's sign comes
+        from the raw score, so a mean-centred read would call a below-average
+        shedding day FIRMING — support building on a day it eroded.
         """
         drifting = [10.0, 10.2, 9.8, 10.1, 9.9, 10.0, 10.1, 9.9, 10.0, 10.0]
 
         # About the mean this is a near-constant series with no dispersion;
         # about zero it is a real, steady, repeated shift.
         assert rs.stdev(drifting) < 0.3
-        assert rs.robust_scale(drifting) == pytest.approx(
-            10.0 * math.sqrt(math.pi / 2), rel=0.02
-        )
-        # So a typical day reads as typical rather than as a 30-sigma event.
+        assert rs.robust_scale(drifting) == pytest.approx(10.0 * 1.4826, rel=0.02)
+        # So a typical day reads as typical rather than as a 70-sigma event.
         assert abs(rs.zscore(10.0, rs.robust_scale(drifting))) == pytest.approx(
-            0.8, abs=0.05
+            0.67, abs=0.02
         )
 
-    def test_a_heavy_tail_stops_setting_the_scale_for_the_ordinary_days(self):
-        """The regression this exists for, reproduced at the shape it was
-        measured at in production.
+    def test_the_median_session_lands_in_the_same_place_for_every_chain(self):
+        """The property that makes symbols comparable, and the one neither
+        mean-based estimator could deliver.
 
-        SPY and SPX track the SAME index, so their reads should mostly agree.
-        Over one 42-session window they did not: the standard deviation put
-        48% of SPX's sessions in QUIET against 17% of SPY's, because SPX's
-        denominator was set by its tail rather than by its ordinary days.
-
-        Two chains below, same typical shift, differing only in tail weight.
-        The standard deviation splits their QUIET rates the way production
-        split SPY from SPX; the robust scale brings them back together.
+        A z-score is only meaningful across symbols if a typical session on
+        one chain scores what a typical session on another does. Anchoring on
+        the median gives that BY CONSTRUCTION, whatever shape the rest of the
+        distribution has.
         """
-        rng = random.Random(11)
-        gaussian = [rng.gauss(0, 1) for _ in range(60)]
-        heavy = [
-            rng.gauss(0, 1) * (9.0 if rng.random() < 0.08 else 1.0) for _ in range(60)
+        rng = random.Random(19)
+        chains = {
+            "gaussian": [rng.gauss(0, 1) for _ in range(60)],
+            "heavy": [
+                rng.gauss(0, 1) * (9.0 if rng.random() < 0.10 else 1.0)
+                for _ in range(60)
+            ],
+            "drifting": [4.0 + rng.gauss(0, 1) for _ in range(60)],
+        }
+        for name, chain in chains.items():
+            median = sorted(abs(v) for v in chain)[len(chain) // 2]
+            z = abs(rs.zscore(median, rs.robust_scale(chain)))
+            assert z == pytest.approx(1 / 1.4826, abs=0.03), name
+
+    def test_a_mean_based_scale_puts_the_cut_at_or_above_the_typical_day(self):
+        """Why half of every symbol's stored history came out QUIET.
+
+        Measured over 42 sessions on each of SPY, SPX, QQQ and NDX, the ratio
+        ``mean|x| / median|x|`` ran 1.07 to 2.61 — never 1. So a scale built
+        from a mean sits ABOVE the typical session, the typical session's
+        combined magnitude falls at or under QUIET_Z, and the cut swallows
+        half the distribution.
+        """
+        rng = random.Random(23)
+        chain = [
+            rng.gauss(0, 1) * (6.0 if rng.random() < 0.08 else 1.0) for _ in range(4000)
         ]
+        magnitudes = sorted(abs(v) for v in chain)
+        median = magnitudes[len(magnitudes) // 2]
+        mean = sum(magnitudes) / len(magnitudes)
 
-        def quiet_rate(chain, estimator):
-            sigma = estimator(chain)
-            pairs = list(zip(chain[::2], chain[1::2]))
-            quiet = sum(
-                1
-                for lean, stab in pairs
-                if rs.classify(
-                    rs.zscore(lean, sigma), rs.zscore(stab, sigma)
-                ).state
-                == "QUIET"
-            )
-            return quiet / len(pairs)
+        # Squarely inside the 1.07-2.61 band the eight production axes showed.
+        assert mean / median == pytest.approx(1.54, abs=0.05)
 
-        # Both chains have a comparable ordinary session...
-        assert sorted(abs(v) for v in heavy)[30] == pytest.approx(
-            sorted(abs(v) for v in gaussian)[30], rel=0.45
+        def combined(scale):
+            z = rs.zscore(median, scale)
+            return math.hypot(z, z)
+
+        assert combined(rs.mean_abs_scale(chain)) < QUIET_CUT
+        assert combined(rs.robust_scale(chain)) > QUIET_CUT
+        # The median session lands in the same place whatever the shape.
+        assert combined(rs.robust_scale(chain)) == pytest.approx(
+            math.sqrt(2) / 1.4826, abs=0.02
         )
-
-        # ...but the standard deviation calls one of them quiet twice as often.
-        assert quiet_rate(heavy, rs.stdev) > 2 * quiet_rate(gaussian, rs.stdev)
-        # The robust scale keeps two comparable chains comparable.
-        assert quiet_rate(heavy, rs.robust_scale) < 1.7 * quiet_rate(
-            gaussian, rs.robust_scale
-        )
-        # And it only ever moves a read OUT of QUIET, never into it.
-        assert quiet_rate(heavy, rs.robust_scale) < quiet_rate(heavy, rs.stdev)
 
     def test_robust_scale_has_no_scale_only_when_nothing_moved(self):
         """Zero would make the next real move's z infinite, so the caller is
@@ -539,13 +547,11 @@ class TestNormalization:
         # A CONSTANT series is not degenerate here, unlike for stdev:
         # measured about zero it has a perfectly good scale.
         assert rs.stdev([5.0, 5.0, 5.0]) is None
-        assert rs.robust_scale([5.0, 5.0, 5.0]) == pytest.approx(
-            5.0 * math.sqrt(math.pi / 2)
-        )
+        assert rs.robust_scale([5.0, 5.0, 5.0]) == pytest.approx(5.0 * 1.4826)
 
     def test_robust_scale_ignores_non_finite_values(self):
         assert rs.robust_scale([2.0, 4.0, float("nan"), float("inf")]) == pytest.approx(
-            3.0 * math.sqrt(math.pi / 2)
+            3.0 * 1.4826
         )
 
     def test_percentile_of(self):

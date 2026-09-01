@@ -56,38 +56,20 @@ from src.tools.regime_session_refresh import default_symbols
 
 logger = logging.getLogger(__name__)
 
-#: Rescales a median absolute value onto the standard deviation's scale.
-#: 1/0.6745 — for a normal, the median |x| is 0.6745 sigma.
-_MEDIAN_TO_SIGMA = 1.4826
-
-
-def median_abs_scale(values: Sequence[float]) -> Optional[float]:
-    """Median absolute value, rescaled to the standard deviation's scale.
-
-    The fully robust candidate: unlike a mean, a median is unmoved by how
-    large the largest sessions are, so a right-skewed magnitude distribution
-    cannot pull the yardstick above its own typical day.  Costs statistical
-    efficiency (~37% against the standard deviation's 100%), which on a
-    60-session window is a denominator that wobbles as the window rolls.
-    """
-    finite = [abs(v) for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
-    if len(finite) < 2:
-        return None
-    finite.sort()
-    mid = len(finite) // 2
-    med = finite[mid] if len(finite) % 2 else (finite[mid - 1] + finite[mid]) / 2
-    scale = med * _MEDIAN_TO_SIGMA
-    return scale if scale > 0 else None
-
-
-#: The candidates, in the order they were tried.  ``stdev`` is what shipped
-#: originally, ``mean_abs`` is what ships now, ``median_abs`` is the option
-#: rejected on efficiency grounds before any of this was measured.
+#: The candidates, in the order they were tried.  ``stdev`` shipped first,
+#: ``mean_abs`` replaced it, and ``median_abs`` — rejected on efficiency
+#: grounds before any of this was measured — is what ``robust_scale`` now
+#: delegates to.  All three stay gradeable so the choice can be re-checked
+#: against a longer history rather than trusted from a commit message.
 CANDIDATES: Dict[str, Callable[[Sequence[float]], Optional[float]]] = {
     "stdev": rs.stdev,
-    "mean_abs": rs.robust_scale,
-    "median_abs": median_abs_scale,
+    "mean_abs": rs.mean_abs_scale,
+    "median_abs": rs.median_abs_scale,
 }
+
+#: Which candidate the product actually uses, marked in the output so the
+#: report never quietly diverges from what ships.
+IN_USE = "median_abs"
 
 
 def _f(value: Any) -> Optional[float]:
@@ -109,7 +91,11 @@ def describe(values: Sequence[float]) -> Dict[str, Any]:
     mean = sum(finite) / n
     sd = rs.stdev(finite) or 0.0
     mean_abs = sum(abs(v) for v in finite) / n
-    med_abs = (median_abs_scale(finite) or 0.0) / _MEDIAN_TO_SIGMA
+    magnitudes = sorted(abs(v) for v in finite)
+    mid = n // 2
+    med_abs = (
+        magnitudes[mid] if n % 2 else (magnitudes[mid - 1] + magnitudes[mid]) / 2
+    )
     return {
         "n": n,
         "mean": mean,
@@ -210,9 +196,11 @@ def render(data: Dict[str, Any]) -> str:
                 f"{(s['drift_share'] or 0):>8.2f}"
             )
     lines.append("")
-    lines.append("QUIET rate by candidate denominator  (target ~25%)")
+    lines.append("QUIET rate by candidate denominator  (target ~25%; * = in use)")
     lines.append("")
-    header = f"{'symbol':<8}" + "".join(f"{name:>12}" for name in CANDIDATES)
+    header = f"{'symbol':<8}" + "".join(
+        f"{name + (' *' if name == IN_USE else ''):>14}" for name in CANDIDATES
+    )
     lines.append(header)
     lines.append("-" * len(header))
     for symbol, d in data.items():
@@ -221,7 +209,7 @@ def render(data: Dict[str, Any]) -> str:
         row = f"{symbol:<8}"
         for name in CANDIDATES:
             rate = d["candidates"][name]["quiet_rate"]
-            row += f"{'--':>12}" if rate is None else f"{rate * 100:>11.0f}%"
+            row += f"{'--':>14}" if rate is None else f"{rate * 100:>13.0f}%"
         lines.append(row)
     lines.append("")
     lines.append("State mix by candidate")

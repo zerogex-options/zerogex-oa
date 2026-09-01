@@ -854,60 +854,93 @@ def horizon_factor(hours: float) -> float:
 
 
 #: Rescales a mean absolute value onto the standard deviation's scale.
-#: ``sqrt(pi/2)`` is the exact ratio for a zero-mean normal, so
-#: :func:`robust_scale` and :func:`stdev` agree on Gaussian data and diverge
-#: only by however heavy the real tail is — which makes their ratio a direct
-#: readout of a chain's tail weight (see :func:`robust_scale`).
-_MAD_TO_SIGMA = math.sqrt(math.pi / 2)
+#: ``sqrt(pi/2)`` is the exact ratio for a zero-mean normal.
+_MEAN_ABS_TO_SIGMA = math.sqrt(math.pi / 2)
+
+#: Rescales a median absolute value onto the same scale.  ``1/0.6745`` — for a
+#: zero-mean normal the median |x| is 0.6745 sigma.
+_MEDIAN_ABS_TO_SIGMA = 1.4826
+
+
+def mean_abs_scale(values: Sequence[float]) -> Optional[float]:
+    """First absolute moment about zero, on the standard deviation's scale.
+
+    Resists a heavy TAIL — one enormous session no longer counts for
+    twenty-five ordinary ones — but not a right-skewed MAGNITUDE, because a
+    mean is still a mean. Kept as a named estimator so
+    :mod:`src.tools.regime_scale_report` can grade it against the others
+    rather than the comparison living only in a commit message.
+    """
+    finite = _finite(values)
+    if len(finite) < 2:
+        return None
+    scale = (sum(abs(v) for v in finite) / len(finite)) * _MEAN_ABS_TO_SIGMA
+    return scale if scale > 0 else None
+
+
+def median_abs_scale(values: Sequence[float]) -> Optional[float]:
+    """Median absolute value about zero, on the standard deviation's scale."""
+    finite = sorted(abs(v) for v in _finite(values))
+    if len(finite) < 2:
+        return None
+    mid = len(finite) // 2
+    median = finite[mid] if len(finite) % 2 else (finite[mid - 1] + finite[mid]) / 2
+    scale = median * _MEDIAN_ABS_TO_SIGMA
+    return scale if scale > 0 else None
 
 
 def robust_scale(values: Sequence[float]) -> Optional[float]:
-    """Typical magnitude of a session's shift, on the standard deviation's
-    scale — the z-score denominator.
+    """Typical magnitude of a session's shift — the z-score denominator.
 
-    Two departures from :func:`stdev`, and the second is the one that matters.
-
-    **Measured about zero, not about the mean.** The numerator these divide
-    is the RAW score, never ``raw - mean``, so the denominator has to describe
+    Measured about ZERO, not about the mean. The numerator these divide is
+    the RAW score, never ``raw - mean``, so the denominator has to describe
     spread about the same origin or the ratio is not a z at all. Zero is also
-    the right null on its own terms: a chain that sheds gamma every single
-    session IS deteriorating every session, and centring on the mean would
-    define that away as "normal for this symbol" and report QUIET straight
-    through it.
+    the right null on its own terms: the STATE's sign comes from the raw
+    score, so a mean-centred read would call a below-average shedding day
+    FIRMING — telling a trader support was building on a day it eroded, which
+    is worse than any magnitude error.
 
-    **Built from the first absolute moment, not the second.** Squaring gives
-    one 5-sigma session as much pull on the denominator as twenty-five
-    ordinary ones. Where the shift distribution is heavy-tailed that inflates
-    the denominator until an ordinary day cannot clear :data:`QUIET_Z`, and
-    the card reports "no meaningful repositioning" on a book that moved.
+    Built from the MEDIAN absolute value rather than the mean or the standard
+    deviation. Three estimators were measured against 42 stored sessions on
+    each of SPY, SPX, QQQ and NDX (``make regime-scale-report``), and the
+    resulting QUIET rates were:
 
-    That failure is measurable without reference to any threshold, because
-    SPY and SPX track the SAME index and should therefore mostly agree. Over
-    one 42-session window they did not: 17% of SPY's sessions read QUIET
-    against 48% of SPX's. The giveaway is ``stdev / mean|shift|``, which is
-    ``sqrt(pi/2)`` = 1.2533 for anything Gaussian and came out at 1.30 for
-    SPY, 1.27 for QQQ, 1.39 for NDX — and 1.90 for SPX. Only SPX's
-    denominator was set by its tail, and only SPX called quiet a market the
-    other three called active.
+        symbol   stdev   mean_abs   median_abs      (target ~25%)
+        SPY       52%       48%        29%
+        SPX       55%       50%        29%
+        QQQ       50%       43%        31%
+        NDX       37%       37%        37%
 
-    This moderates the tail's influence rather than removing it: one enormous
-    session still lifts a mean. The fully robust choice — a median absolute
-    value — would resist it outright, but at 37% statistical efficiency
-    against this estimator's 88% it is too noisy on the 10-60 session windows
-    this runs against, and would trade a bias that is fixed here for a
-    variance nobody asked for. The measured effect of the estimator actually
-    chosen is a ~34% smaller denominator for SPX against 3% for SPY and 1%
-    for QQQ: it corrects the chain that was wrong and leaves alone the ones
-    that were not.
+    The reason is one statistic nobody had looked at: ``mean|x| / median|x|``
+    ran 1.07 to 2.61 across those eight axes — never 1. The typical session on
+    every one of these chains is materially smaller than the average session,
+    so a scale built from ANY mean sits above the typical day and reports it as
+    nothing happening. Both mean-based estimators put the median session at a
+    combined magnitude of 0.43-0.81 against a :data:`QUIET_Z` of 0.75 — the cut
+    landed at or above the median, which is precisely how half of every
+    symbol's history came out QUIET.
 
-    Returns ``None`` only when every value is zero — there is no scale to be
-    had then, and zero would make the next real move's z infinite.
+    A median anchors it by construction: the median session lands at
+    ``sqrt(2) / 1.4826`` = 0.95 for EVERY symbol, whatever its distribution's
+    shape, so the cut sits at 0.79x the typical day and symbols become
+    comparable to each other — which is the entire point of a z-score and the
+    thing the two mean-based scales could not deliver.
+
+    The cost is statistical efficiency: roughly a third of the standard
+    deviation's, so on a 60-session window the denominator wobbles by order
+    15-20% as the window rolls. That is the right trade. A denominator that
+    is noisy moves a read between "barely" and "modestly"; one that is biased
+    moves it to "nothing happened", and the reader stops looking.
+
+    Returns ``None`` only when at least half the sessions are exactly zero —
+    there is no scale to be had then, and zero would make the next real move's
+    z infinite.
     """
-    finite = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
-    if len(finite) < 2:
-        return None
-    scale = (sum(abs(v) for v in finite) / len(finite)) * _MAD_TO_SIGMA
-    return scale if scale > 0 else None
+    return median_abs_scale(values)
+
+
+def _finite(values: Sequence[float]) -> list[float]:
+    return [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
 
 
 def stdev(values: Sequence[float]) -> Optional[float]:
@@ -919,8 +952,8 @@ def stdev(values: Sequence[float]) -> Optional[float]:
 
     NOT the z-score denominator — :func:`robust_scale` is, for the reasons
     documented there.  Kept because "how disperse is this series" is still a
-    question worth being able to ask directly, and because the two together
-    are what measure a chain's tail weight.
+    question worth being able to ask directly, and because ``stdev`` against
+    :func:`mean_abs_scale` is what measures a chain's tail weight.
     """
     finite = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
     if len(finite) < 2:

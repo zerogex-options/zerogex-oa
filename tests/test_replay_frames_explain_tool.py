@@ -97,3 +97,27 @@ def test_amplification_query_compares_session_rows_to_total_rows():
 def test_bad_date_is_rejected_rather_than_silently_probing_nothing():
     with pytest.raises(SystemExit):
         main(["--symbol", "NDX", "--date", "07/24/2026"])
+
+
+def test_no_echo_line_can_be_mislexed_by_psql():
+    """Regression: an apostrophe in \\echo prose truncates the legend.
+
+    psql parses meta-command arguments, so ``session's`` opens a quoted string
+    that never closes. The first production run printed ``unterminated quoted
+    string`` and swallowed the rest of that line plus the next -- two lines of
+    the PASS/FAIL legend, i.e. exactly the text an operator needs in order to
+    read the plan. The output still looked broadly fine, which is what makes it
+    worth a test rather than a careful eye.
+    """
+    for line in _script().splitlines():
+        if line.startswith("\\echo"):
+            assert "'" not in line, f"psql will mis-lex this \\echo line: {line!r}"
+
+
+def test_echo_helper_rejects_an_apostrophe_at_the_source():
+    """The guard lives at the point of authorship, not just in this test."""
+    from src.tools.replay_frames_explain import _echo
+
+    assert _echo("no quotes here") == "\\echo no quotes here"
+    with pytest.raises(ValueError, match="apostrophe"):
+        _echo("the session's minute count")
