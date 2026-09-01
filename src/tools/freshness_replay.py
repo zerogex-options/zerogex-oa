@@ -303,8 +303,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     now_et = datetime.now(ET)
     if now_et.date() == day:
         logger.info(
-            "Day still in progress — graded through %s only; "
-            "re-run after 20:00 ET for the whole day.",
+            "Day still in progress — graded through %s; later ticks have not "
+            "happened yet, so a clean result covers only the elapsed part.",
             now_et.strftime("%H:%M ET"),
         )
     logger.info("Ticks graded per stream (0 = never checked all day — a blind spot, not a pass):")
