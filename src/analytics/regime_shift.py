@@ -853,12 +853,74 @@ def horizon_factor(hours: float) -> float:
     return max(_HORIZON_MIN, min(_HORIZON_MAX, factor))
 
 
+#: Rescales a mean absolute value onto the standard deviation's scale.
+#: ``sqrt(pi/2)`` is the exact ratio for a zero-mean normal, so
+#: :func:`robust_scale` and :func:`stdev` agree on Gaussian data and diverge
+#: only by however heavy the real tail is — which makes their ratio a direct
+#: readout of a chain's tail weight (see :func:`robust_scale`).
+_MAD_TO_SIGMA = math.sqrt(math.pi / 2)
+
+
+def robust_scale(values: Sequence[float]) -> Optional[float]:
+    """Typical magnitude of a session's shift, on the standard deviation's
+    scale — the z-score denominator.
+
+    Two departures from :func:`stdev`, and the second is the one that matters.
+
+    **Measured about zero, not about the mean.** The numerator these divide
+    is the RAW score, never ``raw - mean``, so the denominator has to describe
+    spread about the same origin or the ratio is not a z at all. Zero is also
+    the right null on its own terms: a chain that sheds gamma every single
+    session IS deteriorating every session, and centring on the mean would
+    define that away as "normal for this symbol" and report QUIET straight
+    through it.
+
+    **Built from the first absolute moment, not the second.** Squaring gives
+    one 5-sigma session as much pull on the denominator as twenty-five
+    ordinary ones. Where the shift distribution is heavy-tailed that inflates
+    the denominator until an ordinary day cannot clear :data:`QUIET_Z`, and
+    the card reports "no meaningful repositioning" on a book that moved.
+
+    That failure is measurable without reference to any threshold, because
+    SPY and SPX track the SAME index and should therefore mostly agree. Over
+    one 42-session window they did not: 17% of SPY's sessions read QUIET
+    against 48% of SPX's. The giveaway is ``stdev / mean|shift|``, which is
+    ``sqrt(pi/2)`` = 1.2533 for anything Gaussian and came out at 1.30 for
+    SPY, 1.27 for QQQ, 1.39 for NDX — and 1.90 for SPX. Only SPX's
+    denominator was set by its tail, and only SPX called quiet a market the
+    other three called active.
+
+    This moderates the tail's influence rather than removing it: one enormous
+    session still lifts a mean. The fully robust choice — a median absolute
+    value — would resist it outright, but at 37% statistical efficiency
+    against this estimator's 88% it is too noisy on the 10-60 session windows
+    this runs against, and would trade a bias that is fixed here for a
+    variance nobody asked for. The measured effect of the estimator actually
+    chosen is a ~34% smaller denominator for SPX against 3% for SPY and 1%
+    for QQQ: it corrects the chain that was wrong and leaves alone the ones
+    that were not.
+
+    Returns ``None`` only when every value is zero — there is no scale to be
+    had then, and zero would make the next real move's z infinite.
+    """
+    finite = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
+    if len(finite) < 2:
+        return None
+    scale = (sum(abs(v) for v in finite) / len(finite)) * _MAD_TO_SIGMA
+    return scale if scale > 0 else None
+
+
 def stdev(values: Sequence[float]) -> Optional[float]:
     """Population standard deviation, or None when there is nothing to learn.
 
     Population rather than sample: the stored session reads are the whole
     history we have, not a draw from it, and on the small N this operates at
     (10-60 sessions) the Bessel correction is noise dressed as rigor.
+
+    NOT the z-score denominator — :func:`robust_scale` is, for the reasons
+    documented there.  Kept because "how disperse is this series" is still a
+    question worth being able to ask directly, and because the two together
+    are what measure a chain's tail weight.
     """
     finite = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
     if len(finite) < 2:

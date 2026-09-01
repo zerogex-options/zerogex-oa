@@ -96,8 +96,31 @@ if it is absent, `make regime-session-refresh-install`.
 
 **The strip fills but every session reads QUIET.** Check
 `read.normalization`. On `proxy` with a handful of sessions this is expected to
-be soft — run the backfill. On `trailing` it means the sigma window genuinely
-contains bigger days than today.
+be soft — run the backfill. On `trailing`, check the chain's tail weight before
+concluding the market was quiet:
+
+```sql
+SELECT underlying,
+       COUNT(*) FILTER (WHERE state = 'QUIET')::float / COUNT(*) AS quiet_rate,
+       STDDEV_POP(lean_raw) / AVG(ABS(lean_raw))                 AS tail_weight
+FROM gex_regime_session
+GROUP BY underlying
+ORDER BY tail_weight DESC;
+```
+
+`tail_weight` is `sqrt(pi/2)` = **1.2533** for any Gaussian-shaped chain. Well
+above that means a few violent sessions are much larger than the ordinary ones.
+The z-score denominator (`regime_shift.robust_scale`) is built from the first
+absolute moment precisely so that stops setting the scale, so a reading up to
+~1.5 is handled; far beyond it, the chain's shifts are heavy-tailed enough to
+be worth looking at directly rather than trusting the summary.
+
+`quiet_rate` should land near **25%** — the fraction of a bivariate normal
+inside the `QUIET_Z` = 0.75 ring. A symbol far above that whose `tail_weight`
+is normal is a genuine market observation. A symbol far above it WITH a high
+`tail_weight` is a measurement artifact, and the cross-check that settles it is
+SPY against SPX: they track the same index, so a large gap between their
+`quiet_rate`s is the read miscalibrated, not the market.
 
 **A single session is missing from the middle of the strip.** That day had no
 usable snapshot pair (a market holiday, or an ingestion outage). The refresh
