@@ -24,7 +24,7 @@ from .errors import handle_api_errors
 from .futures_middleware import FuturesProjectionMiddleware
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
 from .ratelimit import rate_limit
-from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
+from .scopes import FLOW, GEX, MARKET_RAW, MARKET_REFERENCE, MAXPAIN, SIGNALS, TECHNICALS
 from .security import api_key_auth, key_store, require_scopes
 from .usage import usage_meter
 from .quote_broadcaster import QuoteBroadcaster, set_broadcaster
@@ -476,14 +476,20 @@ app.add_middleware(RequestIdMiddleware)
 # scope (see scopes.py for the taxonomy and tier bundles). Wiring these
 # onto the routes below is a no-op until keys are backfilled with scopes
 # AND API_SCOPE_ENFORCEMENT=1 (see security.require_scopes); a key with
-# the wildcard "*" scope always passes. This draws the authorization map
-# — including isolating raw market data behind MARKET_RAW so it can be
-# withheld from external/B2B keys — without 403ing today's scopeless keys.
+# the wildcard "*" scope always passes.
+#
+# The one boundary that carries a licence rather than a price is
+# MARKET_REFERENCE vs MARKET_RAW: the underlying's own tape (its quote,
+# bars, session levels) is reference data every levels integration needs
+# and rides with the derived scopes, while the option chain enumerated
+# contract by contract is withheld from external keys. See scopes.py for
+# why the line sits there and not around "upstream data" generally.
 _scope_gex = Depends(require_scopes(GEX))
 _scope_flow = Depends(require_scopes(FLOW))
 _scope_maxpain = Depends(require_scopes(MAXPAIN))
 _scope_technicals = Depends(require_scopes(TECHNICALS))
 _scope_signals = Depends(require_scopes(SIGNALS))
+_scope_market_reference = Depends(require_scopes(MARKET_REFERENCE))
 _scope_market_raw = Depends(require_scopes(MARKET_RAW))
 
 # The /api/signals surface is the premium (basic/pro) tier.
@@ -510,9 +516,10 @@ app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # CHANGED between two snapshots, what expires next, and the classified read
 # stored per session). Same derived-GEX scope as the surfaces it differences.
 app.include_router(gamma_shift_router, dependencies=[_scope_gex])
-# Raw market data routers — per-contract option history (option_contract)
-# and the option-calculator (which embeds raw contract prices). Gated
-# behind MARKET_RAW so they are excluded from derived-only tiers.
+# Option-chain routers — per-contract option history (option_contract) and
+# the option-calculator (which embeds raw contract prices). Both enumerate
+# the chain contract by contract, which is what MARKET_RAW exists to
+# withhold, so they stay excluded from derived-only tiers.
 app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
 # Backtesting platform — premium (basic/pro) tier, same scope as /api/signals.
@@ -1479,7 +1486,7 @@ def get_market_session(
 
 @app.get(
     "/api/market/quote",
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
     response_model=UnderlyingQuote,
     response_model_exclude_none=True,
     tags=["Market Data"],
@@ -1556,7 +1563,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     "/api/market/session-closes",
     response_model=SessionCloses,
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
 )
 @handle_api_errors("GET /api/market/session-closes")
 async def get_session_closes(symbol: str = Query(default="SPY")):
@@ -1584,7 +1591,7 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
     "/api/market/session-levels",
     response_model=SessionLevels,
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
 )
 @handle_api_errors("GET /api/market/session-levels")
 async def get_session_levels(symbol: str = Query(default="SPY")):
@@ -1623,7 +1630,7 @@ async def get_session_levels(symbol: str = Query(default="SPY")):
     "/api/market/historical",
     response_model=List[UnderlyingQuote],
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
 )
 async def get_historical_quotes(
     symbol: str = Query(default="SPY"),

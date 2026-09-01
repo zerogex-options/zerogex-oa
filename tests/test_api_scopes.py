@@ -36,11 +36,34 @@ def test_all_scopes_is_the_union():
 
 
 def test_analytics_tier_excludes_raw_and_signals():
-    """The clean B2B/B2B2C product: derived analytics, no raw, no signals."""
+    """The clean B2B/B2B2C product: derived analytics plus the underlying's
+    own tape, no option chain, no signals."""
     bundle = scopes.TIERS[scopes.TIER_ANALYTICS]
     assert scopes.MARKET_RAW not in bundle
     assert scopes.SIGNALS not in bundle
-    assert bundle == {scopes.GEX, scopes.FLOW, scopes.MAXPAIN, scopes.TECHNICALS}
+    assert bundle == {
+        scopes.GEX,
+        scopes.FLOW,
+        scopes.MAXPAIN,
+        scopes.TECHNICALS,
+        scopes.MARKET_REFERENCE,
+    }
+
+
+def test_analytics_tier_can_price_a_level():
+    """A charting integration must be able to fetch the underlying's price.
+    Without MARKET_REFERENCE it can compute a call wall and has nothing to
+    draw it against — which is how enforcement took out nine integrations
+    that never wanted the option chain at all."""
+    assert scopes.MARKET_REFERENCE in scopes.TIERS[scopes.TIER_ANALYTICS]
+    assert scopes.MARKET_REFERENCE in scopes.DERIVED_SCOPES
+
+
+def test_reference_and_raw_are_distinct_scopes():
+    """Collapsing them is the bug this split exists to prevent."""
+    assert scopes.MARKET_REFERENCE != scopes.MARKET_RAW
+    assert scopes.MARKET_RAW not in scopes.DERIVED_SCOPES
+    assert {scopes.MARKET_REFERENCE, scopes.MARKET_RAW} <= scopes.ALL_SCOPES
 
 
 def test_signals_tier_is_analytics_plus_signals():
@@ -185,3 +208,72 @@ def test_admin_keys_no_tier_no_scope_is_none(monkeypatch: pytest.MonkeyPatch):
     assert rc == 0
     # No grants requested → None (stored as the empty-array default).
     assert captured["scopes"] is None
+
+
+# --------------------------------------------------------------------------
+# Which endpoints sit on which side of the licence boundary
+# --------------------------------------------------------------------------
+#
+# The taxonomy tests above pin the SETS; these pin the WIRING, which is where
+# the 2026-08-31 incident actually lived. Every scope declaration was correct
+# in scopes.py and the bundles were right — the endpoints were simply hung off
+# the wrong one, so switching enforcement on 403'd eleven paying integrations,
+# nine of which only ever wanted the underlying's price. A set-level test
+# cannot catch that; only asserting the routes can.
+
+
+def _dependency_scopes(app, path: str) -> set:
+    """The scopes required by the route serving ``path``.
+
+    Reaches through the ``require_scopes`` closure rather than re-deriving
+    them, so the assertion is about what FastAPI will actually enforce.
+    """
+    for route in app.routes:
+        if getattr(route, "path", None) != path:
+            continue
+        found = set()
+        for dep in getattr(route, "dependencies", []):
+            call = getattr(dep, "dependency", None)
+            closure = getattr(call, "__closure__", None) or ()
+            for cell in closure:
+                if isinstance(cell.cell_contents, set):
+                    found |= cell.cell_contents
+        return found
+    raise AssertionError(f"no route serving {path}")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/market/quote",
+        "/api/market/historical",
+        "/api/market/session-closes",
+        "/api/market/session-levels",
+    ],
+)
+def test_underlying_tape_is_reference_not_raw(path):
+    """A level is meaningless without the price it sits against, so the
+    underlying's own tape must reach an analytics-tier key."""
+    from src.api.main import app
+
+    required = _dependency_scopes(app, path)
+    assert scopes.MARKET_REFERENCE in required, path
+    assert scopes.MARKET_RAW not in required, path
+    assert required <= scopes.TIERS[scopes.TIER_ANALYTICS], path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/option/quote",
+        "/api/market/open-interest",
+    ],
+)
+def test_per_contract_surfaces_stay_raw(path):
+    """Walking the chain contract by contract is the redistribution concern
+    and must NOT be reachable from a customer bundle."""
+    from src.api.main import app
+
+    required = _dependency_scopes(app, path)
+    assert scopes.MARKET_RAW in required, path
+    assert not required <= scopes.TIERS[scopes.TIER_SIGNALS], path

@@ -506,11 +506,22 @@ def test_every_v2_route_enforces_exactly_its_v1_scopes(client: TestClient):
         compared += 1
 
     assert compared > 100, f"only compared {compared} pairs"
-    # And the market_raw gates specifically survived, with that exact scope.
+
+    # Spot-check BOTH sides of the licence boundary by name, so a v2 route
+    # that silently drifted across it fails here even if the pair-diff above
+    # still matches. /api/option/quote enumerates the chain and stays raw;
+    # /api/market/quote is the underlying's own price and must stay reachable
+    # from a customer bundle.
     raw = _scope_gates(
-        [d for d in v2_routes["/api/v2/market/quote"].dependencies if id(d) not in global_ids]
+        [d for d in v2_routes["/api/v2/option/quote"].dependencies if id(d) not in global_ids]
     )
     assert any("market_raw" in scopes for _, scopes in raw), raw
+
+    reference = _scope_gates(
+        [d for d in v2_routes["/api/v2/market/quote"].dependencies if id(d) not in global_ids]
+    )
+    assert any("market_reference" in scopes for _, scopes in reference), reference
+    assert not any("market_raw" in scopes for _, scopes in reference), reference
 
 
 def test_v2_data_is_byte_identical_for_unmodelled_routes(client: TestClient):

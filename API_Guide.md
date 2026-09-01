@@ -177,20 +177,26 @@ always passes, so these declarations are inert until keys are backfilled.
 | `maxpain` | max-pain analytics | ✅ derived |
 | `technicals` | VWAP / ORB / volume / momentum | ✅ derived |
 | `signals` | signal engine, backtest, scorecard, forecast, TradeWorkz | ✅ derived (premium) |
-| `market_raw` | raw per-contract quotes & underlying OHLC (`/api/market/*`, `/api/option/*`) | ❌ **withheld** |
+| `market_reference` | the underlying's own tape — `/api/market/quote`, `/api/market/historical`, `/api/market/session-closes`, `/api/market/session-levels` | ✅ reference |
+| `market_raw` | the option chain, per contract — `/api/option/*`, `/api/market/open-interest`, `/api/tools/option-calculator` | ❌ **withheld** |
 
 Tier bundles (the unit of commercial packaging):
 
-- **`analytics`** — `gex` + `flow` + `maxpain` + `technicals`: the clean
-  derived product for external / B2B2C consumers. **No raw data.**
+- **`analytics`** — `gex` + `flow` + `maxpain` + `technicals` +
+  `market_reference`: the clean derived product for external / B2B2C
+  consumers. **No option chain, no signals.**
 - **`signals`** — `analytics` + `signals`.
 - **`full`** — everything *including* `market_raw`; the internal website
   backend only, never resold.
 
 `market_raw` is isolated precisely so it can be granted to the internal
-BFF and **withheld from every external customer** — the derived scopes are
-broadly redistributable, raw upstream market data is not. A third-party
-charting integration is issued an **`analytics`-tier key**.
+BFF and **withheld from every external customer**. The line is drawn at
+what gets *enumerated*, not at whether the data came from upstream:
+fetching the price of the symbol you are analysing is reference data every
+charting integration needs, while walking the option chain contract by
+contract is the redistribution concern. A third-party charting integration
+is issued an **`analytics`-tier key** and has everything it needs to place
+a level against a price.
 
 ## API versions & the freshness envelope
 
@@ -641,9 +647,15 @@ Underlying buying/selling pressure.
 
 ## Market Data
 
-Scope: `market_raw` — **raw upstream data, not redistributable.** These
-endpoints are for the internal `full`-tier BFF only and are excluded from
-the `analytics` tier issued to external customers.
+Scope: mixed — check each endpoint below.
+
+The underlying's own tape (`quote`, `historical`, `session-closes`,
+`session-levels`) is `market_reference` and rides with the `analytics`
+tier, because placing a level on a chart is meaningless without the price
+it sits against. The per-contract surfaces (`open-interest`, and
+everything under `/api/option/`) are `market_raw` — **not
+redistributable**, internal `full`-tier BFF only, excluded from the
+`analytics` tier issued to external customers.
 
 ### GET /api/market/quote
 Get latest underlying quote (the live tick).
