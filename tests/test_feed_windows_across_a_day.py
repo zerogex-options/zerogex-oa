@@ -76,16 +76,20 @@ class Feed:
 #   analytics        04:00-20:00  engine recomputes off the live tape
 #                    60 s         ANALYTICS_INTERVAL
 #   flow             09:30-16:00  accrued over the cash session only
-#                    60 s         aggregation bucket
+#                    300 s        flow_by_contract rows are keyed to 5-minute
+#                                 bucket starts (database.get_flow and
+#                                 get_flow_series both floor to 300), NOT to
+#                                 AGGREGATION_BUCKET_SECONDS
 #   signals          04:00-20:00  engine runs while its analytics inputs move
-#                    60 s         a scored row cannot beat its inputs, which
-#                                 land on the 60 s analytics cycle
+#                    60 s         a scored row carries uq.timestamp — the
+#                                 newest underlying_quotes row, floored to the
+#                                 60 s bucket — so it can never be fresher
 GROUND_TRUTH = {
     "realtime_quote": Feed((time(4, 0), time(20, 0)), 60.0),
     "option_chain": Feed((time(9, 30), time(16, 15)), 60.0),
     "volatility_bar": Feed((time(4, 0), time(20, 0)), 300.0),
     "analytics_cycle": Feed((time(4, 0), time(20, 0)), 60.0),
-    "flow_aggregate": Feed((time(9, 30), time(16, 0)), 60.0),
+    "flow_aggregate": Feed((time(9, 30), time(16, 0)), 300.0),
     "signals_cycle": Feed((time(4, 0), time(20, 0)), 60.0),
 }
 
@@ -350,3 +354,81 @@ def test_futures_are_graded_on_the_cme_session_not_the_nyse_one(symbol, day):
                 f"{symbol} at {now.astimezone(ET):%a %H:%M ET}: a futures feed "
                 f"silent for an hour reads {dead.freshness_status.value}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Invariant 3 — never promise faster than the feed can store
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path,name", sorted(REPRESENTATIVE_PATHS.items()))
+def test_a_cadence_is_never_faster_than_the_feed_can_store(path, name):
+    """The root cause of this whole family, stated directly.
+
+    ``expected_update_cadence`` is a published contract: "a new observation is
+    due this often". Advertising a number smaller than the storage granularity
+    promises something the feed structurally cannot deliver, so a healthy feed
+    spends most of every bucket past its own advertised cadence — reading
+    ``aging`` at best and ``stale`` at worst, forever, with nothing wrong.
+
+    Invariants 1 and 2 both miss this. Invariant 1 only asks "not stale", so a
+    profile permanently parked in ``aging`` passes; and when the granularity
+    happens to equal the stale window it passes by a single second of margin.
+    This asks the question the other two dance around.
+    """
+    profile = fr.resolve_profile(path)
+    granularity = GROUND_TRUTH[name].granularity
+    for session, advertised in (
+        (fr.SESSION_REGULAR, profile.regular_seconds),
+        (fr.SESSION_PRE_MARKET, profile.extended_seconds),
+    ):
+        if advertised is None:
+            continue  # the feed writes nothing in that session — invariant 2
+        assert advertised >= granularity, (
+            f"{path} advertises a {advertised:.0f}s cadence in the {session} "
+            f"session, but its feed stores at best every {granularity:.0f}s. A "
+            f"healthy feed is past that cadence for "
+            f"{100 * (1 - advertised / granularity):.0f}% of every bucket."
+        )
+
+
+def test_the_flow_bar_constant_matches_what_the_queries_actually_floor_to():
+    """``FLOW_BAR_SECONDS`` is published as a cadence contract, but the value
+    that decides where a flow row really lands is the divisor inside the
+    queries. They were written as a bare ``300`` long before the envelope
+    existed, so naming the constant did not join them up — retune one and the
+    API would advertise a cadence the stored rows do not keep, which is the
+    bug this file exists to prevent.
+    """
+    from pathlib import Path
+
+    from src.config import FLOW_BAR_SECONDS
+
+    src = Path("src/api/database.py").read_text()
+    # get_flow aligns its window to the bucket grid; get_flow_series sizes and
+    # floors its bars on the same number.
+    assert f"bucket_seconds = {FLOW_BAR_SECONDS}" in src, (
+        "get_flow no longer floors to FLOW_BAR_SECONDS — the advertised flow "
+        "cadence and the stored bucket grid have come apart"
+    )
+    assert src.count(f"// {FLOW_BAR_SECONDS}) * {FLOW_BAR_SECONDS}") >= 2, (
+        "get_flow_series no longer floors its bar boundaries to " "FLOW_BAR_SECONDS"
+    )
+
+
+def test_the_signal_score_cannot_outrun_the_bucket_it_reads():
+    """Why signals_cycle is pinned to the tape bucket rather than the engine's
+    loop interval: a score's timestamp IS the underlying-quote timestamp, and
+    those are floored to AGGREGATION_BUCKET_SECONDS. The engine may loop every
+    second; the observation it stamps cannot move faster than its input."""
+    from pathlib import Path
+
+    from src.config import AGGREGATION_BUCKET_SECONDS
+
+    engine = Path("src/signals/unified_signal_engine.py").read_text()
+    assert '"timestamp": ts,' in engine
+    assert "uq.timestamp," in engine, (
+        "the score context no longer reads its timestamp from underlying_quotes "
+        "— re-derive the signals granularity before trusting this cadence"
+    )
+    assert fr.SIGNALS_CYCLE.regular_seconds == float(AGGREGATION_BUCKET_SECONDS)

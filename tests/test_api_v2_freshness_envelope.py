@@ -92,8 +92,20 @@ def test_no_cadence_is_advertised_on_a_non_market_day():
 
 def test_flow_expects_no_updates_outside_the_cash_session():
     """No options flow accrues pre/post-market, so the flow profile must not
-    advertise a cadence there and mark the last bucket stale overnight."""
-    assert fr.FLOW_AGGREGATE.cadence_for(fr.SESSION_REGULAR, market_day=True) == 60.0
+    advertise a cadence there and mark the last bucket stale overnight.
+
+    The in-session figure is the FIVE-minute flow bar, not the one-minute tape
+    bucket. This assertion originally read 60.0 — copied from the profile as
+    written rather than from what flow_by_contract actually stores — so it
+    pinned the bug in place instead of catching it: a healthy flow feed read
+    `stale` for half of every bar, which is what /api/v2/flow/series reported
+    on the first api-test that ever ran inside market hours.
+    """
+    from src.config import FLOW_BAR_SECONDS
+
+    assert fr.FLOW_AGGREGATE.cadence_for(fr.SESSION_REGULAR, market_day=True) == float(
+        FLOW_BAR_SECONDS
+    )
     assert fr.FLOW_AGGREGATE.cadence_for(fr.SESSION_AFTER_HOURS, market_day=True) is None
 
 
