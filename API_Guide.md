@@ -284,8 +284,8 @@ upstream can change.
 | `option_chain` | `/api/option/*`, `/api/market/open-interest` | 60 s | 60 s (to 16:15 only) | — |
 | `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
 | `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
-| `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
-| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 15 s | 60 s | — |
+| `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
+| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
 | `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
@@ -314,9 +314,15 @@ chains (SPX, NDX) stop at 16:00 with the index they price, and every chain
 stops at the early close on a half day.
 
 Cadence describes how often a new observation can be **stored**, not how
-often ingestion polls. The quote tape is polled every few seconds but written
-in 60-second buckets, so 60 s is the fastest a new value can appear; VIX/VXN
-are 5-minute bars.
+often ingestion polls, and not how fast the producing engine loops. The quote
+tape is polled every few seconds but written in 60-second buckets, so 60 s is
+the fastest a new value can appear. VIX/VXN and the whole of `/api/flow/*` are
+5-minute bars. The signal engine loops about once a second, but a score is
+stamped with the underlying-quote timestamp it read, so it cannot be fresher
+than that same 60-second bucket.
+
+Poll faster than the cadence if you like — it is cheap against the cache — but
+expect `aging` between stores. That band is normal, not a warning.
 
 **ES and NQ are graded on the CME calendar**, not the NYSE one — they trade
 Sunday 18:00 to Friday 17:00 ET. A futures symbol therefore reports

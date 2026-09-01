@@ -77,6 +77,7 @@ from pydantic import BaseModel, Field
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     ANALYTICS_INTERVAL,
+    FLOW_BAR_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -320,18 +321,28 @@ ANALYTICS_CYCLE = CadenceProfile(
     stale_floor_seconds=60.0,
 )
 
+# Flow does NOT ride the 60s tape bucket. flow_by_contract rows are keyed to
+# five-minute bucket starts — database.get_flow and get_flow_series both floor
+# their windows to config.FLOW_BAR_SECONDS — so the freshest bar that can
+# exist is up to five minutes old. Advertising 60s put the stale threshold at
+# 150s, inside the bar: a healthy flow feed read `stale` for half of every bar
+# of every cash session, which is what /api/v2/flow/series reported at 09:35
+# on the first run that ever landed inside market hours.
+#
+# Same shape as VOLATILITY_BAR, the other five-minute feed: two missed bars
+# before it is called late.
 FLOW_AGGREGATE = CadenceProfile(
     name="flow_aggregate",
     description=(
-        "Options-flow aggregates, bucketed to "
-        "config.AGGREGATION_BUCKET_SECONDS=60s. No flow accrues outside the "
-        "cash session, so the extended/closed cadences are unset."
+        "Options-flow aggregates, bucketed to config.FLOW_BAR_SECONDS=300s "
+        "(five-minute bars, not the one-minute tape bucket). No flow accrues "
+        "outside the cash session, so the extended/closed cadences are unset."
     ),
-    regular_seconds=float(AGGREGATION_BUCKET_SECONDS),
+    regular_seconds=float(FLOW_BAR_SECONDS),
     extended_seconds=None,
     closed_seconds=None,
-    stale_grace=2.5,
-    stale_floor_seconds=60.0,
+    stale_grace=2.0,
+    stale_floor_seconds=float(2 * FLOW_BAR_SECONDS),
 )
 
 SIGNALS_CYCLE = CadenceProfile(
@@ -346,7 +357,15 @@ SIGNALS_CYCLE = CadenceProfile(
     # Deliberately NOT SIGNALS_INTERVAL (1s): the engine loops that fast but
     # a scored row only lands when its analytics inputs move, and advertising
     # a 1s cadence would report ``stale`` on a healthy quiet tape.
-    regular_seconds=15.0,
+    #
+    # 15s was still too fast, for the same reason 1s was. A score carries
+    # ctx.timestamp, which is uq.timestamp — the newest underlying_quotes row,
+    # floored to AGGREGATION_BUCKET_SECONDS — so it can never be fresher than
+    # the current 60s bucket however hard the engine loops. At 15s a healthy
+    # signals feed sat in ``aging`` for 75% of every minute across all 37
+    # /api/signals/* routes, which is what /api/v2/signals/score reported at
+    # 09:35 ET. Matched to the bucket, and to extended_seconds, already 60.
+    regular_seconds=float(AGGREGATION_BUCKET_SECONDS),
     extended_seconds=60.0,
     # The signal engine runs 24x5, but a scored row can never carry an
     # observation newer than its inputs, and those stop with the feed at
