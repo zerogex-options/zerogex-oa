@@ -14,6 +14,10 @@ Two authentication mechanisms are supported and may be enabled together:
    hashed and looked up against the table; non-revoked rows authorize the
    request and ``last_used_at`` is touched (throttled).
 
+Both mechanisms read the key from a *header*.  One narrow exception exists —
+see :data:`_QUERY_KEY_PATH_PREFIXES` — where an ``?api_key=`` query parameter
+is also accepted, because the client platform physically cannot send headers.
+
 When neither mechanism is configured (no ``API_KEY`` set and no DB pool
 registered with :data:`key_store`), the dependency is a no-op so local
 development and CI continue to work without credentials.
@@ -270,9 +274,53 @@ def _matches_static(provided: Optional[str]) -> bool:
     return hmac.compare_digest(provided, _API_KEY)
 
 
+# Paths where an ``?api_key=`` QUERY PARAMETER is accepted in addition to the
+# two header forms. Matched as a path *prefix* against ``request.url.path``.
+#
+# This exists for exactly one caller: the Sierra Chart (ACSIL) charting study.
+# The portable ACSIL HTTP call across Sierra Chart versions is
+# ``sc.MakeHTTPRequest(URL)`` — a bare GET with no way to attach a request
+# header — so a header-only endpoint is simply not reachable from that
+# platform. See ``frontend/public/sierrachart/ZeroGexGammaLevels.cpp`` in
+# zerogex-web and docs/sierra-chart-indicator.md.
+#
+# Kept to the levels routes ON PURPOSE, and the list must stay that way:
+#
+# * A query string is materially weaker than a header. It is visible to every
+#   proxy in the path, gets written to nginx/uvicorn access logs by default,
+#   and rides along in ``Referer`` on any redirect. That is an acceptable
+#   trade for ONE endpoint whose entire response is derived, redistributable
+#   analytics (gamma flip, walls, max pain, per-strike profile) — and not an
+#   acceptable trade for anything serving raw per-contract quotes, order flow,
+#   or the key-administration surface.
+# * Widening this to a bare ``/api/`` — or to ``/`` — would silently make the
+#   whole paid surface reachable with a credential in the URL. If another
+#   platform needs the same accommodation, add its specific route here rather
+#   than reaching for a broader prefix.
+#
+# ``/api/v2/levels`` is included because the v2 mirror wraps the identical v1
+# body in a freshness envelope; leaving it out would mean the study works
+# today and 401s the moment someone repoints it at v2.
+_QUERY_KEY_PATH_PREFIXES: Tuple[str, ...] = (
+    "/api/v1/levels",
+    "/api/v2/levels",
+)
+
+# The query parameter name. Deliberately NOT ``key`` or ``token``: an explicit
+# ``api_key`` is what log-scrubbing rules and secret scanners are written to
+# match on.
+_QUERY_KEY_PARAM = "api_key"
+
+
+def _query_key_allowed(path: str) -> bool:
+    """Whether ``path`` may present its credential in the query string."""
+    return path.startswith(_QUERY_KEY_PATH_PREFIXES)
+
+
 def _extract_candidate(
     x_api_key: Optional[str],
     bearer: Optional[HTTPAuthorizationCredentials],
+    query_key: Optional[str] = None,
 ) -> Optional[str]:
     # Bearer wins over X-API-Key when both are present: nginx may still
     # `proxy_set_header X-API-Key "<static>"` during the migration window
@@ -283,6 +331,12 @@ def _extract_candidate(
         return bearer.credentials  # type: ignore[no-any-return]
     if x_api_key:
         return x_api_key
+    # Last, and only when the caller's path opted in (see
+    # _QUERY_KEY_PATH_PREFIXES). Ordered last so a header always wins: a
+    # caller that can send one should never be downgraded to the weaker
+    # channel just because a stale URL still carries the parameter.
+    if query_key:
+        return query_key
     return None
 
 
@@ -335,9 +389,14 @@ async def api_key_auth(
 
     # Read X-API-Key from raw request headers rather than declaring it via
     # Security() so it doesn't surface as a separate Swagger Authorize entry
-    # or a per-endpoint parameter.
+    # or a per-endpoint parameter. Same reasoning for the query parameter:
+    # read here rather than declared, so it stays out of every endpoint's
+    # OpenAPI signature and cannot be mistaken for a general auth channel.
     x_api_key = request.headers.get("X-API-Key")
-    candidate = _extract_candidate(x_api_key, bearer)
+    query_key = (
+        request.query_params.get(_QUERY_KEY_PARAM) if _query_key_allowed(request.url.path) else None
+    )
+    candidate = _extract_candidate(x_api_key, bearer, query_key)
     if candidate:
         if static_enabled and _matches_static(candidate):
             # Log WARNING so we can identify callers still using the static

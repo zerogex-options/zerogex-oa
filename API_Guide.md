@@ -42,6 +42,32 @@ rewrites at any layer.
 Requests with an invalid or missing key return `401 Unauthorized` with
 `WWW-Authenticate: Bearer`.
 
+### `?api_key=` on the levels routes only
+
+`/api/v1/levels/*` and `/api/v2/levels/*` — and **nothing else** — additionally
+accept the key as an `api_key` query parameter:
+
+```
+GET /api/v1/levels/ES?strikes=1&api_key=<your-key>
+```
+
+This exists for charting platforms that physically cannot send a request
+header. The Sierra Chart study is the caller it was added for: the ACSIL HTTP
+call that is portable across Sierra Chart versions, `sc.MakeHTTPRequest(URL)`,
+is a bare GET with no header support, so a header-only endpoint is unreachable
+from that platform.
+
+**Use a header if you can.** A credential in a URL is materially weaker: every
+proxy in the path sees it, access logs record it by default (ours redact it —
+see `deploy/steps/120.nginx_api`), and it survives in `Referer`. A header
+always wins when both are present, so a stale URL parameter cannot downgrade a
+caller that sends one.
+
+The allowlist is deliberately narrow and is pinned by
+`tests/test_api_query_key_auth.py`: the levels endpoints return derived,
+redistributable analytics only, and no endpoint serving raw per-contract
+quotes, flow, or key administration will accept a credential in a URL.
+
 Two key types are supported, validated against the same headers:
 
 - **Per-user keys** *(primary)* — long-lived keys issued via the admin
