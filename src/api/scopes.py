@@ -21,19 +21,34 @@ Each scope names one analytics domain:
 * :data:`TECHNICALS` — intraday technicals (VWAP, ORB, volume, momentum).
 * :data:`SIGNALS` — the composite signal engine (Market State Index and
   components).
-* :data:`MARKET_RAW` — **raw, license-restricted market data**: per-
-  contract option quotes (bid/ask/last/volume/OI), underlying OHLC bars,
-  and anything that re-exposes the upstream feed rather than a computed
-  derivative. Held in its own scope precisely so it can be granted to the
-  internal website BFF and **withheld from every external customer** — the
-  derived scopes above are broadly redistributable, this one is not.
+* :data:`MARKET_REFERENCE` — the UNDERLYING's own tape: its current quote,
+  its OHLC bars, prior-session closes and session high/low. Upstream data,
+  but about the one instrument the caller is already charting, and every
+  levels integration needs it to place a level against a price. Bundled
+  with the derived scopes.
+* :data:`MARKET_RAW` — **license-restricted market data**: the OPTION
+  CHAIN enumerated contract by contract (per-contract quotes, per-contract
+  open interest, the contract detail and calculator surfaces). Held in its
+  own scope precisely so it can be granted to the internal website BFF and
+  **withheld from every external customer** — the other scopes are broadly
+  redistributable, this one is not.
+
+  The line between the two is *what gets enumerated*, not whether the data
+  is upstream. Fetching the price of the symbol you are analysing is not
+  the redistribution concern; walking a vendor's option chain contract by
+  contract is. Drawing it anywhere else has been tried and was wrong:
+  MARKET_REFERENCE used to live inside MARKET_RAW, so switching
+  enforcement on 2026-08-31 took out eleven paying integrations, of which
+  nine only ever wanted the underlying's price. Under this split that
+  change would have reached two, both genuinely reading the chain.
 
 Tier bundles
 ------------
 Tiers are named bundles of scopes — the unit of commercial packaging:
 
 * :data:`TIER_ANALYTICS` — the clean, derived B2B/B2B2C product:
-  GEX + FLOW + MAXPAIN + TECHNICALS. **No raw data, no signals.**
+  GEX + FLOW + MAXPAIN + TECHNICALS + MARKET_REFERENCE. **No option chain,
+  no signals.**
 * :data:`TIER_SIGNALS` — analytics plus the signal engine.
 * :data:`TIER_FULL` — everything *including* ``MARKET_RAW``. Intended for
   the internal website backend only, never for external resale.
@@ -55,15 +70,21 @@ FLOW: str = "flow"
 MAXPAIN: str = "maxpain"
 TECHNICALS: str = "technicals"
 SIGNALS: str = "signals"
+MARKET_REFERENCE: str = "market_reference"
 MARKET_RAW: str = "market_raw"
 
 #: Every capability scope the API knows about.
-ALL_SCOPES: FrozenSet[str] = frozenset({GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_RAW})
+ALL_SCOPES: FrozenSet[str] = frozenset(
+    {GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_REFERENCE, MARKET_RAW}
+)
 
-#: The derived-analytics scopes — the subset that is broadly licensable
-#: for redistribution because each is a computed output, not raw upstream
-#: market data. ``MARKET_RAW`` is deliberately excluded.
-DERIVED_SCOPES: FrozenSet[str] = frozenset({GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS})
+#: The broadly licensable subset. Each of these is either a computed output
+#: or reference data about the underlying the caller is already analysing.
+#: ``MARKET_RAW`` — the option chain, contract by contract — is deliberately
+#: excluded; it is the only thing here that cannot be redistributed.
+DERIVED_SCOPES: FrozenSet[str] = frozenset(
+    {GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_REFERENCE}
+)
 
 # --- Tier bundles ---------------------------------------------------------
 
@@ -74,8 +95,8 @@ TIER_FULL: str = "full"
 #: Tier name -> the scopes it grants. ``TIER_FULL`` is the only bundle
 #: that includes ``MARKET_RAW`` and is for the internal BFF only.
 TIERS: Dict[str, FrozenSet[str]] = {
-    TIER_ANALYTICS: frozenset({GEX, FLOW, MAXPAIN, TECHNICALS}),
-    TIER_SIGNALS: frozenset({GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS}),
+    TIER_ANALYTICS: frozenset({GEX, FLOW, MAXPAIN, TECHNICALS, MARKET_REFERENCE}),
+    TIER_SIGNALS: frozenset({GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_REFERENCE}),
     TIER_FULL: frozenset(ALL_SCOPES),
 }
 
