@@ -174,6 +174,14 @@ for cash indices before 09:30 / after 16:00 ET.
   gets through reports how many were held. Suppressed alerts are logged:
   `journalctl -t zerogex-alert`. `make alert-cooldown-status` shows what is
   held right now; `make alert-cooldown-reset` clears it.
+
+  The cooldown's state lives in `/var/lib/zerogex-alert`, created by
+  `StateDirectory=` in `zerogex-alert@.service`. That unit is **not** installed
+  by `make deploy` — only by `make alert-template-install` (deploy mentions it
+  in a comment and nothing more). Until it is reinstalled the cooldown fails
+  open, i.e. behaves exactly as it did before. The dispatcher *script* runs
+  from the repo path, so a `git pull` is enough for everything except that one
+  directory.
 - **Option chains are graded on the OPTIONS session (09:30-16:15 ET), not the
   underlying's window.** A chain row is written only when an option quote
   ticks, so outside that session the gaps are minutes to hours wide and mean

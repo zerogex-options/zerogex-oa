@@ -4551,6 +4551,44 @@ system-monitor-status: ## Show system-monitor timer status + last/next fire + re
 	@echo ""
 	@sudo journalctl -u zerogex-oa-system-monitor -n 30 --no-pager || true
 
+.PHONY: systemd-sync
+systemd-sync: ## Install CHANGED unit files only, reload, report what needs restarting (restarts nothing)
+# `make deploy` is the wrong tool for a one-line unit change: it reinstalls
+# units, enables timers, restarts services and touches nginx/journald. When
+# only a .service or .timer file moved, the whole of what deploy does for it
+# is a verbatim copy plus a daemon-reload (see deploy/steps/100.systemd and
+# 110.api_server -- both plain `cp`). This does exactly that, for units
+# ALREADY installed, and restarts nothing: it prints what a restart would
+# pick up and leaves the timing to you.
+	@echo "$(BLUE)=== Syncing systemd unit files ===$(NC)"
+	@changed=""; missing=""; \
+	for f in setup/systemd/*.service setup/systemd/*.timer; do \
+	  [ -e "$$f" ] || continue; \
+	  n=$$(basename "$$f"); \
+	  if [ ! -f "/etc/systemd/system/$$n" ]; then missing="$$missing $$n"; continue; fi; \
+	  if ! cmp -s "$$f" "/etc/systemd/system/$$n"; then \
+	    sudo cp "$$f" "/etc/systemd/system/$$n" && changed="$$changed $$n"; \
+	  fi; \
+	done; \
+	if [ -n "$$changed" ]; then \
+	  sudo systemctl daemon-reload; \
+	  echo "$(GREEN)Updated:$(NC)"; \
+	  for n in $$changed; do \
+	    if systemctl is-active --quiet "$$n" 2>/dev/null; then \
+	      echo "  $$n  $(YELLOW)(running the old unit — sudo systemctl restart $$n)$(NC)"; \
+	    else \
+	      echo "  $$n"; \
+	    fi; \
+	  done; \
+	else \
+	  echo "  Nothing to do — every installed unit already matches the repo."; \
+	fi; \
+	if [ -n "$$missing" ]; then \
+	  echo "$(YELLOW)In the repo but NOT installed$(NC) (deliberately not installed here —"; \
+	  echo "$(YELLOW)installing a new unit is activation, not a sync; use make deploy or$(NC)"; \
+	  echo "$(YELLOW)the unit's own install target):$(NC)"; \
+	  for n in $$missing; do echo "  $$n"; done; \
+	fi
 .PHONY: alert-template-install
 alert-template-install: ## Install zerogex-alert@.service template + sample env (does NOT enable OnFailure= hooks)
 	@echo "$(BLUE)=== Installing failure-alert template ===$(NC)"
