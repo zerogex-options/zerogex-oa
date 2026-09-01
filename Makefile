@@ -1582,6 +1582,21 @@ journal-volume: ## Why journal retention is short: what caps it, and which unit 
 	  | awk '{ printf "  %8.1f MB/h  %8d lines/h  %6d B/line  %s\n", \
 	            $$1/1048576, $$2, ($$2 ? $$1/$$2 : 0), $$3 }'
 	@echo ""
+	@echo "$(YELLOW)How much of that is HTTP access logging:$(NC)"
+# Called out on its own because a top-N of repeated shapes structurally
+# CANNOT find it: every distinct URL is its own shape, so 240k access lines
+# hid behind a top row of 2,288. nginx already records the same requests to
+# /var/log/nginx/access.log, so in the journal they are pure duplication.
+	@for u in $(API_SERVICE); do \
+	  all=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null | wc -l); \
+	  acc=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null \
+	        | grep -cE '"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) ' || true); \
+	  if [ "$$all" -gt 0 ]; then \
+	    awk -v a="$$acc" -v t="$$all" -v u="$$u" \
+	      'BEGIN { printf "  %8d of %8d lines/h (%.0f%%) are access logs  %s\n", a, t, 100*a/t, u }'; \
+	  fi; \
+	done
+	@echo ""
 	@echo "$(YELLOW)Noisiest repeated lines, PER UNIT (shape, not text):$(NC)"
 # Per unit, not global: one chatty service otherwise owns every row of a
 # global top-N and hides the unit actually burning the most. The 2026-09-01
@@ -1590,7 +1605,7 @@ journal-volume: ## Why journal retention is short: what caps it, and which unit 
 	@for u in $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE); do \
 	  echo "  $(BLUE)$$u$(NC)"; \
 	  journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null \
-	    | sed -E 's/[0-9]+/N/g' \
+	    | sed -E 's/\?[^ "]*/?_/; s/[0-9]+/N/g' \
 	    | sort | uniq -c | sort -rn | head -3 \
 	    | awk '{ n=$$1; $$1=""; printf "    %7d x %.86s\n", n, substr($$0,2) }'; \
 	done

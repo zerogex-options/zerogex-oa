@@ -39,9 +39,26 @@ class SignalEngineService:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
+    # Shutdown must not have to wait out a sleep. PEP 475 makes time.sleep()
+    # RESUME after a signal handler returns, so a plain sleep until the next run
+    # window -- hours at a weekend -- ignores SIGTERM completely: systemd waits
+    # out TimeoutStopSec=30 and then SIGKILLs. Four such kills appeared in the
+    # journal on 2026-09-01. Sleeping in slices and re-checking the flag below
+    # is what makes the handler's `self.running = False` actually take effect.
+    _SHUTDOWN_POLL_SECONDS = 2.0
+
     def _signal_handler(self, signum, frame):
         logger.info("SignalEngineService received signal %s - stopping", signum)
         self.running = False
+
+    def _sleep(self, seconds: float) -> None:
+        """Sleep, but wake within _SHUTDOWN_POLL_SECONDS of a stop request."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        while self.running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(self._SHUTDOWN_POLL_SECONDS, remaining))
 
     def run_cycle(self) -> None:
         # Refresh the playbook pattern-calibration store if its TTL has
@@ -81,7 +98,7 @@ class SignalEngineService:
                     self.underlying,
                     sleep_for,
                 )
-                time.sleep(max(1, sleep_for))
+                self._sleep(max(1, sleep_for))
                 continue
             started = time.time()
             try:
@@ -120,7 +137,7 @@ class SignalEngineService:
                 sleep_for = base + random.uniform(0, base * 0.1)
             else:
                 sleep_for = max(1.0, self.interval_seconds - elapsed)
-            time.sleep(sleep_for)
+            self._sleep(sleep_for)
 
 
 def _run_for_symbol(symbol: str, interval: int) -> None:
