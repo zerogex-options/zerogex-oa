@@ -67,6 +67,9 @@ from src.config import (
 
 logger = get_logger(__name__)
 
+# How often the Greeks progress line may be emitted, in seconds.
+_GREEKS_PROGRESS_LOG_SECONDS = 60.0
+
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
 
@@ -347,6 +350,14 @@ class IngestionEngine:
         # SUCCESSFUL Greek, so gating on it logged once per contract per
         # batch for the whole window before the underlying feed opened.
         self._greeks_no_price_warned = False
+        # Greeks progress was logged every 100 options. At the measured ~496
+        # options/second (1.79M an hour, 2026-09-01) that is 17,852 lines an
+        # hour -- the ingestion unit's largest single shape. A count-based
+        # throttle cannot hold a rate: its cadence is whatever the tape's
+        # throughput happens to be. Throttle on TIME so the line stays one a
+        # minute whether the market is quiet or hot.
+        self._greeks_progress_logged_mono: float = 0.0
+        self._greeks_progress_at_last_log: int = 0
         self.last_flush_time = datetime.now(ET)
         self.errors_count = 0
 
@@ -739,7 +750,9 @@ class IngestionEngine:
                 "high": float(quote["high"]) if quote.get("high") is not None else None,
                 "low": float(quote["low"]) if quote.get("low") is not None else None,
                 "close": float(quote["close"]) if quote.get("close") is not None else None,
-                "up_volume": int(quote["up_volume"]) if quote.get("up_volume") is not None else None,
+                "up_volume": (
+                    int(quote["up_volume"]) if quote.get("up_volume") is not None else None
+                ),
                 "down_volume": (
                     int(quote["down_volume"]) if quote.get("down_volume") is not None else None
                 ),
@@ -763,9 +776,7 @@ class IngestionEngine:
         try:
             cursor.execute("SAVEPOINT zgx_ws_notify")
             try:
-                cursor.execute(
-                    "SELECT pg_notify(%s, %s)", (self._WS_NOTIFY_CHANNEL, body)
-                )
+                cursor.execute("SELECT pg_notify(%s, %s)", (self._WS_NOTIFY_CHANNEL, body))
             except Exception as exc:
                 cursor.execute("ROLLBACK TO SAVEPOINT zgx_ws_notify")
                 logger.debug("WS notify emit failed (savepoint rolled back): %s", exc)
@@ -940,8 +951,23 @@ class IngestionEngine:
                     # instead of failing silently.
                     self._greeks_no_price_warned = False
                     self.greeks_calculated += 1
-                    if self.greeks_calculated % 100 == 0:
-                        logger.info(f"Calculated Greeks for {self.greeks_calculated} options")
+                    now_mono = _time.monotonic()
+                    since = now_mono - self._greeks_progress_logged_mono
+                    if since >= _GREEKS_PROGRESS_LOG_SECONDS:
+                        if self._greeks_progress_logged_mono:
+                            # Report the RATE, not just a running total: the
+                            # only reason to watch this line is whether the
+                            # engine is keeping up, and a total cannot say.
+                            done = self.greeks_calculated - self._greeks_progress_at_last_log
+                            logger.info(
+                                "Calculated Greeks for %d options (%.0f/s)",
+                                self.greeks_calculated,
+                                done / since,
+                            )
+                        else:
+                            logger.info("Calculated Greeks for %d options", self.greeks_calculated)
+                        self._greeks_progress_logged_mono = now_mono
+                        self._greeks_progress_at_last_log = self.greeks_calculated
                     if self.greeks_calculated == 1:
                         logger.info(
                             f"✅ First Greek calculated successfully: delta={data.get('delta')}, gamma={data.get('gamma')}"
@@ -2514,12 +2540,7 @@ def main():
         if s.strip()
     ]
 
-    if (
-        len(symbols) == 1
-        and not vix_enabled
-        and not vxn_enabled
-        and not futures_enabled
-    ):
+    if len(symbols) == 1 and not vix_enabled and not vxn_enabled and not futures_enabled:
         run_for_symbol(symbols[0])
         return
 

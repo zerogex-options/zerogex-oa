@@ -78,6 +78,20 @@ human_message=$(printf '%s\n\nLast 20 journal lines:\n%s' "$human_summary" "$con
 # permission, a corrupt line -- sends the alert. A cooldown that loses an alert
 # is worse than one that repeats itself.
 # ---------------------------------------------------------------------------
+# Persist the cooldown state, silently, whether or not the directory is usable.
+#
+# `printf > "$file" 2>/dev/null` does NOT do this: the redirection is performed
+# by the SHELL before printf runs, so a failure to open the file is reported on
+# the shell's stderr and the redirect never applies to it. Observed in
+# production on 2026-09-01, before StateDirectory= was installed and while
+# ProtectSystem=strict kept /var/lib read-only -- the alert still went out
+# (fail-open worked) but each one dropped a raw bash error into the journal.
+# Grouping the redirect puts the shell's own message inside the silenced scope.
+_record_state() {
+    { mkdir -p "$state_dir" && printf '%s %s %s\n' "$1" "$2" "$3" > "$state_file"; } \
+        2>/dev/null || true
+}
+
 cooldown_secs="${ALERT_MIN_INTERVAL_SEC:-3600}"
 case "$cooldown_secs" in ''|*[!0-9]*) cooldown_secs=3600 ;; esac
 state_dir="${ALERT_STATE_DIR:-/var/lib/zerogex-alert}"
@@ -109,9 +123,7 @@ elif [ "$cooldown_secs" -gt 0 ]; then
     age=$(( now_epoch - prev_epoch ))
     if [ "${prev_sig:-}" = "$signature" ] && [ "$age" -lt "$cooldown_secs" ]; then
         held=$(( prev_count + 1 ))
-        mkdir -p "$state_dir" 2>/dev/null || true
-        printf '%s %s %s\n' "$prev_epoch" "$signature" "$held" \
-            > "$state_file" 2>/dev/null || true
+        _record_state "$prev_epoch" "$signature" "$held"
         # Logged, never silent: a suppressed alert must still be discoverable
         # in `journalctl -t zerogex-alert` or the cooldown becomes a blindfold.
         echo "zerogex-alert: suppressed — same failure ${age}s into a ${cooldown_secs}s cooldown for ${unit_name} (${held} held)" >&2
@@ -265,6 +277,5 @@ esac
 # on failure. Recording the send here, rather than before it, is what keeps a
 # failed send from opening a cooldown that swallows the retry.
 if [ "$is_recovery" = "no" ] && [ "$cooldown_secs" -gt 0 ]; then
-    mkdir -p "$state_dir" 2>/dev/null || true
-    printf '%s %s 0\n' "$now_epoch" "$signature" > "$state_file" 2>/dev/null || true
+    _record_state "$now_epoch" "$signature" 0
 fi

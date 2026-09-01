@@ -14,6 +14,7 @@ halves — the repeat is held, the new failure is not.
 Drives setup/systemd/zerogex-alert.sh with a fake curl and a scriptable fake
 journalctl, the same harness shape as test_alert_resend.py.
 """
+
 from __future__ import annotations
 
 import json
@@ -75,8 +76,14 @@ class _Harness:
         self.fixture = tmp_path / "journal.txt"
         self.state_dir = tmp_path / "state"
 
-    def run(self, journal_text, *, unit="zerogex-oa-ingestion-freshness.service",
-            reason="systemd unit failed", cooldown="3600"):
+    def run(
+        self,
+        journal_text,
+        *,
+        unit="zerogex-oa-ingestion-freshness.service",
+        reason="systemd unit failed",
+        cooldown="3600",
+    ):
         self.fixture.write_text(journal_text)
         env = dict(os.environ)
         env.update(
@@ -186,16 +193,26 @@ def test_recovery_is_never_suppressed_and_rearms(h):
 # --- it must fail open ------------------------------------------------------
 
 
-def test_an_unusable_state_dir_still_alerts(h):
+def test_an_unusable_state_dir_still_alerts(h, capfd):
     """A cooldown that loses an alert is worse than one that repeats itself.
 
     Uses a path under a non-directory (ENOTDIR) rather than a chmod: CI and
     the deploy box both run this as root, where a mode-500 directory is still
-    writable and the test would prove nothing."""
+    writable and the test would prove nothing.
+
+    It must also fail QUIETLY. `printf > "$f" 2>/dev/null` does not: the SHELL
+    performs the redirection before printf runs, so the open failure is
+    reported on the shell's own stderr and the redirect never covers it.
+    Production logged one raw bash error per alert this way on 2026-09-01,
+    before StateDirectory= was installed.
+    """
     h.state_dir = Path("/dev/null/cannot-exist")
     h.run(STALE_QQQ)
     h.run(STALE_QQQ)
     assert h.sends == 2
+    err = capfd.readouterr().err
+    assert "No such file or directory" not in err, err
+    assert "zerogex-alert.sh: line" not in err, err
 
 
 def test_a_corrupt_state_file_still_alerts(h):
