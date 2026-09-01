@@ -3752,17 +3752,56 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ) q
                 GROUP BY bucket_ts
             ),
-            strike_agg AS (
-                SELECT
-                    gbs.timestamp,
-                    -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
-                    COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_put_gex
-                FROM gex_by_strike gbs
+            -- Every gex_by_strike read below is a LATERAL correlated on the
+            -- bucket representative in ``base``, and that is structural.
+            --
+            -- ``base``/``bucketed`` are optimisation-fence CTEs (multiply
+            -- referenced, so PG materialises them), which hides the
+            -- [start_ts, end_ts] bound from the planner.  Keyed on ``base``
+            -- through a plain join or IN, the intended ~window_units index
+            -- probes were only an intention: under production stats PG
+            -- periodically picks a hash/merge join and reads every row this
+            -- underlying has in gex_by_strike, filtering after.  Same gap that
+            -- put get_strike_profile_timeseries (28a2c33), get_gex_heatmap
+            -- (15cb6c3) and the replay frames read in the timeout log.
+            --
+            -- A redundant window bound would NOT be enough here, for the
+            -- reason 15cb6c3 spells out: the window is not the rep set.
+            -- ``base`` is rn=1, ONE timestamp per bucket out of every snapshot
+            -- inside it, so the window holds ~timeframe/cycle times more
+            -- timestamps than these reads need -- ~1x at 1min but ~390x at
+            -- 1day, and this endpoint accepts timeframe=1day with
+            -- window_units up to 90, which spans essentially the whole
+            -- retention window.  A bound capped at "the window" would there be
+            -- capped at "the table".
+            --
+            -- A lateral reference is evaluated per outer row, and each of
+            -- these carries its own aggregation (and, for the walls, a LIMIT),
+            -- which blocks subquery pull-up -- so PG cannot re-plan any of
+            -- them as a hash/merge join over the window or the table.  The
+            -- window bound rides along as defence in depth.
+            -- MATERIALIZED on all three: each is referenced exactly once in
+            -- the final SELECT, so PG inlines it, and an inlined lateral is
+            -- re-evaluated once per OUTER row -- 26 buckets x 26 = 676 probes
+            -- where 26 are needed, measured at 1day/window_units=90.  Correct
+            -- either way, but it multiplies the read by the bucket count, and
+            -- the whole point of the lateral is that the probe count is
+            -- exactly the rep count.  Materialised, each runs once.
+            strike_agg AS MATERIALIZED (
+                SELECT b.timestamp, agg.total_call_gex, agg.total_put_gex
+                FROM base b
                 CROSS JOIN spot s
-                WHERE gbs.underlying = $1
-                  AND gbs.timestamp IN (SELECT timestamp FROM base)
-                GROUP BY gbs.timestamp
+                CROSS JOIN LATERAL (
+                    SELECT
+                        -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+                        COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_call_gex,
+                        COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_put_gex
+                    FROM gex_by_strike gbs
+                    WHERE gbs.underlying = $1
+                      AND gbs.timestamp = b.timestamp
+                      AND gbs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                            AND (SELECT end_ts FROM bounds)
+                ) agg
             ),
             -- Canonical Call/Put Wall computation (matches src/analytics/walls.py
             -- and /api/gex/strike-profile-timeseries with expirations=all):
@@ -3776,43 +3815,52 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- other consumer.  gex_by_strike is keyed (strike, expiration);
             -- aggregating per-strike is what makes the wall agree with
             -- the cross-expiration view consumers see.
-            call_walls AS (
-                SELECT DISTINCT ON (bucket_ts)
-                    bucket_ts,
-                    strike::numeric AS call_wall
-                FROM (
-                    SELECT
-                        b.bucket_ts,
-                        gbs.strike,
-                        SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma
+            -- DISTINCT ON (bucket_ts) over a grouped scan becomes ORDER BY +
+            -- LIMIT 1 inside the lateral, which is the same pick: ``base`` is
+            -- rn=1, so bucket_ts <-> timestamp is 1:1 and grouping by strike
+            -- within the lateral is identical to grouping by (bucket_ts,
+            -- strike) outside it.  The tie-breakers are carried over exactly
+            -- (call: highest gamma, then LOWEST strike; put: highest gamma,
+            -- then HIGHEST strike), and ``WHERE call_gamma > 0`` on the
+            -- grouped rows is the same filter as HAVING SUM(...) > 0.  A
+            -- bucket where nothing qualifies still yields no row, so the outer
+            -- LEFT JOIN still sees NULL -- CROSS is correct here, unlike the
+            -- replay frames ladder where the row itself had to survive.
+            call_walls AS MATERIALIZED (
+                SELECT b.bucket_ts, w.call_wall
+                FROM base b
+                JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
+                CROSS JOIN LATERAL (
+                    SELECT gbs.strike::numeric AS call_wall
                     FROM gex_by_strike gbs
-                    JOIN base b ON b.timestamp = gbs.timestamp
-                    JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
                     WHERE gbs.underlying = $1
+                      AND gbs.timestamp = b.timestamp
+                      AND gbs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                            AND (SELECT end_ts FROM bounds)
                       AND gbs.strike >= bc.bucket_close
-                    GROUP BY b.bucket_ts, gbs.strike
-                ) per_strike
-                WHERE call_gamma > 0
-                ORDER BY bucket_ts, call_gamma DESC, strike ASC
+                    GROUP BY gbs.strike
+                    HAVING SUM(COALESCE(gbs.call_gamma, 0)) > 0
+                    ORDER BY SUM(COALESCE(gbs.call_gamma, 0)) DESC, gbs.strike ASC
+                    LIMIT 1
+                ) w
             ),
-            put_walls AS (
-                SELECT DISTINCT ON (bucket_ts)
-                    bucket_ts,
-                    strike::numeric AS put_wall
-                FROM (
-                    SELECT
-                        b.bucket_ts,
-                        gbs.strike,
-                        SUM(COALESCE(gbs.put_gamma, 0)) AS put_gamma
+            put_walls AS MATERIALIZED (
+                SELECT b.bucket_ts, w.put_wall
+                FROM base b
+                JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
+                CROSS JOIN LATERAL (
+                    SELECT gbs.strike::numeric AS put_wall
                     FROM gex_by_strike gbs
-                    JOIN base b ON b.timestamp = gbs.timestamp
-                    JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
                     WHERE gbs.underlying = $1
+                      AND gbs.timestamp = b.timestamp
+                      AND gbs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                            AND (SELECT end_ts FROM bounds)
                       AND gbs.strike <= bc.bucket_close
-                    GROUP BY b.bucket_ts, gbs.strike
-                ) per_strike
-                WHERE put_gamma > 0
-                ORDER BY bucket_ts, put_gamma DESC, strike DESC
+                    GROUP BY gbs.strike
+                    HAVING SUM(COALESCE(gbs.put_gamma, 0)) > 0
+                    ORDER BY SUM(COALESCE(gbs.put_gamma, 0)) DESC, gbs.strike DESC
+                    LIMIT 1
+                ) w
             )
             SELECT
                 b.bucket_ts as timestamp,
