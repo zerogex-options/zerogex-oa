@@ -11,6 +11,7 @@ Runs on a configured interval and writes to gex_summary and gex_by_strike tables
 """
 
 import bisect
+import logging
 import os
 import signal
 import threading
@@ -78,6 +79,11 @@ from src.market_calendar import (
 )
 
 logger = get_logger(__name__)
+
+# Underlyings whose AnalyticsEngine startup banner has already been logged at
+# INFO in this process. Per-process, per-symbol: the daemon's one engine per
+# symbol still announces itself, the API's per-request constructions do not.
+_BANNER_LOGGED_FOR: set = set()
 
 # Normalization constant for the inline standard-normal pdf in the BS-gamma
 # hot path (see _calculate_bs_gamma): exp(-d1²/2) / sqrt(2π).
@@ -266,13 +272,24 @@ class AnalyticsEngine:
         )
         self._analytics_flow_cache_refresh_enabled: bool = ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 
-        logger.info(f"Initialized AnalyticsEngine for {underlying}")
-        logger.info(f"Calculation interval: {calculation_interval}s")
-        logger.info(f"Risk-free rate: {risk_free_rate:.4f}")
+        # This banner is per-INSTANCE, and the API constructs an AnalyticsEngine
+        # per request -- ~1,800 an hour measured 2026-09-01, so these four lines
+        # were ~7,000/hour in the API's journal for a daemon startup message.
+        # Log them at INFO the first time a given underlying is seen in this
+        # process, DEBUG after: the analytics daemon builds one engine per
+        # symbol at startup and still gets its full banner, while the API's
+        # repeat constructions say it once.
+        first_time = underlying not in _BANNER_LOGGED_FOR
+        _BANNER_LOGGED_FOR.add(underlying)
+        banner = logging.INFO if first_time else logging.DEBUG
+        logger.log(banner, "Initialized AnalyticsEngine for %s", underlying)
+        logger.log(banner, "Calculation interval: %ss", calculation_interval)
+        logger.log(banner, "Risk-free rate: %.4f", risk_free_rate)
         if not self._analytics_flow_cache_refresh_enabled:
-            logger.info(
+            logger.log(
+                banner,
                 "Analytics legacy flow cache refresh is DISABLED "
-                "(ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false)"
+                "(ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false)",
             )
 
         # Setup signal handlers for clean shutdown of the long-running
@@ -2549,9 +2566,7 @@ class AnalyticsEngine:
         # "into expiration" horizon here.  calculate_time_to_expiration returns
         # the intraday-accurate remainder in years (not 1/365) and 0.0 once
         # past the settlement instant, which the pure function reads as EXPIRED.
-        tau = calculate_time_to_expiration(
-            timestamp, today_et, market_close_time="16:00:00"
-        )
+        tau = calculate_time_to_expiration(timestamp, today_et, market_close_time="16:00:00")
 
         # Representative ATM IV via the engine's established ±band policy
         # (mirrors _store_daily_atm_iv): mean ATM call IV, calls preferred.
@@ -2578,9 +2593,7 @@ class AnalyticsEngine:
             )
             T = tte_cache.get(close_t)
             if T is None:
-                T = calculate_time_to_expiration(
-                    timestamp, today_et, market_close_time=close_t
-                )
+                T = calculate_time_to_expiration(timestamp, today_et, market_close_time=close_t)
                 tte_cache[close_t] = T
             contracts.append(
                 {

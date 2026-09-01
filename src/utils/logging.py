@@ -108,6 +108,41 @@ def _build_handler() -> logging.Handler:
     return handler
 
 
+class _DropExactMessages(logging.Filter):
+    """Drop records whose rendered message matches one of a fixed set."""
+
+    def __init__(self, messages):
+        super().__init__()
+        self._messages = frozenset(messages)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() not in self._messages
+
+
+# uvicorn hands its OWN "uvicorn.error" logger to the websockets server, so
+# every connection logs "connection open" then "connection closed" at INFO
+# under that name. Measured on the API 2026-09-01: ~3,900 lines/hour, the two
+# largest repeated shapes in a 300M journal that held only ~2 hours of history
+# -- which is what left the 2026-08-17 post-mortem with no evening to read.
+#
+# Raising the logger's level is not an option: uvicorn's real errors share it.
+# Drop the two messages by name and nothing else. Matching on message text is
+# admittedly brittle across uvicorn/websockets versions, but it fails SAFE --
+# a renamed message simply comes back, it never silences anything new.
+# QUIET_WEBSOCKET_LOGS=false restores them.
+_UVICORN_WS_CHATTER = ("connection open", "connection closed")
+
+
+def _quiet_third_party_chatter() -> None:
+    if os.getenv("QUIET_WEBSOCKET_LOGS", "true").strip().lower() == "false":
+        return
+    ws_logger = logging.getLogger("uvicorn.error")
+    # Idempotent: _configure_logging can run more than once per process.
+    if any(isinstance(f, _DropExactMessages) for f in ws_logger.filters):
+        return
+    ws_logger.addFilter(_DropExactMessages(_UVICORN_WS_CHATTER))
+
+
 def _configure_logging() -> int:
     """
     Configure the root logger with settings from environment variables.
@@ -136,6 +171,8 @@ def _configure_logging() -> int:
         root.removeHandler(h)
     root.addHandler(_build_handler())
     root.setLevel(log_level)
+
+    _quiet_third_party_chatter()
 
     _logging_configured = True
     return log_level

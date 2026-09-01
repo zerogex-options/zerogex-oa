@@ -1570,10 +1570,17 @@ journal-volume: ## Why journal retention is short: what caps it, and which unit 
 	@echo "$(YELLOW)Oldest entry:$(NC)    $$(journalctl --no-pager -o short-iso 2>/dev/null | head -1 | cut -d' ' -f1-2)"
 	@echo ""
 	@echo "$(YELLOW)Burn rate over the last hour:$(NC)"
-	@for u in $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE) $(API_SERVICE); do \
-	  b=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null | wc -c); \
-	  echo "$$b $$u"; \
-	done | sort -rn | awk '{ printf "  %8.1f MB/h  %s\n", $$1/1048576, $$2 }'
+# Bytes AND lines. The two together say which fix applies: many small lines
+# is a cadence problem (demote a per-cycle log), while few large ones is a
+# message problem (one fat payload logged per request). Bytes alone cannot
+# tell them apart, and journald's own per-entry metadata -- ~200-400 bytes
+# of fields per record -- means line COUNT drives disk more than text size.
+	@for u in $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE); do \
+	  out=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null | wc -lc); \
+	  set -- $$out; echo "$$2 $$1 $$u"; \
+	done | sort -rn \
+	  | awk '{ printf "  %8.1f MB/h  %8d lines/h  %6d B/line  %s\n", \
+	            $$1/1048576, $$2, ($$2 ? $$1/$$2 : 0), $$3 }'
 	@echo ""
 	@echo "$(YELLOW)Noisiest repeated lines, PER UNIT (shape, not text):$(NC)"
 # Per unit, not global: one chatty service otherwise owns every row of a
