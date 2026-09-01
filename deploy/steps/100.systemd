@@ -188,8 +188,14 @@ JOURNALD_DROPIN_DST="/etc/systemd/journald.conf.d/10-zerogex-oa.conf"
 if [ -f "$JOURNALD_DROPIN_SRC" ]; then
     log "  → Installing journald disk cap ($JOURNALD_DROPIN_DST)..."
     sudo install -D -m 0644 "$JOURNALD_DROPIN_SRC" "$JOURNALD_DROPIN_DST"
+    # Read the values back out of the file just installed rather than repeating
+    # them here. This line said "SystemMaxUse=100M" for two raises after the
+    # real cap had moved -- the same drift the drop-in warns about, reporting a
+    # number that had not been true since the 2026-08-17 post-mortem.
+    JOURNALD_CAP="$(sed -n 's/^[[:space:]]*SystemMaxUse=//p' "$JOURNALD_DROPIN_DST" | tail -1)"
+    JOURNALD_KEEP="$(sed -n 's/^[[:space:]]*SystemKeepFree=//p' "$JOURNALD_DROPIN_DST" | tail -1)"
     if sudo systemctl restart systemd-journald 2>/dev/null; then
-        log "     ✓ journald cap applied (SystemMaxUse=100M); $(journalctl --disk-usage 2>/dev/null)"
+        log "     ✓ journald applied (SystemMaxUse=${JOURNALD_CAP:-unset}, SystemKeepFree=${JOURNALD_KEEP:-15% default}); $(journalctl --disk-usage 2>/dev/null)"
     else
         log "     ✗ journald restart failed — cap applies on next journald restart"
     fi

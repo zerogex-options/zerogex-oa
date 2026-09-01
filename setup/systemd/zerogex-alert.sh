@@ -54,6 +54,75 @@ fi
 human_summary="🚨 ZeroGEX: ${reason} — ${unit_name} on ${host} at ${ts}"
 human_message=$(printf '%s\n\nLast 20 journal lines:\n%s' "$human_summary" "$context")
 
+# ---------------------------------------------------------------------------
+# Cooldown
+#
+# A failing oneshot re-fires on its own timer -- the freshness check every ten
+# minutes -- and every firing dispatched. One stale symbol therefore sent ~12
+# emails a day (measured 2026-08-31). Only the pagerduty backend deduplicated,
+# through its dedup_key; every other backend resent blind, which is how a known
+# outage becomes an inbox the operator learns to filter.
+#
+# Suppress a repeat of the SAME failure inside ALERT_MIN_INTERVAL_SEC. "Same"
+# is a signature over the failure-bearing journal lines with numbers flattened,
+# so "QQQ chains stale for 18 min" and the same line ten minutes later at 28
+# min collapse into one incident -- while a SECOND symbol going dark changes
+# the signature and pages immediately. That distinction is the entire point: a
+# plain per-unit timer would swallow the new outage as a duplicate, which is
+# the one failure mode a cooldown must not introduce.
+#
+# Recovery notices never wait, and clear the state so the next failure pages at
+# once.
+#
+# Fails OPEN. Any trouble reading or writing state -- missing directory, no
+# permission, a corrupt line -- sends the alert. A cooldown that loses an alert
+# is worse than one that repeats itself.
+# ---------------------------------------------------------------------------
+cooldown_secs="${ALERT_MIN_INTERVAL_SEC:-3600}"
+case "$cooldown_secs" in ''|*[!0-9]*) cooldown_secs=3600 ;; esac
+state_dir="${ALERT_STATE_DIR:-/var/lib/zerogex-alert}"
+state_file="${state_dir}/$(printf '%s' "$unit_name" | tr -c '[:alnum:]._@-' '_').state"
+
+# Only the failure-bearing lines, numbers flattened, order-independent. An INFO
+# line flipping from "fresh" to "outside its delivery window" as a session
+# closes must not register as a new failure and restart the paging.
+signature="$(printf '%s\n' "$context" \
+    | grep -aiE 'error|critical|fatal|traceback|stale|fail' \
+    | sed -E 's/[0-9]+/N/g' \
+    | sort -u \
+    | sha256sum 2>/dev/null | cut -c1-16 || true)"
+[ -z "$signature" ] && signature="nosig"
+
+now_epoch="$(date +%s)"
+is_recovery=no
+case "$reason" in *recover*) is_recovery=yes ;; esac
+
+if [ "$is_recovery" = "yes" ]; then
+    rm -f "$state_file" 2>/dev/null || true
+elif [ "$cooldown_secs" -gt 0 ]; then
+    prev_epoch=0; prev_sig=""; prev_count=0
+    if [ -r "$state_file" ]; then
+        read -r prev_epoch prev_sig prev_count _ < "$state_file" 2>/dev/null || true
+    fi
+    case "${prev_epoch:-}" in ''|*[!0-9]*) prev_epoch=0 ;; esac
+    case "${prev_count:-}" in ''|*[!0-9]*) prev_count=0 ;; esac
+    age=$(( now_epoch - prev_epoch ))
+    if [ "${prev_sig:-}" = "$signature" ] && [ "$age" -lt "$cooldown_secs" ]; then
+        held=$(( prev_count + 1 ))
+        mkdir -p "$state_dir" 2>/dev/null || true
+        printf '%s %s %s\n' "$prev_epoch" "$signature" "$held" \
+            > "$state_file" 2>/dev/null || true
+        # Logged, never silent: a suppressed alert must still be discoverable
+        # in `journalctl -t zerogex-alert` or the cooldown becomes a blindfold.
+        echo "zerogex-alert: suppressed — same failure ${age}s into a ${cooldown_secs}s cooldown for ${unit_name} (${held} held)" >&2
+        exit 0
+    fi
+    if [ "${prev_sig:-}" = "$signature" ] && [ "$prev_count" -gt 0 ]; then
+        human_message="$(printf '%s\n\n%s identical alert(s) were suppressed during the %ss cooldown.' \
+            "$human_message" "$prev_count" "$cooldown_secs")"
+    fi
+fi
+
 require() {
     local var_name="$1"
     if [ -z "${!var_name:-}" ]; then
@@ -191,3 +260,11 @@ case "$backend" in
         exit 1
         ;;
 esac
+
+# Reached only on a successful dispatch -- every backend exits non-zero above
+# on failure. Recording the send here, rather than before it, is what keeps a
+# failed send from opening a cooldown that swallows the retry.
+if [ "$is_recovery" = "no" ] && [ "$cooldown_secs" -gt 0 ]; then
+    mkdir -p "$state_dir" 2>/dev/null || true
+    printf '%s %s 0\n' "$now_epoch" "$signature" > "$state_file" 2>/dev/null || true
+fi

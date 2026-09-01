@@ -1533,6 +1533,54 @@ logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greek
 	@echo "$(BLUE)=== Searching Analytics Logs ===$(NC)"
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in analytics logs"
 
+.PHONY: journal-volume
+journal-volume: ## Why journal retention is short: what caps it, and which unit burns it
+	@echo "$(BLUE)=== Journal retention ===$(NC)"
+	@echo "$(YELLOW)Root filesystem:$(NC)"; df -h / | tail -1
+	@echo "$(YELLOW)Configured cap:$(NC)  SystemMaxUse=$(JOURNAL_MAX_USE)  (from $(JOURNAL_DROPIN))"
+# journald honours the TIGHTER of SystemMaxUse and SystemKeepFree, and KeepFree
+# defaults to 15% of the filesystem. On a volume already fuller than that,
+# journald trims no matter what the cap says and raising SystemMaxUse buys
+# nothing -- so establish which of the two actually binds before changing either.
+	@avail=$$(df --output=avail -k / | tail -1); \
+	size=$$(df --output=size -k / | tail -1); \
+	keep=$$((size * 15 / 100)); \
+	used=$$(du -sk /var/log/journal 2>/dev/null | cut -f1); used=$${used:-0}; \
+	raw="$(JOURNAL_MAX_USE)"; \
+	case "$$raw" in \
+	  *G|*g) cap=$$(( $${raw%[Gg]} * 1024 * 1024 )) ;; \
+	  *M|*m) cap=$$(( $${raw%[Mm]} * 1024 )) ;; \
+	  *K|*k) cap=$$(( $${raw%[Kk]} )) ;; \
+	  *)     cap=$$(( raw / 1024 )) ;; \
+	esac; \
+	echo "$(YELLOW)Journal usage:$(NC)   $$((used / 1024))M of the $$((cap / 1024))M cap"; \
+	echo "$(YELLOW)KeepFree floor:$(NC)  ~$$((keep / 1024))M (15% of /), free now $$((avail / 1024))M"; \
+	if [ "$$used" -ge $$((cap * 9 / 10)) ]; then \
+	  echo "  $(GREEN)-> SystemMaxUse BINDS: the journal is sitting at its cap.$(NC)"; \
+	  echo "  $(GREEN)   Raising it buys proportional history, if the disk has room.$(NC)"; \
+	elif [ "$$avail" -lt "$$keep" ]; then \
+	  echo "  $(RED)-> KeepFree BINDS: the journal is well under its cap while free space$(NC)"; \
+	  echo "  $(RED)   is below the 15% floor, so journald keeps trimming itself.$(NC)"; \
+	  echo "  $(RED)   Raising SystemMaxUse does NOTHING here. Free disk, set an explicit$(NC)"; \
+	  echo "  $(RED)   SystemKeepFree under 15%, or cut the burn rate shown below.$(NC)"; \
+	else \
+	  echo "  $(GREEN)-> Neither binds: retention is bounded by the burn rate below and the$(NC)"; \
+	  echo "  $(GREEN)   nightly vacuum, not by configuration.$(NC)"; \
+	fi
+	@echo "$(YELLOW)Oldest entry:$(NC)    $$(journalctl --no-pager -o short-iso 2>/dev/null | head -1 | cut -d' ' -f1-2)"
+	@echo ""
+	@echo "$(YELLOW)Burn rate over the last hour:$(NC)"
+	@for u in $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE) $(API_SERVICE); do \
+	  b=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null | wc -c); \
+	  echo "$$b $$u"; \
+	done | sort -rn | awk '{ printf "  %8.1f MB/h  %s\n", $$1/1048576, $$2 }'
+	@echo ""
+	@echo "$(YELLOW)Most repeated messages in the last hour (shape, not text):$(NC)"
+	@journalctl --since "-1h" -o cat --no-pager 2>/dev/null \
+	  | sed -E 's/[0-9]+/N/g' \
+	  | sort | uniq -c | sort -rn | head -5 \
+	  | awk '{ n=$$1; $$1=""; printf "  %7d x %.90s\n", n, substr($$0,2) }'
+
 .PHONY: logs-clear
 logs-clear: ## Interactive log cleanup (prompts; calls logs-clear-noconfirm)
 	@echo "$(RED)⚠️  WARNING: This permanently deletes service journals AND system logs.$(NC)"
@@ -4496,9 +4544,30 @@ alert-template-install: ## Install zerogex-alert@.service template + sample env 
 .PHONY: alert-template-test
 alert-template-test: ## Fire one synthetic alert through the template (verifies dispatcher + backend)
 	@echo "$(BLUE)=== Sending synthetic alert via current ALERT_BACKEND ===$(NC)"
+# Clear the cooldown first, or a smoke test repeated inside
+# ALERT_MIN_INTERVAL_SEC is correctly suppressed and reads as broken wiring.
+	@$(MAKE) --no-print-directory alert-cooldown-reset
 	@sudo systemctl start 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service'
 	@echo "$(GREEN)✅ Triggered. View result:$(NC)"
 	@echo "  journalctl -u 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service' -n 30 --no-pager"
+
+.PHONY: alert-cooldown-reset
+alert-cooldown-reset: ## Forget alert cooldowns so the next failure pages immediately
+	@sudo rm -f /var/lib/zerogex-alert/*.state 2>/dev/null || true
+	@echo "$(GREEN)✅ Alert cooldown state cleared$(NC)"
+
+.PHONY: alert-cooldown-status
+alert-cooldown-status: ## Show which units are inside an alert cooldown, and how many alerts are held
+	@if ! ls /var/lib/zerogex-alert/*.state >/dev/null 2>&1; then \
+		echo "No cooldowns active (no unit has alerted recently)."; \
+	else \
+		now=$$(date +%s); \
+		for f in /var/lib/zerogex-alert/*.state; do \
+			read -r epoch sig held _ < "$$f" || continue; \
+			unit=$$(basename "$$f" .state); \
+			printf '  %-52s last sent %5ss ago, %s held\n' "$$unit" "$$((now - epoch))" "$$held"; \
+		done; \
+	fi
 
 .PHONY: liveness-watch-install
 liveness-watch-install: ## Install the per-minute liveness watchdog (alerts when a critical service is DOWN)
