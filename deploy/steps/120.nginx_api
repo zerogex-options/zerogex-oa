@@ -61,12 +61,49 @@ proxy_cache_path /var/cache/nginx/zerogex levels=1:2 keys_zone=zerogex_cache:10m
                  max_size=200m inactive=30s use_temp_path=off;
 CACHEEOF
 
+log "  → Writing access-log scrubbing format (keeps API keys out of the log)..."
+sudo tee /etc/nginx/conf.d/zerogex-log-scrub.conf > /dev/null <<'LOGEOF'
+# Access-log scrubbing for credential-bearing query strings.
+#
+# /api/v1/levels and /api/v2/levels accept an ``?api_key=`` query parameter in
+# addition to the usual headers (see _QUERY_KEY_PATH_PREFIXES in
+# src/api/security.py) because the Sierra Chart charting study makes its
+# requests through an ACSIL call that cannot attach request headers. The
+# default `combined` format logs $request verbatim, so without this every
+# poll from that study would write a live API key into
+# /var/log/nginx/access.log — and into anything shipping that file onward.
+#
+# This redacts the value and keeps the rest of the query string, because
+# symbol and strikes are most of what makes the log worth having. The map is
+# a pass-through for any URI that carries no api_key, so it costs nothing on
+# the rest of the surface.
+#
+# The sibling case is /ws, whose ticket JWT rides in ?ticket= and which turns
+# access_log off entirely (see deploy/steps/130.ssl). Scrubbing is used here
+# rather than `off` because the levels routes are ordinary traffic we want to
+# keep counting.
+map $request_uri $zerogex_logged_uri {
+    default                                 $request_uri;
+    "~^(?<pre>.*)api_key=[^&]*(?<post>.*)$" "${pre}api_key=REDACTED${post}";
+}
+
+log_format zerogex_scrubbed '$remote_addr - $remote_user [$time_local] '
+                            '"$request_method $zerogex_logged_uri $server_protocol" '
+                            '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+LOGEOF
+
 log "  → Creating HTTP-only nginx bootstrap configuration for ${DOMAIN_NAME}..."
 sudo tee "$NGINX_SITE" > /dev/null <<EOF
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN_NAME};
+
+    # Redacts ?api_key= before it reaches the log — see the header comment in
+    # /etc/nginx/conf.d/zerogex-log-scrub.conf, written above. Applied on the
+    # bootstrap block too so a deploy that stops before 130.ssl (or runs with
+    # SKIP_CERTBOT=1) still never logs a key in the clear.
+    access_log /var/log/nginx/access.log zerogex_scrubbed;
 
     # ACME challenge path for certbot
     location /.well-known/acme-challenge/ {
