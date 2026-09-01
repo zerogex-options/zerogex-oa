@@ -49,11 +49,20 @@ class SignalEngineService:
         # failed refresh never blocks the signal cycle (handled internally).
         pattern_calibration.maybe_refresh()
         unified_ok = self.unified_engine.run_cycle()
-        logger.info(
+        # DEBUG, not INFO: this is a heartbeat on a ONE-SECOND loop, so at INFO
+        # it is ~3,600 identical lines an hour per symbol and says nothing a
+        # healthy system needs said. A cycle that FAILS still logs loudly in
+        # run(); liveness is answered by the freshness check, which reads the
+        # data rather than the log.
+        logger.debug(
             "SignalEngineService cycle [%s] complete | unified=%s",
             self.underlying,
             unified_ok,
         )
+        if not unified_ok:
+            # A cycle that returns False wrote nothing. Rare, and the one form
+            # of this line worth an operator's attention.
+            logger.warning("SignalEngineService cycle [%s] returned no result", self.underlying)
 
     def run(self) -> None:
         self.running = True

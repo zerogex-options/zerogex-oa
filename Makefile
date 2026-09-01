@@ -1575,12 +1575,18 @@ journal-volume: ## Why journal retention is short: what caps it, and which unit 
 	  echo "$$b $$u"; \
 	done | sort -rn | awk '{ printf "  %8.1f MB/h  %s\n", $$1/1048576, $$2 }'
 	@echo ""
-	@echo "$(YELLOW)Most repeated messages in the last hour (shape, not text):$(NC)"
-	@journalctl --since "-1h" -o cat --no-pager 2>/dev/null \
-	  | sed -E 's/[0-9]+/N/g' \
-	  | sort | uniq -c | sort -rn | head -5 \
-	  | awk '{ n=$$1; $$1=""; printf "  %7d x %.90s\n", n, substr($$0,2) }'
-
+	@echo "$(YELLOW)Noisiest repeated lines, PER UNIT (shape, not text):$(NC)"
+# Per unit, not global: one chatty service otherwise owns every row of a
+# global top-N and hides the unit actually burning the most. The 2026-09-01
+# run showed five signals lines while the API, at 4x the volume, never
+# appeared -- its bytes are spread across many distinct shapes.
+	@for u in $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE); do \
+	  echo "  $(BLUE)$$u$(NC)"; \
+	  journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null \
+	    | sed -E 's/[0-9]+/N/g' \
+	    | sort | uniq -c | sort -rn | head -3 \
+	    | awk '{ n=$$1; $$1=""; printf "    %7d x %.86s\n", n, substr($$0,2) }'; \
+	done
 .PHONY: logs-clear
 logs-clear: ## Interactive log cleanup (prompts; calls logs-clear-noconfirm)
 	@echo "$(RED)⚠️  WARNING: This permanently deletes service journals AND system logs.$(NC)"
