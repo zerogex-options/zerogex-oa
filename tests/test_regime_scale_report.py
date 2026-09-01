@@ -40,31 +40,21 @@ def _chain(rng, n, tail_p=0.0, tail_x=1.0, drift=0.0):
 
 
 # --------------------------------------------------------------------------- #
-# The median-absolute candidate
+# The candidate set
 # --------------------------------------------------------------------------- #
-class TestMedianAbsScale:
-    def test_agrees_with_the_others_on_gaussian_data(self):
+class TestCandidates:
+    def test_grades_the_estimator_that_actually_ships(self):
+        """The report is worthless if it drifts from the product: whichever
+        candidate is marked in use has to BE the z-score denominator."""
+        assert tool.IN_USE in tool.CANDIDATES
         rng = random.Random(5)
-        sample = [rng.gauss(0, 1) for _ in range(4000)]
-        assert tool.median_abs_scale(sample) == pytest.approx(rs.stdev(sample), rel=0.05)
+        sample = [rng.gauss(0, 1) * (7.0 if rng.random() < 0.1 else 1.0) for _ in range(400)]
+        assert tool.CANDIDATES[tool.IN_USE](sample) == rs.robust_scale(sample)
 
-    def test_is_unmoved_by_how_large_the_largest_sessions_are(self):
-        """The property that separates it from a mean-based scale: a median
-        does not care how far out the tail goes, only how many are in it."""
-        ordinary = [1.0, -1.0, 1.2, -1.2, 0.8, -0.8, 1.1, -1.1, 0.9, -0.9]
-        with_tail = ordinary + [500.0, -500.0]
-
-        assert tool.median_abs_scale(with_tail) == pytest.approx(
-            tool.median_abs_scale(ordinary), rel=0.15
-        )
-        # ...where both of the shipped candidates move a lot.
-        assert rs.stdev(with_tail) > 30 * rs.stdev(ordinary)
-        assert rs.robust_scale(with_tail) > 5 * rs.robust_scale(ordinary)
-
-    def test_has_no_scale_when_nothing_moved(self):
-        assert tool.median_abs_scale([]) is None
-        assert tool.median_abs_scale([1.0]) is None
-        assert tool.median_abs_scale([0.0, 0.0, 0.0, 0.0]) is None
+    def test_grades_every_estimator_that_has_shipped(self):
+        """Including the superseded ones, so the choice can be re-checked
+        against a longer history instead of trusted from a commit message."""
+        assert set(tool.CANDIDATES) == {"stdev", "mean_abs", "median_abs"}
 
 
 # --------------------------------------------------------------------------- #
