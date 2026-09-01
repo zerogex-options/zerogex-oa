@@ -228,6 +228,41 @@ def _basis(ratio=1.0067):
     )
 
 
+def test_wall_ladder_strikes_move_with_the_primary_wall():
+    """C2/C3 must land on the same axis as the Call Wall they sit beside.
+
+    The ladder is a list of nested objects, so it only projects because the
+    walker recurses into lists of dicts and ``strike`` is an allowlisted price
+    field.  If that ever regressed, an ES chart would draw ``C1`` on the
+    futures axis and ``C2`` on the cash-index axis — the two-incompatible-axes
+    failure this module exists to prevent, and harder to spot because both
+    numbers look plausible.
+    """
+    basis = _basis()
+    out = project_payload(
+        {
+            "call_wall": 6700.0,
+            "put_wall": 6500.0,
+            "call_walls": [
+                {"rank": 1, "label": "C1", "strike": 6700.0, "strength": 1.2e9},
+                {"rank": 2, "label": "C2", "strike": 6750.0, "strength": 8.0e8},
+            ],
+            "put_walls": [{"rank": 1, "label": "P1", "strike": 6500.0, "strength": 9.0e8}],
+        },
+        basis,
+    )
+
+    # Rank 1 stays exactly the primary wall after projection, on both sides.
+    assert out["call_walls"][0]["strike"] == out["call_wall"]
+    assert out["put_walls"][0]["strike"] == out["put_wall"]
+    # Deeper ranks move by the same basis.
+    assert out["call_walls"][1]["strike"] == basis.project(6750.0)
+    # Rank, label and the dollar magnitude are not price space — untouched.
+    assert out["call_walls"][1]["rank"] == 2
+    assert out["call_walls"][1]["label"] == "C2"
+    assert out["call_walls"][1]["strength"] == 8.0e8
+
+
 def test_levels_move_to_the_futures_axis():
     basis = _basis()
     out = project_payload(

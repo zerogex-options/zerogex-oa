@@ -13,7 +13,10 @@ class _FakeConn:
         self.row = row
         self.calls = 0
 
-    async def fetchrow(self, _query, _symbol):
+    async def fetchrow(self, _query, *_args):
+        # *_args, not a fixed (_query, _symbol): callers bind a varying number
+        # of parameters (get_latest_gex_summary also passes the wall-ladder
+        # depth), and this fake only cares that a fetch happened.
         self.calls += 1
         return self.row
 
