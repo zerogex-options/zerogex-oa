@@ -146,6 +146,12 @@ server {
     listen [::]:443 ssl http2;
     server_name ${DOMAIN_NAME};
 
+    # Redacts ?api_key= before it reaches the log — the levels routes accept
+    # a key in the query string for the Sierra Chart study, which cannot send
+    # headers. Defined in /etc/nginx/conf.d/zerogex-log-scrub.conf; the map
+    # behind it passes every other URI through untouched.
+    access_log /var/log/nginx/access.log zerogex_scrubbed;
+
     ssl_certificate ${OA_TLS_CERT};
     ssl_certificate_key ${OA_TLS_KEY};
 

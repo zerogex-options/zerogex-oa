@@ -9,6 +9,34 @@ from typing import Dict, List, Optional
 from decimal import Decimal
 
 
+class WallLevel(BaseModel):
+    """One rung of the Call/Put Wall ladder (``C1``/``C2``/``P1``/``P2``…).
+
+    Produced by :func:`src.analytics.walls.compute_wall_ladder`, which ranks
+    the eligible strikes on each side of spot by aggregated dollar gamma.
+    Rank 1 is by construction the canonical Call/Put Wall — the same value
+    the sibling ``call_wall`` / ``put_wall`` scalar carries — so a client can
+    draw the ladder without the primary wall ever disagreeing with it.
+
+    ``label`` ships from the server (``C1``, ``P2``, …) so every surface —
+    chart page, dashboard widget, any future export — spells a wall the same
+    way instead of each re-deriving the name.  ``strength`` is the dollar
+    gamma at the strike on the canonical ``γ × 100 × S² × 0.01`` scale,
+    letting a client dim or size a marker by how much book is actually there.
+    """
+
+    rank: int
+    label: str
+    strike: Decimal
+    strength: Optional[Decimal] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+        }
+
+
 class GEXSummary(BaseModel):
     timestamp: datetime
     symbol: str
@@ -44,6 +72,16 @@ class GEXSummary(BaseModel):
     max_pain: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
+    # Ranked wall ladders — the OPTIONAL secondary/tertiary walls (C2/C3,
+    # P2/P3) charts can draw beside the primary.  ``call_walls[0]`` is the
+    # same strike as ``call_wall`` above (both come from the one ranking in
+    # :mod:`src.analytics.walls`), so the two can never disagree; a client
+    # that only wants the headline wall keeps reading the scalar and ignores
+    # these.  Shorter than the requested depth when the chain has fewer
+    # eligible strikes on that side, and empty when the side has no wall at
+    # all — render what arrives, never pad.
+    call_walls: List[WallLevel] = Field(default_factory=list)
+    put_walls: List[WallLevel] = Field(default_factory=list)
     # GEX King — the strike carrying the largest |net dealer gamma| with the
     # per-strike totals aggregated across ALL expirations (the SpotGamma /
     # SqueezeMetrics convention; see ``_calculate_gex_summary``).  Whole-chain
@@ -648,6 +686,11 @@ class StrikeProfileBucket(BaseModel):
     the pin columns shipped; a ``None`` pin is drawn as no line, never as
     ``0``.
 
+    ``call_walls`` / ``put_walls`` are the ranked ladders (``C1``/``C2``/…,
+    ``P1``/``P2``/…) behind the optional secondary-wall levels, computed from
+    the same rows and the same ``close`` as the scalars, so they follow the
+    ``expirations`` filter identically and rank 1 equals the scalar.
+
     ``strikes`` is the per-strike payload; one row per strike
     available in this bucket's snapshot universe (after the optional
     expiration filter).
@@ -662,6 +705,11 @@ class StrikeProfileBucket(BaseModel):
     gamma_flip: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
+    # Ranked ladders for this bucket, computed from the same rows and the
+    # same bucket ``close`` as the scalars above, so they follow the
+    # ``expirations`` filter identically and rank 1 equals the scalar.
+    call_walls: List[WallLevel] = Field(default_factory=list)
+    put_walls: List[WallLevel] = Field(default_factory=list)
     pin_strike: Optional[Decimal] = None
     # DOUBLE PRECISION in gex_summary (a 0..1 ratio, not a price), so it
     # stays a float rather than joining the NUMERIC price fields above —

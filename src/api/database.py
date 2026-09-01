@@ -17,8 +17,11 @@ import logging
 import json
 
 from src.analytics.walls import (
-    compute_call_put_walls,
+    DEFAULT_WALL_LADDER_DEPTH,
+    align_wall_ladder,
     compute_gamma_flip_from_strikes,
+    compute_wall_ladder,
+    wall_label,
 )
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
@@ -1892,16 +1895,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                  AND gbs.timestamp = ls.timestamp
                 JOIN latest_quote lq ON TRUE
             ),
-            -- Canonical Call Wall fallback: max call-gamma strike at-or-above
-            -- spot, tiebreaker nearest-to-spot (lowest strike above spot).
-            -- Only used when gex_summary.call_wall is NULL.  Aggregates
-            -- ``call_gamma`` across expirations per strike — gex_by_strike
-            -- is keyed (strike, expiration), and ranking per-row picks the
-            -- single largest-expiration outlier, disagreeing with the
-            -- cross-expiration view consumers see.  Matches
-            -- ``compute_call_put_walls`` in src/analytics/walls.py.
-            fallback_call_wall AS (
-                SELECT strike::numeric AS call_wall
+            -- Canonical Call Wall ladder: call-gamma strikes at-or-above spot
+            -- ranked strongest-first, tiebreaker nearest-to-spot (lowest
+            -- strike above spot).  Rank 1 is the Call Wall — used as the
+            -- fallback when gex_summary.call_wall is NULL — and ranks 2..N
+            -- are the optional secondary walls (C2/C3) the charts can draw.
+            -- One CTE serves both so the headline wall and the ladder can
+            -- never be ranked on different bases.
+            --
+            -- Aggregates ``call_gamma`` across expirations per strike —
+            -- gex_by_strike is keyed (strike, expiration), and ranking
+            -- per-row picks the single largest-expiration outlier,
+            -- disagreeing with the cross-expiration view consumers see.
+            -- Matches ``compute_wall_ladder`` in src/analytics/walls.py.
+            ranked_call_walls AS (
+                SELECT
+                    strike::numeric AS strike,
+                    call_gamma,
+                    ROW_NUMBER() OVER (ORDER BY call_gamma DESC, strike ASC) AS rn
                 FROM (
                     SELECT gbs.strike, SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma
                     FROM gex_by_strike gbs
@@ -1913,14 +1924,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     GROUP BY gbs.strike
                 ) per_strike
                 WHERE call_gamma > 0
-                ORDER BY call_gamma DESC, strike ASC
-                LIMIT 1
             ),
-            -- Canonical Put Wall fallback: max put-gamma strike at-or-below
-            -- spot, tiebreaker nearest-to-spot (highest strike below spot).
-            -- Cross-expiration aggregation (see fallback_call_wall above).
-            fallback_put_wall AS (
-                SELECT strike::numeric AS put_wall
+            -- Canonical Put Wall ladder: put-gamma strikes at-or-below spot,
+            -- tiebreaker nearest-to-spot (highest strike below spot).
+            -- Cross-expiration aggregation (see ranked_call_walls above).
+            ranked_put_walls AS (
+                SELECT
+                    strike::numeric AS strike,
+                    put_gamma,
+                    ROW_NUMBER() OVER (ORDER BY put_gamma DESC, strike DESC) AS rn
                 FROM (
                     SELECT gbs.strike, SUM(COALESCE(gbs.put_gamma, 0)) AS put_gamma
                     FROM gex_by_strike gbs
@@ -1932,8 +1944,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     GROUP BY gbs.strike
                 ) per_strike
                 WHERE put_gamma > 0
-                ORDER BY put_gamma DESC, strike DESC
-                LIMIT 1
+            ),
+            -- Top-$2 ranks collapsed to parallel arrays (rank-ordered), so the
+            -- whole ladder rides back on this query's single row.  Plain
+            -- arrays rather than JSON: asyncpg decodes them natively, with no
+            -- codec registration and no per-request JSON parse.
+            call_wall_ladder AS (
+                SELECT
+                    COALESCE(array_agg(strike ORDER BY rn), ARRAY[]::numeric[]) AS strikes,
+                    COALESCE(array_agg(call_gamma ORDER BY rn), ARRAY[]::numeric[]) AS gammas
+                FROM ranked_call_walls
+                WHERE rn <= $2
+            ),
+            put_wall_ladder AS (
+                SELECT
+                    COALESCE(array_agg(strike ORDER BY rn), ARRAY[]::numeric[]) AS strikes,
+                    COALESCE(array_agg(put_gamma ORDER BY rn), ARRAY[]::numeric[]) AS gammas
+                FROM ranked_put_walls
+                WHERE rn <= $2
             )
             SELECT
                 ls.timestamp,
@@ -1954,8 +1982,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.local_gex,
                 ls.convexity_risk,
                 ls.max_pain,
-                COALESCE(ls.stored_call_wall, fcw.call_wall) AS call_wall,
-                COALESCE(ls.stored_put_wall,  fpw.put_wall)  AS put_wall,
+                COALESCE(ls.stored_call_wall, fcw.strike) AS call_wall,
+                COALESCE(ls.stored_put_wall,  fpw.strike)  AS put_wall,
+                -- Ranked ladders behind the optional C2/C3 · P2/P3 levels.
+                -- Assembled into WallLevel dicts below, where rank 1 is also
+                -- pinned to the call_wall / put_wall reported above.
+                cwl.strikes AS call_wall_ladder_strikes,
+                cwl.gammas  AS call_wall_ladder_gammas,
+                pwl.strikes AS put_wall_ladder_strikes,
+                pwl.gammas  AS put_wall_ladder_gammas,
                 -- GEX King — largest |net GEX| strike aggregated across ALL
                 -- expirations (argmax_strike |sum_expirations net_gex|, written
                 -- by ``_calculate_gex_summary``).  Nullable, and deliberately
@@ -1978,14 +2013,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             FROM latest_summary ls
             JOIN latest_quote lq ON TRUE
             JOIN strike_totals st ON TRUE
-            LEFT JOIN fallback_call_wall fcw ON TRUE
-            LEFT JOIN fallback_put_wall  fpw ON TRUE
+            LEFT JOIN (SELECT strike FROM ranked_call_walls WHERE rn = 1) fcw ON TRUE
+            LEFT JOIN (SELECT strike FROM ranked_put_walls  WHERE rn = 1) fpw ON TRUE
+            JOIN call_wall_ladder cwl ON TRUE
+            JOIN put_wall_ladder  pwl ON TRUE
         """
 
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
+                row = await conn.fetchrow(query, symbol, DEFAULT_WALL_LADDER_DEPTH)
                 payload = dict(row) if row else None
+                if payload is not None:
+                    self._attach_wall_ladders(payload)
                 self._cache_set(
                     cache_key,
                     payload,
@@ -1995,6 +2034,57 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
             raise
+
+    @staticmethod
+    def _attach_wall_ladders(payload: Dict[str, Any]) -> None:
+        """Turn the summary query's ladder arrays into ``WallLevel`` dicts.
+
+        The query returns each side as two rank-ordered arrays (strikes and
+        their aggregated gamma).  Here they become the
+        ``{rank, label, strike, strength}`` shape
+        :class:`src.api.models.WallLevel` serialises, with gamma converted to
+        dollar GEX per 1% move on the canonical ``× 100 × S² × 0.01`` scale —
+        the same units ``compute_wall_ladder`` produces, so a ladder read off
+        ``/api/gex/summary`` and one read off a strike-profile bucket are
+        directly comparable.
+
+        Rank 1 is then pinned to the ``call_wall`` / ``put_wall`` this row
+        actually reports (see
+        :func:`src.analytics.walls.align_wall_ladder` for when those can
+        differ), so no client can draw ``C1`` at one price and "Call Wall" at
+        another.  Mutates ``payload`` in place and drops the raw array keys.
+        """
+        spot = payload.get("spot_price")
+        try:
+            spot_f = float(spot) if spot is not None else 0.0
+        except (TypeError, ValueError):
+            spot_f = 0.0
+        # Same scale factor the analytics writer and compute_wall_ladder use.
+        dollar_scale = 100.0 * spot_f * spot_f * 0.01
+
+        for side, primary_key in (("call", "call_wall"), ("put", "put_wall")):
+            strikes = payload.pop(f"{side}_wall_ladder_strikes", None) or []
+            gammas = payload.pop(f"{side}_wall_ladder_gammas", None) or []
+            ladder: List[Dict[str, Any]] = []
+            for rank, strike in enumerate(strikes, start=1):
+                gamma = gammas[rank - 1] if rank - 1 < len(gammas) else None
+                ladder.append(
+                    {
+                        "rank": rank,
+                        "label": wall_label(side, rank),
+                        "strike": float(strike),
+                        "strength": (
+                            abs(float(gamma) * dollar_scale) if gamma is not None else None
+                        ),
+                    }
+                )
+            primary = payload.get(primary_key)
+            payload[f"{side}_walls"] = align_wall_ladder(
+                ladder,
+                float(primary) if primary is not None else None,
+                side,
+                DEFAULT_WALL_LADDER_DEPTH,
+            )
 
     async def get_latest_forced_flow(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """Latest persisted forced-flow snapshot (levels + close-charm headline).
@@ -2279,7 +2369,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             per_strike AS (
                 -- Aggregate across expirations so one strike = one row, the
-                -- same cross-expiration basis compute_call_put_walls uses.
+                -- same cross-expiration basis compute_wall_ladder uses.
                 SELECT
                     g.strike,
                     SUM(COALESCE(g.call_gamma, 0)) AS call_gamma,
@@ -4232,7 +4322,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Walls follow the request's expiration scope.  Each bucket's
         ``call_wall`` / ``put_wall`` is computed live from the same
         (filtered, summed-by-strike) gamma rows the bucket's bars
-        render — via :func:`src.analytics.walls.compute_call_put_walls`,
+        render — via :func:`src.analytics.walls.compute_wall_ladder`,
         the single source of record — against the bucket's own
         close.  This guarantees the wall always sits at the strike the
         bars say it should: with ``expirations=None`` walls are the
@@ -4375,7 +4465,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             -- Walls aren't read from gex_summary here — they're computed
             -- in Python below from each bucket's expiration-filtered
-            -- strikes via compute_call_put_walls.  That keeps the wall
+            -- strikes via compute_wall_ladder.  That keeps the wall
             -- consistent with the bars rendered in the same bucket
             -- (e.g. ``expirations=2026-06-13`` → walls scoped to 2026-06-13
             -- gamma only) and routes every consumer through one helper.
@@ -4589,7 +4679,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 grouped: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
 
                 # Raw per-strike gamma rows for the bucket currently being
-                # read, used as input to compute_call_put_walls.  Kept
+                # read, used as input to compute_wall_ladder.  Kept
                 # separate from the response ``strikes`` list because that
                 # list ships dollar-GEX quantities (and the put values are
                 # sign-flipped) — the wall helper needs the unsigned summed
@@ -4636,9 +4726,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     bucket = grouped[ts]
                     close_val = bucket.get("close")
                     if close_val is not None and inputs:
-                        cw, pw = compute_call_put_walls(inputs, float(close_val))
-                        bucket["call_wall"] = cw
-                        bucket["put_wall"] = pw
+                        # One ranked pass serves both the scalar walls and the
+                        # optional C2/C3 · P2/P3 ladder, so rank 1 IS the
+                        # bucket's Call/Put Wall by construction — no
+                        # alignment step is needed here (unlike the summary
+                        # path, which reports an engine-persisted wall against
+                        # a separately-recomputed ladder).
+                        call_walls, put_walls = compute_wall_ladder(
+                            inputs, float(close_val), DEFAULT_WALL_LADDER_DEPTH
+                        )
+                        bucket["call_walls"] = call_walls
+                        bucket["put_walls"] = put_walls
+                        bucket["call_wall"] = call_walls[0]["strike"] if call_walls else None
+                        bucket["put_wall"] = put_walls[0]["strike"] if put_walls else None
                     if exp_filter is not None:
                         bucket["gamma_flip"] = (
                             compute_gamma_flip_from_strikes(inputs, float(close_val))
@@ -4671,9 +4771,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "pin_strike": r["pin_strike"],
                             "pin_confidence": r["pin_confidence"],
                             # Filled in below, after the bucket's strikes
-                            # are known.
+                            # are known.  The ladders stay empty lists (never
+                            # null) so a client can iterate unconditionally.
                             "call_wall": None,
                             "put_wall": None,
+                            "call_walls": [],
+                            "put_walls": [],
                             "strikes": [],
                         }
                         grouped[ts] = bucket

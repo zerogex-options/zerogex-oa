@@ -42,6 +42,32 @@ rewrites at any layer.
 Requests with an invalid or missing key return `401 Unauthorized` with
 `WWW-Authenticate: Bearer`.
 
+### `?api_key=` on the levels routes only
+
+`/api/v1/levels/*` and `/api/v2/levels/*` — and **nothing else** — additionally
+accept the key as an `api_key` query parameter:
+
+```
+GET /api/v1/levels/ES?strikes=1&api_key=<your-key>
+```
+
+This exists for charting platforms that physically cannot send a request
+header. The Sierra Chart study is the caller it was added for: the ACSIL HTTP
+call that is portable across Sierra Chart versions, `sc.MakeHTTPRequest(URL)`,
+is a bare GET with no header support, so a header-only endpoint is unreachable
+from that platform.
+
+**Use a header if you can.** A credential in a URL is materially weaker: every
+proxy in the path sees it, access logs record it by default (ours redact it —
+see `deploy/steps/120.nginx_api`), and it survives in `Referer`. A header
+always wins when both are present, so a stale URL parameter cannot downgrade a
+caller that sends one.
+
+The allowlist is deliberately narrow and is pinned by
+`tests/test_api_query_key_auth.py`: the levels endpoints return derived,
+redistributable analytics only, and no endpoint serving raw per-contract
+quotes, flow, or key administration will accept a credential in a URL.
+
 Two key types are supported, validated against the same headers:
 
 - **Per-user keys** *(primary)* — long-lived keys issued via the admin
@@ -284,8 +310,8 @@ upstream can change.
 | `option_chain` | `/api/option/*`, `/api/market/open-interest` | 60 s | 60 s (to 16:15 only) | — |
 | `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
 | `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
-| `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
-| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 15 s | 60 s | — |
+| `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
+| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
 | `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
@@ -314,9 +340,15 @@ chains (SPX, NDX) stop at 16:00 with the index they price, and every chain
 stops at the early close on a half day.
 
 Cadence describes how often a new observation can be **stored**, not how
-often ingestion polls. The quote tape is polled every few seconds but written
-in 60-second buckets, so 60 s is the fastest a new value can appear; VIX/VXN
-are 5-minute bars.
+often ingestion polls, and not how fast the producing engine loops. The quote
+tape is polled every few seconds but written in 60-second buckets, so 60 s is
+the fastest a new value can appear. VIX/VXN and the whole of `/api/flow/*` are
+5-minute bars. The signal engine loops about once a second, but a score is
+stamped with the underlying-quote timestamp it read, so it cannot be fresher
+than that same 60-second bucket.
+
+Poll faster than the cadence if you like — it is cheap against the cache — but
+expect `aging` between stores. That band is normal, not a warning.
 
 **ES and NQ are graded on the CME calendar**, not the NYSE one — they trade
 Sunday 18:00 to Friday 17:00 ET. A futures symbol therefore reports

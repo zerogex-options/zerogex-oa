@@ -70,6 +70,17 @@ def _sample_bucket(ts: str, strike: float = 505.0) -> dict:
         "gamma_flip": 510.0,
         "call_wall": 515.0,
         "put_wall": 505.0,
+        # Ranked ladders behind the optional C2/C3 · P2/P3 levels.  Rank 1
+        # repeats the scalar wall above by construction (one ranking pass in
+        # src.analytics.walls produces both).
+        "call_walls": [
+            {"rank": 1, "label": "C1", "strike": 515.0, "strength": 1.2e9},
+            {"rank": 2, "label": "C2", "strike": 520.0, "strength": 8.0e8},
+        ],
+        "put_walls": [
+            {"rank": 1, "label": "P1", "strike": 505.0, "strength": 9.0e8},
+            {"rank": 2, "label": "P2", "strike": 500.0, "strength": 4.0e8},
+        ],
         "pin_strike": 512.0,
         "pin_confidence": 0.61,
         "strikes": [
@@ -118,6 +129,8 @@ def test_response_shape_is_list_of_buckets(monkeypatch: pytest.MonkeyPatch):
         "gamma_flip",
         "call_wall",
         "put_wall",
+        "call_walls",
+        "put_walls",
         "pin_strike",
         "pin_confidence",
         "strikes",
@@ -160,6 +173,52 @@ def test_buckets_with_no_strikes_serialize_with_empty_array(monkeypatch: pytest.
     body = response.json()
     assert len(body) == 1
     assert body[0]["strikes"] == []
+
+
+def test_wall_ladders_serialize_and_lead_with_the_scalar_wall(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """C1/P1 must be the bucket's own call_wall / put_wall.
+
+    Charts draw the ladder next to the primary wall line; if rank 1 could
+    describe a different strike the two levels would contradict each other on
+    the same axis.
+    """
+    client, _ = _build_app_with_mocked_method(
+        monkeypatch, returns=[_sample_bucket("2026-06-08T14:30:00+00:00")]
+    )
+    with client:
+        response = client.get("/api/gex/strike-profile-timeseries?symbol=SPY")
+
+    assert response.status_code == 200, response.text
+    bucket = response.json()[0]
+
+    assert [w["label"] for w in bucket["call_walls"]] == ["C1", "C2"]
+    assert [w["label"] for w in bucket["put_walls"]] == ["P1", "P2"]
+    assert bucket["call_walls"][0]["strike"] == bucket["call_wall"]
+    assert bucket["put_walls"][0]["strike"] == bucket["put_wall"]
+    # Decimals arrive as plain JSON numbers, same as every other price field.
+    assert isinstance(bucket["call_walls"][1]["strike"], float)
+    assert bucket["call_walls"][1]["strike"] == 520.0
+    assert isinstance(bucket["call_walls"][0]["strength"], float)
+
+
+def test_wall_ladders_default_to_empty_lists(monkeypatch: pytest.MonkeyPatch):
+    """A bucket with no walls serializes [] — never null.
+
+    The clients iterate the ladder unconditionally.
+    """
+    bucket = _sample_bucket("2026-06-08T14:30:00+00:00")
+    bucket.pop("call_walls")
+    bucket.pop("put_walls")
+    client, _ = _build_app_with_mocked_method(monkeypatch, returns=[bucket])
+    with client:
+        response = client.get("/api/gex/strike-profile-timeseries?symbol=SPY")
+
+    assert response.status_code == 200
+    body = response.json()[0]
+    assert body["call_walls"] == []
+    assert body["put_walls"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +265,7 @@ def test_expirations_comma_list_passed_through(monkeypatch: pytest.MonkeyPatch):
     client, mock = _build_app_with_mocked_method(monkeypatch, returns=[])
     with client:
         response = client.get(
-            "/api/gex/strike-profile-timeseries"
-            "?symbol=SPY&expirations=2026-06-19,2026-06-20"
+            "/api/gex/strike-profile-timeseries" "?symbol=SPY&expirations=2026-06-19,2026-06-20"
         )
 
     assert response.status_code == 200

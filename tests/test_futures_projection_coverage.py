@@ -44,6 +44,7 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         # --- dollar exposures and notionals -------------------------------
         "gex",
         "exposure",
+        "strength",  # WallLevel: dollar gamma at a C1/C2/P1/P2 wall strike
         "net_gamma",
         "call_gamma",
         "put_gamma",
@@ -143,6 +144,7 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "profiles",
         "span_used",
         "now_index",  # positional index into the session, not an index level
+        "rank",  # WallLevel: 1/2/3 position on the wall ladder, not a level
         # --- time and bookkeeping -----------------------------------------
         "available_max_dte",
         "available_strike_count",

@@ -856,6 +856,15 @@ MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS = max(
 # Time Bucket Size
 AGGREGATION_BUCKET_SECONDS = _getenv_int("AGGREGATION_BUCKET_SECONDS", 60)  # 1 minute
 
+# Options-flow aggregates are keyed to FIVE-minute bucket starts, not to
+# AGGREGATION_BUCKET_SECONDS. database.get_flow and get_flow_series both floor
+# their windows to 300, and flow_by_contract rows are stored on that grid.
+# Named here because the v2 freshness envelope publishes it as a cadence
+# contract: it was advertising the 60s bucket, which no flow row can meet, so
+# a healthy feed read `stale` for half of every bar. Not operator-tunable —
+# the bucket grid is baked into the stored rows.
+FLOW_BAR_SECONDS = 300
+
 # Buffer Flush Settings
 MAX_BUFFER_SIZE = _getenv_int("MAX_BUFFER_SIZE", 1000)  # flush if buffer exceeds
 BUFFER_FLUSH_INTERVAL = _getenv_int("BUFFER_FLUSH_INTERVAL", 60)  # seconds
