@@ -22,13 +22,37 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from src.api.database import DatabaseManager
 from src.api.identity import ANONYMOUS, resolve_end_user
 from src.api.scopes import SIGNALS
-from src.api.security import require_scopes
+from src.api.security import require_admin, require_scopes
 from src.tradeworkz import config as tw_config
 from src.tradeworkz.trend import build_trend
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tradeworkz", tags=["TradeWorkz"])
+
+# Gate for every ``/admin/*`` route on this router.
+#
+# These operate the whole bot fleet — provision, capital changes,
+# reset-fleet, simulate/clear, inject-test-event — and read fleet-wide
+# positions and trades. They were reachable on ``require_scopes(SIGNALS)``
+# alone, which is not an admin gate: ``signals`` is an ordinary customer
+# scope bundled into TIER_SIGNALS, and ``require_scopes`` is deliberately
+# lenient — it grants a wildcard ``*`` key, grants everyone when
+# ``API_SCOPE_ENFORCEMENT`` is off, and grants the static break-glass key
+# outright (``info is None``). Any of those reached POST /admin/reset-fleet.
+#
+# ``require_admin`` is the unconditional gate the credential-minting routers
+# already use (``admin_api_keys``, ``admin_xpost``): a matching
+# ``X-Admin-Token`` on top of a valid API key, failing closed with 503 when
+# the secret is unprovisioned. main.py states the principle this router was
+# missing — an admin surface "must not ride on the lenient data-plane
+# scopes".
+#
+# The scope check stays underneath as defence in depth. Note this deliberately
+# does NOT cover ``/internal/*`` on this router: those are called by the
+# notification job, which has no admin token to send.
+# ``tests/test_tradeworkz_admin_gate.py`` asserts both halves of that.
+_ADMIN_GATE = [Depends(require_admin), Depends(require_scopes(SIGNALS))]
 
 
 def get_db() -> DatabaseManager:
@@ -797,7 +821,7 @@ async def my_feed(
 
 @router.post(
     "/admin/provision",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_provision(db: DatabaseManager = Depends(get_db)) -> Dict[str, Any]:
     """Seed the default bot roster + capital sleeves (idempotent).
@@ -816,7 +840,7 @@ async def admin_provision(db: DatabaseManager = Depends(get_db)) -> Dict[str, An
 
 @router.patch(
     "/admin/bots/{bot_id}",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_update_bot(
     bot_id: str,
@@ -845,7 +869,7 @@ async def admin_update_bot(
 
 @router.patch(
     "/admin/bots/{bot_id}/capital",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_update_capital(
     bot_id: str,
@@ -869,7 +893,7 @@ async def admin_update_capital(
 
 @router.post(
     "/admin/simulate",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_simulate(
     body: Dict[str, Any] = Body(default_factory=dict),
@@ -910,7 +934,7 @@ async def admin_simulate(
 
 @router.post(
     "/admin/simulate/clear",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_simulate_clear(
     body: Dict[str, Any] = Body(default_factory=dict),
@@ -933,7 +957,7 @@ async def admin_simulate_clear(
 
 @router.post(
     "/admin/reset-fleet",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_reset_fleet(
     body: Dict[str, Any] = Body(default_factory=dict),
@@ -962,7 +986,7 @@ async def admin_reset_fleet(
 
 @router.get(
     "/admin/positions",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_positions(
     db: DatabaseManager = Depends(get_db),
@@ -1067,7 +1091,7 @@ async def admin_positions(
 
 @router.get(
     "/admin/trades",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_trades(
     origin: str = Query(default="all", pattern="^(all|live|simulate)$"),
@@ -1289,7 +1313,7 @@ async def admin_trades(
 
 @router.post(
     "/admin/inject-test-event",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_inject_test_event(
     body: Dict[str, Any] = Body(...),
@@ -1408,7 +1432,7 @@ async def admin_inject_test_event(
 
 @router.get(
     "/admin/diagnose",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def admin_diagnose() -> Dict[str, Any]:
     """Explain per-bot why an entry did or did not fire on the current tick.

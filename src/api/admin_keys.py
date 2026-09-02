@@ -130,22 +130,28 @@ async def _list(user_id: Optional[str], active_only: bool) -> int:
             return "-"
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+    # ``scopes`` is what decides which endpoints a key reaches, so it belongs
+    # in the listing: it was selected but never shown, which made
+    # `api-keys-list | grep <scope>` look like a clean audit while matching
+    # nothing. An empty list prints "-" rather than blank.
     headers = (
         "id",
         "user_id",
         "name",
         "prefix",
+        "scopes",
         "state",
         "created_at (UTC)",
         "last_used_at (UTC)",
     )
-    aligns = (">", "<", "<", "<", "<", "<", "<")
+    aligns = (">", "<", "<", "<", "<", "<", "<", "<")
     cells = [
         (
             str(r["id"]),
             r["user_id"],
             r["name"],
             r["prefix"],
+            ",".join(r["scopes"] or []) or "-",
             "revoked" if r["revoked_at"] else "active",
             _fmt_utc(r["created_at"]),
             _fmt_utc(r["last_used_at"]),
