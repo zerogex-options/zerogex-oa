@@ -938,6 +938,7 @@ help: ## Show this help message
 	@echo "  make api-keys-create USER=<id> NAME=<label> - Issue a per-user API key"
 	@echo "  make api-keys-list [USER=<id>] [ACTIVE=yes] - List per-user API keys"
 	@echo "  make api-keys-revoke ID=<n>    - Revoke a per-user API key"
+	@echo "  make api-caller-report [IP=<ip>] [USER=<id>] - Which key is a caller using?"
 	@echo "  make db-maintain-install - Install daily DB maintenance timer (prune + vacuum)"
 	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
 	@echo "  make normalizer-cache-status  - Show normalizer-refresh timer status + recent log"
@@ -3827,6 +3828,39 @@ api-keys-revoke: ## Revoke a per-user API key (ID=<numeric id from api-keys-list
 		exit 1; \
 	fi
 	@$(VENV_PYTHON) -m src.api.admin_keys revoke "$(ID)"
+
+# -----------------------------------------------------------------------------
+# Who is calling the API? (src/tools/api_caller_report.py)
+# -----------------------------------------------------------------------------
+# Neither log answers this alone: nginx's access.log has the client IP and
+# User-Agent but no credential (the zerogex_scrubbed format in
+# deploy/steps/120.nginx_api logs no key and rewrites ?api_key= to REDACTED),
+# while the API's audit line has the key identity. The report reads both.
+#
+# Runs under sudo because reading another unit's journal and
+# /var/log/nginx/access.log both need it. --preserve-env=HOME keeps ~/.pgpass
+# pointing at the invoking user's home so the api_keys enrichment can still
+# resolve DB credentials (resolve_db_credentials reads the .pgpass line
+# matching the DB_* target); without it sudo would look in root's home and the
+# report would silently degrade to "api_keys lookup unavailable".
+#
+# `subst` cannot take a literal comma inside a function call's argument list,
+# so IP=a,b and ID=1,2 need this to expand into repeated flags.
+COMMA := ,
+
+.PHONY: api-caller-report
+api-caller-report: ## Which API key is a caller using? Vars: IP=<ip[,ip]> USER=<owner> ID=<key id> UA=<substring> HOURS=2 JSON=<path> NO_DB=yes
+	@echo "$(BLUE)=== API caller attribution ===$(NC)"
+	@sudo --preserve-env=HOME $(VENV_PYTHON) -m src.tools.api_caller_report \
+		--hours $(or $(HOURS),2) \
+		$(foreach i,$(subst $(COMMA), ,$(IP)),--ip "$(i)") \
+		$(if $(KEY_USER),--user "$(KEY_USER)") \
+		$(foreach k,$(subst $(COMMA), ,$(ID)),--key-id "$(k)") \
+		$(if $(UA),--ua-contains "$(UA)") \
+		$(if $(UNIT),--unit "$(UNIT)") \
+		$(if $(ACCESS_LOG),--access-log "$(ACCESS_LOG)") \
+		$(if $(NO_DB),--no-db) \
+		$(if $(JSON),--json "$(JSON)")
 
 .PHONY: db-maintain-install
 db-maintain-install: ## Install daily DB maintenance timer (prune old data + vacuum)

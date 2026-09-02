@@ -10,9 +10,9 @@ RequestIdMiddleware
 
 AuditLogMiddleware
     Emits exactly one structured ``src.api.audit`` line per HTTP request
-    with method, path, status, the resolved caller/end-user identity
-    (set on ``request.state.identity`` by the auth dependency), and the
-    wall-clock duration. Pure-ASGI, same as above. Registered so that
+    with method, path, status, the client IP, the resolved caller/end-user
+    identity (set on ``request.state.identity`` by the auth dependency),
+    and the wall-clock duration. Pure-ASGI, same as above. Registered so that
     ``RequestIdMiddleware`` stays *outermost* — the request-id contextvar
     is still set when the audit line is emitted — while this middleware
     still wraps routing, so it observes the identity resolved during
@@ -73,6 +73,32 @@ class RequestIdMiddleware:
             request_id_var.reset(token)
 
 
+def _audit_token(value: object) -> str:
+    """Render one audit field as a single whitespace-free token.
+
+    The audit line is space-separated ``key=value`` pairs precisely so it
+    stays greppable/awk-able straight out of ``journalctl`` with no real
+    parser. Two of the fields are free text — ``caller_name`` is an
+    operator-chosen label (``make api-keys-create NAME=...``) and
+    ``end_user_id`` is a ``sub`` from the BFF's token — so either could
+    carry a space and silently shift every field after it for a positional
+    reader. Collapsing internal whitespace to ``_`` keeps every field
+    exactly one token. Empty and ``None`` both render as ``-`` for the same
+    reason: a blank value would leave ``key=`` followed by a space.
+
+    Lengths are already bounded upstream by the schema (``api_keys.name``
+    is VARCHAR(128), ``user_id`` VARCHAR(128)) and by the signed token, so
+    values are not truncated here — a truncated identifier is worse than a
+    long one when the whole point of the line is attribution.
+    """
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    if not text:
+        return "-"
+    return "_".join(text.split())
+
+
 class AuditLogMiddleware:
     """Pure-ASGI per-request audit logging.
 
@@ -80,6 +106,39 @@ class AuditLogMiddleware:
     stashed on ``request.state`` (mirrored into ``scope["state"]``), and
     emits one ``src.api.audit`` line. Every observation runs inside a
     guarded ``finally`` — auditing must never break or slow a response.
+
+    The line records ``client_ip`` alongside the key identity so "which key
+    is this IP using" is a grep rather than a correlation exercise. It used
+    to be the latter: nginx's access log has the IP but no credential (the
+    ``zerogex_scrubbed`` format in ``deploy/steps/120.nginx_api`` logs no
+    key and rewrites any ``?api_key=`` to REDACTED), while this line had the
+    credential but no IP — so attributing a caller meant joining the two
+    logs on (second, method, path, status), which is ambiguous whenever two
+    clients hit the same path in the same second.
+
+    ``client_ip`` is read from ``scope["client"]``, which is the real client
+    address only because uvicorn's ProxyHeadersMiddleware rewrites it from
+    ``X-Forwarded-For`` (``proxy_headers`` defaults on, trusting
+    ``127.0.0.1``, and nginx sets the header and proxies from localhost —
+    see ``deploy/steps/120.nginx_api``). Were the API ever fronted directly,
+    or ``--no-proxy-headers`` passed, this would degrade to the proxy's own
+    address rather than lie about a different client.
+
+    ``caller_key_id`` and ``caller_name`` distinguish *which* of an owner's
+    keys is in use, which is what a rotation or a revocation needs to
+    target — ``caller_user_id`` alone only identifies the account.
+
+    COST: the three added fields are ~61 bytes on a representative line, or
+    about 40% more per request (154 -> 215 bytes), and this line is emitted
+    once per request. The journal is capped at 300M shared across all four
+    zerogex units and vacuumed nightly
+    (``setup/systemd/zerogex-oa-journald.conf``), and API log volume has
+    already had to be cut once to keep useful history — see the header of
+    ``tests/test_api_log_volume.py``. At 50k requests/hour this costs ~3
+    MB/h. If that retention ever matters more than self-describing lines,
+    ``caller_name`` is the field to drop first: it is recoverable from
+    ``caller_key_id`` via the ``api_keys`` table, which is exactly what
+    ``src/tools/api_caller_report.py`` does.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -104,21 +163,26 @@ class AuditLogMiddleware:
             try:
                 duration_ms = (time.perf_counter() - start) * 1000.0
                 identity = (scope.get("state") or {}).get("identity")
-                caller_kind = getattr(identity, "caller_kind", "anonymous")
-                caller_user_id = getattr(identity, "caller_user_id", None)
-                end_user_id = getattr(identity, "end_user_id", None)
+                # scope["client"] is a (host, port) tuple, or None for a
+                # transport that has no peer (ASGI test harnesses).
+                client = scope.get("client")
+                client_ip = client[0] if client else None
                 _audit_logger.info(
-                    "api_request method=%s path=%s status=%s caller_kind=%s "
-                    "caller_user_id=%s end_user_id=%s duration_ms=%.1f",
+                    "api_request method=%s path=%s status=%s client_ip=%s "
+                    "caller_kind=%s caller_user_id=%s caller_key_id=%s "
+                    "caller_name=%s end_user_id=%s duration_ms=%.1f",
                     scope.get("method", "-"),
                     # An ES/NQ request is routed to its backing index, but the
                     # audit trail must record what the caller actually asked
                     # for (FuturesProjectionMiddleware stashes it).
                     scope.get("zerogex_original_path") or scope.get("path", "-"),
                     captured["status"],
-                    caller_kind,
-                    caller_user_id or "-",
-                    end_user_id or "-",
+                    _audit_token(client_ip),
+                    _audit_token(getattr(identity, "caller_kind", "anonymous")),
+                    _audit_token(getattr(identity, "caller_user_id", None)),
+                    _audit_token(getattr(identity, "caller_key_id", None)),
+                    _audit_token(getattr(identity, "caller_name", None)),
+                    _audit_token(getattr(identity, "end_user_id", None)),
                     duration_ms,
                 )
             except Exception:

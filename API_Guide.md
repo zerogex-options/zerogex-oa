@@ -171,9 +171,44 @@ async def example(identity: RequestIdentity = Depends(current_identity)):
     ...
 ```
 
-Every request also emits one structured line on the `src.api.audit`
-logger: `api_request method=… path=… status=… caller_kind=…
-caller_user_id=… end_user_id=… duration_ms=…`.
+**Audit trail.** Every request emits one structured line on the
+`src.api.audit` logger (into the journal, under `zerogex-oa-api`):
+
+```
+api_request method=… path=… status=… client_ip=… caller_kind=…
+caller_user_id=… caller_key_id=… caller_name=… end_user_id=… duration_ms=…
+```
+
+Values are always single whitespace-free tokens — internal whitespace is
+collapsed to `_` and absent values render as `-` — so the line stays
+parseable with `grep`/`awk` straight out of `journalctl`.
+
+This is the **only** record that ties a key to a request: nginx's access
+log is deliberately credential-free (its `zerogex_scrubbed` format logs no
+key and rewrites any `?api_key=` to `REDACTED`), so `client_ip` here is
+what makes "which key is this IP using" answerable. `caller_key_id` and
+`caller_name` say *which* of an owner's keys was used, which is what a
+rotation or revocation has to target.
+
+To read it, use `make api-caller-report` (see
+`src/tools/api_caller_report.py`), which joins these lines against the
+access log's User-Agents and enriches them from the `api_keys` table:
+
+```bash
+make api-caller-report IP=23.115.8.132        # who is this IP?
+make api-caller-report USER=alice@example.com HOURS=12
+make api-caller-report UA=NT8 JSON=/tmp/callers.json
+```
+
+Note that `client_ip` is the real client address only because uvicorn's
+`ProxyHeadersMiddleware` rewrites it from `X-Forwarded-For` (on by default,
+trusting `127.0.0.1`, which is where nginx proxies from). Serving the API
+without that proxy in front would record the proxy's own address instead.
+
+`status=0` on a line means the handler raised and no response had started
+when the audit ran — the client still receives the `500` that Starlette's
+outer error middleware synthesizes. Ordinary 4xx/5xx responses (including
+`HTTPException`) record their real status.
 
 **Identity-keyed rate limiting.** A global dependency (`src.api.ratelimit`)
 can throttle per end-user (falling back to caller, then client IP — see
