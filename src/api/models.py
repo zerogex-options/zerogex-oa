@@ -117,6 +117,33 @@ class GEXSummary(BaseModel):
         }
 
 
+class PinStabilityResponse(BaseModel):
+    """What the Pin Strike has *done* during the session.
+
+    The third question in the reading order — regime, then confidence, then
+    stability — and the only one the API could not previously answer.  A pin
+    that has held one strike since the open and a pin that has migrated thirty
+    points are different signals wearing the same label; without this a drifting
+    pin reads as a level that failed rather than one tracking a repricing book.
+
+    ``held_since`` is when the CURRENT value took hold; ``net_migration`` is
+    signed (negative = the pin has walked down).  Sample counts, not minutes:
+    the analytics cycle is ~60s but is not guaranteed to be, so the honest unit
+    is "stored frames".  Null-bodied (``stability`` omitted) when the session
+    carried no active pin at all — hide, don't zero.
+    """
+
+    symbol: str
+    current_pin: float
+    held_since: datetime
+    held_samples: int
+    session_open_pin: float
+    net_migration: float
+    distinct_values: int
+    quiet_samples: int
+    total_samples: int
+
+
 class GEXByStrike(BaseModel):
     timestamp: datetime
     symbol: str

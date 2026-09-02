@@ -28,9 +28,11 @@ from .scopes import FLOW, GEX, MARKET_RAW, MARKET_REFERENCE, MAXPAIN, SIGNALS, T
 from .security import api_key_auth, key_store, require_scopes
 from .usage import usage_meter
 from .quote_broadcaster import QuoteBroadcaster, set_broadcaster
+from src.analytics.pin_stability import build_pin_stability
 from .routers import websockets as ws_router
 from .models import (
     GEXSummary,
+    PinStabilityResponse,
     GEXByStrike,
     GEXProfile,
     GEXHistoricalContext,
@@ -663,6 +665,29 @@ async def get_gex_summary(symbol: str = Query(default="SPY")):
     if not data:
         raise HTTPException(status_code=404, detail="No GEX data available")
     return GEXSummary(**data)
+
+
+@app.get(
+    "/api/gex/pin-stability",
+    response_model=PinStabilityResponse,
+    tags=["GEX"],
+    dependencies=[_scope_gex],
+)
+@handle_api_errors("GET /api/gex/pin-stability")
+async def get_pin_stability(symbol: str = Query(default="SPY")):
+    """How stable the Pin Strike has been across the current session.
+
+    Kept off ``/api/gex/summary`` on purpose: that endpoint is a single-row
+    read on a hot cached path, and folding a whole-session scan into it would
+    make every chart poll pay for a figure that changes at most once a minute.
+    404 when the session carries no active pin at any point — the client then
+    shows nothing rather than a zeroed record.
+    """
+    frames = await _db().get_pin_path_for_session(symbol)
+    stability = build_pin_stability(frames)
+    if stability is None:
+        raise HTTPException(status_code=404, detail="No pin activity for this session")
+    return PinStabilityResponse(symbol=symbol.upper(), **stability.to_dict())
 
 
 @app.get(

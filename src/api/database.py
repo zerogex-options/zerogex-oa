@@ -2086,6 +2086,79 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 DEFAULT_WALL_LADDER_DEPTH,
             )
 
+    async def get_pin_path_for_session(self, symbol: str = "SPY") -> List[Dict[str, Any]]:
+        """The most recent session's per-minute Pin Strike path.
+
+        Feeds :func:`src.analytics.pin_stability.build_pin_stability`, which
+        turns the path into "held 7730 since 09:41, -30 pts today".  Returns
+        chronological ``{timestamp, pin_strike}`` rows for the cash session
+        (09:30-16:00 ET), or ``[]`` when there is nothing to read.
+
+        The session is anchored on the LATEST stored row's ET date rather than
+        on "today", so the read is correct after the bell, over a weekend and
+        on a holiday without needing a market calendar: whatever session the
+        engine last wrote for is the session a trader is looking at.
+
+        Deliberately two indexed round trips rather than one.  Resolving the
+        date inside SQL would mean filtering on
+        ``(timestamp AT TIME ZONE 'America/New_York')::date``, which is not
+        sargable -- the planner would drop the (underlying, timestamp) index
+        and scan the whole DATA_RETENTION_DAYS window, so the read would get
+        slower every day the table grows.  Converting in Python and bounding
+        by explicit UTC timestamps keeps both probes on the index.  Same
+        structural reasoning as ``get_gex_frames_for_session``.
+        """
+        symbol = symbol.upper()
+        cache_key = f"pin_path:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        try:
+            async with self._acquire_connection() as conn:
+                latest_ts = await conn.fetchval(
+                    """
+                    SELECT timestamp FROM gex_summary
+                    WHERE underlying = $1
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    symbol,
+                )
+                if latest_ts is None:
+                    self._cache_set(cache_key, [], self._analytics_cache_ttl_seconds)
+                    return []
+
+                utc = ZoneInfo("UTC")
+                session_date = latest_ts.astimezone(_ET).date()
+                start_utc = datetime.combine(
+                    session_date, time(9, 30), tzinfo=_ET
+                ).astimezone(utc)
+                # +1 minute so the 16:00 row itself is included.
+                end_utc = datetime.combine(
+                    session_date, time(16, 1), tzinfo=_ET
+                ).astimezone(utc)
+
+                rows = await conn.fetch(
+                    """
+                    SELECT timestamp, pin_strike
+                    FROM gex_summary
+                    WHERE underlying = $1
+                      AND timestamp >= $2
+                      AND timestamp < $3
+                    ORDER BY timestamp
+                    """,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                )
+                payload = [dict(r) for r in rows]
+                self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+                return payload
+        except Exception as e:
+            logger.warning("get_pin_path_for_session(%s) failed: %s", symbol, e)
+            return []
+
     async def get_latest_forced_flow(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """Latest persisted forced-flow snapshot (levels + close-charm headline).
 
