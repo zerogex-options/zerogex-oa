@@ -2421,7 +2421,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                        gamma_flip_point, gamma_flip_raw, gamma_flip_span_used,
                        flip_distance, max_pain, call_wall, put_wall,
                        total_call_oi, total_put_oi, put_call_ratio,
-                       pin_strike, pin_score, pin_confidence, pin_strike_reason
+                       pin_strike, pin_score, pin_confidence, pin_strike_reason,
+                       max_gamma_strike
                 FROM gex_summary
                 WHERE underlying = $1
                   AND timestamp <= $2
@@ -2452,7 +2453,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 f.pin_strike,
                 f.pin_score,
                 f.pin_confidence,
-                f.pin_strike_reason
+                f.pin_strike_reason,
+                f.max_gamma_strike
             FROM frame f
         """
         try:
@@ -2925,6 +2927,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT gs.timestamp, gs.gamma_flip_point AS gamma_flip,
                        gs.call_wall, gs.put_wall, gs.max_pain,
                        gs.pin_strike, gs.pin_confidence,
+                       gs.max_gamma_strike,
                        (SELECT uq.close::numeric
                           FROM underlying_quotes uq
                          WHERE uq.symbol = $1
@@ -2944,6 +2947,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.max_pain,
                 s.pin_strike,
                 s.pin_confidence,
+                s.max_gamma_strike,
                 ladder.strike,
                 ladder.net_gex,
                 ladder.call_gex,
@@ -3060,6 +3064,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "max_pain": r["max_pain"],
                     "pin_strike": r["pin_strike"],
                     "pin_confidence": r["pin_confidence"],
+                    "max_gamma_strike": r["max_gamma_strike"],
                     "strikes": [],
                 }
             if r["strike"] is not None:
@@ -4488,7 +4493,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.timestamp AS rep_ts,
                     gs.gamma_flip_point AS gamma_flip,
                     gs.pin_strike,
-                    gs.pin_confidence
+                    gs.pin_confidence,
+                    -- GEX King as of the bucket's close.  Whole-chain like the
+                    -- pin, so it is carried straight through rather than
+                    -- recomputed under an expirations filter.
+                    gs.max_gamma_strike
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                     AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
@@ -4633,6 +4642,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 br.gamma_flip,
                 br.pin_strike,
                 br.pin_confidence,
+                br.max_gamma_strike,
                 s.strike,
                 -- Raw summed gamma at this (bucket, strike) — used by the
                 -- Python wall computation below.  Not exposed in the
@@ -4770,6 +4780,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             # rather than a zero.
                             "pin_strike": r["pin_strike"],
                             "pin_confidence": r["pin_confidence"],
+                            # GEX King as of the bucket's close.  Like the pin
+                            # it is never recomputed in _finalize_bucket: it is
+                            # whole-chain by definition and must not move with
+                            # the expirations filter.  None on buckets predating
+                            # the column — consumers draw no line for None.
+                            "max_gamma_strike": r["max_gamma_strike"],
                             # Filled in below, after the bucket's strikes
                             # are known.  The ladders stay empty lists (never
                             # null) so a client can iterate unconditionally.
