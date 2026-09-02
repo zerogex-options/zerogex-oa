@@ -23,12 +23,16 @@ TWO MODES, PICKED AUTOMATICALLY
               per-request fact.
     legacy  — audit lines predate that field (an API that has not been
               restarted since the change). Falls back to joining the two
-              logs on (second, method, path, status). That key is ambiguous
-              whenever two clients hit the same path in the same second, so
-              ambiguous requests are DISCARDED rather than guessed at, and
-              the report says how many were dropped. Absence of evidence for
-              an IP in legacy mode means "could not attribute", never "not
-              authenticated".
+              logs on (second, method, path, status), keeping only keys that
+              pair 1:1 — one access-log row and one audit record. Everything
+              else is DISCARDED rather than guessed at, and the report says
+              how many were dropped. Absence of evidence for an IP in legacy
+              mode means "could not attribute", never "not authenticated".
+
+              Expect most requests to drop on a busy window: popular paths
+              collide constantly, and the website BFF bypasses nginx
+              altogether so its audit lines have no row to pair with. A
+              restart, which puts client_ip on the line, is the real fix.
 
 READ-ONLY. Runs SELECTs against ``api_keys`` and reads logs; changes nothing.
 
@@ -236,25 +240,42 @@ def attribute(
         return out, "direct", len(audit) - len(out)
 
     # Legacy: join on (second, method, path, status), keeping only keys that
-    # exactly one client IP produced.
+    # pair 1:1 — exactly one access-log row AND exactly one audit record.
+    #
+    # Uniqueness on the nginx side alone is NOT enough, and assuming it was
+    # produced a real false attribution: the website BFF calls uvicorn at
+    # 127.0.0.1 directly, bypassing nginx entirely
+    # (deploy/API_BEHIND_CLOUDFLARE.md), so its requests emit an audit line
+    # with no access-log row of their own. Matching only on the nginx side
+    # let such a line adopt whichever unrelated client owned the sole row for
+    # that second — reporting website traffic, end-user tokens and all, at an
+    # external customer's residential IP. Any audit record with no row of its
+    # own can do this, so the count must balance on both sides.
+    rows_by_key: Counter = Counter()
     ips_by_key: Dict[str, set] = defaultdict(set)
     for row in access:
         key = _join_key(row["_when"], row["method"], row["path"], row["status"])
+        rows_by_key[key] += 1
         ips_by_key[key].add(row["ip"])
+
+    audit_by_key: Counter = Counter()
+    for rec in audit:
+        audit_by_key[
+            _join_key(rec["_when"], rec["method"], rec["path"], rec.get("status", ""))
+        ] += 1
 
     out = []
     dropped = 0
     for rec in audit:
         key = _join_key(rec["_when"], rec["method"], rec["path"], rec.get("status", ""))
-        candidates = ips_by_key.get(key)
-        if not candidates or len(candidates) != 1:
-            # Either no matching access-log row, or two clients collided on
-            # this key. Both are "unknown", and a coin flip between two real
-            # customers is worse than saying so.
+        if rows_by_key.get(key) != 1 or audit_by_key[key] != 1:
+            # No matching row, two clients collided on this key, or more
+            # requests reached the API than nginx saw. All are "unknown", and
+            # a coin flip between two real customers is worse than saying so.
             dropped += 1
             continue
         enriched = dict(rec)
-        enriched["ip"] = next(iter(candidates))
+        enriched["ip"] = next(iter(ips_by_key[key]))
         out.append(enriched)
     return out, "legacy", dropped
 
@@ -458,8 +479,16 @@ def render(report: List[Dict[str, Any]], mode: str, dropped: int, window: str) -
             )
         others = entry.get("other_keys_for_owner") or []
         if others:
+            # In legacy mode caller_key_id is unknown, so these are not
+            # "other" keys — they are every key the owner has, one of which
+            # served these requests.
+            label = (
+                "  owner's keys (pre-restart lines do not record which was used): "
+                if entry["caller_key_id"] == "-"
+                else "  owner's other keys: "
+            )
             lines.append(
-                "  owner's other keys: "
+                label
                 + ", ".join(
                     f"{k['name']} (id {k['id']}, " f"{'revoked' if k['revoked'] else 'active'})"
                     for k in others
@@ -532,6 +561,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         wanted_users = set(args.user)
         attributed = [r for r in attributed if r.get("caller_user_id") in wanted_users]
     if args.key_id:
+        if mode == "legacy":
+            print(
+                "--key-id cannot match: audit lines written before the API last "
+                "restarted\ncarry no caller_key_id. Filter by --user instead, or "
+                "restart the API so\nthe field starts being recorded.",
+                file=sys.stderr,
+            )
+            return 2
         wanted_keys = {str(k) for k in args.key_id}
         attributed = [r for r in attributed if r.get("caller_key_id") in wanted_keys]
 

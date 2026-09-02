@@ -200,6 +200,15 @@ make api-caller-report USER=alice@example.com HOURS=12
 make api-caller-report UA=NT8 JSON=/tmp/callers.json
 ```
 
+Until the API restarts, those lines carry no `client_ip` and the tool falls
+back to joining the two logs on (second, method, path, status), keeping only
+keys that pair 1:1. Expect most requests to drop on a busy window: popular
+paths collide constantly, and the website BFF talks to uvicorn at
+`127.0.0.1:8000` directly (`deploy/API_BEHIND_CLOUDFLARE.md`) so its audit
+lines have no access-log row to pair with at all. **Restart the API to get
+real attribution** — the fallback is a stopgap for reading history that was
+already written, not a substitute.
+
 Note that `client_ip` is the real client address only because uvicorn's
 `ProxyHeadersMiddleware` rewrites it from `X-Forwarded-For` (on by default,
 trusting `127.0.0.1`, which is where nginx proxies from). Serving the API
