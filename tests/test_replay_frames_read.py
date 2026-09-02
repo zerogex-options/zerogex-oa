@@ -222,6 +222,7 @@ def test_a_minute_with_no_strikes_still_becomes_a_frame():
                 "max_pain": 600.0,
                 "pin_strike": 600.0,
                 "pin_confidence": 0.4,
+                "max_gamma_strike": 511.0,
                 "strike": None,
                 "net_gex": None,
                 "call_gex": None,
