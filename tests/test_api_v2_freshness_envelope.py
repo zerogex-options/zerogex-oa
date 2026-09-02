@@ -1205,3 +1205,82 @@ def test_the_symbol_actually_reaches_build_freshness_through_a_real_request(
         assert c.get("/api/v2/levels/NQ").status_code == 200
 
     assert seen == ["ES", "NQ"], f"symbol did not reach build_freshness: {seen}"
+
+
+# ---------------------------------------------------------------------------
+# The guide is the contract document — it must not drift from the code
+# ---------------------------------------------------------------------------
+
+
+def _guide_cadence_rows():
+    """(profile name, regular cell, extended cell) from API_Guide.md's table."""
+    from pathlib import Path
+
+    txt = Path("API_Guide.md").read_text()
+    start = txt.index("| Profile | Endpoints |")
+    block = txt[start : txt.index("\nA dash means", start)]
+    rows = []
+    for line in block.splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        rows.append((cells[0].strip("`"), cells[2], cells[3]))
+    assert rows, "cadence table not found — this guard is watching nothing"
+    return rows
+
+
+def _cell_seconds(cell):
+    """Parse a table cell like '60 s' or '5 min'. None for a dash.
+
+    A trailing parenthetical qualifier is allowed and ignored — option_chain
+    reads "60 s (to 16:15 only)", where the figure is the cadence and the
+    note is the window. The window itself is checked by the day sweep in
+    test_feed_windows_across_a_day.py; this only pins the number.
+    """
+    import re
+
+    cell = cell.strip()
+    if cell in ("—", ""):
+        return None
+    m = re.match(r"([\d.]+)\s*(s|min)\b", cell)
+    return None if m is None else float(m.group(1)) * (60 if m.group(2) == "min" else 1)
+
+
+def test_the_guide_cadence_table_matches_the_profiles():
+    """API_Guide.md is what an integrator reads and builds alert thresholds
+    from — a published contract, not commentary. Retune a profile without
+    touching the table and the number a customer works to is silently wrong,
+    which is the same class of failure as the envelope itself disagreeing with
+    the feed. Two of these numbers were quoted to an integrator by email.
+
+    ``daily_cycle`` states its cadence as prose spanning both columns ("one
+    per trading session") because it ages in sessions rather than seconds;
+    that row is checked for the prose, not a figure.
+    """
+    for name, regular, extended in _guide_cadence_rows():
+        profile = fr.CADENCE_PROFILES.get(name)
+        assert profile is not None, f"the guide documents a profile the code does not have: {name}"
+
+        if profile.session_scoped:
+            assert "session" in regular.lower(), (
+                f"{name} ages in trading sessions; its guide row should say so "
+                f"rather than quoting {regular!r} in seconds"
+            )
+            continue
+
+        assert _cell_seconds(regular) == profile.regular_seconds, (
+            f"{name}: the guide advertises a regular cadence of {regular!r}, "
+            f"the code publishes {profile.regular_seconds}"
+        )
+        assert _cell_seconds(extended) == profile.extended_seconds, (
+            f"{name}: the guide advertises an extended cadence of {extended!r}, "
+            f"the code publishes {profile.extended_seconds}"
+        )
+
+
+def test_every_profile_is_documented():
+    """A profile absent from the table is one no integrator can plan around —
+    which is how option_chain's 09:30-16:15 window would have gone unpublished
+    while it changed the verdict on three endpoints for nine hours a day."""
+    documented = {name for name, _, _ in _guide_cadence_rows()}
+    assert not sorted(set(fr.CADENCE_PROFILES) - documented)
