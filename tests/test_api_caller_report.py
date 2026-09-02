@@ -147,21 +147,43 @@ class TestDirectMode:
 
 
 class TestLegacyMode:
-    def test_unambiguous_request_is_attributed(self, tmp_path):
+    """Legacy mode awards an ADDRESS to a caller on aggregate evidence.
+
+    Each cheaply-pairable request votes for (caller, address); an address is
+    awarded only on a decisive majority with real support behind it. These
+    pin the four ways the naive per-request join went wrong.
+    """
+
+    @staticmethod
+    def _traffic(ip, ua, path, caller, start=10, n=10):
+        """n requests from one client: matching access rows and audit lines."""
+        rows = [
+            f"{ip} - - [02/Sep/2026:10:59:{s:02d} -0400] "
+            f'"GET {path}?x=1 HTTP/2.0" 200 100 "-" "{ua}"'
+            for s in range(start, start + n)
+        ]
+        audit = [
+            _audit(f"2026-09-02 10:59:{s:02d}", path, caller_user_id=caller)
+            for s in range(start, start + n)
+        ]
+        return rows, audit
+
+    def test_a_consistent_client_is_attributed(self, tmp_path):
+        rows, audit = self._traffic("1.1.1.1", "cust/1.0", "/api/owned", "cust@x")
         log = tmp_path / "access.log"
-        log.write_text("\n".join(ACCESS_LINES) + "\n")
+        log.write_text("\n".join(rows) + "\n")
         access = read_access_log(str(log), since="2026-09-02 00:00:00")
-        audit = [_audit("2026-09-02 10:58:54", "/api/forecast", caller_user_id="alice@x")]
 
         attributed, mode, dropped = attribute(audit, access)
 
         assert mode == "legacy"
         assert dropped == 0
-        assert attributed[0]["ip"] == "1.1.1.1"
+        assert {r["ip"] for r in attributed} == {"1.1.1.1"}
+        assert {r["caller_user_id"] for r in attributed} == {"cust@x"}
 
-    def test_ambiguous_request_is_dropped_not_guessed(self, tmp_path):
-        """Two IPs share this (second, path, status); attributing it to
-        either would be a coin flip pointed at a real customer."""
+    def test_ambiguous_second_does_not_vote(self, tmp_path):
+        """Two clients on the same (second, path, status) say nothing about
+        which owns either address, so neither request counts."""
         log = tmp_path / "access.log"
         log.write_text("\n".join(ACCESS_LINES) + "\n")
         access = read_access_log(str(log), since="2026-09-02 00:00:00")
@@ -173,27 +195,63 @@ class TestLegacyMode:
         assert attributed == []
         assert dropped == 1
 
-    def test_bff_request_cannot_steal_another_clients_ip(self, tmp_path):
-        """The website BFF calls uvicorn at 127.0.0.1 directly, bypassing
-        nginx (deploy/API_BEHIND_CLOUDFLARE.md), so its requests produce an
-        audit line with NO access-log row of their own.
-
-        Such a line must not be paired with whatever unrelated client happens
-        to share its (second, method, path, status). Observed in production:
-        website traffic carrying end-user tokens was reported at an external
-        customer's residential IP, because that IP owned the only nginx row
-        for the second.
-        """
+    def test_bff_minority_cannot_take_a_customers_address(self, tmp_path):
+        """The production leak. The website BFF calls uvicorn at 127.0.0.1
+        directly, bypassing nginx (deploy/API_BEHIND_CLOUDFLARE.md), so its
+        lines have no access-log row and land on whichever customer shared
+        the second. Against that customer's own volume it must lose."""
+        # Proportions matter: in production the contamination was ~1.5% of
+        # the address's traffic (6 website requests against lori's 399), and
+        # _MIN_SHARE is set for that. A fixture with 17% noise would be
+        # testing the threshold, not the behaviour.
+        rows, audit = self._traffic("1.1.1.1", "cust/1.0", "/api/owned", "cust@x", n=30)
         log = tmp_path / "access.log"
-        log.write_text("\n".join(ACCESS_LINES) + "\n")
+        log.write_text("\n".join(rows) + "\n")
+        access = read_access_log(str(log), since="2026-09-02 00:00:00")
+        # Two bypassing records colliding with the customer's seconds.
+        audit += [
+            _audit(
+                "2026-09-02 10:59:11",
+                "/api/owned",
+                caller_user_id="zerogex-web",
+                end_user_id="user_a",
+            ),
+            _audit(
+                "2026-09-02 10:59:12",
+                "/api/owned",
+                caller_user_id="zerogex-web",
+                end_user_id="user_b",
+            ),
+        ]
+
+        attributed, mode, dropped = attribute(audit, access)
+
+        assert mode == "legacy"
+        owners = {r["caller_user_id"] for r in attributed}
+        assert owners == {"cust@x"}, f"1.1.1.1 belongs to cust@x, got {owners}"
+        assert dropped == 2
+
+    def test_a_lone_pairing_cannot_claim_an_address(self, tmp_path):
+        """The subtler leak, which survived the strict 1:1 join.
+
+        nginx stamps $time_local at completion and the audit line is emitted
+        in the middleware's finally, so one request's two records can
+        straddle a second. That orphans the access-log row, and a bypassing
+        record sitting on it pairs perfectly. Support alone refutes it: one
+        vote is not evidence of ownership."""
+        log = tmp_path / "access.log"
+        log.write_text(
+            "9.9.9.9 - - [02/Sep/2026:10:58:53 -0400] "
+            '"GET /api/trade-bias?u=QQQ HTTP/2.0" 200 899 "-" "cust/1.0"\n'
+        )
         access = read_access_log(str(log), since="2026-09-02 00:00:00")
         audit = [
-            # The real owner of the only 10:58:54 /api/forecast nginx row.
-            _audit("2026-09-02 10:58:54", "/api/forecast", caller_user_id="customer@x"),
-            # A BFF-direct request that never touched nginx.
+            # The row's real owner, logged a second later by the app.
+            _audit("2026-09-02 10:58:54", "/api/trade-bias", caller_user_id="cust@x"),
+            # Bypassing, with no row of its own, landing on the orphan.
             _audit(
-                "2026-09-02 10:58:54",
-                "/api/forecast",
+                "2026-09-02 10:58:53",
+                "/api/trade-bias",
                 caller_user_id="zerogex-web",
                 end_user_id="user_abc",
             ),
@@ -202,9 +260,23 @@ class TestLegacyMode:
         attributed, mode, dropped = attribute(audit, access)
 
         assert mode == "legacy"
-        # One nginx row cannot substantiate two requests. Neither is claimed.
-        assert attributed == []
+        assert attributed == [], "a single pairing claimed an address outright"
         assert dropped == 2
+
+    def test_a_genuinely_shared_address_is_left_unattributed(self, tmp_path):
+        """Two customers behind one NAT is not a majority for either, so the
+        address earns no owner rather than going to whoever is busier."""
+        rows_a, audit_a = self._traffic("7.7.7.7", "a/1.0", "/api/a", "a@x", start=10, n=6)
+        rows_b, audit_b = self._traffic("7.7.7.7", "b/1.0", "/api/b", "b@x", start=30, n=6)
+        log = tmp_path / "access.log"
+        log.write_text("\n".join(rows_a + rows_b) + "\n")
+        access = read_access_log(str(log), since="2026-09-02 00:00:00")
+
+        attributed, mode, dropped = attribute(audit_a + audit_b, access)
+
+        assert mode == "legacy"
+        assert attributed == []
+        assert dropped == 12
 
     def test_request_with_no_access_log_match_is_dropped(self, tmp_path):
         log = tmp_path / "access.log"

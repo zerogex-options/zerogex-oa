@@ -22,16 +22,18 @@ TWO MODES, PICKED AUTOMATICALLY
     direct  — audit lines carry ``client_ip=``. Attribution is an exact
               per-request fact.
     legacy  — audit lines predate that field (an API that has not been
-              restarted since the change). Falls back to joining the two
-              logs on (second, method, path, status), keeping only keys that
-              pair 1:1 — one access-log row and one audit record. Everything
-              else is DISCARDED rather than guessed at, and the report says
-              how many were dropped. Absence of evidence for an IP in legacy
+              restarted since the change). Falls back to deciding who owns
+              each ADDRESS from aggregate evidence: requests that pair
+              unambiguously on (second, method, path, status) each vote for
+              (caller, address), and an address is awarded only on a
+              decisive majority with real support behind it. Everything else
+              is DISCARDED rather than guessed at, and the report says how
+              many were dropped. Absence of evidence for an IP in legacy
               mode means "could not attribute", never "not authenticated".
 
               Expect most requests to drop on a busy window: popular paths
-              collide constantly, and the website BFF bypasses nginx
-              altogether so its audit lines have no row to pair with. A
+              collide constantly and cannot vote. It is also a heuristic,
+              not a proof — it never sees a request that skipped nginx. A
               restart, which puts client_ip on the line, is the real fix.
 
 READ-ONLY. Runs SELECTs against ``api_keys`` and reads logs; changes nothing.
@@ -206,6 +208,15 @@ def read_access_log(path: str, since: str) -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+# An address is awarded to a caller only on this much agreement. _MIN_SUPPORT
+# stops one lucky pairing from claiming an address outright — the shape a
+# bypassing request takes when it lands on a quiet second. _MIN_SHARE keeps a
+# genuinely mixed address (two customers behind one office NAT) unattributed
+# rather than handed to whichever is busier.
+_MIN_SUPPORT = 5
+_MIN_SHARE = 0.9
+
+
 def _join_key(when: str, method: str, path: str, status: str) -> str:
     return f"{when}|{method}|{path}|{status}"
 
@@ -239,43 +250,71 @@ def attribute(
             out.append(enriched)
         return out, "direct", len(audit) - len(out)
 
-    # Legacy: join on (second, method, path, status), keeping only keys that
-    # pair 1:1 — exactly one access-log row AND exactly one audit record.
+    # Legacy: decide who owns each ADDRESS from aggregate evidence, rather
+    # than trying to pair each request individually.
     #
-    # Uniqueness on the nginx side alone is NOT enough, and assuming it was
-    # produced a real false attribution: the website BFF calls uvicorn at
-    # 127.0.0.1 directly, bypassing nginx entirely
-    # (deploy/API_BEHIND_CLOUDFLARE.md), so its requests emit an audit line
-    # with no access-log row of their own. Matching only on the nginx side
-    # let such a line adopt whichever unrelated client owned the sole row for
-    # that second — reporting website traffic, end-user tokens and all, at an
-    # external customer's residential IP. Any audit record with no row of its
-    # own can do this, so the count must balance on both sides.
-    rows_by_key: Counter = Counter()
+    # Per-request pairing looked obvious and was wrong twice over. Requiring
+    # a unique client IP per (second, method, path, status) let the website
+    # BFF — which calls uvicorn at 127.0.0.1 directly, bypassing nginx
+    # (deploy/API_BEHIND_CLOUDFLARE.md), so its lines have no access-log row
+    # at all — adopt whichever customer shared that second. Tightening it to
+    # a strict 1:1 count, then to a +/-1s window, cured that case but made
+    # the failure worse in kind: a busy customer's own requests collide with
+    # each other and drop, while a bypassing record sitting alone on a quiet
+    # second survives untouched. The guard was keeping precisely the records
+    # most likely to be wrong.
+    #
+    # The signal that actually identifies a caller is volume, which is how a
+    # human reads this report: 8,504 requests from one address under one
+    # User-Agent is the customer; nine scattered ones are noise. So each
+    # cheaply-pairable request casts a VOTE for (caller, address), and an
+    # address is awarded to a caller only on a decisive majority backed by
+    # real support. Individual mispairings are then just noise in a tally
+    # they cannot win.
+    #
+    # This is still a heuristic and cannot become sound — it never sees a
+    # request that skipped nginx. Restarting the API puts client_ip on the
+    # line and retires all of it.
     ips_by_key: Dict[str, set] = defaultdict(set)
     for row in access:
-        key = _join_key(row["_when"], row["method"], row["path"], row["status"])
-        rows_by_key[key] += 1
-        ips_by_key[key].add(row["ip"])
+        ips_by_key[_join_key(row["_when"], row["method"], row["path"], row["status"])].add(
+            row["ip"]
+        )
 
-    audit_by_key: Counter = Counter()
+    votes: Dict[str, Counter] = defaultdict(Counter)
     for rec in audit:
-        audit_by_key[
-            _join_key(rec["_when"], rec["method"], rec["path"], rec.get("status", ""))
-        ] += 1
+        key = _join_key(rec["_when"], rec["method"], rec["path"], rec.get("status", ""))
+        candidates = ips_by_key.get(key)
+        # Only unambiguous pairings vote. They are plentiful, and a request
+        # that could have come from either of two clients says nothing about
+        # which one owns the address.
+        if candidates and len(candidates) == 1:
+            votes[next(iter(candidates))][rec.get("caller_user_id", "-")] += 1
+
+    owner_of: Dict[str, str] = {}
+    for ip, tally in votes.items():
+        total = sum(tally.values())
+        caller, count = tally.most_common(1)[0]
+        if total >= _MIN_SUPPORT and count / total >= _MIN_SHARE:
+            owner_of[ip] = caller
 
     out = []
     dropped = 0
     for rec in audit:
         key = _join_key(rec["_when"], rec["method"], rec["path"], rec.get("status", ""))
-        if rows_by_key.get(key) != 1 or audit_by_key[key] != 1:
-            # No matching row, two clients collided on this key, or more
-            # requests reached the API than nginx saw. All are "unknown", and
-            # a coin flip between two real customers is worse than saying so.
+        candidates = ips_by_key.get(key)
+        if not candidates or len(candidates) != 1:
+            dropped += 1
+            continue
+        ip = next(iter(candidates))
+        if owner_of.get(ip) != rec.get("caller_user_id", "-"):
+            # Either the address never earned an owner, or this record
+            # disagrees with the one it earned — the shape both production
+            # leaks took.
             dropped += 1
             continue
         enriched = dict(rec)
-        enriched["ip"] = next(iter(ips_by_key[key]))
+        enriched["ip"] = ip
         out.append(enriched)
     return out, "legacy", dropped
 

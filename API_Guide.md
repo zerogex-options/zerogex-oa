@@ -201,13 +201,15 @@ make api-caller-report UA=NT8 JSON=/tmp/callers.json
 ```
 
 Until the API restarts, those lines carry no `client_ip` and the tool falls
-back to joining the two logs on (second, method, path, status), keeping only
-keys that pair 1:1. Expect most requests to drop on a busy window: popular
-paths collide constantly, and the website BFF talks to uvicorn at
-`127.0.0.1:8000` directly (`deploy/API_BEHIND_CLOUDFLARE.md`) so its audit
-lines have no access-log row to pair with at all. **Restart the API to get
-real attribution** — the fallback is a stopgap for reading history that was
-already written, not a substitute.
+back to inferring who owns each address: requests that pair unambiguously on
+(second, method, path, status) vote for (caller, address), and an address is
+awarded only on a decisive majority. Expect most requests to drop on a busy
+window — popular paths collide constantly and cannot vote — and treat the
+result as a heuristic: it never sees a request that skipped nginx, and the
+website BFF talks to uvicorn at `127.0.0.1:8000` directly
+(`deploy/API_BEHIND_CLOUDFLARE.md`), so its calls have no access-log row at
+all. **Restart the API to get real attribution** — the fallback is a stopgap
+for reading history that was already written, not a substitute.
 
 Note that `client_ip` is the real client address only because uvicorn's
 `ProxyHeadersMiddleware` rewrites it from `X-Forwarded-For` (on by default,
