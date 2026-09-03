@@ -1537,14 +1537,24 @@ logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greek
 .PHONY: journal-volume
 journal-volume: ## Why journal retention is short: what caps it, and which unit burns it
 	@echo "$(BLUE)=== Journal retention ===$(NC)"
-	@echo "$(YELLOW)Root filesystem:$(NC)"; df -h / | tail -1
+	@echo "$(YELLOW)Journal filesystem:$(NC)"; df -h $$([ -d /var/log/journal ] && echo /var/log/journal || echo /var/log) | tail -1
 	@echo "$(YELLOW)Configured cap:$(NC)  SystemMaxUse=$(JOURNAL_MAX_USE)  (from $(JOURNAL_DROPIN))"
 # journald honours the TIGHTER of SystemMaxUse and SystemKeepFree, and KeepFree
 # defaults to 15% of the filesystem. On a volume already fuller than that,
 # journald trims no matter what the cap says and raising SystemMaxUse buys
 # nothing -- so establish which of the two actually binds before changing either.
-	@avail=$$(df --output=avail -k / | tail -1); \
-	size=$$(df --output=size -k / | tail -1); \
+#
+# WHICH filesystem is the whole question, and this target got it wrong until
+# 2026-09-03: it measured `du /var/log/journal` (right) but sized headroom
+# against `/` (wrong). /var/log is its own volume -- deploy/steps/015.data_volume
+# -- so the numbers reported were the ROOT volume's, on which the journal does
+# not sit. That made a 10G volume at 39% read as a 6.8G volume at 86%, and made
+# KeepFree look like it was about to bind when it had ~4G of slack. Everything
+# below now resolves the journal's own mount first.
+	@jdir=$$([ -d /var/log/journal ] && echo /var/log/journal || echo /var/log); \
+	avail=$$(df --output=avail -k "$$jdir" | tail -1); \
+	size=$$(df --output=size -k "$$jdir" | tail -1); \
+	mnt=$$(df --output=target "$$jdir" | tail -1); \
 	keep=$$((size * 15 / 100)); \
 	used=$$(du -sk /var/log/journal 2>/dev/null | cut -f1); used=$${used:-0}; \
 	raw="$(JOURNAL_MAX_USE)"; \
@@ -1555,7 +1565,7 @@ journal-volume: ## Why journal retention is short: what caps it, and which unit 
 	  *)     cap=$$(( raw / 1024 )) ;; \
 	esac; \
 	echo "$(YELLOW)Journal usage:$(NC)   $$((used / 1024))M of the $$((cap / 1024))M cap"; \
-	echo "$(YELLOW)KeepFree floor:$(NC)  ~$$((keep / 1024))M (15% of /), free now $$((avail / 1024))M"; \
+	echo "$(YELLOW)KeepFree floor:$(NC)  ~$$((keep / 1024))M (15% of $$mnt), free now $$((avail / 1024))M"; \
 	if [ "$$used" -ge $$((cap * 9 / 10)) ]; then \
 	  echo "  $(GREEN)-> SystemMaxUse BINDS: the journal is sitting at its cap.$(NC)"; \
 	  echo "  $(GREEN)   Raising it buys proportional history, if the disk has room.$(NC)"; \
@@ -1588,10 +1598,16 @@ journal-volume: ## Why journal retention is short: what caps it, and which unit 
 # CANNOT find it: every distinct URL is its own shape, so 240k access lines
 # hid behind a top row of 2,288. nginx already records the same requests to
 # /var/log/nginx/access.log, so in the journal they are pure duplication.
+#
+# TWO shapes count, and missing the second is how this stayed hidden after
+# --no-access-log silenced the first. uvicorn writes `"GET /path HTTP/1.1"`;
+# AuditLogMiddleware writes `api_request method=GET path=... status=...`, with
+# no quotes. Matching only the quoted form reported 0% while 420k audit lines
+# an hour -- 99% of the unit's volume -- went uncounted.
 	@for u in $(API_SERVICE); do \
 	  all=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null | wc -l); \
 	  acc=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null \
-	        | grep -cE '"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) ' || true); \
+	        | grep -cE '"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) |api_request method=' || true); \
 	  if [ "$$all" -gt 0 ]; then \
 	    awk -v a="$$acc" -v t="$$all" -v u="$$u" \
 	      'BEGIN { printf "  %8d of %8d lines/h (%.0f%%) are access logs  %s\n", a, t, 100*a/t, u }'; \
