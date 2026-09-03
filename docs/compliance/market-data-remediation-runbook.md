@@ -1,318 +1,315 @@
-# Market data remediation runbook
+# What to do about the data problem — step by step
 
-**Companion to:** `market-data-licensing-audit-2026-09-02.md` (finding IDs F1–F11 refer to it).
-**Status:** Not legal advice. Sequencing and technical steps are engineering judgement; the
-disclosure timing in Stage 4 and the self-reporting question in 2.1 are legal calls.
+**Companion to:** `market-data-licensing-audit-2026-09-02.md`. That one is written for a lawyer and
+uses finding IDs (F1–F11). **This one is written for whoever does the work.**
 
-Ordered so that everything within our own control — and everything compounding daily — happens
-before anything involving a counterparty. **Stages 0 and 1 take a week and need nobody's permission.**
-
----
-
-## First: the TradeStation professional-status question
-
-**Declaring professional does not fix the problem, and doing it now makes things worse.**
-
-Professional is a *rate class*, not a licence. A professional subscriber is still a subscriber, and
-the clause prohibiting furnishing market data to any other person or entity applies to professionals
-identically. Declaring fixes exactly one of eleven findings, prospectively, and leaves every
-redistribution finding untouched.
-
-**Will we get in trouble for declaring?** The notification obligation already exists and is already
-running — subscriber agreements require prompt written notice when you cease to qualify, so we are
-in breach of that duty today, every day. Declaring is complying late with a duty we already have.
-Exposure to back fees and penalties exists whether or not we declare; the declaration doesn't create
-it, it dates it.
-
-**Will they terminate API access?** Not for the status change itself — TradeStation serves
-professional accounts and runs a Professional Desk for exactly this. What ends immediately is the
-free/nominal-price arrangement: those are non-professional products.
-
-**The real risk is the second question.** The desk will ask why the status changed — what the
-business is, whether there's an entity, what the data is used for. The honest answer is the
-disclosure that opens the redistribution conversation, and *that* is where termination lives. Not
-the checkbox.
-
-So the sequencing is not delay for its own sake. We get one conversation with TradeStation, and we
-want it **after** redistribution has stopped and a licensed feed is live — arriving as someone who
-found a problem and fixed it, not someone still doing it.
-
-**Where this becomes a legal call:** the sequencing is about stopping the harm before opening the
-conversation, not concealment. But the notification duty is live and every week of delay is a week
-of breach. Weighing those is counsel's judgement, not ours. Bring them this exact question in Stage
-2; if they say notify now, notify now.
+Not legal advice. The technical steps and the ordering are engineering judgement. *When and how we
+talk to TradeStation* is a legal decision — that's step 10, and it's in week one for that reason.
 
 ---
 
-## Stage 0 — Record the facts before changing anything (1 hour, today)
+## The problem, once more
 
-**0.1 Write down the commercial facts** (F2)
-- Date of first paying subscriber — the "first business use" date that sets any back-fee window.
-- Current paid subscribers split by tier; all-time count.
-- Every external API integration: name, key id, scopes, start date, use.
-- Every symbol ingested and when each started.
-- Date real-time CME went live — **2026-08-27**, per `docs/runbooks/es_nq_futures_rollout.md`.
+We bought a home cable subscription. We've opened a sports bar and we're charging people at the door
+to watch the TV.
 
-*Check:* a dated file stored **outside the repo**, answering all of the above without opening a DB.
+The exchanges — CME, Cboe, Nasdaq, and a group called OPRA that handles options prices — own the
+actual price data. TradeStation resells it to us. When we signed up we agreed the data was **for
+personal trading, and that we wouldn't pass it to anyone else.**
 
-**0.2 Tag the current state of both repos**
+We now run a business on it and pass it to paying customers. That's the whole thing.
+
+**Our own calculations — GEX, walls, flip, max pain, signals — are ours** and nobody disputes them.
+The problem is only the raw prices we hand through.
+
+---
+
+## Week 1 — Things only we can do
+
+No lawyer, no money, nobody's permission. **This is the part that matters most**, because every day
+it isn't done the problem gets slightly bigger. The product keeps working throughout — nothing here
+touches the data feed.
+
+### 1. Write down five facts · 10 min
+- The date of our **first paying customer**.
+- Paying subscribers **right now**, split Basic / Pro.
+- Total subscribers **ever**.
+- Every company with an **API key** — name, start date, what they use it for.
+- The date ES/NQ went live — **2026-08-27**, already in `docs/runbooks/es_nq_futures_rollout.md`.
+
+*Why:* every conversation from here starts with these, and once we start changing code and revoking
+keys we can't reconstruct them.
+
+**Done when:** it's in a dated file saved somewhere that isn't the repo.
+
+### 2. Bookmark where the code is today · 5 min
 ```
-git tag -a pre-remediation-2026-09-02 -m "state before licensing remediation"
+git tag -a pre-remediation-2026-09-02 -m "before fixing data licensing"
 git push origin pre-remediation-2026-09-02
 ```
-*Check:* both tags on the remote.
+*Why:* "we fixed it on this date" is much stronger when we can show it.
 
-**0.3 Do not contact TradeStation yet** (→ Stage 4)
-No status change, no "hypothetical" call, no support ticket about redistribution. There is no
-hypothetical — they have the account on screen.
+**Done when:** the tag is on GitHub for both repos.
 
----
+### 3. Find out who can currently see what · 1 hour
+Run `make api-keys-list ACTIVE=yes`. For every key, write down who holds it and what it can reach.
 
-## Stage 1 — Stop the redistribution (48–72 hours)
+Then check `API_SCOPE_ENFORCEMENT` on the **actual deployed server**, not `.env.example`. If it's
+`0` or missing, the permission system isn't running and every key can reach everything.
 
-All within our control, costs only engineering time, and it is the part that compounds daily.
+> Note: don't look for the `SCOPE_DRYRUN … would 403` log line as evidence — it's emitted at
+> `logger.debug`, so unless a deployment runs at DEBUG it was never written. The database is the
+> authoritative source.
 
-**1.1 Inventory every live API key and its scopes** (F6)
-```
-make api-keys-list ACTIVE=yes
-```
-> **Correction to earlier advice in this session:** the
-> `SCOPE_DRYRUN … would 403 if API_SCOPE_ENFORCEMENT were on` line is emitted at `logger.debug`
-> (`src/api/security.py`). Unless the deployed log level is DEBUG it was never written and the
-> history does not exist. Query the database via `api-keys-list` — that is authoritative.
+*Why:* this single answer decides how big the problem is. If enforcement is off, outside companies
+have been able to pull raw option prices — much bigger than showing them on our own site.
 
-*Check:* a table of key id, user, name, scopes, last used, each marked internal (website BFF) or
-external.
+**Done when:** we can say, for each outside company, exactly what their key reaches today.
 
-**1.2 Establish what enforcement actually does in production** (F6)
-- Read `API_SCOPE_ENFORCEMENT` from the **deployed environment**, not `.env.example`. Code default
-  is `"0"`.
-- Find every key carrying wildcard `"*"` — those pass regardless of the flag.
-- Find the static break-glass key granted by `src/api/routers/tradeworkz.py` when enforcement is off.
+### 4. Shut off the API access that shouldn't exist · 2–3 hours
+- Give every outside key the `analytics` or `signals` bundle. **Never `full`** — that includes the
+  raw option chain and is for our own website only.
+- Any key with `*` bypasses everything. Cancel and reissue.
+- Set `API_SCOPE_ENFORCEMENT=1` on the live server.
 
-*Check:* for each external key, one sentence stating exactly which endpoints it can reach today.
+**Done when:** a real outside key against `/api/option/quote` returns **403**. Actually test it.
 
-**1.3 Backfill scopes, retire wildcards, turn enforcement on** (F6)
-- Assign each external key `TIER_ANALYTICS` or `TIER_SIGNALS`. **Never `TIER_FULL`** — it carries
-  `MARKET_RAW` and is for the internal BFF only.
-- Revoke and reissue any external key holding `"*"`.
-- Set `API_SCOPE_ENFORCEMENT=1` in every deployed environment.
+### 5. Stop selling the underlying price through the API · 1–2 hours
+In `src/api/scopes.py`, remove `MARKET_REFERENCE` from the `analytics` and `signals` bundles.
 
-*Check:* an external key calling `/api/option/quote` returns **403**. Test with a real key.
+The docstring argues this is fine to resell because we only serve one symbol's price rather than the
+whole chain. **That reasoning is wrong** — SPY/QQQ prices belong to the stock exchanges, SPX/NDX to
+Cboe and Nasdaq, and serving one price is reselling as much as serving a thousand. **Fix the comment
+in the same commit as the code** — it's currently the written justification for selling this
+externally.
 
-**1.4 Pull `MARKET_REFERENCE` out of the external tiers** (F5)
-Remove it from `TIER_ANALYTICS` and `TIER_SIGNALS` in `src/api/scopes.py`. **Correct the docstring's
-theory in the same commit** — it currently argues the line is "what gets enumerated", and that
-paragraph is the written record of what we believed and when.
+**Done when:** an outside key gets 403 on `/api/market/quote` but 200 on `/api/gex/summary`.
 
-*Check:* external key → `/api/market/quote` returns 403; `/api/gex/*` and `/api/signals/*` still 200.
+### 6. Tell the affected companies · 30 min
+Steps 4 and 5 break integrations. Email them:
 
-**1.5 Notify affected integrators — the change, not the diagnosis** (F5)
-State the change and the date, offer the derived alternative. Do not write a legal conclusion into a
-customer email — not concealment, but counsel hasn't confirmed the diagnosis and a counterparty is
-the wrong audience for a first draft of it.
+> "From [date], our API no longer serves underlying price and bar data. The GEX, flow, max pain and
+> signals endpoints are unchanged. If you need a price, your charting platform already has one."
 
-*Check:* every affected customer has a dated written notice; we kept copies.
+**Don't explain why in legal terms** — not concealment, but counsel hasn't confirmed the diagnosis
+and a customer email is the wrong place for a first attempt at describing it.
 
-**1.6 Close the unauthenticated backtest share route** (F7)
-`/backtesting/shared/[token]` serves derived exchange data to anyone with a link. Require an
-authenticated session; give tokens an expiry.
+**Done when:** every affected company has a dated email and we kept copies.
 
-*Check:* logged-out fetch of a known-valid token returns 401.
+### 7. Delete the option price table · half a day
+`/option-contracts` shows customers real bid, ask, last, volume and open interest per contract —
+the exchange's actual product on a screen someone paid for. The endpoints behind it go too:
+`/api/option/*`, `/api/flow/by-contract`, `/api/flow/contracts`, `/api/flow/smart-money`,
+`/api/market/open-interest`, `/api/tools/option-calculator`.
 
-**1.7 Retire the per-contract quote display** (F3)
-`/option-contracts` plus `/api/option/*`, `/api/flow/by-contract`, `/api/flow/contracts`,
-`/api/flow/smart-money`, `/api/market/open-interest`, `/api/tools/option-calculator`.
+**Cut it rather than hiding it.** Licensing this costs a minimum of $1,500/month before a single
+customer, and it's the least distinctive thing we sell. Nobody subscribes for a bid/ask table.
 
-**Cut it, don't gate it.** It is the largest fee driver in the register ($1,500/mo floor before a
-single user) and the least differentiated thing we sell. Subscribers pay for GEX, walls and signals,
-none of which need anyone to see a bid/ask.
+**Done when:** no page and no endpoint returns per-contract bid/ask/last/OI to anyone, our own
+website included. Grep the response models; don't trust the routing.
 
-*Check:* no page or endpoint returns per-contract bid/ask/last/OI to any user, internal BFF included.
-Grep the response models; don't trust the routing.
+### 8. Put the public pages on yesterday's numbers · half a day
+The home page, `/spx-gamma-levels`, `/real-time-gex-0dte` and `/education/*` show near-live levels to
+anyone with no login (`frontend/core/auth.ts`, `gammaLevels.tsx` with `revalidate = 900`).
 
-**1.8 Take public real-time down to prior-session close** (F9)
-`frontend/core/auth.ts` leaves `/`, `/real-time-gex-0dte`, `/spx-gamma-levels` and `/education/*`
-open; `gammaLevels.tsx` fetches live summaries on a 15-minute revalidate. Publish prior-session
-close levels publicly with a dated label; keep live behind login. SEO value is in the page existing
-and ranking, not in the number being 15 minutes old.
+Switch the logged-out view to **yesterday's closing levels**, clearly dated. Keep live behind login.
 
-*Check:* logged out, `/spx-gamma-levels` shows prior-close with a visible "as of" label; logged in,
-live.
+*Why:* legally it's the widest audience we serve. Practically, those pages are how an exchange or a
+competitor finds us — we deliberately optimised them to rank. And we lose nothing: the SEO value is
+in the page existing and ranking, not in the number being 15 minutes old.
 
-**1.9 Freeze every channel not already open** (F8)
-- No new B2B API customers until Stage 3 completes.
-- Mark `docs/design/pine-seeds-gamma-levels-exporter.md` **HOLD — licensing** in its first three
-  lines. TradingView's suspension of new Seeds repos is luck, not a control.
-- No new indicator distribution, no new social/bot data channel.
+**Done when:** in a private window `/spx-gamma-levels` shows yesterday's close with a visible date;
+logged in it shows live.
 
----
+### 9. Lock the shared backtest links and freeze everything new · 1–2 hours
+- `/backtesting/shared/[token]` shows results to anyone with the link. Require login, add expiry.
+- **Stop selling new API access** until we've switched suppliers.
+- Put **HOLD — licensing** at the top of `docs/design/pine-seeds-gamma-levels-exporter.md`. That
+  would publish our levels into a public GitHub repo TradingView reads. It's only shelved because
+  TradingView paused new repos — luck, not a decision.
+- No new chart-platform indicators until this is sorted.
 
-## Stage 2 — Counsel, agreements, feed decision (weeks 1–2)
-
-**2.1 Engage a market-data licensing attorney**
-A genuine specialism — ask whether they've handled **exchange market-data audits**. Bring the audit,
-the Stage 0 facts, the channel inventory (2.3), the signed agreements (2.2). Ask specifically about:
-- Stage 4 timing — when and how to notify TradeStation, and whether before migration completes.
-- Whether a business/entity account is cleaner than converting a personal one.
-- Whether to self-report to any exchange or wait to be asked.
-- The F11 adviser/CTA question on TradeWorkz.
-- Realistic back-fee exposure, to price the 2.5 options against.
-
-**2.2 Pull the actual signed agreements** (F1, F2)
-The TradeStation Technologies Subscription Agreement we accepted, brokerage market-data addenda, and
-every exchange subscriber agreement clicked through — for **both usernames**, since they may differ.
-A written document request is an ordinary customer request and flags nothing.
-
-*Check:* PDFs for both usernames; F1 and F2 re-run against the real text.
-
-**2.3 Build the channel inventory** (F8)
-One page: website by tier, API by scope and customer, each chart indicator, each social/bot output,
-shared backtest links, anything else.
-
-*Check:* someone who has never seen the system could name every place our data ends up.
-
-**2.4 Get quotes from licensed redistributors**
-Databento, Polygon, dxFeed, ICE, Nasdaq Basic and similar. **Tell them exactly what we're building** —
-their licensing desks will say what their agreement permits, and it's the fastest education
-available. Ask each:
-- Does your agreement permit **our redistribution to end users** — website and API both?
-- Does it cover our **derived outputs** (GEX, greeks, signals) sold commercially?
-- Which of OPRA, CTA/UTP, Cboe index, CME do you cover — and where do we still need a direct
-  relationship?
-- What per-user reporting and classification falls on us?
-- What are the historical/storage rights, for backtesting and replay?
-
-*Check:* three **written** quotes answering all five. Verbal assurances are worth nothing in an audit.
-
-**2.5 Decide the sourcing model**
-
-| Option | What it is | Indicative |
-| --- | --- | --- |
-| A | Direct vendor agreements with all four. Complete, heaviest, still needs a non-brokerage source. | $60–120k/yr |
-| **B — recommended** | Licensed redistributor that can extend redistribution rights. Retires F1 outright. | $500–5,000/mo |
-| **C — pair with B** | Narrow to derived-only. Moves us from per-user display fees to negotiated derived-data fees. | Cuts the fee base |
-
-Steps 1.4 and 1.7 already did most of C.
+**Done when:** logged out, a real share link returns not-authorised; the Pine Seeds doc says HOLD in
+its first three lines.
 
 ---
 
-## Stage 3 — Migrate off the brokerage feed (weeks 2–8)
+## Week 1–2 — Get the right help
 
-Until this completes, a TradeStation cutoff is an extinction event. After it, the account is just an
-account.
+Two things at once. Neither waits for the other, and neither waits for week 1 to finish.
 
-**3.1 Stand the new feed up in parallel** (F1)
-Both feeds running, separate tables or a tagged source column. **Do not cut over first.**
-*Check:* both writing concurrently for a full session, no gaps.
+### 10. Hire a market data licensing lawyer · this week
+Not a general business lawyer — this is a narrow specialty. Ask firms directly: **"have you handled
+an exchange market data audit?"** If not, keep calling.
 
-**3.2 Validate derived outputs across both sources**
-Compare GEX summary, walls, flip, max pain and greeks from each feed over a full session. Tick
-granularity and timestamping differences will move the numbers — know by how much before subscribers
-notice. Extend the existing freshness/validation harness rather than writing a one-off.
-*Check:* written comparison over ≥5 sessions including one OPEX and one high-vol day, with
-differences explained.
+Tell them up front: *"I want to fix this and I probably want to disclose it. I need the order of
+operations right."*
 
-**3.3 Cut over, keeping TradeStation warm**
-Serve from the licensed feed; leave old ingestion running but non-authoritative for a week.
-*Check:* production analytics read only from the licensed source, verified in the query path.
+Give them: the audit document, the five facts from step 1, the actual contracts from step 11.
 
-**3.4 Retire TradeStation as a production dependency** (F1)
-- Remove `TRADESTATION_REFRESH_TOKEN` and `TRADESTATION_FUTURES_REFRESH_TOKEN` from every deployed env.
-- Revoke the OAuth app's authorisation from both usernames.
-- Remove or quarantine the backfill tools that call it.
+Ask these four specifically:
+- **When do we tell TradeStation, and who makes the call?** Can you approach them rather than me
+  phoning in?
+- **Would a business account be cleaner** than converting a personal one?
+- **What's the realistic exposure in dollars**, so we can weigh the options?
+- **Does the trade-signals product make us an investment adviser?** Separate legal question, and it
+  affects the first one.
 
-*Check:* **zero TradeStation API calls in production logs for seven consecutive days.** That is the
-gate to Stage 4 — not "we think it's off."
+**Done when:** someone is engaged and has the documents. Not "I emailed a firm."
 
-**3.5 Deal with the stored history** (F7)
-The TimescaleDB corpus was built from the brokerage feed. Ask counsel and the new vendor what happens
-to it — some vendors' historical rights let us keep serving derived outputs from it, some don't, and
-the answer decides whether backtesting survives in its current form.
-*Check:* written vendor answer on pre-existing history; a documented retention policy replacing
-"indefinite".
+### 11. Get the actual contracts · 30 min
+The audit read published templates, not what we signed. Download from the account portal — **for
+both usernames**, since they may differ. If they're not there, email TradeStation for copies. That's
+an ordinary customer request and raises no flags.
 
----
+**Done when:** PDFs for both accounts, and the lawyer has them.
 
-## Stage 4 — Resolve the TradeStation account (after 3.4, with counsel)
+### 12. Call three data companies · 2–3 hours
+**Databento, Polygon, dxFeed.** Tell each exactly what we're building. Their licensing people will
+say what their contract allows, and that conversation teaches more in an hour than any document.
 
-**4.1 Let counsel choose the shape of the disclosure**
-- **Convert to professional** on the existing personal account. Simplest; professional rates apply,
-  free package ends.
-- **Close the second account**, keep one genuinely non-professional personal account for own trading.
-  Clean, and after Stage 3 the business no longer needs the feed.
-- **Open a business/entity account** with professional data. Separates personal trading from the
-  company; a better structure for any later conversation.
+Ask all three the same five:
+- Can we **show your data to paying customers**, on a website and through our own API?
+- Can we sell **calculations built from it** — gamma exposure, greeks, signals?
+- Which exchanges do you cover — **options, US stocks, index values, CME futures**? Where do we still
+  need our own agreement?
+- What **reporting** falls on us, and how often?
+- Can we **store history and sell backtesting** on it?
 
-**4.2 Answer honestly when asked**
-The desk will ask what changed. **Tell them the truth.** Misrepresenting on a broker or market-data
-certification converts a licensing breach into a misrepresentation — categorically worse, and it
-forecloses the negotiated outcome. Being able to say "we identified this, stopped it, and migrated to
-a licensed source" is worth a great deal, and is the entire reason Stages 1–3 come first.
+*Get it in writing.* A salesperson saying "yeah that's fine" is worth nothing later.
 
-**4.3 Expect the free data to end immediately**
-Free and nominal-price packages are non-professional products. Budget for professional rates from the
-change date, or for closing the account.
+**Done when:** three written quotes answering all five. Expect $500–5,000/month.
 
 ---
 
-## Stage 5 — Build the compliance surface (days 30–90, then ongoing)
+## Week 2–8 — Switch data suppliers
 
-**5.1 Pro/non-pro self-certification at signup** (F10) — **do this first, before we have a licence.**
-Long-lead item, harmless if unneeded, painful to retrofit across an existing user base. Produces the
-per-user split that makes F3 reportable.
-*Check:* every new user classified at signup, existing users prompted on next login, count by
-classification available on demand.
+Until this is done, TradeStation switching us off kills the product. Once done, they're just an
+account. **This is what buys the ability to have the conversation calmly.**
 
-**5.2 Add the market-data terms we don't have** (F10)
-Source attribution and prescribed exchange disclaimers; a subscriber-agreement passthrough binding
-users to exchange terms; a delay/accuracy disclosure (`FuturesDelayBadge` is already the right
-pattern in the UI — the terms need the counterpart). All five locales.
+### 13. Run the new feed alongside the old one · 1–2 weeks
+Both running, separate tables or a source column. **Don't switch over yet.** The ingestion layer
+already separates the data client from everything else — this is the payoff for that.
 
-**5.3 Build the usage-reporting pipeline** (F3)
-User counts by classification, per feed, monthly. Assume it will be asked for on short notice and for
-prior periods.
-*Check:* a report generates for an arbitrary past month without manual work.
+**Done when:** both feeds have written a full trading day with no gaps.
 
-**5.4 Declare every channel to the licensor** (F8)
-Hand over the 2.3 inventory. Undeclared channels turn a fee dispute into a good-faith dispute.
-*Check:* written licensor acknowledgement covering each channel, indicators included.
+### 14. Check the numbers actually match · 1 week
+Compare GEX summary, walls, flip, max pain and greeks from each feed. They **won't match exactly** —
+providers time and batch ticks differently — and we need to know how far apart before subscribers do.
 
-**5.5 Reopen what we froze, under the new terms** (F8)
-B2B API sales, chart integrations, Pine Seeds if it reopens — each checked against what the licence
-permits, not what we hope it does.
-*Check:* each reopened channel maps to a specific clause.
+At least five days, including one OPEX Friday and one volatile day. Extend the existing
+freshness/validation harness rather than writing a one-off.
 
-**5.6 Keep an audit file and review annually**
-Signed agreements, monthly reports, channel inventory, the audit and this runbook with revisions.
-Review each **January**, when all four exchanges reprice.
+**Done when:** the differences are written down and *explained*, not just measured.
 
----
+### 15. Switch over, keeping the old feed warm · 1 day
+Serve everything from the new supplier; leave TradeStation running but unused for a week so a
+problem is a rollback rather than an outage.
 
-## Things that turn this into a worse problem
+**Done when:** live analytics read only from the new source — checked in the query path, not assumed
+from config.
 
-- **Don't misrepresent status or use** — on a form, a call, or to a vendor. A licensing breach is
-  negotiable; a misrepresentation on a broker certification is a different category and removes our
-  best outcomes.
-- **Don't open a third account or move entitlements again.** F1 already reads as deliberate
-  structuring across two usernames. Extending the pattern converts a licensing question into a
-  bad-faith question.
-- **Don't quietly un-ship ES/NQ and hope.** The pricing pages advertise them in five languages and
-  are indexed and cached.
-- **Don't call the Professional Desk to "ask hypothetically."** There is no hypothetical.
-- **Don't write legal conclusions into customer or vendor emails.** Sequencing, not concealment.
-- **Don't let Stage 1 wait for Stage 2.** Nothing in Stage 1 needs a lawyer's permission, and it is
-  the part that compounds daily.
+### 16. Turn TradeStation off properly · 1 hour
+- Remove both refresh tokens from every deployed server.
+- Revoke the app's access from **both** usernames.
+- Disable the backfill tools that still call them.
+
+**Done when:** **zero TradeStation API calls in production logs for seven days straight.** This is a
+gate, not a step — phase 4 doesn't start until it holds.
+
+### 17. Ask about the stored history
+The price database was built from TradeStation. Ask the new supplier and the lawyer what happens to
+it — some contracts let us keep using existing history, some don't, and it decides whether
+backtesting survives in its current form.
+
+**Done when:** a written answer, and a stated retention policy instead of "we keep everything."
 
 ---
 
-## If there is one hour
+## After step 16 — The TradeStation conversation
 
-Steps **1.1, 1.2, 1.3**. Find out whether scope enforcement is actually running in production, list
-which external keys can currently reach the option chain and the underlying quote endpoints, and shut
-those off.
+By now the violation has stopped, the product doesn't depend on them, and we can afford whatever
+answer we get. **That's the whole reason it comes last.**
 
-Everything else here is a plan. That one is a fact we don't currently have, and it determines whether
-the largest finding is "we showed data to our own subscribers" or "we sold it to third parties."
-Those are very different conversations, and we should know which one we're having before anyone else
-does.
+### 18. Let the lawyer decide the approach
+- **Convert to professional.** Simplest. Professional rates; free data ends.
+- **Close the second account**, keep one genuinely personal account. Clean — and after step 16 the
+  business doesn't need their feed.
+- **Open a business account.** Separates personal from company properly. Usually the best structure
+  for any later conversation.
+
+The lawyer may make the approach rather than us phoning in. That's normal and usually better.
+
+### 19. Be honest, and expect the free data to end
+They'll ask what changed. **Tell the truth.** Lying on a broker form turns a licensing problem —
+fixable, mostly about money — into a fraud problem, which isn't.
+
+Being able to say *"we found this, stopped it, and moved to a licensed supplier"* is worth a great
+deal. That sentence is the entire reason steps 1–17 come first.
+
+Budget for it: the free and cheap packages are personal-use products and end the day status changes.
+
+---
+
+## Ongoing — Keeping it clean
+
+### 20. Ask new signups whether they're a professional · start now
+A tickbox at signup: professional trader, registered with a regulator, or trading for a business?
+Prompt existing users on next login.
+
+*Why start before we have a contract:* every supplier requires it, it costs nothing if unneeded, and
+retrofitting it across an existing user base is painful.
+
+**Done when:** we can produce a professional / non-professional count on demand.
+
+### 21. Fix the terms page
+Our terms say nothing about market data — where it comes from, that it may be delayed, or the
+disclaimers exchanges require. They only stop *our* users reselling *our* content, which is an
+awkward look. The supplier will give exact wording. All five languages.
+
+### 22. Keep one file with everything in it
+Contracts, the audit, this runbook, monthly reports, the list of everywhere our data goes. Review
+each **January** — that's when the exchanges change their prices.
+
+---
+
+## Things that make it worse
+
+- **Don't lie on a form or in a call.** A licensing problem is negotiable. A false statement on a
+  broker form is a different category and removes the good outcomes.
+- **Don't open a third account or move entitlements again.** The two-username arrangement already
+  looks deliberate; more of it turns "got the rules wrong" into "knew and worked around it."
+- **Don't delete the trail.** Not volunteering is a judgement call the lawyer can make. Scrubbing git
+  history or purging web archives is not.
+- **Don't phone TradeStation to "ask hypothetically."** There's no hypothetical — the account is on
+  their screen.
+- **Don't wait for the lawyer to start week 1.** Steps 1–9 need nobody's permission and it's the part
+  growing every day.
+
+---
+
+## The words the lawyer will use
+
+| Term | What it means |
+| --- | --- |
+| Exchange | Where trading happens, and who owns the prices. CME (futures), Cboe (SPX, VIX), Nasdaq (NDX), NYSE. |
+| OPRA | The single body that collects and sells *all* US options prices. Every option quote we have came from them. |
+| Subscriber | Us, receiving data. Two flavours below. |
+| Non-professional | An individual using data for their own trading only. Cheap or free. What we're signed up as. |
+| Professional | Everyone else, including anyone using it for a business. Much more expensive. What we actually are. |
+| Vendor / distributor | A company licensed to pass data on to others. Separate, more expensive agreement. What we'd need. |
+| Redistribution | Showing or sending exchange data to anyone else. What our website and API do. |
+| Derived data | Numbers calculated *from* prices rather than the prices themselves. Our GEX and signals. Usually much cheaper to license — our best lever. |
+| Entitlement | Permission attached to a specific username for a specific feed. Ours are split across two usernames (finding F1). |
+| Back-billing | Being charged retroactively for what we should have been paying. The main financial risk. |
+
+---
+
+## If we do nothing else this week
+
+**Step 3.** Find out whether `API_SCOPE_ENFORCEMENT` is actually on in production, and which outside
+companies can currently reach the option chain and price endpoints.
+
+Everything else here is a plan. That one is a fact we don't have yet, and it decides whether the
+biggest problem is "we showed data to our own subscribers" or "we sold it to other companies." Very
+different conversations, and we should know which one we're in before anybody else does.
