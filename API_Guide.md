@@ -244,13 +244,13 @@ always passes, so these declarations are inert until keys are backfilled.
 
 | Scope | Covers | Redistributable? |
 | --- | --- | --- |
-| `gex` | GEX summary / by-strike / profile, walls, flip term-structure & surface, vol & premium surface, replay, **`/api/market/open-interest`**, and **`/api/v1/levels`** | ✅ derived |
+| `gex` | GEX summary / by-strike / profile, walls, flip term-structure & surface, vol surface, replay, **`/api/market/open-interest`**, and **`/api/v1/levels`** | ✅ derived |
 | `flow` | options-flow aggregates, forced flow | ✅ derived |
 | `maxpain` | max-pain analytics | ✅ derived |
 | `technicals` | VWAP / ORB / volume / momentum | ✅ derived |
 | `signals` | signal engine, backtest, scorecard, forecast, TradeWorkz | ✅ derived (premium) |
 | `market_reference` | the underlying's own tape — `/api/market/quote`, `/api/market/historical`, `/api/market/session-closes`, `/api/market/session-levels` | ✅ reference |
-| `market_raw` | per-contract **quoted prices** (bid/ask/last/mid) — `/api/option/*`, `/api/tools/option-calculator` | ❌ **withheld** |
+| `market_raw` | per-contract **quoted prices** (bid/ask/last/mid) — `/api/option/*`, `/api/tools/option-calculator`, `/api/gex/premium_surface` | ❌ **withheld** |
 
 Tier bundles (the unit of commercial packaging):
 

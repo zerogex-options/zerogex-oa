@@ -38,7 +38,18 @@ from src.api.main import app
 
 # Field names that ARE a quoted price. A payload exposing any of these is
 # handing over the vendor's quote, whatever the endpoint is called.
-QUOTE_FIELDS = frozenset({"bid", "ask", "last", "mid", "bid_price", "ask_price"})
+RAW_QUOTE_FIELDS = frozenset({"bid", "ask", "last", "mid", "bid_price", "ask_price"})
+
+# A quoted price under another name, or one recoverable from what sits beside
+# it. ``premium`` on /api/gex/premium_surface is the mid quote; its siblings
+# make it recoverable even if it were dropped, since ``intrinsic`` is
+# max(0, spot-strike) and ``extrinsic`` is max(0, premium - intrinsic) — so
+# extrinsic == premium at every OTM strike. Held in its own set so the reason
+# is written down, but enforced identically: the rule is about the value
+# reaching the caller, not the label on it.
+DERIVED_QUOTE_FIELDS = frozenset({"premium"})
+
+QUOTE_FIELDS = RAW_QUOTE_FIELDS | DERIVED_QUOTE_FIELDS
 
 
 class _Endpoint(typing.NamedTuple):
@@ -154,7 +165,13 @@ def test_the_route_table_is_actually_introspectable():
 
 
 def test_no_quote_bearing_payload_escapes_market_raw():
-    """The invariant. A response carrying bid/ask/last/mid needs MARKET_RAW."""
+    """The invariant. A response carrying a quoted price needs MARKET_RAW.
+
+    Covers both spellings — a literal ``bid``/``ask``/``last``/``mid``, and
+    a quote wearing another name (see ``DERIVED_QUOTE_FIELDS``). A new
+    endpoint that publishes either is caught here without needing its own
+    test.
+    """
     leaks = []
     for endpoint in _data_routes():
         fields = _model_fields(endpoint.response_model)
@@ -213,20 +230,40 @@ def test_the_quote_surfaces_still_require_market_raw(path):
     ), f"{path} returns per-contract prices and must require MARKET_RAW"
 
 
-def test_premium_surface_classification_is_recorded_not_silently_passing():
-    """A knowingly unresolved case, pinned so it cannot drift unnoticed.
+@pytest.mark.parametrize("path", ["/api/gex/premium_surface", "/api/v2/gex/premium_surface"])
+def test_premium_surface_needs_market_raw_because_its_z_axis_is_the_quote(path):
+    """The surface cannot be served without the quote, so the route is gated.
 
-    ``/api/gex/premium_surface`` rides GEX and returns ``premium``, its own
-    model documenting it as "quoted premium used (mid, or last as
-    fallback)" — a quoted price under a name QUOTE_FIELDS does not match.
-    This test asserts the CURRENT state, not that it is correct. It belongs
-    to the open question in the scopes.py docstring; if that question is
-    answered, change this test deliberately rather than deleting it.
+    ``premium`` is the mid quote. ``intrinsic`` is ``max(0, spot - strike)``,
+    computed from the underlying. ``extrinsic`` is
+    ``max(0, premium - intrinsic)``. So at every OTM strike intrinsic is 0
+    and ``extrinsic == premium``; elsewhere ``premium == extrinsic +
+    intrinsic``. Dropping the ``premium`` field alone would leave the quote
+    recoverable by addition — which is why this is gated at the ROUTE and
+    not by field selection, and why it sits beside /api/option/quote rather
+    than beside the vol surface.
+
+    The vol surface is the contrast worth keeping in view: IV only, and an
+    IV does not invert to a price without the rate, dividend and time
+    conventions behind it. It stays on GEX (asserted below).
     """
-    endpoint = _by_path("/api/gex/premium_surface")
-    fields = _model_fields(endpoint.response_model)
-    assert "premium" in fields, "premium_surface stopped returning `premium` — re-read this test"
-    assert scopes.MARKET_RAW not in endpoint.required_scopes, (
-        "premium_surface now requires MARKET_RAW — if that was deliberate, "
-        "update the open question in scopes.py and this test together"
+    endpoint = _by_path(path)
+    assert scopes.MARKET_RAW in endpoint.required_scopes, (
+        f"{path} publishes a quoted option premium and must require "
+        "MARKET_RAW; field-level redaction does not work here (see docstring)"
     )
+    assert (
+        not endpoint.required_scopes <= scopes.TIERS[scopes.TIER_SIGNALS]
+    ), f"{path} is reachable from a customer bundle again"
+
+
+def test_the_vol_surface_stays_derived():
+    """Guard against over-correcting: IV is ours, and must not be swept in
+    with the premium surface just because both are 'surfaces'."""
+    endpoint = _by_path("/api/gex/vol_surface")
+    fields = _model_fields(endpoint.response_model)
+    assert not (
+        fields & QUOTE_FIELDS
+    ), f"vol_surface now returns a price: {sorted(fields & QUOTE_FIELDS)}"
+    assert scopes.MARKET_RAW not in endpoint.required_scopes
+    assert endpoint.required_scopes <= scopes.TIERS[scopes.TIER_ANALYTICS]

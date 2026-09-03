@@ -45,6 +45,8 @@ Usage:
     python -m src.tools.api_caller_report --user alice@example.com
     python -m src.tools.api_caller_report --key-id 7
     python -m src.tools.api_caller_report --ua-contains Gexa   # by client build
+    python -m src.tools.api_caller_report --status 403 --hours 72  # who is refused
+    python -m src.tools.api_caller_report --status 4xx --hours 72  # all client errors
     python -m src.tools.api_caller_report --json /tmp/callers.json
 
 Or via make (see ``make api-caller-report``).
@@ -215,6 +217,33 @@ def read_access_log(path: str, since: str) -> List[Dict[str, str]]:
 # rather than handed to whichever is busier.
 _MIN_SUPPORT = 5
 _MIN_SHARE = 0.9
+
+
+def _status_matcher(wanted: List[str]):
+    """Build a predicate over a record's ``status`` from CLI values.
+
+    Accepts exact codes (``403``) and class shorthands (``4xx``) so
+    "everything the API refused" is one flag rather than four. An
+    unparseable value is a usage error rather than a filter that silently
+    matches nothing — getting an empty report and concluding "no 403s" is
+    the failure mode worth preventing here.
+    """
+    exact = set()
+    classes = set()
+    for raw in wanted:
+        token = str(raw).strip().lower()
+        if re.fullmatch(r"\d{3}", token):
+            exact.add(token)
+        elif re.fullmatch(r"\dxx", token):
+            classes.add(token[0])
+        else:
+            raise ValueError(f"--status {raw!r} is neither a code (403) nor a class (4xx)")
+
+    def matches(record: Dict[str, str]) -> bool:
+        status = str(record.get("status", "") or "")
+        return status in exact or (bool(status) and status[0] in classes)
+
+    return matches
 
 
 def _join_key(when: str, method: str, path: str, status: str) -> str:
@@ -561,6 +590,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ip", action="append", default=[], help="filter to client IP (repeatable)"
     )
+    parser.add_argument(
+        "--status",
+        action="append",
+        default=[],
+        metavar="CODE",
+        help=(
+            "filter to these response codes; repeatable. Exact ('403') or a "
+            "class ('4xx'). Use --status 403 to turn this into a "
+            "'who is being refused, and what are they asking for' report"
+        ),
+    )
     parser.add_argument("--user", action="append", default=[], help="filter to caller_user_id")
     parser.add_argument("--key-id", action="append", default=[], help="filter to caller_key_id")
     parser.add_argument(
@@ -573,6 +613,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+
+    # Validate before any log reading: --status 72h over a capped journal is
+    # not work to do twice, and a typo rejected only afterwards reads as
+    # "no matches" once the journal happens to be empty.
+    matches_status = None
+    if args.status:
+        try:
+            matches_status = _status_matcher(args.status)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     since_dt = datetime.now() - timedelta(hours=args.hours)
     since = since_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -592,6 +643,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     access = read_access_log(args.access_log, since)
     attributed, mode, dropped = attribute(audit, access)
+
+    if matches_status is not None:
+        attributed = [r for r in attributed if matches_status(r)]
+        # Fold it into the window label: every count below is now a count of
+        # FILTERED requests, and a header that still read "last 72h" would
+        # invite reading 'requests' as the caller's total traffic.
+        window = f"{window}, status in {sorted(set(args.status))}"
 
     if args.ip:
         wanted_ips = set(args.ip)

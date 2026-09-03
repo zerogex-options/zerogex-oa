@@ -15,9 +15,12 @@ each hold half the answer. The properties that matter:
 
 from __future__ import annotations
 
+import pytest
+
 from src.tools.api_caller_report import (
     _norm_journal_time,
     _norm_nginx_time,
+    _status_matcher,
     attribute,
     build_report,
     read_access_log,
@@ -369,3 +372,100 @@ class TestReportGrouping:
         report = build_report(attributed, access)
 
         assert [e["requests"] for e in report] == [2, 1]
+
+
+class TestStatusFilter:
+    """``--status`` turns the report into "who is being refused, and for what".
+
+    The motivating case: scope enforcement went on, a plain
+    ``grep status=403`` over three days of journal returned more lines than
+    anyone can read, and every line differed by ``duration_ms`` and
+    ``client_ip`` so ``uniq -c`` counted everything once. Filtering the
+    records and letting the existing per-caller grouping do the counting is
+    the answer — it also joins each caller to their key's SCOPES, which is
+    what says which grant is missing.
+    """
+
+    def test_exact_code(self):
+        matches = _status_matcher(["403"])
+        assert matches({"status": "403"})
+        assert not matches({"status": "200"})
+        assert not matches({"status": "404"})
+
+    def test_class_shorthand_covers_the_family(self):
+        matches = _status_matcher(["4xx"])
+        assert matches({"status": "401"})
+        assert matches({"status": "403"})
+        assert matches({"status": "429"})
+        assert not matches({"status": "200"})
+        assert not matches({"status": "503"})
+
+    def test_codes_and_classes_combine(self):
+        matches = _status_matcher(["403", "5xx"])
+        assert matches({"status": "403"})
+        assert matches({"status": "502"})
+        assert not matches({"status": "401"})
+
+    def test_missing_status_never_matches(self):
+        """A legacy line with no status must not be swept into a class filter
+        — it would inflate the count of an incident it has no evidence of."""
+        matches = _status_matcher(["4xx"])
+        assert not matches({})
+        assert not matches({"status": ""})
+        assert not matches({"status": "-"})
+
+    def test_a_bad_value_is_a_usage_error_not_an_empty_report(self):
+        """The failure mode worth preventing: a typo that matches nothing,
+        and an operator concluding there were no 403s."""
+        for bad in ("4o3", "forbidden", "40", "xx4", ""):
+            with pytest.raises(ValueError):
+                _status_matcher([bad])
+
+    def test_filtered_records_still_group_and_count_per_caller(self, tmp_path):
+        """End of the pipeline: the filter feeds the existing grouping, so the
+        answer arrives as one row per key with its failing paths."""
+        log = tmp_path / "access.log"
+        log.write_text("\n".join(ACCESS_LINES) + "\n")
+        access = read_access_log(str(log), since="2026-09-02 00:00:00")
+
+        records = [
+            _audit(
+                "2026-09-02 10:58:53",
+                "/api/market/open-interest",
+                status="403",
+                ip="1.1.1.1",
+                caller_kind="db",
+                caller_user_id="jim@x",
+                caller_key_id="145",
+                caller_name="jim-2",
+            ),
+            _audit(
+                "2026-09-02 10:58:54",
+                "/api/market/open-interest",
+                status="403",
+                ip="1.1.1.1",
+                caller_kind="db",
+                caller_user_id="jim@x",
+                caller_key_id="145",
+                caller_name="jim-2",
+            ),
+            # Same caller, succeeding elsewhere — must not be counted.
+            _audit(
+                "2026-09-02 10:58:55",
+                "/api/gex/summary",
+                status="200",
+                ip="1.1.1.1",
+                caller_kind="db",
+                caller_user_id="jim@x",
+                caller_key_id="145",
+                caller_name="jim-2",
+            ),
+        ]
+
+        matches = _status_matcher(["403"])
+        report = build_report([r for r in records if matches(r)], access)
+
+        assert len(report) == 1
+        assert report[0]["requests"] == 2
+        assert report[0]["caller_key_id"] == "145"
+        assert dict(report[0]["top_paths"]) == {"/api/market/open-interest": 2}

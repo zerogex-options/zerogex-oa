@@ -3849,10 +3849,11 @@ api-keys-revoke: ## Revoke a per-user API key (ID=<numeric id from api-keys-list
 COMMA := ,
 
 .PHONY: api-caller-report
-api-caller-report: ## Which API key is a caller using? Vars: IP=<ip[,ip]> USER=<owner> ID=<key id> UA=<substring> HOURS=2 JSON=<path> NO_DB=yes
+api-caller-report: ## Which API key is a caller using? Vars: IP=<ip[,ip]> USER=<owner> ID=<key id> UA=<substring> STATUS=<code[,code]> HOURS=2 JSON=<path> NO_DB=yes
 	@echo "$(BLUE)=== API caller attribution ===$(NC)"
 	@sudo --preserve-env=HOME $(VENV_PYTHON) -m src.tools.api_caller_report \
 		--hours $(or $(HOURS),2) \
+		$(foreach s,$(subst $(COMMA), ,$(STATUS)),--status "$(s)") \
 		$(foreach i,$(subst $(COMMA), ,$(IP)),--ip "$(i)") \
 		$(if $(KEY_USER),--user "$(KEY_USER)") \
 		$(foreach k,$(subst $(COMMA), ,$(ID)),--key-id "$(k)") \

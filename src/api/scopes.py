@@ -75,12 +75,18 @@ Each scope names one analytics domain:
   rebuild. Recording it here means that decision gets made on purpose
   rather than discovered by a customer's 403.
 
-  One item is knowingly unresolved: ``/api/gex/premium_surface`` rides
-  :data:`GEX` and returns ``premium`` — documented in its own model as
-  "quoted premium used (mid, or last as fallback)". That is a quoted price
-  under another name. It is pinned by the boundary test as a recorded
-  exception rather than silently passing, so moving it stays a deliberate
-  act. It belongs to the same open question above.
+  What is NOT open, and was settled on 2026-09-03:
+  ``/api/gex/premium_surface`` rode :data:`GEX` while returning ``premium``
+  — its own model calls it "quoted premium used (mid, or last as
+  fallback)". It now requires :data:`MARKET_RAW`, because the surface
+  cannot be served without the quote. ``intrinsic`` is
+  ``max(0, spot - strike)``, so for every OTM strike ``extrinsic ==
+  premium`` exactly, and elsewhere ``premium == extrinsic + intrinsic``.
+  Redacting the ``premium`` field alone would leave the quote recoverable
+  by addition — the one place where classifying by field, rather than by
+  route, does not work. The vol surface stays on :data:`GEX` by contrast:
+  it publishes implied volatilities, and an IV does not invert to a price
+  without the rate, dividend and time conventions behind it.
 
 Tier bundles
 ------------

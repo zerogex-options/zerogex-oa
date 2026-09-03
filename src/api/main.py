@@ -509,10 +509,23 @@ app.include_router(trade_bias_router, dependencies=[_scope_signals])
 app.include_router(levels_router, dependencies=[_scope_gex])
 app.include_router(volatility_gauge_router, dependencies=[_scope_gex])
 app.include_router(vol_surface_router, dependencies=[_scope_gex])
-# Options premium (extrinsic-value) surface — Beta. Derived analytics built
-# from quoted option prices, redistributable on the same GEX scope as the
-# vol surface.
-app.include_router(premium_surface_router, dependencies=[_scope_gex])
+# Options premium (extrinsic-value) surface — Beta. MARKET_RAW, not GEX: its
+# z-axis IS a quoted option price, and no amount of field selection changes
+# that. `premium` is the mid quote ((bid+ask)/2, falling back to the stored
+# mid then the last trade); `intrinsic` is max(0, spot-strike), computed from
+# the underlying and the strike; `extrinsic` is max(0, premium - intrinsic).
+# For every OUT-OF-THE-MONEY strike intrinsic is 0, so extrinsic == premium
+# exactly — and where it is non-zero, premium == extrinsic + intrinsic. So
+# withholding the `premium` field while serving the surface would be
+# arithmetic theatre: the caller recovers the quote by addition, or reads it
+# directly off the OTM half of the chain. The whole surface therefore rides
+# the same scope as /api/option/quote.
+#
+# This is the one case the derived/raw split cannot straddle. Contrast the
+# vol surface immediately above, which stays on GEX: it publishes implied
+# volatilities only, and an IV is not invertible to a price without the rate,
+# dividend and time conventions that produced it.
+app.include_router(premium_surface_router, dependencies=[_scope_market_raw])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # Gamma Regime Shift — the derivative of the dealer-gamma surface (what
 # CHANGED between two snapshots, what expires next, and the classified read
