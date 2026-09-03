@@ -15,15 +15,20 @@ each hold half the answer. The properties that matter:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from src.tools.api_caller_report import (
     _norm_journal_time,
     _norm_nginx_time,
+    _record_filter,
     _status_matcher,
     attribute,
     build_report,
+    is_direct_mode,
     read_access_log,
+    read_audit_lines,
 )
 
 ACCESS_LINES = [
@@ -469,3 +474,171 @@ class TestStatusFilter:
         assert report[0]["requests"] == 2
         assert report[0]["caller_key_id"] == "145"
         assert dict(report[0]["top_paths"]) == {"/api/market/open-interest": 2}
+
+
+AUDIT_LINE = (
+    "{ts} ip-1 zerogex-oa-api[1]: {ts_app} - src.api.audit - INFO - "
+    "[request_id=r{n}] api_request method=GET path={path} status={status} "
+    "client_ip={ip} caller_kind=db caller_user_id={user} caller_key_id={key} "
+    "caller_name=k{key} end_user_id=- duration_ms=1.0"
+)
+
+
+def _fake_journalctl(tmp_path, monkeypatch, lines):
+    """Put a stub ``journalctl`` on PATH that prints ``lines``.
+
+    Exercises the real subprocess path — the streaming rewrite is about how
+    the pipe is consumed, so stubbing ``Popen`` would test the wrong thing.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    payload = tmp_path / "journal.txt"
+    payload.write_text("\n".join(lines) + "\n")
+    stub = bindir / "journalctl"
+    stub.write_text("#!/bin/sh\ncat %s\n" % payload)
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+
+
+class TestStreamingRead:
+    """The journal read streams and filters as it goes.
+
+    It used to buffer the whole window twice (``capture_output`` string, then
+    ``splitlines`` list) before parsing a record. On 2026-09-03 that was
+    OOM-killed on a 72h window: one caller retrying a 403 at ~38/s had made
+    the journal too big to read, so the incident blocked its own
+    investigation. Pushing the filter into the reader is what keeps an
+    incident window to the failures.
+    """
+
+    def _lines(self):
+        return [
+            AUDIT_LINE.format(
+                ts="2026-09-03T10:28:46-04:00",
+                ts_app="2026-09-03 10:28:46,117",
+                n=1,
+                path="/api/gex/summary",
+                status="200",
+                ip="1.1.1.1",
+                user="web",
+                key="4",
+            ),
+            AUDIT_LINE.format(
+                ts="2026-09-03T10:29:00-04:00",
+                ts_app="2026-09-03 10:29:00,000",
+                n=2,
+                path="/api/market/open-interest",
+                status="403",
+                ip="2.2.2.2",
+                user="jim@x",
+                key="145",
+            ),
+            AUDIT_LINE.format(
+                ts="2026-09-03T10:29:01-04:00",
+                ts_app="2026-09-03 10:29:01,000",
+                n=3,
+                path="/api/option/quote",
+                status="403",
+                ip="3.3.3.3",
+                user="rak@x",
+                key="59",
+            ),
+            "2026-09-03T10:29:02-04:00 ip-1 zerogex-oa-api[1]: not an audit line",
+        ]
+
+    def test_reads_every_audit_record_when_unfiltered(self, tmp_path, monkeypatch):
+        _fake_journalctl(tmp_path, monkeypatch, self._lines())
+        records = read_audit_lines("zerogex-oa-api", "2026-09-03 00:00:00")
+        assert [r["path"] for r in records] == [
+            "/api/gex/summary",
+            "/api/market/open-interest",
+            "/api/option/quote",
+        ]
+        assert records[1]["caller_key_id"] == "145"
+        assert records[1]["_when"] == "2026-09-03 10:29:00"
+
+    def test_keep_predicate_discards_before_retention(self, tmp_path, monkeypatch):
+        """The point of the pushdown: non-matching records are never held."""
+        _fake_journalctl(tmp_path, monkeypatch, self._lines())
+        records = read_audit_lines(
+            "zerogex-oa-api", "2026-09-03 00:00:00", keep=_record_filter(["403"], [])
+        )
+        assert len(records) == 2
+        assert {r["status"] for r in records} == {"403"}
+
+    def test_path_and_status_filters_compose(self, tmp_path, monkeypatch):
+        _fake_journalctl(tmp_path, monkeypatch, self._lines())
+        records = read_audit_lines(
+            "zerogex-oa-api",
+            "2026-09-03 00:00:00",
+            keep=_record_filter(["403"], ["/api/market/"]),
+        )
+        assert [r["path"] for r in records] == ["/api/market/open-interest"]
+
+
+class TestRecordFilter:
+    def test_no_filters_is_none_not_an_always_true_predicate(self):
+        assert _record_filter([], []) is None
+
+    def test_path_matches_on_prefix(self):
+        keep = _record_filter([], ["/api/gex/premium_surface"])
+        assert keep({"path": "/api/gex/premium_surface"})
+        assert keep({"path": "/api/gex/premium_surface/extra"})
+        assert not keep({"path": "/api/gex/vol_surface"})
+
+    def test_several_prefixes_are_a_union(self):
+        keep = _record_filter([], ["/api/option/", "/api/tools/"])
+        assert keep({"path": "/api/option/quote"})
+        assert keep({"path": "/api/tools/option-calculator"})
+        assert not keep({"path": "/api/gex/summary"})
+
+    def test_a_bad_status_still_raises_through_the_combiner(self):
+        with pytest.raises(ValueError):
+            _record_filter(["nope"], [])
+
+
+class TestAccessLogScoping:
+    def test_only_ips_keeps_just_those_addresses(self, tmp_path):
+        log = tmp_path / "access.log"
+        log.write_text("\n".join(ACCESS_LINES) + "\n")
+
+        everything = read_access_log(str(log), since="2026-09-02 00:00:00")
+        scoped = read_access_log(str(log), since="2026-09-02 00:00:00", only_ips={"1.1.1.1"})
+
+        assert {r["ip"] for r in everything} == {"1.1.1.1", "2.2.2.2"}
+        assert {r["ip"] for r in scoped} == {"1.1.1.1"}
+        # Same rows for the address we kept — scoping must not alter content.
+        assert [r for r in everything if r["ip"] == "1.1.1.1"] == scoped
+
+    def test_user_agents_survive_scoping_in_direct_mode(self, tmp_path):
+        """Scoping is only safe because it drops addresses the report never
+        looks up. The UA tally for a listed caller must be unchanged."""
+        log = tmp_path / "access.log"
+        log.write_text("\n".join(ACCESS_LINES) + "\n")
+        attributed = [
+            _audit(
+                "2026-09-02 10:58:53",
+                "/api/gex/summary",
+                ip="1.1.1.1",
+                client_ip="1.1.1.1",
+                caller_kind="db",
+                caller_user_id="alice@x",
+                caller_key_id="7",
+                caller_name="k7",
+            )
+        ]
+        scoped = read_access_log(str(log), since="2026-09-02 00:00:00", only_ips={"1.1.1.1"})
+        report = build_report(attributed, scoped)
+        assert dict(report[0]["user_agents"]) == {"alpha-client/1.0": 2}
+
+
+class TestModeDetection:
+    def test_one_client_ip_anywhere_selects_direct(self):
+        assert is_direct_mode([{"client_ip": "-"}, {"client_ip": "1.1.1.1"}])
+
+    def test_all_dashes_is_legacy(self):
+        assert not is_direct_mode([{"client_ip": "-"}, {}])
+
+    def test_empty_window_is_legacy(self):
+        """No evidence of the field is not evidence of the field."""
+        assert not is_direct_mode([])
