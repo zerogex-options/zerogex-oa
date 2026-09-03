@@ -14,17 +14,21 @@ Without it a trader watching a pin drift away reasonably concludes the level
 
 This module turns the day's per-minute pin path into that account:
 
-  * ``held_since`` — when the CURRENT pin value took hold.
-  * ``session_open_pin`` / ``net_migration`` — where the pin started and how
-    far, net, it has travelled since.
+  * ``current_*`` — where the pin is right now, and since when.
+  * ``held_*`` — the most recent value that has actually SETTLED, plus
+    ``session_open_pin`` / ``net_migration``: where the pin started and how
+    far, net, it has travelled between settled levels.
   * ``distinct_values`` — how many strikes it has genuinely occupied.
+  * ``current_established`` — whether those two levels are the same value, i.e.
+    whether the pin standing right now has held long enough to count as a move.
 
 Flicker is pruned the way :mod:`src.jobs.level_history` prunes it for the
 walls, and for the same reason: a pin ticking to a neighbouring strike for a
 minute and back is a near-tie in the scoring, not a migration.  Reporting it
 would bury the one or two moves that mattered.  A 713 pin that printed 712
 twice has not "migrated to 712" — that distinction is the whole point of the
-metric, so single-sample excursions are dropped before anything is counted.
+metric, so single-sample excursions are dropped before anything is counted,
+including one that lands on the very last sample of the session.
 
 Design notes
 ------------
@@ -73,9 +77,27 @@ class PinRun:
 
 @dataclass
 class PinStability:
-    """The session's pin path, reduced to what a trader needs to read."""
+    """The session's pin path, reduced to what a trader needs to read.
+
+    Two levels, deliberately:
+
+    * ``current_*`` is where the pin is RIGHT NOW, however new that value is.
+      A caller asking "where is the pin" must never be told about a previous
+      one.
+    * ``held_*`` is the most recent value that has actually SETTLED -- cleared
+      :data:`MIN_HOLD_SAMPLES`. Migration is measured between settled levels,
+      so a one-sample tick at the bell is not reported as a move.
+
+    ``current_established`` says whether those two are the same value. When it
+    is False the current pin is provisional: real, but not yet evidence of a
+    migration.
+    """
 
     current_pin: float
+    current_since: datetime
+    current_samples: int
+    current_established: bool
+    held_pin: float
     held_since: datetime
     held_samples: int
     session_open_pin: float
@@ -87,6 +109,10 @@ class PinStability:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "current_pin": self.current_pin,
+            "current_since": self.current_since.isoformat(),
+            "current_samples": self.current_samples,
+            "current_established": self.current_established,
+            "held_pin": self.held_pin,
             "held_since": self.held_since.isoformat(),
             "held_samples": self.held_samples,
             "session_open_pin": self.session_open_pin,
@@ -139,18 +165,20 @@ def _merge_adjacent(runs: List[PinRun]) -> List[PinRun]:
     return merged
 
 
-def _prune_flicker(runs: List[PinRun]) -> List[PinRun]:
-    """Drop sub-:data:`MIN_HOLD_SAMPLES` runs, then re-merge.
+def _established_runs(runs: List[PinRun]) -> List[PinRun]:
+    """The runs that actually SETTLED, at :data:`MIN_HOLD_SAMPLES` or more.
 
-    The final run is always kept: it is the pin standing right now, however
-    recently it formed, and a caller asking "where is the pin" must not be
-    told about the previous one.
+    Unlike the walls' pruning in :mod:`src.jobs.level_history`, the final run
+    gets NO exemption here.  That exemption is what let a one-sample tick at
+    the bell be promoted to a migration: mid-session such a blip is pruned, but
+    at the session edge it survived as "the current run" and the reported
+    net move jumped with it -- precisely the flicker-is-not-a-migration rule
+    this module exists to enforce, defeated by its own edge case.
+
+    Where the pin IS is answered separately (``current_*``), so nothing is lost
+    by holding this series to one consistent standard.
     """
-    if len(runs) <= 1:
-        return runs
-    kept = [r for r in runs[:-1] if r.samples >= MIN_HOLD_SAMPLES]
-    kept.append(runs[-1])
-    return _merge_adjacent(kept)
+    return _merge_adjacent([r for r in runs if r.samples >= MIN_HOLD_SAMPLES])
 
 
 def build_pin_stability(frames: Sequence[Dict[str, Any]]) -> Optional[PinStability]:
@@ -164,24 +192,42 @@ def build_pin_stability(frames: Sequence[Dict[str, Any]]) -> Optional[PinStabili
     if not frames:
         return None
 
-    runs = _prune_flicker(_raw_runs(frames))
+    runs = _merge_adjacent(_raw_runs(frames))
     if not runs:
         return None
 
     current = runs[-1]
+    settled = _established_runs(runs)
+
+    if settled:
+        held = settled[-1]
+        opening = settled[0].value
+        established = abs(held.value - current.value) < _EPS
+    else:
+        # Nothing has settled yet -- an opening still inside the noise floor.
+        # The honest reading is "no migration established", not a move
+        # measured between two levels neither of which has held.
+        held = current
+        opening = current.value
+        established = False
+
     total = len(frames)
     # Quiet minutes are the frames the engine declined to name a pin for -- a
     # real and frequent answer, not missing data, so it is reported rather
-    # than silently folded into the held count.
+    # than silently folded into any held count.
     quiet = sum(1 for row in frames if _to_float(row.get("pin_strike")) is None)
 
     return PinStability(
         current_pin=current.value,
-        held_since=current.start,
-        held_samples=current.samples,
-        session_open_pin=runs[0].value,
-        net_migration=current.value - runs[0].value,
-        distinct_values=len(runs),
+        current_since=current.start,
+        current_samples=current.samples,
+        current_established=established,
+        held_pin=held.value,
+        held_since=held.start,
+        held_samples=held.samples,
+        session_open_pin=opening,
+        net_migration=held.value - opening,
+        distinct_values=len(settled) if settled else 1,
         quiet_samples=quiet,
         total_samples=total,
     )

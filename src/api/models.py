@@ -126,7 +126,10 @@ class PinStabilityResponse(BaseModel):
     points are different signals wearing the same label; without this a drifting
     pin reads as a level that failed rather than one tracking a repricing book.
 
-    ``held_since`` is when the CURRENT value took hold; ``net_migration`` is
+    ``current_*`` is the pin standing right now, ``held_*`` the most recent
+    value that has SETTLED, and ``current_established`` says whether they are
+    the same. Migration is measured between settled levels only, so a
+    one-sample tick at the bell is not reported as a move; ``net_migration`` is
     signed (negative = the pin has walked down).  Sample counts, not minutes:
     the analytics cycle is ~60s but is not guaranteed to be, so the honest unit
     is "stored frames".  Null-bodied (``stability`` omitted) when the session
@@ -135,6 +138,10 @@ class PinStabilityResponse(BaseModel):
 
     symbol: str
     current_pin: float
+    current_since: datetime
+    current_samples: int
+    current_established: bool
+    held_pin: float
     held_since: datetime
     held_samples: int
     session_open_pin: float
