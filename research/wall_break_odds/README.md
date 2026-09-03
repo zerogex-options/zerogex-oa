@@ -82,13 +82,13 @@ identical for every test that day, and those tests share the day's regime. A
 textbook two-proportion z-test treats them as independent and is measurably
 anti-conservative for it. The screen uses a session-clustered bootstrap instead.
 
-Measured false-positive rate at α=0.05 on synthetic null data (400 sessions, 1–3
-events each, 250 trials per cell):
+Measured false-positive rate at α=0.05 on synthetic null data (300 sessions, 1–3
+events each, 200 trials per cell, both arms on the same balanced split):
 
 | design | naive z-test | this |
 |---|---|---|
-| independent rows | 0.040 | 0.068 |
-| session-clustered rows | **0.110** | **0.032** |
+| independent rows | 0.045 | 0.035 |
+| session-clustered rows | **0.110** | **0.055** |
 
 The clustered row is the one that matters, and it is the one the naive test gets
 wrong.

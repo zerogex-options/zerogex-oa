@@ -332,3 +332,88 @@ def test_evaluate_refuses_to_model_a_small_sample():
     out = evaluate(rows)
     assert out["status"] == "insufficient_data"
     assert out["required"] == MIN_EVENTS_FOR_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Option-type encoding — the defect that emptied the flow column on the first
+# real run: flow_by_contract stores 'C'/'P', the feature layer asked for
+# 'call'/'put', and every lookup returned None looking like a quiet tape.
+# ---------------------------------------------------------------------------
+
+
+def test_flow_matches_the_c_p_encoding_the_table_actually_uses():
+    rows = [
+        {
+            "timestamp": OPEN + timedelta(minutes=5),
+            "option_type": "C",
+            "strike": WALL,
+            "expiration": SESSION,
+            "net_premium": 100.0,
+        },
+        {
+            "timestamp": OPEN + timedelta(minutes=35),
+            "option_type": "C",
+            "strike": WALL,
+            "expiration": SESSION,
+            "net_premium": 400.0,
+        },
+    ]
+    flow = FlowWindow.from_rows(rows)
+    assert flow.coverage() == {"C": 1}
+    got = flow.window_premium(
+        "call", [WALL], OPEN + timedelta(minutes=5), OPEN + timedelta(minutes=35)
+    )
+    assert got == pytest.approx(300.0)
+
+
+def test_flow_accepts_either_spelling_on_both_sides():
+    from research.wall_break_odds.features import canonical_option_type
+
+    assert canonical_option_type("C") == canonical_option_type("call") == "C"
+    assert canonical_option_type("P") == canonical_option_type("PUT") == "P"
+    assert canonical_option_type("banana") is None
+
+
+def test_unrecognised_option_type_is_recorded_not_swallowed():
+    rows = [
+        {
+            "timestamp": OPEN,
+            "option_type": "CALL_OPTION",
+            "strike": WALL,
+            "expiration": SESSION,
+            "net_premium": 1.0,
+        },
+    ]
+    flow = FlowWindow.from_rows(rows)
+    assert flow.coverage() == {}
+    assert flow.unrecognised == {"CALL_OPTION": 1}
+
+
+# ---------------------------------------------------------------------------
+# Split rule
+# ---------------------------------------------------------------------------
+
+
+def test_binary_feature_is_screenable():
+    """A median split leaves the 'above' group empty when the majority value
+    IS the median; the balanced split lands on the 0/1 boundary instead."""
+    from research.wall_break_odds.model import _best_split, univariate_screen
+
+    assert _best_split([1.0] * 60 + [0.0] * 40) == 1.0
+
+    rows = []
+    for i in range(200):
+        day = SESSION + timedelta(days=i % 50)
+        above = 1.0 if i % 5 else 0.0  # 80% ones — median is 1
+        rows.append(Row(session=day, side="call", broke=i % 2, features={"spot_above_flip": above}))
+    screened = univariate_screen(rows, feature_names=("spot_above_flip",))[0]
+    assert screened["n"] == 200
+    # It may or may not clear the per-group floor, but it must not fail for the
+    # structural reason the median split used to fail for.
+    assert screened.get("reason") != "median split degenerate"
+
+
+def test_continuous_split_still_lands_on_the_median():
+    from research.wall_break_odds.model import _best_split
+
+    assert _best_split([float(i) for i in range(100)]) == 50.0

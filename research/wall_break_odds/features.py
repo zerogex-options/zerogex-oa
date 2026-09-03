@@ -28,7 +28,7 @@ tape is actually pushing.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Mapping, Optional, Sequence
 
@@ -147,6 +147,29 @@ class SummarySeries:
         return self.call_wall_strength if side == "call" else self.put_wall_strength
 
 
+#: Canonical option-type codes, and every spelling seen in the wild mapped
+#: onto them. ``flow_by_contract`` stores 'C'/'P' (see
+#: src/flow_series_sql.py), but callers and fixtures naturally write
+#: 'call'/'put'. Matching on the wrong spelling silently drops EVERY row and
+#: the feature reads as "no flow" — which is how the first real run of this
+#: study produced an empty flow column against a fully populated table.
+_OPTION_TYPE_CANON = {
+    "c": "C",
+    "call": "C",
+    "calls": "C",
+    "p": "P",
+    "put": "P",
+    "puts": "P",
+}
+
+
+def canonical_option_type(value: Any) -> Optional[str]:
+    """'call' / 'C' / 'CALL' -> 'C'. None when unrecognised."""
+    if value is None:
+        return None
+    return _OPTION_TYPE_CANON.get(str(value).strip().lower())
+
+
 @dataclass
 class FlowWindow:
     """Signed aggressor premium at the wall strike, as a cumulative series.
@@ -163,26 +186,33 @@ class FlowWindow:
     totals would book its entire day-to-date figure as window activity.
     """
 
-    #: ``{(option_type, strike, expiration): [(bucket_ts, cumulative)]}``
+    #: ``{(canonical_type, strike, expiration): [(bucket_ts, cumulative)]}``
     series: dict[tuple[str, float, Any], list[tuple[datetime, float]]]
+    #: Option-type values that could not be canonicalised, with their counts.
+    #: Non-empty means the encoding changed underneath this module, and the
+    #: flow features are silently degraded — the caller is expected to make
+    #: noise about it rather than let the column quietly read as "no flow".
+    unrecognised: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_rows(cls, rows: Sequence[Mapping[str, Any]]) -> "FlowWindow":
         acc: dict[tuple[str, float, Any], list[tuple[datetime, float]]] = {}
+        bad: dict[str, int] = {}
         for r in rows:
             prem = r.get("net_premium")
             ts = r.get("timestamp")
             if prem is None or ts is None:
                 continue
-            key = (
-                str(r.get("option_type") or "").lower(),
-                float(r.get("strike") or 0.0),
-                r.get("expiration"),
-            )
+            opt = canonical_option_type(r.get("option_type"))
+            if opt is None:
+                raw = str(r.get("option_type"))
+                bad[raw] = bad.get(raw, 0) + 1
+                continue
+            key = (opt, float(r.get("strike") or 0.0), r.get("expiration"))
             acc.setdefault(key, []).append((ts, float(prem)))
         for v in acc.values():
             v.sort(key=lambda p: p[0])
-        return cls(series=acc)
+        return cls(series=acc, unrecognised=bad)
 
     @staticmethod
     def _cum_at(points: Sequence[tuple[datetime, float]], ts: datetime) -> float:
@@ -199,17 +229,33 @@ class FlowWindow:
         """Net aggressor premium over ``(start, end]`` for the given strikes.
 
         Returns None when no contract in the neighbourhood traded at all, so a
-        genuinely empty tape is distinguishable from a balanced one.
+        genuinely empty tape is distinguishable from a balanced one. Both the
+        stored and the requested option type are canonicalised first, so a
+        caller saying 'call' and a table storing 'C' agree.
         """
+        want_type = canonical_option_type(option_type)
+        if want_type is None:
+            return None
         wanted = {round(float(s), 4) for s in strikes}
         total = 0.0
         seen = False
         for (opt, strike, _exp), points in self.series.items():
-            if opt != option_type or round(strike, 4) not in wanted:
+            if opt != want_type or round(strike, 4) not in wanted:
                 continue
             seen = True
             total += self._cum_at(points, end) - self._cum_at(points, start)
         return total if seen else None
+
+    def coverage(self) -> dict[str, int]:
+        """Contracts held per canonical option type — a cheap sanity probe.
+
+        A window built from a populated table that reports ``{}`` here is the
+        signature of an encoding mismatch, not a quiet tape.
+        """
+        out: dict[str, int] = {}
+        for opt, _strike, _exp in self.series:
+            out[opt] = out.get(opt, 0) + 1
+        return out
 
 
 def _realized_sigma(bars: Sequence[PriceBar], end: datetime, minutes: int) -> Optional[float]:
@@ -311,9 +357,8 @@ def build_features(
     flow_now = flow_prior = None
     if flow is not None:
         neighbourhood = [event.wall, event.wall + strike_step * toward]
-        opt = "call" if side == "call" else "put"
-        flow_now = flow.window_premium(opt, neighbourhood, then, t)
-        flow_prior = flow.window_premium(opt, neighbourhood, prior, then)
+        flow_now = flow.window_premium(side, neighbourhood, then, t)
+        flow_prior = flow.window_premium(side, neighbourhood, prior, then)
 
     feats: dict[str, Optional[float]] = {
         "wall_strength_log": _signed_log(strength_now),

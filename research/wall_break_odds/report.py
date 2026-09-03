@@ -58,6 +58,19 @@ def _sample_block(meta: Mapping[str, Any]) -> list[str]:
         "   — horizon ran past 16:00 ET, outcome never observable"
     )
     lines.append(f"  resolved (modelled)   {meta.get('events_resolved', 0)}")
+    fetched = meta.get("flow_rows_fetched")
+    if fetched is not None:
+        usable = meta.get("flow_contracts_usable", 0)
+        with_flow = meta.get("events_with_flow", 0)
+        lines.append(
+            f"  flow rows fetched     {fetched}"
+            f"  (usable contracts {usable}; events with a flow value {with_flow})"
+        )
+        if fetched and not usable:
+            lines.append(
+                "    ** flow rows were fetched but NONE were usable — this is an "
+                "encoding mismatch, not a quiet tape"
+            )
     return lines
 
 
@@ -76,7 +89,7 @@ def _config_block(cfg: Mapping[str, Any]) -> list[str]:
 
 def _screen_block(screen: Sequence[Mapping[str, Any]]) -> list[str]:
     lines = [
-        "UNIVARIATE SCREEN  (break rate above vs below each feature's median)",
+        "UNIVARIATE SCREEN  (break rate above vs below a balanced split)",
         _THIN,
         "  Marginal associations only, and mutually correlated. Benjamini-Hochberg",
         "  FDR control at 5% across the family — without it roughly one in twenty",
