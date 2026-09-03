@@ -47,6 +47,7 @@ Usage:
     python -m src.tools.api_caller_report --ua-contains Gexa   # by client build
     python -m src.tools.api_caller_report --status 403 --hours 72  # who is refused
     python -m src.tools.api_caller_report --status 4xx --hours 72  # all client errors
+    python -m src.tools.api_caller_report --path /api/gex/premium_surface  # who uses it
     python -m src.tools.api_caller_report --json /tmp/callers.json
 
 Or via make (see ``make api-caller-report``).
@@ -62,7 +63,7 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Log parsing
@@ -121,16 +122,34 @@ def _norm_journal_time(token: str) -> Optional[str]:
     return stamp.replace("T", " ", 1)
 
 
-def read_audit_lines(unit: str, since: str) -> List[Dict[str, str]]:
+def read_audit_lines(
+    unit: str,
+    since: str,
+    keep: Optional[Callable[[Dict[str, str]], bool]] = None,
+) -> List[Dict[str, str]]:
     """Pull ``api_request`` audit records out of the journal.
 
     ``since`` is an absolute local ``YYYY-MM-DD HH:MM:SS`` cutoff — the same
     string used to filter the access log, so both sides of the join are
     bounded identically. (Passing journalctl a relative expression instead
     would let systemd's own time parser pick a slightly different cutoff.)
+
+    STREAMED, not buffered. This used to be ``subprocess.run(...,
+    capture_output=True)``, which holds the whole journal window as one
+    string and then copies it again as a list of lines — two full copies of
+    the output before a single record is parsed. On a busy API a multi-day
+    window is gigabytes and the process is OOM-killed, which is how it
+    failed on 2026-09-03: the incident under investigation (one caller
+    retrying a 403 at ~38/s) was itself what made the window too big to
+    read. Reading the pipe line by line keeps only what ``keep`` admits.
+
+    ``keep`` is applied to the parsed fields. Push a filter down here rather
+    than discarding records in the caller: on an incident window, that is
+    the difference between holding every request and holding only the
+    failures.
     """
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 "journalctl",
                 "-u",
@@ -141,37 +160,55 @@ def read_audit_lines(unit: str, since: str) -> List[Dict[str, str]]:
                 "short-iso",
                 "--no-pager",
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
         )
     except FileNotFoundError:
         raise SystemExit("journalctl not found — run this on the API host.")
-    if proc.returncode != 0 and not proc.stdout:
-        raise SystemExit(
-            f"journalctl -u {unit} failed (rc={proc.returncode}): "
-            f"{proc.stderr.strip() or 'no output'}\n"
-            "Reading another unit's journal usually needs sudo."
-        )
 
     records: List[Dict[str, str]] = []
-    for line in proc.stdout.splitlines():
-        marker = line.find(_AUDIT_MARKER)
-        if marker < 0:
-            continue
-        fields = dict(_KV_RE.findall(line[marker:]))
-        if "method" not in fields or "path" not in fields:
-            continue
-        when = _norm_journal_time(line.split(None, 1)[0])
-        if when is None:
-            continue
-        fields["_when"] = when
-        records.append(fields)
+    assert proc.stdout is not None
+    with proc.stdout as stream:
+        for line in stream:
+            marker = line.find(_AUDIT_MARKER)
+            if marker < 0:
+                continue
+            fields = dict(_KV_RE.findall(line[marker:]))
+            if "method" not in fields or "path" not in fields:
+                continue
+            when = _norm_journal_time(line.split(None, 1)[0])
+            if when is None:
+                continue
+            fields["_when"] = when
+            if keep is not None and not keep(fields):
+                continue
+            records.append(fields)
+
+    stderr = proc.stderr.read() if proc.stderr else ""
+    if proc.stderr:
+        proc.stderr.close()
+    returncode = proc.wait()
+    if returncode != 0 and not records:
+        raise SystemExit(
+            f"journalctl -u {unit} failed (rc={returncode}): "
+            f"{stderr.strip() or 'no output'}\n"
+            "Reading another unit's journal usually needs sudo."
+        )
     return records
 
 
-def read_access_log(path: str, since: str) -> List[Dict[str, str]]:
-    """Parse nginx access-log rows at or after ``since`` (local ISO string)."""
+def read_access_log(path: str, since: str, only_ips: Optional[set] = None) -> List[Dict[str, str]]:
+    """Parse nginx access-log rows at or after ``since`` (local ISO string).
+
+    ``only_ips`` keeps rows from those addresses alone. Safe **in direct
+    mode only**, where these rows feed nothing but the User-Agent tally
+    (``build_report``'s ``ua_by_ip``) and so are read exclusively at
+    addresses the report already lists — same output, bounded memory. In
+    legacy mode they also build ``ips_by_key``, where a missing row makes a
+    colliding second look unique and turns a discarded request into a
+    confidently wrong attribution; the caller must pass ``None`` there.
+    """
     rows: List[Dict[str, str]] = []
     try:
         handle = open(path, "r", errors="replace")
@@ -186,6 +223,8 @@ def read_access_log(path: str, since: str) -> List[Dict[str, str]]:
                 continue
             when = _norm_nginx_time(match.group("ts"))
             if when is None or when < since:
+                continue
+            if only_ips is not None and match.group("ip") not in only_ips:
                 continue
             request = match.group("request").split()
             if len(request) < 2:
@@ -246,8 +285,43 @@ def _status_matcher(wanted: List[str]):
     return matches
 
 
+def _record_filter(
+    statuses: List[str], path_prefixes: List[str]
+) -> Optional[Callable[[Dict[str, str]], bool]]:
+    """Combine ``--status`` and ``--path`` into one predicate, or None.
+
+    Returning None when nothing was asked for lets the reader skip the call
+    per line, and keeps "no filter" a single unambiguous state rather than a
+    predicate that happens to always be true.
+    """
+    matches_status = _status_matcher(statuses) if statuses else None
+    prefixes = tuple(path_prefixes)
+    if matches_status is None and not prefixes:
+        return None
+
+    def keep(record: Dict[str, str]) -> bool:
+        if matches_status is not None and not matches_status(record):
+            return False
+        if prefixes and not str(record.get("path", "")).startswith(prefixes):
+            return False
+        return True
+
+    return keep
+
+
 def _join_key(when: str, method: str, path: str, status: str) -> str:
     return f"{when}|{method}|{path}|{status}"
+
+
+def is_direct_mode(audit: List[Dict[str, str]]) -> bool:
+    """Whether audit lines carry ``client_ip`` — i.e. attribution is exact.
+
+    A single such line anywhere in the window selects direct mode (see
+    :func:`attribute`). Exposed so the caller can know which mode it is in
+    BEFORE reading the access log, because the two modes need different
+    amounts of it.
+    """
+    return any(r.get("client_ip", "-") not in ("-", None) for r in audit)
 
 
 def attribute(
@@ -266,9 +340,7 @@ def attribute(
     than run through the weaker join, so one report never mixes an exact
     attribution with an inferred one.
     """
-    has_client_ip = any(r.get("client_ip", "-") not in ("-", None) for r in audit)
-
-    if has_client_ip:
+    if is_direct_mode(audit):
         out = []
         for rec in audit:
             ip = rec.get("client_ip", "-")
@@ -601,6 +673,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "'who is being refused, and what are they asking for' report"
         ),
     )
+    parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help=(
+            "filter to request paths starting with this; repeatable. "
+            "'who calls this endpoint' — ask before re-gating one, while "
+            "the callers are still getting 200s and so invisible to --status"
+        ),
+    )
     parser.add_argument("--user", action="append", default=[], help="filter to caller_user_id")
     parser.add_argument("--key-id", action="append", default=[], help="filter to caller_key_id")
     parser.add_argument(
@@ -617,19 +700,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Validate before any log reading: --status 72h over a capped journal is
     # not work to do twice, and a typo rejected only afterwards reads as
     # "no matches" once the journal happens to be empty.
-    matches_status = None
-    if args.status:
-        try:
-            matches_status = _status_matcher(args.status)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
+    try:
+        keep = _record_filter(args.status, args.path)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     since_dt = datetime.now() - timedelta(hours=args.hours)
     since = since_dt.strftime("%Y-%m-%d %H:%M:%S")
     window = f"last {args.hours:g}h (since {since})"
 
-    audit = read_audit_lines(args.unit, since)
+    audit = read_audit_lines(args.unit, since, keep=keep)
     if not audit:
         print(
             f"No 'api_request' audit lines in the last {args.hours:g}h of "
@@ -641,15 +722,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
-    access = read_access_log(args.access_log, since)
+    # Direct mode reads the access log only for User-Agents-by-IP, so it is
+    # needed at the addresses the report will list and nowhere else. Legacy
+    # mode also joins on it and must see every row (see read_access_log).
+    only_ips = None
+    if is_direct_mode(audit):
+        only_ips = {r["client_ip"] for r in audit if r.get("client_ip", "-") != "-"}
+    elif keep is not None:
+        print(
+            "note: legacy mode (audit lines carry no client_ip) — a filtered "
+            "window gives the\nIP-ownership vote less to work with, so expect "
+            "more requests to be discarded as\nunattributable. Restart the API "
+            "to get exact attribution.",
+            file=sys.stderr,
+        )
+
+    access = read_access_log(args.access_log, since, only_ips=only_ips)
     attributed, mode, dropped = attribute(audit, access)
 
-    if matches_status is not None:
-        attributed = [r for r in attributed if matches_status(r)]
-        # Fold it into the window label: every count below is now a count of
-        # FILTERED requests, and a header that still read "last 72h" would
-        # invite reading 'requests' as the caller's total traffic.
+    # Fold the filters into the window label: every count below is a count of
+    # FILTERED requests, and a header still reading "last 72h" would invite
+    # reading 'requests' as the caller's total traffic.
+    if args.status:
         window = f"{window}, status in {sorted(set(args.status))}"
+    if args.path:
+        window = f"{window}, path under {sorted(set(args.path))}"
 
     if args.ip:
         wanted_ips = set(args.ip)
