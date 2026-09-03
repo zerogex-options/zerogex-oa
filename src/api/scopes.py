@@ -26,21 +26,61 @@ Each scope names one analytics domain:
   but about the one instrument the caller is already charting, and every
   levels integration needs it to place a level against a price. Bundled
   with the derived scopes.
-* :data:`MARKET_RAW` — **license-restricted market data**: the OPTION
-  CHAIN enumerated contract by contract (per-contract quotes, per-contract
-  open interest, the contract detail and calculator surfaces). Held in its
-  own scope precisely so it can be granted to the internal website BFF and
-  **withheld from every external customer** — the other scopes are broadly
-  redistributable, this one is not.
+* :data:`MARKET_RAW` — **per-contract QUOTED PRICES**: bid, ask, last and
+  mid for an individual option contract. Three surfaces return them —
+  ``/api/option/quote``, ``/api/option/contract`` and
+  ``/api/tools/option-calculator`` — and this scope exists so they can be
+  granted to the internal website BFF and **withheld from every external
+  customer**.
 
-  The line between the two is *what gets enumerated*, not whether the data
-  is upstream. Fetching the price of the symbol you are analysing is not
-  the redistribution concern; walking a vendor's option chain contract by
-  contract is. Drawing it anywhere else has been tried and was wrong:
-  MARKET_REFERENCE used to live inside MARKET_RAW, so switching
-  enforcement on 2026-08-31 took out eleven paying integrations, of which
-  nine only ever wanted the underlying's price. Under this split that
-  change would have reached two, both genuinely reading the chain.
+  WHERE THE LINE IS DRAWN, AND WHY IT MOVED
+  -----------------------------------------
+  This scope used to be described as "the option chain enumerated contract
+  by contract", on the theory that *what gets enumerated* — not whether the
+  data is upstream — is the licensing trigger. That theory is disputed:
+  ``docs/compliance/market-data-licensing-audit-2026-09-02.md`` (F5) holds
+  that the trigger is whose data it is and whether an end user sees it, and
+  that serving one symbol's live price is redistribution just as much as
+  walking a chain. Counsel has not confirmed either reading.
+
+  So the boundary here is deliberately NOT a claim about what is
+  licensable. It is drawn on the one distinction the code can actually
+  hold and test: **does the payload carry a quoted price?** That is
+  enforceable (``tests/test_market_data_scope_boundary.py`` walks the
+  mounted route table and asserts it) and it is honest about its own
+  scope — an engineering boundary, not a legal conclusion.
+
+  Two consequences worth stating plainly, because both have already been
+  learned the expensive way:
+
+  * MARKET_REFERENCE used to live inside MARKET_RAW, so switching
+    enforcement on 2026-08-31 took out eleven paying integrations, of
+    which nine only ever wanted the underlying's price.
+  * ``/api/market/open-interest`` used to live here too, and it returns no
+    quote at all — just ``open_interest`` and a derived ``exposure``. It
+    was the only quoteless route in the bundle, and gating it withheld
+    nothing: the same per-strike OI ships on GEX via
+    ``/api/gex/by-strike`` and ``/api/gex/strike-profile-timeseries``
+    (every strike, uncapped). All it did was 403 the integrations honest
+    enough to ask for it by name. It now rides GEX.
+
+  THE OPEN QUESTION
+  -----------------
+  Whether **per-strike open interest** is redistributable at all is not
+  settled, and this taxonomy does not pretend to settle it. Today OI is
+  served on :data:`GEX`, deliberately and in one place. If counsel
+  determines it is not redistributable, the change is a known, finite set
+  — ``/api/market/open-interest``, ``/api/gex/by-strike`` and
+  ``/api/gex/strike-profile-timeseries`` — and it is a re-gating, not a
+  rebuild. Recording it here means that decision gets made on purpose
+  rather than discovered by a customer's 403.
+
+  One item is knowingly unresolved: ``/api/gex/premium_surface`` rides
+  :data:`GEX` and returns ``premium`` — documented in its own model as
+  "quoted premium used (mid, or last as fallback)". That is a quoted price
+  under another name. It is pinned by the boundary test as a recorded
+  exception rather than silently passing, so moving it stays a deliberate
+  act. It belongs to the same open question above.
 
 Tier bundles
 ------------
@@ -78,10 +118,11 @@ ALL_SCOPES: FrozenSet[str] = frozenset(
     {GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_REFERENCE, MARKET_RAW}
 )
 
-#: The broadly licensable subset. Each of these is either a computed output
-#: or reference data about the underlying the caller is already analysing.
-#: ``MARKET_RAW`` — the option chain, contract by contract — is deliberately
-#: excluded; it is the only thing here that cannot be redistributed.
+#: The subset granted to external keys. Each of these is either a computed
+#: output or reference data about the underlying the caller is already
+#: analysing. ``MARKET_RAW`` — per-contract quoted prices — is deliberately
+#: excluded; see the module docstring for where that boundary now sits and
+#: which question about it is still open.
 DERIVED_SCOPES: FrozenSet[str] = frozenset(
     {GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_REFERENCE}
 )

@@ -501,6 +501,14 @@ def require_scopes(*required: str) -> Callable:
     Enforcement stays a no-op until keys are backfilled with scopes and
     ``API_SCOPE_ENFORCEMENT=1`` is set, so adding it cannot cause an
     outage for the currently-scopeless key population.
+
+    The returned dependency carries the scopes it requires on a
+    ``required_scopes`` attribute. That exists so the licence boundary can
+    be asserted against the *mounted route table* rather than by reading
+    ``main.py`` — see ``tests/test_market_data_scope_boundary.py``. Parsing
+    the source would miss a route that moves between routers or inherits
+    its gate from an ``include_router``, which is precisely how
+    ``/api/market/open-interest`` sat in the wrong bundle unnoticed.
     """
     required_set = set(required)
 
@@ -534,4 +542,7 @@ def require_scopes(*required: str) -> Callable:
             )
         return info
 
+    # Machine-readable record of what this gate demands (see the docstring).
+    # Purely introspective: nothing in the request path reads it.
+    _dependency.required_scopes = frozenset(required_set)  # type: ignore[attr-defined]
     return _dependency

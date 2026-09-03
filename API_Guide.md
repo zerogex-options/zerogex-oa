@@ -244,13 +244,13 @@ always passes, so these declarations are inert until keys are backfilled.
 
 | Scope | Covers | Redistributable? |
 | --- | --- | --- |
-| `gex` | GEX summary / by-strike / profile, walls, flip term-structure & surface, vol & premium surface, replay, and **`/api/v1/levels`** | ✅ derived |
+| `gex` | GEX summary / by-strike / profile, walls, flip term-structure & surface, vol & premium surface, replay, **`/api/market/open-interest`**, and **`/api/v1/levels`** | ✅ derived |
 | `flow` | options-flow aggregates, forced flow | ✅ derived |
 | `maxpain` | max-pain analytics | ✅ derived |
 | `technicals` | VWAP / ORB / volume / momentum | ✅ derived |
 | `signals` | signal engine, backtest, scorecard, forecast, TradeWorkz | ✅ derived (premium) |
 | `market_reference` | the underlying's own tape — `/api/market/quote`, `/api/market/historical`, `/api/market/session-closes`, `/api/market/session-levels` | ✅ reference |
-| `market_raw` | the option chain, per contract — `/api/option/*`, `/api/market/open-interest`, `/api/tools/option-calculator` | ❌ **withheld** |
+| `market_raw` | per-contract **quoted prices** (bid/ask/last/mid) — `/api/option/*`, `/api/tools/option-calculator` | ❌ **withheld** |
 
 Tier bundles (the unit of commercial packaging):
 
@@ -263,10 +263,11 @@ Tier bundles (the unit of commercial packaging):
 
 `market_raw` is isolated precisely so it can be granted to the internal
 BFF and **withheld from every external customer**. The line is drawn at
-what gets *enumerated*, not at whether the data came from upstream:
-fetching the price of the symbol you are analysing is reference data every
-charting integration needs, while walking the option chain contract by
-contract is the redistribution concern. A third-party charting integration
+whether a payload carries a **quoted price**: bid, ask, last or mid for an
+individual contract is withheld, while a computed output and the reference
+price a level is drawn against are not. Open interest sits on the derived
+side — it is dealer-positioning input, carries no quote, and the same
+per-strike figures already ship under `gex` via `/api/gex/by-strike`. A third-party charting integration
 is issued an **`analytics`-tier key** and has everything it needs to place
 a level against a price.
 
@@ -730,8 +731,10 @@ Scope: mixed — check each endpoint below.
 The underlying's own tape (`quote`, `historical`, `session-closes`,
 `session-levels`) is `market_reference` and rides with the `analytics`
 tier, because placing a level on a chart is meaningless without the price
-it sits against. The per-contract surfaces (`open-interest`, and
-everything under `/api/option/`) are `market_raw` — **not
+it sits against. `open-interest` is `gex` — it returns open interest and a derived
+exposure, no quoted price, and the same per-strike figures ship under the
+same scope via `/api/gex/by-strike`. Everything under `/api/option/`
+returns per-contract quoted prices and is `market_raw` — **not
 redistributable**, internal `full`-tier BFF only, excluded from the
 `analytics` tier issued to external customers.
 

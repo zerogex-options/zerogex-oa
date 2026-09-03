@@ -1746,11 +1746,21 @@ async def get_option_quote(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+# Open interest is dealer-positioning input, not a quoted price. The payload
+# (OpenInterestRecord) carries `open_interest` and a derived `exposure` and no
+# bid/ask/last at all — the only route in MARKET_RAW that never returned a
+# quote. The identical per-strike OI is already served on GEX by
+# /api/gex/by-strike (call_oi/put_oi/call_volume/put_volume, <=200 rows) and
+# by /api/gex/strike-profile-timeseries (every strike, uncapped), so gating it
+# on MARKET_RAW withheld nothing a GEX-scoped key could not already read while
+# 403ing integrations that asked for it by its own name. Moving it to GEX is
+# entitlement-neutral by construction: no key gains a field or a strike it
+# lacked. See scopes.py for the boundary this now sits on.
 @app.get(
     "/api/market/open-interest",
     response_model=OpenInterestResponse,
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_gex],
 )
 @handle_api_errors("GET /api/market/open-interest")
 async def get_open_interest(

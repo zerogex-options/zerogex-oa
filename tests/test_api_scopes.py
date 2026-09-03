@@ -266,12 +266,21 @@ def test_underlying_tape_is_reference_not_raw(path):
     "path",
     [
         "/api/option/quote",
-        "/api/market/open-interest",
     ],
 )
 def test_per_contract_surfaces_stay_raw(path):
-    """Walking the chain contract by contract is the redistribution concern
-    and must NOT be reachable from a customer bundle."""
+    """A per-contract QUOTED PRICE must not be reachable from a customer
+    bundle.
+
+    ``/api/market/open-interest`` used to be listed here, on the older
+    theory that enumerating the chain was itself the concern. It returns no
+    quote — ``open_interest`` and a derived ``exposure`` — and the same
+    per-strike OI already ships on GEX via ``/api/gex/by-strike``, so the
+    gate withheld nothing while 403ing paying integrations. It moved to GEX
+    on 2026-09-03; ``tests/test_market_data_scope_boundary.py`` now pins
+    both halves of that boundary against the mounted route table. See the
+    ``scopes.py`` docstring for the question that is still open.
+    """
     from src.api.main import app
 
     required = _dependency_scopes(app, path)
