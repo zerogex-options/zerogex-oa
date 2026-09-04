@@ -1,8 +1,9 @@
 # Does the MSI regime gauge predict realized price excursion?
 
-**Status:** structural arm complete with a result. Empirical arm complete, tested, and
-**unrun** — no database was reachable from the environment it was built in, so no
-market data has been through it.
+**Status:** complete. Both arms have run. Headline: the regime bands **do** order
+realized excursion, in the claimed direction, on every instrument and horizon — but
+weakly, and a magnitude-only rebuild of the composite beats the shipped one on all 30
+instrument-horizon cells. See §5.
 
 **Code:** [`research/msi_regime_excursion/`](../../research/msi_regime_excursion/)
 **Run it:** [`docs/runbooks/msi_regime_excursion_how_to_run.md`](../runbooks/msi_regime_excursion_how_to_run.md)
@@ -260,57 +261,142 @@ no significance test, no deciles, no rest-of-session horizon, and no ES/NQ.
 
 ## 5. Result
 
-**The structural arm has a result and it is reported in §3.**
+**Run:** 2026-06-29 to 2026-09-03, 141,210 readings across six instruments, 30-47
+sessions each. Bars were the binding constraint, not scores: cash bars begin
+2026-06-29 and futures bars 2026-07-06, so April-June scores had nothing to
+measure against.
 
-**The empirical arm has produced no numbers.** The pipeline was built and validated in
-an environment with no reachable database (`pg_isready`: no response; no `.env`; no
-`DB_*` in the environment), and no archived extract exists in either repository. There
-is therefore **no finding yet** about whether the bands beat the base rate.
+### The customer's claim does not survive
 
-That is a statement about where the work stopped, not a result. It must not be read as
-"the signal held" or as "the signal failed". Running §3 of the runbook against the
-archive produces the answer; the answer belongs in this section when it exists.
+GP asserted that realized excursion "had no connection with regime at all." It has a
+connection, in the right direction, at every horizon, on every instrument.
 
-### What is already known about the size of the window
+**Band ordering is correct everywhere.** Mean forward range as a ratio of the
+unconditional base rate, 15-minute horizon:
 
-`DATA_RETENTION_DAYS` defaults to 90 and prunes `signal_scores`, `underlying_quotes`
-and `futures_quotes` alike, so the deepest available history is about a quarter unless
-retention was raised in advance. `src/tools/futures_backfill.py` can extend ES/NQ bars,
-but its own docstring warns that anything loaded outside the retention window is
-deleted on the next prune unless `FUTURES_BARS_RETENTION_DAYS` is raised **first**.
-Check with `cli describe` before assuming a window exists.
+| | reversal | chop | controlled | trend |
+|---|---:|---:|---:|---:|
+| SPY | 0.81 | 0.97 | 1.04 | 1.09 |
+| SPX | 0.86 | 0.89 | 1.07 | 1.19 |
+| QQQ | 0.86 | 0.94 | 1.06 | 1.09 |
+| NDX | 0.89 | 0.90 | 1.16 | 1.77 |
+| ES | 0.86 | 0.89 | 1.07 | 1.19 |
+| NQ | 0.91 | 0.90 | 1.14 | 1.77 |
+
+Monotone in every row (NQ's bottom two are inverted by 0.01, which is noise). No
+instrument at any horizon produced an `INVERTED` verdict.
+
+**In the customer's own units** — P(ES travels at least 10 points), by band:
+
+| horizon | reversal | base | trend |
+|---|---:|---:|---:|
+| 15m | 8.5% | 13.7% | 19.2% |
+| 30m | 17.0% | 24.9% | 31.5% |
+| 60m | 27.7% | 36.6% | 44.4% |
+
+A 10-point ES run in 15 minutes is **2.3x more likely** in the top band than the
+bottom. That is not nothing, and it is exactly the question he was asking.
+
+**1,386 of 4,140 tests survive Benjamini-Hochberg at 5%** — 33% against a 5% chance
+expectation.
+
+### But the effect is small, and that matters
+
+Cliff's delta is mostly 0.10-0.23: "small" by the conventional labels. Spearman rho
+between the MSI and forward range is +0.20 to +0.24 on SPX and ES, and only +0.06 to
++0.14 on SPY and QQQ, where it does **not** survive BH correction.
+
+So the gauge orders excursion, but weakly enough that a discretionary trader
+eyeballing charts could reasonably fail to see it. GP's conclusion was wrong; his
+experience was not unreasonable.
+
+The exception is NDX/NQ `trend_expansion`, where the ratio is 1.77 and Cliff's delta
+reaches 0.59 — a large effect. That band holds only 622 readings over 30 sessions, so
+it is the least reliable cell in the study and the first thing to re-check on a longer
+window.
+
+### The structural finding is confirmed, and the repair is measured
+
+Section 3 predicted, from code alone, that the directional components contaminate the
+scale. The data agrees, and quantifies the cost.
+
+**`msi_direction`, the negative control, carries no excursion information at all** --
+rho between +0.03 and -0.18, centred near zero. The two components worth 36 of the
+100 points contribute nothing to what the bands claim to measure.
+
+**`msi_magnitude_pcr` beats the shipped MSI on all 30 instrument-horizon cells.**
+Spearman rho vs forward range:
+
+| | 5m | 15m | 30m | 60m | session |
+|---|---:|---:|---:|---:|---:|
+| SPY msi / mag+pcr | .097 / **.125** | .104 / **.131** | .090 / **.117** | .075 / **.098** | .085 / **.093** |
+| SPX msi / mag+pcr | .212 / **.254** | .230 / **.268** | .230 / **.264** | .228 / **.251** | .197 / **.241** |
+| QQQ msi / mag+pcr | .097 / **.137** | .098 / **.141** | .082 / **.123** | .058 / **.097** | .141 / **.217** |
+| NDX msi / mag+pcr | .191 / **.336** | .211 / **.362** | .195 / **.369** | .158 / **.358** | .149 / **.271** |
+| ES msi / mag+pcr | .222 / **.259** | .235 / **.266** | .233 / **.260** | .238 / **.256** | .199 / **.237** |
+| NQ msi / mag+pcr | .194 / **.345** | .206 / **.361** | .186 / **.362** | .150 / **.350** | .152 / **.275** |
+
+Improvement runs from +13% (ES) to +75% (NQ). Thirty cells, thirty wins.
+
+Two refinements the run settled that the code analysis could not:
+
+* **`put_call_ratio` is load-bearing, not ambiguous.** `msi_magnitude` *without* PCR
+  loses to the shipped MSI on SPY and QQQ at most horizons (QQQ 60m: .002 vs .058).
+  With PCR it wins everywhere. Whatever PCR is measuring, it belongs in the regime
+  read.
+* **Folding is the wrong repair.** `msi_folded` is *negative* at every cell
+  (-0.02 to -0.14). Distance-from-neutral is not the missing structure; dropping the
+  directional components is.
+
+### A defect this run surfaced that nobody was looking for
+
+The `reconstructible` column splits the instruments cleanly in two:
+
+| SPX | ES | SPY | QQQ | NDX | NQ |
+|---:|---:|---:|---:|---:|---:|
+| 97.9% | 97.8% | 54.9% | 55.4% | 57.9% | 57.9% |
+
+A row fails to reconstruct when components **abstained** -- the composite was built
+from a partial set and renormalized onto the full 100-point scale. On SPY, QQQ, NDX
+and NQ that is happening on roughly **45% of readings**.
+
+Those are exactly the four instruments whose rho fails to survive BH correction, while
+the two clean instruments (SPX, ES) both survive at every horizon. The likely cause is
+that SPY and QQQ persist ~800 readings/session against SPX's ~350 -- i.e. they score
+through extended hours, where the options tape is too thin to feed the components. That
+is a hypothesis this run did not test; see §6.
 
 ## 6. Recommendation
 
-Two of these do not depend on the empirical result. The third does.
+The empirical arm has now run, so these are ordered by what the data supports.
 
-**1. Fix the description, or fix the number — but the current pair cannot both stand.**
-§3 establishes without any market data that the MSI is not "deliberately directionless"
-and that its bands move on direction alone. Either:
+**1. Ship `msi_magnitude_pcr` as the band source. This is the strongest result in the
+study.** Thirty of thirty cells improve, the negative control confirms the mechanism,
+and the alternative was rebuilt with the engine's own renormalization rule rather than
+a new formula. Do it as an **additive** change: persist the variant alongside the
+shipped composite, backtest the re-gating offline, then switch the bands. The blast
+radius is 17 playbook patterns that gate on `valid_regimes` / `preferred_regime`, plus
+the portfolio engine and eight frontend surfaces -- this is not a copy change.
 
-- *Describe it as what it is* — a blended positioning-and-direction score — and stop
-  labelling its bands with travel claims; or
-- *Make it what the copy says* — score the bands off a magnitude-only composite
-  (`msi_magnitude`, already implemented), keep the directional components as the
-  separate directional read they are already documented to be, and let
-  `impliedDirection.ts` do the job it was written for.
+**2. Correct the "deliberately directionless" claim in
+`frontend/core/impliedDirection.ts` now.** It is an internal spec comment, not customer
+copy, it is measurably false, and it costs nothing to fix.
 
-The second is the smaller change and the one the code is already shaped for: the
-directional components are individually documented as directional, and the frontend
-already has a separate direction overlay. The two reads are being summed into one
-scalar and then split apart again downstream.
+**3. Keep the band copy, but attach the effect size.** The bands do order excursion in
+the direction they claim, so the copy is not a false promise -- it is an
+unquantified one. "Strong directional regime" is fair for a band that precedes 1.19x
+the base range on SPX and a 2.3x higher chance of a 10-point ES run. Consider stating
+the number rather than the adjective.
 
-**2. Whatever the empirical arm returns, the copy needs the honest verb.** "Trends can
-run" is a prediction. If the bands do beat the base rate, the copy can say so with the
-effect size attached. If they do not, the fix is the description, not the number: a
-positioning gauge that describes the dealer book is a legitimate product; a positioning
-gauge whose bands promise travel it does not deliver is not.
+**4. Investigate the 45% abstention rate on SPY/QQQ/NDX/NQ before anything else.**
+This may be the larger prize. If the cause is scoring through extended hours on a thin
+options tape, the fix is a session gate, not a model change -- and it would plausibly
+lift those four instruments toward the SPX/ES relationship, which is roughly twice as
+strong. Check whether reconstruction failures cluster outside 09:30-16:00 ET.
 
-**3. Do not change customer-facing copy on the strength of §3 alone.** §3 shows the
-scale is contaminated. It does not show the bands fail to predict excursion — a
-contaminated scale can still be correlated with travel. The correction the bands need
-depends on which of `msi`, `msi_folded` and `msi_magnitude` actually orders excursion,
-and that is exactly what the unrun arm decides.
+**5. Re-run on a longer window once bars accumulate.** The study is bar-limited to ~47
+sessions. NDX/NQ `trend_expansion` (622 readings, 30 sessions) carries the largest
+effect in the study on the thinnest sample and should be confirmed before being quoted.
 
 ## 7. Second question: the CVD / limit-order framing
 
