@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from research.wall_break_odds.events import (
     ET,
@@ -42,6 +42,8 @@ from research.wall_break_odds.events import (
 
 __all__ = [
     "FEATURE_NAMES",
+    "MECHANICAL_FEATURES",
+    "substantive_features",
     "SummarySeries",
     "FlowWindow",
     "build_features",
@@ -53,6 +55,33 @@ __all__ = [
 TREND_WINDOW_MIN = 30
 
 _EPS = 1e-9
+
+#: Features that describe the MEASUREMENT rather than the market: where in the
+#: session the test happened, how much session is left, how many tests have
+#: already occurred, how long the wall has stood. Their relationship to the
+#: resolution window is structural — a test at 15:30 has less room to resolve
+#: than one at 10:00 in ANY symbol — so they agree across any two samples and
+#: will manufacture "replication" that says nothing about gamma.
+#:
+#: The replication test reports the substantive features separately for
+#: exactly this reason; without the split, a pair whose only agreement is the
+#: clock reads identically to a pair that agrees about walls.
+MECHANICAL_FEATURES: frozenset[str] = frozenset(
+    {
+        "minutes_since_open",
+        "minutes_to_close",
+        "test_ordinal",
+        "wall_age_minutes",
+        # sigma x sqrt(minutes remaining): dominated by the time term.
+        "travel_budget",
+    }
+)
+
+
+def substantive_features(names: Iterable[str]) -> list[str]:
+    """``names`` minus the mechanical ones — the columns actually about gamma."""
+    return [n for n in names if n not in MECHANICAL_FEATURES]
+
 
 #: The model's feature vector, in a fixed order.  The report prints them in
 #: this order and the dataset writes them under these keys, so a column added

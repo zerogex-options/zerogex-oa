@@ -165,19 +165,31 @@ def _replication_matrix(rep: Mapping[str, Any]) -> list[str]:
         "  Rank correlation near zero with sign agreement near 50% means the",
         "  deltas are noise, however large they look in either sample alone.",
         "",
-        f"    {'pair':<18}{'features':>10}{'Spearman':>11}{'sign agree':>12}   verdict",
+        "  Two columns: ALL features, then SUBSTANTIVE only (the mechanical",
+        "  ones removed). Read the substantive column — the mechanical",
+        "  features agree in any two samples and will manufacture agreement.",
+        "",
+        f"    {'pair':<16}{'all r':>9}{'all agr':>9}"
+        f"{'subst r':>10}{'subst agr':>11}   verdict (substantive)",
     ]
     for (a, b), rep_pair in sorted((rep.get("matrix") or {}).items()):
         label = f"{a} vs {b}"
         if not rep_pair:
-            lines.append(f"    {label:<18}{'—':>10}{'—':>11}{'—':>12}   too few features")
+            lines.append(f"    {label:<16}{'—':>9}{'—':>9}{'—':>10}{'—':>11}   too few features")
             continue
         sp = rep_pair.get("spearman")
         ag = rep_pair.get("sign_agreement")
-        replicates = sp is not None and ag is not None and sp >= 0.3 and ag >= 0.65
+        sub = rep_pair.get("substantive") or {}
+        ssp = sub.get("spearman")
+        sag = sub.get("sign_agreement")
+        if ssp is None or sag is None:
+            verdict = "too few substantive features"
+            ssp_txt, sag_txt = "—", "—"
+        else:
+            verdict = "replicates" if (ssp >= 0.3 and sag >= 0.65) else "NO replication"
+            ssp_txt, sag_txt = f"{ssp:+.3f}", f"{sag:.0%}"
         lines.append(
-            f"    {label:<18}{rep_pair.get('n_features'):>10}{sp:>+11.3f}"
-            f"{ag:>11.0%}   {'replicates' if replicates else 'NO replication'}"
+            f"    {label:<16}{sp:>+9.3f}{ag:>9.0%}" f"{ssp_txt:>10}{sag_txt:>11}   {verdict}"
         )
     lines += [
         "",

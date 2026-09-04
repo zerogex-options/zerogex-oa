@@ -38,7 +38,7 @@ from research.mm_attributed_gex.stats import (
     log_loss,
     logistic_regression,
 )
-from research.wall_break_odds.features import FEATURE_NAMES
+from research.wall_break_odds.features import FEATURE_NAMES, substantive_features
 
 __all__ = [
     "MIN_EVENTS_FOR_MODEL",
@@ -581,7 +581,30 @@ def replication(screens: Mapping[str, Sequence[Mapping[str, Any]]]) -> Optional[
 
     nonzero = [(x, y) for x, y in zip(a, b) if x * y != 0]
     agree = sum(1 for x, y in nonzero if x * y > 0)
+
+    # The same calculation over the SUBSTANTIVE columns only. Mechanical
+    # features agree across any two samples because their link to the
+    # resolution window is structural, so a pair whose agreement is entirely
+    # the clock scores identically to one that agrees about gamma. This is
+    # the number to read.
+    sub = substantive_features(shared)
+    sub_stats: dict[str, Any] = {"n_features": len(sub)}
+    if len(sub) >= 5:
+        sa = [a_map[f] for f in sub]
+        sb = [b_map[f] for f in sub]
+        sub_nonzero = [(x, y) for x, y in zip(sa, sb) if x * y != 0]
+        sub_stats.update(
+            {
+                "spearman": _pearson(_rank(sa), _rank(sb)),
+                "sign_agreement": (
+                    sum(1 for x, y in sub_nonzero if x * y > 0) / len(sub_nonzero)
+                    if sub_nonzero
+                    else None
+                ),
+            }
+        )
     return {
+        "substantive": sub_stats,
         "symbols": names,
         "n_features": len(shared),
         "spearman": _pearson(_rank(a), _rank(b)),

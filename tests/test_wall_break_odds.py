@@ -837,16 +837,29 @@ def test_replication_matrix_renders_every_pair():
                 "spearman": 0.75,
                 "sign_agreement": 0.83,
                 "rows": [],
+                "substantive": {
+                    "n_features": 8,
+                    "spearman": 0.71,
+                    "sign_agreement": 0.75,
+                },
             },
+            # Agrees overall but ONLY on the clock: the substantive columns
+            # are flat. The verdict must follow the substantive column.
             ("QQQ", "SPX"): {
                 "symbols": ["QQQ", "SPX"],
                 "n_features": 12,
-                "spearman": -0.02,
-                "sign_agreement": 0.50,
+                "spearman": 0.68,
+                "sign_agreement": 0.80,
                 "rows": [],
+                "substantive": {
+                    "n_features": 8,
+                    "spearman": -0.05,
+                    "sign_agreement": 0.50,
+                },
             },
         },
     }
     text = "\n".join(_replication_block(rep))
     assert "SPX vs SPY" in text and "replicates" in text
-    assert "QQQ vs SPX" in text and "NO replication" in text
+    qqq_line = next(ln for ln in text.splitlines() if "QQQ vs SPX" in ln)
+    assert "NO replication" in qqq_line

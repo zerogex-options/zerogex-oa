@@ -46,21 +46,42 @@ broken wall is spent, so the afternoon sample is enriched for survivors — and
 controlling for it removes most of the apparent difference. The pooled curve
 stands.
 
-### SPX and QQQ are NOT one process
+### It is the INDEX, not the strike ladder
 
-Adding QQQ over the same window (58 sessions, 209 tests) and running the
-pooling check:
+All four index products over the same window, with every pair tested:
 
-| symbol | n | breaks | P(30m) | P(60m) |
+| symbol | ladder | index | n | P(60m) |
 |---|---|---|---|---|
-| SPX | 178 | 45 | 17.5% | 30.7% |
-| QQQ | 209 | 91 | 30.0% | **50.1%** |
+| SPY | $1 | S&P | 246 | 31.1% |
+| SPX | $5 | S&P | 178 | 30.7% |
+| QQQ | $1 | Nasdaq | 209 | 50.1% |
+| NDX | $5 | Nasdaq | 104 | 46.8% |
 
-Log-rank chi2=11.60, **p=0.0007**. QQQ walls break at roughly a coin flip
-within the hour where SPX walls hold two times in three. Pooling them is
-therefore not available as a route to the model's event floor, and `analyze`
-withholds every pooled quantity when the check fails rather than printing an
-average that describes neither.
+| pair | p | verdict |
+|---|---|---|
+| SPX vs SPY | 0.82 | same |
+| NDX vs QQQ | 0.81 | same |
+| NDX vs SPX | 0.0087 | differ |
+| NDX vs SPY | 0.0021 | differ |
+| QQQ vs SPX | 0.0007 | differ |
+| QQQ vs SPY | 0.0000 | differ |
+
+The rows of the 2x2 differ and the columns do not. **Wall break odds are a
+property of the underlying index and are invariant to the option market you
+observe them through** — $1 ETF strikes and $5 index strikes give the same
+answer for the same index, while S&P and Nasdaq differ by roughly 16
+percentage points at the hour.
+
+The competing explanation — that finer strikes spread open interest and make
+each wall weaker — is dead. Had it been right, SPY would track QQQ; it tracks
+SPX (p=0.82).
+
+### These four cannot be pooled
+
+Any single rejecting pair invalidates the pool, so pooling is not available
+as a route to the model's event floor, and `analyze` withholds every pooled
+quantity when the check fails rather than printing an average that describes
+none of them.
 
 That suppression matters most for the SCREEN, not the curve: pooled, dollar-
 scale features stop measuring walls and start measuring *which symbol a row
@@ -75,8 +96,15 @@ another.
 QQQ is a second, independent sample, so every candidate can be asked the
 harder question: does it show up again in data it has never seen?
 
-**Spearman r = −0.033 between the two screens' effect sizes. Sign agreement
-9/18 = 50%, exactly chance.**
+Every pair is compared, on ALL features and on the SUBSTANTIVE ones with the
+mechanical columns (time of day, minutes to close, test ordinal, wall age,
+travel budget) removed. That split is load-bearing: mechanical features agree
+across any two samples because their link to the resolution window is
+structural, so a pair whose only agreement is the clock scores identically to
+one that agrees about gamma. **Read the substantive column.**
+
+On SPX vs QQQ: **Spearman r = −0.033, sign agreement 9/18 = 50%, exactly
+chance.**
 
 The largest SPX effects are precisely the ones that fail:
 
