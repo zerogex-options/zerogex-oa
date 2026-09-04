@@ -417,11 +417,25 @@ def evaluate(
     keep = _complete(rows, names)
     fitted_rows = [rows[i] for i in keep]
     if len(fitted_rows) < MIN_EVENTS_FOR_MODEL:
+        # Naming the bottleneck matters: with enough events but sparse
+        # columns, the fix is dropping a feature rather than waiting months
+        # for more sessions, and there is no way to tell which from a bare
+        # count. Each entry is how many complete cases dropping that ONE
+        # feature would recover.
+        gains: list[dict[str, Any]] = []
+        for name in names:
+            without = [n for n in names if n != name]
+            gained = len(_complete(rows, without)) - len(fitted_rows)
+            if gained > 0:
+                gains.append({"feature": name, "rows_gained_if_dropped": gained})
+        gains.sort(key=lambda g: -g["rows_gained_if_dropped"])
         return {
             "status": "insufficient_complete_cases",
             "n": len(fitted_rows),
+            "n_resolved": len(rows),
             "required": MIN_EVENTS_FOR_MODEL,
             "features": names,
+            "bottleneck": gains[:5],
         }
 
     splits = session_walk_forward(fitted_rows, n_folds=n_folds)

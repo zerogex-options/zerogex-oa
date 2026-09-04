@@ -46,6 +46,30 @@ broken wall is spent, so the afternoon sample is enriched for survivors — and
 controlling for it removes most of the apparent difference. The pooled curve
 stands.
 
+### SPX and QQQ are NOT one process
+
+Adding QQQ over the same window (58 sessions, 209 tests) and running the
+pooling check:
+
+| symbol | n | breaks | P(30m) | P(60m) |
+|---|---|---|---|---|
+| SPX | 178 | 45 | 17.5% | 30.7% |
+| QQQ | 209 | 91 | 30.0% | **50.1%** |
+
+Log-rank chi2=11.60, **p=0.0007**. QQQ walls break at roughly a coin flip
+within the hour where SPX walls hold two times in three. Pooling them is
+therefore not available as a route to the model's event floor, and `analyze`
+withholds every pooled quantity when the check fails rather than printing an
+average that describes neither.
+
+That suppression matters most for the SCREEN, not the curve: pooled, dollar-
+scale features stop measuring walls and start measuring *which symbol a row
+came from*. `wall_strength_log` reads −2 points on SPX alone and −15 pooled,
+which is the confound, not a finding.
+
+Break rates are per-symbol. A number from one product does not carry to
+another.
+
 ### What has NOT been established
 
 * **No feature is FDR-significant.** Nineteen screened, session-clustered

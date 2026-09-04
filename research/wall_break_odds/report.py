@@ -151,6 +151,37 @@ def _survival_block(
     return lines
 
 
+def _pooling_rejected(pooling: Optional[Mapping[str, Any]]) -> bool:
+    """Did the symbols fail the same-process test?"""
+    if not pooling:
+        return False
+    test = pooling.get("logrank")
+    return bool(test is not None and test.p_value < 0.05)
+
+
+def _suppressed_block(pooling: Optional[Mapping[str, Any]]) -> list[str]:
+    """What is withheld when pooling is rejected, and what to run instead."""
+    symbols = sorted((pooling or {}).get("curves", {}))
+    return [
+        "POOLED ANALYSIS WITHHELD",
+        _THIN,
+        "  The symbols above failed the same-process test, so every pooled",
+        "  quantity would describe none of them:",
+        "",
+        "    * the pooled break curve averages two different hazards",
+        "    * the pooled base rate does the same at one horizon",
+        "    * the pooled feature screen is CONFOUNDED BY SYMBOL — a feature",
+        "      that merely tracks which symbol a row came from will show up",
+        "      as a predictor of breaking, and dollar-scale features like",
+        "      wall strength are exactly the ones that do this",
+        "    * the model would fit that confound and validate it",
+        "",
+        "  Per-symbol curves are in the block above. For the full report on",
+        "  each, run them one at a time:",
+        "",
+    ] + [f"    python -m research.wall_break_odds.cli analyze <{sym}>.jsonl" for sym in symbols]
+
+
 def _pooling_block(pooling: Mapping[str, Any]) -> list[str]:
     """Per-symbol curves and whether combining them is defensible.
 
@@ -303,6 +334,21 @@ def _oos_block(ev: Mapping[str, Any]) -> list[str]:
     if status != "ok":
         lines.append(f"  no model reported — {status}")
         lines.append(f"  events available: {ev.get('n', 0)}, required: {ev.get('required', 'n/a')}")
+        bottleneck = ev.get("bottleneck")
+        if bottleneck:
+            resolved = ev.get("n_resolved")
+            if resolved:
+                lines.append(
+                    f"  {resolved} events resolved, but only {ev.get('n')} have every"
+                    " feature present"
+                )
+            lines.append("")
+            lines.append("  Complete cases recovered by dropping ONE feature:")
+            for entry in bottleneck:
+                lines.append(f"    {entry['feature']:<34}+{entry['rows_gained_if_dropped']}")
+            lines.append("")
+            lines.append("  A sparse column costs more rows than it contributes; dropping the")
+            lines.append("  top one may reach the floor sooner than waiting for more sessions.")
         lines.append("")
         lines.append("  This is the honest outcome of a short sample, not a failure to run.")
         return lines
@@ -411,6 +457,20 @@ def render_report(
     ]
     lines += _sample_block(meta)
     lines += ["", *_config_block(meta.get("config", {}))]
+
+    # A rejected pooling check invalidates EVERYTHING computed on the pooled
+    # rows -- the curve, the base rates and, most dangerously, the screen,
+    # where "low wall strength" can simply stand in for "is the smaller
+    # symbol" and read as a finding about walls. So the check is printed
+    # first and the pooled analysis is withheld rather than footnoted;
+    # a footnote under a table of numbers does not stop the numbers being
+    # quoted.
+    rejected = _pooling_rejected(pooling)
+    if pooling:
+        lines += ["", *_pooling_block(pooling)]
+    if rejected:
+        lines += ["", *_suppressed_block(pooling), "", _LIMITS, ""]
+        return "\n".join(lines)
     if survival is not None:
         lines += [
             "",
@@ -421,8 +481,6 @@ def render_report(
                 (meta.get("config") or {}).get("confirm_minutes"),
             ),
         ]
-    if pooling:
-        lines += ["", *_pooling_block(pooling)]
     if halves:
         lines += ["", *_censoring_block(halves)]
     lines += ["", "BASE RATES  (single horizon — read the curve above first)", _THIN]

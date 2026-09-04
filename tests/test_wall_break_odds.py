@@ -687,3 +687,77 @@ def test_pooled_meta_flags_conflicting_label_settings():
     assert merged["start"] == "2026-01-01" and merged["end"] == "2026-03-01"
     same = _merge_meta([a, {**b, "config": {"confirm_minutes": 10}}], [])
     assert "config_conflict" not in same
+
+
+def _pooling(p_value):
+    from research.wall_break_odds.survival import LogRank
+
+    return {
+        "curves": {"SPX": ([], 100, 30), "QQQ": ([], 100, 50)},
+        "logrank": LogRank(30, 40.0, 9.0, p_value, 100, 100),
+        "pair": ("QQQ", "SPX"),
+    }
+
+
+def test_rejected_pooling_withholds_every_pooled_number():
+    """A failed same-process test invalidates the curve, the base rate and —
+    most dangerously — the screen, where a dollar-scale feature can stand in
+    for 'which symbol is this' and read as a finding about walls."""
+    from research.wall_break_odds.report import render_report
+
+    text = render_report(
+        {"symbol": "SPX + QQQ", "config": {"confirm_minutes": 10}},
+        {"overall": {"n": 200, "breaks": 80, "rate": 0.4, "ci95": [0.3, 0.5], "reportable": True}},
+        [
+            {
+                "feature": "wall_strength_log",
+                "n": 200,
+                "rate_above": 0.3,
+                "rate_below": 0.5,
+                "delta": -0.2,
+                "reportable": True,
+            }
+        ],
+        {"status": "ok", "n": 200, "oos": {}},
+        pooling=_pooling(0.0007),
+    )
+    assert "POOLED ANALYSIS WITHHELD" in text
+    assert "UNIVARIATE SCREEN" not in text
+    assert "BASE RATES" not in text
+    assert "P(BREAK WITHIN" not in text
+    assert "LIMITS" in text
+
+
+def test_accepted_pooling_reports_normally():
+    from research.wall_break_odds.report import render_report
+
+    text = render_report(
+        {"symbol": "SPX + QQQ", "config": {"confirm_minutes": 10}},
+        {"overall": {"n": 200, "breaks": 80, "rate": 0.4, "ci95": [0.3, 0.5], "reportable": True}},
+        [],
+        {"status": "ok", "n": 200, "oos": {}},
+        pooling=_pooling(0.42),
+    )
+    assert "POOLED ANALYSIS WITHHELD" not in text
+    assert "BASE RATES" in text
+
+
+def test_model_names_the_feature_costing_the_most_complete_cases():
+    """With plenty of events but one sparse column, the fix is dropping the
+    column, not waiting months for more sessions."""
+    from research.wall_break_odds.model import evaluate
+
+    rows = []
+    for i in range(260):
+        feats = {"dense_a": float(i % 7), "dense_b": float(i % 5)}
+        # Present on 70% of rows: passes the coverage filter, then destroys
+        # the complete-case count.
+        feats["sparse"] = float(i % 3) if i % 10 < 7 else None
+        rows.append(
+            Row(session=SESSION + timedelta(days=i % 60), side="call", broke=i % 2, features=feats)
+        )
+    out = evaluate(rows, feature_names=("dense_a", "dense_b", "sparse"))
+    assert out["status"] == "insufficient_complete_cases"
+    assert out["n_resolved"] == 260 and out["n"] < 200
+    assert out["bottleneck"], "the limiting feature must be named"
+    assert out["bottleneck"][0]["feature"] == "sparse"
