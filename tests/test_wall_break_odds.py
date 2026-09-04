@@ -657,7 +657,7 @@ def test_strike_step_defaults_per_symbol():
     from research.wall_break_odds.cli import strike_step_for
 
     assert strike_step_for("SPX") == 5.0
-    assert strike_step_for("ndx") == 5.0
+    assert strike_step_for("ndx") == 25.0
     assert strike_step_for("QQQ") == 1.0
     assert strike_step_for("SPY") == 1.0
 
@@ -897,3 +897,14 @@ def test_feature_consistency_needs_enough_symbols():
         "SPY": [{"feature": "x", "delta": -0.2, "reportable": True}],
     }
     assert feature_consistency(screens, min_symbols=3) is None
+
+
+def test_ndx_uses_its_real_25_point_ladder():
+    """Verified against gex_by_strike: NDX quotes 28025/28050/28075 at a
+    ~28,000 index level. A $5 step aims the flow neighbourhood at strikes that
+    do not exist and the column reads as 'no flow' rather than as an error."""
+    from research.wall_break_odds.cli import strike_step_for
+
+    assert strike_step_for("NDX") == 25.0
+    assert strike_step_for("SPX") == 5.0
+    assert strike_step_for("QQQ") == 1.0

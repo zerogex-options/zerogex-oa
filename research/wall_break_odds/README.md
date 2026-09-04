@@ -91,6 +91,33 @@ which is the confound, not a finding.
 Break rates are per-symbol. A number from one product does not carry to
 another.
 
+### No feature survived — including the one I called a null too early
+
+Every candidate, tested across all four symbols at once. A real predictor
+keeps its sign in every symbol; under the null that is a coin flip per symbol.
+
+**14 features compared, 2 sign-consistent, 2.6 expected by chance.** At or
+below chance. Nothing has survived.
+
+The two that are consistent are both measures of wall size:
+
+| feature | NDX | QQQ | SPX | SPY |
+|---|---|---|---|---|
+| `wall_strength_log` | −11 | −12 | **−2** | −8 |
+| `wall_strength_pctile_trailing` | −1 | −9 | −11 | −9 |
+
+They point the intuitive way — bigger wall, fewer breaks — in all four. That
+is worth recording precisely because an earlier draft of this README called
+wall size a flat null on the strength of SPX's −2, which is the weakest of the
+four samples. It was not "no information"; it was a small effect measured on
+the one symbol where it happened to vanish.
+
+It is still not a finding: two consistent features out of fourteen is what
+chance produces, the two are not independent (both measure wall size), and
+non-independence inflates the observed count relative to the expectation. The
+honest statement is **a small effect in the expected direction that this
+sample cannot distinguish from noise** — not a null, and not a result.
+
 ### The features do not replicate
 
 QQQ is a second, independent sample, so every candidate can be asked the
