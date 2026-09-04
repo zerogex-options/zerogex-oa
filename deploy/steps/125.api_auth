@@ -134,10 +134,24 @@ else
         fi
     fi
 
-    # 4a. Delete the include file itself if it still exists.
-    if sudo test -f "$NGINX_INCLUDE"; then
-        log "  → Removing legacy include file $NGINX_INCLUDE..."
-        sudo rm -f "$NGINX_INCLUDE"
+    # 4a. Delete the include file AND every sibling the glob can match.
+    #
+    # nginx_inject_api_key.py writes the include as
+    #   include /etc/nginx/conf.d/zerogex-api-key.conf*;
+    # with a trailing glob, so that a missing file does not break nginx. The
+    # consequence is that renaming the file does NOT disable it: a
+    # zerogex-api-key.conf.bak.<stamp> left in conf.d still matches, still
+    # loads, and still puts a shared static credential in front of the whole
+    # API — overwriting each caller's own X-API-Key on the way upstream, so
+    # their real key never reaches the app. Removing only the exact name left
+    # exactly that situation in production for four months. Remove the set the
+    # glob can see, not one filename.
+    if sudo sh -c "ls ${NGINX_INCLUDE}* >/dev/null 2>&1"; then
+        log "  → Removing legacy include file(s) matching ${NGINX_INCLUDE}*..."
+        sudo sh -c "ls -1 ${NGINX_INCLUDE}*" | while IFS= read -r legacy; do
+            log "     - $legacy"
+        done
+        sudo sh -c "rm -f ${NGINX_INCLUDE}*"
         NGINX_CHANGED=1
         log "     ✓ removed"
     fi
@@ -155,6 +169,21 @@ else
         NGINX_CHANGED=1
         log "     ✓ removed from sites-enabled (file kept in sites-available for reference)"
     fi
+
+    # 4b-bis. Assert the injection is gone from the EFFECTIVE config.
+    #
+    # Deleting files and reloading is not proof. Only `nginx -T` reports what
+    # nginx is actually running, across every include, symlink and glob. This
+    # is the check that would have caught the stale .bak immediately instead
+    # of four months later.
+    if sudo nginx -T 2>/dev/null | grep -qE '^[[:space:]]*proxy_set_header[[:space:]]+X-API-Key'; then
+        log "  ✗ nginx is STILL injecting X-API-Key after cleanup — refusing to continue."
+        log "     Locate it with:"
+        log "       sudo nginx -T | grep -n X-API-Key"
+        log "       sudo grep -Rn 'zerogex-api-key' /etc/nginx/    # -R follows symlinks; -r does not"
+        exit 1
+    fi
+    log "  ✓ verified: no X-API-Key injection in the effective nginx config"
 
     # 4c. Reload nginx if anything changed and the config is valid.
     if [ "$NGINX_CHANGED" = "1" ]; then
