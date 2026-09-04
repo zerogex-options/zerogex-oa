@@ -143,6 +143,15 @@ TIMER_UNITS=(
     # reason to leave it uninstalled.  See src/tools/wall_break_stats_refresh.py
     # and docs/design/wall-break-odds.md.
     "zerogex-oa-wall-break-stats-refresh"
+    # Nightly percentile bands for the headline GEX metrics (04:45 ET), read
+    # by /api/gex/historical-context and by TradeWorkz via
+    # gex_stats.fetch_wall_strength_pctile -- which wall_reversion gates live
+    # trades on.  Unit files have existed for a while and the timer is enabled
+    # on the current box, but it was never in this list, so a rebuilt or
+    # replacement host would come up without it and the percentile lookups
+    # would silently fall back to neutral sizing.  See
+    # src/tools/gex_historical_stats_refresh.py.
+    "zerogex-oa-gex-historical-stats-refresh"
     # Per-symbol ingestion freshness (every 10 min, all day): alerts when a
     # configured underlying stops writing bars inside its delivery window.
     # This is the ONLY check that sees a single dead per-symbol worker --
