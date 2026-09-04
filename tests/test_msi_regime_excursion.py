@@ -569,3 +569,46 @@ def test_shadow_score_agrees_with_the_study_exactly_when_nothing_abstains():
     assert agreed_clean == total_clean, (
         f"shadow and study disagree on {total_clean - agreed_clean} abstention-free rows"
     )
+
+
+def test_shadow_score_reaches_the_persisted_payload():
+    """score() computing it is not enough — it has to survive persist().
+
+    ``_persist_inner`` rebuilds the payload as
+    ``dict(score.components)`` plus ``__aggregation__``, so a value that lives
+    only on the snapshot would be silently dropped on the way to the database.
+    This drives the real ``score_and_persist`` against a capturing connection
+    and inspects the JSON that would have been written.
+    """
+    import json
+    from src.signals.scoring_engine import ScoringEngine
+
+    captured: list = []
+
+    class _Cursor:
+        def execute(self, sql, params=None):
+            captured.append((sql, params))
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def commit(self):
+            pass
+
+    scores = {n: 0.4 for n in ScoringEngine.COMPONENT_POINTS}
+    snapshot = _fake_engine(scores).score_and_persist(_flat_context(), conn=_Conn())
+
+    insert = next(
+        (p for sql, p in captured if "INSERT INTO signal_scores" in sql), None
+    )
+    assert insert is not None, "no signal_scores insert was issued"
+    payload = insert[5]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    agg = payload.get("__aggregation__", {})
+    assert agg.get("mode") == "market_state_index"
+    assert agg.get("magnitude_score") == pytest.approx(
+        snapshot.aggregation["magnitude_score"]
+    )
+    assert agg.get("magnitude_direction") == snapshot.aggregation["magnitude_direction"]
