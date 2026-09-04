@@ -87,6 +87,48 @@ def _config_block(cfg: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+#: Horizons the survival block quotes. Chosen to bracket a 0DTE holding
+#: period rather than to flatter the curve.
+SURVIVAL_MARKS = (5, 15, 30, 45, 60)
+
+
+def _survival_block(curve: Sequence[Any], n_obs: int, n_breaks: int) -> list[str]:
+    """P(break within t) as a curve, which is the horizon-free answer.
+
+    The point estimate this replaces moved from 15% to 34% on nothing but a
+    change of horizon, so the curve is printed FIRST and the single-horizon
+    rate is kept below it only as a cross-check.
+    """
+    from research.wall_break_odds.survival import break_probability_at
+
+    lines = [
+        "P(BREAK WITHIN t)  Kaplan-Meier, all tests including late-session",
+        _THIN,
+        "  Every test contributes the time it was actually watched. A test that",
+        "  held 15 minutes and then hit the bell is right-censored at 15, not",
+        "  discarded — so this uses the whole sample, not just the tests with",
+        "  room to resolve.",
+        "",
+    ]
+    if not curve:
+        lines.append(f"  no curve — {n_breaks} breaks among {n_obs} observations")
+        return lines
+    lines.append(f"  observations {n_obs}   breaks {n_breaks}")
+    lines.append("")
+    lines.append(f"    {'within':<10}{'P(break)':>12}{'95% CI':>22}{'at risk':>10}")
+    for mark in SURVIVAL_MARKS:
+        point = break_probability_at(curve, mark)
+        if point is None:
+            lines.append(f"    {str(mark) + ' min':<10}{'no breaks yet':>12}")
+            continue
+        ci = f"[{point.break_lo * 100:.1f}% – {point.break_hi * 100:.1f}%]"
+        lines.append(
+            f"    {str(mark) + ' min':<10}{point.break_prob * 100:>11.1f}%{ci:>22}"
+            f"{point.at_risk:>10}"
+        )
+    return lines
+
+
 def _screen_block(screen: Sequence[Mapping[str, Any]]) -> list[str]:
     lines = [
         "UNIVARIATE SCREEN  (break rate above vs below a balanced split)",
@@ -212,6 +254,11 @@ _LIMITS = (
   * Labels are sensitive to confirm_minutes and break_buffer_pct. A break
     under one setting is a pierce under another. Re-run with --confirm and
     --buffer before quoting any figure as settled.
+  * The single-horizon BASE RATE is horizon-dependent by construction, and
+    measurably so: on SPX over 2026-06-29..09-03 it read 15.3% at a 30-minute
+    horizon, 29.7% at 45 and 34.4% at 60, on non-overlapping intervals. Quote
+    the curve, or quote the rate WITH its horizon; the bare number means
+    nothing on its own.
   * Nothing here is calibrated for use as a trading signal, and no result in
     this report has been validated live."""
 )
@@ -223,6 +270,7 @@ def render_report(
     screen: Sequence[Mapping[str, Any]],
     evaluation: Mapping[str, Any],
     fit: Optional[Mapping[str, Any]] = None,
+    survival: Optional[tuple] = None,
 ) -> str:
     """The full text report."""
     lines = [
@@ -234,7 +282,9 @@ def render_report(
     ]
     lines += _sample_block(meta)
     lines += ["", *_config_block(meta.get("config", {}))]
-    lines += ["", "BASE RATES", _THIN]
+    if survival is not None:
+        lines += ["", *_survival_block(survival[0], survival[1], survival[2])]
+    lines += ["", "BASE RATES  (single horizon — read the curve above first)", _THIN]
     lines.append(_rate_line("overall", rates.get("overall", {})))
     lines.append(_rate_line("call wall", rates.get("call", {})))
     lines.append(_rate_line("put wall", rates.get("put", {})))

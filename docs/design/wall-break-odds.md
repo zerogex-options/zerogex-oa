@@ -143,6 +143,48 @@ implicit prior cumulative is zero, and differencing a pre-summed total would boo
 its entire day-to-date figure as window activity. Both properties are pinned by
 tests.
 
+## 3a. The headline is a curve, not a number
+
+The first real run (SPX, 2026-06-29..09-03, 48 sessions) made this
+unavoidable. Sweeping **only** the resolution horizon:
+
+| horizon | tests | censored | resolved | P(break \| tested) | 95% CI |
+|---|---|---|---|---|---|
+| 30 min | 234 | 44 | 190 | 15.3% | [10.8, 21.1] |
+| 45 min | 193 | 45 | 148 | 29.7% | [23.0, 37.5] |
+| 60 min | 178 | 47 | 131 | 34.4% | [26.8, 42.8] |
+
+Nothing about the market differs between those rows. A longer watch gives
+price more chances to go, so the point estimate was substantially a
+restatement of a parameter we picked — and the intervals do not overlap.
+
+Two further defects in the point estimate, visible in the same table:
+
+* **It discarded a quarter of the sample.** 47 of 178 events were censored and
+  dropped. But "held 15 minutes, then the bell rang" is the observation that
+  the wall had not broken at 15 minutes, not missing data. Dropping those
+  biases the sample away from the late-session tape, where 0DTE gamma is
+  largest and the question is most interesting.
+* **The event sets are not comparable across horizons.** A longer window
+  occupies the wall for longer, so re-arming emits fewer events (234 vs 178).
+  Comparing rates across horizons compares different populations.
+
+`research/wall_break_odds/survival.py` replaces the point estimate with a
+Kaplan-Meier curve: every test contributes the time it was actually watched
+(`WallTest.observed_minutes`) plus whether it broke, `held` and `censored`
+become the same kind of right-censored observation, and the report quotes
+`P(break within t)` for t in 5/15/30/45/60 with log-log bounds.
+
+The single-horizon rate is kept below the curve as a cross-check, labelled as
+horizon-dependent. **A bare "walls break X% of the time" is not a
+publishable claim; the horizon is part of the number.**
+
+The assumption worth stating: Kaplan-Meier needs censoring independent of the
+outcome given covariates. Here censoring is "the session ended", which is not
+obviously independent of break behaviour. `survival.by_group` exists so the
+curve can be split by session half and the assumption inspected rather than
+assumed. That check has not been run yet.
+
 ## 4. Evaluation
 
 Implemented in `research/wall_break_odds/model.py`, reusing the statistical

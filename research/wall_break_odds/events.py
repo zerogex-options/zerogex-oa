@@ -202,6 +202,12 @@ class WallTest:
     #: the wall and oriented toward the break (positive = past the wall).
     #: Diagnostic only — it is an OUTCOME, never a feature.
     excursion_pct: Optional[float] = None
+    #: Minutes this test was actually WATCHED — to confirmation for a break,
+    #: otherwise to the last bar examined (the horizon, or the bell, whichever
+    #: came first). This is what makes ``held`` and ``censored`` the same kind
+    #: of observation for survival analysis: both are right-censored, they
+    #: merely differ in when the watching stopped. See :mod:`survival`.
+    observed_minutes: Optional[float] = None
 
     @property
     def broke(self) -> bool:
@@ -220,6 +226,7 @@ class WallTest:
             "minutes_to_resolve": self.minutes_to_resolve,
             "test_ordinal": self.test_ordinal,
             "excursion_pct": self.excursion_pct,
+            "observed_minutes": self.observed_minutes,
         }
 
 
@@ -244,13 +251,20 @@ def _resolve(
     bars: Sequence[PriceBar],
     cfg: EventConfig,
     session_end: datetime,
-) -> tuple[str, Optional[datetime], Optional[float]]:
+) -> tuple[str, Optional[datetime], Optional[float], float]:
     """Scan forward from ``start_idx`` and decide the outcome.
 
-    Returns ``(outcome, resolved_at, excursion_pct)``.  A break is only
-    declared on ``confirm_minutes`` consecutive closes beyond the buffer;
-    the run resets the moment one close falls back inside, which is exactly
-    the failed-breakout shape the label has to exclude.
+    Returns ``(outcome, resolved_at, excursion_pct, observed_minutes)``.  A
+    break is only declared on ``confirm_minutes`` consecutive closes beyond
+    the buffer; the run resets the moment one close falls back inside, which
+    is exactly the failed-breakout shape the label has to exclude.
+
+    ``observed_minutes`` is how far the scan actually got — to confirmation
+    for a break, otherwise to the last bar inside the horizon and the session.
+    A ``held`` result is therefore "did not break in the time we watched",
+    which is the same statement a ``censored`` result makes with a shorter
+    watch. The survival layer treats them identically and the base-rate layer
+    does not, which is the whole reason both are recorded.
     """
     buf = cfg.buffer(wall)
     deadline = bars[start_idx].ts + timedelta(minutes=cfg.resolution_minutes)
@@ -260,21 +274,24 @@ def _resolve(
     truncated = deadline > session_end
     run = 0
     best: Optional[float] = None
+    start_ts = bars[start_idx].ts
+    watched = 0.0
     for bar in bars[start_idx:]:
         if bar.ts > deadline or bar.ts > session_end:
             break
+        watched = (bar.ts - start_ts).total_seconds() / 60.0
         extreme = bar.high if side == "call" else bar.low
         signed = (extreme - wall) / wall * (1.0 if side == "call" else -1.0) * 100.0
         best = signed if best is None else max(best, signed)
         if _beyond(side, bar.close, wall, buf):
             run += 1
             if run >= cfg.confirm_minutes:
-                return "broke", bar.ts, best
+                return "broke", bar.ts, best, watched
         else:
             run = 0
     if truncated:
-        return "censored", None, best
-    return "held", None, best
+        return "censored", None, best, watched
+    return "held", None, best, watched
 
 
 def extract_wall_tests(
@@ -345,7 +362,7 @@ def extract_wall_tests(
             wall = float(wall)
             ordinal = ordinals.get(wall, 0) + 1
             ordinals[wall] = ordinal
-            outcome, resolved_at, excursion = _resolve(
+            outcome, resolved_at, excursion, watched = _resolve(
                 side, wall, i, ordered_bars, cfg, session_end
             )
             out.append(
@@ -363,6 +380,7 @@ def extract_wall_tests(
                     ),
                     test_ordinal=ordinal,
                     excursion_pct=excursion,
+                    observed_minutes=watched,
                 )
             )
             if outcome == "broke":
