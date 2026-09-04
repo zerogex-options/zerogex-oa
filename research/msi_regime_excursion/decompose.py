@@ -54,6 +54,18 @@ partial component set is scaled back onto the full 100-point scale exactly as
 ``ScoringEngine.score`` does when components abstain -- so a variant is "what
 the MSI would read if only these components existed", not a new formula.
 
+**A limit worth stating.** These variants are rebuilt from the persisted
+*display* scores, and an abstaining component's display score is a small regime
+tilt rather than zero. So :func:`variant_scores` cannot distinguish an abstainer
+from a genuine small reading, and includes components the engine would have
+excluded. On rows where nothing abstained -- exactly the ``--clean-only`` sample
+the study's conclusions rest on -- it is exact, and
+``tests/test_msi_regime_excursion.py`` asserts that against the production
+engine's own shadow score. On rows where a band component abstained the variant
+is an approximation, which is one more reason the full-sample variant figures
+are the weaker of the two runs. ``ScoringEngine.BAND_CANDIDATE_COMPONENTS``
+computes the same subset correctly, live, and is the number to prefer from here.
+
 **Reconstruction fidelity.** The persisted payload stores each component's
 *display* score, which differs from its composite input only when the component
 abstained (``|raw| < 1e-3``, replaced by a small regime tilt for display while
