@@ -17,6 +17,7 @@ import sys
 from datetime import date, datetime
 
 from research.wall_break_odds.events import ET
+from research.wall_break_odds.features import MECHANICAL_FEATURES
 from typing import Any, Optional, Sequence
 
 from research.wall_break_odds.events import EventConfig
@@ -25,6 +26,7 @@ from research.wall_break_odds.model import (
     base_rate,
     evaluate,
     fit_full,
+    feature_consistency,
     replication,
     univariate_screen,
 )
@@ -323,7 +325,15 @@ def _replication(records: Sequence[dict[str, Any]]) -> Optional[dict[str, Any]]:
     for i, a in enumerate(syms):
         for b in syms[i + 1 :]:
             matrix[(a, b)] = replication({a: screens[a], b: screens[b]})
-    return {"matrix": matrix, "symbols": syms}
+    substantive_only = {
+        sym: [r for r in screen if r.get("feature") not in MECHANICAL_FEATURES]
+        for sym, screen in screens.items()
+    }
+    return {
+        "matrix": matrix,
+        "symbols": syms,
+        "consistency": feature_consistency(substantive_only),
+    }
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:

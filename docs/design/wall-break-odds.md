@@ -266,6 +266,38 @@ cannot agree across that pair is not measuring anything about walls.
 rejecting pair invalidates the whole pool, so the pooled analysis is withheld
 unless every pair agrees.
 
+## 3e. Why pairwise correlation cannot settle the feature question
+
+The four-symbol replication matrix produced a pattern no market story
+explains: agreement tracked INSTRUMENT TYPE, not the index.
+
+| pair | substantive r | sign agree | shares |
+|---|---|---|---|
+| NDX vs SPX | +0.762 | 100% | cash-settled index options |
+| QQQ vs SPY | +0.556 | 71% | ETF options |
+| SPX vs SPY | −0.319 | 31% | the S&P |
+| NDX vs QQQ | −0.452 | 38% | the Nasdaq |
+
+Removing the mechanical features did not dissolve it, so "the clock agrees in
+any two samples" is not the explanation.
+
+The likely explanation is that the question is badly posed. The substantive
+features are mostly dollar-scale gamma quantities — wall strength, net GEX,
+convexity risk, local GEX share, raw flow premium — and within a symbol they
+move together. A 15-feature delta vector therefore carries far fewer than 15
+independent degrees of freedom, and two samples of similar notional scale can
+correlate without any individual feature being real.
+
+`feature_consistency` asks the cleaner question instead: **does each feature
+point the same way in every symbol?** A real predictor does. Under the null it
+is a coin flip per symbol, so a feature seen in four symbols agrees by chance
+with probability 1/8, and the expected count over the whole feature set is
+reported beside the observed count — so "six features agree" can be read
+against "and five would by chance".
+
+That comparison, not the pairwise matrix, is the decisive read on whether any
+feature has survived.
+
 ## 4. Evaluation
 
 Implemented in `research/wall_break_odds/model.py`, reusing the statistical

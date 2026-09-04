@@ -151,6 +151,49 @@ def _survival_block(
     return lines
 
 
+def _consistency_block(cons: Mapping[str, Any]) -> list[str]:
+    """Per-feature sign agreement across every symbol — the decisive read.
+
+    Printed above the pairwise matrix because it answers the question the
+    matrix cannot: a feature that genuinely predicts breaking points the same
+    way everywhere, and the count that does so is directly comparable to the
+    count chance would produce.
+    """
+    symbols = cons["symbols"]
+    observed = cons["n_consistent"]
+    expected = cons["expected_by_chance"]
+    lines = [
+        "FEATURE CONSISTENCY  (does each feature point the same way everywhere?)",
+        _THIN,
+        "  A real predictor keeps its sign in every symbol. Under the null that",
+        "  is a coin flip per symbol, so this compares how many features agree",
+        "  against how many would agree by chance. Pairwise correlation cannot",
+        "  settle this — these features move together, so two samples can",
+        "  correlate with nothing real underneath.",
+        "",
+        f"  features compared     {cons['n_features']}",
+        f"  sign-consistent       {observed}",
+        f"  expected by chance    {expected:.1f}",
+        "",
+    ]
+    if observed <= expected + 1e-9:
+        lines.append("    -> at or below chance. No feature has survived.")
+    elif observed >= 2 * expected:
+        lines.append("    -> above chance; the consistent features below are worth pursuing.")
+    else:
+        lines.append("    -> barely above chance; not enough to call any feature real.")
+    lines.append("")
+    header = f"    {'feature':<32}" + "".join(f"{sym:>9}" for sym in symbols) + "   same sign"
+    lines.append(header)
+    for row in cons["rows"]:
+        cells = "".join(
+            (f"{row['by_symbol'][sym] * 100:>+9.0f}" if sym in row["by_symbol"] else f"{'—':>9}")
+            for sym in symbols
+        )
+        lines.append(f"    {row['feature']:<32}{cells}   {'yes' if row['consistent'] else ''}")
+    return lines
+
+
 def _replication_matrix(rep: Mapping[str, Any]) -> list[str]:
     """Pairwise replication across more than two symbols.
 
@@ -209,7 +252,10 @@ def _replication_block(rep: Mapping[str, Any]) -> list[str]:
     informative than either screen on its own.
     """
     if rep.get("matrix") is not None:
-        return _replication_matrix(rep)
+        out: list[str] = []
+        if rep.get("consistency"):
+            out += _consistency_block(rep["consistency"]) + [""]
+        return out + _replication_matrix(rep)
     a, b = rep["symbols"]
     spearman = rep.get("spearman")
     agreement = rep.get("sign_agreement")

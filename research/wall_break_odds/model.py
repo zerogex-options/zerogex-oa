@@ -51,6 +51,7 @@ __all__ = [
     "evaluate",
     "fit_full",
     "replication",
+    "feature_consistency",
 ]
 
 #: Below this many resolved events, no coefficient is reported at all. Twenty
@@ -615,4 +616,61 @@ def replication(screens: Mapping[str, Sequence[Mapping[str, Any]]]) -> Optional[
             ({"feature": f, names[0]: a_map[f], names[1]: b_map[f]} for f in shared),
             key=lambda r: -abs(r[names[0]]),
         ),
+    }
+
+
+def feature_consistency(
+    screens: Mapping[str, Sequence[Mapping[str, Any]]], *, min_symbols: int = 3
+) -> Optional[dict[str, Any]]:
+    """Per-feature sign agreement across EVERY symbol at once.
+
+    Pairwise rank correlation asks whether two delta VECTORS line up, and that
+    question is badly behaved here: the substantive features are mostly
+    dollar-scale gamma quantities that move together, so a 15-feature vector
+    carries far fewer than 15 independent degrees of freedom and two samples of
+    similar notional scale can correlate with nothing real underneath.
+
+    This asks the cleaner question instead. A feature that genuinely predicts
+    breaking should point the SAME WAY in every symbol. Under the null it is a
+    coin flip per symbol, so a feature seen in k symbols agrees by chance with
+    probability 2^(1-k) — 1/8 across four. Multiply by the number of features
+    and you get the count to beat, which is reported alongside the observed
+    count so "six features agree!" can be read against "and five would by
+    chance".
+    """
+    per_feature: dict[str, dict[str, float]] = {}
+    for symbol, screen in screens.items():
+        for row in screen:
+            if not row.get("reportable") or row.get("delta") is None:
+                continue
+            per_feature.setdefault(row["feature"], {})[symbol] = float(row["delta"])
+
+    rows: list[dict[str, Any]] = []
+    expected = 0.0
+    consistent = 0
+    for feature, by_symbol in per_feature.items():
+        deltas = [d for d in by_symbol.values() if d != 0]
+        if len(deltas) < min_symbols:
+            continue
+        agrees = all(d > 0 for d in deltas) or all(d < 0 for d in deltas)
+        expected += 2.0 ** (1 - len(deltas))
+        consistent += int(agrees)
+        rows.append(
+            {
+                "feature": feature,
+                "by_symbol": by_symbol,
+                "n_symbols": len(deltas),
+                "consistent": agrees,
+                "mean_abs": sum(abs(d) for d in deltas) / len(deltas),
+            }
+        )
+    if not rows:
+        return None
+    rows.sort(key=lambda r: (not r["consistent"], -r["mean_abs"]))
+    return {
+        "symbols": sorted(screens),
+        "rows": rows,
+        "n_features": len(rows),
+        "n_consistent": consistent,
+        "expected_by_chance": expected,
     }

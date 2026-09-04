@@ -863,3 +863,37 @@ def test_replication_matrix_renders_every_pair():
     assert "SPX vs SPY" in text and "replicates" in text
     qqq_line = next(ln for ln in text.splitlines() if "QQQ vs SPX" in ln)
     assert "NO replication" in qqq_line
+
+
+def test_feature_consistency_scores_against_chance_not_against_zero():
+    """Six agreeing features sounds impressive until you know five would agree
+    by chance. The expected count is what makes the observed one readable."""
+    from research.wall_break_odds.model import feature_consistency
+
+    def screen(deltas):
+        return [{"feature": k, "delta": v, "reportable": True} for k, v in deltas.items()]
+
+    # One feature genuinely consistent, two not.
+    screens = {
+        "SPX": screen({"real": -0.30, "noise_a": 0.20, "noise_b": -0.10}),
+        "SPY": screen({"real": -0.20, "noise_a": -0.10, "noise_b": 0.05}),
+        "QQQ": screen({"real": -0.25, "noise_a": 0.30, "noise_b": -0.02}),
+        "NDX": screen({"real": -0.15, "noise_a": -0.20, "noise_b": 0.08}),
+    }
+    out = feature_consistency(screens)
+    assert out["n_features"] == 3
+    assert out["n_consistent"] == 1
+    # 3 features x 2^(1-4) = 3/8
+    assert out["expected_by_chance"] == pytest.approx(0.375)
+    assert out["rows"][0]["feature"] == "real"
+    assert out["rows"][0]["consistent"] is True
+
+
+def test_feature_consistency_needs_enough_symbols():
+    from research.wall_break_odds.model import feature_consistency
+
+    screens = {
+        "SPX": [{"feature": "x", "delta": -0.3, "reportable": True}],
+        "SPY": [{"feature": "x", "delta": -0.2, "reportable": True}],
+    }
+    assert feature_consistency(screens, min_symbols=3) is None
