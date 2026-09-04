@@ -123,6 +123,34 @@ No database. A six-instrument, five-horizon run takes a few minutes.
 | `--min-bucket` | `30` | skip buckets with fewer usable rows |
 | `--horizons` | all in the dataset | focus one horizon |
 | `--no-digest` | off | suppress the one-screen summary printed at the end |
+| `--clean-only` | off | keep only rows whose composite reconstructs exactly — see below |
+
+## 3b. Check whether the result is being diluted by partial-data readings
+
+A row reconstructs when rebuilding the composite from its persisted components
+reproduces the persisted score. It fails when components **abstained** and the engine
+built the composite from a partial set. Those readings still get a regime label, still
+reach customers, and still gate the playbook patterns — but they are scored on less
+information, and they dilute every number in the report.
+
+The first run found SPX and ES near 98% but SPY / QQQ / NDX / NQ near 55%. Two
+commands settle what that is, and neither needs the database:
+
+```bash
+# Where do components abstain? (seconds)
+python -m research.msi_regime_excursion.cli abstention research_output/msi_excursion.jsonl
+
+# Do the findings hold on clean rows only? (a full re-run)
+python -m research.msi_regime_excursion.cli analyze research_output/msi_excursion.jsonl \
+    --clean-only \
+    --out research_output/msi_excursion_clean.md \
+    --json-out research_output/msi_excursion_clean_findings.json
+```
+
+If the abstention clusters outside 09:30-16:00 ET, the fix is a session gate on scoring
+rather than a model change. If `--clean-only` lifts the weak instruments toward the
+clean ones, then every headline number in the full run understates the gauge, and any
+model change decided on the full run was decided on contaminated data.
 
 The full markdown report is thousands of rows — the right level of detail to audit a
 finding, the wrong level to read one. `analyze` therefore finishes by printing a
