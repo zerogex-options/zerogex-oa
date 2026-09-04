@@ -400,6 +400,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "a result is being diluted by readings scored on partial data.")
     p.set_defaults(func=cmd_analyze)
 
+    p = sub.add_parser("components",
+                       help="which component is starving the composite (read-only)")
+    p.add_argument("--symbol", required=True, help="score symbol, e.g. NDX")
+    p.add_argument("--days", type=int, default=45)
+    p.set_defaults(func=lambda a: __import__(
+        "research.msi_regime_excursion.components", fromlist=["main"]).main(a.symbol, a.days))
+
     p = sub.add_parser("abstention",
                        help="where components abstain, by ET hour (no database)")
     p.add_argument("dataset")
