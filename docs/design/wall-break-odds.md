@@ -207,6 +207,32 @@ handled rather than noted:
   reports the log-rank restricted to **first tests only**, which compares like
   with like; that is the row to read.
 
+## 3c. Replication beats significance
+
+QQQ is a second independent sample, so every candidate can be asked the
+question that matters more than a p-value: does it show up again in data it
+has never seen?
+
+**It does not.** Spearman r between the two screens' effect sizes is −0.033
+and sign agreement is 9 of 18 — exactly chance. The largest SPX effects fail
+hardest: `flip_distance` −22 becomes +5, `spot_above_flip` −20 becomes +3,
+`flow_toward_break` −16 becomes +1.
+
+This is a stronger statement than "nothing survived FDR correction", and it
+arrives at the same conclusion from an independent direction. It also
+retracts a claim made publicly on the SPX sample alone — that the regime
+around the wall looked promising — which is exactly what a replication test is
+for.
+
+`convexity_risk_log` (−18 and −19) is the one substantive feature agreeing
+closely. With 19 features at chance-level agreement overall, one close match
+is what chance produces; it is a candidate to watch, not a finding.
+
+Agreement otherwise concentrates in mechanical columns — time of day, minutes
+to close, test ordinal — whose relationship to the resolution window is
+structural and would agree in any two samples. The report says so, so that
+agreement is not read as signal.
+
 ## 4. Evaluation
 
 Implemented in `research/wall_break_odds/model.py`, reusing the statistical

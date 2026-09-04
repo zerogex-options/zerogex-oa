@@ -75,7 +75,7 @@ another.
 QQQ is a second, independent sample, so every candidate can be asked the
 harder question: does it show up again in data it has never seen?
 
-**Spearman r = −0.01 between the two screens' effect sizes. Sign agreement
+**Spearman r = −0.033 between the two screens' effect sizes. Sign agreement
 9/18 = 50%, exactly chance.**
 
 The largest SPX effects are precisely the ones that fail:
