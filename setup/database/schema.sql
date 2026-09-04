@@ -2033,6 +2033,66 @@ DELETE FROM component_normalizer_cache
  WHERE field_name IN ('smart_money_volume_delta', 'smart_money_premium');
 
 -- =============================================================================
+-- wall_break_stats
+-- =============================================================================
+-- Per-symbol measured odds that a gamma wall gives way once price reaches it.
+--
+-- The product draws call and put walls identically for every symbol, which
+-- implies they mean the same thing.  Measured over mid-2026, they do not:
+-- S&P walls (SPY, SPX) broke about 31% of the time within an hour of being
+-- tested, Nasdaq walls (QQQ, NDX) closer to 48-50%.  That gap is a property
+-- of the underlying index -- SPY and SPX agree despite $1 and $5 strike
+-- ladders, as do QQQ and NDX -- so it cannot be presented as one number.
+--
+-- Granularity
+--   * underlying        -- symbol
+--   * side              -- 'call', 'put', or 'both' (the pooled curve)
+--   * horizon_minutes   -- minutes after the test the probability refers to
+--
+-- The answer is deliberately a CURVE and not a rate.  "Does the wall break"
+-- has no meaning without a clock: on SPX the same tests read 15.3% at a
+-- thirty-minute horizon and 34.4% at sixty, on non-overlapping intervals.
+-- Consumers must quote the horizon with the number.
+--
+-- break_prob is a Kaplan-Meier estimate, so tests that ran into the closing
+-- bell before they could resolve still contribute for the time they WERE
+-- observed rather than being discarded -- dropping them biases the estimate
+-- away from the late-session tape, where 0DTE gamma is heaviest.
+--
+-- Refresh
+--   Populated by src/tools/wall_break_stats_refresh.py, run nightly from the
+--   zerogex-oa-wall-break-stats-refresh timer (04:55 ET, after the historical
+--   stats refresh).  Idempotent UPSERT.
+--
+-- Methodology and measured results: docs/design/wall-break-odds.md
+CREATE TABLE IF NOT EXISTS wall_break_stats (
+    underlying      VARCHAR(10)      NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    side            VARCHAR(8)       NOT NULL,
+    horizon_minutes SMALLINT         NOT NULL,
+    break_prob      DOUBLE PRECISION,
+    ci_low          DOUBLE PRECISION,
+    ci_high         DOUBLE PRECISION,
+    -- Observations still being watched at this horizon; small values here are
+    -- why a probability can be present while remaining unreportable.
+    at_risk         INTEGER,
+    n_tests         INTEGER          NOT NULL,
+    n_breaks        INTEGER          NOT NULL,
+    n_censored      INTEGER          NOT NULL,
+    window_sessions INTEGER          NOT NULL,
+    window_start    DATE,
+    window_end      DATE,
+    -- False when the sample is too thin to publish; consumers must hide the
+    -- figure rather than render a misleading one.
+    reportable      BOOLEAN          NOT NULL DEFAULT FALSE,
+    refreshed_at    TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, side, horizon_minutes)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wall_break_stats_lookup
+    ON wall_break_stats (underlying, side, horizon_minutes);
+
+
+-- =============================================================================
 -- gex_historical_stats
 -- =============================================================================
 -- Per-symbol historical distribution snapshots of headline GEX metrics

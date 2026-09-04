@@ -3143,6 +3143,25 @@ gex-historical-stats-dry-run: ## Compute gex_historical_stats distributions with
 	@$(PY) -m src.tools.gex_historical_stats_refresh \
 		$(if $(GEX_HIST_SYMBOLS),--symbols $(GEX_HIST_SYMBOLS)) --dry-run
 
+# Measured odds a gamma wall gives way once price reaches it, per symbol.
+# Nightly, after gex-historical-stats-refresh. The levels surfaces read this
+# so a call wall can carry its own hit rate instead of implying one -- S&P
+# walls and Nasdaq walls are not the same object and the product should not
+# present them as if they were. See docs/design/wall-break-odds.md.
+.PHONY: wall-break-stats-refresh
+wall-break-stats-refresh: ## Recompute wall_break_stats break curves (run nightly)
+	@echo "$(BLUE)=== Refreshing wall_break_stats ===$(NC)"
+	@$(PY) -m src.tools.wall_break_stats_refresh \
+		$(if $(WALL_BREAK_SYMBOLS),--symbols $(WALL_BREAK_SYMBOLS)) \
+		$(if $(WALL_BREAK_WINDOW),--window $(WALL_BREAK_WINDOW))
+
+.PHONY: wall-break-stats-dry-run
+wall-break-stats-dry-run: ## Measure wall break curves without writing
+	@echo "$(BLUE)=== wall_break_stats (dry-run) ===$(NC)"
+	@$(PY) -m src.tools.wall_break_stats_refresh \
+		$(if $(WALL_BREAK_SYMBOLS),--symbols $(WALL_BREAK_SYMBOLS)) \
+		$(if $(WALL_BREAK_WINDOW),--window $(WALL_BREAK_WINDOW)) --dry-run
+
 # Read-only re-validation of the relative gamma-flip thresholds after the
 # 7106711 flip redefinition. Splits persisted gex_summary.flip_distance at
 # the deploy boundary (NORMALIZER_DEPLOY_CUTOFF) and reports the gate

@@ -1,0 +1,39 @@
+[Unit]
+Description=ZeroGEX nightly refresh of wall_break_stats break curves
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target zerogex-oa-gex-historical-stats-refresh.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Re-label every gamma-wall test in the trailing window and re-estimate the
+# per-symbol break curve, so the levels surfaces can publish a measured hit
+# rate beside each wall.  Per symbol because it has to be: S&P walls held
+# about two times in three within the hour and Nasdaq walls closer to one in
+# two, and that gap tracks the underlying index rather than the option chain.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa wall-break-stats-refresh
+
+# Re-labels ~60 sessions x a handful of symbols from gex_summary and
+# underlying_quotes; minutes at most.  Capped well below the 1800s the
+# db-maintain unit uses so a stuck DB doesn't sit overnight.
+TimeoutStartSec=900
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-wall-break-stats-refresh
