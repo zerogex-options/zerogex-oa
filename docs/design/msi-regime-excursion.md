@@ -473,6 +473,21 @@ And `msi_direction` is now clearly **negative** on SPY, QQQ, NDX and NQ (-0.08 t
 -0.17), not merely uninformative. On four of six instruments the directional components
 pull the composite the wrong way.
 
+### A caveat the implementation surfaced
+
+Publishing the variant from the engine (`ScoringEngine.BAND_CANDIDATE_COMPONENTS`)
+exposed a limit in how the study computed it. `decompose.variant_scores` rebuilds the
+variants from the persisted *display* scores, and an abstaining component's display
+score is a small regime tilt rather than zero — so it cannot tell an abstainer from a
+genuine small reading and includes components the engine would have excluded.
+
+Measured against the production engine across 400 randomized draws: the two agree on
+**100%** of rows where no band component abstained, and on **0%** where one did. The
+`--clean-only` sample is by construction the abstention-free one, so **the clean-data
+variant figures in this section are exact** and the recommendation rests on them. The
+full-sample variant figures are an approximation, which is one more reason to prefer
+the clean run. From here the engine's own `magnitude_score` is the number to use.
+
 ## 6. Recommendation
 
 Ordered by evidence, after the clean-data run.

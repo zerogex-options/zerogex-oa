@@ -432,3 +432,140 @@ def test_the_neutral_structure_crosses_three_bands_on_direction_alone():
     assert summary["msi_span"] > 35.0
     assert summary["band_path"][0] == "Chop / Range"
     assert summary["band_path"][-1] == "Trend / Expansion"
+
+
+# ---------------------------------------------------------------------------
+# The shadow magnitude score published by the engine
+# ---------------------------------------------------------------------------
+
+def _fake_engine(scores: dict):
+    """A ScoringEngine whose components return exactly ``scores``."""
+    from src.signals.components.base import ComponentBase
+    from src.signals.scoring_engine import ScoringEngine
+
+    class Fake(ComponentBase):
+        def __init__(self, name, value):
+            self.name = name
+            self.weight = 0.0
+            self._v = value
+
+        def compute(self, ctx):
+            return self._v
+
+        def context_values(self, ctx):
+            return {}
+
+    return ScoringEngine("SPX", [Fake(n, v) for n, v in scores.items()])
+
+
+def _flat_context():
+    from datetime import timezone
+    from src.signals.components.base import MarketContext
+
+    return MarketContext(
+        datetime(2026, 6, 1, 15, 0, tzinfo=timezone.utc), "SPX", 5000.0, 0.0, 4990.0,
+        1.0, 5000.0, 0.0, 0.0, [5000.0] * 40, 50.0, 0.0, 5000.0, 0.0, None, 800_000,
+        [5000.0] * 40, [5000.0] * 40, {},
+    )
+
+
+def test_publishing_the_shadow_score_leaves_the_composite_bit_identical():
+    """The whole point of the shadow score is that it changes nothing.
+
+    This recomputes the composite with the formula as it stood before the
+    shadow score was added and requires an exact match, so a future edit to
+    ``_saturate`` cannot quietly move the shipped number.
+    """
+    from src.signals.scoring_engine import ScoringEngine, _COMPOSITE_SAT_SCALE
+    from src.signals.components.spectrum import _ABSTAIN_THRESHOLD
+
+    points = ScoringEngine.COMPONENT_POINTS
+    ctx = _flat_context()
+    rng = random.Random(11)
+
+    for _ in range(400):
+        scores = {
+            n: (0.0 if rng.random() < 0.25 else round(rng.uniform(-1, 1), 6))
+            for n in points
+        }
+        # The pre-change formula, inline.
+        offset = active = total = 0.0
+        for name, value in scores.items():
+            clamped = max(-1.0, min(1.0, value))
+            total += points[name]
+            if abs(clamped) >= _ABSTAIN_THRESHOLD:
+                offset += points[name] * clamped
+                active += points[name]
+        full = offset * (total / active) if active > 0 else 0.0
+        expected = max(0.0, min(100.0, 50.0 + 50.0 * math.tanh(full / _COMPOSITE_SAT_SCALE)))
+
+        snapshot, _ = _fake_engine(scores).score(ctx)
+        # ScoreSnapshot rounds to 6dp on the way out; compare like for like.
+        assert snapshot.composite_score == round(expected, 6)
+
+
+def test_shadow_score_is_published_without_being_used():
+    from src.signals.scoring_engine import ScoringEngine
+
+    scores = {n: 0.5 for n in ScoringEngine.COMPONENT_POINTS}
+    snapshot, _ = _fake_engine(scores).score(_flat_context())
+    agg = snapshot.aggregation
+    assert "magnitude_score" in agg and "magnitude_direction" in agg
+    assert 0.0 <= agg["magnitude_score"] <= 100.0
+    # The shipped label still comes from the composite, not the shadow.
+    assert snapshot.direction == ScoringEngine._regime_label(snapshot.composite_score)
+    # Band components only: 16 + 30 + 6 + 12.
+    assert agg["magnitude_active_points"] == pytest.approx(64.0)
+
+
+def test_band_candidate_set_is_the_researched_variant():
+    """The engine's subset must be the one the study actually scored."""
+    from src.signals.scoring_engine import ScoringEngine
+    from research.msi_regime_excursion.decompose import VARIANTS
+
+    assert set(ScoringEngine.BAND_CANDIDATE_COMPONENTS) == set(VARIANTS["msi_magnitude_pcr"])
+
+
+def test_shadow_score_agrees_with_the_study_exactly_when_nothing_abstains():
+    """And diverges only where the study's inputs could not have known better.
+
+    The persisted payload stores each component's *display* score, which for an
+    abstaining component is a small regime tilt rather than zero -- so
+    ``decompose.variant_scores`` cannot tell an abstainer from a genuine small
+    reading and includes it. The engine applies the real abstention rule, so it
+    is the more correct of the two. They agree exactly on rows where no band
+    component abstained, which is precisely the ``--clean-only`` sample the
+    study's conclusions were drawn from.
+    """
+    from src.signals.scoring_engine import ScoringEngine
+    from src.signals.components.spectrum import _ABSTAIN_THRESHOLD
+    from research.msi_regime_excursion.decompose import read_components, variant_scores
+
+    band = ScoringEngine.BAND_CANDIDATE_COMPONENTS
+    ctx = _flat_context()
+    rng = random.Random(11)
+    agreed_clean = total_clean = 0
+
+    for _ in range(400):
+        scores = {
+            n: (0.0 if rng.random() < 0.25 else round(rng.uniform(-1, 1), 6))
+            for n in ScoringEngine.COMPONENT_POINTS
+        }
+        snapshot, _ = _fake_engine(scores).score(ctx)
+        rebuilt = variant_scores(
+            read_components(dict(snapshot.components)), snapshot.composite_score
+        )["msi_magnitude_pcr"]
+        shadow = snapshot.aggregation["magnitude_score"]
+
+        band_abstained = any(
+            abs(scores[n]) < _ABSTAIN_THRESHOLD for n in band
+        )
+        if not band_abstained:
+            total_clean += 1
+            if rebuilt is not None and abs(shadow - rebuilt) <= 1e-4:
+                agreed_clean += 1
+
+    assert total_clean > 50, "not enough abstention-free draws to be meaningful"
+    assert agreed_clean == total_clean, (
+        f"shadow and study disagree on {total_clean - agreed_clean} abstention-free rows"
+    )
