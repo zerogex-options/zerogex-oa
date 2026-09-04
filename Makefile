@@ -3410,6 +3410,15 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 		"SELECT 'legacy artifacts pruned' AS status;" \
 	| $(PSQL)
 
+.PHONY: db-pin-vs-king-export
+db-pin-vs-king-export: ## Export the Pin-vs-GEX-King study CSVs (SPX+QQQ, 90d). Read-only. Writes 3 CSVs into the current directory.
+	@echo "$(BLUE)=== Pin Strike vs GEX King study export (read-only) ===$(NC)"
+	@echo "$(YELLOW)Writes zerogex_sessions.csv, zerogex_levels.csv and zerogex_bars.csv$(NC)"
+	@echo "$(YELLOW)into $$(pwd) via client-side \\copy. Check rows_with_king in the$(NC)"
+	@echo "$(YELLOW)sessions file before using the export: max_gamma_strike is nullable$(NC)"
+	@echo "$(YELLOW)and never backfilled, so old sessions may not carry the King.$(NC)"
+	@$(PSQL) -f setup/database/diagnostics/pin_vs_king_export.sql
+
 .PHONY: db-symbols-audit
 db-symbols-audit: ## Read-only audit of malformed symbols rows + the FK-cascade blast radius of deleting them. Nothing is deleted.
 	@echo "$(BLUE)=== symbols cleanup audit (read-only) ===$(NC)"
