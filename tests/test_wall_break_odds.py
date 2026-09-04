@@ -523,3 +523,128 @@ def test_session_half_split_uses_et_and_the_session_midpoint():
     assert _in_half(early, morning=True) and not _in_half(early, morning=False)
     assert _in_half(late, morning=False) and not _in_half(late, morning=True)
     assert not _in_half({"tested_at": "nonsense"}, morning=True)
+
+
+def test_logrank_separates_real_differences_from_noise():
+    import random
+
+    from research.wall_break_odds.survival import Observation, logrank
+
+    rng = random.Random(5)
+
+    def group(p_break, n):
+        out = []
+        for _ in range(n):
+            if rng.random() < p_break:
+                out.append(Observation(rng.uniform(10, 60), True))
+            else:
+                out.append(Observation(60.0, False))
+        return out
+
+    assert logrank(group(0.30, 200), group(0.30, 200)).p_value > 0.05
+    assert logrank(group(0.55, 200), group(0.15, 200)).p_value < 0.001
+
+
+def test_logrank_declines_rather_than_guessing_without_events():
+    from research.wall_break_odds.survival import Observation, logrank
+
+    assert logrank([Observation(60, False)] * 50, [Observation(60, False)] * 50) is None
+    assert logrank([], [Observation(10, True)]) is None
+
+
+def test_logrank_reproduces_the_freireich_benchmark():
+    """The standard worked example (6-MP vs placebo leukemia trial).
+
+    Pinned against published values — observed 9, expected 19.25, chi2 16.79 —
+    because this statistic is the only thing standing between a raw count
+    difference and a claim about hazards, and it has to be right under
+    UNEQUAL censoring, which is exactly the situation in this study.
+    """
+    from research.wall_break_odds.survival import Observation, logrank
+
+    mp = [
+        (6, 0),
+        (6, 1),
+        (6, 1),
+        (6, 1),
+        (7, 1),
+        (9, 0),
+        (10, 0),
+        (10, 1),
+        (11, 0),
+        (13, 1),
+        (16, 1),
+        (17, 0),
+        (19, 0),
+        (20, 0),
+        (22, 1),
+        (23, 1),
+        (25, 0),
+        (32, 0),
+        (32, 0),
+        (34, 0),
+        (35, 0),
+    ]
+    placebo = [
+        (1, 1),
+        (1, 1),
+        (2, 1),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+        (4, 1),
+        (5, 1),
+        (5, 1),
+        (8, 1),
+        (8, 1),
+        (8, 1),
+        (8, 1),
+        (11, 1),
+        (11, 1),
+        (12, 1),
+        (12, 1),
+        (15, 1),
+        (17, 1),
+        (22, 1),
+        (23, 1),
+    ]
+    result = logrank(
+        [Observation(float(t), bool(e)) for t, e in mp],
+        [Observation(float(t), bool(e)) for t, e in placebo],
+    )
+    assert result.observed_a == 9
+    assert result.expected_a == pytest.approx(19.25, abs=0.01)
+    assert result.chi2 == pytest.approx(16.79, abs=0.01)
+    assert result.p_value < 0.0001
+
+
+def test_logrank_adjusts_for_unequal_exposure():
+    """Fewer breaks in a group watched for less time is not a lower hazard.
+
+    Afternoon wall tests are censored by the closing bell, so they carry far
+    less exposure than morning ones. Comparing raw break counts across the two
+    is the mistake this test exists to prevent: both groups here are drawn
+    from the SAME exponential hazard and differ only in when watching stopped,
+    so the second group shows far fewer breaks and the log-rank must still
+    report no difference.
+    """
+    import random
+
+    from research.wall_break_odds.survival import Observation, logrank
+
+    rng = random.Random(17)
+
+    def draw(n, censor_at):
+        out = []
+        for _ in range(n):
+            t = rng.expovariate(1 / 80.0)  # identical hazard in both arms
+            c = censor_at()
+            out.append(Observation(min(t, c), t <= c))
+        return out
+
+    watched = draw(300, lambda: 60.0)
+    cut_short = draw(300, lambda: rng.uniform(5, 30))
+    assert sum(o.broke for o in cut_short) < sum(o.broke for o in watched) / 2
+    result = logrank(watched, cut_short)
+    assert result is not None
+    assert result.p_value > 0.05, f"same hazard flagged as different (p={result.p_value})"

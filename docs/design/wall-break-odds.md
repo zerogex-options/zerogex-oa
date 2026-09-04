@@ -185,6 +185,28 @@ obviously independent of break behaviour. `survival.by_group` exists so the
 curve can be split by session half and the assumption inspected rather than
 assumed. That check has not been run yet.
 
+## 3b. The censoring check, and why raw halves mislead
+
+The report splits the curve at the session midpoint on every run, because
+Kaplan-Meier needs censoring independent of the outcome and here censoring IS
+"the session ended" — it falls entirely on late-day tests.
+
+Two things make the raw comparison untrustworthy on its own, and both are
+handled rather than noted:
+
+* **Unequal exposure.** Afternoon tests are censored by the bell, so they are
+  watched for far less time and will show fewer breaks *even at an identical
+  hazard*. Comparing raw break counts across halves is therefore meaningless.
+  The block reports a **log-rank test**, which compares hazards with exposure
+  accounted for. It is pinned against the published Freireich benchmark
+  (observed 9, expected 19.25, chi2 16.79) precisely because it has to be
+  right under unequal censoring, which is the whole situation here.
+* **Survivorship.** A wall that breaks is spent for the session, so the
+  afternoon sample is enriched for walls that already survived a morning test.
+  Some of any gap is that selection, not the clock. The block therefore also
+  reports the log-rank restricted to **first tests only**, which compares like
+  with like; that is the row to read.
+
 ## 4. Evaluation
 
 Implemented in `research/wall_break_odds/model.py`, reusing the statistical

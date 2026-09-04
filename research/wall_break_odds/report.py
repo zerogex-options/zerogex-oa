@@ -164,6 +164,11 @@ def _censoring_block(halves: Mapping[str, Any]) -> list[str]:
         "  assumption is not automatic. Similar halves support the pooled",
         "  curve; divergent ones mean it is averaging two regimes.",
         "",
+        "  CONFOUND: a wall that breaks is spent for the session, so the",
+        "  afternoon sample is enriched for walls that ALREADY survived a",
+        "  morning test. Some of any gap is that survivorship, not the clock.",
+        "  The first-tests-only row below removes it; read that one.",
+        "",
         f"    {'half':<12}{'n':>6}{'breaks':>8}{'P(30m)':>10}{'P(60m)':>10}",
     ]
     for name in ("morning", "afternoon"):
@@ -179,6 +184,25 @@ def _censoring_block(halves: Mapping[str, Any]) -> list[str]:
             f"{(_pct(p30.break_prob, 1) if p30 else 'n/a'):>10}"
             f"{(_pct(p60.break_prob, 1) if p60 else 'n/a'):>10}"
         )
+    for label, key in (
+        ("all tests", "logrank"),
+        ("first tests only", "logrank_first"),
+    ):
+        test = halves.get(key)
+        lines.append("")
+        if test is None:
+            lines.append(f"  log-rank ({label}): not computable — too few events")
+            continue
+        verdict = (
+            "the halves differ by more than noise"
+            if test.p_value < 0.05
+            else "no evidence the halves differ"
+        )
+        lines.append(
+            f"  log-rank ({label}): chi2={test.chi2:.2f}  p={test.p_value:.4f}"
+            f"  (n {test.n_a} vs {test.n_b})"
+        )
+        lines.append(f"    -> {verdict}")
     return lines
 
 
