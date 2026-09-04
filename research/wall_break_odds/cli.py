@@ -34,9 +34,10 @@ from research.wall_break_odds.report import render_report
 
 # NOTE: research.wall_break_odds.dataset (and through it sources, and through
 # that src.database) is imported INSIDE the commands that need a database, not
-# here. `selftest` and `analyze` must run on a checkout with nothing but numpy
-# installed — a plumbing check that needs the production dependency stack to
-# start is not much of a plumbing check.
+# here. `selftest` and `analyze` need no database and no market data; they do
+# need the project's own dependencies, since the labelling and survival math
+# now live in src.analytics.wall_breaks so the shipped number and the study
+# cannot drift apart.
 
 
 #: Ladder step per symbol, used to aim the flow neighbourhood at the strikes
