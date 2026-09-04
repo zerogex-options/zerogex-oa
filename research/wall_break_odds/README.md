@@ -70,9 +70,26 @@ python -m research.wall_break_odds.cli build-dataset SPX \
     --start 2026-01-02 --end 2026-06-30 \
     --out research_output/wall_events.jsonl
 
-# 2. Base rates, the screen, and the walk-forward evaluation.
+# 2. Base rates, the curve, the screen, and the walk-forward evaluation.
 python -m research.wall_break_odds.cli analyze research_output/wall_events.jsonl --by-side
+
+# 3. A second symbol, and a check on whether they can be pooled.
+python -m research.wall_break_odds.cli build-dataset QQQ \
+    --start 2026-01-02 --end 2026-06-30 --out research_output/qqq_events.jsonl
+python -m research.wall_break_odds.cli analyze \
+    research_output/wall_events.jsonl research_output/qqq_events.jsonl
 ```
+
+`--strike-step` defaults per symbol ($5 for SPX/NDX/RUT, $1 otherwise), so QQQ
+does not need it set by hand. Aiming a $5 ladder at $1 strikes finds no
+contracts and reads as "no flow at the wall" rather than as an error.
+
+**Pooling is not free.** Passing several datasets to `analyze` combines them
+and prints a POOLING CHECK: per-symbol curves plus a log-rank on whether they
+are one process. Pooling to clear the model's 200-event floor is only honest
+if that test says they agree — otherwise the extra events buy an average
+describing neither symbol. Note SPY is close to a duplicate of SPX rather than
+an independent sample; QQQ is a genuinely different book.
 
 `build-dataset` also writes `<out>.meta.json` — symbol, window, sessions seen vs
 used, skip reasons, censored count, and the exact label thresholds. The report

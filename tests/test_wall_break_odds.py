@@ -648,3 +648,42 @@ def test_logrank_adjusts_for_unequal_exposure():
     result = logrank(watched, cut_short)
     assert result is not None
     assert result.p_value > 0.05, f"same hazard flagged as different (p={result.p_value})"
+
+
+def test_strike_step_defaults_per_symbol():
+    """A $5 ladder aimed at QQQ's $1 strikes silently finds no flow — it reads
+    as 'no flow at the wall' rather than as a misconfiguration, which is the
+    same class of silent failure as the option_type mismatch."""
+    from research.wall_break_odds.cli import strike_step_for
+
+    assert strike_step_for("SPX") == 5.0
+    assert strike_step_for("ndx") == 5.0
+    assert strike_step_for("QQQ") == 1.0
+    assert strike_step_for("SPY") == 1.0
+
+
+def test_pooled_meta_flags_conflicting_label_settings():
+    """Datasets built with different thresholds must not be silently pooled —
+    a 'break' means something different in each."""
+    from research.wall_break_odds.cli import _merge_meta
+
+    a = {
+        "symbol": "SPX",
+        "start": "2026-01-01",
+        "end": "2026-02-01",
+        "events_total": 10,
+        "config": {"confirm_minutes": 10},
+    }
+    b = {
+        "symbol": "QQQ",
+        "start": "2026-01-15",
+        "end": "2026-03-01",
+        "events_total": 20,
+        "config": {"confirm_minutes": 20},
+    }
+    merged = _merge_meta([a, b], [])
+    assert merged["config_conflict"] is True
+    assert merged["events_total"] == 30
+    assert merged["start"] == "2026-01-01" and merged["end"] == "2026-03-01"
+    same = _merge_meta([a, {**b, "config": {"confirm_minutes": 10}}], [])
+    assert "config_conflict" not in same

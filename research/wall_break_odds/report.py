@@ -46,6 +46,11 @@ def _sample_block(meta: Mapping[str, Any]) -> list[str]:
     lines = ["SAMPLE", _THIN]
     lines.append(f"  symbol                {meta.get('symbol')}")
     lines.append(f"  window                {meta.get('start')} .. {meta.get('end')}")
+    if meta.get("config_conflict"):
+        lines.append(
+            "  ** pooled datasets were built with DIFFERENT label settings;"
+            " the outcomes are not comparable"
+        )
     lines.append(f"  sessions with frames  {meta.get('sessions_seen', 0)}")
     lines.append(f"  sessions contributing {meta.get('sessions_used', 0)}")
     skipped = meta.get("skipped") or {}
@@ -143,6 +148,50 @@ def _survival_block(
             f"    {str(mark) + ' min':<10}{point.break_prob * 100:>11.1f}%{ci:>22}"
             f"{point.at_risk:>10}"
         )
+    return lines
+
+
+def _pooling_block(pooling: Mapping[str, Any]) -> list[str]:
+    """Per-symbol curves and whether combining them is defensible.
+
+    Pooling symbols to reach the model's event floor is only honest if they
+    behave like one process; otherwise the extra events buy an average that
+    describes neither. This asks rather than assumes.
+    """
+    from research.wall_break_odds.survival import break_probability_at
+
+    lines = [
+        "POOLING CHECK  (do these symbols behave like one process?)",
+        _THIN,
+        "  Combining symbols to clear the model's event floor is only",
+        "  legitimate if their hazards agree. If they do not, report them",
+        "  separately — more events would buy a worse answer, not a better one.",
+        "",
+        f"    {'symbol':<16}{'n':>6}{'breaks':>8}{'P(30m)':>10}{'P(60m)':>10}",
+    ]
+    for sym, entry in sorted((pooling.get("curves") or {}).items()):
+        curve, n_obs, n_breaks = entry
+        p30 = break_probability_at(curve, 30)
+        p60 = break_probability_at(curve, 60)
+        lines.append(
+            f"    {sym:<16}{n_obs:>6}{n_breaks:>8}"
+            f"{(_pct(p30.break_prob, 1) if p30 else 'n/a'):>10}"
+            f"{(_pct(p60.break_prob, 1) if p60 else 'n/a'):>10}"
+        )
+    test = pooling.get("logrank")
+    pair = pooling.get("pair")
+    lines.append("")
+    if test is None:
+        lines.append("  log-rank: not computable — too few events, or more than two symbols")
+        return lines
+    verdict = (
+        "these are NOT one process — report them separately"
+        if test.p_value < 0.05
+        else "no evidence they differ — pooling is defensible"
+    )
+    label = f"{pair[0]} vs {pair[1]}" if pair else "symbols"
+    lines.append(f"  log-rank ({label}): chi2={test.chi2:.2f}  p={test.p_value:.4f}")
+    lines.append(f"    -> {verdict}")
     return lines
 
 
@@ -350,6 +399,7 @@ def render_report(
     fit: Optional[Mapping[str, Any]] = None,
     survival: Optional[tuple] = None,
     halves: Optional[Mapping[str, Any]] = None,
+    pooling: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """The full text report."""
     lines = [
@@ -371,6 +421,8 @@ def render_report(
                 (meta.get("config") or {}).get("confirm_minutes"),
             ),
         ]
+    if pooling:
+        lines += ["", *_pooling_block(pooling)]
     if halves:
         lines += ["", *_censoring_block(halves)]
     lines += ["", "BASE RATES  (single horizon — read the curve above first)", _THIN]

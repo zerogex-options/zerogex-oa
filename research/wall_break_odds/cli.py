@@ -30,6 +30,21 @@ from research.wall_break_odds.report import render_report
 # start is not much of a plumbing check.
 
 
+#: Ladder step per symbol. Mirrors ``src/jobs/forecast_writer._strike_step_for``
+#: -- SPX/NDX/RUT quote $5 strikes at scale, everything else $1. Kept as a
+#: local rule rather than an import because build-dataset is the only caller
+#: and pulling a job module into research to read one line is a worse trade;
+#: if the production rule changes, this comment is the pointer to change with
+#: it. Getting it wrong silently mis-aims the flow neighbourhood at strikes
+#: that do not exist, which reads as "no flow" rather than as an error.
+_STRIKE_STEP = {"SPX": 5.0, "NDX": 5.0, "RUT": 5.0}
+_DEFAULT_STRIKE_STEP = 1.0
+
+
+def strike_step_for(symbol: str) -> float:
+    return _STRIKE_STEP.get(symbol.upper(), _DEFAULT_STRIKE_STEP)
+
+
 def _iso(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -55,6 +70,8 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
     from research.wall_break_odds.sources import DatabaseUnavailable, research_connection
 
     cfg = _config_from_args(args)
+    strike_step = args.strike_step if args.strike_step is not None else strike_step_for(args.symbol)
+    print(f"strike ladder step for {args.symbol}: {strike_step}", file=sys.stderr)
     records: list[dict[str, Any]] = []
     seen = used = censored = 0
     skipped: dict[str, int] = {}
@@ -81,7 +98,7 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
                 args.start,
                 args.end,
                 cfg,
-                strike_step=args.strike_step,
+                strike_step=strike_step,
                 with_flow=not args.no_flow,
                 progress=progress,
             ):
@@ -192,16 +209,90 @@ def _in_half(record: dict[str, Any], morning: bool) -> bool:
     return minute < 12 * 60 + 45 if morning else minute >= 12 * 60 + 45
 
 
+def _merge_meta(
+    metas: Sequence[dict[str, Any]], records: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """One provenance block covering however many datasets were supplied."""
+    if len(metas) == 1:
+        return dict(metas[0])
+    if not metas:
+        return {"symbol": "?", "start": "?", "end": "?", "events_total": len(records)}
+    merged: dict[str, Any] = {
+        "symbol": " + ".join(str(m.get("symbol")) for m in metas),
+        "start": min(str(m.get("start")) for m in metas),
+        "end": max(str(m.get("end")) for m in metas),
+        # Config must AGREE across pooled datasets or the labels mean
+        # different things; disagreement is surfaced rather than averaged.
+        "config": metas[0].get("config", {}),
+    }
+    for key in (
+        "sessions_seen",
+        "sessions_used",
+        "events_total",
+        "events_censored",
+        "events_resolved",
+        "events_with_flow",
+        "flow_rows_fetched",
+        "flow_contracts_usable",
+    ):
+        vals = [m.get(key) for m in metas if isinstance(m.get(key), int)]
+        if vals:
+            merged[key] = sum(vals)
+    configs = [json.dumps(m.get("config", {}), sort_keys=True) for m in metas]
+    if len(set(configs)) > 1:
+        merged["config_conflict"] = True
+    return merged
+
+
+def _pooling_check(records: Sequence[dict[str, Any]], horizon: Optional[int]) -> Optional[dict]:
+    """Per-symbol curves plus a log-rank — is pooling these legitimate?
+
+    Pooling two symbols to clear the model's event floor is only honest if
+    they behave like one process. Two symbols with different hazards pooled
+    into one curve produce an average describing neither, and the extra events
+    buy a worse answer rather than a better one. The same log-rank that checks
+    the session halves answers this, so it is asked automatically rather than
+    assumed.
+    """
+    from research.wall_break_odds.survival import kaplan_meier, logrank
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        by_symbol.setdefault(str(r.get("symbol")), []).append(r)
+    if len(by_symbol) < 2:
+        return None
+    out: dict[str, Any] = {"curves": {}}
+    for sym, rows in sorted(by_symbol.items()):
+        obs = _observations(rows, horizon)
+        if len(obs) >= 30:
+            out["curves"][sym] = (
+                kaplan_meier(obs),
+                len(obs),
+                sum(1 for o in obs if o.broke),
+            )
+    syms = sorted(by_symbol)
+    if len(syms) == 2:
+        out["logrank"] = logrank(
+            _observations(by_symbol[syms[0]], horizon),
+            _observations(by_symbol[syms[1]], horizon),
+        )
+        out["pair"] = (syms[0], syms[1])
+    return out
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     from research.wall_break_odds.dataset import read_jsonl
 
-    records = read_jsonl(args.dataset)
-    meta: dict[str, Any] = {}
-    try:
-        with open(args.dataset + ".meta.json", "r", encoding="utf-8") as fh:
-            meta = json.load(fh)
-    except OSError:
-        meta = {"symbol": "?", "start": "?", "end": "?", "events_total": len(records)}
+    records: list[dict[str, Any]] = []
+    metas: list[dict[str, Any]] = []
+    for path in args.dataset:
+        records.extend(read_jsonl(path))
+        try:
+            with open(path + ".meta.json", "r", encoding="utf-8") as fh:
+                metas.append(json.load(fh))
+        except OSError:
+            pass
+    meta = _merge_meta(metas, records)
 
     for side in ([None] if not args.by_side else [None, "call", "put"]):
         rows = _rows_from_records(records, side)
@@ -266,6 +357,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             fit_full(rows),
             survival=(kaplan_meier(obs), len(obs), sum(1 for o in obs if o.broke)),
             halves=halves,
+            pooling=_pooling_check(subset, horizon) if side is None else None,
         )
         print(report)
         if args.out and side is None:
@@ -292,13 +384,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start", type=_iso, required=True, help="YYYY-MM-DD, ET session date")
     p.add_argument("--end", type=_iso, required=True)
     p.add_argument("--out", required=True, help="JSONL output path")
-    p.add_argument("--strike-step", type=float, default=5.0, help="strike ladder step")
+    p.add_argument(
+        "--strike-step",
+        type=float,
+        default=None,
+        help="strike ladder step; defaults per symbol ($5 SPX/NDX/RUT, $1 otherwise)",
+    )
     p.add_argument("--no-flow", action="store_true", help="skip the flow_by_contract reads")
     _add_event_args(p)
     p.set_defaults(func=cmd_build_dataset)
 
-    p = sub.add_parser("analyze", help="base rates, screen, walk-forward, from a saved dataset")
-    p.add_argument("dataset")
+    p = sub.add_parser("analyze", help="base rates, screen, walk-forward, from saved datasets")
+    p.add_argument(
+        "dataset",
+        nargs="+",
+        help="one or more JSONL datasets; several are pooled, and a pooling "
+        "check reports whether that is legitimate",
+    )
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--by-side", action="store_true", help="also report call and put separately")
     p.add_argument("--out", help="write the pooled report to this path as well")
