@@ -39,14 +39,18 @@ from research.wall_break_odds.report import render_report
 # start is not much of a plumbing check.
 
 
-#: Ladder step per symbol. Mirrors ``src/jobs/forecast_writer._strike_step_for``
-#: -- SPX/NDX/RUT quote $5 strikes at scale, everything else $1. Kept as a
-#: local rule rather than an import because build-dataset is the only caller
-#: and pulling a job module into research to read one line is a worse trade;
-#: if the production rule changes, this comment is the pointer to change with
-#: it. Getting it wrong silently mis-aims the flow neighbourhood at strikes
-#: that do not exist, which reads as "no flow" rather than as an error.
-_STRIKE_STEP = {"SPX": 5.0, "NDX": 5.0, "RUT": 5.0}
+#: Ladder step per symbol, used to aim the flow neighbourhood at the strikes
+#: either side of the wall. Getting it wrong silently points at strikes that
+#: do not exist, which reads as "no flow at the wall" rather than as an error.
+#:
+#: NDX is 25, verified against gex_by_strike: at ~28,000 index level the chain
+#: quotes 28025 / 28050 / 28075. ``src/jobs/forecast_writer._strike_step_for``
+#: assigns it 5, which is wrong but almost entirely masked there -- its only
+#: consumers are _pin_tolerance, where max(step x 0.5, spot x 0.0015) is
+#: dominated by the spot floor at that index level, and _round_to_strike's
+#: fallback, reached only when max_pain is absent. Worth fixing there, but it
+#: is not the same bug it would be here.
+_STRIKE_STEP = {"SPX": 5.0, "NDX": 25.0, "RUT": 5.0}
 _DEFAULT_STRIKE_STEP = 1.0
 
 

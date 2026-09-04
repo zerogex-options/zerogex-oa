@@ -191,6 +191,14 @@ def _consistency_block(cons: Mapping[str, Any]) -> list[str]:
             for sym in symbols
         )
         lines.append(f"    {row['feature']:<32}{cells}   {'yes' if row['consistent'] else ''}")
+    lines += [
+        "",
+        "  The chance count assumes the features are independent, and they are",
+        "  not — several measure the same underlying quantity, so they tend to",
+        "  agree together. That inflates the OBSERVED count relative to this",
+        "  expectation, which makes the test generous: a result at or below",
+        "  chance here is if anything an overstatement of what was found.",
+    ]
     return lines
 
 
