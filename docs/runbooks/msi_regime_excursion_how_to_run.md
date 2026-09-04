@@ -122,6 +122,18 @@ No database. A six-instrument, five-horizon run takes a few minutes.
 | `--iterations` | `2000` | block-bootstrap resamples; lower while iterating, not for a final run |
 | `--min-bucket` | `30` | skip buckets with fewer usable rows |
 | `--horizons` | all in the dataset | focus one horizon |
+| `--no-digest` | off | suppress the one-screen summary printed at the end |
+
+The full markdown report is thousands of rows — the right level of detail to audit a
+finding, the wrong level to read one. `analyze` therefore finishes by printing a
+**digest**: sample sizes, the headline correlation per horizon, every band against the
+base rate, the alternative constructions, and the point targets. That is the part to
+read first and the part to paste into an email. Re-print it any time without re-running
+the analysis:
+
+```bash
+python -m research.msi_regime_excursion.cli digest research_output/msi_excursion_findings.json
+```
 
 ## 4. Reading the output
 
