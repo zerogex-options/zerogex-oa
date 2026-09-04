@@ -306,27 +306,35 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     else:
         print(markdown)
 
+    payload = {
+        "meta": {k: v for k, v in meta.items() if not k.startswith("_")},
+        "instruments": [
+            {
+                "instrument": r.instrument, "n_rows": r.n_rows,
+                "n_sessions": r.n_sessions,
+                "band_counts": r.band_counts,
+                "reconstruction_ok": r.reconstruction_ok,
+                "reconstruction_total": r.reconstruction_total,
+                "notes": r.notes,
+                "correlations": [c.as_dict() for c in r.correlations],
+                "buckets": [b.as_dict() for b in r.buckets],
+                "targets": [t.as_dict() for t in r.targets],
+            }
+            for r in results
+        ],
+    }
     if args.json_out:
-        payload = {
-            "meta": {k: v for k, v in meta.items() if not k.startswith("_")},
-            "instruments": [
-                {
-                    "instrument": r.instrument, "n_rows": r.n_rows,
-                    "n_sessions": r.n_sessions,
-                    "band_counts": r.band_counts,
-                    "reconstruction_ok": r.reconstruction_ok,
-                    "reconstruction_total": r.reconstruction_total,
-                    "notes": r.notes,
-                    "correlations": [c.as_dict() for c in r.correlations],
-                    "buckets": [b.as_dict() for b in r.buckets],
-                    "targets": [t.as_dict() for t in r.targets],
-                }
-                for r in results
-            ],
-        }
         with open(args.json_out, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, default=str)
         print(f"wrote {args.json_out}", file=sys.stderr)
+
+    # The full report is thousands of rows. Always finish with the digest, so a
+    # run ends with the part that answers the question rather than the part
+    # that audits it.
+    if not args.no_digest:
+        from research.msi_regime_excursion.digest import render_digest
+        print()
+        print(render_digest(payload))
     return 0
 
 
@@ -366,7 +374,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip a bucket with fewer usable rows than this")
     p.add_argument("--out", default="", help="write markdown here (default stdout)")
     p.add_argument("--json-out", default="", help="also write the raw findings as JSON")
+    p.add_argument("--no-digest", action="store_true",
+                   help="suppress the one-screen summary printed at the end")
     p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("digest", help="one-screen summary of a findings JSON")
+    p.add_argument("findings", help="the file written by `analyze --json-out`")
+    p.set_defaults(func=lambda a: __import__(
+        "research.msi_regime_excursion.digest", fromlist=["main"]).main(a.findings))
 
     p = sub.add_parser("selftest", help="synthetic worlds; validates the machinery")
     p.set_defaults(func=lambda a: __import__(

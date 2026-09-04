@@ -59,11 +59,15 @@ python -m research.msi_regime_excursion.cli extract \
     --start 2026-06-01 --end 2026-09-01 \
     --out research_output/msi_excursion.jsonl
 
-# 3. Report. No database.
+# 3. Report. No database. Ends by printing a one-screen digest.
 python -m research.msi_regime_excursion.cli analyze \
     research_output/msi_excursion.jsonl \
     --out research_output/msi_excursion_report.md \
     --json-out research_output/msi_excursion_findings.json
+
+# 3b. Re-print that digest later without re-running the analysis.
+python -m research.msi_regime_excursion.cli digest \
+    research_output/msi_excursion_findings.json
 ```
 
 Run from the repository root (`pythonpath = ["."]` in `pyproject.toml` makes
@@ -126,7 +130,8 @@ over-confident**.
 | `report.py` | verdict logic + markdown |
 | `structural.py` | the data-free flow-direction sweep against the real engine |
 | `selftest.py` | synthetic worlds with known answers; validates the machinery |
-| `cli.py` | `describe` / `extract` / `analyze` / `selftest` / `structural` |
+| `digest.py` | the one-screen summary `analyze` ends with |
+| `cli.py` | `describe` / `extract` / `analyze` / `digest` / `selftest` / `structural` |
 
 ## The one idea worth knowing
 
