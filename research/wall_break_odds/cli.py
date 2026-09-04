@@ -278,12 +278,27 @@ def _pooling_check(records: Sequence[dict[str, Any]], horizon: Optional[int]) ->
                 sum(1 for o in obs if o.broke),
             )
     syms = sorted(by_symbol)
+    obs_by_symbol = {sym: _observations(by_symbol[sym], horizon) for sym in syms}
+    # Every pair, because with four symbols the PAIRS are the analysis. SPY
+    # against SPX holds the underlying index fixed and varies only the option
+    # market, which is what separates "the Nasdaq breaks more" from "finer
+    # strike ladders break more" -- two explanations that are perfectly
+    # confounded while only SPX and QQQ are in the sample.
+    pairs: dict[tuple[str, str], Any] = {}
+    for i, a in enumerate(syms):
+        for b in syms[i + 1 :]:
+            pairs[(a, b)] = logrank(obs_by_symbol[a], obs_by_symbol[b])
+    out["pairs"] = pairs
+    out["symbols"] = syms
     if len(syms) == 2:
-        out["logrank"] = logrank(
-            _observations(by_symbol[syms[0]], horizon),
-            _observations(by_symbol[syms[1]], horizon),
-        )
+        out["logrank"] = pairs[(syms[0], syms[1])]
         out["pair"] = (syms[0], syms[1])
+    else:
+        # One rejecting pair invalidates the whole pool, so "can these be
+        # pooled?" is answered by whether ANY pair differs.
+        rejects = [t for t in pairs.values() if t is not None and t.p_value < 0.05]
+        out["logrank"] = rejects[0] if rejects else None
+        out["any_pair_differs"] = bool(rejects)
     return out
 
 
@@ -293,12 +308,22 @@ def _replication(records: Sequence[dict[str, Any]]) -> Optional[dict[str, Any]]:
     by_symbol: dict[str, list[dict[str, Any]]] = {}
     for r in records:
         by_symbol.setdefault(str(r.get("symbol")), []).append(r)
-    if len(by_symbol) != 2:
+    if len(by_symbol) < 2:
         return None
     screens = {
         sym: univariate_screen(_rows_from_records(rows, None)) for sym, rows in by_symbol.items()
     }
-    return replication(screens)
+    syms = sorted(screens)
+    if len(syms) == 2:
+        return replication(screens)
+    # More than two: the pairwise matrix is the answer. A feature set that is
+    # real should replicate across every pair, and most informatively across
+    # a pair sharing an underlying index.
+    matrix: dict[tuple[str, str], Any] = {}
+    for i, a in enumerate(syms):
+        for b in syms[i + 1 :]:
+            matrix[(a, b)] = replication({a: screens[a], b: screens[b]})
+    return {"matrix": matrix, "symbols": syms}
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:

@@ -799,3 +799,54 @@ def test_anticorrelated_screens_are_not_called_agreement():
     text = "\n".join(_replication_block(rep))
     assert "NO replication" in text
     assert "some agreement" not in text
+
+
+def test_pooling_matrix_rejects_when_any_pair_differs():
+    """One rejecting pair invalidates the whole pool — pooling four symbols
+    is only legitimate if every pair agrees, not the average of them."""
+    from research.wall_break_odds.report import _pooling_block, _pooling_rejected
+    from research.wall_break_odds.survival import LogRank
+
+    ok = LogRank(30, 31.0, 0.1, 0.75, 100, 100)
+    bad = LogRank(30, 45.0, 12.0, 0.0005, 100, 100)
+    pooling = {
+        "curves": {s: ([], 100, 30) for s in ("SPX", "SPY", "QQQ", "NDX")},
+        "pairs": {("NDX", "SPX"): ok, ("QQQ", "SPY"): ok, ("SPX", "SPY"): bad},
+        "symbols": ["NDX", "QQQ", "SPX", "SPY"],
+        "logrank": bad,
+        "any_pair_differs": True,
+    }
+    assert _pooling_rejected(pooling) is True
+    text = "\n".join(_pooling_block(pooling))
+    assert "DIFFER" in text
+    assert "cannot all be pooled" in text
+
+    clean = {**pooling, "pairs": {("NDX", "SPX"): ok}, "logrank": None, "any_pair_differs": False}
+    assert _pooling_rejected(clean) is False
+
+
+def test_replication_matrix_renders_every_pair():
+    from research.wall_break_odds.report import _replication_block
+
+    rep = {
+        "symbols": ["NDX", "QQQ", "SPX", "SPY"],
+        "matrix": {
+            ("SPX", "SPY"): {
+                "symbols": ["SPX", "SPY"],
+                "n_features": 12,
+                "spearman": 0.75,
+                "sign_agreement": 0.83,
+                "rows": [],
+            },
+            ("QQQ", "SPX"): {
+                "symbols": ["QQQ", "SPX"],
+                "n_features": 12,
+                "spearman": -0.02,
+                "sign_agreement": 0.50,
+                "rows": [],
+            },
+        },
+    }
+    text = "\n".join(_replication_block(rep))
+    assert "SPX vs SPY" in text and "replicates" in text
+    assert "QQQ vs SPX" in text and "NO replication" in text

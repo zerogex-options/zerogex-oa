@@ -233,6 +233,39 @@ to close, test ordinal — whose relationship to the resolution window is
 structural and would agree in any two samples. The report says so, so that
 agreement is not read as signal.
 
+## 3d. Why all four index products, not two
+
+The first pass used SPX and QQQ, on the reasoning that SPY duplicates SPX's
+underlying exposure and so adds no independent information. That reasoning is
+correct **for pooling** and wrong as a reason to leave them out, because the
+value of SPY and NDX is as CONTROLS.
+
+SPX and QQQ differ in two ways at once: the underlying index, and the strike
+ladder ($5 vs $1). Finer strikes spread open interest across more strikes, so
+any one "wall" is a smaller share of the book — a mechanical reason QQQ walls
+might break more that has nothing to do with the Nasdaq. With only those two
+symbols the explanations are perfectly confounded.
+
+The four products form a 2x2:
+
+| | $1 strikes | $5 strikes |
+|---|---|---|
+| S&P | SPY | SPX |
+| Nasdaq | QQQ | NDX |
+
+* **SPY ≈ SPX, QQQ ≈ NDX, and the rows differ** → it is the index.
+* **SPY ≈ QQQ, SPX ≈ NDX, and the columns differ** → it is the strike ladder,
+  and "QQQ walls break more" is a statement about option-market structure
+  rather than about the Nasdaq.
+
+SPY against SPX is also the fairest replication test available: it holds the
+underlying index fixed and varies only the option market, so a feature that
+cannot agree across that pair is not measuring anything about walls.
+
+`_pooling_check` and `_replication` therefore compute every pair. One
+rejecting pair invalidates the whole pool, so the pooled analysis is withheld
+unless every pair agrees.
+
 ## 4. Evaluation
 
 Implemented in `research/wall_break_odds/model.py`, reusing the statistical

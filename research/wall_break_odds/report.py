@@ -151,6 +151,43 @@ def _survival_block(
     return lines
 
 
+def _replication_matrix(rep: Mapping[str, Any]) -> list[str]:
+    """Pairwise replication across more than two symbols.
+
+    The pair sharing an underlying index is the one to read: it holds the
+    index fixed and varies only the option market, so agreement there is the
+    fairest test a feature can be given.
+    """
+    lines = [
+        "REPLICATION  (do the samples agree about which features matter?)",
+        _THIN,
+        "  Each pair asks whether two independent samples tell the same story.",
+        "  Rank correlation near zero with sign agreement near 50% means the",
+        "  deltas are noise, however large they look in either sample alone.",
+        "",
+        f"    {'pair':<18}{'features':>10}{'Spearman':>11}{'sign agree':>12}   verdict",
+    ]
+    for (a, b), rep_pair in sorted((rep.get("matrix") or {}).items()):
+        label = f"{a} vs {b}"
+        if not rep_pair:
+            lines.append(f"    {label:<18}{'—':>10}{'—':>11}{'—':>12}   too few features")
+            continue
+        sp = rep_pair.get("spearman")
+        ag = rep_pair.get("sign_agreement")
+        replicates = sp is not None and ag is not None and sp >= 0.3 and ag >= 0.65
+        lines.append(
+            f"    {label:<18}{rep_pair.get('n_features'):>10}{sp:>+11.3f}"
+            f"{ag:>11.0%}   {'replicates' if replicates else 'NO replication'}"
+        )
+    lines += [
+        "",
+        "  Caveat: mechanical features (time of day, minutes to close, test",
+        "  ordinal) agree in ANY two samples because their link to the",
+        "  resolution window is structural, not about markets.",
+    ]
+    return lines
+
+
 def _replication_block(rep: Mapping[str, Any]) -> list[str]:
     """Do the two samples agree about which features matter?
 
@@ -159,6 +196,8 @@ def _replication_block(rep: Mapping[str, Any]) -> list[str]:
     never seen. When pooling is rejected this is what remains, and it is more
     informative than either screen on its own.
     """
+    if rep.get("matrix") is not None:
+        return _replication_matrix(rep)
     a, b = rep["symbols"]
     spearman = rep.get("spearman")
     agreement = rep.get("sign_agreement")
@@ -260,11 +299,31 @@ def _pooling_block(pooling: Mapping[str, Any]) -> list[str]:
             f"{(_pct(p30.break_prob, 1) if p30 else 'n/a'):>10}"
             f"{(_pct(p60.break_prob, 1) if p60 else 'n/a'):>10}"
         )
+    pairs = pooling.get("pairs") or {}
+    lines.append("")
+    if len(pairs) > 1:
+        # With more than two symbols the PAIRS are the analysis: a pair
+        # sharing an underlying index isolates option-market structure from
+        # the index itself.
+        lines.append(f"    {'pair':<18}{'chi2':>8}{'p':>10}   verdict")
+        for (a, b), test in sorted(pairs.items()):
+            if test is None:
+                lines.append(f"    {a + ' vs ' + b:<18}{'—':>8}{'—':>10}   too few events")
+                continue
+            verdict = "DIFFER" if test.p_value < 0.05 else "no evidence of a difference"
+            lines.append(
+                f"    {a + ' vs ' + b:<18}{test.chi2:>8.2f}{test.p_value:>10.4f}   {verdict}"
+            )
+        lines.append("")
+        if pooling.get("any_pair_differs"):
+            lines.append("    -> at least one pair differs; these cannot all be pooled")
+        else:
+            lines.append("    -> no pair differs; pooling is defensible")
+        return lines
     test = pooling.get("logrank")
     pair = pooling.get("pair")
-    lines.append("")
     if test is None:
-        lines.append("  log-rank: not computable — too few events, or more than two symbols")
+        lines.append("  log-rank: not computable — too few events")
         return lines
     verdict = (
         "these are NOT one process — report them separately"
