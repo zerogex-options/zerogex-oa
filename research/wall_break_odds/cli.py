@@ -177,6 +177,21 @@ def _observations(records: Sequence[dict[str, Any]], horizon: Optional[int]) -> 
     return out
 
 
+def _in_half(record: dict[str, Any], morning: bool) -> bool:
+    """Is this test in the first or second half of the cash session?
+
+    Split at 12:45 ET, the midpoint of 09:30-16:00. Used only for the
+    censoring check — censoring falls entirely on late-day tests, so the two
+    halves are exactly the comparison that probes the assumption.
+    """
+    try:
+        ts = datetime.fromisoformat(str(record.get("tested_at"))).astimezone(ET)
+    except (TypeError, ValueError):
+        return False
+    minute = ts.hour * 60 + ts.minute
+    return minute < 12 * 60 + 45 if morning else minute >= 12 * 60 + 45
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     from research.wall_break_odds.dataset import read_jsonl
 
@@ -221,6 +236,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         subset = [r for r in records if not side or r.get("side") == side]
         horizon = (meta.get("config") or {}).get("resolution_minutes")
         obs = _observations(subset, horizon)
+        halves: dict[str, Any] = {}
+        for name, is_morning in (("morning", True), ("afternoon", False)):
+            part_obs = _observations([r for r in subset if _in_half(r, is_morning)], horizon)
+            if len(part_obs) >= 30:
+                halves[name] = (
+                    kaplan_meier(part_obs),
+                    len(part_obs),
+                    sum(1 for o in part_obs if o.broke),
+                )
         report = render_report(
             side_meta,
             base_rate(rows),
@@ -228,6 +252,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             evaluate(rows, n_folds=args.folds),
             fit_full(rows),
             survival=(kaplan_meier(obs), len(obs), sum(1 for o in obs if o.broke)),
+            halves=halves,
         )
         print(report)
         if args.out and side is None:
