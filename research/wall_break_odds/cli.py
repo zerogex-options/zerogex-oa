@@ -20,7 +20,14 @@ from research.wall_break_odds.events import ET
 from typing import Any, Optional, Sequence
 
 from research.wall_break_odds.events import EventConfig
-from research.wall_break_odds.model import Row, base_rate, evaluate, fit_full, univariate_screen
+from research.wall_break_odds.model import (
+    Row,
+    base_rate,
+    evaluate,
+    fit_full,
+    replication,
+    univariate_screen,
+)
 from research.wall_break_odds.report import render_report
 
 # NOTE: research.wall_break_odds.dataset (and through it sources, and through
@@ -280,6 +287,20 @@ def _pooling_check(records: Sequence[dict[str, Any]], horizon: Optional[int]) ->
     return out
 
 
+def _replication(records: Sequence[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Screen each symbol separately and compare — the question that survives
+    a rejected pooling check."""
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        by_symbol.setdefault(str(r.get("symbol")), []).append(r)
+    if len(by_symbol) != 2:
+        return None
+    screens = {
+        sym: univariate_screen(_rows_from_records(rows, None)) for sym, rows in by_symbol.items()
+    }
+    return replication(screens)
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     from research.wall_break_odds.dataset import read_jsonl
 
@@ -326,6 +347,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
         subset = [r for r in records if not side or r.get("side") == side]
         horizon = (meta.get("config") or {}).get("resolution_minutes")
+        pooling = _pooling_check(subset, horizon) if side is None else None
         obs = _observations(subset, horizon)
         halves: dict[str, Any] = {}
         split = {m: [r for r in subset if _in_half(r, m)] for m in (True, False)}
@@ -357,7 +379,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             fit_full(rows),
             survival=(kaplan_meier(obs), len(obs), sum(1 for o in obs if o.broke)),
             halves=halves,
-            pooling=_pooling_check(subset, horizon) if side is None else None,
+            pooling=pooling,
+            replication=_replication(records) if side is None and pooling else None,
         )
         print(report)
         if args.out and side is None:

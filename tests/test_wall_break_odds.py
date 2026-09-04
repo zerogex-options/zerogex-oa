@@ -761,3 +761,41 @@ def test_model_names_the_feature_costing_the_most_complete_cases():
     assert out["n_resolved"] == 260 and out["n"] < 200
     assert out["bottleneck"], "the limiting feature must be named"
     assert out["bottleneck"][0]["feature"] == "sparse"
+
+
+def _screen_of(deltas):
+    return [{"feature": k, "delta": v, "reportable": True, "n": 100} for k, v in deltas.items()]
+
+
+def test_replication_detects_agreement_and_its_absence():
+    from research.wall_break_odds.model import replication
+
+    feats = [f"f{i}" for i in range(8)]
+    same = {f: (i - 4) / 10.0 for i, f in enumerate(feats)}
+    rep = replication({"SPX": _screen_of(same), "QQQ": _screen_of(same)})
+    assert rep["spearman"] == pytest.approx(1.0)
+    assert rep["sign_agreement"] == pytest.approx(1.0)
+
+    flipped = {f: -v for f, v in same.items()}
+    rep = replication({"SPX": _screen_of(same), "QQQ": _screen_of(flipped)})
+    assert rep["spearman"] == pytest.approx(-1.0)
+    assert rep["sign_agreement"] == pytest.approx(0.0)
+
+
+def test_anticorrelated_screens_are_not_called_agreement():
+    """Testing |r| would score two samples that systematically DISAGREE as
+    replication — the exact opposite of the finding."""
+    from research.wall_break_odds.report import _replication_block
+
+    feats = [f"f{i}" for i in range(8)]
+    rep = {
+        "symbols": ["SPX", "QQQ"],
+        "n_features": 8,
+        "spearman": -0.9,
+        "sign_agreement": 0.1,
+        "n_signed": 8,
+        "rows": [{"feature": f, "SPX": 0.1, "QQQ": -0.1} for f in feats],
+    }
+    text = "\n".join(_replication_block(rep))
+    assert "NO replication" in text
+    assert "some agreement" not in text

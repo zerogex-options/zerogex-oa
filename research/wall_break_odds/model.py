@@ -28,7 +28,7 @@ import bisect
 import math
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from research.mm_attributed_gex.stats import (
     auc,
@@ -50,6 +50,7 @@ __all__ = [
     "session_walk_forward",
     "evaluate",
     "fit_full",
+    "replication",
 ]
 
 #: Below this many resolved events, no coefficient is reported at all. Twenty
@@ -526,3 +527,69 @@ def fit_full(
     d["standardised"] = True
     d["note"] = "in-sample; coefficient DIRECTION only, never a performance claim"
     return d
+
+
+def replication(screens: Mapping[str, Sequence[Mapping[str, Any]]]) -> Optional[dict[str, Any]]:
+    """Do two independent samples agree about which features matter?
+
+    When the pooling check rejects, the screens cannot be combined — but the
+    two samples can still be asked whether they tell the same story, and that
+    question is more informative than either screen alone.
+
+    A significance test asks "could this delta be noise?". Replication asks
+    the harder version: "does it show up again, in data it has never seen?".
+    Nineteen features screened twice give nineteen chances to agree; if the
+    rank correlation is ~0 and signs agree at ~50%, the deltas are noise
+    regardless of how large the biggest ones look.
+
+    Note that mechanical features (time of day, minutes to close, test
+    ordinal) will tend to agree in ANY two samples, because their relationship
+    to the resolution window is structural rather than about markets. Agreement
+    concentrated there is not evidence of a finding.
+    """
+    names = [k for k in screens]
+    if len(names) != 2:
+        return None
+    a_map = {
+        s["feature"]: s["delta"]
+        for s in screens[names[0]]
+        if s.get("reportable") and s.get("delta") is not None
+    }
+    b_map = {
+        s["feature"]: s["delta"]
+        for s in screens[names[1]]
+        if s.get("reportable") and s.get("delta") is not None
+    }
+    shared = sorted(set(a_map) & set(b_map))
+    if len(shared) < 5:
+        return None
+    a = [a_map[f] for f in shared]
+    b = [b_map[f] for f in shared]
+
+    def _rank(v: Sequence[float]) -> list[float]:
+        order = sorted(range(len(v)), key=lambda i: v[i])
+        out = [0.0] * len(v)
+        for pos, i in enumerate(order):
+            out[i] = pos + 1.0
+        return out
+
+    def _pearson(x: Sequence[float], y: Sequence[float]) -> float:
+        mx, my = sum(x) / len(x), sum(y) / len(y)
+        num = sum((p - mx) * (q - my) for p, q in zip(x, y))
+        den = (sum((p - mx) ** 2 for p in x) * sum((q - my) ** 2 for q in y)) ** 0.5
+        return num / den if den else 0.0
+
+    nonzero = [(x, y) for x, y in zip(a, b) if x * y != 0]
+    agree = sum(1 for x, y in nonzero if x * y > 0)
+    return {
+        "symbols": names,
+        "n_features": len(shared),
+        "spearman": _pearson(_rank(a), _rank(b)),
+        "pearson": _pearson(a, b),
+        "sign_agreement": (agree / len(nonzero)) if nonzero else None,
+        "n_signed": len(nonzero),
+        "rows": sorted(
+            ({"feature": f, names[0]: a_map[f], names[1]: b_map[f]} for f in shared),
+            key=lambda r: -abs(r[names[0]]),
+        ),
+    }

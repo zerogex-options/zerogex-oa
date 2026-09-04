@@ -151,6 +151,57 @@ def _survival_block(
     return lines
 
 
+def _replication_block(rep: Mapping[str, Any]) -> list[str]:
+    """Do the two samples agree about which features matter?
+
+    This is the stronger question. A significance test asks whether one delta
+    could be noise; replication asks whether it shows up again in data it has
+    never seen. When pooling is rejected this is what remains, and it is more
+    informative than either screen on its own.
+    """
+    a, b = rep["symbols"]
+    spearman = rep.get("spearman")
+    agreement = rep.get("sign_agreement")
+    lines = [
+        "REPLICATION  (do the two samples agree about which features matter?)",
+        _THIN,
+        "  The screens cannot be pooled, but they can be asked whether they",
+        "  tell the same story. Rank correlation near zero and sign agreement",
+        "  near 50% means the deltas are noise — however large the biggest",
+        "  ones look in either sample alone.",
+        "",
+        f"  features compared   {rep.get('n_features')}",
+    ]
+    if spearman is not None:
+        lines.append(f"  Spearman r          {spearman:+.3f}")
+    if agreement is not None:
+        lines.append(f"  sign agreement      {agreement:.0%}   (chance = 50%)")
+    lines.append("")
+    if agreement is not None and spearman is not None:
+        # Replication requires BOTH a positive rank correlation and sign
+        # agreement above chance. Testing |r| would score a strongly
+        # ANTI-correlated pair — the two samples disagreeing systematically —
+        # as agreement, which is the opposite of the finding.
+        if spearman >= 0.3 and agreement >= 0.65:
+            lines.append("    -> some agreement; the features below are worth a closer look.")
+        else:
+            lines.append("    -> NO replication. Treat every delta below as noise.")
+        lines.append("")
+    lines.append(f"    {'feature':<32}{a:>9}{b:>9}   agree")
+    for row in rep.get("rows", []):
+        va, vb = row[a], row[b]
+        mark = "yes" if va * vb > 0 else ("--" if va * vb == 0 else "NO")
+        lines.append(f"    {row['feature']:<32}{va * 100:>+9.0f}{vb * 100:>+9.0f}   {mark}")
+    lines += [
+        "",
+        "  Caveat: mechanical features (time of day, minutes to close, test",
+        "  ordinal) agree in ANY two samples because their link to the",
+        "  resolution window is structural. Agreement concentrated there is",
+        "  not evidence of a finding about walls.",
+    ]
+    return lines
+
+
 def _pooling_rejected(pooling: Optional[Mapping[str, Any]]) -> bool:
     """Did the symbols fail the same-process test?"""
     if not pooling:
@@ -446,6 +497,7 @@ def render_report(
     survival: Optional[tuple] = None,
     halves: Optional[Mapping[str, Any]] = None,
     pooling: Optional[Mapping[str, Any]] = None,
+    replication: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """The full text report."""
     lines = [
@@ -469,7 +521,10 @@ def render_report(
     if pooling:
         lines += ["", *_pooling_block(pooling)]
     if rejected:
-        lines += ["", *_suppressed_block(pooling), "", _LIMITS, ""]
+        lines += ["", *_suppressed_block(pooling)]
+        if replication:
+            lines += ["", *_replication_block(replication)]
+        lines += ["", _LIMITS, ""]
         return "\n".join(lines)
     if survival is not None:
         lines += [

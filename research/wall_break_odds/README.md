@@ -70,6 +70,39 @@ which is the confound, not a finding.
 Break rates are per-symbol. A number from one product does not carry to
 another.
 
+### The features do not replicate
+
+QQQ is a second, independent sample, so every candidate can be asked the
+harder question: does it show up again in data it has never seen?
+
+**Spearman r = −0.01 between the two screens' effect sizes. Sign agreement
+9/18 = 50%, exactly chance.**
+
+The largest SPX effects are precisely the ones that fail:
+
+| feature | SPX | QQQ | agrees |
+|---|---|---|---|
+| `net_gex_log_signed` | −30 | −9 | yes, much weaker |
+| `flip_distance` | −22 | **+5** | no |
+| `spot_above_flip` | −20 | **+3** | no |
+| `wall_strength_trend` | +19 | **−9** | no |
+| `flow_toward_break` | −16 | **+1** | no |
+| `convexity_risk_log` | −18 | −19 | yes |
+
+So the "regime around the wall" story — net GEX, distance to the flip — is
+**not supported**. It looked like the strongest thing in the SPX screen and it
+did not survive contact with a second symbol.
+
+`convexity_risk_log` is the one substantive feature agreeing closely across
+both. With 19 features and 50% overall agreement, one close match is what
+chance produces; it is a candidate to watch, not a finding.
+
+The features that do agree are mostly mechanical — time of day, minutes to
+close, test ordinal. Their link to the resolution window is structural and
+would agree in any two samples.
+
+`analyze` computes this automatically whenever two symbols are supplied.
+
 ### What has NOT been established
 
 * **No feature is FDR-significant.** Nineteen screened, session-clustered
