@@ -380,14 +380,23 @@ def test_flow_direction_alone_moves_the_regime_band():
     Gamma structure is held fixed across the sweep, so every magnitude-axis
     input -- net GEX, VIX, local gamma, the flip, the max-gamma strike -- is
     identical in every row. Only the direction of options flow varies. If the
-    MSI were "deliberately directionless" as the frontend states, the band
+    MSI were "deliberately directionless" as the frontend states, the score
     could not move at all.
 
-    If this test ever fails because the span shrank, that is good news and the
-    thresholds should be tightened, not deleted.
+    The sweep runs at the MEASURED dealer-delta scale (``cli dni``), not the
+    range the formula permits, so these are numbers the shipped system can
+    actually reach. At that scale the ``free`` structure saturates near the top
+    of the range and stops crossing boundaries -- which is itself worth pinning,
+    because an earlier version of this test asserted every structure crossed a
+    band and only did so because the sweep was driving dealer delta ~9x beyond
+    anything production produces.
+
+    If this fails because the spans shrank, that is good news and the thresholds
+    should be tightened, not deleted.
     """
     from research.msi_regime_excursion.structural import STRUCTURES, run_sweep, summarize
 
+    summaries = {}
     for name in STRUCTURES:
         rows = run_sweep(structure=name, steps=9)
         components = [r.components for r in rows]
@@ -397,13 +406,20 @@ def test_flow_direction_alone_moves_the_regime_band():
             values = {round(c[key], 6) for c in components}
             assert len(values) == 1, f"{key} varied across the {name} sweep: {values}"
 
-        summary = summarize(name, rows)
-        assert summary["msi_span"] > 25.0, (
+        summaries[name] = summarize(name, rows)
+
+    # Direction alone moves the score materially under every structure.
+    for name, summary in summaries.items():
+        assert summary["msi_span"] > 15.0, (
             f"{name}: flow direction moved the MSI only {summary['msi_span']:.1f} points"
         )
-        assert summary["distinct_bands"] >= 2, (
-            f"{name}: flow direction crossed no band boundary"
-        )
+
+    # And it carries the label across a boundary under most of them.
+    crossing = [n for n, s in summaries.items() if s["distinct_bands"] >= 2]
+    assert len(crossing) >= 2, (
+        f"flow direction crossed a band boundary in only {crossing} — "
+        "the regime label is no longer direction-sensitive, which would be a fix"
+    )
 
 
 def test_the_neutral_structure_crosses_three_bands_on_direction_alone():
@@ -412,6 +428,7 @@ def test_the_neutral_structure_crosses_three_bands_on_direction_alone():
 
     summary = summarize("neutral", run_sweep(structure="neutral", steps=9))
     assert summary["distinct_bands"] == 3
-    assert summary["msi_span"] > 55.0
+    # Measured at the REAL dealer-delta scale (cli dni), not the formula's range.
+    assert summary["msi_span"] > 35.0
     assert summary["band_path"][0] == "Chop / Range"
     assert summary["band_path"][-1] == "Trend / Expansion"

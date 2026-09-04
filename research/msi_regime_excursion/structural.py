@@ -167,10 +167,18 @@ def run_sweep(
     *,
     structure: str = "pinned",
     premium: float = 5.0e7,
-    dni_scale: float = 3.0e8,
+    dni_scale: float = 3.4e7,
     steps: int = 9,
 ) -> list[SweepRow]:
     """Sweep flow direction from maximally bearish to maximally bullish.
+
+    ``dni_scale`` defaults to 3.4e7 -- the measured p95 of |dealer net delta| on
+    SPY, the largest of the four scored symbols (``cli dni``). This matters:
+    ``dealer_delta_pressure`` divides by ``_DNI_NORM = 3.0e8``, so driving the
+    sweep to +/-3.0e8 would swing that component over its full [-1, +1] range,
+    which production never approaches. At the real scale it swings +/-0.11, and
+    the sweep measures what the shipped system can actually do rather than what
+    the formula permits.
 
     Every gamma-structure input is fixed by ``structure`` and never varies
     within a sweep -- that is the point. ``steps`` is forced odd so the sweep

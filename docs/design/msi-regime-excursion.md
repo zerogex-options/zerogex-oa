@@ -72,8 +72,11 @@ But the components are not all on the same axis. Each one's own docstring says w
 `order_flow_imbalance`'s docstring is explicit that this is what it is: "a
 **directional** house heuristic lifted into the MSI composite".
 
-So **at least 36 of 100 points are a direction read on a scale whose bands are labelled
-as a regime**. Meanwhile `frontend/core/impliedDirection.ts` says of the same number:
+So **36 of 100 points are nominally a direction read on a scale whose bands are
+labelled as a regime**. §5 refines this: only `order_flow_imbalance`'s 19 points are
+doing that work in practice, because `dealer_delta_pressure`'s normalizer is mis-sized
+by 9–377× and the component contributes under a point of its 17. Meanwhile
+`frontend/core/impliedDirection.ts` says of the same number:
 
 > The MSI itself is a *regime* gauge (0–100) … **It is deliberately directionless.**
 
@@ -88,28 +91,32 @@ gamma flip, local gamma, the max-gamma strike, VIX, the put/call ratio, the pric
 If the MSI were directionless, the band could not move.
 
 **Neutral gamma structure** (no magnitude component saturated — the ordinary state of
-the market):
+the market), swept at the **measured** dealer-delta scale (see the note below):
 
 | flow skew | MSI | Band |
 |---:|---:|---|
-| −1.00 (all put premium) | 24.78 | Chop / Range — *"Range-bound — fade extremes, avoid trend trades."* |
-| −0.75 | 28.08 | Chop / Range |
-| −0.50 | 31.64 | Chop / Range |
-| −0.25 | 44.52 | Controlled Trend |
-| 0.00 | 62.60 | Controlled Trend |
-| +0.25 | 70.68 | Trend / Expansion |
-| +0.50 | 80.69 | Trend / Expansion |
-| +0.75 | 83.20 | Trend / Expansion |
-| +1.00 (all call premium) | 85.44 | Trend / Expansion — *"Strong directional regime — favor trades in the prevailing bias."* |
+| −1.00 (all put premium) | 37.58 | Chop / Range — *"Range-bound — fade extremes, avoid trend trades."* |
+| −0.25 | 55.32 | Controlled Trend |
+| +0.25 | 68.51 | Controlled Trend |
+| +1.00 (all call premium) | 76.26 | Trend / Expansion — *"Strong directional regime — favor trades in the prevailing bias."* |
 
-**60.7 MSI points and three regime bands, on direction alone.** Repeated with the
+**38.7 MSI points and three regime bands, on direction alone.** Repeated with the
 structure pinned at both extremes:
 
 | Structure held fixed at | MSI range | Span | Bands crossed |
 |---|---|---:|---|
-| pinned (every magnitude signal says "damped") | 3.20 → 37.08 | 33.9 | High-Risk Reversal → Chop / Range |
-| neutral | 24.78 → 85.44 | **60.7** | Chop / Range → Controlled Trend → Trend / Expansion |
-| free (every magnitude signal says "moves can run") | 66.75 → 97.28 | 30.5 | Controlled Trend → Trend / Expansion |
+| pinned (every magnitude signal says "damped") | 4.41 → 24.38 | 20.0 | High-Risk Reversal → Chop / Range |
+| neutral | 37.58 → 76.26 | **38.7** | Chop / Range → Controlled Trend → Trend / Expansion |
+| free (every magnitude signal says "moves can run") | 78.58 → 96.57 | 18.0 | saturates in Trend / Expansion |
+
+> **Correction.** An earlier version of this section reported a 60.7-point span and
+> claimed all three structures crossed a band. That sweep drove `dealer_net_delta` over
+> ±3.0e8 — exactly `_DNI_NORM` — swinging `dealer_delta_pressure` across its full
+> [−1, +1] range. §5 establishes that production never approaches that: SPY's p95
+> |dni| is 3.4e7, so the component actually swings ±0.11. The numbers above use the
+> measured scale and are what the shipped system can reach. The finding survives —
+> direction alone still carries the label across three bands — but it is 38.7 points,
+> not 60.7, and the `free` structure saturates rather than crossing a boundary.
 
 ### What this means
 
@@ -396,6 +403,54 @@ travel less -- the composite starts encoding *how much data we had* rather than 
 the gamma model says. That is a real correlation with forward excursion and it is not
 the model working.
 
+### Root cause of the NDX/NQ starvation
+
+`cli components` recovers the active component set per reading exactly, by trying every
+subset and keeping the largest that reproduces the persisted composite. On NDX it
+resolved all 11,672 rows with none unresolved, and the answer is unambiguous:
+
+| dealer | anchor | net_gex | flow | pcr | vol |
+|---:|---:|---:|---:|---:|---:|
+| **60.4%** | 99.7% | 99.9% | 96.1% | 99.9% | 99.7% |
+
+`dealer_delta_pressure`, flat across every hour of the session. Not
+`order_flow_imbalance`, the component most likely to starve on a thin options tape —
+that one is healthy.
+
+The component abstains when its score lands within 1e-3 of zero, and the score is
+`-clamp(dni / _DNI_NORM)` with `_DNI_NORM = 3.0e8`, so it drops out whenever
+|dealer net delta| < 300,000 shares-equivalent. `_DNI_NORM` is a module constant from
+one env var, and this is **the only MSI component with no per-symbol calibration path**
+— `net_gex_sign`, `put_call_ratio_state` and `local_gamma` all consult
+`ctx.extra["normalizers"]` first.
+
+The component persists its own raw estimate, so the scale can be measured directly
+(`cli dni`, 45 days):
+
+| symbol | median dni | p95 dni | % below the 300k floor | median contribution, of 17 pts |
+|---|---:|---:|---:|---:|
+| SPY | 12,856,935 | 34,135,733 | 0.4% | 0.73 |
+| SPX | 7,933,643 | 18,702,518 | 1.8% | 0.45 |
+| QQQ | 5,059,394 | 20,472,072 | 2.7% | 0.29 |
+| NDX | 357,399 | 795,097 | **39.5%** | **0.02** |
+
+Two independent methods agree to 0.1pp: `components` measured 60.4% participation on
+NDX, and 100 − 39.5 = 60.5% of readings clear the floor. All four symbols take the same
+estimation path (`dealer_net_delta_field`), so this is not a fallback artifact — NDX's
+dealer net delta is genuinely 14–36× smaller, which is what index options carrying far
+more notional per contract produces.
+
+**The finding is larger than NDX.** `_DNI_NORM` is too big by 9× even for SPY. A
+component allocated **17 of 100 points contributes a median of 0.73 on SPY and 0.02 on
+NDX**. It has never meaningfully been in the composite, on any symbol.
+
+That also explains the mechanism behind the spurious NDX signal. A near-dead component
+that does *not* abstain still adds its 17 points to `active_points` while contributing
+almost nothing to `sum_offset`, dragging the renormalized composite toward 50; when it
+*does* abstain, the survivors are scaled up by 100/83. So whether it clears the floor
+shifts the composite by several points, and that switch correlates with market activity
+rather than with anything the gamma model says.
+
 ### The alternative constructions, on clean data
 
 `msi_magnitude_pcr` still beats the shipped MSI on **all 30** instrument-horizon cells,
@@ -422,26 +477,29 @@ pull the composite the wrong way.
 
 Ordered by evidence, after the clean-data run.
 
-**1. Fix the NDX/NQ component starvation first. It is a live bug.** Roughly 45% of NDX
-and NQ readings are built on partial data *during market hours*, and once those rows are
-removed the gauge is shown to carry no information on those symbols at all. Customers
-are being shown regime labels there that the data does not support, and 17 playbook
-patterns are being gated on them. Run `cli components --symbol NDX` to name the
-starving component; the fix follows from which one it is.
-
-**2. Gate scoring to the cash session for SPY and QQQ.** Half their readings are
-overnight, they reconstruct at ~22%, and removing them lifts both instruments into
-significance. This is a scheduling fix, not a model change.
-
-**3. Then ship `msi_magnitude_pcr` as the band source.** Thirty of thirty cells improve
-on clean data, the directional-only control is actively negative on four instruments,
-and on NDX/NQ the variant is the difference between nothing and a working gauge. Do it
-**additively** -- persist the variant alongside the shipped composite, replay the
-pattern engine, compare, then switch. `valid_regimes` is a hard gate
+**1. Ship `msi_magnitude_pcr` as the band source — it also removes the broken
+component.** This is the convergence worth noticing: the variant that wins all 30 cells
+is built from `net_gex_sign + gamma_anchor + volatility_regime + put_call_ratio`, which
+**excludes `dealer_delta_pressure` entirely**. The composite fix and the NDX bug fix are
+the same change. Do it additively — persist the variant alongside the shipped composite,
+replay the pattern engine, compare, then switch. `valid_regimes` is a hard gate
 (`playbook/engine.py:154`) across 17 patterns, and the existing playbook backtest reads
 `signal_action_cards`, so it can only score cards that actually fired; it cannot answer
-what a different gate would have emitted. That replay is the real prerequisite here, and
-it is a project rather than an afternoon.
+what a different gate would have emitted. That replay is the real prerequisite, and it
+is a project rather than an afternoon.
+
+**2. Do NOT simply rescale `_DNI_NORM`.** Fixing the normalizer per symbol would put the
+component on a proper [−1, +1] footing, but that raises its influence on *every* symbol
+from under a point to roughly eight — a large behavioural change to all 17 pattern
+gates, in service of a component this study has not shown to predict excursion. The
+directional-only control is uninformative-to-negative everywhere. If the component is
+worth keeping, calibrate it and then **re-test it** before restoring its weight; if the
+answer is `msi_magnitude_pcr`, the question is moot.
+
+**3. Gate scoring to the cash session for SPY and QQQ.** Half their readings are
+overnight, they reconstruct at ~22%, and removing them lifts both instruments into
+significance. Independent of everything above, and a scheduling fix rather than a model
+change.
 
 **4. Correct the "deliberately directionless" comment in
 `frontend/core/impliedDirection.ts`.** Internal spec text, measurably false, free to fix.
