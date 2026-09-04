@@ -268,7 +268,11 @@ fi
 # 9b: if auth is configured, a keyless request MUST be rejected with 401.
 if [ -n "$API_KEY_VAL" ]; then
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-    NOAUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api/health)
+    # A GATED path, deliberately not /api/health: that one lives in
+    # _PUBLIC_PATHS (src/api/security.py) and answers 200 to anybody by
+    # design, so probing it here tested nothing and reported a failure on
+    # every single deploy — which taught operators to ignore this section.
+    NOAUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8000/api/v1/levels/SPX?strikes=1")
     if [ "$NOAUTH_CODE" = "401" ]; then
         log "  ✓ API rejects keyless requests (401)"
         PASSED_CHECKS=$((PASSED_CHECKS + 1))
@@ -278,24 +282,59 @@ if [ -n "$API_KEY_VAL" ]; then
         FAILED_CHECKS=$((FAILED_CHECKS + 1))
     fi
 
-    # 9c: nginx should inject the key on its upstream request.
-    # Only meaningful if nginx is installed and resolvable on localhost.
+    # 9c: nginx must NOT authenticate on the caller's behalf.
+    #
+    # This asserted the opposite until now — that a keyless request through
+    # nginx returns 200 — and called that proof the X-API-Key injection was
+    # working. Two things were wrong with it. It contradicted step 125, whose
+    # entire purpose is removing that injection so every caller presents its
+    # own revocable, attributable key. And it proved nothing either way,
+    # because it probed /api/health, which is public: that returns 200 with or
+    # without an injected credential, so the check passed no matter what nginx
+    # was doing. Now it probes a gated path and requires rejection.
     if command -v nginx >/dev/null 2>&1; then
         TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
         # Use --resolve to hit nginx locally without depending on public DNS.
         DOMAIN="${OA_API_DOMAIN:-api.zerogex.io}"
         NGINX_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
             --resolve "$DOMAIN:443:127.0.0.1" \
-            "https://$DOMAIN/api/health" 2>/dev/null || echo "000")
-        if [ "$NGINX_CODE" = "200" ]; then
-            log "  ✓ nginx injects X-API-Key on upstream (HTTPS returns 200)"
+            "https://$DOMAIN/api/v1/levels/SPX?strikes=1" 2>/dev/null || echo "000")
+        if [ "$NGINX_CODE" = "401" ]; then
+            log "  ✓ nginx does not authenticate for the caller (keyless → 401)"
             PASSED_CHECKS=$((PASSED_CHECKS + 1))
         elif [ "$NGINX_CODE" = "000" ]; then
             log "  ⚠ Could not reach nginx for $DOMAIN (cert or SSL step may not have run)"
             WARNING_CHECKS=$((WARNING_CHECKS + 1))
         else
-            log "  ✗ nginx-proxied /api/health returned $NGINX_CODE (expected 200)"
-            log "     Check /etc/nginx/conf.d/zerogex-api-key.conf and include directive in site config"
+            log "  ✗ nginx-proxied keyless request returned $NGINX_CODE (expected 401)"
+            log "     nginx is still supplying a credential for anonymous callers."
+            log "     The site include is a glob, so a RENAMED file still loads:"
+            log "       sudo grep -Rn 'zerogex-api-key' /etc/nginx/   # -R follows symlinks"
+            log "     Re-run step 125 to clear it."
+            FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        fi
+    fi
+
+    # 9d: API keys must not be written to the access log in the clear.
+    #
+    # /api/v1/levels accepts ?api_key= for Sierra Chart, whose ACSIL HTTP call
+    # cannot attach headers. nginx logs the request line regardless of response
+    # status, so without the scrubbing format every poll — including the ones
+    # that 401 — writes a live credential to disk. Step 120 installs the map
+    # and log_format; this asserts the running config actually uses them,
+    # because a box that has not re-run 120 since they were added will log in
+    # the clear while every other check passes.
+    if command -v nginx >/dev/null 2>&1; then
+        TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+        if sudo nginx -T 2>/dev/null | grep -q 'access_log .* zerogex_scrubbed'; then
+            log "  ✓ access log scrubs ?api_key= before writing"
+            PASSED_CHECKS=$((PASSED_CHECKS + 1))
+        else
+            log "  ✗ access log is NOT using the zerogex_scrubbed format"
+            log "     API keys in query strings are being written to"
+            log "     /var/log/nginx/access.log in the clear. Re-run step 120,"
+            log "     then rotate any key that appears in the existing logs:"
+            log "       sudo grep -ho 'api_key=[^& ]*' /var/log/nginx/access.log* | sort -u | wc -l"
             FAILED_CHECKS=$((FAILED_CHECKS + 1))
         fi
     fi
