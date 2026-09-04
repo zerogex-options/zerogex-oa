@@ -56,9 +56,11 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 __all__ = [
     "Observation",
     "SurvivalPoint",
+    "LogRank",
     "kaplan_meier",
     "break_probability_at",
     "by_group",
+    "logrank",
 ]
 
 
@@ -176,3 +178,68 @@ def by_group(
             continue
         buckets.setdefault(group, []).append(obs)
     return {g: kaplan_meier(o) for g, o in buckets.items() if len(o) >= min_n}
+
+
+@dataclass(frozen=True)
+class LogRank:
+    """Comparison of two survival curves."""
+
+    observed_a: int
+    expected_a: float
+    chi2: float
+    p_value: float
+    n_a: int
+    n_b: int
+
+
+def logrank(a: Sequence[Observation], b: Sequence[Observation]) -> Optional[LogRank]:
+    """Log-rank test that two groups share one hazard.
+
+    Needed because eyeballing two curves is exactly the over-reading this
+    study exists to avoid: "35.9% vs 25.3%" at n=78 and n=100 is not a result
+    until something says whether it survives the noise.
+
+    At each time a break occurs anywhere, the breaks in group A are compared
+    against what the pooled risk sets predict, with the hypergeometric
+    variance. The statistic is chi-square on 1 degree of freedom, so its
+    p-value is the standard normal two-sided tail of its square root.
+
+    Returns None when either group is empty or no break is observed — with no
+    events there is nothing to compare, which is a different statement from
+    "the curves agree".
+    """
+    obs_a = [o for o in a if o.minutes is not None and math.isfinite(o.minutes)]
+    obs_b = [o for o in b if o.minutes is not None and math.isfinite(o.minutes)]
+    if not obs_a or not obs_b:
+        return None
+    times = sorted({o.minutes for o in obs_a + obs_b if o.broke})
+    if not times:
+        return None
+
+    observed = expected = variance = 0.0
+    for t in times:
+        n_a = sum(1 for o in obs_a if o.minutes >= t)
+        n_b = sum(1 for o in obs_b if o.minutes >= t)
+        n = n_a + n_b
+        if n <= 1:
+            continue
+        d_a = sum(1 for o in obs_a if o.broke and o.minutes == t)
+        d = d_a + sum(1 for o in obs_b if o.broke and o.minutes == t)
+        if d == 0:
+            continue
+        share = n_a / n
+        observed += d_a
+        expected += d * share
+        variance += d * share * (1.0 - share) * (n - d) / (n - 1)
+    if variance <= 0:
+        return None
+    chi2 = (observed - expected) ** 2 / variance
+    p_value = math.erfc(math.sqrt(chi2 / 2.0))
+    return LogRank(
+        observed_a=int(observed),
+        expected_a=expected,
+        chi2=chi2,
+        p_value=p_value,
+        n_a=len(obs_a),
+        n_b=len(obs_b),
+    )

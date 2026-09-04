@@ -231,20 +231,33 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             )
             side_meta.pop("flow_rows_fetched", None)
             side_meta.pop("flow_contracts_usable", None)
-        from research.wall_break_odds.survival import kaplan_meier
+        from research.wall_break_odds.survival import kaplan_meier, logrank
 
         subset = [r for r in records if not side or r.get("side") == side]
         horizon = (meta.get("config") or {}).get("resolution_minutes")
         obs = _observations(subset, horizon)
         halves: dict[str, Any] = {}
+        split = {m: [r for r in subset if _in_half(r, m)] for m in (True, False)}
         for name, is_morning in (("morning", True), ("afternoon", False)):
-            part_obs = _observations([r for r in subset if _in_half(r, is_morning)], horizon)
+            part_obs = _observations(split[is_morning], horizon)
             if len(part_obs) >= 30:
                 halves[name] = (
                     kaplan_meier(part_obs),
                     len(part_obs),
                     sum(1 for o in part_obs if o.broke),
                 )
+        halves["logrank"] = logrank(
+            _observations(split[True], horizon), _observations(split[False], horizon)
+        )
+        # First tests only. A wall that breaks is spent for the session, so the
+        # afternoon sample is enriched for walls that ALREADY survived a test;
+        # restricting to ordinal 1 compares like with like.
+        firsts = {
+            m: [r for r in rows_m if r.get("test_ordinal") == 1] for m, rows_m in split.items()
+        }
+        halves["logrank_first"] = logrank(
+            _observations(firsts[True], horizon), _observations(firsts[False], horizon)
+        )
         report = render_report(
             side_meta,
             base_rate(rows),
