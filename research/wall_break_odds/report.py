@@ -54,10 +54,11 @@ def _sample_block(meta: Mapping[str, Any]) -> list[str]:
             lines.append(f"    skipped: {reason:<20} {count}")
     lines.append(f"  wall tests found      {meta.get('events_total', 0)}")
     lines.append(
-        f"  censored (excluded)   {meta.get('events_censored', 0)}"
-        "   — horizon ran past 16:00 ET, outcome never observable"
+        f"  censored              {meta.get('events_censored', 0)}"
+        "   — horizon ran past 16:00 ET; USED by the curve,"
     )
-    lines.append(f"  resolved (modelled)   {meta.get('events_resolved', 0)}")
+    lines.append("                              excluded from the base rate below")
+    lines.append(f"  resolved              {meta.get('events_resolved', 0)}")
     fetched = meta.get("flow_rows_fetched")
     if fetched is not None:
         usable = meta.get("flow_contracts_usable", 0)

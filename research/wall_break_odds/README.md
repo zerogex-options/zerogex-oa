@@ -22,12 +22,42 @@ two is the most common way this question gets answered wrongly, which is why
 
 ## Status
 
-The pipeline is complete, tested, and verified end to end on synthetic data.
+The pipeline is complete, tested, and verified end to end on synthetic data and
+against production.
 
-**No result has been produced**, because producing one requires running
-`build-dataset` against a database with `gex_summary` and `underlying_quotes`
-history. Nothing in this package reports a break rate it did not measure; on an
-empty or short window the report says so and stops.
+### First measured result — SPX, 2026-06-29 .. 09-03, 48 sessions, 178 tests
+
+**P(break within t | tested):**
+
+| within | P(break) | 95% CI |
+|---|---|---|
+| 15 min | 7.6% | [4.4 – 13.0] |
+| 30 min | 17.5% | [12.4 – 24.5] |
+| 45 min | 26.8% | [20.4 – 34.8] |
+| 60 min | **30.7%** | [23.9 – 39.0] |
+
+Call and put walls are indistinguishable at every horizon (60-min: call 32.4%
+[22.4–45.4], put 29.4% [20.7–40.7]).
+
+The censoring assumption was checked, not assumed: log-rank on the session
+halves gives p=0.13 over all tests and **p=0.46 restricted to first tests**.
+The gap between those two is the survivorship the event rule creates — a
+broken wall is spent, so the afternoon sample is enriched for survivors — and
+controlling for it removes most of the apparent difference. The pooled curve
+stands.
+
+### What has NOT been established
+
+* **No feature is FDR-significant.** Nineteen screened, session-clustered
+  bootstrap plus Benjamini-Hochberg, none survive. The largest effect
+  (`net_gex_log_signed`, −30 points) does not survive either.
+* **Wall size shows nothing.** `wall_strength_log` splits 35% / 33% — the
+  variable everyone anchors on carried no information in this sample. That is
+  a null at n=92, not proof of no effect.
+* **No model.** 131 resolved events against a floor of 200; the walk-forward
+  block declines to fit and will keep declining until the sample grows.
+
+Nothing here is calibrated for trading and no result has been validated live.
 
 ## Quick start
 
