@@ -283,6 +283,24 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             for h in args.horizons.split(",") if h.strip()
         ]
 
+    if getattr(args, "clean_only", False):
+        from research.msi_regime_excursion.study import RECONSTRUCTION_TOLERANCE
+        kept: dict[str, list[Row]] = {}
+        for key, rows in by_inst.items():
+            clean = [
+                r for r in rows
+                if r.reconstruction_error is not None
+                and r.reconstruction_error <= RECONSTRUCTION_TOLERANCE
+            ]
+            print(f"{key}: kept {len(clean):,} of {len(rows):,} rows that reconstruct",
+                  file=sys.stderr)
+            if clean:
+                kept[key] = clean
+        by_inst = kept
+        if not by_inst:
+            print("No rows reconstruct — nothing to analyse.", file=sys.stderr)
+            return 1
+
     results = []
     for key in sorted(by_inst, key=lambda k: DEFAULT_INSTRUMENTS.index(k)
                       if k in DEFAULT_INSTRUMENTS else 99):
@@ -376,7 +394,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json-out", default="", help="also write the raw findings as JSON")
     p.add_argument("--no-digest", action="store_true",
                    help="suppress the one-screen summary printed at the end")
+    p.add_argument("--clean-only", action="store_true",
+                   help="keep only rows whose composite reconstructs exactly — i.e. "
+                        "rows where no component abstained. Use this to check whether "
+                        "a result is being diluted by readings scored on partial data.")
     p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("abstention",
+                       help="where components abstain, by ET hour (no database)")
+    p.add_argument("dataset")
+    p.set_defaults(func=lambda a: __import__(
+        "research.msi_regime_excursion.abstention", fromlist=["main"]).main(a.dataset))
 
     p = sub.add_parser("digest", help="one-screen summary of a findings JSON")
     p.add_argument("findings", help="the file written by `analyze --json-out`")
