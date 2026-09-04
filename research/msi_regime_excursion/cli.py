@@ -407,6 +407,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=lambda a: __import__(
         "research.msi_regime_excursion.components", fromlist=["main"]).main(a.symbol, a.days))
 
+    p = sub.add_parser("dni",
+                       help="is dealer_delta_pressure's normalizer sized per symbol? (read-only)")
+    p.add_argument("--symbols", default="SPY,SPX,QQQ,NDX")
+    p.add_argument("--days", type=int, default=45)
+    p.set_defaults(func=lambda a: __import__(
+        "research.msi_regime_excursion.dni", fromlist=["main"]).main(a.symbols, a.days))
+
     p = sub.add_parser("abstention",
                        help="where components abstain, by ET hour (no database)")
     p.add_argument("dataset")
