@@ -501,3 +501,25 @@ def test_observed_minutes_is_recorded_for_every_outcome():
         assert e.observed_minutes >= 0
     late = [e for e in events if e.outcome == "censored"]
     assert late and all(e.observed_minutes < 60 for e in late)
+
+
+def test_survival_marks_below_the_confirmation_window_are_not_reported_as_zero():
+    """No break can be OBSERVED before confirm_minutes have elapsed, so a
+    5-minute row is a property of the label, not a measurement."""
+    from research.wall_break_odds.report import _survival_block
+    from research.wall_break_odds.survival import Observation, kaplan_meier
+
+    curve = kaplan_meier([Observation(20, True)] + [Observation(60, False)] * 40)
+    text = "\n".join(_survival_block(curve, 41, 1, confirm_minutes=10))
+    assert "not observable" in text
+    assert "no breaks yet" not in text.split("15 min")[0]
+
+
+def test_session_half_split_uses_et_and_the_session_midpoint():
+    from research.wall_break_odds.cli import _in_half
+
+    early = {"tested_at": "2026-07-01T14:00:00+00:00"}  # 10:00 ET
+    late = {"tested_at": "2026-07-01T19:30:00+00:00"}  # 15:30 ET
+    assert _in_half(early, morning=True) and not _in_half(early, morning=False)
+    assert _in_half(late, morning=False) and not _in_half(late, morning=True)
+    assert not _in_half({"tested_at": "nonsense"}, morning=True)

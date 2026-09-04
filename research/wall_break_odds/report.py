@@ -92,7 +92,12 @@ def _config_block(cfg: Mapping[str, Any]) -> list[str]:
 SURVIVAL_MARKS = (5, 15, 30, 45, 60)
 
 
-def _survival_block(curve: Sequence[Any], n_obs: int, n_breaks: int) -> list[str]:
+def _survival_block(
+    curve: Sequence[Any],
+    n_obs: int,
+    n_breaks: int,
+    confirm_minutes: Optional[int] = None,
+) -> list[str]:
     """P(break within t) as a curve, which is the horizon-free answer.
 
     The point estimate this replaces moved from 15% to 34% on nothing but a
@@ -116,7 +121,18 @@ def _survival_block(curve: Sequence[Any], n_obs: int, n_breaks: int) -> list[str
     lines.append(f"  observations {n_obs}   breaks {n_breaks}")
     lines.append("")
     lines.append(f"    {'within':<10}{'P(break)':>12}{'95% CI':>22}{'at risk':>10}")
+    floor = int(confirm_minutes or 0)
     for mark in SURVIVAL_MARKS:
+        # A break needs confirm_minutes of consecutive closes beyond the
+        # buffer, so no break can be OBSERVED before then. Printing a
+        # definitional zero beside estimated values invites reading it as a
+        # measurement; it is an artefact of the label and now says so.
+        if mark < floor:
+            lines.append(
+                f"    {str(mark) + ' min':<10}{'—':>12}"
+                f"   not observable: confirmation takes {floor} min"
+            )
+            continue
         point = break_probability_at(curve, mark)
         if point is None:
             lines.append(f"    {str(mark) + ' min':<10}{'no breaks yet':>12}")
@@ -125,6 +141,43 @@ def _survival_block(curve: Sequence[Any], n_obs: int, n_breaks: int) -> list[str
         lines.append(
             f"    {str(mark) + ' min':<10}{point.break_prob * 100:>11.1f}%{ci:>22}"
             f"{point.at_risk:>10}"
+        )
+    return lines
+
+
+def _censoring_block(halves: Mapping[str, Any]) -> list[str]:
+    """Morning vs afternoon curves — the Kaplan-Meier assumption, inspected.
+
+    KM needs censoring independent of the outcome. Here censoring IS "the
+    session ended", so it falls entirely on late-day tests. If the two halves
+    look like the same process the pooled curve is trustworthy; if they do
+    not, the pooled curve is averaging two regimes and has to be reported as
+    one. This block exists so the check happens on every run rather than
+    remaining an intention.
+    """
+    from research.wall_break_odds.survival import break_probability_at
+
+    lines = [
+        "CENSORING CHECK  (does the curve differ by session half?)",
+        _THIN,
+        "  Censoring here is entirely late-session, so KM's independence",
+        "  assumption is not automatic. Similar halves support the pooled",
+        "  curve; divergent ones mean it is averaging two regimes.",
+        "",
+        f"    {'half':<12}{'n':>6}{'breaks':>8}{'P(30m)':>10}{'P(60m)':>10}",
+    ]
+    for name in ("morning", "afternoon"):
+        entry = halves.get(name)
+        if not entry:
+            lines.append(f"    {name:<12}{'insufficient data':>34}")
+            continue
+        curve, n_obs, n_breaks = entry
+        p30 = break_probability_at(curve, 30)
+        p60 = break_probability_at(curve, 60)
+        lines.append(
+            f"    {name:<12}{n_obs:>6}{n_breaks:>8}"
+            f"{(_pct(p30.break_prob, 1) if p30 else 'n/a'):>10}"
+            f"{(_pct(p60.break_prob, 1) if p60 else 'n/a'):>10}"
         )
     return lines
 
@@ -271,6 +324,7 @@ def render_report(
     evaluation: Mapping[str, Any],
     fit: Optional[Mapping[str, Any]] = None,
     survival: Optional[tuple] = None,
+    halves: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """The full text report."""
     lines = [
@@ -283,7 +337,17 @@ def render_report(
     lines += _sample_block(meta)
     lines += ["", *_config_block(meta.get("config", {}))]
     if survival is not None:
-        lines += ["", *_survival_block(survival[0], survival[1], survival[2])]
+        lines += [
+            "",
+            *_survival_block(
+                survival[0],
+                survival[1],
+                survival[2],
+                (meta.get("config") or {}).get("confirm_minutes"),
+            ),
+        ]
+    if halves:
+        lines += ["", *_censoring_block(halves)]
     lines += ["", "BASE RATES  (single horizon — read the curve above first)", _THIN]
     lines.append(_rate_line("overall", rates.get("overall", {})))
     lines.append(_rate_line("call wall", rates.get("call", {})))
