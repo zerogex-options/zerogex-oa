@@ -417,3 +417,87 @@ def test_continuous_split_still_lands_on_the_median():
     from research.wall_break_odds.model import _best_split
 
     assert _best_split([float(i) for i in range(100)]) == 50.0
+
+
+# ---------------------------------------------------------------------------
+# Survival — the horizon-free answer, and the recovery of censored events
+# ---------------------------------------------------------------------------
+
+
+def test_kaplan_meier_matches_a_hand_computed_curve():
+    from research.wall_break_odds.survival import Observation, kaplan_meier
+
+    obs = [
+        Observation(10, True),
+        Observation(20, False),  # censored before the second break
+        Observation(30, True),
+        Observation(40, False),
+        Observation(50, False),
+    ]
+    curve = kaplan_meier(obs)
+    assert [p.minutes for p in curve] == [10, 30]
+    assert curve[0].survival == pytest.approx(0.8)  # 4/5
+    # The censored subject leaves the risk set: 3 at risk at t=30, not 4.
+    assert curve[1].at_risk == 3
+    assert curve[1].survival == pytest.approx(0.8 * 2 / 3)
+
+
+def test_censored_observations_still_inform_the_curve():
+    """A test that held 15 minutes and hit the bell is data, not missing data.
+
+    Dropping it (the old behaviour) shrinks the risk set and inflates the
+    estimated break probability.
+    """
+    from research.wall_break_odds.survival import Observation, kaplan_meier
+
+    # A censored observation counts toward the risk set for every moment it
+    # WAS watched — so it informs the curve at times before its censoring,
+    # which is precisely the information dropping it threw away.
+    with_censored = [Observation(10, True)] + [Observation(15, False)] * 20
+    dropped = [Observation(10, True)]
+    p_with = kaplan_meier(with_censored)[0].break_prob
+    p_without = kaplan_meier(dropped)[0].break_prob
+    assert p_with == pytest.approx(1 / 21)
+    assert p_without == pytest.approx(1.0)
+    assert p_with < p_without
+
+    # ...and it correctly stops counting once watching stopped: the same 20
+    # tests, censored at 15, say nothing about a break at 30.
+    later = kaplan_meier([Observation(30, True)] + [Observation(15, False)] * 20)
+    assert later[0].at_risk == 1
+
+
+def test_break_probability_is_monotone_in_time():
+    from research.wall_break_odds.survival import (
+        Observation,
+        break_probability_at,
+        kaplan_meier,
+    )
+
+    obs = [Observation(float(5 * i), i % 3 == 0) for i in range(1, 40)]
+    curve = kaplan_meier(obs)
+    probs = [
+        p.break_prob
+        for p in (break_probability_at(curve, t) for t in (5, 15, 30, 45, 60))
+        if p is not None
+    ]
+    assert probs == sorted(probs)
+
+
+def test_no_breaks_yields_no_curve_rather_than_a_flat_zero():
+    from research.wall_break_odds.survival import Observation, kaplan_meier
+
+    assert kaplan_meier([Observation(30, False)] * 50) == []
+
+
+def test_observed_minutes_is_recorded_for_every_outcome():
+    """held and censored must both carry a watch time, or they cannot be
+    pooled into the survival estimate."""
+    closes = [WALL * 0.990] * 375 + [WALL * 0.9999] * 15
+    events = _calls(closes)
+    assert events
+    for e in events:
+        assert e.observed_minutes is not None
+        assert e.observed_minutes >= 0
+    late = [e for e in events if e.outcome == "censored"]
+    assert late and all(e.observed_minutes < 60 for e in late)

@@ -15,6 +15,8 @@ import argparse
 import json
 import sys
 from datetime import date, datetime
+
+from research.wall_break_odds.events import ET
 from typing import Any, Optional, Sequence
 
 from research.wall_break_odds.events import EventConfig
@@ -141,6 +143,40 @@ def _rows_from_records(records: Sequence[dict[str, Any]], side: Optional[str]) -
     return rows
 
 
+def _observations(records: Sequence[dict[str, Any]], horizon: Optional[int]) -> list[Any]:
+    """Survival observations, deriving the watch time when it is absent.
+
+    Datasets written before ``observed_minutes`` existed can still be analysed:
+    a break was watched until it confirmed, a censored test until the bell, and
+    a hold for the full horizon. Derived values are approximations of what the
+    labeller recorded directly, so rebuilding is still preferable.
+    """
+    from research.wall_break_odds.survival import Observation
+
+    out: list[Observation] = []
+    for r in records:
+        outcome = r.get("outcome")
+        if outcome not in ("broke", "held", "censored"):
+            continue
+        minutes = r.get("observed_minutes")
+        if minutes is None:
+            if outcome == "broke":
+                minutes = r.get("minutes_to_resolve")
+            elif outcome == "censored":
+                tested = r.get("tested_at")
+                try:
+                    ts = datetime.fromisoformat(str(tested)).astimezone(ET)
+                    minutes = max((16 * 60) - (ts.hour * 60 + ts.minute), 0)
+                except (TypeError, ValueError):
+                    minutes = None
+            else:
+                minutes = horizon
+        if minutes is None:
+            continue
+        out.append(Observation(minutes=float(minutes), broke=outcome == "broke"))
+    return out
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     from research.wall_break_odds.dataset import read_jsonl
 
@@ -158,12 +194,18 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             print("\n\n" + "#" * 78)
             print(f"# {side.upper()} WALL ONLY")
             print("#" * 78 + "\n")
+        from research.wall_break_odds.survival import kaplan_meier
+
+        subset = [r for r in records if not side or r.get("side") == side]
+        horizon = (meta.get("config") or {}).get("resolution_minutes")
+        obs = _observations(subset, horizon)
         report = render_report(
             meta,
             base_rate(rows),
             univariate_screen(rows),
             evaluate(rows, n_folds=args.folds),
             fit_full(rows),
+            survival=(kaplan_meier(obs), len(obs), sum(1 for o in obs if o.broke)),
         )
         print(report)
         if args.out and side is None:

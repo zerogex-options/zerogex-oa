@@ -48,6 +48,17 @@ python -m research.wall_break_odds.cli analyze research_output/wall_events.jsonl
 used, skip reasons, censored count, and the exact label thresholds. The report
 reads it, so a printed report always carries its own provenance.
 
+## The headline is a curve
+
+Sweeping only the resolution horizon on the first real run moved the point
+estimate from 15.3% (30 min) to 29.7% (45) to 34.4% (60), on non-overlapping
+intervals — a longer watch simply gives price more chances to go. So the
+report leads with a Kaplan-Meier curve of `P(break within t)`, which also
+recovers the ~25% of events that were previously censored and discarded.
+
+Quote the curve, or quote a rate **with** its horizon. A bare "walls break X%
+of the time" is not a claim this study supports.
+
 ## The event definition
 
 | | |
