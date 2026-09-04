@@ -1,9 +1,9 @@
 # Does the MSI regime gauge predict realized price excursion?
 
-**Status:** complete. Both arms have run. Headline: the regime bands **do** order
-realized excursion, in the claimed direction, on every instrument and horizon — but
-weakly, and a magnitude-only rebuild of the composite beats the shipped one on all 30
-instrument-horizon cells. See §5.
+**Status:** complete. Headline: on clean data the bands order realized excursion on
+SPX/ES/SPY/QQQ but carry **nothing** on NDX/NQ, where a component-starvation bug had
+manufactured an apparent signal. A magnitude-only rebuild beats the shipped composite
+on all 30 instrument-horizon cells. Two unrelated data bugs found. See §5.
 
 **Code:** [`research/msi_regime_excursion/`](../../research/msi_regime_excursion/)
 **Run it:** [`docs/runbooks/msi_regime_excursion_how_to_run.md`](../runbooks/msi_regime_excursion_how_to_run.md)
@@ -348,55 +348,111 @@ Two refinements the run settled that the code analysis could not:
   (-0.02 to -0.14). Distance-from-neutral is not the missing structure; dropping the
   directional components is.
 
-### A defect this run surfaced that nobody was looking for
+### The defect this run surfaced, and what it did to the result
 
-The `reconstructible` column splits the instruments cleanly in two:
+The `reconstructible` column split the instruments cleanly in two -- SPX and ES near
+98%, SPY / QQQ / NDX / NQ near 55%. A row fails to reconstruct when components
+**abstained**: the composite was built from a partial set and renormalized onto the
+full 100-point scale. Those readings still get a regime label, still reach customers,
+and still gate the playbook patterns.
 
-| SPX | ES | SPY | QQQ | NDX | NQ |
-|---:|---:|---:|---:|---:|---:|
-| 97.9% | 97.8% | 54.9% | 55.4% | 57.9% | 57.9% |
+Breaking the rate down by ET hour (`cli abstention`) showed **two unrelated bugs**, not
+one.
 
-A row fails to reconstruct when components **abstained** -- the composite was built
-from a partial set and renormalized onto the full 100-point scale. On SPY, QQQ, NDX
-and NQ that is happening on roughly **45% of readings**.
+**SPY and QQQ — extended-hours scoring.** 52-53% of their readings fall outside the
+cash session, and those reconstruct at only 21-24% against 91-92% inside it. The rate
+collapses monotonically into the small hours (SPY: 48% at 04:00, 1% at 08:00) and again
+after the bell (10% at 17:00). This is the options tape being too thin to feed the
+components overnight.
 
-Those are exactly the four instruments whose rho fails to survive BH correction, while
-the two clean instruments (SPX, ES) both survive at every horizon. The likely cause is
-that SPY and QQQ persist ~800 readings/session against SPX's ~350 -- i.e. they score
-through extended hours, where the options tape is too thin to feed the components. That
-is a hypothesis this run did not test; see §6.
+**NDX and NQ — something else entirely.** They have **0%** of readings outside RTH and
+still reconstruct at only 51-66%, flat across every hour of the session. Nothing about
+the clock explains it; a component is starving on NDX during regular trading hours.
+
+Re-running the study over rows that reconstruct exactly (`analyze --clean-only`)
+separates a diluted signal from a weak one, and the three groups behave differently:
+
+| | rho @ 15m, all rows | rho @ 15m, clean rows | |
+|---|---:|---:|---|
+| SPY | +0.104 | **+0.152** | dilution removed, now survives BH |
+| QQQ | +0.098 | **+0.176** | dilution removed, now survives BH |
+| SPX | +0.230 | +0.232 | already clean — control behaves |
+| ES | +0.235 | +0.237 | already clean — control behaves |
+| NDX | +0.211 | **+0.053** | **collapsed** |
+| NQ | +0.206 | **+0.045** | **collapsed** |
+
+SPX and ES moving by 0.002 is the check that matters: the filter does not flatter an
+instrument that had nothing wrong with it.
+
+**NDX and NQ's apparent signal was an artifact.** On clean rows the shipped MSI carries
+essentially nothing there (rho 0.01-0.06), and `high_risk_reversal` lands at 0.99x the
+base rate with p = 0.83 -- literally no information. The `trend_expansion` band drops
+from 622 readings to 128, so roughly 80% of what looked like the strongest effect in
+the whole study was abstaining rows.
+
+The mechanism is worth naming, because it will recur: when abstention correlates with
+market conditions -- fewer components have data when the tape is quiet, and quiet tapes
+travel less -- the composite starts encoding *how much data we had* rather than what
+the gamma model says. That is a real correlation with forward excursion and it is not
+the model working.
+
+### The alternative constructions, on clean data
+
+`msi_magnitude_pcr` still beats the shipped MSI on **all 30** instrument-horizon cells,
+and by a wider margin than before:
+
+| | 5m | 15m | 30m | 60m | session |
+|---|---:|---:|---:|---:|---:|
+| SPY msi / mag+pcr | .145 / **.193** | .152 / **.201** | .143 / **.194** | .138 / **.181** | .147 / **.170** |
+| SPX msi / mag+pcr | .212 / **.256** | .232 / **.271** | .233 / **.268** | .236 / **.260** | .202 / **.247** |
+| QQQ msi / mag+pcr | .159 / **.254** | .176 / **.270** | .176 / **.266** | .174 / **.255** | .194 / **.311** |
+| NDX msi / mag+pcr | .039 / **.165** | .053 / **.204** | .039 / **.214** | .025 / **.229** | .060 / **.138** |
+| ES msi / mag+pcr | .223 / **.261** | .237 / **.269** | .237 / **.265** | .247 / **.267** | .204 / **.244** |
+| NQ msi / mag+pcr | .034 / **.167** | .045 / **.196** | .029 / **.199** | .010 / **.214** | .059 / **.143** |
+
+On NDX and NQ this is no longer an improvement — it is the difference between a gauge
+that carries nothing (0.010 at NQ 60m) and one that works (0.214). Nine-fold on NDX
+60m, twenty-one-fold on NQ 60m.
+
+And `msi_direction` is now clearly **negative** on SPY, QQQ, NDX and NQ (-0.08 to
+-0.17), not merely uninformative. On four of six instruments the directional components
+pull the composite the wrong way.
 
 ## 6. Recommendation
 
-The empirical arm has now run, so these are ordered by what the data supports.
+Ordered by evidence, after the clean-data run.
 
-**1. Ship `msi_magnitude_pcr` as the band source. This is the strongest result in the
-study.** Thirty of thirty cells improve, the negative control confirms the mechanism,
-and the alternative was rebuilt with the engine's own renormalization rule rather than
-a new formula. Do it as an **additive** change: persist the variant alongside the
-shipped composite, backtest the re-gating offline, then switch the bands. The blast
-radius is 17 playbook patterns that gate on `valid_regimes` / `preferred_regime`, plus
-the portfolio engine and eight frontend surfaces -- this is not a copy change.
+**1. Fix the NDX/NQ component starvation first. It is a live bug.** Roughly 45% of NDX
+and NQ readings are built on partial data *during market hours*, and once those rows are
+removed the gauge is shown to carry no information on those symbols at all. Customers
+are being shown regime labels there that the data does not support, and 17 playbook
+patterns are being gated on them. Run `cli components --symbol NDX` to name the
+starving component; the fix follows from which one it is.
 
-**2. Correct the "deliberately directionless" claim in
-`frontend/core/impliedDirection.ts` now.** It is an internal spec comment, not customer
-copy, it is measurably false, and it costs nothing to fix.
+**2. Gate scoring to the cash session for SPY and QQQ.** Half their readings are
+overnight, they reconstruct at ~22%, and removing them lifts both instruments into
+significance. This is a scheduling fix, not a model change.
 
-**3. Keep the band copy, but attach the effect size.** The bands do order excursion in
-the direction they claim, so the copy is not a false promise -- it is an
-unquantified one. "Strong directional regime" is fair for a band that precedes 1.19x
-the base range on SPX and a 2.3x higher chance of a 10-point ES run. Consider stating
-the number rather than the adjective.
+**3. Then ship `msi_magnitude_pcr` as the band source.** Thirty of thirty cells improve
+on clean data, the directional-only control is actively negative on four instruments,
+and on NDX/NQ the variant is the difference between nothing and a working gauge. Do it
+**additively** -- persist the variant alongside the shipped composite, replay the
+pattern engine, compare, then switch. `valid_regimes` is a hard gate
+(`playbook/engine.py:154`) across 17 patterns, and the existing playbook backtest reads
+`signal_action_cards`, so it can only score cards that actually fired; it cannot answer
+what a different gate would have emitted. That replay is the real prerequisite here, and
+it is a project rather than an afternoon.
 
-**4. Investigate the 45% abstention rate on SPY/QQQ/NDX/NQ before anything else.**
-This may be the larger prize. If the cause is scoring through extended hours on a thin
-options tape, the fix is a session gate, not a model change -- and it would plausibly
-lift those four instruments toward the SPX/ES relationship, which is roughly twice as
-strong. Check whether reconstruction failures cluster outside 09:30-16:00 ET.
+**4. Correct the "deliberately directionless" comment in
+`frontend/core/impliedDirection.ts`.** Internal spec text, measurably false, free to fix.
 
-**5. Re-run on a longer window once bars accumulate.** The study is bar-limited to ~47
-sessions. NDX/NQ `trend_expansion` (622 readings, 30 sessions) carries the largest
-effect in the study on the thinnest sample and should be confirmed before being quoted.
+**5. Keep the band copy, and attach the effect size.** On SPX and ES -- the two clean
+instruments -- the bands order excursion in the direction they claim at every horizon.
+The copy is not a false promise; it is an unquantified one.
+
+**6. Re-run once bars accumulate.** The study is bar-limited to ~47 sessions. NDX/NQ
+`trend_expansion` now holds 128 readings over 27 sessions and carries the largest
+effect in the study on the thinnest sample; do not quote it.
 
 ## 7. Second question: the CVD / limit-order framing
 
