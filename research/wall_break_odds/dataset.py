@@ -117,6 +117,11 @@ class SessionResult:
     skipped_reason: Optional[str] = None
     n_frames: int = 0
     n_bars: int = 0
+    #: Flow rows fetched, and how many distinct contracts were usable after
+    #: canonicalising the option type. Rows > 0 with contracts == 0 is the
+    #: encoding-mismatch signature.
+    n_flow_rows: int = 0
+    n_flow_contracts: int = 0
 
 
 def build_session(
@@ -148,6 +153,7 @@ def build_session(
         return SessionResult(session, [], "no_tests", len(rows), len(bars))
 
     flow: Optional[FlowWindow] = None
+    flow_rows: list[dict[str, Any]] = []
     if with_flow:
         walls = {t.wall for t in tests}
         strikes = sorted(
@@ -155,6 +161,19 @@ def build_session(
         )
         flow_rows = sources.fetch_flow_at_strikes(conn, symbol, session, strikes)
         flow = FlowWindow.from_rows(flow_rows) if flow_rows else None
+        # A populated table that yields no usable contracts is an encoding
+        # mismatch, not a quiet tape, and it is invisible downstream: every
+        # flow feature just reads None and the column drops out of the screen
+        # looking like missing data. Say so at WARNING, once per session.
+        if flow is not None and not flow.coverage():
+            logger.warning(
+                "%s %s: %d flow rows fetched but none usable "
+                "(unrecognised option_type values: %s) — flow features will be empty",
+                symbol,
+                session,
+                len(flow_rows),
+                flow.unrecognised or "none",
+            )
 
     summary = SummarySeries.from_rows(rows)
     vix = sources.fetch_vix_series(conn, session)
@@ -183,7 +202,15 @@ def build_session(
 
     # Only now does this session become history for the ones that follow.
     trailing.add_session(rows)
-    return SessionResult(session, out, None, len(rows), len(bars))
+    return SessionResult(
+        session,
+        out,
+        None,
+        len(rows),
+        len(bars),
+        n_flow_rows=len(flow_rows),
+        n_flow_contracts=sum((flow.coverage() if flow else {}).values()),
+    )
 
 
 def build_dataset(

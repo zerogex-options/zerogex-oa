@@ -118,6 +118,17 @@ Three notes on specific choices:
   what shortens dealers in it — so the same sign means the same thing for calls
   and puts, and the two fits can be read against each other.
 
+### Two flow traps, both found the hard way
+
+**Option-type encoding.** `flow_by_contract.option_type` stores `'C'` / `'P'`
+(`src/flow_series_sql.py`), not `'call'` / `'put'`. The first real run of this
+study matched on the long spelling, so every lookup missed, every flow feature
+read `None`, and the column dropped out of the screen looking like missing
+data against a fully populated table. Both the stored and the requested type
+are now canonicalised, `FlowWindow.coverage()` reports what was actually
+understood, and the dataset layer logs a WARNING when rows are fetched but
+none are usable — the two situations must never again be indistinguishable.
+
 ### The cumulative-flow trap
 
 `flow_by_contract.net_premium` is **day-to-date cumulative per contract**, reset
@@ -148,8 +159,8 @@ day, and those tests share the day's regime. Measured false-positive rate at
 
 | design | naive z-test | session-clustered bootstrap |
 |---|---|---|
-| independent rows | 0.040 | 0.068 |
-| session-clustered rows | **0.110** | **0.032** |
+| independent rows | 0.045 | 0.035 |
+| session-clustered rows | **0.110** | **0.055** |
 
 Benjamini-Hochberg then controls the false-discovery rate across the feature
 family, because screening twenty columns at α=0.05 produces one spurious hit per

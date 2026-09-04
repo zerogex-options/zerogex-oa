@@ -57,9 +57,13 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
     seen = used = censored = 0
     skipped: dict[str, int] = {}
 
+    flow_rows = flow_contracts = 0
+
     def progress(result: Any) -> None:
-        nonlocal seen, used
+        nonlocal seen, used, flow_rows, flow_contracts
         seen += 1
+        flow_rows += result.n_flow_rows
+        flow_contracts += result.n_flow_contracts
         if result.skipped_reason:
             skipped[result.skipped_reason] = skipped.get(result.skipped_reason, 0) + 1
         elif result.events:
@@ -95,6 +99,11 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
         "events_total": len(records),
         "events_censored": censored,
         "events_resolved": len(records) - censored,
+        "flow_rows_fetched": flow_rows,
+        "flow_contracts_usable": flow_contracts,
+        "events_with_flow": sum(
+            1 for r in records if (r.get("features") or {}).get("flow_toward_break") is not None
+        ),
         "config": {
             "touch_pct": cfg.touch_pct,
             "break_buffer_pct": cfg.break_buffer_pct,

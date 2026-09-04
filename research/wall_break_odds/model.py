@@ -24,6 +24,7 @@ easy to fool yourself with:
 
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass, field
 from datetime import date
@@ -113,6 +114,50 @@ def base_rate(rows: Sequence[Row]) -> dict[str, Any]:
 CLUSTER_BOOTSTRAP_N = 500
 
 
+def _best_split(values: Sequence[float]) -> Optional[float]:
+    """Threshold ``t`` splitting into ``>= t`` and ``< t`` as evenly as possible.
+
+    A plain median split is wrong for the two shapes this dataset actually
+    contains. A BINARY feature (``spot_above_flip``) whose majority value is 1
+    has median 1, so ``> median`` is empty and the feature reads as "not enough
+    coverage" when the data are perfectly adequate. A MOSTLY-ZERO feature
+    (``wall_migration_toward_break`` — walls hold still most minutes) has median
+    0, and ``> 0`` keeps only the rare migrations.
+
+    ``n_hi(t)`` is monotone decreasing in ``t``, so the most balanced cut is
+    found by binary search over the distinct values and checking the immediate
+    neighbours of the crossing — O(n log n), dominated by the sort. Scanning
+    every distinct value instead is O(distinct x n), which on a continuous
+    column is quadratic; the bootstrap re-splits 500 times per feature, so that
+    difference is the difference between a screen that returns and one that
+    does not.
+    """
+    clean = sorted(v for v in values if v is not None and math.isfinite(v))
+    n = len(clean)
+    if n < 2:
+        return None
+    uniq = sorted(set(clean))
+    if len(uniq) < 2:
+        return None
+    target = n / 2.0
+    lo, hi = 0, len(uniq) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if n - bisect.bisect_left(clean, uniq[mid]) > target:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    best: Optional[float] = None
+    best_balance = -1
+    for idx in range(max(0, hi - 1), min(len(uniq), lo + 2)):
+        t = uniq[idx]
+        n_hi = n - bisect.bisect_left(clean, t)
+        balance = min(n_hi, n - n_hi)
+        if balance > best_balance:
+            best_balance, best = balance, t
+    return best
+
+
 def _cluster_bootstrap_delta(
     pairs: Sequence[tuple[Any, float, int]],
     *,
@@ -135,14 +180,16 @@ def _cluster_bootstrap_delta(
     uncertainty in the split point is priced in too.
 
     Measured false-positive rate at alpha=0.05, on synthetic null data with
-    400 sessions and 1-3 events each (250 trials per cell):
+    300 sessions and 1-3 events each, 200 trials per cell, both arms using the
+    same balanced split so only the p-value differs:
 
         design                     naive z-test    this
-        independent rows               0.040       0.068
-        session-clustered rows         0.110       0.032
+        independent rows               0.045       0.035
+        session-clustered rows         0.110       0.055
 
     The clustered row is the one that matters — it is what the real dataset
-    looks like — and it is the one the naive test gets wrong. Reproduce with
+    looks like — and it is the one the naive test gets wrong, at better than
+    twice the nominal rate. Reproduce with
     ``research/wall_break_odds/README.md`` -> "Checking the screen's
     calibration".
     """
@@ -159,10 +206,11 @@ def _cluster_bootstrap_delta(
         vals = [vb for s in sample for vb in by_session[s]]
         if len(vals) < 2 * MIN_EVENTS_FOR_RATE:
             return None
-        ordered = sorted(v for v, _ in vals)
-        median = ordered[len(ordered) // 2]
-        hi = [b for v, b in vals if v > median]
-        lo = [b for v, b in vals if v <= median]
+        split = _best_split([v for v, _ in vals])
+        if split is None:
+            return None
+        hi = [b for v, b in vals if v >= split]
+        lo = [b for v, b in vals if v < split]
         if not hi or not lo:
             return None
         return sum(hi) / len(hi) - sum(lo) / len(lo)
@@ -211,12 +259,21 @@ def univariate_screen(
         if len(usable) < 2 * MIN_EVENTS_FOR_RATE:
             out.append({"feature": name, "n": len(usable), "reportable": False})
             continue
-        ordered = sorted(v for v, _ in usable)
-        median = ordered[len(ordered) // 2]
-        hi = [b for v, b in usable if v > median]
-        lo = [b for v, b in usable if v <= median]
-        if len(hi) < MIN_EVENTS_FOR_RATE or len(lo) < MIN_EVENTS_FOR_RATE:
+        split = _best_split([v for v, _ in usable])
+        if split is None:
             out.append({"feature": name, "n": len(usable), "reportable": False})
+            continue
+        hi = [b for v, b in usable if v >= split]
+        lo = [b for v, b in usable if v < split]
+        if len(hi) < MIN_EVENTS_FOR_RATE or len(lo) < MIN_EVENTS_FOR_RATE:
+            out.append(
+                {
+                    "feature": name,
+                    "n": len(usable),
+                    "reportable": False,
+                    "reason": "no split leaves both groups above the reporting floor",
+                }
+            )
             continue
         p_hi, p_lo = sum(hi) / len(hi), sum(lo) / len(lo)
         pairs = [
@@ -233,7 +290,7 @@ def univariate_screen(
                 "feature": name,
                 "n": len(usable),
                 "n_sessions": len({s for s, _, _ in pairs}),
-                "median": median,
+                "split_at": split,
                 "rate_above": p_hi,
                 "rate_below": p_lo,
                 "delta": delta,
