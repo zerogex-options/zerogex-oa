@@ -248,6 +248,51 @@ in parallel" plan relies on this). Concretely:
 The derived-only column is the one the audit recommends (B + C); the right-hand column is the price
 of keeping a bid/ask table.
 
+### 5a. Worked example — the setup as it runs today (Branch B)
+
+Everything the site and API do today, sourced from a licensed vendor, decomposes into a fixed block
+plus a per-subscriber block. Figures are the brief's tags: [R] from the 2026-09-02 audit, [K] to
+confirm; none were readable from the authoring environment.
+
+| Fixed, per month | Massive (Business) | Databento | dxFeed |
+| --- | --- | --- | --- |
+| Vendor platform (four asset classes, redistribution-capable tier) | ≈ $1,000–4,000 [K] | ≈ $500–2,000 usage + licence lines [K] | ≈ $2,000–6,000 [K] |
+| OPRA redistribution (vendor) fee | $1,500 [R] | $1,500 [R] | $1,500 [R] |
+| OPRA professional device fees, ingestion servers | 2–4 × $31.50 [R] | same | same |
+| CTA Network B + UTP access / non-display (SPY, QQQ shown live) | ≈ $500–3,000 combined [K] | same | same |
+| Cboe Global Indices Feed (VIX, VXN, SPX values shown live) | ≈ $1,000+ [R] | same | same |
+| Nasdaq GIDS (NDX value) | low hundreds [K] | same | same |
+| CME distributor + Derived Data licence (ES/NQ display, basis projection) | ≈ $500–2,000 [K] | same | same |
+| CME historical distribution, if replay/backtests keep CME data | $30,000 / DCM / year ≈ $2,500 [R] | same | same |
+| **Fixed subtotal** | **≈ $7,000–15,000** | **≈ $6,500–13,000** | **≈ $8,000–17,000** |
+
+| Per subscriber who sees real-time data, per month | Non-professional | Professional |
+| --- | --- | --- |
+| OPRA | $1.25 [R] | $31.50 [R] |
+| CTA Network B (SPY) | ≈ $1 [K] | ≈ $23 [K] |
+| UTP (QQQ) | ≈ $1 [K] | ≈ $24 [K] |
+| Cboe indices (SPX, VIX, VXN) | ≈ $1–2 [K] | ≈ $10–20 [K] |
+| Nasdaq GIDS (NDX) | ≈ $0.50–1 [K] | ≈ $5–10 [K] |
+| CME (ES, NQ) | ≈ $3–15 [K] | ≈ $105–125 [K] |
+| **Per-user subtotal** | **≈ $8–22** | **≈ $200–235** |
+
+Illustration, at a 5% professional share and mid-range figures (≈ $14 non-pro, ≈ $215 pro):
+
+| Paying subscribers | Per-user block / month | Fixed block / month | All-in / month |
+| --- | --- | --- | --- |
+| 100 | ≈ $2,400 | ≈ $7,000–15,000 | **≈ $9,500–17,500** |
+| 300 | ≈ $7,200 | ≈ $7,000–15,000 | **≈ $14,000–22,000** |
+| 1,000 | ≈ $24,000 | ≈ $7,000–15,000 | **≈ $31,000–39,000** |
+
+Three things the table cannot price: the external API customers who receive real-time underlying
+prices today would have to be licensed as sub-vendors or counted as our users (most vendors will refuse
+the former at our size); every subscriber must self-certify pro/non-pro at signup and be reported
+monthly; and a professional true-up on the existing TradeStation accounts is a separate exposure the
+audit already covers. Branch A (derived-only) keeps only the vendor platform, the server device fees,
+the index feeds and the CME professional/derived lines: **≈ $2,000–6,000/mo with no per-user block**,
+which is why the audit's recommendation is B + C.
+
+
 ---
 
 ## 6. Corrections to earlier repo documents
