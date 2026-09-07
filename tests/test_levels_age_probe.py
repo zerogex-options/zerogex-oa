@@ -24,7 +24,7 @@ def _v1_body(as_of: datetime, now: datetime) -> dict:
     return {"symbol": "NQ", "as_of": _z(as_of), "age_seconds": int((now - as_of).total_seconds())}
 
 
-def _v2_body(as_of: datetime, now: datetime) -> dict:
+def _v2_body(as_of: datetime, now: datetime, closed: bool = False) -> dict:
     return {
         "data": _v1_body(as_of, now),
         "freshness": {
@@ -33,7 +33,8 @@ def _v2_body(as_of: datetime, now: datetime) -> dict:
             "source_timestamp": _z(as_of),
             "age_seconds": (now - as_of).total_seconds(),
             "cadence_profile": "analytics_cycle",
-            "freshness_status": "fresh",
+            "market_session_status": "closed" if closed else "regular",
+            "freshness_status": "session_closed" if closed else "fresh",
         },
     }
 
@@ -55,14 +56,24 @@ class FakeServer:
     """Publishes a new snapshot every ``period`` seconds, each born
     ``publish_lag`` seconds old -- the shape the engine actually produces."""
 
-    def __init__(self, clock: FakeClock, period: float, publish_lag: float, v2: bool = True):
+    def __init__(
+        self,
+        clock: FakeClock,
+        period: float,
+        publish_lag: float,
+        v2: bool = True,
+        closed: bool = False,
+    ):
         self.clock = clock
         self.period = period
         self.publish_lag = publish_lag
         self.v2 = v2
+        self.closed = closed
         self.urls: List[str] = []
 
     def visible_as_of(self) -> datetime:
+        if self.closed:
+            return T0 - timedelta(days=2, hours=21)  # Friday's close, seen on a holiday
         # Snapshot stamped S is visible from S + publish_lag onward.
         elapsed = (self.clock.now - T0).total_seconds() - self.publish_lag
         cycles = int(elapsed // self.period)
@@ -72,7 +83,9 @@ class FakeServer:
         self.urls.append(url)
         now = self.clock.now
         if "/api/v2/" in url:
-            return (200, _v2_body(self.visible_as_of(), now)) if self.v2 else (404, None)
+            if not self.v2:
+                return 404, None
+            return 200, _v2_body(self.visible_as_of(), now, closed=self.closed)
         return 200, _v1_body(self.visible_as_of(), now)
 
 
@@ -93,6 +106,7 @@ def test_v2_sample_uses_the_server_clock_and_the_envelope_age():
     assert sample.as_of == T0
     assert sample.age_seconds == 70.0
     assert sample.advanced is False
+    assert (sample.session, sample.freshness) == ("regular", "fresh")
 
 
 def test_v1_sample_falls_back_to_the_body_and_the_client_clock():
@@ -144,6 +158,34 @@ def test_format_report_warns_when_too_few_snapshots_were_seen():
     text = probe.format_report(probe.summarize([one]), interval=5.0)
     assert "fewer than three snapshots" in text
     assert "n/a" in text
+
+
+def test_format_report_names_a_frozen_snapshot_for_what_it_is():
+    frozen = [
+        probe.take_sample(_v1_body(T0, T0 + timedelta(seconds=5 * i)), T0, 1, previous=None)
+        for i in range(12)
+    ]
+    text = probe.format_report(probe.summarize(frozen), interval=5.0)
+    assert "never advanced" in text
+    assert "cash session" in text
+
+
+def test_fmt_age_reads_like_a_person_would():
+    assert probe.fmt_age(63.24) == "63.2s"
+    assert probe.fmt_age(750) == "12m 30s"
+    assert probe.fmt_age(3 * 3600 + 5 * 60) == "3h 5m"
+    assert probe.fmt_age(250617) == "2d 21h 36m"
+    assert probe.fmt_age(None) == "-"
+
+
+def test_should_print_keeps_the_first_the_advances_and_a_heartbeat():
+    quiet = probe.take_sample(_v1_body(T0, T0), T0, 1, previous=None)
+    moved = probe.take_sample(_v1_body(T0 + timedelta(seconds=60), T0), T0, 1, previous=quiet)
+    assert probe.should_print(quiet, 0, 12, verbose=False)
+    assert not probe.should_print(quiet, 1, 12, verbose=False)
+    assert probe.should_print(quiet, 12, 12, verbose=False)
+    assert probe.should_print(moved, 7, 12, verbose=False)
+    assert probe.should_print(quiet, 7, 12, verbose=True)
 
 
 def test_percentile_interpolates():
@@ -226,6 +268,60 @@ def test_a_dead_server_is_given_up_on_after_repeated_failures():
     assert code == 2
     assert samples == []
     assert len(calls) == probe.MAX_CONSECUTIVE_FAILURES
+
+
+def test_a_closed_session_ends_the_run_before_the_second_sample():
+    clock = FakeClock(T0)
+    server = FakeServer(clock, period=60.0, publish_lag=35.0, closed=True)
+    messages: List[str] = []
+    samples, code = probe.run_probe(
+        fetch=server,
+        base_url="https://x",
+        symbol="NQ",
+        interval=5.0,
+        duration_seconds=3600.0,
+        clock=clock,
+        sleep=clock.sleep,
+        log=messages.append,
+    )
+    assert code == probe.EXIT_NOTHING_TO_MEASURE
+    assert len(samples) == 1
+    assert any("session closed" in m for m in messages)
+
+
+def test_force_polls_a_closed_session_anyway():
+    clock = FakeClock(T0)
+    server = FakeServer(clock, period=60.0, publish_lag=35.0, closed=True)
+    samples, code = probe.run_probe(
+        fetch=server,
+        base_url="https://x",
+        symbol="NQ",
+        interval=5.0,
+        duration_seconds=30.0,
+        clock=clock,
+        sleep=clock.sleep,
+        log=lambda _m: None,
+        force=True,
+    )
+    assert code == probe.EXIT_OK
+    # Samples land at 0, 5, ... 30s inclusive: seven of them.
+    assert len(samples) == 7
+
+
+def test_v1_with_a_stale_first_sample_is_treated_as_closed():
+    stale_as_of = T0 - timedelta(hours=1)
+    samples, code = probe.run_probe(
+        fetch=lambda _url: (404, None) if "/v2/" in _url else (200, _v1_body(stale_as_of, T0)),
+        base_url="https://x",
+        symbol="NQ",
+        interval=5.0,
+        duration_seconds=3600.0,
+        clock=FakeClock(T0),
+        sleep=lambda _s: None,
+        log=lambda _m: None,
+    )
+    assert code == probe.EXIT_NOTHING_TO_MEASURE
+    assert len(samples) == 1
 
 
 def test_once_takes_exactly_one_sample():

@@ -25,13 +25,24 @@ What it reports, and how to read it:
   cycle, so this is the distribution its info panel shows before its own
   poll wait is added on top.
 
+Run it during the cash session. Outside one nothing advances -- the first
+run of this tool spent an hour on Labor Day watching Friday's 15:59 ET
+snapshot get older -- so when the first answer says the session is closed,
+or the snapshot is already more than half an hour old, the tool says so and
+stops (exit 3). ``--force`` polls anyway.
+
+Two things bound what the API can tell you. The service sits behind a
+5-second nginx response cache keyed by URL and key, so sampling faster than
+5s buys nothing and every age here can trail the app by up to 5s. And on
+this endpoint ``generated_at`` equals ``as_of`` -- the API does not expose
+when the analytics row was written -- so the API alone cannot split "age at
+publish" into chain lag versus compute time. That split needs the engine's
+own timing log.
+
 The v2 envelope is preferred because ``evaluated_at`` is the server's clock,
-so the age needs no trust in the laptop's clock; the tool falls back to v1
-(``as_of`` + ``age_seconds``, also server-computed) when v2 is not deployed.
-On this endpoint ``generated_at`` equals ``as_of`` -- the API does not
-expose when the analytics row was written -- so the API alone cannot split
-"age at publish" into chain lag versus compute time. That split needs the
-engine's own timing log.
+so the age needs no trust in the laptop's clock, and because it carries the
+session status; the tool falls back to v1 (``as_of`` + ``age_seconds``, also
+server-computed) when v2 is not deployed.
 
 Deliberately stdlib-only (urllib, no requests/httpx), like
 ``v2_envelope_check``, so it runs from a bare laptop or a deploy shell.
@@ -39,6 +50,8 @@ Deliberately stdlib-only (urllib, no requests/httpx), like
 Exit codes:
     0 -- probe completed.
     2 -- could not reach the server, or the key was refused.
+    3 -- nothing to measure: the session is closed or the snapshot is
+         frozen (override with --force).
 
 Usage:
     API_KEY=... python -m src.tools.levels_age_probe --symbol NQ --minutes 60
@@ -69,6 +82,18 @@ USER_AGENT = "zerogex-levels-age-probe"
 # dropped connection should not end an hour-long probe; a dead server should.
 MAX_CONSECUTIVE_FAILURES = 6
 
+# A first sample older than this means the market is closed or the engine is
+# not publishing; either way an hour of polling would measure nothing. Half
+# an hour is thirty cycles: no healthy session ever shows that.
+STALE_AT_START_SECONDS = 30 * 60
+
+# The v2 freshness_status that says the feed is not expected to move.
+SESSION_CLOSED = "session_closed"
+
+EXIT_OK = 0
+EXIT_UNREACHABLE = 2
+EXIT_NOTHING_TO_MEASURE = 3
+
 FetchFn = Callable[[str], Tuple[int, Optional[dict]]]
 
 
@@ -82,6 +107,8 @@ class Sample:
     age_seconds: Optional[float]
     api_version: int
     advanced: bool  # as_of moved since the previous sample
+    session: Optional[str] = None  # v2 market_session_status
+    freshness: Optional[str] = None  # v2 freshness_status
 
 
 @dataclass(frozen=True)
@@ -106,6 +133,37 @@ def parse_iso(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def fmt_age(seconds: Optional[float]) -> str:
+    """Seconds as a person reads them: 63.2s, 12m 30s, 2d 21h 36m."""
+    if seconds is None:
+        return "-"
+    total = max(0.0, seconds)
+    if total < 600:
+        return f"{total:.1f}s"
+    minutes = int(total // 60)
+    if minutes < 120:
+        return f"{minutes}m {int(total - minutes * 60)}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h {minutes}m"
+
+
+def fmt_when(moment: Optional[datetime]) -> str:
+    """A timestamp in UTC and, where the tz database allows, New York time."""
+    if moment is None:
+        return "-"
+    text = moment.strftime("%Y-%m-%d %H:%M:%S UTC")
+    try:
+        from zoneinfo import ZoneInfo
+
+        text += moment.astimezone(ZoneInfo("America/New_York")).strftime(" (%H:%M:%S ET)")
+    except Exception:  # noqa: BLE001 - no tz database on this machine is fine
+        pass
+    return text
 
 
 def levels_url(base_url: str, version: int, symbol: str) -> str:
@@ -142,15 +200,18 @@ def take_sample(
     body: dict, sample_at: datetime, api_version: int, previous: Optional[Sample]
 ) -> Sample:
     """Reduce one response body to the few fields the probe reasons about."""
+    session = freshness = None
     if api_version == 2:
-        freshness = body.get("freshness") or {}
+        envelope = body.get("freshness") or {}
         data = body.get("data") or {}
-        evaluated_raw = freshness.get("evaluated_at")
+        evaluated_raw = envelope.get("evaluated_at")
         evaluated_at = parse_iso(evaluated_raw) if evaluated_raw else sample_at
-        as_of_raw = data.get("as_of") or freshness.get("source_timestamp")
-        age = freshness.get("age_seconds")
+        as_of_raw = data.get("as_of") or envelope.get("source_timestamp")
+        age = envelope.get("age_seconds")
         if age is None:
             age = data.get("age_seconds")
+        session = envelope.get("market_session_status")
+        freshness = envelope.get("freshness_status")
     else:
         evaluated_at = sample_at
         as_of_raw = body.get("as_of")
@@ -168,7 +229,31 @@ def take_sample(
         age_seconds=float(age) if age is not None else None,
         api_version=api_version,
         advanced=advanced,
+        session=session,
+        freshness=freshness,
     )
+
+
+def nothing_to_measure(first: Sample) -> Optional[str]:
+    """Why polling on from ``first`` would measure nothing, or None.
+
+    v2 says it outright through ``freshness_status``. v1 has no such field,
+    so the age has to speak: a snapshot already half an hour old at the
+    start is a closed market or a silent engine, and an hour of samples of
+    it is an hour of the same number.
+    """
+    if first.freshness == SESSION_CLOSED:
+        return (
+            f"the API reports the session closed (market_session_status="
+            f"{first.session}); the newest snapshot is from {fmt_when(first.as_of)}"
+        )
+    if first.age_seconds is not None and first.age_seconds > STALE_AT_START_SECONDS:
+        return (
+            f"the newest snapshot is already {fmt_age(first.age_seconds)} old "
+            f"(as_of {fmt_when(first.as_of)}): the market is closed or the "
+            "engine is not publishing"
+        )
+    return None
 
 
 def summarize(samples: Sequence[Sample]) -> Summary:
@@ -220,8 +305,11 @@ def percentile(values: Sequence[float], pct: float) -> float:
 def _stats(values: Sequence[float]) -> str:
     if not values:
         return "n/a"
-    return "min {:.0f}s  median {:.0f}s  p90 {:.0f}s  max {:.0f}s".format(
-        min(values), statistics.median(values), percentile(values, 90), max(values)
+    return "min {}  median {}  p90 {}  max {}".format(
+        fmt_age(min(values)),
+        fmt_age(statistics.median(values)),
+        fmt_age(percentile(values, 90)),
+        fmt_age(max(values)),
     )
 
 
@@ -230,10 +318,16 @@ def format_report(summary: Summary, interval: float) -> str:
         f"samples: {summary.samples}   distinct snapshots: {summary.snapshots}",
         f"cycle period (as_of to as_of):   {_stats(summary.period_seconds)}",
         f"age at publish (first sight):    {_stats(summary.publish_age_seconds)}"
-        f"   [resolution {interval:.0f}s: true value up to that much lower]",
+        f"   [resolution {interval:.0f}s plus the 5s edge cache: true value is lower]",
         f"age seen by a random poll:       {_stats(summary.ages)}",
     ]
-    if summary.snapshots < 3:
+    if summary.snapshots == 1 and summary.samples > 1:
+        lines.append(
+            "as_of never advanced during the run: the market was closed or the "
+            "engine is not publishing. Run this during the cash session "
+            "(09:30-16:00 ET on a trading day)."
+        )
+    elif summary.snapshots < 3:
         lines.append(
             "fewer than three snapshots observed; run longer than two cycles "
             "for the period and publish-age lines to mean anything"
@@ -263,6 +357,14 @@ def summary_json(summary: Summary, interval: float) -> Dict[str, object]:
     }
 
 
+def should_print(sample: Sample, index: int, heartbeat_every: int, verbose: bool) -> bool:
+    """Which samples earn a line: every one when verbose; otherwise the
+    first, each advance, and one heartbeat per ``heartbeat_every``."""
+    if verbose or sample.advanced:
+        return True
+    return index % max(1, heartbeat_every) == 0
+
+
 def run_probe(
     fetch: FetchFn,
     base_url: str,
@@ -273,13 +375,14 @@ def run_probe(
     sleep: Callable[[float], None] = time.sleep,
     on_sample: Optional[Callable[[Sample], None]] = None,
     log: Callable[[str], None] = lambda message: print(message, file=sys.stderr),
+    force: bool = False,
 ) -> Tuple[List[Sample], int]:
     """Poll until ``duration_seconds`` elapse; ``(samples, exit_code)``.
 
     Tries v2 first for its server-clock ``evaluated_at`` and drops to v1 for
     the rest of the run on a 404, which is what an API without the v2 mirror
     answers. A refused key ends the run immediately: every later sample
-    would fail the same way.
+    would fail the same way. So does a closed market, unless ``force``.
     """
     version = 2
     samples: List[Sample] = []
@@ -295,7 +398,7 @@ def run_probe(
             # An hour of samples is worth a report even if the trader got
             # bored at fifty minutes.
             log("interrupted; summarizing what was collected")
-            return samples, 0
+            return samples, EXIT_OK
 
         if status == 404 and version == 2:
             log("v2 not available here; continuing with v1")
@@ -303,16 +406,16 @@ def run_probe(
             continue
         if status == 404:
             log(f"HTTP 404 from v1 as well: no levels for {symbol.upper()} (check --symbol)")
-            return samples, 2
+            return samples, EXIT_UNREACHABLE
         if status in (401, 403):
             log(f"key refused (HTTP {status}); nothing to measure")
-            return samples, 2
+            return samples, EXIT_UNREACHABLE
         if body is None:
             failures += 1
             log(f"fetch failed (HTTP {status}); {failures} consecutive")
             if failures >= MAX_CONSECUTIVE_FAILURES:
                 log("giving up")
-                return samples, 2
+                return samples, EXIT_UNREACHABLE
         else:
             failures = 0
             sample = take_sample(body, now, version, previous)
@@ -320,23 +423,34 @@ def run_probe(
             previous = sample
             if on_sample is not None:
                 on_sample(sample)
+            if len(samples) == 1 and duration_seconds > 0:
+                reason = nothing_to_measure(sample)
+                if reason is not None:
+                    if force:
+                        log(f"note: {reason}; polling anyway (--force)")
+                    else:
+                        log(f"stopping: {reason}. Run during the cash session, "
+                            "or pass --force to poll anyway.")
+                        return samples, EXIT_NOTHING_TO_MEASURE
 
         if (clock() - started).total_seconds() + interval > duration_seconds:
-            return samples, 0
+            return samples, EXIT_OK
         try:
             sleep(interval)
         except KeyboardInterrupt:
             log("interrupted; summarizing what was collected")
-            return samples, 0
+            return samples, EXIT_OK
 
 
-def _print_sample(sample: Sample) -> None:
+def format_sample(sample: Sample) -> str:
     as_of = sample.as_of.strftime("%H:%M:%S") if sample.as_of else "-"
-    age = f"{sample.age_seconds:6.1f}s" if sample.age_seconds is not None else "     -"
     marker = "  NEW SNAPSHOT" if sample.advanced else ""
-    print(
+    status = ""
+    if sample.session or sample.freshness:
+        status = f"  [{sample.session or '?'}/{sample.freshness or '?'}]"
+    return (
         f"{sample.sample_at.strftime('%H:%M:%S')}  as_of {as_of}  "
-        f"age {age}  v{sample.api_version}{marker}"
+        f"age {fmt_age(sample.age_seconds):>10}  v{sample.api_version}{status}{marker}"
     )
 
 
@@ -344,7 +458,16 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
-            ["sample_at", "evaluated_at", "as_of", "age_seconds", "api_version", "advanced"]
+            [
+                "sample_at",
+                "evaluated_at",
+                "as_of",
+                "age_seconds",
+                "api_version",
+                "advanced",
+                "session",
+                "freshness",
+            ]
         )
         for s in samples:
             writer.writerow(
@@ -355,6 +478,8 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                     "" if s.age_seconds is None else f"{s.age_seconds:.3f}",
                     s.api_version,
                     int(s.advanced),
+                    s.session or "",
+                    s.freshness or "",
                 ]
             )
 
@@ -372,26 +497,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--interval",
         type=float,
         default=5.0,
-        help="seconds between samples (default 5; this is also the resolution)",
+        help=(
+            "seconds between samples (default 5, which is also the edge cache; "
+            "faster buys nothing)"
+        ),
     )
     parser.add_argument("--minutes", type=float, default=30.0, help="how long to run (default 30)")
     parser.add_argument("--once", action="store_true", help="take one sample and exit")
+    parser.add_argument("--force", action="store_true", help="keep polling on a closed market")
     parser.add_argument("--csv", metavar="PATH", help="write every sample to this CSV")
     parser.add_argument("--json", action="store_true", help="print the summary as JSON")
-    parser.add_argument("--quiet", action="store_true", help="do not print per-sample lines")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print every sample, not just advances and heartbeats",
+    )
+    parser.add_argument("--quiet", action="store_true", help="print no per-sample lines")
     args = parser.parse_args(argv)
 
     if not args.api_key:
         print("no API key: pass --api-key or set API_KEY", file=sys.stderr)
-        return 2
+        return EXIT_UNREACHABLE
     if args.interval <= 0:
         print("--interval must be positive", file=sys.stderr)
-        return 2
+        return EXIT_UNREACHABLE
 
     duration = 0.0 if args.once else args.minutes * 60.0
+    heartbeat_every = max(1, round(60.0 / args.interval))
+    counter = {"n": 0}
+
+    def on_sample(sample: Sample) -> None:
+        index = counter["n"]
+        counter["n"] += 1
+        if should_print(sample, index, heartbeat_every, args.verbose):
+            print(format_sample(sample))
 
     def fetch(url: str) -> Tuple[int, Optional[dict]]:
         return fetch_json(url, args.api_key)
+
+    if not args.once:
+        print(
+            f"probing {args.symbol.upper()} at {args.base_url} every {args.interval:g}s "
+            f"for {args.minutes:g} min; printing advances and one line a minute"
+            + (" (verbose)" if args.verbose else ""),
+            file=sys.stderr,
+        )
 
     samples, code = run_probe(
         fetch=fetch,
@@ -399,11 +549,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         symbol=args.symbol,
         interval=args.interval,
         duration_seconds=duration,
-        on_sample=None if args.quiet else _print_sample,
+        on_sample=None if args.quiet else on_sample,
+        force=args.force,
     )
 
     if args.csv and samples:
         _write_csv(args.csv, samples)
+
+    if code == EXIT_NOTHING_TO_MEASURE:
+        return code
 
     summary = summarize(samples)
     if args.json:
