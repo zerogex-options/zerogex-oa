@@ -41,6 +41,21 @@ Guardrails that are part of the method, not decoration:
 * **Confidence gating.** Results are additionally reported restricted to
   snapshots whose inventory confidence is high, which is what separates "the
   methodology failed" from "the reconstruction was too incomplete to tell".
+
+Three-arm extension
+-------------------
+The two-arm functions above compare the production reading with the
+Market-Maker Attributed one.  The ``arms_*`` functions generalise the same
+families to every positioning arm present in the rows — Production Modeled
+GEX, Aggressor-Inferred MM GEX (production-anchored, B2) and Market-Maker
+Attributed GEX (C) — always against the production baseline, on identical
+rows and identical outcome definitions.  :func:`hedge_pressure_test` is a
+separate family for the two *flow* arms (B1 and C-flow-since-open): a change
+in gamma-weighted inferred/attributed positioning is a different object from a
+static level and is tested as one.  :func:`validation_split_test` re-runs the
+headline families on a chronological development segment and an untouched
+validation segment, so a verdict can be checked for direction on data the
+thresholds never saw.
 """
 
 from __future__ import annotations
@@ -61,6 +76,9 @@ from research.mm_attributed_gex.outcomes import (
 
 __all__ = [
     "MIN_SAMPLE_FOR_CONCLUSION",
+    "ARMS",
+    "FLOW_ARMS",
+    "ArmColumns",
     "ExperimentConfig",
     "ExperimentResult",
     "attach_outcomes",
@@ -70,6 +88,13 @@ __all__ = [
     "wall_test",
     "incremental_value_test",
     "confluence_test",
+    "arms_present",
+    "arms_regime_test",
+    "arms_flip_test",
+    "arms_wall_test",
+    "arms_incremental_test",
+    "hedge_pressure_test",
+    "validation_split_test",
 ]
 
 #: Below this many observations a comparison is reported but explicitly not
@@ -98,6 +123,13 @@ class ExperimentConfig:
     walk_forward_folds: int = 5
     seed: int = 20260821
     large_move_bps: float = 50.0
+    #: Snapshots back over which a flow arm's CHANGE is measured (same session).
+    pressure_lookback_snapshots: int = 3
+    #: Chronological share of sessions that form the development segment; the
+    #: remainder is the validation segment the thresholds never touched.
+    development_share: float = 0.60
+    #: Sessions needed before a validation segment is carved out at all.
+    min_sessions_for_validation: int = 40
 
 
 @dataclass
@@ -115,6 +147,10 @@ class ExperimentResult:
     controls: dict[str, Any] = field(default_factory=dict)
     multiplicity: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    #: Three-arm families (present only when more than the production arm is).
+    arms: dict[str, Any] = field(default_factory=dict)
+    hedge_pressure: dict[str, Any] = field(default_factory=dict)
+    validation: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +165,9 @@ class ExperimentResult:
             "controls": self.controls,
             "multiplicity": self.multiplicity,
             "warnings": self.warnings,
+            "arms": self.arms,
+            "hedge_pressure": self.hedge_pressure,
+            "validation": self.validation,
         }
 
 
@@ -784,7 +823,17 @@ def incremental_value_test(
     features = _build_features(rows)
     baseline = {k: features[k] for k in _BASELINE_TERMS}
     enhanced = {**baseline, **{k: features[k] for k in _MM_TERMS}}
+    return _incremental_block(rows, baseline, enhanced, config, sampling_minutes)
 
+
+def _incremental_block(
+    rows: Sequence[Mapping[str, Any]],
+    baseline: Mapping[str, np.ndarray],
+    enhanced: Mapping[str, np.ndarray],
+    config: ExperimentConfig,
+    sampling_minutes: int,
+) -> dict[str, Any]:
+    """The per-horizon nested-model / classification / walk-forward loop."""
     out: dict[str, Any] = {"ok": True, "n_rows": len(rows), "horizons": {}}
     for h in config.horizons:
         lags = _block_size(h, sampling_minutes)
@@ -1131,6 +1180,39 @@ def run_experiment(
     result.incremental = incremental_value_test(scored, config, sampling_minutes=sampling_minutes)
     result.confluence = confluence_test(scored, config)
 
+    # Three-arm families, when anything beyond the production arm is present.
+    present = arms_present(scored)
+    b_rows = [r for r in scored if _finite_number(r.get(ARMS["aggressor_anchored"].gamma_at_spot))]
+    result.coverage["arms_present"] = present
+    result.coverage["aggressor_row_share"] = (len(b_rows) / len(scored)) if scored else 0.0
+    result.coverage["aggressor_mean_classified_share"] = (
+        float(np.mean(_values(b_rows, "aggressor_classified_share"))) if b_rows else None
+    )
+    result.coverage["aggressor_extrapolated_share"] = (
+        float(np.mean([1.0 if r.get("aggressor_extrapolated") else 0.0 for r in b_rows]))
+        if b_rows
+        else None
+    )
+    if len(present) > 1:
+        result.arms = {
+            "present": present,
+            "labels": {name: ARMS[name].label for name in present},
+            "regime": arms_regime_test(
+                scored, config, sampling_minutes=sampling_minutes, arms=present
+            ),
+            "flip": arms_flip_test(scored, config, sampling_minutes=sampling_minutes, arms=present),
+            "walls": arms_wall_test(scored, config, arms=present),
+            "incremental": arms_incremental_test(
+                scored, config, sampling_minutes=sampling_minutes, arms=present
+            ),
+        }
+        result.hedge_pressure = hedge_pressure_test(
+            scored, config, sampling_minutes=sampling_minutes
+        )
+        result.validation = validation_split_test(
+            scored, config, sampling_minutes=sampling_minutes, arms=present
+        )
+
     controls: dict[str, Any] = {}
     for name, subset in _control_splits(scored, config).items():
         entry: dict[str, Any] = {"n": len(subset)}
@@ -1151,6 +1233,8 @@ def run_experiment(
             "walls": result.walls,
             "incremental": result.incremental,
             "confluence": result.confluence,
+            "arms": result.arms,
+            "hedge_pressure": result.hedge_pressure,
         }
     )
     flags = st.benjamini_hochberg([p for _, p in p_values])
@@ -1187,4 +1271,554 @@ def _incremental_summary(inc: Mapping[str, Any]) -> dict[str, Any]:
             "folds_improved": wf.get("folds_improved"),
             "n_folds": wf.get("n_folds"),
         }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 6. Three-arm families — every arm against the production baseline
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ArmColumns:
+    """Where one positioning arm's readings live in a dataset row."""
+
+    label: str
+    gamma_at_spot: str
+    flip: Optional[str] = None
+    net_gex: Optional[str] = None
+    call_wall: Optional[str] = None
+    put_wall: Optional[str] = None
+    b_call_wall: Optional[str] = None
+    b_put_wall: Optional[str] = None
+    negative_gamma_share: Optional[str] = None
+    concentration_hhi: Optional[str] = None
+
+
+#: The static (level) arms.  Labels are the mandatory terminology.
+ARMS: Mapping[str, ArmColumns] = {
+    "production": ArmColumns(
+        label="Production Modeled GEX (A)",
+        gamma_at_spot="existing_dealer_gamma_at_spot",
+        flip="existing_gamma_flip",
+        net_gex="existing_net_gex",
+        call_wall="existing_call_wall",
+        put_wall="existing_put_wall",
+    ),
+    "aggressor_anchored": ArmColumns(
+        label="Aggressor-Inferred MM GEX, production-anchored (B2)",
+        gamma_at_spot="production_anchored_aggressor_gamma_at_spot",
+        flip="production_anchored_aggressor_gamma_flip",
+        net_gex="production_anchored_aggressor_net_gex",
+        call_wall="production_anchored_aggressor_call_wall",
+        put_wall="production_anchored_aggressor_put_wall",
+        b_call_wall="production_anchored_aggressor_b_call_wall",
+        b_put_wall="production_anchored_aggressor_b_put_wall",
+        negative_gamma_share="production_anchored_aggressor_negative_gamma_share",
+        concentration_hhi="production_anchored_aggressor_concentration_hhi",
+    ),
+    "mm_attributed": ArmColumns(
+        label="Market-Maker Attributed GEX (C)",
+        gamma_at_spot="mm_attributed_gamma_at_spot",
+        flip="mm_attributed_gamma_flip",
+        net_gex="mm_attributed_net_gex",
+        call_wall="mm_attributed_call_wall",
+        put_wall="mm_attributed_put_wall",
+        b_call_wall="mm_attributed_b_call_wall",
+        b_put_wall="mm_attributed_b_put_wall",
+        negative_gamma_share="mm_negative_gamma_share",
+        concentration_hhi="mm_concentration_hhi",
+    ),
+}
+
+#: The flow (change-since-open) arms for the dynamic hedge-pressure family.
+FLOW_ARMS: Mapping[str, tuple[str, str]] = {
+    "aggressor_flow": (
+        "Aggressor-Inferred MM flow since open (B1)",
+        "aggressor_mm_flow_gamma_at_spot",
+    ),
+    "mm_attributed_flow": (
+        "Market-Maker Attributed flow since open (C)",
+        "mm_attributed_flow_gamma_at_spot",
+    ),
+}
+
+
+def _finite_number(v: Any) -> bool:
+    return (
+        isinstance(v, (int, float))
+        and not isinstance(v, bool)
+        and not (isinstance(v, float) and math.isnan(v))
+    )
+
+
+def arms_present(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Arms with at least one non-null gamma-at-spot reading; production first."""
+    out = ["production"]
+    for name, cols in ARMS.items():
+        if name == "production":
+            continue
+        if any(_finite_number(r.get(cols.gamma_at_spot)) for r in rows):
+            out.append(name)
+    return out
+
+
+def _better(base_d: Optional[float], arm_d: Optional[float], undecided: bool) -> Optional[str]:
+    if base_d is None or arm_d is None or undecided:
+        return None
+    if abs(arm_d) > abs(base_d) * 1.10:
+        return "arm"
+    if abs(base_d) > abs(arm_d) * 1.10:
+        return "production"
+    return "tie"
+
+
+def _pairwise_separation(base: Mapping[str, Any], arm: Mapping[str, Any]) -> dict[str, Any]:
+    """Per measure·horizon effect sizes of two regime arms, and who separates more."""
+    out: dict[str, Any] = {}
+    undecided = bool(base.get("note") or arm.get("note"))
+    for label, _ in _REGIME_MEASURES:
+        b_meas = base["measures"].get(label, {})
+        a_meas = arm["measures"].get(label, {})
+        for horizon in sorted(set(b_meas) | set(a_meas)):
+            b = b_meas.get(horizon, {}).get("welch", {})
+            a = a_meas.get(horizon, {}).get("welch", {})
+            b_d, a_d = b.get("cohens_d"), a.get("cohens_d")
+            if b_d is None or a_d is None:
+                continue
+            out[f"{label}.{horizon}"] = {
+                "production_effect_size": b_d,
+                "arm_effect_size": a_d,
+                "production_p": b.get("p_value"),
+                "arm_p": a.get("p_value"),
+                "abs_effect_ratio": (abs(a_d) / abs(b_d)) if b_d else None,
+                "better": _better(b_d, a_d, undecided),
+            }
+    return out
+
+
+def _tally(separation: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    verdicts = [v.get("better") for v in separation.values()]
+    decided = [v for v in verdicts if v]
+    return {
+        "comparisons": len(verdicts),
+        "arm_better": sum(1 for v in decided if v == "arm"),
+        "production_better": sum(1 for v in decided if v == "production"),
+        "tie": sum(1 for v in decided if v == "tie"),
+        "undecided": len(verdicts) - len(decided),
+        "arm_better_share": (
+            (sum(1 for v in decided if v == "arm") / len(decided)) if decided else None
+        ),
+    }
+
+
+def _aligned(rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> list[Mapping[str, Any]]:
+    """Rows where every listed column is a finite number — identical rows for every arm."""
+    return [r for r in rows if all(_finite_number(r.get(c)) for c in columns)]
+
+
+def arms_regime_test(
+    rows: Sequence[Mapping[str, Any]],
+    config: ExperimentConfig = ExperimentConfig(),
+    *,
+    sampling_minutes: int = 5,
+    arms: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """Regime discrimination for every arm, each compared with production.
+
+    All arms are scored on the SAME rows — those where every present arm has a
+    reading — so a coverage difference cannot be read as a methodology
+    difference.
+    """
+    present = list(arms or arms_present(rows))
+    aligned = _aligned(rows, [ARMS[a].gamma_at_spot for a in present])
+    per_arm = {
+        name: _regime_arm(aligned, ARMS[name].gamma_at_spot, config, sampling_minutes)
+        for name in present
+    }
+    vs_production: dict[str, Any] = {}
+    summary: dict[str, Any] = {}
+    for name in present:
+        if name == "production":
+            continue
+        sep = _pairwise_separation(per_arm["production"], per_arm[name])
+        vs_production[name] = sep
+        summary[name] = _tally(sep)
+    return {
+        "n_aligned": len(aligned),
+        "arms": per_arm,
+        "vs_production": vs_production,
+        "summary": summary,
+    }
+
+
+def _flip_agreement_columns(
+    rows: Sequence[Mapping[str, Any]], base_col: str, other_col: str
+) -> dict[str, Any]:
+    same = 0
+    total = 0
+    gaps: list[float] = []
+    for row in rows:
+        e, m, spot = row.get(base_col), row.get(other_col), row.get("spot")
+        if not all(_finite_number(v) for v in (e, m, spot)) or not spot:
+            continue
+        total += 1
+        if (float(spot) > float(e)) == (float(spot) > float(m)):
+            same += 1
+        gaps.append(10_000.0 * (float(m) - float(e)) / float(spot))
+    return {
+        "n": total,
+        "same_side_rate": (same / total) if total else None,
+        "flip_gap_bps": st.describe(gaps).as_dict() if gaps else None,
+    }
+
+
+def arms_flip_test(
+    rows: Sequence[Mapping[str, Any]],
+    config: ExperimentConfig = ExperimentConfig(),
+    *,
+    sampling_minutes: int = 5,
+    arms: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """Above / below / crossing each arm's flip, compared with production's."""
+    present = [a for a in (arms or arms_present(rows)) if ARMS[a].flip]
+    per_arm = {
+        name: _flip_arm(rows, ARMS[name].flip or "", config, sampling_minutes) for name in present
+    }
+    comparison: dict[str, Any] = {}
+    agreement: dict[str, Any] = {}
+    for name in present:
+        if name == "production":
+            continue
+        per_h: dict[str, Any] = {}
+        undecided = bool(per_arm["production"].get("note") or per_arm[name].get("note"))
+        for h in config.horizons:
+            key = f"{h}m"
+            b = (
+                per_arm["production"]["by_horizon"]
+                .get(key, {})
+                .get("realized_vol", {})
+                .get("welch", {})
+            )
+            a = per_arm[name]["by_horizon"].get(key, {}).get("realized_vol", {}).get("welch", {})
+            b_d, a_d = b.get("cohens_d"), a.get("cohens_d")
+            if b_d is None or a_d is None:
+                continue
+            per_h[key] = {
+                "production_effect_size": b_d,
+                "arm_effect_size": a_d,
+                "better": _better(b_d, a_d, undecided),
+            }
+        comparison[name] = per_h
+        agreement[name] = _flip_agreement_columns(
+            rows, ARMS["production"].flip or "", ARMS[name].flip or ""
+        )
+    return {"arms": per_arm, "vs_production": comparison, "agreement": agreement}
+
+
+def arms_wall_test(
+    rows: Sequence[Mapping[str, Any]],
+    config: ExperimentConfig = ExperimentConfig(),
+    *,
+    arms: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """Identical wall-touch definitions across arms; rejection compared with production."""
+    present = [a for a in (arms or arms_present(rows)) if ARMS[a].call_wall and ARMS[a].put_wall]
+    per_arm: dict[str, Any] = {}
+    for name in present:
+        cols = ARMS[name]
+        entry = {
+            "call_wall": _wall_arm(rows, cols.call_wall or "", "call", config),
+            "put_wall": _wall_arm(rows, cols.put_wall or "", "put", config),
+        }
+        if cols.b_call_wall and cols.b_put_wall:
+            entry["b_call_wall"] = _wall_arm(rows, cols.b_call_wall, "call", config)
+            entry["b_put_wall"] = _wall_arm(rows, cols.b_put_wall, "put", config)
+        per_arm[name] = entry
+
+    comparison: dict[str, Any] = {}
+    for name in present:
+        if name == "production":
+            continue
+        comparison[name] = {}
+        for side in ("call", "put"):
+            base = per_arm["production"][f"{side}_wall"]
+            arm = per_arm[name][f"{side}_wall"]
+            block: dict[str, Any] = {
+                "production_rejection_rate_30m": base.get("rejection_rate_30m"),
+                "arm_rejection_rate_30m": arm.get("rejection_rate_30m"),
+                "production_n": base.get("n_at_wall"),
+                "arm_n": arm.get("n_at_wall"),
+            }
+            if (
+                base.get("rejection_rate_30m") is not None
+                and arm.get("rejection_rate_30m") is not None
+                and base.get("n_at_wall")
+                and arm.get("n_at_wall")
+            ):
+                block["arm_vs_production"] = st.compare_proportions(
+                    int(round(arm["rejection_rate_30m"] * arm["n_at_wall"])),
+                    arm["n_at_wall"],
+                    int(round(base["rejection_rate_30m"] * base["n_at_wall"])),
+                    base["n_at_wall"],
+                ).as_dict()
+            base_col = (
+                ARMS["production"].call_wall if side == "call" else ARMS["production"].put_wall
+            )
+            arm_col = ARMS[name].call_wall if side == "call" else ARMS[name].put_wall
+            same = 0
+            total = 0
+            for row in rows:
+                e, m = row.get(base_col), row.get(arm_col)
+                if not (_finite_number(e) and _finite_number(m)):
+                    continue
+                total += 1
+                same += int(float(e) == float(m))
+            block["same_strike_rate"] = (same / total) if total else None
+            block["n_both"] = total
+            comparison[name][side] = block
+    return {"arms": per_arm, "vs_production": comparison}
+
+
+def _arm_feature_block(rows: Sequence[Mapping[str, Any]], name: str) -> dict[str, np.ndarray]:
+    """Standardised predictor columns for one arm, named ``<arm>.<feature>``."""
+    cols = ARMS[name]
+    spot = _numeric(rows, "spot")
+
+    def _dist(col: str) -> np.ndarray:
+        level = _numeric(rows, col)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(spot > 0, 10_000.0 * (spot - level) / spot, np.nan)
+
+    def _signed_log(col: str) -> np.ndarray:
+        v = _numeric(rows, col)
+        return np.sign(v) * np.log1p(np.abs(v))
+
+    features: dict[str, np.ndarray] = {f"{name}.gamma_at_spot": _signed_log(cols.gamma_at_spot)}
+    if cols.net_gex:
+        features[f"{name}.net_gex"] = _signed_log(cols.net_gex)
+    if cols.flip:
+        features[f"{name}.flip_distance_bps"] = _dist(cols.flip)
+    if cols.call_wall:
+        features[f"{name}.call_wall_distance_bps"] = _dist(cols.call_wall)
+    if cols.put_wall:
+        features[f"{name}.put_wall_distance_bps"] = _dist(cols.put_wall)
+    if cols.negative_gamma_share:
+        features[f"{name}.negative_gamma_share"] = _numeric(rows, cols.negative_gamma_share)
+    if cols.concentration_hhi:
+        features[f"{name}.concentration_hhi"] = _numeric(rows, cols.concentration_hhi)
+    return {k: _standardize(v) for k, v in features.items()}
+
+
+def arms_incremental_test(
+    rows: Sequence[Mapping[str, Any]],
+    config: ExperimentConfig = ExperimentConfig(),
+    *,
+    sampling_minutes: int = 5,
+    arms: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """Baseline (production) vs baseline + each arm's variables, on identical rows.
+
+    The rows are aligned across every present arm first, so ``production +
+    B2`` and ``production + C`` are fitted on exactly the same observations.
+    """
+    present = list(arms or arms_present(rows))
+    aligned = _aligned(rows, [ARMS[a].gamma_at_spot for a in present])
+    out: dict[str, Any] = {"n_aligned": len(aligned), "arms": {}}
+    if len(aligned) < 50:
+        out["ok"] = False
+        out["reason"] = "insufficient aligned rows"
+        return out
+    out["ok"] = True
+    baseline = _arm_feature_block(aligned, "production")
+    for name in present:
+        if name == "production":
+            continue
+        enhanced = {**baseline, **_arm_feature_block(aligned, name)}
+        out["arms"][name] = _incremental_block(
+            aligned, baseline, enhanced, config, sampling_minutes
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7. Dynamic hedge pressure — the flow arms
+# ---------------------------------------------------------------------------
+
+
+def _same_session_change(
+    rows: Sequence[Mapping[str, Any]], column: str, lookback: int
+) -> np.ndarray:
+    """``level(t) − level(t − lookback snapshots)`` inside one trading date, else NaN."""
+    out = np.full(len(rows), np.nan)
+    for i, row in enumerate(rows):
+        j = i - lookback
+        if j < 0:
+            continue
+        prev = rows[j]
+        if prev.get("trading_date") != row.get("trading_date"):
+            continue
+        a, b = row.get(column), prev.get(column)
+        if _finite_number(a) and _finite_number(b):
+            out[i] = float(a) - float(b)
+    return out
+
+
+def hedge_pressure_test(
+    rows: Sequence[Mapping[str, Any]],
+    config: ExperimentConfig = ExperimentConfig(),
+    *,
+    sampling_minutes: int = 5,
+) -> dict[str, Any]:
+    """Does inferred/attributed MM flow since open relate to what price does next?
+
+    Two readings per flow arm.  **Level**: the sign of gamma-weighted flow
+    since the open (positive = the market-maker population is assumed/attributed
+    to have net *bought* gamma so far today) splits subsequent realized
+    volatility, absolute and signed returns.  **Change**: the same quantity's
+    move over the last ``pressure_lookback_snapshots`` snapshots inside the
+    session, regressed on forward return and volatility with HAC errors.
+    Neither is a level of dealer inventory; both are changes, and the report
+    says so.
+    """
+    out: dict[str, Any] = {}
+    for name, (label, column) in FLOW_ARMS.items():
+        present = [r for r in rows if _finite_number(r.get(column))]
+        if len(present) < 30:
+            out[name] = {
+                "label": label,
+                "column": column,
+                "n": len(present),
+                "note": "insufficient_sample",
+            }
+            continue
+        arm: dict[str, Any] = {
+            "label": label,
+            "column": column,
+            "n": len(present),
+            "level": {},
+            "change": {},
+        }
+        pos, neg = _split_by_sign(present, column)
+        arm["n_positive"] = len(pos)
+        arm["n_negative"] = len(neg)
+        note = _verdict(len(pos), len(neg))
+        if note:
+            arm["note"] = note
+        delta = _same_session_change(list(rows), column, config.pressure_lookback_snapshots)
+        level = _standardize(
+            np.sign(_numeric(rows, column)) * np.log1p(np.abs(_numeric(rows, column)))
+        )
+        change = _standardize(np.sign(delta) * np.log1p(np.abs(delta)))
+        for h in config.horizons:
+            block = _block_size(h, sampling_minutes)
+            entry: dict[str, Any] = {}
+            for measure, template in (
+                ("realized_vol", "rvol_{h}m_bps"),
+                ("abs_return", "abs_ret_{h}m_bps"),
+                ("signed_return", "ret_{h}m_bps"),
+            ):
+                col = template.format(h=h)
+                a = _values(pos, col)
+                b = _values(neg, col)
+                if len(a) >= 5 and len(b) >= 5:
+                    entry[measure] = {
+                        "positive_flow": st.describe(a).as_dict(),
+                        "negative_flow": st.describe(b).as_dict(),
+                        "welch": st.compare_means(a, b).as_dict(),
+                        "block_bootstrap": st.block_bootstrap_diff(
+                            a, b, n_boot=config.n_boot, block_size=block, seed=config.seed
+                        ),
+                    }
+            arm["level"][f"{h}m"] = entry
+            change_entry: dict[str, Any] = {}
+            for measure, template in (
+                ("realized_vol", "rvol_{h}m_bps"),
+                ("signed_return", "ret_{h}m_bps"),
+            ):
+                y = _numeric(rows, template.format(h=h))
+                mask = np.isfinite(y) & np.isfinite(change) & np.isfinite(level)
+                if mask.sum() < 50:
+                    continue
+                reg = st.ols_hac(
+                    y[mask],
+                    {"flow_level": level[mask], "flow_change": change[mask]},
+                    hac_lags=block,
+                )
+                if reg is not None:
+                    change_entry[measure] = reg.as_dict()
+            up = [r for r, d in zip(rows, delta) if math.isfinite(d) and d > 0]
+            down = [r for r, d in zip(rows, delta) if math.isfinite(d) and d < 0]
+            if len(up) >= 5 and len(down) >= 5:
+                change_entry["sign_split"] = {
+                    "n_up": len(up),
+                    "n_down": len(down),
+                    "realized_vol": st.compare_means(
+                        _values(up, f"rvol_{h}m_bps"), _values(down, f"rvol_{h}m_bps")
+                    ).as_dict(),
+                    "signed_return": st.compare_means(
+                        _values(up, f"ret_{h}m_bps"), _values(down, f"ret_{h}m_bps")
+                    ).as_dict(),
+                }
+            arm["change"][f"{h}m"] = change_entry
+        out[name] = arm
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 8. Development / validation split
+# ---------------------------------------------------------------------------
+
+
+def validation_split_test(
+    rows: Sequence[Mapping[str, Any]],
+    config: ExperimentConfig = ExperimentConfig(),
+    *,
+    sampling_minutes: int = 5,
+    arms: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """Re-run the headline arm families on a chronological development /
+    validation split of SESSIONS.
+
+    Sessions, not rows, are the unit: intraday rows are serially dependent.
+    The split is fixed by ``development_share`` before anything is looked at,
+    and below ``min_sessions_for_validation`` sessions no validation segment
+    exists — the report then says the verdict rests on the full sample only.
+    """
+    sessions = sorted({r.get("trading_date") for r in rows if r.get("trading_date")})
+    out: dict[str, Any] = {
+        "n_sessions": len(sessions),
+        "development_share": config.development_share,
+        "min_sessions_for_validation": config.min_sessions_for_validation,
+        "available": len(sessions) >= config.min_sessions_for_validation,
+    }
+    if not out["available"]:
+        out["note"] = (
+            f"{len(sessions)} sessions < {config.min_sessions_for_validation}; no validation "
+            "segment was carved out and the arms verdict rests on the full sample"
+        )
+        return out
+    cut = max(1, int(round(len(sessions) * config.development_share)))
+    dev_sessions = set(sessions[:cut])
+    out["development_sessions"] = [sessions[0], sessions[cut - 1]]
+    out["validation_sessions"] = [sessions[cut], sessions[-1]]
+    present = list(arms or arms_present(rows))
+    for segment, subset in (
+        ("development", [r for r in rows if r.get("trading_date") in dev_sessions]),
+        ("validation", [r for r in rows if r.get("trading_date") not in dev_sessions]),
+    ):
+        block: dict[str, Any] = {"n_rows": len(subset)}
+        if len(subset) >= 60:
+            block["regime_summary"] = arms_regime_test(
+                subset, config, sampling_minutes=sampling_minutes, arms=present
+            )["summary"]
+        if len(subset) >= 200:
+            inc = arms_incremental_test(
+                subset, config, sampling_minutes=sampling_minutes, arms=present
+            )
+            block["incremental_summary"] = {
+                name: _incremental_summary(payload)
+                for name, payload in (inc.get("arms") or {}).items()
+            }
+        out[segment] = block
     return out

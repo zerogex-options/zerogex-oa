@@ -14,7 +14,11 @@ Three things are read:
 * the persisted production readings (``gex_summary``) — the *actual* values the
   live system published, which is a stronger comparand than a recomputation;
 * underlying bars (``underlying_quotes``) and VIX (``vix_bars``) for forward
-  outcomes and volatility-regime controls.
+  outcomes and volatility-regime controls;
+* the session-cumulative Lee-Ready counters on ``option_chains``
+  (``ask_volume`` / ``mid_volume`` / ``bid_volume``), differenced per contract
+  per minute, for the Aggressor-Inferred arm (Model B) — see
+  :func:`fetch_aggressor_buckets`.
 
 The archive table (``option_chains_archive``) is retention-exempt, so it is the
 only place chain history older than ``DATA_RETENTION_DAYS`` survives; the chain
@@ -27,9 +31,14 @@ import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterator, Optional, Sequence
 
+from research.mm_attributed_gex.aggressor import (
+    SOURCE_FLOW_FACTS,
+    SOURCE_OPTION_CHAINS,
+    AggressorBucket,
+)
 from research.mm_attributed_gex.gex import ChainQuote
 from research.mm_attributed_gex.schema import SeriesKey
 
@@ -49,6 +58,9 @@ __all__ = [
     "fetch_open_interest_series",
     "SampleAnchor",
     "fetch_sample_anchor",
+    "AGGRESSOR_SESSION_END_ET",
+    "fetch_aggressor_buckets",
+    "fetch_aggressor_buckets_from_facts",
 ]
 
 
@@ -622,3 +634,213 @@ def fetch_sample_anchor(
         end=end,
         spot=spot,
     )
+
+
+# ---------------------------------------------------------------------------
+# Aggressor-classified tape (Model B)
+# ---------------------------------------------------------------------------
+
+#: End of the cash session for SPX options (they trade until 16:15 ET).  The
+#: 09:30 open is the start of the session-cumulative counters, so nothing
+#: earlier is ever needed.
+AGGRESSOR_SESSION_END_ET = "16:15"
+
+_ET_NAME = "America/New_York"
+
+# One cash session at a time.  ``option_chains`` counters are cumulative from
+# the 09:30 ET open (the ingestion accumulator is keyed by cash-session date,
+# the same keying ``flow_contract_facts`` uses), so within the window a
+# contract's per-minute classified flow is the difference between consecutive
+# rows and the first row's counters ARE its flow since the open.  Rows with no
+# volume yet carry all-zero counters and can be skipped before the window
+# function without changing a single delta.  The known-at instant of a row is
+# one minute after its stamp (the stamp is the bucket start).
+_AGGRESSOR_SQL = """
+    WITH rows AS (
+        SELECT option_symbol, timestamp, strike, expiration, option_type,
+               COALESCE(ask_volume, 0) AS ask_volume,
+               COALESCE(mid_volume, 0) AS mid_volume,
+               COALESCE(bid_volume, 0) AS bid_volume,
+               bid, ask, gamma, implied_volatility
+          FROM option_chains
+         WHERE underlying = %(symbol)s
+           AND timestamp >= %(session_open)s
+           AND timestamp <  %(session_end)s
+           AND COALESCE(volume, 0) > 0
+    ),
+    lagged AS (
+        SELECT *,
+               LAG(ask_volume) OVER w AS prev_ask,
+               LAG(mid_volume) OVER w AS prev_mid,
+               LAG(bid_volume) OVER w AS prev_bid,
+               LAG(timestamp)  OVER w AS prev_ts
+          FROM rows
+        WINDOW w AS (PARTITION BY option_symbol ORDER BY timestamp)
+    ),
+    deltas AS (
+        SELECT option_symbol, timestamp, strike, expiration, option_type,
+               GREATEST(ask_volume - COALESCE(prev_ask, 0), 0) AS ask_delta,
+               GREATEST(mid_volume - COALESCE(prev_mid, 0), 0) AS mid_delta,
+               GREATEST(bid_volume - COALESCE(prev_bid, 0), 0) AS bid_delta,
+               (prev_ts IS NULL) AS first_row,
+               bid, ask, gamma, implied_volatility
+          FROM lagged
+    )
+    SELECT option_symbol, timestamp, strike, expiration, option_type,
+           ask_delta, mid_delta, bid_delta, first_row,
+           bid, ask, gamma, implied_volatility
+      FROM deltas
+     WHERE ask_delta > 0 OR mid_delta > 0 OR bid_delta > 0
+     ORDER BY timestamp, option_symbol
+"""
+
+_FACTS_SQL = """
+    SELECT option_symbol, timestamp, strike, expiration, option_type,
+           volume_delta, buy_volume, sell_volume, implied_volatility
+      FROM flow_contract_facts
+     WHERE symbol = %(symbol)s
+       AND timestamp >= %(session_open)s
+       AND timestamp <  %(session_end)s
+       AND volume_delta > 0
+     ORDER BY timestamp, option_symbol
+"""
+
+
+def _session_bounds(session: date, session_end_et: str) -> tuple[datetime, datetime]:
+    """UTC ``[09:30 ET, session_end_et)`` for one ET session date."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        et = ZoneInfo(_ET_NAME)
+        hh, mm = (int(x) for x in session_end_et.split(":"))
+        open_ = datetime.combine(session, time(9, 30)).replace(tzinfo=et)
+        close = datetime.combine(session, time(hh, mm)).replace(tzinfo=et)
+    except Exception:  # pragma: no cover - zoneinfo is stdlib on 3.9+
+        import pytz
+
+        et = pytz.timezone("US/Eastern")
+        hh, mm = (int(x) for x in session_end_et.split(":"))
+        open_ = et.localize(datetime.combine(session, time(9, 30)))
+        close = et.localize(datetime.combine(session, time(hh, mm)))
+    return open_.astimezone(timezone.utc), close.astimezone(timezone.utc)
+
+
+def _quote_flags(bid: Any, ask: Any) -> tuple[bool, bool, bool]:
+    """``(locked, crossed, missing)`` from the row's stored NBBO."""
+    if bid is None or ask is None:
+        return False, False, True
+    b, a = float(bid), float(ask)
+    return (a == b), (a < b), False
+
+
+def fetch_aggressor_buckets(
+    conn: Any,
+    symbol: str,
+    sessions: Sequence[date],
+    *,
+    session_end_et: str = AGGRESSOR_SESSION_END_ET,
+    progress: Optional[Any] = None,
+) -> Iterator[AggressorBucket]:
+    """Stream per-contract, per-minute classified volume for each session.
+
+    Reads the production Lee-Ready counters on ``option_chains`` and
+    differences them per contract inside the cash session — the same delta
+    ``flow_contract_facts`` materialises, but WITHOUT redistributing the
+    mid-classified volume into buy/sell, so the unclassified share survives.
+    Yields in chronological order across sessions, which the replay relies on.
+
+    The chain rows are minute buckets stamped at the bucket START; the
+    emitted ``timestamp`` is the bucket END, the instant the row is fully known.
+    """
+    for i, session in enumerate(sorted(sessions)):
+        if progress is not None:
+            progress(i + 1, len(sessions), session)
+        session_open, session_end = _session_bounds(session, session_end_et)
+        with conn.cursor() as cur:
+            cur.execute(
+                _AGGRESSOR_SQL,
+                {"symbol": symbol, "session_open": session_open, "session_end": session_end},
+            )
+            rows = cur.fetchall()
+        for r in rows:
+            (
+                option_symbol,
+                ts,
+                strike,
+                expiration,
+                option_type,
+                ask_delta,
+                mid_delta,
+                bid_delta,
+                first_row,
+                bid,
+                ask,
+                gamma,
+                iv,
+            ) = r
+            locked, crossed, missing = _quote_flags(bid, ask)
+            yield AggressorBucket(
+                symbol=symbol,
+                option_symbol=str(option_symbol),
+                expiration=expiration,
+                strike=float(strike),
+                option_type=str(option_type),
+                timestamp=ts + timedelta(minutes=1),
+                trading_date=session,
+                buyer_initiated=int(ask_delta or 0),
+                seller_initiated=int(bid_delta or 0),
+                unclassified=int(mid_delta or 0),
+                source=SOURCE_OPTION_CHAINS,
+                extrapolated=False,
+                gamma=(float(gamma) if gamma is not None else None),
+                implied_volatility=(float(iv) if iv is not None else None),
+                quote_locked=locked,
+                quote_crossed=crossed,
+                quote_missing=missing,
+                first_row_of_session=bool(first_row),
+            )
+
+
+def fetch_aggressor_buckets_from_facts(
+    conn: Any,
+    symbol: str,
+    sessions: Sequence[date],
+    *,
+    session_end_et: str = AGGRESSOR_SESSION_END_ET,
+    progress: Optional[Any] = None,
+) -> Iterator[AggressorBucket]:
+    """The same stream from ``flow_contract_facts`` — a LABELLED fallback.
+
+    That table stores a buy/sell split in which the mid-classified volume has
+    already been redistributed pro-rata, so the unclassified share cannot be
+    recovered.  Every bucket is marked ``extrapolated`` and the session gate
+    refuses it unless the operator opts in.  Use it only when ``option_chains``
+    has aged past retention for the window.
+    """
+    for i, session in enumerate(sorted(sessions)):
+        if progress is not None:
+            progress(i + 1, len(sessions), session)
+        session_open, session_end = _session_bounds(session, session_end_et)
+        with conn.cursor() as cur:
+            cur.execute(
+                _FACTS_SQL,
+                {"symbol": symbol, "session_open": session_open, "session_end": session_end},
+            )
+            rows = cur.fetchall()
+        for option_symbol, ts, strike, expiration, option_type, _vol, buy, sell, iv in rows:
+            yield AggressorBucket(
+                symbol=symbol,
+                option_symbol=str(option_symbol),
+                expiration=expiration,
+                strike=float(strike),
+                option_type=str(option_type),
+                timestamp=ts + timedelta(minutes=1),
+                trading_date=session,
+                buyer_initiated=int(buy or 0),
+                seller_initiated=int(sell or 0),
+                unclassified=0,
+                source=SOURCE_FLOW_FACTS,
+                extrapolated=True,
+                implied_volatility=(float(iv) if iv is not None else None),
+                quote_missing=True,
+            )

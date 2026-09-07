@@ -7,6 +7,13 @@ No production metric, table, endpoint or dashboard is changed by it.
 Market Maker Open/Close activity carry materially more information than ZeroGEX's
 current dealer-gamma methodology?
 
+**Extension (2026-09).** A third arm — **Aggressor-Inferred MM GEX**, ZeroGEX's own
+tape classification with the passive side *assumed* to be a market maker — and a direct
+B-vs-C attribution test were added on top of this framework. They are documented in
+[`aggressor-inferred-positioning-experiment.md`](aggressor-inferred-positioning-experiment.md),
+which also carries the audit of what historical data can and cannot support that arm.
+Nothing below changed; this document remains the specification of the attributed arm.
+
 **Terminology (non-negotiable).** The metric is **Market-Maker Attributed GEX**.
 Acceptable synonyms: *Exchange-Classified MM GEX*, *Reconstructed Market Maker
 Positioning*, *Participant-Attributed Gamma*. It must **not** be called "true dealer
@@ -314,7 +321,9 @@ research/mm_attributed_gex/
     gex.py          MM inventory -> gamma@spot / flip / net GEX (production kernels)
     walls.py        MM inventory -> strike structure (definitions A and B, nodes)
     sources.py      READ-ONLY production database access
-    dataset.py      side-by-side existing-vs-MM research dataset (two-pass replay)
+    aggressor.py    Model B: aggressor-classified tape -> assumed MM flow (B1), anchor (B2)
+    attribution.py  Model B vs Model C on the exchange interval (the direct test)
+    dataset.py      side-by-side A / B / C research dataset (two-pass causal replay)
     outcomes.py     forward market outcomes each reading is scored against
     stats.py        CI / Welch / HAC OLS / logit / bootstrap / permutation / walk-forward
     backtest.py     the experiment battery
@@ -486,6 +495,10 @@ python -m research.mm_attributed_gex.cli backtest research_output/mm_dataset.jso
 Useful arms: `--include-censored` (partial-data), `--raw-positioning` (no horizon
 weighting), `--net-flow-estimator` (open/close-agnostic quantity),
 `--headline-universe 0dte`.
+
+The aggressor arm and the attribution test (`build-aggressor`, `compare-attribution`,
+`build-dataset --aggressor`) are described in the extension document; `build-dataset`
+now accepts no Cboe files at all for an A-vs-B run.
 
 `pipeline-check` runs every layer on synthetic data. It validates plumbing only; its
 inputs are invented, and it says so in its output.

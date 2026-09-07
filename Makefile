@@ -1235,8 +1235,38 @@ mmgex-dataset: ## MM-GEX: build the side-by-side dataset. Vars: MMGEX_FILES=path
 		--start $(START) --end $(END) \
 		--out $(MMGEX_OUT)/mm_dataset.jsonl
 
+.PHONY: mmgex-dataset-ab
+mmgex-dataset-ab: ## MM-GEX: A-vs-B dataset from ZeroGEX's own tape, no Cboe files needed. Vars: START=ISO END=ISO [MMGEX_AGGRESSOR=path]
+	$(PY) -m research.mm_attributed_gex.cli build-dataset \
+		--start $(START) --end $(END) \
+		$(if $(MMGEX_AGGRESSOR),--aggressor $(MMGEX_AGGRESSOR),--aggressor-source option_chains) \
+		--out $(MMGEX_OUT)/mm_dataset.jsonl
+
+.PHONY: mmgex-dataset-abc
+mmgex-dataset-abc: ## MM-GEX: A / B / C dataset. Vars: MMGEX_FILES=path START=ISO END=ISO [MMGEX_AGGRESSOR=path]
+	$(PY) -m research.mm_attributed_gex.cli build-dataset $(MMGEX_FILES) \
+		--profile $(MMGEX_PROFILE) \
+		--start $(START) --end $(END) \
+		$(if $(MMGEX_AGGRESSOR),--aggressor $(MMGEX_AGGRESSOR),--aggressor-source option_chains) \
+		--out $(MMGEX_OUT)/mm_dataset.jsonl
+
+.PHONY: mmgex-aggressor
+mmgex-aggressor: ## MM-GEX: extract ZeroGEX's aggressor-classified tape (Model B). Vars: START=ISO END=ISO [AGGRESSOR_SOURCE=option_chains|flow_contract_facts]
+	$(PY) -m research.mm_attributed_gex.cli build-aggressor \
+		--start $(START) --end $(END) \
+		--source $(or $(AGGRESSOR_SOURCE),option_chains) \
+		--symbol $(or $(SYMBOL),SPX) \
+		--out $(MMGEX_OUT)/aggressor_buckets.jsonl
+
+.PHONY: mmgex-attribution
+mmgex-attribution: ## MM-GEX: B-vs-C attribution test (aggressor assumption vs exchange-classified MM). Vars: MMGEX_FILES=path [MMGEX_AGGRESSOR=path]
+	$(PY) -m research.mm_attributed_gex.cli compare-attribution $(MMGEX_FILES) \
+		--profile $(MMGEX_PROFILE) \
+		--aggressor $(or $(MMGEX_AGGRESSOR),$(MMGEX_OUT)/aggressor_buckets.jsonl) \
+		--out $(MMGEX_OUT)/attribution_report.md
+
 .PHONY: mmgex-backtest
-mmgex-backtest: ## MM-GEX: run the experiment battery and render the report
+mmgex-backtest: ## MM-GEX: run the experiment battery (two-arm and three-arm) and render the report
 	$(PY) -m research.mm_attributed_gex.cli backtest $(MMGEX_OUT)/mm_dataset.jsonl \
 		--out $(MMGEX_OUT)/mm_report.md
 
