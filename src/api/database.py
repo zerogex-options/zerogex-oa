@@ -530,6 +530,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
             "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
         )
+        # Newest gex_summary.timestamp this process has served, per symbol,
+        # and when it last warned about the database reading older than that.
+        # See get_latest_gex_summary for why a cache alone is not enough.
+        self._latest_gex_summary_served_ts: Dict[str, datetime] = {}
+        self._latest_gex_summary_backwards_warned_mono: Dict[str, float] = {}
         # index<->future carry ratio (src/jobs/futures_projection.py). Moves on
         # the order of a point a day, so it is cached far longer than a quote;
         # every ES/NQ request resolves it, hence caching it at all.
@@ -1828,12 +1833,38 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # ========================================================================
 
     async def get_latest_gex_summary(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
-        """Get latest GEX summary"""
+        """Get latest GEX summary.
+
+        Cached per process for ``LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS``, but a
+        cached body is served only while its ``timestamp`` is still the newest
+        row in ``gex_summary``. That check is one index-only lookup on
+        ``(underlying, timestamp DESC)`` per call, and it exists because the
+        cache alone let the API go backwards: with several uvicorn workers
+        each holding its own copy, a worker whose copy predates a new snapshot
+        serves the previous minute's levels after another worker has already
+        served the new ones. A probe polling ``/api/v2/levels/NQ`` every 5s
+        caught it four times in an hour, ten seconds each, with the server's
+        own ``evaluated_at`` proving each body was produced fresh by the app.
+        Levels that revert to the previous minute for one poll look like a
+        data bug on every chart that draws them.
+
+        The lookup makes every worker agree with the database. The served
+        high-water mark makes each worker monotonic on its own, and turns the
+        one way left to go backwards -- a connection whose view of the table
+        is behind another's -- into a WARNING carrying both timestamps, so it
+        can be found rather than guessed at.
+        """
         symbol = symbol.upper()
         cache_key = f"latest_gex_summary:{symbol}"
         cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached  # type: ignore[no-any-return]
+
+        newest_ts_query = """
+            SELECT timestamp
+            FROM gex_summary
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
 
         # Call/Put Walls are persisted to ``gex_summary`` by the Analytics
         # Engine using the canonical definition in
@@ -2021,10 +2052,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
+                newest = await conn.fetchval(newest_ts_query, symbol)
+                served = self._latest_gex_summary_served_ts.get(symbol)
+                if newest is not None and served is not None and newest < served:
+                    self._warn_gex_summary_went_backwards(symbol, newest, served)
+                    if cached is not None and cached.get("timestamp") == served:
+                        return cached  # type: ignore[no-any-return]
+                if cached is not None and cached.get("timestamp") == newest:
+                    return cached  # type: ignore[no-any-return]
+
                 row = await conn.fetchrow(query, symbol, DEFAULT_WALL_LADDER_DEPTH)
                 payload = dict(row) if row else None
                 if payload is not None:
                     self._attach_wall_ladders(payload)
+                    ts = payload.get("timestamp")
+                    if isinstance(ts, datetime) and (served is None or ts > served):
+                        self._latest_gex_summary_served_ts[symbol] = ts
                 self._cache_set(
                     cache_key,
                     payload,
@@ -2034,6 +2077,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
             raise
+
+    def _warn_gex_summary_went_backwards(
+        self, symbol: str, newest: datetime, served: datetime
+    ) -> None:
+        """Once per symbol per 30s: the table read older than this process
+        already served. With the cache ruled out by the timestamp check, that
+        leaves a connection whose view lags another's, which is worth a look
+        at pool and isolation settings rather than a log line per request."""
+        now = time_module.monotonic()
+        last = self._latest_gex_summary_backwards_warned_mono.get(symbol, 0.0)
+        if now - last < 30.0:
+            return
+        self._latest_gex_summary_backwards_warned_mono[symbol] = now
+        logger.warning(
+            "gex_summary newest timestamp for %s read as %s, behind the %s this process "
+            "already served; serving the newer one. Only a connection whose view of the "
+            "table lags another's does this once the cache is ruled out: check the pool "
+            "and isolation settings.",
+            symbol,
+            newest,
+            served,
+        )
 
     @staticmethod
     def _attach_wall_ladders(payload: Dict[str, Any]) -> None:
