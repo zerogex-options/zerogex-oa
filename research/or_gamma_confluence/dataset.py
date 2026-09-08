@@ -362,7 +362,12 @@ def write_jsonl(
             if result.or_open_bar_repaired:
                 acc["open_bars_repaired"] += 1
             if result.skipped_reason:
-                key = result.skipped_reason.split(":")[0]
+                # Keep the diagnostic detail. Collapsing on the first colon
+                # threw away exactly the part that says WHY, which made the
+                # bar-coverage probe pointless in the summary.
+                key = result.skipped_reason
+                if key.startswith("error:"):
+                    key = "error"  # exception text is unbounded
                 skips[key] = skips.get(key, 0) + 1
                 continue
             acc["sessions_used"] += 1
