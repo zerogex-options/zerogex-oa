@@ -82,11 +82,21 @@ class GammaVwapConfluenceSignal:
 
         score = directional * cluster_quality * multi_mult
         score = max(-1.0, min(1.0, score))
-        dir_sign = 1.0 if dist_from_level > 0 else -1.0 if dist_from_level < 0 else 0.0
+        # Continuation projects price FURTHER FROM the cluster, in whichever
+        # direction it has already left it; mean reversion targets the cluster
+        # itself.  ``ctx.close - confluence_level`` is already signed, so it
+        # carries that direction on its own.
+        #
+        # It used to be multiplied by a ``dir_sign`` of the same quantity,
+        # which collapsed it to ``abs(close - confluence_level)`` and so always
+        # projected UPWARD.  A bullish continuation was right by coincidence; a
+        # bearish one printed a target above spot while the score read bearish,
+        # which is how a customer found it -- score -37.92 with spot 770.19,
+        # cluster 771.35, and an expected target of 772.50 instead of 767.87.
         expected_target = (
             confluence_level
             if regime_direction == "mean_reversion"
-            else ctx.close + dir_sign * (ctx.close - confluence_level) * 2.0
+            else ctx.close + (ctx.close - confluence_level) * 2.0
         )
         triggered = abs(score) >= 0.2
 
