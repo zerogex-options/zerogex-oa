@@ -1200,6 +1200,61 @@ tw-magnet-backtest: ## Backtest the PutWallMagnetReversal thesis. Vars: SYMBOLS=
 MMGEX_PROFILE ?= research_output/cboe_profile.json
 MMGEX_OUT     ?= research_output
 
+# =============================================================================
+# Opening-range extension x gamma confluence (research/or_gamma_confluence)
+# =============================================================================
+# Research only: read-only against production, outputs to files, changes no
+# production behaviour. Methodology in
+# docs/design/or-extension-gamma-confluence.md.
+#
+# Run orgc-coverage FIRST. gex_summary and underlying_quotes are
+# retention-exempt but gex_by_strike (the only source of ranked GEX levels) is
+# pruned, so the two arms of the study have different windows -- and coverage
+# also checks whether created_at is a usable publish clock or has been made
+# fiction by backfilling.
+ORGC_OUT     ?= research_output
+ORGC_SYMBOLS ?= SPY QQQ SPX NDX ES NQ
+ORGC_EVENTS  ?= $(ORGC_OUT)/orgc_events.jsonl
+
+.PHONY: orgc-selftest
+orgc-selftest: ## OR-gamma: synthetic end-to-end plumbing check (NOT a research result)
+	$(PY) -m research.or_gamma_confluence.cli selftest
+
+.PHONY: orgc-coverage
+orgc-coverage: ## OR-gamma: how much history exists per symbol/table + is created_at a usable publish clock. Read-only. Vars: ORGC_SYMBOLS
+	$(PY) -m research.or_gamma_confluence.cli coverage $(ORGC_SYMBOLS) \
+		--out $(ORGC_OUT)/orgc_coverage.json
+
+.PHONY: orgc-dataset
+orgc-dataset: ## OR-gamma: label OR-extension touch events (read-only). Vars: START=ISO END=ISO ORGC_SYMBOLS [OR_MINUTES=5 GAMMA_LEAD=120 CLOCK=visible]
+	$(PY) -m research.or_gamma_confluence.cli build-dataset $(ORGC_SYMBOLS) \
+		--start $(START) --end $(END) \
+		--out $(ORGC_EVENTS) \
+		$(if $(OR_MINUTES),--or-minutes $(OR_MINUTES)) \
+		$(if $(GAMMA_LEAD),--gamma-lead $(GAMMA_LEAD)) \
+		$(if $(CLOCK),--clock $(CLOCK)) \
+		$(if $(EXTENSION_STEP),--extension-step $(EXTENSION_STEP)) \
+		$(if $(filter yes,$(NO_GEX_RANKS)),--no-gex-ranks)
+
+.PHONY: orgc-analyze
+orgc-analyze: ## OR-gamma: cohorts, sensitivity grids, chronological out-of-sample. Vars: ORGC_EVENTS [CONFLUENCE_DISTANCE=10 TREND_FILTER=ema_slope]
+	$(PY) -m research.or_gamma_confluence.cli analyze $(ORGC_EVENTS) \
+		--out $(ORGC_OUT)/orgc_report.md \
+		--json-out $(ORGC_OUT)/orgc_summary.json \
+		--csv-out $(ORGC_OUT)/orgc_events.csv \
+		$(if $(CONFLUENCE_DISTANCE),--confluence-distance $(CONFLUENCE_DISTANCE)) \
+		$(if $(TREND_FILTER),--trend-filter $(TREND_FILTER))
+
+.PHONY: orgc-sweep
+orgc-sweep: ## OR-gamma: parameter neighbourhoods (one build per cell; a surface, not a leaderboard). Vars: START=ISO END=ISO ORGC_SYMBOLS
+	$(PY) -m research.or_gamma_confluence.cli sweep $(ORGC_SYMBOLS) \
+		--start $(START) --end $(END) \
+		--outdir $(ORGC_OUT)/orgc_sweep
+
+.PHONY: orgc-test
+orgc-test: ## OR-gamma: run just this study's test suite
+	$(PY) -m pytest tests/test_or_gamma_confluence.py -q -o "addopts="
+
 .PHONY: mmgex-pipeline-check
 mmgex-pipeline-check: ## MM-GEX: synthetic end-to-end plumbing check (NOT a research result)
 	$(PY) -m research.mm_attributed_gex.cli pipeline-check
