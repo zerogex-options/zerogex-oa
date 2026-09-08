@@ -13,6 +13,12 @@ Design, methodology and full data requirements:
 > The metric is **Market-Maker Attributed GEX**. Not "true dealer GEX" — exchange tags
 > improve attribution, but the position is still a reconstruction.
 
+> Since 2026-09 the experiment has **three arms**: **Production Modeled GEX** (A),
+> **Aggressor-Inferred MM GEX** (B — ZeroGEX's own tape classification with the passive
+> side *assumed* to be a market maker) and **Market-Maker Attributed GEX** (C). Design,
+> audit and exact definitions:
+> [`docs/design/aggressor-inferred-positioning-experiment.md`](../../docs/design/aggressor-inferred-positioning-experiment.md).
+
 ## Status
 
 The pipeline is complete, tested, and verified end to end against the production
@@ -22,6 +28,10 @@ the design doc for what that run established.
 **No Cboe Open-Close file has been supplied**, so no historical comparison has been run
 and no result about the methodology exists. Drop real files in and the commands below
 produce the dataset and the report.
+
+The **A-vs-B** comparison needs no Cboe file — it runs on ZeroGEX's own database
+(`make mmgex-aggressor` then `make mmgex-dataset-ab` / `make mmgex-backtest`). It has not
+been run either; no result exists for it.
 
 ## Quick start
 
@@ -63,6 +73,23 @@ python -m research.mm_attributed_gex.cli backtest research_output/mm_dataset.jso
     --out research_output/mm_report.md
 ```
 
+The three-arm study adds three commands (details in the design note):
+
+```bash
+# B. ZeroGEX's own aggressor-classified tape for the window (read-only).
+python -m research.mm_attributed_gex.cli build-aggressor --start ... --end ... \
+    --out research_output/aggressor_buckets.jsonl
+
+# B vs C: does the aggressor assumption reproduce exchange-classified MM activity?
+python -m research.mm_attributed_gex.cli compare-attribution <files...> --profile profile.json \
+    --aggressor research_output/aggressor_buckets.jsonl --out research_output/attribution_report.md
+
+# A / B / C dataset (files optional: omit them for A vs B), then the same backtest.
+python -m research.mm_attributed_gex.cli build-dataset <files...> --profile profile.json \
+    --aggressor research_output/aggressor_buckets.jsonl --start ... --end ... \
+    --out research_output/mm_dataset.jsonl
+```
+
 Run from the repository root (`pythonpath = ["."]` in `pyproject.toml` makes
 `research.*` importable, same as the test suite).
 
@@ -84,6 +111,8 @@ re-run.
 | Module | Responsibility |
 |---|---|
 | `schema.py` | `ParticipantActivity` — the exchange-agnostic normalized record |
+| `aggressor.py` | Model B: classified-tape buckets, the passive-side-is-MM assumption, session-scoped flow (B1), production anchor (B2), causal replay, gates |
+| `attribution.py` | Model B vs Model C on the exchange interval: agreement, error, strata, session-bootstrap CIs |
 | `cboe/profiles.py` | declarative column mapping; JSON round-trip; `confirmed` flag |
 | `cboe/loader.py` | streaming csv / csv.gz / zip / parquet → records |
 | `cboe/inspect.py` | propose a mapping from a real header; name what it could not map |
@@ -96,8 +125,8 @@ re-run.
 | `dataset.py` | two-pass replay → the side-by-side dataset |
 | `outcomes.py` | forward market outcomes |
 | `stats.py` | HAC OLS, logit, bootstrap, permutation, walk-forward, BH |
-| `backtest.py` | the experiment battery |
-| `report.py` | verdict logic + markdown/JSON report |
+| `backtest.py` | the experiment battery — two-arm families plus the `arms_*` three-arm families and hedge pressure |
+| `report.py` | two-arm verdict, three-arm verdict (`decide_arms`) + markdown/JSON report |
 
 Cboe parsing is not coupled to the GEX engine. Supporting another exchange's
 Open-Close feed means writing one more loader that emits `ParticipantActivity`.
@@ -119,7 +148,8 @@ between the two methodologies is the attribution.
 pytest tests/ -k mm_attributed -q
 ```
 
-177 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
-outcomes, statistics, replay and verdict logic. Synthetic examples throughout, sized so
+235 tests across ingestion, inventory, gamma, walls, confidence, reconciliation,
+outcomes, statistics, replay, verdict logic, the aggressor arm, the attribution
+comparison and the three-arm battery. Synthetic examples throughout, sized so
 the correct answer can be checked by hand. Synthetic data is never used as evidence
 about the methodology.

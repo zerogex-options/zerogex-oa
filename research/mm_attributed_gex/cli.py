@@ -6,13 +6,16 @@ Run from the repository root::
 
 Commands, in the order you would use them on real data::
 
-    inspect-cboe   read a delivered Cboe file and propose a column mapping
-    check-load     parse files with a profile and report what came through
-    reconstruct    build MM inventory and report completeness + reconciliation
-    build-dataset  produce the side-by-side existing-vs-MM research dataset
-    backtest       run the experiment battery over a dataset
-    report         render the research report from a backtest result
-    pipeline-check plumbing self-test on synthetic data (NOT a research result)
+    inspect-cboe        read a delivered Cboe file and propose a column mapping
+    check-load          parse files with a profile and report what came through
+    reconstruct         build MM inventory and report completeness + reconciliation
+    build-aggressor     extract ZeroGEX's own aggressor-classified tape (Model B)
+    compare-attribution B vs C: does the aggressor assumption reproduce
+                        exchange-classified Market Maker activity?
+    build-dataset       produce the A / B / C side-by-side research dataset
+    backtest            run the experiment battery (two-arm and three-arm) over a dataset
+    report              render the research report from a backtest result
+    pipeline-check      plumbing self-test on synthetic data (NOT a research result)
 
 Everything that touches the database is read-only.  No command writes to any
 production table.
@@ -284,7 +287,164 @@ def cmd_reconstruct(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _aggressor_sessions(start: datetime, end: datetime) -> list:
+    from research.mm_attributed_gex.inventory import expected_sessions
+
+    return expected_sessions(start.date(), end.date())
+
+
+def _extract_aggressor(conn: Any, args: argparse.Namespace, out_path: Path, start, end) -> Path:
+    """Stream Model B buckets from the database into a JSONL file."""
+    from research.mm_attributed_gex.aggressor import write_aggressor_jsonl
+    from research.mm_attributed_gex.sources import (
+        fetch_aggressor_buckets,
+        fetch_aggressor_buckets_from_facts,
+    )
+
+    sessions = _aggressor_sessions(start, end)
+    reader = (
+        fetch_aggressor_buckets_from_facts
+        if args.aggressor_source == "flow_contract_facts"
+        else fetch_aggressor_buckets
+    )
+
+    def progress(i: int, n: int, session) -> None:
+        print(f"  [aggressor tape] session {i}/{n} {session}", flush=True)
+
+    path = write_aggressor_jsonl(reader(conn, args.symbol, sessions, progress=progress), out_path)
+    return path
+
+
+def _print_aggressor_coverage(path: Path, gates) -> dict:
+    from research.mm_attributed_gex.aggressor import coverage_by_session, read_aggressor_jsonl
+
+    coverage = coverage_by_session(read_aggressor_jsonl(path))
+    payload = {d.isoformat(): cov.as_dict(gates) for d, cov in sorted(coverage.items())}
+    passed = sum(1 for v in payload.values() if v["gate_passed"])
+    print(
+        json.dumps(
+            {
+                "sessions": len(payload),
+                "sessions_passed_gate": passed,
+                "coverage_by_session": payload,
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    return payload
+
+
+def cmd_build_aggressor(args: argparse.Namespace) -> int:
+    """Extract ZeroGEX's aggressor-classified tape for the study window.
+
+    Reads the session-cumulative Lee-Ready counters on ``option_chains`` (or,
+    with ``--source flow_contract_facts``, the already-differenced and
+    EXTRAPOLATED buy/sell split) and writes one JSONL bucket per contract per
+    minute with classified volume.  Nothing about participant identity is in
+    this file: it is trade direction, and every downstream label says so.
+    """
+    from research.mm_attributed_gex.aggressor import AggressorGateConfig
+    from research.mm_attributed_gex.sources import research_connection
+
+    start = _parse_dt(args.start)
+    end = _parse_dt(args.end)
+    out = Path(args.out)
+    with research_connection() as conn:
+        with _phase(f"aggressor tape {args.aggressor_source}"):
+            path = _extract_aggressor(conn, args, out, start, end)
+    gates = AggressorGateConfig(allow_extrapolated=args.allow_extrapolated)
+    coverage = _print_aggressor_coverage(path, gates)
+    out.with_name(out.stem + "_coverage.json").write_text(
+        json.dumps(coverage, indent=2, default=str), encoding="utf-8"
+    )
+    print(f"\n{path} (+ _coverage.json)")
+    if args.aggressor_source == "flow_contract_facts":
+        print(
+            "\nEXTRAPOLATED SOURCE — flow_contract_facts redistributes mid-classified volume "
+            "into buy/sell, so the unclassified share is unknown. Sessions built from it fail "
+            "the aggressor gate unless --allow-extrapolated is passed to build-dataset, and "
+            "the label travels into every report.",
+            file=sys.stderr,
+        )
+    return 0 if coverage else 2
+
+
+def cmd_compare_attribution(args: argparse.Namespace) -> int:
+    """Phase 2: the aggressor assumption against exchange-classified MM activity."""
+    from research.mm_attributed_gex.aggressor import read_aggressor_jsonl
+    from research.mm_attributed_gex.attribution import (
+        AttributionConfig,
+        compare_attribution,
+        write_attribution_report,
+    )
+    from research.mm_attributed_gex.cboe.loader import load_paths
+
+    profile = _load_profile(args.profile)
+    records = list(load_paths(args.files, profile, allow_unconfirmed=args.allow_unconfirmed))
+    if not records:
+        print("No exchange records parsed; nothing to compare against.", file=sys.stderr)
+        return 2
+    buckets = list(read_aggressor_jsonl(args.aggressor))
+    if not buckets:
+        print(f"{args.aggressor} holds no aggressor buckets.", file=sys.stderr)
+        return 2
+
+    spot_provider = None
+    if not args.no_db:
+        from research.mm_attributed_gex.sources import fetch_underlying_bars, research_connection
+
+        stamps = [b.timestamp for b in buckets]
+        start, end = min(stamps) - timedelta(days=1), max(stamps) + timedelta(days=1)
+        with research_connection() as conn:
+            bars = fetch_underlying_bars(conn, args.symbol, start, end)
+        spot_by_ts = {ts: close for ts, _o, _h, _l, close in bars}
+        sorted_ts = sorted(spot_by_ts)
+
+        def spot_provider(ts: datetime) -> Optional[float]:  # noqa: F811
+            import bisect
+
+            i = bisect.bisect_right(sorted_ts, ts) - 1
+            if i < 0 or (ts - sorted_ts[i]) > timedelta(minutes=15):
+                return None
+            return spot_by_ts[sorted_ts[i]]
+
+    config = AttributionConfig(min_attributed_activity=args.active_threshold, n_boot=args.n_boot)
+    with _phase("match and score"):
+        result, cells = compare_attribution(
+            buckets, records, config=config, spot_provider=spot_provider
+        )
+    path = write_attribution_report(result, cells, args.out)
+    head = result.headline.get("active_cells") or {}
+    print(
+        json.dumps(
+            {
+                "interval": result.diagnostics.interval,
+                "intraday_identification_testable": (
+                    result.diagnostics.intraday_identification_testable
+                ),
+                "matched_cells": result.n_cells,
+                "sessions": result.n_sessions,
+                "active_cells": head.get("n"),
+                "sign_agreement_both_nonzero": head.get("sign_agreement_both_nonzero"),
+                "weighted_sign_agreement": head.get("weighted_sign_agreement_by_abs_c_gamma"),
+                "pearson": head.get("pearson"),
+                "bias_mean_b_minus_c": head.get("bias_mean_b_minus_c"),
+                "confidence": result.confidence.get("sign_agreement_active"),
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    print(
+        f"\nreport -> {path}\nresult -> {path.with_suffix('.json')}\n"
+        f"cells  -> {path.with_name(path.stem + '_cells.csv')}"
+    )
+    return 0
+
+
 def cmd_build_dataset(args: argparse.Namespace) -> int:
+    from research.mm_attributed_gex.aggressor import AggressorGateConfig, make_bucket_factory
     from research.mm_attributed_gex.cboe.loader import load_paths
     from research.mm_attributed_gex.dataset import (
         DatasetSpec,
@@ -303,16 +463,43 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
         research_connection,
     )
 
-    profile = _load_profile(args.profile)
-    files = list(args.files)
+    files = list(args.files or [])
+    want_aggressor = bool(args.aggressor) or args.aggressor_source != "none"
+    if not files and not want_aggressor:
+        print(
+            "Nothing to compare against production: pass Cboe files (Model C), "
+            "--aggressor <jsonl> / --aggressor-source (Model B), or both.",
+            file=sys.stderr,
+        )
+        return 2
 
-    def records_factory():
-        return load_paths(files, profile, allow_unconfirmed=args.allow_unconfirmed)
+    records_factory = None
+    if files:
+        profile = _load_profile(args.profile)
+
+        def records_factory():  # noqa: F811
+            return load_paths(files, profile, allow_unconfirmed=args.allow_unconfirmed)
 
     start = _parse_dt(args.start)
     end = _parse_dt(args.end)
+    out = Path(args.out)
 
     with research_connection() as conn:
+        aggressor_factory = None
+        if want_aggressor:
+            aggressor_path = Path(args.aggressor) if args.aggressor else None
+            if aggressor_path is None:
+                aggressor_path = out.with_name(out.stem + "_aggressor.jsonl")
+                with _phase(f"aggressor tape {args.aggressor_source}"):
+                    _extract_aggressor(conn, args, aggressor_path, start, end)
+            elif not aggressor_path.exists():
+                print(
+                    f"No aggressor file at {aggressor_path}; run build-aggressor first.",
+                    file=sys.stderr,
+                )
+                return 2
+            aggressor_factory = make_bucket_factory(aggressor_path)
+            print(f"  aggressor tape: {aggressor_path}")
         with _phase("snapshot timestamps"):
             stamps = fetch_snapshot_timestamps(
                 conn, args.symbol, start, end, step_minutes=args.step_minutes
@@ -334,23 +521,25 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
             bars = fetch_underlying_bars(conn, args.symbol, start, end)
         with _phase("vix"):
             vix = dict(fetch_vix_closes(conn, start, end))
-        with _phase("parse open-close files"):
-            expirations = sorted({r.expiration for r in records_factory()})
-        with _phase(f"listing dates ({len(expirations)} expirations)"):
-            # Bounded scan. Unbounded, this aggregates the whole retained
-            # history of option_chains for these expirations and blows past any
-            # statement timeout. See fetch_series_listing_dates for why the
-            # bound cannot simply be the study window.
-            listing_dates = fetch_series_listing_dates(
-                conn,
-                args.symbol,
-                expirations,
-                since=start - timedelta(days=args.listing_lookback_days),
+        listing_dates: dict = {}
+        if records_factory is not None:
+            with _phase("parse open-close files"):
+                expirations = sorted({r.expiration for r in records_factory()})
+            with _phase(f"listing dates ({len(expirations)} expirations)"):
+                # Bounded scan. Unbounded, this aggregates the whole retained
+                # history of option_chains for these expirations and blows past any
+                # statement timeout. See fetch_series_listing_dates for why the
+                # bound cannot simply be the study window.
+                listing_dates = fetch_series_listing_dates(
+                    conn,
+                    args.symbol,
+                    expirations,
+                    since=start - timedelta(days=args.listing_lookback_days),
+                )
+            print(
+                f"  listing dates established for {len(listing_dates)} series "
+                f"(the rest fall back to the window heuristic)"
             )
-        print(
-            f"  listing dates established for {len(listing_dates)} series "
-            f"(the rest fall back to the window heuristic)"
-        )
 
         spot_by_ts = {ts: close for ts, _o, _h, _l, close in bars}
         sorted_bar_ts = sorted(spot_by_ts)
@@ -397,6 +586,7 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
             clean_only=not args.include_censored,
             apply_horizon_weighting=not args.raw_positioning,
             use_net_flow_estimator=args.net_flow_estimator,
+            aggressor_gates=AggressorGateConfig(allow_extrapolated=args.allow_extrapolated),
         )
 
         build_started = time.monotonic()
@@ -423,9 +613,9 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
             vix_provider=vix_provider,
             listing_dates=listing_dates,
             progress=progress,
+            aggressor_factory=aggressor_factory,
         )
 
-    out = Path(args.out)
     write_jsonl(rows, out)
     write_csv(rows, out.with_suffix(".csv"))
     out.with_name(out.stem + "_provenance.json").write_text(
@@ -436,10 +626,18 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
 
     # The provenance block carries the answer, but it is long and the numbers
     # that invalidate a run sit in the middle of it.  Say them out loud.
+    aggr = provenance.get("aggressor") or {}
+    if aggr:
+        failed = aggr.get("sessions_failed") or {}
+        print(
+            f"\naggressor tape: {aggr.get('sessions')} session(s), "
+            f"{aggr.get('sessions_passed')} passed the minimum-data gate"
+            + (f"; failed: {json.dumps(failed)}" if failed else "")
+        )
     recon = provenance.get("reconstruction") or {}
     completeness = provenance.get("data_completeness") or 0.0
     gaps = recon.get("session_gap_count") or 0
-    if completeness < 0.9 or gaps > 2:
+    if recon and (completeness < 0.9 or gaps > 2):
         print(
             f"\n⚠  DATA COMPLETENESS {completeness:.1%} — {gaps} expected trading "
             f"session(s) missing between {recon.get('window_start')} and "
@@ -499,9 +697,19 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     from research.mm_attributed_gex.report import decide
 
     verdict = decide(result)
-    print(f"\nVERDICT: {verdict.label}")
+    print(f"\nTWO-ARM VERDICT (Attributed vs Production): {verdict.label}")
     for reason in verdict.rationale:
         print(f"  - {reason}")
+    if result.arms:
+        from research.mm_attributed_gex.report import decide_arms
+
+        arms_verdict = decide_arms(result)
+        print(
+            "\nTHREE-ARM VERDICT (Production / Aggressor-Inferred / Attributed): "
+            f"{arms_verdict.label}"
+        )
+        for reason in arms_verdict.rationale:
+            print(f"  - {reason}")
     return 0
 
 
@@ -672,11 +880,67 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.set_defaults(func=cmd_reconstruct)
 
-    p = sub.add_parser("build-dataset", help="produce the side-by-side research dataset")
-    p.add_argument("files", nargs="+", help="Cboe Open-Close files or directories")
+    p = sub.add_parser(
+        "build-aggressor",
+        help="extract ZeroGEX's aggressor-classified tape for Model B (read-only)",
+    )
+    p.add_argument("--start", required=True, help="ISO start timestamp")
+    p.add_argument("--end", required=True, help="ISO end timestamp")
+    p.add_argument("--out", default="research_output/aggressor_buckets.jsonl")
+    p.add_argument(
+        "--source",
+        dest="aggressor_source",
+        choices=("option_chains", "flow_contract_facts"),
+        default="option_chains",
+        help="option_chains keeps the unclassified share (honest); flow_contract_facts "
+        "is a labelled EXTRAPOLATED fallback for windows past chain retention",
+    )
+    p.add_argument("--allow-extrapolated", action="store_true")
+    _add_common(p)
+    p.set_defaults(func=cmd_build_aggressor)
+
+    p = sub.add_parser(
+        "compare-attribution",
+        help="B vs C: how often the aggressor assumption matches exchange-classified MM activity",
+    )
+    p.add_argument("files", nargs="+", help="Cboe Open-Close files or directories (Model C)")
+    p.add_argument(
+        "--aggressor", required=True, help="aggressor buckets JSONL from build-aggressor"
+    )
+    p.add_argument("--out", default="research_output/attribution_report.md")
+    p.add_argument(
+        "--active-threshold",
+        type=float,
+        default=10.0,
+        help="gross attributed MM contracts for a cell to count as active (predeclared)",
+    )
+    p.add_argument("--n-boot", type=int, default=1000)
+    p.add_argument("--no-db", action="store_true", help="skip spot lookups (no moneyness strata)")
+    _add_common(p)
+    p.set_defaults(func=cmd_compare_attribution)
+
+    p = sub.add_parser("build-dataset", help="produce the A / B / C side-by-side research dataset")
+    p.add_argument(
+        "files", nargs="*", help="Cboe Open-Close files or directories (Model C); optional"
+    )
     p.add_argument("--start", required=True, help="ISO start timestamp")
     p.add_argument("--end", required=True, help="ISO end timestamp")
     p.add_argument("--out", default="research_output/mm_attributed_dataset.jsonl")
+    p.add_argument(
+        "--aggressor",
+        help="aggressor buckets JSONL from build-aggressor (Model B); skips the extraction",
+    )
+    p.add_argument(
+        "--aggressor-source",
+        choices=("none", "option_chains", "flow_contract_facts"),
+        default="none",
+        help="extract Model B from the database as part of this run",
+    )
+    p.add_argument(
+        "--allow-extrapolated",
+        action="store_true",
+        help="let sessions built from flow_contract_facts pass the aggressor gate",
+    )
     p.add_argument(
         "--step-minutes",
         type=int,
