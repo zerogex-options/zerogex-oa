@@ -51,6 +51,7 @@ __all__ = [
     "fetch_bars",
     "fetch_index_bars",
     "fetch_volumes",
+    "probe_bars",
     "fetch_strike_frames",
     "fetch_trade_bias",
     "coverage",
@@ -464,3 +465,53 @@ def fetch_volumes(
             pass
         return {}, proxy
     return {ts: float(v or 0.0) for ts, v in rows if ts is not None}, proxy
+
+
+def probe_bars(conn: Any, inst: InstrumentSpec, session: date) -> dict[str, Any]:
+    """Why did a session have no RTH bars?  Runs only when the read came back
+    empty, so it costs nothing on the normal path.
+
+    Distinguishes the two causes, which need different responses:
+
+    * **nothing on the date at all** — a genuine coverage gap, e.g. ES before
+      the futures ingester started, or a holiday the gamma feed published on;
+    * **bars exist but none inside the session window** — a window or timezone
+      problem, which is a bug rather than a gap and must not be written off as
+      missing data.
+    """
+    lo = datetime.combine(session, time(0, 0), tzinfo=ET)
+    hi = lo + timedelta(days=1)
+    if inst.is_futures:
+        sql = """
+            SELECT COUNT(*), MIN(timestamp), MAX(timestamp)
+              FROM futures_quotes
+             WHERE index_symbol = %(symbol)s
+               AND timestamp >= %(lo)s AND timestamp < %(hi)s
+        """
+    else:
+        sql = """
+            SELECT COUNT(*), MIN(timestamp), MAX(timestamp)
+              FROM underlying_quotes
+             WHERE symbol = %(symbol)s
+               AND timestamp >= %(lo)s AND timestamp < %(hi)s
+        """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"symbol": inst.bar_symbol.upper(), "lo": lo, "hi": hi})
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"probe": "failed"}
+    n, first, last = row or (0, None, None)
+    n = int(n or 0)
+    if n == 0:
+        return {"probe": "no_rows_on_date", "rows_on_date": 0}
+    return {
+        "probe": "rows_outside_session_window",
+        "rows_on_date": n,
+        "first_et": first.astimezone(ET).strftime("%H:%M") if first else None,
+        "last_et": last.astimezone(ET).strftime("%H:%M") if last else None,
+    }

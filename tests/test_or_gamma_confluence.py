@@ -888,3 +888,67 @@ def test_compare_to_baseline_point_estimate_lies_inside_its_own_interval():
     assert res["clustered_ci_low"] < res["clustered_ci_high"]
     assert res["clustered_ci_low"] <= res["clustered_diff"] <= res["clustered_ci_high"]
     assert res["clustered_diff"] == pytest.approx(res["rate"] - res["baseline_rate"])
+
+
+def test_gex_ladder_depth_cannot_silently_exceed_production_cap():
+    """A depth beyond production's cap is clamped by compute_wall_ladder, so
+    accepting it would let the run's fingerprint describe parameters that were
+    never used. The first production run did exactly that at depth 10."""
+    from src.analytics.walls import DEFAULT_WALL_LADDER_DEPTH, MAX_WALL_LADDER_DEPTH
+
+    assert ResearchConfig().gex_ladder_depth == DEFAULT_WALL_LADDER_DEPTH
+    ResearchConfig(gex_ladder_depth=MAX_WALL_LADDER_DEPTH)  # the cap itself is fine
+    with pytest.raises(ValueError, match="MAX_WALL_LADDER_DEPTH"):
+        ResearchConfig(gex_ladder_depth=MAX_WALL_LADDER_DEPTH + 1)
+
+
+def test_report_flags_a_confluence_cohort_that_contains_the_population():
+    """A filter keeping most of the sample is not separating anything, and the
+    report must say so rather than leave it to be noticed by eye."""
+    from research.or_gamma_confluence.report import build_summary, render_markdown
+
+    rows = [
+        {
+            "symbol": "NQ",
+            "gamma_symbol": "NDX",
+            "session": f"2026-07-{d % 28 + 1:02d}",
+            "outcome": OUTCOME_REVERSAL if d % 2 else OUTCOME_CONTINUATION,
+            "extension_k": 2.0,
+            "gamma_available": True,
+            "gamma_levels_total": 13,
+            "nearest_gamma_distance": 1.0,
+            # Near-universal confluence at every threshold.
+            **{f"gamma_confluence_count_{b}": 1 for b in ("2", "5", "10", "15", "20")},
+        }
+        for d in range(60)
+    ]
+    md = render_markdown(build_summary(rows, ResearchConfig()))
+    assert "Is the confluence cohort actually a filter?" in md
+    assert "is not" in md and "separating anything" in md
+
+
+def test_report_flags_the_depth_confound_when_it_is_present():
+    """Ingestion streams strikes within 3% of spot, so a deep extension can be
+    somewhere no gamma level can exist. If the no-confluence group is
+    systematically deeper, the cohorts differ by distance as much as by gamma."""
+    from research.or_gamma_confluence.report import build_summary, render_markdown
+
+    def _row(d, depth, conf):
+        return {
+            "symbol": "NQ",
+            "gamma_symbol": "NDX",
+            "session": f"2026-07-{d % 28 + 1:02d}",
+            "outcome": OUTCOME_REVERSAL if d % 2 else OUTCOME_CONTINUATION,
+            "extension_k": depth,
+            "gamma_available": True,
+            "gamma_levels_total": 13,
+            "nearest_gamma_distance": 1.0 if conf else 200.0,
+            **{
+                f"gamma_confluence_count_{b}": (1 if conf else 0)
+                for b in ("2", "5", "10", "15", "20")
+            },
+        }
+
+    rows = [_row(d, 1.0, True) for d in range(60)] + [_row(d, 6.0, False) for d in range(60)]
+    md = render_markdown(build_summary(rows, ResearchConfig()))
+    assert "Confounded" in md

@@ -126,7 +126,17 @@ def build_session(
     bars = sources.fetch_bars(conn, inst, session, cfg)
     result.n_bars = len(bars)
     if not bars:
-        result.skipped_reason = "no_bars"
+        # "no_bars" on its own cannot distinguish a coverage gap from a window
+        # bug, and those need different responses. Probe only on the empty
+        # path, so the normal path pays nothing.
+        probe = sources.probe_bars(conn, inst, session)
+        detail = probe.get("probe", "unknown")
+        if detail == "rows_outside_session_window":
+            detail += (
+                f" ({probe['rows_on_date']} rows on date, "
+                f"{probe.get('first_et')}-{probe.get('last_et')} ET)"
+            )
+        result.skipped_reason = f"no_bars: {detail}"
         return result
 
     # De-phantom ONCE, here, so the repaired bars feed the opening range, the
