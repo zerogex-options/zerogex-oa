@@ -21,7 +21,13 @@ import pytest
 
 from research.msi_regime_excursion.excursion import ET, Bar, BarSeries
 from research.or_gamma_confluence.basis import BasisReader, BasisUnavailable, project_snapshot
-from research.or_gamma_confluence.cohorts import build_cohorts, summarize
+from research.or_gamma_confluence.cohorts import (
+    book_of,
+    build_cohorts,
+    compare_to_baseline,
+    pooling_check,
+    summarize,
+)
 from research.or_gamma_confluence.config import (
     CLOCK_DATA,
     CLOCK_PUBLISHED,
@@ -44,6 +50,7 @@ from research.or_gamma_confluence.levels import (
     GammaTimeline,
     SnapshotRejected,
     build_snapshot,
+    build_timeline_tolerant,
     confluence_at,
 )
 from research.or_gamma_confluence.outcomes import measure_outcome, reversion_sign
@@ -207,13 +214,80 @@ def test_visible_clock_adds_the_client_poll_lag():
         ({"created_at": None}, CLOCK_PUBLISHED),
         ({"created_at": None}, CLOCK_VISIBLE),
         ({"created_at": _ts(9, 59)}, CLOCK_VISIBLE),  # before timestamp
-        ({"created_at": _ts(14, 0)}, CLOCK_VISIBLE),  # backfill-scale lag
+        # Backfill scale: written days later, so created_at is a backfill time.
+        ({"created_at": _ts(10, 0) + timedelta(days=3)}, CLOCK_VISIBLE),
     ],
 )
 def test_untrustworthy_publish_clock_fails_closed(override, clock):
     row = _frame(10, 0, call_wall=29500.0, **override)
     with pytest.raises(SnapshotRejected):
         build_snapshot(row, _cfg(availability_clock=clock), spot=29500.0)
+
+
+@pytest.mark.parametrize("lag_s", [83, 96, 651, 1618])
+def test_a_slow_publish_is_kept_and_reported_as_late(lag_s):
+    """The measured production tail (p95 ~65 s, maxima 83-1618 s) is slow
+    publishing, not backfilling. Discarding it would throw away correctly
+    timed frames; the visible clock already handles it by reporting the level
+    as late, which is exactly what a trader experienced."""
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    snap = build_snapshot(_frame(10, 0, call_wall=29500.0, lag_s=lag_s), cfg, spot=29500.0)
+    assert snap.publish_lag_seconds == pytest.approx(lag_s)
+    assert snap.available_at == _ts(10, 0) + timedelta(seconds=lag_s + cfg.client_poll_lag_seconds)
+
+
+def _minute_frames(n: int) -> list[dict]:
+    """``n`` one-a-minute frames from 10:00, the production cadence."""
+    rows = []
+    for m in range(n):
+        ts = _ts(10, 0) + timedelta(minutes=m)
+        row = _frame(10, 0, call_wall=29500.0 + m)
+        row["timestamp"] = ts
+        row["created_at"] = ts + timedelta(seconds=8)
+        rows.append(row)
+    return rows
+
+
+def test_one_bad_frame_is_dropped_not_the_whole_session():
+    """A step function holds the previous value across a dropped frame, so an
+    isolated bad clock costs one frame — not a session."""
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    rows = _minute_frames(100)
+    rows[7]["created_at"] = None  # one unusable frame
+
+    built = build_timeline_tolerant(rows, cfg, spot_at=lambda ts: 29500.0)
+    assert built.rejected == 1
+    assert built.accepted == 99
+    assert built.reasons == {"created_at_missing": 1}
+    assert built.rejected_frac < cfg.max_rejected_frame_frac
+
+    # The 10:07 frame is gone, so 10:06 stays in force across it.
+    snap = built.timeline.as_of(_ts(10, 8), 0)
+    assert snap is not None and snap.data_ts == _ts(10, 6)
+
+
+def test_a_session_of_bad_frames_still_fails_closed():
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    rows = _minute_frames(100)
+    for row in rows[:50]:
+        row["created_at"] = None
+    built = build_timeline_tolerant(rows, cfg, spot_at=lambda ts: 29500.0)
+    assert built.rejected_frac == pytest.approx(0.5)
+    assert built.rejected_frac > cfg.max_rejected_frame_frac
+
+
+def test_the_measured_production_outliers_do_not_cost_a_session():
+    """SPY carries one ~1618 s publish and QQQ one negative-lag row across
+    ~59 sessions each. Under a per-session rule those cost a session apiece;
+    under the per-frame rule they cost a frame."""
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    rows = _minute_frames(390)  # a full session
+    rows[100]["created_at"] = rows[100]["timestamp"] - timedelta(seconds=1)  # negative
+    built = build_timeline_tolerant(rows, cfg, spot_at=lambda ts: 29500.0)
+    assert built.rejected == 1
+    assert built.reasons == {"created_at_before_timestamp": 1}
+    assert built.rejected_frac <= cfg.max_rejected_frame_frac
+    assert built.accepted >= cfg.min_session_frames
 
 
 def test_data_clock_never_consults_created_at():
@@ -727,3 +801,90 @@ def test_out_of_sample_split_is_chronological_and_session_aligned():
 
 def test_selftest_passes():
     assert run_selftest(sessions=40, seed=7, verbose=False) == 0
+
+
+# ── Clustering unit and pooling ───────────────────────────────────────
+
+
+def test_inference_clusters_on_the_calendar_session_not_the_symbol_session():
+    """SPY, SPX and ES are one option book on one set of days. Counting three
+    symbol-sessions as three independent clusters would shrink every interval
+    by about sqrt(3)."""
+    rows = [
+        {
+            "symbol": sym,
+            "gamma_symbol": "SPX" if sym in ("SPX", "ES") else sym,
+            "session": "2026-07-01",
+            "outcome": OUTCOME_REVERSAL,
+        }
+        for sym in ("SPY", "SPX", "ES")
+    ]
+    stat = summarize(rows)
+    assert stat["n_sessions"] == 1, "one calendar day is one observation"
+    assert stat["n_symbol_sessions"] == 3
+
+
+def test_book_of_maps_price_axes_onto_their_option_chain():
+    assert book_of({"symbol": "NQ", "gamma_symbol": "NDX"}) == "Nasdaq"
+    assert book_of({"symbol": "ES", "gamma_symbol": "SPX"}) == "S&P"
+    assert book_of({"symbol": "SPY"}) == "S&P"
+    assert book_of({"symbol": "QQQ"}) == "Nasdaq"
+    assert book_of({"symbol": "IWM"}) is None
+
+
+def _book_rows(sp_delta: float, ndx_delta: float, *, days: int = 40, seed: int = 3):
+    rng = random.Random(seed)
+    rows = []
+    for d in range(days):
+        offset = rng.gauss(0.0, 0.08)
+        for sym, gamma, delta in (
+            ("SPY", "SPY", sp_delta),
+            ("SPX", "SPX", sp_delta),
+            ("QQQ", "QQQ", ndx_delta),
+            ("NDX", "NDX", ndx_delta),
+        ):
+            for _ in range(10):
+                conf = rng.random() < 0.35
+                p = min(0.98, max(0.02, 0.55 + offset + (delta if conf else 0.0)))
+                rows.append(
+                    {
+                        "symbol": sym,
+                        "gamma_symbol": gamma,
+                        "session": f"2026-07-{d % 28 + 1:02d}",
+                        "outcome": (OUTCOME_REVERSAL if rng.random() < p else OUTCOME_CONTINUATION),
+                        "conf": conf,
+                    }
+                )
+    return rows
+
+
+def test_pooling_check_refuses_to_pool_books_that_disagree():
+    rows = _book_rows(sp_delta=0.20, ndx_delta=0.0)
+    result = pooling_check(rows, lambda r: r["conf"], iterations=600)
+    assert result["verdict"] == "books_disagree"
+    assert set(result["per_book"]) == {"S&P", "Nasdaq"}
+    assert (
+        result["per_book"]["S&P"]["clustered_diff"] > result["per_book"]["Nasdaq"]["clustered_diff"]
+    )
+
+
+def test_pooling_check_allows_pooling_when_books_agree():
+    rows = _book_rows(sp_delta=0.12, ndx_delta=0.12, seed=11)
+    result = pooling_check(rows, lambda r: r["conf"], iterations=600)
+    assert result["verdict"] == "consistent"
+
+
+def test_pooling_check_says_so_when_only_one_book_is_present():
+    rows = [r for r in _book_rows(sp_delta=0.10, ndx_delta=0.10) if r["symbol"] in ("SPY", "SPX")]
+    assert pooling_check(rows, lambda r: r["conf"], iterations=400)["verdict"] == "single_book"
+
+
+def test_compare_to_baseline_point_estimate_lies_inside_its_own_interval():
+    """Regression: the bootstrap returns (ci_lo, ci_hi, p) and was once
+    unpacked as (diff, lo, hi), which produced reversed bounds that did not
+    contain their own point estimate."""
+    rows = _book_rows(sp_delta=0.15, ndx_delta=0.15, seed=5)
+    res = compare_to_baseline(rows, lambda r: r["conf"], iterations=600)
+    assert res["clustered_ci_low"] < res["clustered_ci_high"]
+    assert res["clustered_ci_low"] <= res["clustered_diff"] <= res["clustered_ci_high"]
+    assert res["clustered_diff"] == pytest.approx(res["rate"] - res["baseline_rate"])
