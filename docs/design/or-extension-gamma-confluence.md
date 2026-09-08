@@ -495,3 +495,24 @@ wrong place. `src/tools/cash_index_open_repair.py` is production's rule for it;
 the harness applies it defensively at read time rather than assuming
 `make cash-index-open-repair` has been run over history. It is a no-op for
 SPY/QQQ (real traded opens) and for ES/NQ (futures print continuously).
+
+## 11. Correction — which axes are re-cohortable
+
+An earlier draft of §7 said the lead-time and confluence-distance axes could
+both be re-cohorted from a single build. Only the second is true, and the
+distinction is not cosmetic: `gamma_min_lead_seconds` is passed to
+`GammaTimeline.as_of` inside `dataset.build_session`, so it selects a
+*different gamma snapshot per touch* and is baked into the stored confluence
+distances. Sweeping it requires a rebuild per value.
+
+| axis | changes | swept by |
+|---|---|---|
+| `opening_range_minutes` | the range, so the ladder, so the events | `sweep` (rebuild) |
+| `extension_step` | the ladder, so the events | `sweep` (rebuild) |
+| `gamma_min_lead_seconds` | which snapshot each touch sees | `sweep --lead-grid` (rebuild) |
+| `confluence_distance` | only how stored distances are bucketed | `analyze` (no rebuild) |
+
+The consequence is that the brief's required lead-time sensitivity check
+(0 / 30 / 60 / 120 / 180 s) had never actually run: it was assumed to fall out
+of `analyze`, and it does not. `make orgc-sweep-lead` runs it as five
+rebuilds.

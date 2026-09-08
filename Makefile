@@ -1246,10 +1246,19 @@ orgc-analyze: ## OR-gamma: cohorts, sensitivity grids, chronological out-of-samp
 		$(if $(TREND_FILTER),--trend-filter $(TREND_FILTER))
 
 .PHONY: orgc-sweep
-orgc-sweep: ## OR-gamma: parameter neighbourhoods (one build per cell; a surface, not a leaderboard). Vars: START=ISO END=ISO ORGC_SYMBOLS
+orgc-sweep: ## OR-gamma: ladder-geometry sweep, 9 cells (OR 5/15/30 x step .25/.5/1). One REBUILD per cell. Vars: START=ISO END=ISO [FAST=yes skips gex_by_strike]
 	$(PY) -m research.or_gamma_confluence.cli sweep $(ORGC_SYMBOLS) \
 		--start $(START) --end $(END) \
-		--outdir $(ORGC_OUT)/orgc_sweep
+		--outdir $(ORGC_OUT)/orgc_sweep \
+		$(if $(filter yes,$(FAST)),--no-gex-ranks)
+
+.PHONY: orgc-sweep-lead
+orgc-sweep-lead: ## OR-gamma: gamma lead-time sweep, 5 cells (0/30/60/120/180s). Also a rebuild per cell -- the lead selects a different snapshot per touch. Vars: START=ISO END=ISO
+	$(PY) -m research.or_gamma_confluence.cli sweep $(ORGC_SYMBOLS) \
+		--start $(START) --end $(END) \
+		--outdir $(ORGC_OUT)/orgc_sweep_lead \
+		--or-minutes-grid 5 --step-grid 0.5 \
+		--lead-grid 0 30 60 120 180
 
 .PHONY: orgc-test
 orgc-test: ## OR-gamma: run just this study's test suite
