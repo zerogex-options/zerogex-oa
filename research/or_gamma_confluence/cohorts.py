@@ -52,6 +52,9 @@ __all__ = [
     "compare_to_baseline",
     "confluence_count",
     "has_confluence",
+    "BOOKS",
+    "book_of",
+    "pooling_check",
 ]
 
 #: Below this many resolved events a cohort is labelled ``thin``.  Not a
@@ -203,6 +206,76 @@ def build_cohorts(
     ]
 
 
+#: Which option book a symbol's gamma comes from.  This is the only axis along
+#: which the six symbols are genuinely different samples: SPY, SPX and ES are
+#: three price axes over ONE S&P chain, and QQQ, NDX and NQ over ONE Nasdaq
+#: chain.  ``research/wall_break_odds`` measured the two books as different
+#: processes for wall breaks (p<0.01 on every S&P-vs-Nasdaq pair) while the
+#: symbols within a book were indistinguishable (p=0.82, p=0.81), which is
+#: exactly the shape that makes pooling across books unsafe and pooling within
+#: one merely redundant.
+BOOKS: dict[str, str] = {
+    "SPY": "S&P",
+    "SPX": "S&P",
+    "ES": "S&P",
+    "QQQ": "Nasdaq",
+    "NDX": "Nasdaq",
+    "NQ": "Nasdaq",
+}
+
+
+def book_of(row: Mapping[str, Any]) -> Optional[str]:
+    """The option book behind a row, from its gamma symbol where available."""
+    gamma = row.get("gamma_symbol")
+    if gamma:
+        for symbol, book in BOOKS.items():
+            if symbol == gamma:
+                return book
+    return BOOKS.get(str(row.get("symbol") or "").upper())
+
+
+def pooling_check(
+    rows: Sequence[Mapping[str, Any]],
+    predicate: Callable[[Mapping[str, Any]], bool],
+    *,
+    iterations: int = 2000,
+) -> dict[str, Any]:
+    """Do the books agree about this cohort's effect, or is pooling a fiction?
+
+    Pooling is what makes this study powered at all — on the measured sample a
+    single symbol can only resolve an effect of roughly 12-18 percentage
+    points, while all six together resolve about 5.  But that only buys
+    anything if the books are one process.  If they are not, a pooled figure
+    is an average describing neither.
+
+    The test is deliberately simple and conservative: compute the effect
+    separately per book and report whether their intervals overlap.  A formal
+    interaction test on two groups at this sample size would claim more
+    precision than the data has.
+    """
+    per_book: dict[str, Any] = {}
+    for book in sorted({b for b in (book_of(r) for r in rows) if b}):
+        subset = [r for r in rows if book_of(r) == book]
+        stat = compare_to_baseline(subset, predicate, iterations=iterations)
+        stat["n_sessions"] = len({r.get("session") for r in subset})
+        per_book[book] = stat
+
+    verdict = "single_book"
+    if len(per_book) >= 2:
+        bands = [
+            (v["clustered_ci_low"], v["clustered_ci_high"])
+            for v in per_book.values()
+            if v.get("clustered_ci_low") is not None
+        ]
+        if len(bands) < 2:
+            verdict = "undetermined"
+        else:
+            lo = max(b[0] for b in bands)
+            hi = min(b[1] for b in bands)
+            verdict = "consistent" if lo <= hi else "books_disagree"
+    return {"per_book": per_book, "verdict": verdict}
+
+
 def _rate(rows: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
     """``(reversals, resolved)`` — ambiguous and censored excluded from both."""
     resolved = [r for r in rows if r.get("outcome") in RESOLVED_OUTCOMES]
@@ -233,13 +306,22 @@ def summarize(
     """
     k, n = _rate(rows)
     lo, hi = stats.wilson_ci(k, n) if n else (None, None)
-    sessions = {(r.get("symbol"), r.get("session")) for r in rows}
+    # Two different counts, and the distinction matters once more than one
+    # symbol is pooled. SPY, SPX and ES are the SAME S&P option book on the
+    # SAME calendar days, so three symbol-sessions on 2026-07-01 are one
+    # independent observation of that day's regime, not three.
+    sessions = {r.get("session") for r in rows}
+    symbol_sessions = {(r.get("symbol"), r.get("session")) for r in rows}
     outcomes = [r.get("outcome") for r in rows]
 
     out: dict[str, Any] = {
         "n": len(rows),
         "n_resolved": n,
+        #: Distinct CALENDAR sessions — the unit inference is done on.
         "n_sessions": len(sessions),
+        #: Distinct (symbol, session) pairs. Larger than ``n_sessions`` when
+        #: symbols are pooled; never the denominator for anything.
+        "n_symbol_sessions": len(symbol_sessions),
         "reversal_first": k,
         "reversal_rate": (k / n) if n else None,
         "reversal_ci_low": lo,
@@ -312,7 +394,14 @@ def compare_to_baseline(
     lo = hi = pval = None
     if any(in_bucket) and not all(in_bucket):
         values = [1.0 if r.get("outcome") == OUTCOME_REVERSAL else 0.0 for r in resolved]
-        sessions = [(r.get("symbol"), r.get("session")) for r in resolved]
+        # Cluster on the CALENDAR session, not on (symbol, session). Pooling
+        # SPY + SPX + ES over 59 days would otherwise present 177 clusters
+        # drawn from 59 actual days and shrink every interval by ~sqrt(3),
+        # because those three symbols are one option book on one set of days.
+        # Clustering on the date is conservative even across books (S&P and
+        # Nasdaq move together on a macro day), which is the right default
+        # here.
+        sessions = [r.get("session") for r in resolved]
         lo, hi, pval = stats.session_block_bootstrap_diff(
             values, sessions, in_bucket, iterations=iterations, seed=seed
         )

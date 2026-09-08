@@ -33,9 +33,11 @@ from typing import Any, Mapping, Optional, Sequence
 
 from research.or_gamma_confluence.cohorts import (
     MIN_REPORTABLE_N,
+    book_of,
     build_cohorts,
     compare_to_baseline,
     has_confluence,
+    pooling_check,
     summarize,
 )
 from research.or_gamma_confluence.config import ResearchConfig
@@ -175,6 +177,13 @@ def build_summary(
         for name, part in splits.items()
     }
 
+    pooling = pooling_check(list(rows), lambda r: has_confluence(r, confluence_distance))
+
+    by_book = {
+        book: summarize([r for r in rows if book_of(r) == book])
+        for book in sorted({b for b in (book_of(r) for r in rows) if b})
+    }
+
     by_symbol = {
         sym: summarize([r for r in rows if r.get("symbol") == sym])
         for sym in sorted({str(r.get("symbol")) for r in rows if r.get("symbol")})
@@ -188,6 +197,8 @@ def build_summary(
         "confluence_distance_used": confluence_distance,
         "overall": summarize(rows),
         "by_symbol": by_symbol,
+        "by_book": by_book,
+        "pooling_check": pooling,
         "cohorts": cohort_stats,
         "depth_table": _depth_table(rows, (0.5, 1.0, 2.0, 3.0, 5.0)),
         "distance_grid": _distance_grid(rows, cfg.confluence_buckets_pts),
@@ -254,8 +265,14 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     )
     A(f"- Confluence distance used for cohorts: " f"{summary['confluence_distance_used']:g} pts")
     A(
-        f"- Events: **{overall['n']}** across **{overall['n_sessions']}** "
-        f"symbol-sessions ({overall['n_resolved']} resolved)"
+        f"- Events: **{overall['n']}** ({overall['n_resolved']} resolved) across "
+        f"**{overall['n_sessions']}** calendar sessions "
+        f"/ {overall.get('n_symbol_sessions', '?')} symbol-sessions"
+    )
+    A(
+        "- Inference is clustered on the CALENDAR session: SPY, SPX and ES are "
+        "one option book on one set of days, so pooling them adds events, not "
+        "independent observations."
     )
     if prov.get("skip_reasons"):
         A(f"- Sessions skipped: `{json.dumps(prov['skip_reasons'])}`")
@@ -352,6 +369,44 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             f"| {name} | {part.get('sessions', 0)} | {_cell('all')} | "
             f"{_cell('confluence')} | {_cell('no_confluence')} |"
         )
+    A("")
+
+    A("## Pooling check — do the two option books agree?\n")
+    pc = summary.get("pooling_check") or {}
+    A(
+        "Pooling is what makes this study powered at all: on the measured sample "
+        "a single symbol resolves roughly a 12-18 point effect, all six together "
+        "about 5. But SPY/SPX/ES are three price axes over ONE S&P chain and "
+        "QQQ/NDX/NQ over ONE Nasdaq chain, so there are two samples here, not "
+        "six — and `wall_break_odds` found those two books to be different "
+        "processes for wall breaks.\n"
+    )
+    A("| book | sessions | n | effect vs baseline | clustered 95% CI |")
+    A("|---|---:|---:|---:|---|")
+    for book, v in (pc.get("per_book") or {}).items():
+        band = (
+            f"[{v['clustered_ci_low'] * 100:+.1f}, {v['clustered_ci_high'] * 100:+.1f}]"
+            if v.get("clustered_ci_low") is not None
+            else "—"
+        )
+        eff = "—" if v.get("clustered_diff") is None else f"{v['clustered_diff'] * 100:+.1f} pts"
+        A(f"| {book} | {v.get('n_sessions', 0)} | {v.get('n', 0)} | {eff} | {band} |")
+    A("")
+    verdict = pc.get("verdict")
+    A(
+        {
+            "consistent": "**Intervals overlap — the pooled figure above is admissible.** "
+            "Overlap at this sample size is weak evidence of agreement, "
+            "not proof of it.",
+            "books_disagree": "**The books DISAGREE — do not quote the pooled figure.** "
+            "An average of two different processes describes neither. "
+            "Report per book.",
+            "single_book": "Only one book is present, so there is nothing to pool and "
+            "nothing to check. The result does not carry to the other index.",
+            "undetermined": "Not enough resolved events in one or both books to compare. "
+            "Treat the pooled figure as unverified.",
+        }.get(verdict, f"Verdict: {verdict}")
+    )
     A("")
 
     A("## Per symbol\n")

@@ -21,7 +21,13 @@ import pytest
 
 from research.msi_regime_excursion.excursion import ET, Bar, BarSeries
 from research.or_gamma_confluence.basis import BasisReader, BasisUnavailable, project_snapshot
-from research.or_gamma_confluence.cohorts import build_cohorts, summarize
+from research.or_gamma_confluence.cohorts import (
+    book_of,
+    build_cohorts,
+    compare_to_baseline,
+    pooling_check,
+    summarize,
+)
 from research.or_gamma_confluence.config import (
     CLOCK_DATA,
     CLOCK_PUBLISHED,
@@ -795,3 +801,90 @@ def test_out_of_sample_split_is_chronological_and_session_aligned():
 
 def test_selftest_passes():
     assert run_selftest(sessions=40, seed=7, verbose=False) == 0
+
+
+# ── Clustering unit and pooling ───────────────────────────────────────
+
+
+def test_inference_clusters_on_the_calendar_session_not_the_symbol_session():
+    """SPY, SPX and ES are one option book on one set of days. Counting three
+    symbol-sessions as three independent clusters would shrink every interval
+    by about sqrt(3)."""
+    rows = [
+        {
+            "symbol": sym,
+            "gamma_symbol": "SPX" if sym in ("SPX", "ES") else sym,
+            "session": "2026-07-01",
+            "outcome": OUTCOME_REVERSAL,
+        }
+        for sym in ("SPY", "SPX", "ES")
+    ]
+    stat = summarize(rows)
+    assert stat["n_sessions"] == 1, "one calendar day is one observation"
+    assert stat["n_symbol_sessions"] == 3
+
+
+def test_book_of_maps_price_axes_onto_their_option_chain():
+    assert book_of({"symbol": "NQ", "gamma_symbol": "NDX"}) == "Nasdaq"
+    assert book_of({"symbol": "ES", "gamma_symbol": "SPX"}) == "S&P"
+    assert book_of({"symbol": "SPY"}) == "S&P"
+    assert book_of({"symbol": "QQQ"}) == "Nasdaq"
+    assert book_of({"symbol": "IWM"}) is None
+
+
+def _book_rows(sp_delta: float, ndx_delta: float, *, days: int = 40, seed: int = 3):
+    rng = random.Random(seed)
+    rows = []
+    for d in range(days):
+        offset = rng.gauss(0.0, 0.08)
+        for sym, gamma, delta in (
+            ("SPY", "SPY", sp_delta),
+            ("SPX", "SPX", sp_delta),
+            ("QQQ", "QQQ", ndx_delta),
+            ("NDX", "NDX", ndx_delta),
+        ):
+            for _ in range(10):
+                conf = rng.random() < 0.35
+                p = min(0.98, max(0.02, 0.55 + offset + (delta if conf else 0.0)))
+                rows.append(
+                    {
+                        "symbol": sym,
+                        "gamma_symbol": gamma,
+                        "session": f"2026-07-{d % 28 + 1:02d}",
+                        "outcome": (OUTCOME_REVERSAL if rng.random() < p else OUTCOME_CONTINUATION),
+                        "conf": conf,
+                    }
+                )
+    return rows
+
+
+def test_pooling_check_refuses_to_pool_books_that_disagree():
+    rows = _book_rows(sp_delta=0.20, ndx_delta=0.0)
+    result = pooling_check(rows, lambda r: r["conf"], iterations=600)
+    assert result["verdict"] == "books_disagree"
+    assert set(result["per_book"]) == {"S&P", "Nasdaq"}
+    assert (
+        result["per_book"]["S&P"]["clustered_diff"] > result["per_book"]["Nasdaq"]["clustered_diff"]
+    )
+
+
+def test_pooling_check_allows_pooling_when_books_agree():
+    rows = _book_rows(sp_delta=0.12, ndx_delta=0.12, seed=11)
+    result = pooling_check(rows, lambda r: r["conf"], iterations=600)
+    assert result["verdict"] == "consistent"
+
+
+def test_pooling_check_says_so_when_only_one_book_is_present():
+    rows = [r for r in _book_rows(sp_delta=0.10, ndx_delta=0.10) if r["symbol"] in ("SPY", "SPX")]
+    assert pooling_check(rows, lambda r: r["conf"], iterations=400)["verdict"] == "single_book"
+
+
+def test_compare_to_baseline_point_estimate_lies_inside_its_own_interval():
+    """Regression: the bootstrap returns (ci_lo, ci_hi, p) and was once
+    unpacked as (diff, lo, hi), which produced reversed bounds that did not
+    contain their own point estimate."""
+    rows = _book_rows(sp_delta=0.15, ndx_delta=0.15, seed=5)
+    res = compare_to_baseline(rows, lambda r: r["conf"], iterations=600)
+    assert res["clustered_ci_low"] < res["clustered_ci_high"]
+    assert res["clustered_ci_low"] <= res["clustered_diff"] <= res["clustered_ci_high"]
+    assert res["clustered_diff"] == pytest.approx(res["rate"] - res["baseline_rate"])
