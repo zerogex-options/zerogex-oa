@@ -208,7 +208,19 @@ class ResearchConfig:
     #: all morning" from "we sampled it twice".
     min_session_frames: int = 60
     #: Depth of the recomputed GEX rank ladder per side (C1..Cn / P1..Pn).
-    gex_ladder_depth: int = 10
+    #:
+    #: Production's own default (``src/analytics/walls.DEFAULT_WALL_LADDER_DEPTH``),
+    #: and for a reason this study learned the hard way. The first run used 10,
+    #: which ``compute_wall_ladder`` silently clamps to ``MAX_WALL_LADDER_DEPTH``
+    #: (5) — so the config claimed a depth the run had not used. Worse, even at
+    #: 5 the level set is 7 singletons + 10 ranked strikes, which blankets the
+    #: price range densely enough that 79% of touches registered "confluence"
+    #: within 10 points. A cohort that contains four fifths of the sample is not
+    #: a filter, and the confluence question cannot be answered through one.
+    #:
+    #: Validated against production's cap so a config can never again describe
+    #: something other than what ran.
+    gex_ladder_depth: int = 3
     #: Include the ranked-GEX level source at all.  Requires ``gex_by_strike``,
     #: which is retention-pruned; a run without it still produces every
     #: wall / flip / max-pain / pin cohort.
@@ -297,6 +309,16 @@ class ResearchConfig:
             raise ValueError("rearm_minutes must not be negative")
         if not 0.0 <= self.max_rejected_frame_frac <= 1.0:
             raise ValueError("max_rejected_frame_frac must be in [0, 1]")
+        # Production clamps silently; here it is an error, because a clamped
+        # depth makes the run's fingerprint describe parameters it did not use.
+        from src.analytics.walls import MAX_WALL_LADDER_DEPTH
+
+        if not 0 <= self.gex_ladder_depth <= MAX_WALL_LADDER_DEPTH:
+            raise ValueError(
+                f"gex_ladder_depth={self.gex_ladder_depth} exceeds production's "
+                f"MAX_WALL_LADDER_DEPTH={MAX_WALL_LADDER_DEPTH}; "
+                f"compute_wall_ladder would clamp it and the fingerprint would lie"
+            )
 
     # ── Derived ──────────────────────────────────────────────────────
 

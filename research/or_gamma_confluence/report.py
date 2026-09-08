@@ -40,6 +40,7 @@ from research.or_gamma_confluence.cohorts import (
     pooling_check,
     summarize,
 )
+from research.msi_regime_excursion import stats
 from research.or_gamma_confluence.config import ResearchConfig
 
 __all__ = ["split_chronological", "build_summary", "render_markdown", "write_csv"]
@@ -141,6 +142,64 @@ def _distance_grid(
     return grid
 
 
+def _discrimination(
+    rows: Sequence[Mapping[str, Any]], distances: Sequence[float]
+) -> dict[str, Any]:
+    """Is the confluence cohort a filter, or does it contain everything?
+
+    A confluence test is only informative if "has a gamma level nearby"
+    actually splits the sample.  With enough level kinds and a deep enough
+    rank ladder, every price in the session has a level near it, and the
+    cohort becomes the population — at which point a null result says nothing
+    about gamma and everything about level density.
+
+    Also cross-tabs confluence against extension DEPTH, because the obvious
+    confound runs that way: ingestion only streams strikes within
+    ``INGEST_STRIKE_PCT_RANGE`` (3%) of spot, so a deep extension can sit
+    where no gamma level is able to exist.  If the no-confluence group is
+    systematically deeper than the confluence group, the two cohorts differ by
+    distance-from-spot as much as by gamma, and the comparison is confounded.
+    """
+    total = [r for r in rows if r.get("gamma_available")]
+    counts = [r.get("gamma_levels_total") for r in total]
+    nearest = [r.get("nearest_gamma_distance") for r in total]
+
+    coverage = []
+    for d in distances:
+        n_with = sum(1 for r in rows if has_confluence(r, d))
+        coverage.append(
+            {
+                "distance": d,
+                "n_with": n_with,
+                "share": (n_with / len(rows)) if rows else None,
+            }
+        )
+
+    def _depth_of(r: Mapping[str, Any]) -> Optional[float]:
+        k = r.get("extension_k")
+        return abs(float(k)) if k is not None else None
+
+    by_group = {}
+    for label, sel in (
+        ("with confluence", [r for r in rows if has_confluence(r, 10.0)]),
+        ("no confluence", [r for r in rows if not has_confluence(r, 10.0)]),
+    ):
+        depths = stats.describe([_depth_of(r) for r in sel])
+        by_group[label] = {
+            "n": len(sel),
+            "median_depth_r": depths.median,
+            "mean_depth_r": depths.mean,
+        }
+
+    return {
+        "n_with_gamma": len(total),
+        "levels_per_snapshot_median": stats.describe(counts).median,
+        "nearest_distance_median": stats.describe(nearest).median,
+        "coverage": coverage,
+        "depth_by_group": by_group,
+    }
+
+
 def build_summary(
     rows: Sequence[Mapping[str, Any]],
     cfg: ResearchConfig,
@@ -202,6 +261,7 @@ def build_summary(
         "cohorts": cohort_stats,
         "depth_table": _depth_table(rows, (0.5, 1.0, 2.0, 3.0, 5.0)),
         "distance_grid": _distance_grid(rows, cfg.confluence_buckets_pts),
+        "discrimination": _discrimination(rows, cfg.confluence_buckets_pts),
         "out_of_sample": oos,
         "min_reportable_n": MIN_REPORTABLE_N,
     }
@@ -333,6 +393,52 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             "so no trend read is selected. Re-run with `--trend-filter ema_slope` "
             "(or `hma` / `vwap_slope` / `trade_bias`) to populate them.\n"
         )
+
+    A("## Is the confluence cohort actually a filter?\n")
+    disc = summary.get("discrimination") or {}
+    A(
+        f"- Gamma levels published per snapshot (median): "
+        f"**{_num(disc.get('levels_per_snapshot_median'), 0)}**"
+    )
+    A(
+        f"- Distance from an extension to its nearest level (median): "
+        f"**{_num(disc.get('nearest_distance_median'))} pts**\n"
+    )
+    A("| threshold | touches with confluence | share of sample |")
+    A("|---:|---:|---:|")
+    for c in disc.get("coverage", []):
+        A(f"| ≤{c['distance']:g} pts | {c['n_with']} | {_pct(c['share'])} |")
+    A("")
+    worst = max((c["share"] or 0.0) for c in disc.get("coverage", [{"share": 0.0}]))
+    if worst > 0.7:
+        A(
+            f"> **The cohort contains {_pct(worst)} of the sample at its widest "
+            "threshold.** A filter that keeps most of the population is not "
+            "separating anything, and a null result through it is a statement "
+            "about level density rather than about gamma. Reduce "
+            "`gex_ladder_depth`, or read only the tightest threshold row.\n"
+        )
+    dg = disc.get("depth_by_group") or {}
+    if dg:
+        A("| group | n | median depth | mean depth |")
+        A("|---|---:|---:|---:|")
+        for label, v in dg.items():
+            A(
+                f"| {label} | {v['n']} | {_num(v.get('median_depth_r'))}R | "
+                f"{_num(v.get('mean_depth_r'))}R |"
+            )
+        A("")
+        a = (dg.get("no confluence") or {}).get("median_depth_r")
+        b = (dg.get("with confluence") or {}).get("median_depth_r")
+        if a is not None and b is not None and a > b * 1.25:
+            A(
+                "> **Confounded.** The no-confluence group sits systematically "
+                "deeper. Ingestion streams strikes only within 3% of spot, so a "
+                "far extension is somewhere a gamma level CANNOT exist — the two "
+                "cohorts then differ by distance-from-spot as much as by gamma. "
+                "Compare within a depth band before reading the confluence "
+                "effect.\n"
+            )
 
     A("## Q9 — Is the effect stable across the confluence threshold?\n")
     A("| distance | n with | reversal (with) | n without | reversal (without) | gap |")
