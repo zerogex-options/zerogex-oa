@@ -229,6 +229,13 @@ class AnalyticsEngine:
         # unchanged timestamp skips; an RTH bar advances the timestamp
         # every minute so legitimate intraday recompute is unaffected.
         self._last_processed_snapshot_ts: Optional[datetime] = None
+        # ...paired with the chain's latest-table write clock at that cycle.
+        # The bucket timestamp moves once a minute, so on its own it would
+        # make any interval shorter than a minute skip every other cycle;
+        # the write clock moves every few seconds while quotes flow, so the
+        # same bucket with fresher rows is recomputed and the same bucket
+        # with the same rows is not.
+        self._last_processed_data_updated_at: Optional[datetime] = None
         # Latch for the "snapshot has no Greek-bearing options" state.
         # A weekday night is inside the 24x5 run window, so the engine
         # keeps cycling after the close; once the underlying feed stops
@@ -1038,11 +1045,28 @@ class AnalyticsEngine:
                         f"(threshold {self.min_oi_coverage_pct_alert:.1%})"
                     )
 
+                # Sub-minute change signal. The chain rows are minute
+                # buckets rewritten in place every few seconds, so the bucket
+                # timestamp alone cannot say whether anything changed since
+                # the last cycle; the latest table's write clock can. One
+                # indexed aggregate over this underlying's contracts.
+                cursor.execute(
+                    """
+                    SELECT MAX(updated_at)
+                    FROM option_chains_latest
+                    WHERE underlying = %s
+                    """,
+                    (self.db_symbol,),
+                )
+                updated_row = cursor.fetchone()
+                data_updated_at = updated_row[0] if updated_row else None
+
                 return {
                     "timestamp": timestamp,
                     "underlying_price": underlying_price,
                     "options": options,
                     "spot_anchored": spot_anchored,
+                    "data_updated_at": data_updated_at,
                 }
 
         except Exception as e:
@@ -3129,8 +3153,8 @@ class AnalyticsEngine:
              call_wall, put_wall, call_wall_strength, put_wall_strength,
              max_pain_by_expiration, gamma_flip_span_used,
              gamma_flip_raw, pin_strike, pin_score, pin_confidence,
-             pin_strike_reason)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             pin_strike_reason, computed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -3156,7 +3180,8 @@ class AnalyticsEngine:
                 pin_strike = EXCLUDED.pin_strike,
                 pin_score = EXCLUDED.pin_score,
                 pin_confidence = EXCLUDED.pin_confidence,
-                pin_strike_reason = EXCLUDED.pin_strike_reason
+                pin_strike_reason = EXCLUDED.pin_strike_reason,
+                computed_at = NOW()
             WHERE
                 EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                 OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -3954,6 +3979,7 @@ class AnalyticsEngine:
             latest_timestamp = snapshot["timestamp"]
             underlying_price = snapshot["underlying_price"]
             options = snapshot["options"]
+            data_updated_at = snapshot.get("data_updated_at")
 
             # Skip the recompute when the snapshot timestamp is unchanged
             # since the last successful cycle.  Off-hours the latest
@@ -3970,9 +3996,14 @@ class AnalyticsEngine:
             # the timestamp every minute, so latest_timestamp moves and the
             # guard falls through.  Only set on SUCCESS (see end of method)
             # so a failed/partial cycle re-attempts the same timestamp.
+            # The write clock is part of the key so an interval shorter than
+            # the bucket still recomputes: the bucket row is rewritten every
+            # few seconds, so the same timestamp can carry fresher quotes.
             if (
                 self._last_processed_snapshot_ts is not None
                 and latest_timestamp == self._last_processed_snapshot_ts
+                # getattr: tests build bare engines without __init__.
+                and data_updated_at == getattr(self, "_last_processed_data_updated_at", None)
             ):
                 # Off-hours the snapshot timestamp is frozen until the
                 # next session, so this guard fires every interval for
@@ -4032,6 +4063,7 @@ class AnalyticsEngine:
                     )
                     self._empty_snapshot_state = True
                 self._last_processed_snapshot_ts = latest_timestamp
+                self._last_processed_data_updated_at = data_updated_at
                 return True
 
             # Greek-bearing data is back — clear the closed-market latch so
@@ -4122,6 +4154,7 @@ class AnalyticsEngine:
             # Record only after a fully successful cycle so a transient
             # mid-cycle failure re-attempts the same timestamp next round.
             self._last_processed_snapshot_ts = latest_timestamp
+            self._last_processed_data_updated_at = data_updated_at
 
             # Emit per-stage timings so cycle-overrun warnings can be
             # diagnosed without guessing which step is slow. The exact

@@ -110,6 +110,8 @@ class Sample:
     api_version: int
     advanced: bool  # as_of moved since the previous sample
     regressed: bool = False  # ...and moved BACKWARDS: an older snapshot served after a newer
+    computed_at: Optional[datetime] = None  # when the engine wrote it, if the API says
+    recomputed: bool = False  # same as_of, newer computed_at: the minute row was rewritten
     session: Optional[str] = None  # v2 market_session_status
     freshness: Optional[str] = None  # v2 freshness_status
     cache_status: Optional[str] = None  # nginx X-Cache-Status, when sent
@@ -226,6 +228,7 @@ def take_sample(
         evaluated_raw = envelope.get("evaluated_at")
         evaluated_at = parse_iso(evaluated_raw) if evaluated_raw else sample_at
         as_of_raw = data.get("as_of") or envelope.get("source_timestamp")
+        computed_raw = data.get("computed_at")
         age = envelope.get("age_seconds")
         if age is None:
             age = data.get("age_seconds")
@@ -234,14 +237,22 @@ def take_sample(
     else:
         evaluated_at = sample_at
         as_of_raw = body.get("as_of")
+        computed_raw = body.get("computed_at")
         age = body.get("age_seconds")
 
     as_of = parse_iso(as_of_raw) if as_of_raw else None
+    computed_at = parse_iso(computed_raw) if computed_raw else None
     if age is None and as_of is not None:
         age = (evaluated_at - as_of).total_seconds()
 
     advanced = previous is not None and as_of is not None and as_of != previous.as_of
     regressed = advanced and previous.as_of is not None and as_of < previous.as_of
+    recomputed = (
+        previous is not None
+        and not advanced
+        and computed_at is not None
+        and computed_at != previous.computed_at
+    )
     return Sample(
         sample_at=sample_at,
         evaluated_at=evaluated_at,
@@ -253,6 +264,8 @@ def take_sample(
         session=session,
         freshness=freshness,
         cache_status=cache_status,
+        computed_at=computed_at,
+        recomputed=recomputed,
     )
 
 
@@ -496,6 +509,8 @@ def format_sample(sample: Sample) -> str:
         marker = "  WENT BACKWARDS"
     elif sample.advanced:
         marker = "  NEW SNAPSHOT"
+    elif sample.recomputed:
+        marker = "  RECOMPUTED"
     status = ""
     if sample.session or sample.freshness:
         status = f"  [{sample.session or '?'}/{sample.freshness or '?'}]"
@@ -522,6 +537,7 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                 "session",
                 "freshness",
                 "cache_status",
+                "computed_at",
             ]
         )
         for s in samples:
@@ -537,6 +553,7 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                     s.session or "",
                     s.freshness or "",
                     s.cache_status or "",
+                    s.computed_at.isoformat() if s.computed_at else "",
                 ]
             )
 

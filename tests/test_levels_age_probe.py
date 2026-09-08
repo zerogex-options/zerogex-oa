@@ -193,6 +193,17 @@ def test_a_regression_is_counted_and_kept_out_of_the_cycle_statistics():
     assert "WENT BACKWARDS" in probe.format_sample(samples[2])
 
 
+def test_a_rewrite_of_the_same_minute_is_marked_recomputed_not_new():
+    body_a = {**_v1_body(T0, T0), "computed_at": _z(T0 + timedelta(seconds=40))}
+    body_b = {**_v1_body(T0, T0), "computed_at": _z(T0 + timedelta(seconds=70))}
+    first = probe.take_sample(body_a, T0, 1, previous=None)
+    second = probe.take_sample(body_b, T0, 1, previous=first)
+    assert not second.advanced and second.recomputed
+    assert "RECOMPUTED" in probe.format_sample(second)
+    same = probe.take_sample(body_b, T0, 1, previous=second)
+    assert not same.recomputed
+
+
 def test_fmt_age_reads_like_a_person_would():
     assert probe.fmt_age(63.24) == "63.2s"
     assert probe.fmt_age(750) == "12m 30s"

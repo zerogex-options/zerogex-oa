@@ -560,6 +560,15 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_strike NUMERIC(12, 4);
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_score DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_confidence DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_strike_reason TEXT;
+-- When the analytics engine last wrote this row (server clock). ``timestamp``
+-- is the chain bucket the snapshot was computed FROM, i.e. what the data are
+-- as of; this is when the numbers were PRODUCED. The two differ by the cycle's
+-- phase within the minute plus its own duration (26-59s measured in
+-- production), and a sub-minute cadence rewrites the same minute row, so this
+-- is also the only column that says a rewrite happened. NULL on rows that
+-- predate the column. Not bumped by the no-op upsert guard: a recompute that
+-- changed nothing leaves the row, and this, alone.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS computed_at TIMESTAMPTZ;
 
 -- Volume column semantics. ``total_call_volume`` and ``total_put_volume``
 -- are per-snapshot session-cumulative aggregates summed across every

@@ -161,6 +161,20 @@ def test_status_bands_for_a_feed_backed_endpoint(age, expected):
     assert f.freshness_status is expected
 
 
+def test_a_body_with_as_of_and_computed_at_is_graded_on_as_of():
+    """The levels body now carries both. Same-depth ties among generated
+    stamps take the newest, which would grade freshness on computed_at and
+    hide the engine cycle; a body that names both has said which is which."""
+    as_of = THU_REGULAR - timedelta(seconds=100)
+    computed = THU_REGULAR - timedelta(seconds=55)
+    f = fr.build_freshness(
+        {"as_of": as_of, "computed_at": computed}, profile=fr.ANALYTICS_CYCLE, now=THU_REGULAR
+    )
+    assert f.generated_at == computed
+    assert f.source_timestamp == as_of
+    assert f.age_seconds == 100.0
+
+
 def test_stale_after_is_published_so_clients_do_not_guess_a_threshold():
     f = fr.build_freshness(_payload_aged(10), profile=fr.ANALYTICS_CYCLE, now=THU_REGULAR)
     assert f.stale_after == f.source_timestamp + timedelta(seconds=150)

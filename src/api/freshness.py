@@ -929,10 +929,19 @@ def _scan_timestamps(payload: Any, now: datetime) -> Tuple[Optional[datetime], O
 
         if isinstance(node, dict):
             items: Iterable[Tuple[Any, Any]] = node.items()
+            names: Iterable[Any] = node.keys()
         elif isinstance(node, BaseModel):
             items = node.__dict__.items()
+            names = node.__dict__.keys()
         else:
             continue
+
+        # A body carrying both as_of and computed_at has said which is which:
+        # as_of is what the data are from, computed_at is when they were
+        # produced. Without this the same-depth tie below would take the
+        # newer computed_at as the observation and report the snapshot as
+        # fresher than its data by the whole engine cycle (26-59s measured).
+        observation_key = "as_of" if ("as_of" in names and "computed_at" in names) else None
 
         for key, value in items:
             if isinstance(value, (dict, list, tuple, BaseModel)):
@@ -951,7 +960,7 @@ def _scan_timestamps(payload: Any, now: datetime) -> Tuple[Optional[datetime], O
                 continue
             if key in _BOOKKEEPING_KEYS:
                 bookkeeping = dt if bookkeeping is None else max(bookkeeping, dt)
-            elif key in _GENERATED_KEYS:
+            elif key in _GENERATED_KEYS and key != observation_key:
                 # Breadth-first, so the first level to yield a generated stamp
                 # is the shallowest: a nested row's own ``as_of`` describes
                 # that row, while the top-level one describes the response.

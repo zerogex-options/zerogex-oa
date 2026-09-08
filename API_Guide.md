@@ -582,6 +582,7 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   "spot": 676.04,
   "as_of": "2026-07-06T19:30:00Z",
   "age_seconds": 42,
+  "computed_at": "2026-07-06T19:30:45Z",
   "net_gex_at_spot": -1200000000.0,
   "levels": {
     "gamma_flip": 675.0,
@@ -620,6 +621,14 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
 - `profile` is ascending by strike (histogram order). `net_gex` is dollar
   gamma per 1% move, calls positive / puts negative, and
   `net_gex == call_gex + put_gex` by construction.
+- `computed_at` is when the analytics engine last wrote the snapshot (server
+  clock; `null` on rows that predate the column). `as_of` is the chain bucket
+  the numbers were computed *from*; `computed_at` is when they were
+  *produced*. They differ by the engine cycle's phase within the minute plus
+  its own duration (26–59s measured in production), and a sub-minute cadence
+  rewrites the same minute row, so `computed_at` is the one field that
+  changes on a rewrite. Freshness (`age_seconds`, v2 `source_timestamp`)
+  stays measured from `as_of`; v2 `generated_at` reports `computed_at`.
 - `as_of` / `age_seconds` describe snapshot freshness — see *Data
   freshness & update cadence* above.
 

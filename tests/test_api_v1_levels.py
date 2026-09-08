@@ -182,6 +182,24 @@ def test_endpoint_returns_consolidated_contract(monkeypatch: pytest.MonkeyPatch)
     assert isinstance(body["age_seconds"], int) and body["age_seconds"] >= 0
 
 
+def test_endpoint_passes_computed_at_through_and_tolerates_its_absence(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """computed_at is when the engine wrote the row; as_of is the chain bucket
+    it was computed from. Additive: rows older than the column carry null."""
+    written = datetime(2026, 7, 6, 19, 30, 45, tzinfo=timezone.utc)
+    client = _build_app(monkeypatch, summary=_summary(computed_at=written), profile=_profile_rows())
+    with client:
+        body = client.get("/api/v1/levels/SPY?strikes=1").json()
+    assert body["computed_at"].startswith("2026-07-06T19:30:45")
+    assert body["as_of"].startswith("2026-07-06T19:30:00")
+
+    client = _build_app(monkeypatch, summary=_summary(), profile=_profile_rows())
+    with client:
+        body = client.get("/api/v1/levels/SPY?strikes=1").json()
+    assert body["computed_at"] is None
+
+
 def test_endpoint_surfaces_null_pin_with_reason(monkeypatch: pytest.MonkeyPatch):
     """No active pin ⇒ levels.pin_strike is null (hide, don't zero) and the
     REASON_* code rides in pin_strike_reason — the nullable-analytics contract."""

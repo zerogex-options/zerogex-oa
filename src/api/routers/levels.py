@@ -102,6 +102,14 @@ class LevelsResponse(BaseModel):
     spot: Optional[float] = None
     as_of: datetime
     age_seconds: Optional[int] = None
+    # When the analytics engine last wrote this snapshot (server clock), or
+    # null on rows that predate the column. ``as_of`` is the chain bucket the
+    # numbers were computed FROM; this is when they were PRODUCED. They differ
+    # by the cycle's phase within the minute plus its own duration, and a
+    # sub-minute cadence rewrites the same minute row, so this is also the
+    # one field that changes on a rewrite. Freshness stays measured from
+    # ``as_of`` (see src/api/freshness.py); this is additive.
+    computed_at: Optional[datetime] = None
     net_gex_at_spot: Optional[float] = None
     levels: DealerLevels
     # Pin Strike metadata (scalars, not drawable lines): the raw maximum pin
@@ -186,6 +194,7 @@ async def get_levels(
         spot=_maybe_float(summary.get("spot_price")),
         as_of=as_of,
         age_seconds=age_seconds,
+        computed_at=summary.get("computed_at"),
         net_gex_at_spot=_maybe_float(summary.get("net_gex_at_spot")),
         levels=DealerLevels(
             gamma_flip=_maybe_float(summary.get("gamma_flip")),

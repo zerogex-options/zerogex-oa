@@ -15,13 +15,15 @@ class _FakeConn:
         # What the newest-timestamp lookup answers. Defaults to the row's own
         # timestamp so a fake with a timestamped row is self-consistent.
         self.newest = newest if newest is not None else (row or {}).get("timestamp")
-        self.fetchval_calls = 0
-
-    async def fetchval(self, _query, *_args):
-        self.fetchval_calls += 1
-        return self.newest
+        self.newest_computed = (row or {}).get("computed_at")
+        self.probes = 0
 
     async def fetchrow(self, _query, *_args):
+        # The newest-row probe announces itself in a leading SQL comment, so
+        # it can be answered without counting as a fetch of the body.
+        if "newest-row probe" in _query:
+            self.probes += 1
+            return {"timestamp": self.newest, "computed_at": self.newest_computed}
         # *_args, not a fixed (_query, _symbol): callers bind a varying number
         # of parameters (get_latest_gex_summary also passes the wall-ladder
         # depth), and this fake only cares that a fetch happened.
@@ -121,7 +123,7 @@ def test_get_latest_gex_summary_serves_the_cache_only_while_its_row_is_still_new
     again = asyncio.run(db.get_latest_gex_summary("SPY"))
     assert again is first
     assert conn.calls == 1
-    assert conn.fetchval_calls == 2
+    assert conn.probes == 2
 
     # A new snapshot lands. The TTL has not expired, and the cache must still
     # lose: this is the exact case that served stale levels in production.
@@ -129,6 +131,32 @@ def test_get_latest_gex_summary_serves_the_cache_only_while_its_row_is_still_new
     conn.newest = t2
     third = asyncio.run(db.get_latest_gex_summary("SPY"))
     assert third["timestamp"] == t2
+    assert conn.calls == 2
+
+
+def test_get_latest_gex_summary_serves_a_rewrite_of_the_same_minute():
+    """A sub-minute cadence rewrites the same minute row. The stamp does not
+    move, so computed_at is what tells the cache its copy is behind."""
+    t1 = datetime(2026, 9, 8, 13, 41, tzinfo=timezone.utc)
+    c1 = t1 + timedelta(seconds=40)
+    c2 = t1 + timedelta(seconds=70)
+    db = DatabaseManager()
+    db._latest_gex_summary_cache_ttl_seconds = 60.0
+    conn = _FakeConn({**_summary_row(t1), "computed_at": c1, "net_gex": 1.0})
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    first = asyncio.run(db.get_latest_gex_summary("SPY"))
+    assert first["net_gex"] == 1.0
+
+    conn.row = {**_summary_row(t1), "computed_at": c2, "net_gex": 2.0}
+    conn.newest_computed = c2
+    second = asyncio.run(db.get_latest_gex_summary("SPY"))
+    assert second["net_gex"] == 2.0
     assert conn.calls == 2
 
 

@@ -1836,9 +1836,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """Get latest GEX summary.
 
         Cached per process for ``LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS``, but a
-        cached body is served only while its ``timestamp`` is still the newest
-        row in ``gex_summary``. That check is one index-only lookup on
-        ``(underlying, timestamp DESC)`` per call, and it exists because the
+        cached body is served only while its ``timestamp`` and ``computed_at``
+        still match the newest row in ``gex_summary``. That check is one
+        single-row lookup through ``(underlying, timestamp DESC)`` per call
+        (``computed_at`` is what changes when a sub-minute cadence rewrites
+        the same minute row), and it exists because the
         cache alone let the API go backwards: with several uvicorn workers
         each holding its own copy, a worker whose copy predates a new snapshot
         serves the previous minute's levels after another worker has already
@@ -1858,8 +1860,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"latest_gex_summary:{symbol}"
         cached = self._cache_get(cache_key)
 
-        newest_ts_query = """
-            SELECT timestamp
+        # The leading comment is a test seam: fakes recognise the probe by it.
+        newest_query = """
+            -- newest-row probe
+            SELECT timestamp, computed_at
             FROM gex_summary
             WHERE underlying = $1
             ORDER BY timestamp DESC
@@ -1882,6 +1886,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     gs.timestamp,
                     gs.underlying,
+                    gs.computed_at,
                     gs.gamma_flip_point,
                     gs.gamma_flip_raw,
                     gs.flip_distance,
@@ -1997,6 +2002,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT
                 ls.timestamp,
                 ls.underlying AS symbol,
+                ls.computed_at,
                 lq.spot_price,
                 st.total_call_gex,
                 st.total_put_gex,
@@ -2052,13 +2058,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                newest = await conn.fetchval(newest_ts_query, symbol)
+                probe = await conn.fetchrow(newest_query, symbol)
+                newest = probe["timestamp"] if probe else None
+                newest_computed = probe["computed_at"] if probe else None
                 served = self._latest_gex_summary_served_ts.get(symbol)
                 if newest is not None and served is not None and newest < served:
                     self._warn_gex_summary_went_backwards(symbol, newest, served)
                     if cached is not None and cached.get("timestamp") == served:
                         return cached  # type: ignore[no-any-return]
-                if cached is not None and cached.get("timestamp") == newest:
+                if (
+                    cached is not None
+                    and cached.get("timestamp") == newest
+                    and cached.get("computed_at") == newest_computed
+                ):
                     return cached  # type: ignore[no-any-return]
 
                 row = await conn.fetchrow(query, symbol, DEFAULT_WALL_LADDER_DEPTH)
