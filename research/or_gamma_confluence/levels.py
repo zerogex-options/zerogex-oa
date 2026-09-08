@@ -70,6 +70,8 @@ __all__ = [
     "SnapshotRejected",
     "build_snapshot",
     "build_timeline",
+    "TimelineBuild",
+    "build_timeline_tolerant",
     "confluence_at",
 ]
 
@@ -517,17 +519,17 @@ def build_timeline(
     spot_at: Any = None,
     strikes_at: Any = None,
 ) -> GammaTimeline:
-    """Build a timeline from ``gex_summary`` rows.
+    """Build a timeline from ``gex_summary`` rows, strictly.
 
     ``spot_at(ts) -> float | None`` and ``strikes_at(ts) -> rows`` are
     callables the caller supplies so this module stays free of the database.
     Both are asked for the FRAME's timestamp, never a touch timestamp.
 
-    A :class:`SnapshotRejected` from any frame propagates: one unusable clock
-    in a session makes that session's whole timeline untrustworthy, and the
-    dataset layer turns that into a recorded skip.
+    Any :class:`SnapshotRejected` propagates.  Use
+    :func:`build_timeline_tolerant` for the dataset path, which drops isolated
+    bad frames and fails the session only when too many are unusable.
     """
-    snapshots = [
+    return GammaTimeline(
         build_snapshot(
             row,
             cfg,
@@ -536,5 +538,89 @@ def build_timeline(
         )
         for row in rows
         if row.get("timestamp") is not None
-    ]
-    return GammaTimeline(snapshots)
+    )
+
+
+@dataclass(frozen=True)
+class TimelineBuild:
+    """A timeline plus an account of what could not be used."""
+
+    timeline: GammaTimeline
+    accepted: int
+    rejected: int
+    #: Reason string -> count, for the run's provenance.
+    reasons: dict[str, int]
+
+    @property
+    def total(self) -> int:
+        return self.accepted + self.rejected
+
+    @property
+    def rejected_frac(self) -> float:
+        return (self.rejected / self.total) if self.total else 0.0
+
+
+def _reason_key(exc: SnapshotRejected) -> str:
+    """Collapse a rejection message to a countable category."""
+    text = str(exc)
+    for needle, key in (
+        ("created_at missing", "created_at_missing"),
+        ("precedes timestamp", "created_at_before_timestamp"),
+        ("publish lag", "publish_lag_backfill"),
+    ):
+        if needle in text:
+            return key
+    return "other"
+
+
+def build_timeline_tolerant(
+    rows: Sequence[Mapping[str, Any]],
+    cfg: ResearchConfig,
+    *,
+    spot_at: Any = None,
+    strikes_at: Any = None,
+) -> TimelineBuild:
+    """Build a timeline, dropping individual frames that cannot be trusted.
+
+    Isolated bad frames are DROPPED rather than taken as evidence against the
+    whole session.  A step function is exactly the right structure for that:
+    the previous frame simply stays in force across the gap, which is what a
+    consumer would have seen anyway if the publish had failed.
+
+    The session-level judgement is left to the caller, on
+    :attr:`TimelineBuild.rejected_frac` against
+    ``cfg.max_rejected_frame_frac`` — a clock that is broken for a few frames
+    is a stall, one that is broken for a fifth of the day is not a clock.
+
+    Measured on production, this distinction is worth roughly a session per
+    symbol: SPY carries a single 1618-second publish and QQQ a single
+    negative-lag row across ~59 sessions each.  Failing the whole session for
+    one frame would discard ~3% of the longest history available, and for a
+    reason ("the level was published late") that the availability clock
+    already handles correctly.
+    """
+    snapshots: list[GammaSnapshot] = []
+    reasons: dict[str, int] = {}
+    rejected = 0
+    for row in rows:
+        if row.get("timestamp") is None:
+            continue
+        try:
+            snapshots.append(
+                build_snapshot(
+                    row,
+                    cfg,
+                    spot=spot_at(row["timestamp"]) if spot_at is not None else None,
+                    strike_rows=(strikes_at(row["timestamp"]) if strikes_at is not None else None),
+                )
+            )
+        except SnapshotRejected as exc:
+            rejected += 1
+            key = _reason_key(exc)
+            reasons[key] = reasons.get(key, 0) + 1
+    return TimelineBuild(
+        timeline=GammaTimeline(snapshots),
+        accepted=len(snapshots),
+        rejected=rejected,
+        reasons=reasons,
+    )

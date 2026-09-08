@@ -48,12 +48,7 @@ from research.or_gamma_confluence.config import ResearchConfig
 from research.or_gamma_confluence.events import extract_touch_events
 from research.or_gamma_confluence.features import SessionContext, build_features
 from research.or_gamma_confluence.instruments import InstrumentSpec, spec
-from research.or_gamma_confluence.levels import (
-    GammaTimeline,
-    SnapshotRejected,
-    build_snapshot,
-    confluence_at,
-)
+from research.or_gamma_confluence.levels import build_timeline_tolerant, confluence_at
 from research.or_gamma_confluence.outcomes import measure_outcome
 from research.or_gamma_confluence.ranges import (
     build_ladder,
@@ -95,6 +90,11 @@ class SessionResult:
     #: cohort split needs them.
     n_events_without_gamma: int = 0
     gex_rank_frames: int = 0
+    #: Frames dropped because their availability clock could not be trusted.
+    #: Counted, not silent: a run whose provenance shows many of these is
+    #: measuring a degraded feed, whatever its cohort table says.
+    frames_rejected: int = 0
+    frame_reject_reasons: dict[str, int] = field(default_factory=dict)
     basis_source: Optional[str] = None
     or_open_bar_repaired: bool = False
 
@@ -166,21 +166,26 @@ def build_session(
         else {}
     )
 
-    try:
-        timeline = GammaTimeline(
-            build_snapshot(
-                row,
-                cfg,
-                spot=index_spot_at(row["timestamp"]),
-                strike_rows=strike_frames.get(row["timestamp"]),
-            )
-            for row in frames
-            if row.get("timestamp") is not None
+    built = build_timeline_tolerant(
+        frames,
+        cfg,
+        spot_at=index_spot_at,
+        strikes_at=strike_frames.get,
+    )
+    result.frames_rejected = built.rejected
+    result.frame_reject_reasons = dict(built.reasons)
+    if built.rejected_frac > cfg.max_rejected_frame_frac:
+        # Fail closed. An isolated unusable frame is dropped and the step
+        # function holds the previous value across it; a session where many
+        # frames are unusable does not have a clock worth trusting anywhere.
+        result.skipped_reason = (
+            f"gamma_clock_rejected: {built.rejected}/{built.total} frames "
+            f"({built.rejected_frac:.1%}) unusable {built.reasons}"
         )
-    except SnapshotRejected as exc:
-        # Fail closed: one untrustworthy clock makes the session's whole
-        # timeline unusable, and a partially-trusted timeline is worse than none.
-        result.skipped_reason = f"gamma_clock_rejected: {exc}"
+        return result
+    timeline = built.timeline
+    if built.accepted < cfg.min_session_frames:
+        result.skipped_reason = f"usable_frames_{built.accepted}_below_min_{cfg.min_session_frames}"
         return result
     result.gex_rank_frames = sum(1 for s in timeline if s.gex_ranks_available)
 
@@ -332,11 +337,18 @@ def write_jsonl(
                     "events": 0,
                     "events_without_gamma": 0,
                     "gex_rank_frames": 0,
+                    "frames_rejected": 0,
+                    "frame_reject_reasons": {},
                     "open_bars_repaired": 0,
                     "basis_sources": {},
                 },
             )
             acc["sessions_seen"] += 1
+            acc["frames_rejected"] += result.frames_rejected
+            for reason, count in result.frame_reject_reasons.items():
+                acc["frame_reject_reasons"][reason] = (
+                    acc["frame_reject_reasons"].get(reason, 0) + count
+                )
             if result.or_open_bar_repaired:
                 acc["open_bars_repaired"] += 1
             if result.skipped_reason:

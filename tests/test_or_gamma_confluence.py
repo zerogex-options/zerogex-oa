@@ -44,6 +44,7 @@ from research.or_gamma_confluence.levels import (
     GammaTimeline,
     SnapshotRejected,
     build_snapshot,
+    build_timeline_tolerant,
     confluence_at,
 )
 from research.or_gamma_confluence.outcomes import measure_outcome, reversion_sign
@@ -207,13 +208,80 @@ def test_visible_clock_adds_the_client_poll_lag():
         ({"created_at": None}, CLOCK_PUBLISHED),
         ({"created_at": None}, CLOCK_VISIBLE),
         ({"created_at": _ts(9, 59)}, CLOCK_VISIBLE),  # before timestamp
-        ({"created_at": _ts(14, 0)}, CLOCK_VISIBLE),  # backfill-scale lag
+        # Backfill scale: written days later, so created_at is a backfill time.
+        ({"created_at": _ts(10, 0) + timedelta(days=3)}, CLOCK_VISIBLE),
     ],
 )
 def test_untrustworthy_publish_clock_fails_closed(override, clock):
     row = _frame(10, 0, call_wall=29500.0, **override)
     with pytest.raises(SnapshotRejected):
         build_snapshot(row, _cfg(availability_clock=clock), spot=29500.0)
+
+
+@pytest.mark.parametrize("lag_s", [83, 96, 651, 1618])
+def test_a_slow_publish_is_kept_and_reported_as_late(lag_s):
+    """The measured production tail (p95 ~65 s, maxima 83-1618 s) is slow
+    publishing, not backfilling. Discarding it would throw away correctly
+    timed frames; the visible clock already handles it by reporting the level
+    as late, which is exactly what a trader experienced."""
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    snap = build_snapshot(_frame(10, 0, call_wall=29500.0, lag_s=lag_s), cfg, spot=29500.0)
+    assert snap.publish_lag_seconds == pytest.approx(lag_s)
+    assert snap.available_at == _ts(10, 0) + timedelta(seconds=lag_s + cfg.client_poll_lag_seconds)
+
+
+def _minute_frames(n: int) -> list[dict]:
+    """``n`` one-a-minute frames from 10:00, the production cadence."""
+    rows = []
+    for m in range(n):
+        ts = _ts(10, 0) + timedelta(minutes=m)
+        row = _frame(10, 0, call_wall=29500.0 + m)
+        row["timestamp"] = ts
+        row["created_at"] = ts + timedelta(seconds=8)
+        rows.append(row)
+    return rows
+
+
+def test_one_bad_frame_is_dropped_not_the_whole_session():
+    """A step function holds the previous value across a dropped frame, so an
+    isolated bad clock costs one frame — not a session."""
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    rows = _minute_frames(100)
+    rows[7]["created_at"] = None  # one unusable frame
+
+    built = build_timeline_tolerant(rows, cfg, spot_at=lambda ts: 29500.0)
+    assert built.rejected == 1
+    assert built.accepted == 99
+    assert built.reasons == {"created_at_missing": 1}
+    assert built.rejected_frac < cfg.max_rejected_frame_frac
+
+    # The 10:07 frame is gone, so 10:06 stays in force across it.
+    snap = built.timeline.as_of(_ts(10, 8), 0)
+    assert snap is not None and snap.data_ts == _ts(10, 6)
+
+
+def test_a_session_of_bad_frames_still_fails_closed():
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    rows = _minute_frames(100)
+    for row in rows[:50]:
+        row["created_at"] = None
+    built = build_timeline_tolerant(rows, cfg, spot_at=lambda ts: 29500.0)
+    assert built.rejected_frac == pytest.approx(0.5)
+    assert built.rejected_frac > cfg.max_rejected_frame_frac
+
+
+def test_the_measured_production_outliers_do_not_cost_a_session():
+    """SPY carries one ~1618 s publish and QQQ one negative-lag row across
+    ~59 sessions each. Under a per-session rule those cost a session apiece;
+    under the per-frame rule they cost a frame."""
+    cfg = _cfg(availability_clock=CLOCK_VISIBLE)
+    rows = _minute_frames(390)  # a full session
+    rows[100]["created_at"] = rows[100]["timestamp"] - timedelta(seconds=1)  # negative
+    built = build_timeline_tolerant(rows, cfg, spot_at=lambda ts: 29500.0)
+    assert built.rejected == 1
+    assert built.reasons == {"created_at_before_timestamp": 1}
+    assert built.rejected_frac <= cfg.max_rejected_frame_frac
+    assert built.accepted >= cfg.min_session_frames
 
 
 def test_data_clock_never_consults_created_at():

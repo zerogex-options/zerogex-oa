@@ -151,15 +151,42 @@ def cmd_coverage(args: argparse.Namespace) -> int:
             f"{(c.get('lag_max_s') or 0):>10.1f}{c.get('negative_lag_rows', 0):>6}"
             f"{c.get('backfilled_pct', 0):>11.2f}  {verdict}"
         )
+    print("\n=== Usable window (what actually bounds the study) ===")
+    print(f"{'symbol':<7}{'gamma':>7}{'bars':>7}{'usable':>8}{'ranked':>8}  bound by")
+    for sym, block in payload["symbols"].items():
+        tables = block["tables"]
+        gamma = (tables.get("gex_summary") or {}).get("sessions") or 0
+        ranked = (tables.get("gex_by_strike") or {}).get("sessions") or 0
+        bar_table = (
+            "futures_quotes" if block["spec"]["bar_source"] == "futures" else "underlying_quotes"
+        )
+        bars = (tables.get(bar_table) or {}).get("sessions") or 0
+        usable = min(gamma, bars) if gamma and bars else 0
+        bound = "gamma frames" if gamma <= bars else "bars"
+        flag = "  <-- THIN" if usable and usable < 40 else ""
+        print(f"{sym:<7}{gamma:>7}{bars:>7}{usable:>8}{ranked:>8}  {bound}{flag}")
+
     print("\nNotes:")
-    print("  * gex_by_strike is the ONLY source of ranked GEX levels ('GEX #4') and")
-    print("    is retention-pruned. Its window caps the ranked-confluence arm only;")
-    print("    every wall / flip / max-pain / pin cohort uses gex_summary, which is")
-    print("    retention-exempt.")
+    print("  * 'usable' is the intersection of gamma frames and bars — the real")
+    print("    ceiling on sessions. 'ranked' is the gex_by_strike window, which")
+    print("    caps the ranked-GEX ('GEX #4') confluence arm ONLY; every wall /")
+    print("    flip / max-pain / pin cohort runs on the full 'usable' window.")
+    print("    Run with --no-gex-ranks to use the long arm alone.")
+    print("  * SESSIONS, not events, are the independent unit: the cohort")
+    print("    comparison resamples whole sessions, so a symbol under ~40")
+    print("    sessions will not separate cohorts however many touches it has.")
     print("  * 'backfill%' counts rows whose created_at - timestamp exceeds")
-    print(f"    max_publish_lag_seconds ({cfg.max_publish_lag_seconds}s). Those rows")
-    print("    were written long after the fact, so their created_at is a backfill")
-    print("    time, not a publish time, and sessions containing them fail closed.")
+    print(
+        f"    max_publish_lag_seconds ({cfg.max_publish_lag_seconds}s ="
+        f" {cfg.max_publish_lag_seconds / 3600:.0f}h). Those rows were written long"
+    )
+    print("    after the fact, so created_at is a backfill time rather than a")
+    print("    publish time, and each such FRAME is dropped. A session is only")
+    print(f"    failed closed when over {cfg.max_rejected_frame_frac:.0%} of its frames are")
+    print("    unusable — an isolated slow publish costs a frame, not a day.")
+    print("  * A p50 lag near 30-40s means the 'visible' clock sits roughly")
+    print("    60-70s behind the 'data' clock. That gap is larger than half the")
+    print("    lead-time sweep, so the clock choice is not a detail.")
     return 0
 
 

@@ -125,13 +125,52 @@ of the gamma picture have very different history depths.**
 | `trade_bias_scores` | `bias_code`, `direction`, `market_state`, `confidence` | not pruned by `db-prune` |
 | `gex_regime_session` | per-session FIRMING / CAPPING / FRAGILE_BID / DETERIORATING / QUIET | not pruned |
 
-**The asymmetry that matters.** Walls, flip, max pain and pin come from
-`gex_summary` and have long history. **Ranked GEX levels do not exist as stored
+**Measured 2026-09-08 — the "long history" was wrong.** The retention *rule*
+above is right, but the retention exemption only dates from 2026-08-25, so it
+preserves history forward from then and does not restore what was already
+pruned. `make orgc-coverage` against production returns:
+
+| symbol | gamma frames | bars | **usable** | ranked (GEX) | gamma window |
+|---|---:|---:|---:|---:|---|
+| SPY | 59 | 59 | **59** | 51 | 2026-06-29 .. 09-05 |
+| QQQ | 59 | 59 | **59** | 51 | 2026-06-29 .. 09-05 |
+| SPX | 49 | 59 | **49** | 42 | 2026-06-29 .. 09-04 |
+| NDX | 31 | 52 | **31** | 31 | 2026-07-24 .. 09-04 |
+| ES | 49 | 52 | **49** | 42 | (SPX book) |
+| NQ | 31 | 52 | **31** | 31 | (NDX book) |
+
+So the ceiling is **~59 sessions**, not years — and **NQ, the symbol the idea
+came from, is the thinnest at 31**. Gamma frames bind everywhere; bars are never
+the constraint. For scale, `research/wall_break_odds` ran 48 SPX sessions and
+declined to fit a model below 200 events. Sessions, not touches, are the
+independent unit here, because the cohort comparison resamples whole sessions.
+
+**The publish clock is usable, and the lag is bigger than assumed.** Zero NULL
+`created_at`, zero backfilled rows, one negative-lag row (QQQ) across ~146k
+rows. Lag runs p50 29–41 s, p95 61–71 s, with maxima of 83 s (SPX), 96 s (NDX),
+651 s (QQQ), 1618 s (SPY). Two consequences:
+
+* The `visible` clock sits **~60–70 s behind the `data` clock at the median**
+  — which independently reproduces what the source email told the customer
+  ("a line is normally about a minute behind"). That gap is larger than half
+  the 0–180 s lead sweep, so the clock choice changes the answer, not the
+  decimal place.
+* The original `max_publish_lag_seconds = 1200` was a blind guess and was
+  wrong: it would have discarded SPY's 1618 s frame as "backfilled" when it is
+  a slow publish that the `visible` clock already handles correctly. Raised to
+  6 h, chosen off this distribution, and rejection moved from the SESSION to
+  the FRAME — an isolated bad clock now costs one frame (the step function
+  holds the previous value across it) and a session fails closed only when
+  over 5% of its frames are unusable. Under the old rule SPY and QQQ each lost
+  a whole session to a single row.
+
+**The asymmetry that still matters.** Walls, flip, max pain and pin come from
+`gex_summary`. **Ranked GEX levels do not exist as stored
 data at all** — they are computed on demand by `compute_wall_ladder` from
 `gex_by_strike`, which is the one pruned table. So:
 
 * the *wall / flip / max-pain / pin* confluence arm can run over the full
-  `gex_summary` history;
+  `gex_summary` window (59 / 49 / 31 sessions above);
 * the *"GEX #4" ranked-strike* arm — which is half of what the email is actually
   excited about ("Call Wall, Max Pain, Pin Strike and GEX 1 were all sitting on
   29530") — is capped at ~60–90 days.
@@ -383,10 +422,11 @@ ask for that this repo's structure makes necessary:
 
 ## 8. Honest limitations to state up front
 
-1. **Sample size will be the binding constraint on the ranked-GEX arm.** At 60-day
-   retention that is ~40 sessions of `gex_by_strike`. `wall_break_odds` set its
-   model floor at 200 events and declined to fit below it; the same discipline
-   applies here.
+1. **Sample size is the binding constraint everywhere, not just on the
+   ranked-GEX arm.** Measured: 59 sessions for SPY/QQQ, 49 for SPX/ES, **31 for
+   NDX/NQ**. `wall_break_odds` set its model floor at 200 events and declined
+   to fit below it; the same discipline applies here, and on NQ specifically
+   the honest expectation is that most cohorts will not separate.
 2. **The ±3 % strike band censors exactly the far extensions the reversion
    hypothesis cares most about.** This must be reported as coverage, not
    silently absorbed.

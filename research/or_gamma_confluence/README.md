@@ -165,10 +165,14 @@ the cooldown clock alone.
 
 ## Known limitations
 
-* **Sample size will bind on the ranked-GEX arm.** `gex_summary` and
-  `underlying_quotes` are retention-exempt; `gex_by_strike` — the only source
-  of ranked levels — is pruned at `DATA_RETENTION_DAYS`. `coverage` prints both
-  windows. Run with `--no-gex-ranks` to use the long-history arm alone.
+* **Sample size binds everywhere.** Measured 2026-09-08: 59 usable sessions
+  for SPY/QQQ, 49 for SPX/ES, **31 for NDX/NQ** — and NQ is the symbol the idea
+  came from. Gamma frames are the constraint, never bars. The retention
+  exemption on `gex_summary` only dates from 2026-08-25, so it preserves
+  history forward rather than restoring what was pruned. `gex_by_strike` (the
+  only source of ranked levels) is a few sessions shorter again; run with
+  `--no-gex-ranks` to use the longer arm alone. Sessions, not touches, are the
+  independent unit — the cohort bootstrap resamples whole sessions.
 * **The ±3% ingest strike band censors the far extensions.** A rung at −300%
   of R on a wide day can sit outside the band, where **no gamma level can
   exist by construction** — precisely where the reversion hypothesis is most

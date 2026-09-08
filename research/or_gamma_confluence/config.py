@@ -183,11 +183,26 @@ class ResearchConfig:
     #: Published cadence of the analytics engine, seconds.  Used to sanity-
     #: check a session's frame density, never to interpolate.
     snapshot_cadence_seconds: int = 60
-    #: A snapshot whose publish lag exceeds this is treated as a backfilled or
-    #: pathological row and the session FAILS CLOSED.  Twenty minutes is far
-    #: beyond any healthy compute + write, and far below the hours-to-days gap
-    #: a backfill leaves.
-    max_publish_lag_seconds: int = 1200
+    #: Beyond this publish lag a row is treated as BACKFILLED — written long
+    #: after the fact, so its ``created_at`` is a backfill time and not a
+    #: publish time.  Such a frame is dropped.
+    #:
+    #: Six hours, chosen from the measured distribution rather than guessed.
+    #: On production (2026-06-29..09-05) the lag runs p50 29-41 s, p95 61-71 s,
+    #: with per-symbol maxima of 83 s (SPX), 96 s (NDX), 651 s (QQQ) and
+    #: 1618 s (SPY).  Those tails are slow publishes — an engine stall or a
+    #: restart — and the ``visible`` clock already handles them correctly by
+    #: reporting the level as late.  A genuine backfill is hours to days away
+    #: from that, so 6 h separates the two cleanly while an earlier 20-minute
+    #: guess would have discarded real, correctly-timed frames.
+    max_publish_lag_seconds: int = 21_600
+
+    #: Fraction of a session's gamma frames that may be unusable before the
+    #: SESSION fails closed.  An isolated bad frame is dropped and the step
+    #: function simply holds the previous value across it — that is what a
+    #: step function is for.  A session where many frames are unusable has a
+    #: clock that cannot be trusted at all, and no part of it is salvageable.
+    max_rejected_frame_frac: float = 0.05
     #: Sessions with fewer usable gamma frames than this are dropped whole.
     #: A handful of scattered frames cannot distinguish "the level sat there
     #: all morning" from "we sampled it twice".
@@ -280,6 +295,8 @@ class ResearchConfig:
             raise ValueError("discovery_frac + validation_frac must leave a non-empty holdout")
         if self.rearm_minutes is not None and self.rearm_minutes < 0:
             raise ValueError("rearm_minutes must not be negative")
+        if not 0.0 <= self.max_rejected_frame_frac <= 1.0:
+            raise ValueError("max_rejected_frame_frac must be in [0, 1]")
 
     # ── Derived ──────────────────────────────────────────────────────
 
