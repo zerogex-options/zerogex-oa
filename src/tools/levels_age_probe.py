@@ -107,6 +107,7 @@ class Sample:
     age_seconds: Optional[float]
     api_version: int
     advanced: bool  # as_of moved since the previous sample
+    regressed: bool = False  # ...and moved BACKWARDS: an older snapshot served after a newer
     session: Optional[str] = None  # v2 market_session_status
     freshness: Optional[str] = None  # v2 freshness_status
 
@@ -114,10 +115,11 @@ class Sample:
 @dataclass(frozen=True)
 class Summary:
     samples: int
-    snapshots: int  # distinct as_of values seen
-    period_seconds: List[float]  # gaps between successive distinct as_of
+    snapshots: int  # distinct as_of values seen, counting only forward moves
+    period_seconds: List[float]  # gaps between successive NEW as_of values
     publish_age_seconds: List[float]  # age on first sight of each new as_of
     ages: List[float]  # age_seconds of every sample
+    regressions: int = 0  # samples where as_of went backwards
 
 
 def parse_iso(value: str) -> datetime:
@@ -139,17 +141,18 @@ def fmt_age(seconds: Optional[float]) -> str:
     """Seconds as a person reads them: 63.2s, 12m 30s, 2d 21h 36m."""
     if seconds is None:
         return "-"
-    total = max(0.0, seconds)
+    sign = "-" if seconds < 0 else ""
+    total = abs(seconds)
     if total < 600:
-        return f"{total:.1f}s"
+        return f"{sign}{total:.1f}s"
     minutes = int(total // 60)
     if minutes < 120:
-        return f"{minutes}m {int(total - minutes * 60)}s"
+        return f"{sign}{minutes}m {int(total - minutes * 60)}s"
     hours, minutes = divmod(minutes, 60)
     if hours < 48:
-        return f"{hours}h {minutes}m"
+        return f"{sign}{hours}h {minutes}m"
     days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h {minutes}m"
+    return f"{sign}{days}d {hours}h {minutes}m"
 
 
 def fmt_when(moment: Optional[datetime]) -> str:
@@ -222,6 +225,7 @@ def take_sample(
         age = (evaluated_at - as_of).total_seconds()
 
     advanced = previous is not None and as_of is not None and as_of != previous.as_of
+    regressed = advanced and previous.as_of is not None and as_of < previous.as_of
     return Sample(
         sample_at=sample_at,
         evaluated_at=evaluated_at,
@@ -229,6 +233,7 @@ def take_sample(
         age_seconds=float(age) if age is not None else None,
         api_version=api_version,
         advanced=advanced,
+        regressed=regressed,
         session=session,
         freshness=freshness,
     )
@@ -262,25 +267,37 @@ def summarize(samples: Sequence[Sample]) -> Summary:
     The first ``as_of`` seen is excluded from the publish ages: the probe
     joined that cycle mid-way, so its age says nothing about when it was
     born. Only an advance observed during the run counts.
+
+    A sample whose ``as_of`` is OLDER than the newest one seen so far is a
+    regression: the API served a previous snapshot after a newer one had
+    already been served, which is a serving bug rather than a cycle. The
+    first live run saw four in an hour, ten seconds each. They are counted
+    and reported on their own line, and kept out of the period and
+    publish-age statistics, which would otherwise show a period of -60s
+    and a "publish age" of 110s that no snapshot ever had.
     """
     periods: List[float] = []
     publish_ages: List[float] = []
     ages: List[float] = []
-    last_as_of: Optional[datetime] = None
+    newest: Optional[datetime] = None  # high-water mark
     snapshots = 0
+    regressions = 0
 
     for sample in samples:
         if sample.age_seconds is not None:
             ages.append(sample.age_seconds)
         if sample.as_of is None:
             continue
-        if last_as_of is None or sample.as_of != last_as_of:
+        if newest is not None and sample.as_of < newest:
+            regressions += 1
+            continue
+        if newest is None or sample.as_of != newest:
             snapshots += 1
-            if last_as_of is not None:
-                periods.append((sample.as_of - last_as_of).total_seconds())
+            if newest is not None:
+                periods.append((sample.as_of - newest).total_seconds())
                 if sample.age_seconds is not None:
                     publish_ages.append(sample.age_seconds)
-            last_as_of = sample.as_of
+            newest = sample.as_of
 
     return Summary(
         samples=len(samples),
@@ -288,6 +305,7 @@ def summarize(samples: Sequence[Sample]) -> Summary:
         period_seconds=periods,
         publish_age_seconds=publish_ages,
         ages=ages,
+        regressions=regressions,
     )
 
 
@@ -321,6 +339,12 @@ def format_report(summary: Summary, interval: float) -> str:
         f"   [resolution {interval:.0f}s plus the 5s edge cache: true value is lower]",
         f"age seen by a random poll:       {_stats(summary.ages)}",
     ]
+    if summary.regressions:
+        lines.append(
+            f"as_of went BACKWARDS in {summary.regressions} sample(s): an older snapshot "
+            "was served after a newer one. That is a serving bug, not latency; "
+            "look for more than one API worker each holding its own cache."
+        )
     if summary.snapshots == 1 and summary.samples > 1:
         lines.append(
             "as_of never advanced during the run: the market was closed or the "
@@ -350,6 +374,7 @@ def summary_json(summary: Summary, interval: float) -> Dict[str, object]:
     return {
         "samples": summary.samples,
         "snapshots": summary.snapshots,
+        "regressions": summary.regressions,
         "probe_interval_seconds": interval,
         "cycle_period_seconds": block(summary.period_seconds),
         "age_at_publish_seconds": block(summary.publish_age_seconds),
@@ -444,7 +469,11 @@ def run_probe(
 
 def format_sample(sample: Sample) -> str:
     as_of = sample.as_of.strftime("%H:%M:%S") if sample.as_of else "-"
-    marker = "  NEW SNAPSHOT" if sample.advanced else ""
+    marker = ""
+    if sample.regressed:
+        marker = "  WENT BACKWARDS"
+    elif sample.advanced:
+        marker = "  NEW SNAPSHOT"
     status = ""
     if sample.session or sample.freshness:
         status = f"  [{sample.session or '?'}/{sample.freshness or '?'}]"
@@ -465,6 +494,7 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                 "age_seconds",
                 "api_version",
                 "advanced",
+                "regressed",
                 "session",
                 "freshness",
             ]
@@ -478,6 +508,7 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                     "" if s.age_seconds is None else f"{s.age_seconds:.3f}",
                     s.api_version,
                     int(s.advanced),
+                    int(s.regressed),
                     s.session or "",
                     s.freshness or "",
                 ]

@@ -170,12 +170,36 @@ def test_format_report_names_a_frozen_snapshot_for_what_it_is():
     assert "cash session" in text
 
 
+def test_a_regression_is_counted_and_kept_out_of_the_cycle_statistics():
+    """The live run served 13:41 for one sample after 13:42 had appeared.
+    Folded into the periods that read as a -60s cycle and a 105s publish
+    age; neither is a fact about the cycle."""
+    m0, m1, m2 = T0, T0 + timedelta(seconds=60), T0 + timedelta(seconds=120)
+    served = [(m0, 40), (m1, 40), (m0, 100), (m1, 50), (m2, 40)]
+    samples: List[probe.Sample] = []
+    prev = None
+    for i, (as_of, age) in enumerate(served):
+        now = as_of + timedelta(seconds=age)
+        sample = probe.take_sample(_v1_body(as_of, now), T0 + timedelta(seconds=5 * i), 1, prev)
+        samples.append(sample)
+        prev = sample
+    assert [s.regressed for s in samples] == [False, False, True, False, False]
+    summary = probe.summarize(samples)
+    assert summary.regressions == 1
+    assert summary.snapshots == 3
+    assert summary.period_seconds == [60.0, 60.0]
+    assert summary.publish_age_seconds == [40.0, 40.0]
+    assert "BACKWARDS" in probe.format_report(summary, interval=5.0)
+    assert "WENT BACKWARDS" in probe.format_sample(samples[2])
+
+
 def test_fmt_age_reads_like_a_person_would():
     assert probe.fmt_age(63.24) == "63.2s"
     assert probe.fmt_age(750) == "12m 30s"
     assert probe.fmt_age(3 * 3600 + 5 * 60) == "3h 5m"
     assert probe.fmt_age(250617) == "2d 21h 36m"
     assert probe.fmt_age(None) == "-"
+    assert probe.fmt_age(-60.0) == "-60.0s"
 
 
 def test_should_print_keeps_the_first_the_advances_and_a_heartbeat():
