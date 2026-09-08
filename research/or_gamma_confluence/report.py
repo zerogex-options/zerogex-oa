@@ -223,15 +223,28 @@ def build_summary(
             stat.update(compare_to_baseline(baseline, c.predicate))
         cohort_stats.append(stat)
 
+    # Multiplicity. Fourteen cohorts times several thresholds is a machine for
+    # producing one p<0.05 by chance; the family is corrected here rather than
+    # left as an instruction in the prose, because an instruction in the prose
+    # is exactly what gets skipped when a number looks interesting.
+    testable = [c for c in cohort_stats if c.get("clustered_p") is not None]
+    flags = stats.benjamini_hochberg([c["clustered_p"] for c in testable], alpha=0.05)
+    for c, flag in zip(testable, flags):
+        c["bh_significant"] = bool(flag)
+    for c in cohort_stats:
+        c.setdefault("bh_significant", None)
+    bh = {
+        "family_size": len(testable),
+        "alpha": 0.05,
+        "survivors": [c["key"] for c in testable if c["bh_significant"]],
+        "min_p": min((c["clustered_p"] for c in testable), default=None),
+    }
+
     splits = split_chronological(rows, cfg)
     oos = {
         name: {
             "sessions": len({_session_key(r) for r in part}),
-            "cohorts": {
-                c.key: summarize(c.select(part))
-                for c in cohorts
-                if c.key in ("all", "confluence", "no_confluence", "extreme_confluence")
-            },
+            "cohorts": {c.key: summarize(c.select(part)) for c in cohorts},
         }
         for name, part in splits.items()
     }
@@ -263,14 +276,15 @@ def build_summary(
         "distance_grid": _distance_grid(rows, cfg.confluence_buckets_pts),
         "discrimination": _discrimination(rows, cfg.confluence_buckets_pts),
         "out_of_sample": oos,
+        "multiplicity": bh,
         "min_reportable_n": MIN_REPORTABLE_N,
     }
 
 
 def _cohort_rows_md(cohorts: Sequence[Mapping[str, Any]]) -> list[str]:
     lines = [
-        "| cohort | n | sessions | reversal | 95% CI | vs baseline | clustered 95% CI | p |",
-        "|---|---:|---:|---:|---|---:|---|---:|",
+        "| cohort | n | sessions | reversal | 95% CI | vs baseline | clustered 95% CI | p | BH |",
+        "|---|---:|---:|---:|---|---:|---|---:|---|",
     ]
     for c in cohorts:
         ci = (
@@ -286,10 +300,11 @@ def _cohort_rows_md(cohorts: Sequence[Mapping[str, Any]]) -> list[str]:
             else "—"
         )
         pval = "—" if c.get("clustered_p") is None else f"{c['clustered_p']:.3f}"
+        bh = {True: "**yes**", False: "no", None: "—"}[c.get("bh_significant")]
         thin = " ⚠︎thin" if c.get("thin") else ""
         lines.append(
             f"| {c['label']}{thin} | {c['n_resolved']} | {c['n_sessions']} | "
-            f"{_pct(c.get('reversal_rate'))} | {ci} | {eff} | {band} | {pval} |"
+            f"{_pct(c.get('reversal_rate'))} | {ci} | {eff} | {band} | {pval} | {bh} |"
         )
     return lines
 
@@ -383,10 +398,29 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         "SESSIONS, so they reflect the number of independent days rather than the "
         "number of minutes. An interval spanning zero means the cohort is not "
         "distinguishable from the baseline, however large the point estimate looks. "
-        "No multiplicity correction is applied within this table — with this many "
-        "cohorts, apply Benjamini-Hochberg across the family before calling any "
-        "single row significant.\n"
+        "The `BH` column is Benjamini-Hochberg across this whole cohort family at "
+        "alpha=0.05 — a row is only worth reading as a finding if it survives "
+        "there, not on its own p-value.\n"
     )
+    mult = summary.get("multiplicity") or {}
+    if mult.get("family_size"):
+        survivors = mult.get("survivors") or []
+        if survivors:
+            A(
+                f"**Benjamini-Hochberg across all {mult['family_size']} cohorts "
+                f"(alpha=0.05): {len(survivors)} survive** — "
+                f"`{'`, `'.join(survivors)}`.\n"
+            )
+        else:
+            A(
+                f"**Benjamini-Hochberg across all {mult['family_size']} cohorts "
+                f"(alpha=0.05): NOTHING SURVIVES.** Smallest p is "
+                f"{mult.get('min_p'):.3f} against a rank-1 threshold of "
+                f"{0.05 / mult['family_size']:.4f}. A single row that looks "
+                f"significant on its own p-value is what this many comparisons "
+                f"produces by chance.\n"
+            )
+
     if (cfg.get("trend_filter") or "none") == "none":
         A(
             "> Cohorts 8 and 9 are empty by construction: `trend_filter` is `none`, "
@@ -458,24 +492,34 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
 
     A("## Q8 — Out of sample\n")
     A(
-        "Sessions are cut chronologically; no shuffling. Parameters chosen on "
-        "discovery must be frozen before the test column is read.\n"
+        "Sessions are cut chronologically; no shuffling. EVERY cohort is shown, "
+        "because the point of the split is to catch the cohort that looked best "
+        "in discovery and does not repeat — and that cohort cannot be named in "
+        "advance.\n"
     )
-    A("| split | sessions | all touches | with confluence | no confluence |")
-    A("|---|---:|---:|---:|---:|")
+    oos = summary["out_of_sample"]
+    header = "| cohort |"
+    rule = "|---|"
     for name in ("discovery", "validation", "test"):
-        part = summary["out_of_sample"].get(name, {})
-        c = part.get("cohorts", {})
-
-        def _cell(key: str) -> str:
-            s = c.get(key) or {}
-            return f"{_pct(s.get('reversal_rate'))} (n={s.get('n_resolved', 0)})"
-
-        A(
-            f"| {name} | {part.get('sessions', 0)} | {_cell('all')} | "
-            f"{_cell('confluence')} | {_cell('no_confluence')} |"
-        )
+        header += f" {name} ({oos.get(name, {}).get('sessions', 0)}d) |"
+        rule += "---:|"
+    A(header)
+    A(rule)
+    for c in summary["cohorts"]:
+        row = f"| {c['label']} |"
+        for name in ("discovery", "validation", "test"):
+            st = (oos.get(name, {}).get("cohorts", {}) or {}).get(c["key"]) or {}
+            nres = st.get("n_resolved", 0)
+            row += f" {_pct(st.get('reversal_rate'))} (n={nres}) |" if nres else " — |"
+        A(row)
     A("")
+    A(
+        "A cohort whose rate moves by more than its in-sample interval across "
+        "these columns was fitted to the discovery period, whatever its p-value "
+        "there. Note the BASELINE itself drifts across the columns, so read each "
+        "cohort against the `All OR extension touches` row of the SAME column, "
+        "never against the pooled figure above.\n"
+    )
 
     A("## Pooling check — do the two option books agree?\n")
     pc = summary.get("pooling_check") or {}

@@ -952,3 +952,105 @@ def test_report_flags_the_depth_confound_when_it_is_present():
     rows = [_row(d, 1.0, True) for d in range(60)] + [_row(d, 6.0, False) for d in range(60)]
     md = render_markdown(build_summary(rows, ResearchConfig()))
     assert "Confounded" in md
+
+
+def test_report_applies_benjamini_hochberg_across_the_cohort_family():
+    """A p=0.051 among fourteen cohorts is what this many comparisons produces
+    by chance. The correction is computed in the report rather than left as an
+    instruction in the prose, because prose instructions get skipped exactly
+    when a number looks interesting."""
+    from research.or_gamma_confluence.report import build_summary, render_markdown
+
+    rng = random.Random(17)
+    rows = []
+    for d in range(45):
+        for _ in range(20):
+            rows.append(
+                {
+                    "symbol": "NQ",
+                    "gamma_symbol": "NDX",
+                    "session": f"2026-07-{d % 28 + 1:02d}",
+                    "outcome": (OUTCOME_REVERSAL if rng.random() < 0.52 else OUTCOME_CONTINUATION),
+                    "extension_k": rng.choice([0.5, 1.0, 2.0, 3.0]),
+                    "gamma_available": True,
+                    "gamma_levels_total": 13,
+                    "nearest_gamma_distance": rng.uniform(0.0, 30.0),
+                    "gamma_regime_sign": rng.choice([-1, 1]),
+                    **{
+                        f"gamma_confluence_count_{b}": int(rng.random() < 0.4)
+                        for b in ("2", "5", "10", "15", "20")
+                    },
+                }
+            )
+    summary = build_summary(rows, ResearchConfig())
+    mult = summary["multiplicity"]
+    # Family size depends on which cohorts are non-empty in the fixture; what
+    # matters is that several are tested together and corrected as a family.
+    assert mult["family_size"] >= 5
+    # Pure noise: nothing should survive the family correction.
+    assert mult["survivors"] == []
+    md = render_markdown(summary)
+    assert "NOTHING SURVIVES" in md
+    assert "| BH |" in md
+
+
+def test_out_of_sample_table_covers_every_cohort():
+    """The cohort that looked best in discovery cannot be named in advance, so
+    the split has to show all of them."""
+    from research.or_gamma_confluence.report import build_summary, render_markdown
+
+    rows = [
+        {
+            "symbol": "NQ",
+            "gamma_symbol": "NDX",
+            "session": f"2026-07-{d % 28 + 1:02d}",
+            "outcome": OUTCOME_REVERSAL if d % 2 else OUTCOME_CONTINUATION,
+            "extension_k": 3.0,
+            "gamma_available": True,
+            "gamma_regime_sign": -1,
+            "gamma_levels_total": 13,
+            "nearest_gamma_distance": 1.0,
+            **{f"gamma_confluence_count_{b}": 1 for b in ("2", "5", "10", "15", "20")},
+        }
+        for d in range(50)
+    ]
+    summary = build_summary(rows, ResearchConfig())
+    for part in summary["out_of_sample"].values():
+        assert "confluence_neg_gex" in part["cohorts"], "regime cohorts must be split too"
+    md = render_markdown(summary)
+    assert "5. Confluence + negative GEX" in md.split("Q8 — Out of sample")[1]
+
+
+def test_skip_reasons_keep_their_diagnostic_detail():
+    """Collapsing on the first colon threw away the part that says WHY, which
+    made the bar-coverage probe useless in the run summary."""
+    import json as _json
+    from research.or_gamma_confluence.dataset import SessionResult, write_jsonl
+
+    results = [
+        SessionResult(
+            symbol="ES",
+            session=date(2026, 7, 1),
+            skipped_reason="no_bars: no_rows_on_date",
+        ),
+        SessionResult(
+            symbol="SPY",
+            session=date(2026, 7, 2),
+            skipped_reason="no_bars: rows_outside_session_window (12 rows on date, 04:01-09:29 ET)",
+        ),
+    ]
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        meta = write_jsonl(
+            Path(tmp) / "x.jsonl",
+            results,
+            ResearchConfig(),
+            symbols=["ES", "SPY"],
+            start=date(2026, 7, 1),
+            end=date(2026, 7, 2),
+        )
+    keys = list(meta["skip_reasons"])
+    assert any("no_rows_on_date" in k for k in keys)
+    assert any("rows_outside_session_window" in k for k in keys)
+    _json.dumps(meta)  # must stay serialisable
