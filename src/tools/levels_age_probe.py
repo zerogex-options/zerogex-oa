@@ -94,7 +94,9 @@ EXIT_OK = 0
 EXIT_UNREACHABLE = 2
 EXIT_NOTHING_TO_MEASURE = 3
 
-FetchFn = Callable[[str], Tuple[int, Optional[dict]]]
+# (status, body, cache_status) -- the third is nginx's X-Cache-Status header
+# (HIT / MISS / EXPIRED / ...), or None when the server did not send one.
+FetchFn = Callable[[str], Tuple[int, Optional[dict], Optional[str]]]
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,7 @@ class Sample:
     regressed: bool = False  # ...and moved BACKWARDS: an older snapshot served after a newer
     session: Optional[str] = None  # v2 market_session_status
     freshness: Optional[str] = None  # v2 freshness_status
+    cache_status: Optional[str] = None  # nginx X-Cache-Status, when sent
 
 
 @dataclass(frozen=True)
@@ -169,14 +172,22 @@ def fmt_when(moment: Optional[datetime]) -> str:
     return text
 
 
-def levels_url(base_url: str, version: int, symbol: str) -> str:
+def levels_url(base_url: str, version: int, symbol: str, bust: Optional[str] = None) -> str:
     # strikes=1 keeps the payload to the headline levels: the profile is
-    # dozens of rows the probe never reads.
-    return f"{base_url.rstrip('/')}/api/v{version}/levels/{symbol.upper()}?strikes=1"
+    # dozens of rows the probe never reads. ``bust`` is a per-request token
+    # appended as an extra query parameter; the nginx cache key is the full
+    # request URI, so a unique token is a guaranteed cache miss.
+    url = f"{base_url.rstrip('/')}/api/v{version}/levels/{symbol.upper()}?strikes=1"
+    return f"{url}&probe={bust}" if bust else url
 
 
-def fetch_json(url: str, api_key: str, timeout: float = 10.0) -> Tuple[int, Optional[dict]]:
-    """GET ``url`` with the bearer key; ``(status, body)`` or ``(status, None)``.
+def fetch_json(
+    url: str, api_key: str, timeout: float = 10.0
+) -> Tuple[int, Optional[dict], Optional[str]]:
+    """GET ``url`` with the bearer key; ``(status, body, cache_status)``.
+
+    ``cache_status`` is nginx's ``X-Cache-Status`` header when present, so a
+    sample can say whether it came from the edge cache or the app.
 
     A network-level failure (no route, refused, timeout) is reported as
     status 0 rather than raised, so the probe loop can count it like any
@@ -192,15 +203,20 @@ def fetch_json(url: str, api_key: str, timeout: float = 10.0) -> Tuple[int, Opti
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+            cache_status = response.headers.get("X-Cache-Status")
+            return response.status, json.loads(response.read().decode("utf-8")), cache_status
     except urllib.error.HTTPError as exc:
-        return exc.code, None
+        return exc.code, None, None
     except (urllib.error.URLError, OSError, ValueError):
-        return 0, None
+        return 0, None, None
 
 
 def take_sample(
-    body: dict, sample_at: datetime, api_version: int, previous: Optional[Sample]
+    body: dict,
+    sample_at: datetime,
+    api_version: int,
+    previous: Optional[Sample],
+    cache_status: Optional[str] = None,
 ) -> Sample:
     """Reduce one response body to the few fields the probe reasons about."""
     session = freshness = None
@@ -236,6 +252,7 @@ def take_sample(
         regressed=regressed,
         session=session,
         freshness=freshness,
+        cache_status=cache_status,
     )
 
 
@@ -401,6 +418,7 @@ def run_probe(
     on_sample: Optional[Callable[[Sample], None]] = None,
     log: Callable[[str], None] = lambda message: print(message, file=sys.stderr),
     force: bool = False,
+    bust_cache: bool = False,
 ) -> Tuple[List[Sample], int]:
     """Poll until ``duration_seconds`` elapse; ``(samples, exit_code)``.
 
@@ -417,8 +435,9 @@ def run_probe(
 
     while True:
         now = clock()
+        bust = f"{int(now.timestamp() * 1000)}-{len(samples)}" if bust_cache else None
         try:
-            status, body = fetch(levels_url(base_url, version, symbol))
+            status, body, cache_status = fetch(levels_url(base_url, version, symbol, bust))
         except KeyboardInterrupt:
             # An hour of samples is worth a report even if the trader got
             # bored at fifty minutes.
@@ -443,7 +462,7 @@ def run_probe(
                 return samples, EXIT_UNREACHABLE
         else:
             failures = 0
-            sample = take_sample(body, now, version, previous)
+            sample = take_sample(body, now, version, previous, cache_status)
             samples.append(sample)
             previous = sample
             if on_sample is not None:
@@ -468,6 +487,9 @@ def run_probe(
 
 
 def format_sample(sample: Sample) -> str:
+    """One line per sample. ``eval`` is the server's own clock for this
+    response, which is what separates "the app said this at :45" from "the
+    edge handed back a copy from :35"."""
     as_of = sample.as_of.strftime("%H:%M:%S") if sample.as_of else "-"
     marker = ""
     if sample.regressed:
@@ -477,9 +499,11 @@ def format_sample(sample: Sample) -> str:
     status = ""
     if sample.session or sample.freshness:
         status = f"  [{sample.session or '?'}/{sample.freshness or '?'}]"
+    cache = f"  {sample.cache_status}" if sample.cache_status else ""
     return (
-        f"{sample.sample_at.strftime('%H:%M:%S')}  as_of {as_of}  "
-        f"age {fmt_age(sample.age_seconds):>10}  v{sample.api_version}{status}{marker}"
+        f"{sample.sample_at.strftime('%H:%M:%S')}  eval {sample.evaluated_at.strftime('%H:%M:%S')}"
+        f"  as_of {as_of}  age {fmt_age(sample.age_seconds):>10}  "
+        f"v{sample.api_version}{status}{cache}{marker}"
     )
 
 
@@ -497,6 +521,7 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                 "regressed",
                 "session",
                 "freshness",
+                "cache_status",
             ]
         )
         for s in samples:
@@ -511,6 +536,7 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                     int(s.regressed),
                     s.session or "",
                     s.freshness or "",
+                    s.cache_status or "",
                 ]
             )
 
@@ -536,6 +562,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--minutes", type=float, default=30.0, help="how long to run (default 30)")
     parser.add_argument("--once", action="store_true", help="take one sample and exit")
     parser.add_argument("--force", action="store_true", help="keep polling on a closed market")
+    parser.add_argument(
+        "--bust-cache",
+        action="store_true",
+        help="add a unique query token per request so every sample bypasses the edge cache",
+    )
     parser.add_argument("--csv", metavar="PATH", help="write every sample to this CSV")
     parser.add_argument("--json", action="store_true", help="print the summary as JSON")
     parser.add_argument(
@@ -563,7 +594,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if should_print(sample, index, heartbeat_every, args.verbose):
             print(format_sample(sample))
 
-    def fetch(url: str) -> Tuple[int, Optional[dict]]:
+    def fetch(url: str) -> Tuple[int, Optional[dict], Optional[str]]:
         return fetch_json(url, args.api_key)
 
     if not args.once:
@@ -582,6 +613,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         duration_seconds=duration,
         on_sample=None if args.quiet else on_sample,
         force=args.force,
+        bust_cache=args.bust_cache,
     )
 
     if args.csv and samples:

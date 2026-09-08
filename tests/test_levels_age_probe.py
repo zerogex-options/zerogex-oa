@@ -79,14 +79,14 @@ class FakeServer:
         cycles = int(elapsed // self.period)
         return T0 + timedelta(seconds=cycles * self.period)
 
-    def __call__(self, url: str) -> Tuple[int, Optional[dict]]:
+    def __call__(self, url: str) -> Tuple[int, Optional[dict], Optional[str]]:
         self.urls.append(url)
         now = self.clock.now
         if "/api/v2/" in url:
             if not self.v2:
-                return 404, None
-            return 200, _v2_body(self.visible_as_of(), now, closed=self.closed)
-        return 200, _v1_body(self.visible_as_of(), now)
+                return 404, None, None
+            return 200, _v2_body(self.visible_as_of(), now, closed=self.closed), "MISS"
+        return 200, _v1_body(self.visible_as_of(), now), "MISS"
 
 
 # --- parsing --------------------------------------------------------------
@@ -248,7 +248,7 @@ def test_the_probe_drops_to_v1_when_v2_is_not_deployed():
 
 def test_a_refused_key_ends_the_run_with_exit_2():
     samples, code = probe.run_probe(
-        fetch=lambda _url: (401, None),
+        fetch=lambda _url: (401, None, None),
         base_url="https://x",
         symbol="NQ",
         interval=5.0,
@@ -263,7 +263,7 @@ def test_a_refused_key_ends_the_run_with_exit_2():
 
 def test_an_unknown_symbol_ends_the_run_with_exit_2():
     samples, code = probe.run_probe(
-        fetch=lambda _url: (404, None),
+        fetch=lambda _url: (404, None, None),
         base_url="https://x",
         symbol="XYZ",
         interval=5.0,
@@ -280,7 +280,7 @@ def test_a_dead_server_is_given_up_on_after_repeated_failures():
     clock = FakeClock(T0)
     calls = []
     samples, code = probe.run_probe(
-        fetch=lambda url: (calls.append(url), (0, None))[1],
+        fetch=lambda url: (calls.append(url), (0, None, None))[1],
         base_url="https://x",
         symbol="NQ",
         interval=5.0,
@@ -335,7 +335,9 @@ def test_force_polls_a_closed_session_anyway():
 def test_v1_with_a_stale_first_sample_is_treated_as_closed():
     stale_as_of = T0 - timedelta(hours=1)
     samples, code = probe.run_probe(
-        fetch=lambda _url: (404, None) if "/v2/" in _url else (200, _v1_body(stale_as_of, T0)),
+        fetch=lambda _url: (
+            (404, None, None) if "/v2/" in _url else (200, _v1_body(stale_as_of, T0), None)
+        ),
         base_url="https://x",
         symbol="NQ",
         interval=5.0,
@@ -346,6 +348,28 @@ def test_v1_with_a_stale_first_sample_is_treated_as_closed():
     )
     assert code == probe.EXIT_NOTHING_TO_MEASURE
     assert len(samples) == 1
+
+
+def test_bust_cache_makes_every_url_unique_and_records_the_cache_header():
+    clock = FakeClock(T0)
+    server = FakeServer(clock, period=60.0, publish_lag=35.0)
+    samples, code = probe.run_probe(
+        fetch=server,
+        base_url="https://x",
+        symbol="NQ",
+        interval=5.0,
+        duration_seconds=20.0,
+        clock=clock,
+        sleep=clock.sleep,
+        log=lambda _m: None,
+        bust_cache=True,
+    )
+    assert code == probe.EXIT_OK
+    assert len(set(server.urls)) == len(server.urls) == 5
+    assert all("&probe=" in u for u in server.urls)
+    assert all(s.cache_status == "MISS" for s in samples)
+    assert "MISS" in probe.format_sample(samples[0])
+    assert "eval " in probe.format_sample(samples[0])
 
 
 def test_once_takes_exactly_one_sample():
