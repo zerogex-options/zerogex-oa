@@ -263,80 +263,173 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_sweep(args: argparse.Namespace) -> int:
-    """Parameter neighbourhoods, reported as a grid rather than a winner.
+def _cell_metrics(rows, cfg, confluence_distance: float) -> dict[str, Any]:
+    """The three questions a sweep cell has to answer, as numbers.
 
-    Builds one dataset per parameter cell.  That is deliberately expensive:
-    the opening range and the ladder change with ``or_minutes`` and
-    ``extension_step``, so those cells genuinely are different datasets and
-    re-cohorting one build would silently answer a different question.  The
-    lead-time and confluence-distance axes are NOT swept here — they are
-    re-cohorted from a single build in ``analyze``, which is both cheaper and
-    stricter, because every cell then sees identical events.
+    Deliberately not "which cell had the best rate": a sweep is a stability
+    check, and the thing being checked is whether each EFFECT survives moving
+    its parameters, not whether some cell can be found where the number is
+    large.
     """
-    symbols = args.symbols or ["NQ"]
+    from research.msi_regime_excursion import stats as _stats
+    from research.or_gamma_confluence.cohorts import (
+        build_cohorts,
+        compare_to_baseline,
+        has_confluence,
+    )
+    from research.or_gamma_confluence.events import OUTCOME_REVERSAL, RESOLVED_OUTCOMES
+
+    resolved = [r for r in rows if r.get("outcome") in RESOLVED_OUTCOMES]
+    out: dict[str, Any] = {
+        "n": len(resolved),
+        "sessions": len({r.get("session") for r in resolved}),
+        "reversal_rate": (
+            sum(1 for r in resolved if r.get("outcome") == OUTCOME_REVERSAL) / len(resolved)
+            if resolved
+            else None
+        ),
+    }
+    # H1, as one number: does reversion rise with extension depth? Spearman on
+    # (depth, reversal) per event. Positive = the rubber-band claim.
+    depths = [abs(float(r.get("extension_k") or 0.0)) for r in resolved]
+    hits = [1.0 if r.get("outcome") == OUTCOME_REVERSAL else 0.0 for r in resolved]
+    out["depth_rho"] = _stats.spearman(depths, hits) if len(resolved) > 10 else None
+
+    # H3, as one number: the confluence effect against the unconditional base.
+    if resolved:
+        conf = compare_to_baseline(
+            resolved, lambda r: has_confluence(r, confluence_distance), iterations=600
+        )
+        out["confluence_diff"] = conf.get("clustered_diff")
+        out["confluence_p"] = conf.get("clustered_p")
+    # H2, as one number: broken ladders vs the base rate.
+    cohorts = {
+        c.key: c
+        for c in build_cohorts(
+            confluence_distance=confluence_distance,
+            min_extension=cfg.min_extension_for_reversion,
+            min_broken=cfg.min_failed_extensions_for_continuation,
+        )
+    }
+    broken = cohorts.get("prior_broken")
+    if broken is not None and resolved:
+        b = compare_to_baseline(resolved, broken.predicate, iterations=600)
+        out["broken_diff"] = b.get("clustered_diff")
+        out["broken_p"] = b.get("clustered_p")
+        out["broken_n"] = b.get("n")
+    return out
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Parameter neighbourhoods, reported as a surface rather than a winner.
+
+    One dataset is built per cell, because each of these axes changes what the
+    dataset IS:
+
+    * ``or_minutes`` and ``extension_step`` move the opening range and the
+      ladder, so the touch events themselves differ;
+    * ``gamma_lead`` selects a different gamma snapshot per touch
+      (``dataset.py`` passes it to ``GammaTimeline.as_of``), so the stored
+      confluence distances differ.
+
+    Only ``confluence_distance`` is genuinely re-cohortable from a saved
+    build, because raw distances are stored — and that axis is therefore swept
+    in ``analyze`` instead, where every cell provably sees identical events.
+
+    Each cell reports one number per hypothesis: a Spearman rho for "deeper
+    reverts more", and clustered effects for confluence and for broken
+    ladders.  Read down a column for stability; a value that exists in one
+    cell and not its neighbours is noise.
+    """
+    symbols = args.symbols or list(DEFAULT_SYMBOLS)
     base = _config_from_args(args)
-    cells: list[dict[str, Any]] = []
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    grid = [
+        (o, st, ld) for o in args.or_minutes_grid for st in args.step_grid for ld in args.lead_grid
+    ]
+    print(
+        f"{len(grid)} cells x {len(symbols)} symbols. Each cell is a full "
+        f"rebuild; budget several minutes per cell."
+    )
+    if base.use_gex_ranks:
+        print(
+            "Tip: --no-gex-ranks skips the gex_by_strike reads and is much "
+            "faster. It drops the ranked-GEX levels only; wall / flip / "
+            "max-pain / pin confluence is unaffected."
+        )
+
+    cells: list[dict[str, Any]] = []
     with sources.research_connection() as conn:
-        for or_min in args.or_minutes_grid:
-            for step in args.step_grid:
-                cfg = base.variant(opening_range_minutes=or_min, extension_step=step)
-                path = outdir / f"orgc_or{or_min}_step{step:g}_{cfg.fingerprint()}.jsonl"
-                meta = write_jsonl(
-                    path,
-                    build_dataset(conn, symbols, args.start, args.end, cfg),
-                    cfg,
-                    symbols=symbols,
-                    start=args.start,
-                    end=args.end,
-                )
-                rows = read_jsonl(path)
-                summary = build_summary(
-                    rows, cfg, meta, confluence_distance=args.confluence_distance
-                )
-                overall = summary["overall"]
-                cells.append(
-                    {
-                        "or_minutes": or_min,
-                        "extension_step": step,
-                        "fingerprint": cfg.fingerprint(),
-                        "path": str(path),
-                        "n": overall["n_resolved"],
-                        "sessions": overall["n_sessions"],
-                        "reversal_rate": overall["reversal_rate"],
-                        "confluence_gap": next(
-                            (
-                                g["gap"]
-                                for g in summary["distance_grid"]
-                                if g["distance"] == args.confluence_distance
-                            ),
-                            None,
-                        ),
-                    }
-                )
-                print(
-                    f"  OR={or_min:>2}m step={step:g}R -> n={overall['n_resolved']:>5} "
-                    f"reversal={overall['reversal_rate']}"
-                )
+        for or_min, step, lead in grid:
+            cfg = base.variant(
+                opening_range_minutes=or_min,
+                extension_step=step,
+                gamma_min_lead_seconds=lead,
+            )
+            path = outdir / f"orgc_or{or_min}_s{step:g}_l{lead}_{cfg.fingerprint()}.jsonl"
+            meta = write_jsonl(
+                path,
+                build_dataset(conn, symbols, args.start, args.end, cfg),
+                cfg,
+                symbols=symbols,
+                start=args.start,
+                end=args.end,
+            )
+            m = _cell_metrics(read_jsonl(path), cfg, args.confluence_distance)
+            cells.append(
+                {
+                    "or_minutes": or_min,
+                    "extension_step": step,
+                    "gamma_lead": lead,
+                    "fingerprint": cfg.fingerprint(),
+                    "path": str(path),
+                    "rows": meta["rows"],
+                    **m,
+                }
+            )
+            rate_txt = "—" if m["reversal_rate"] is None else f"{m['reversal_rate'] * 100:.1f}%"
+            print(
+                f"  OR={or_min:>2}m step={step:g}R lead={lead:>3}s -> "
+                f"n={m['n']:>5} reversal={rate_txt}"
+            )
 
     grid_path = outdir / "orgc_sweep.json"
     grid_path.write_text(json.dumps(cells, indent=2, default=str), encoding="utf-8")
-    print(f"\n=== Sweep grid ({len(cells)} cells) -> {grid_path} ===")
-    print(f"{'OR':>4}{'step':>7}{'n':>7}{'sessions':>10}{'reversal':>10}{'conf gap':>10}")
+
+    def _f(v, places=3, scale=1.0, suffix=""):
+        return "—" if v is None else f"{v * scale:+.{places}f}{suffix}"
+
+    print(f"\n=== Sweep surface ({len(cells)} cells) -> {grid_path} ===")
+    print(
+        f"{'OR':>4}{'step':>7}{'lead':>6}{'n':>7}{'days':>6}{'reversal':>10}"
+        f"{'H1 rho':>9}{'H3 conf':>10}{'  p':>7}{'H2 broken':>11}{'  p':>7}"
+    )
+
+    def _p(v):
+        return "—" if v is None else f"{v:.3f}"
+
     for c in cells:
         rate = "—" if c["reversal_rate"] is None else f"{c['reversal_rate'] * 100:.1f}%"
-        gap = "—" if c["confluence_gap"] is None else f"{c['confluence_gap'] * 100:+.1f}"
         print(
-            f"{c['or_minutes']:>4}{c['extension_step']:>7g}{c['n']:>7}"
-            f"{c['sessions']:>10}{rate:>10}{gap:>10}"
+            f"{c['or_minutes']:>4}{c['extension_step']:>7g}{c['gamma_lead']:>6}"
+            f"{c['n']:>7}{c['sessions']:>6}{rate:>10}"
+            f"{_f(c.get('depth_rho')):>9}"
+            f"{_f(c.get('confluence_diff'), 1, 100, 'pt'):>10}"
+            f"{_p(c.get('confluence_p')):>7}"
+            f"{_f(c.get('broken_diff'), 1, 100, 'pt'):>11}"
+            f"{_p(c.get('broken_p')):>7}"
         )
-    print(
-        "\nRead this as a surface, not a leaderboard. An effect that exists in "
-        "one cell and not its neighbours is noise."
-    )
+    print("\nH1 rho  : Spearman(extension depth, reversal). Positive supports")
+    print("          the rubber-band claim; near zero falsifies it.")
+    print("H3 conf : confluence effect vs the unconditional base rate.")
+    print("H2 broken: broken-ladder effect vs the same base. Negative means")
+    print("          less reversion, i.e. continuation.")
+    print("\nRead DOWN each column. An effect that appears in one cell and not")
+    print("its neighbours is noise; a real one survives its own parameters.")
+    print("No multiplicity correction across cells -- with this many, expect")
+    print("one p<0.05 by chance.")
     return 0
 
 
@@ -469,6 +562,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--outdir", default="research_output/orgc_sweep")
     p.add_argument("--or-minutes-grid", type=int, nargs="+", default=(5, 15, 30))
     p.add_argument("--step-grid", type=float, nargs="+", default=(0.25, 0.5, 1.0))
+    p.add_argument(
+        "--lead-grid",
+        type=int,
+        nargs="+",
+        default=(120,),
+        help="gamma lead times in seconds. Each value is a REBUILD (the lead "
+        "selects a different snapshot per touch), so this multiplies runtime. "
+        "Sweep it on its own: --lead-grid 0 30 60 120 180 --or-minutes-grid 5 "
+        "--step-grid 0.5",
+    )
     p.add_argument("--confluence-distance", type=float, default=10.0)
     _add_config_args(p)
     p.set_defaults(func=cmd_sweep)

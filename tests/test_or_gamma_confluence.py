@@ -1054,3 +1054,55 @@ def test_skip_reasons_keep_their_diagnostic_detail():
     assert any("no_rows_on_date" in k for k in keys)
     assert any("rows_outside_session_window" in k for k in keys)
     _json.dumps(meta)  # must stay serialisable
+
+
+def test_sweep_cell_metrics_recover_a_planted_depth_effect():
+    """H1 is reported as one number per sweep cell, so that number has to move
+    with the effect and sit at zero without it."""
+    from research.or_gamma_confluence.cli import _cell_metrics
+
+    rng = random.Random(3)
+    rows = []
+    for d in range(40):
+        for _ in range(25):
+            depth = rng.choice([0.5, 1.0, 2.0, 3.0, 5.0])
+            p = 0.40 + 0.04 * depth  # planted: deeper reverts more
+            rows.append(
+                {
+                    "symbol": "NQ",
+                    "gamma_symbol": "NDX",
+                    "session": f"2026-07-{d % 28 + 1:02d}",
+                    "outcome": (OUTCOME_REVERSAL if rng.random() < p else OUTCOME_CONTINUATION),
+                    "extension_k": depth,
+                    "gamma_confluence_count_10": 0,
+                }
+            )
+    cfg = ResearchConfig()
+    with_effect = _cell_metrics(rows, cfg, 10.0)
+    assert with_effect["depth_rho"] > 0.05
+
+    scrambled = [dict(r, extension_k=rng.choice([0.5, 1.0, 2.0, 3.0, 5.0])) for r in rows]
+    assert abs(_cell_metrics(scrambled, cfg, 10.0)["depth_rho"]) < 0.05
+
+
+def test_gamma_lead_is_a_rebuild_axis_not_a_recohort_axis():
+    """The lead selects a different snapshot per touch at BUILD time, so a
+    saved dataset cannot be re-read at another lead. Only the confluence
+    DISTANCE is re-cohortable, because raw distances are stored."""
+    base = ResearchConfig()
+    assert base.variant(gamma_min_lead_seconds=60).fingerprint() != base.fingerprint()
+    # ...whereas the reporting buckets do not change what was measured, only
+    # how it is sliced, and analyze sweeps them without a rebuild.
+    from research.or_gamma_confluence.report import _distance_grid
+
+    rows = [
+        {
+            "symbol": "NQ",
+            "session": "2026-07-01",
+            "outcome": OUTCOME_REVERSAL,
+            "gamma_confluence_count_2": 0,
+            "gamma_confluence_count_20": 1,
+        }
+    ]
+    grid = _distance_grid(rows, (2.0, 20.0))
+    assert grid[0]["n_with"] == 0 and grid[1]["n_with"] == 1
