@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.analytics.main_engine import format_cycle_timing
+from src.analytics.main_engine import format_cycle_timing, format_loop_timing
 
 STAMP = datetime(2026, 9, 8, 14, 12, tzinfo=timezone.utc)  # as_of 14:12:00
 
@@ -45,3 +45,12 @@ def test_a_cycle_that_started_before_its_stamp_shows_a_negative_phase():
     # the cycle start; the sign must survive rather than be clamped.
     line = format_cycle_timing("NDX", STAMP, STAMP.timestamp() - 3.0, STAMP.timestamp() + 7.0, {})
     assert "phase=-3.0s duration=10.0s publish_lag=7.0s" in line
+
+
+def test_loop_timing_line_names_the_overrun_that_moves_the_phase():
+    quiet = format_loop_timing("$NDXP.X", 0.3, 4.2, 55.5, 60)
+    assert quiet == "Loop timing [$NDXP.X] calc=0.3s flow=4.2s sleep=55.5s interval=60s"
+
+    late = format_loop_timing("$NDXP.X", 0.3, 89.9, 0.0, 60)
+    assert late.startswith("Loop timing [$NDXP.X] calc=0.3s flow=89.9s sleep=0.0s interval=60s")
+    assert "OVERRUN by 30.2s" in late

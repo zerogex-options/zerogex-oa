@@ -4249,6 +4249,7 @@ class AnalyticsEngine:
 
                 # Run calculation
                 success = self.run_calculation()
+                calc_seconds = time.time() - cycle_start
 
                 if success:
                     logger.info(f"✅ Calculation cycle {self.calculations_completed} complete")
@@ -4262,11 +4263,28 @@ class AnalyticsEngine:
                 # data sources (flow_contract_facts → flow_by_contract)
                 # remain live well past the GEX side's cash-close freeze.
                 # See _run_flow_cycle for the full rationale.
+                flow_start = time.time()
                 self._run_flow_cycle()
+                flow_seconds = time.time() - flow_start
 
                 # Calculate sleep time
                 cycle_duration = time.time() - cycle_start
                 sleep_time = max(0, effective_interval - cycle_duration)
+
+                # One line per loop for what the cycle line cannot see. The
+                # loop's period is calc + flow + sleep, so a flow refresh that
+                # runs past the interval is what moves the publish phase: the
+                # probe saw the phase jump by 10 to 30s between minutes while
+                # calc measured 0.3s. Symbol-tagged, as "Sleeping for" is not.
+                logger.info(
+                    format_loop_timing(
+                        self.underlying,
+                        calc_seconds,
+                        flow_seconds,
+                        sleep_time,
+                        effective_interval,
+                    )
+                )
 
                 if sleep_time > 0:
                     logger.info(f"Sleeping for {sleep_time:.1f}s until next calculation...\n")
@@ -4355,6 +4373,33 @@ def format_cycle_timing(
         f"Cycle timing [{symbol}] snapshot={stamp.isoformat(timespec='seconds')} "
         f"phase={phase:+.1f}s duration={duration:.1f}s publish_lag={publish_lag:.1f}s "
         f"stages: {stages or 'n/a'}"
+    )
+
+
+def format_loop_timing(
+    symbol: str,
+    calc_seconds: float,
+    flow_seconds: float,
+    sleep_seconds: float,
+    interval_seconds: float,
+) -> str:
+    """One line per loop iteration: how the interval was spent.
+
+    ``calc`` is run_calculation (the cycle line has its stages), ``flow`` is
+    the flow-cache refresh that follows it, ``sleep`` is what was left of the
+    interval. When calc + flow exceeds the interval the loop sleeps zero and
+    the next cycle starts late, so the publish phase moves by the overrun;
+    that is the only thing that moves it, and the line says so.
+    """
+    over = calc_seconds + flow_seconds - interval_seconds
+    tail = (
+        f" OVERRUN by {over:.1f}s: next cycle starts late, publish phase moves"
+        if over > 0
+        else ""
+    )
+    return (
+        f"Loop timing [{symbol}] calc={calc_seconds:.1f}s flow={flow_seconds:.1f}s "
+        f"sleep={sleep_seconds:.1f}s interval={interval_seconds:.0f}s{tail}"
     )
 
 
