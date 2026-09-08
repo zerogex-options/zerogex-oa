@@ -404,16 +404,54 @@ ask for that this repo's structure makes necessary:
 
 ---
 
-## 9. Open decisions for the requester
+## 9. Decisions taken (2026-09-08)
 
-1. **Execution fork (§6)** — confirm Path A + B as recommended, or pick one.
-2. **Availability clock default (§1)** — I propose `visible`
-   (`created_at` + 30 s). Confirm, or default to `published` and report
-   `visible` as a robustness row.
-3. **Symbol order.** NQ first as asked. NDX is the same underlying index with a
-   longer, un-projected history and no basis uncertainty — running NDX
-   **alongside** NQ gives a free replication check of the kind that killed every
-   `wall_break_odds` feature. Recommend both.
-4. **History window.** `gex_summary` is retention-exempt; how far back does it
-   actually go in production? That number bounds the whole study and I cannot
-   read it from here.
+1. **Execution fork (§6)** — Path A + B as recommended. Phase 4 builds a
+   futures fill model for the RESEARCH P&L only, so "is this tradeable after
+   costs?" is answered on the instrument the effect was measured on; Phase 5's
+   TradeWorkz candidates express the signal in NDX/QQQ options so they reach
+   the real engine, audit trail and promotion gate. Phase 6 reports both, and
+   flags it explicitly if the effect survives in points but dies under option
+   carry.
+2. **Availability clock** — default `visible` (`created_at` + 30 s poll lag),
+   with `published` and `data` available as robustness rows. Implemented as
+   `ResearchConfig.availability_clock`.
+3. **Symbols** — all six: SPY, QQQ, SPX, NDX, ES, NQ. The four-way structure
+   is a genuine replication design rather than six separate studies: SPY/SPX
+   share the S&P book and QQQ/NDX the Nasdaq one, while ES/NQ are the same two
+   books on a futures axis. A feature that is real should hold its sign across
+   the pairs; `wall_break_odds` used exactly this shape to kill fourteen
+   candidates.
+4. **History window** — not knowable from the code, so it is now a command:
+   `make orgc-coverage` (`cli coverage`) reports per symbol and per table the
+   earliest/latest row and the session count, and separately measures whether
+   `created_at` is a usable publish clock. **Run it before anything else** —
+   it bounds the whole study and validates decision 2.
+
+## 10. Phase 2 status — built
+
+`research/or_gamma_confluence/` is complete, tested (53 tests) and verified end
+to end on synthetic data. It has NOT been run against production; this session
+had no database access, so Phase 3 onward is pending.
+
+Two defects were found and fixed by the tests while building, both of the kind
+that would have produced a confident wrong answer rather than a crash:
+
+* `consecutive_extensions_broken` scored a rung as *respected* using the touch
+  bar's own far extreme — which is where price came FROM on its way to the
+  level — so any rung reached by a large bar counted as respected, and the
+  continuation hypothesis would have had almost no sample.
+* `gex_ranks_available` was computed and then never set on the snapshot, so
+  every row claimed ranked levels were unavailable and the ranked-confluence
+  arm would have silently reported an empty cohort.
+
+One data-quality hazard was found that the Phase 1 assessment missed, and it
+bears directly on a **5-minute** opening range: SPX and NDX print a stale
+opening-rotation value at 09:30 (constituents have not opened), which
+TradeStation folds into the bar's OHLC. On a gap day that phantom value IS the
+bar's high or low, and on a 5-minute range that one bar is 20% of the sample —
+frequently setting `ORH` or `ORL` outright and putting the entire ladder in the
+wrong place. `src/tools/cash_index_open_repair.py` is production's rule for it;
+the harness applies it defensively at read time rather than assuming
+`make cash-index-open-repair` has been run over history. It is a no-op for
+SPY/QQQ (real traded opens) and for ES/NQ (futures print continuously).
