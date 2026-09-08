@@ -3932,6 +3932,7 @@ class AnalyticsEngine:
             True if successful, False otherwise
         """
         stage_timings: Dict[str, float] = {}
+        cycle_started_wall = _time.time()
 
         try:
             # Single DB call: get timestamp, underlying price, and option data
@@ -4123,7 +4124,9 @@ class AnalyticsEngine:
             self._last_processed_snapshot_ts = latest_timestamp
 
             # Emit per-stage timings so cycle-overrun warnings can be
-            # diagnosed without guessing which step is slow.
+            # diagnosed without guessing which step is slow. The exact
+            # wording is parsed by src/tools/system_monitor.py; the richer
+            # line below is additive, not a replacement.
             self._last_stage_timings = stage_timings
             total_stage_time = sum(stage_timings.values())
             timings_str = ", ".join(f"{label}={secs:.2f}s" for label, secs in stage_timings.items())
@@ -4131,6 +4134,18 @@ class AnalyticsEngine:
                 "Stage timings (total %.2fs): %s",
                 total_stage_time,
                 timings_str,
+            )
+            # And one line per cycle with the symbol and the two halves of
+            # the snapshot's age at publish (phase and duration) that nothing
+            # outside this process can separate. See format_cycle_timing.
+            logger.info(
+                format_cycle_timing(
+                    self.underlying,
+                    latest_timestamp,
+                    cycle_started_wall,
+                    _time.time(),
+                    stage_timings,
+                )
             )
 
             return True
@@ -4263,6 +4278,51 @@ class AnalyticsEngine:
             logger.info("=" * 80 + "\n")
 
             close_connection_pool()
+
+
+def format_cycle_timing(
+    symbol: str,
+    snapshot_ts: datetime,
+    cycle_started_wall: float,
+    published_wall: float,
+    stage_timings: Dict[str, float],
+) -> str:
+    """The one log line per cycle that says where a snapshot's age comes from.
+
+    A snapshot is stamped with the chain timestamp the cycle started from,
+    so by the time it is written it is already ``publish_lag`` seconds old,
+    and that lag has two halves the API cannot tell apart:
+
+    * ``phase`` -- how far past the snapshot stamp the cycle *started*. With
+      minute-bucketed chain rows this is mostly where in the minute the
+      fixed 60s clock happens to fire; the rows themselves are rewritten
+      every 5s, so it is label age, not data age.
+    * ``duration`` -- the cycle's own in-flight time, start to store. This is
+      data age, and the part worth shortening.
+
+    A probe polling ``/api/v2/levels/NQ`` every 5s measured publish_lag at
+    26-59s and saw it swing by up to 30s between consecutive minutes on a
+    period of exactly 60s; only duration can swing like that, and only the
+    stage breakdown here says which stage does. Stages are listed slowest
+    first. Grep the journal for ``Cycle timing [NDX]``.
+
+    The log format carries no worker name and every symbol's worker logs
+    into the same journal, so the symbol is in the line itself.
+    """
+    stamp = snapshot_ts if snapshot_ts.tzinfo is not None else snapshot_ts.replace(tzinfo=timezone.utc)
+    stamp_epoch = stamp.timestamp()
+    phase = cycle_started_wall - stamp_epoch
+    duration = published_wall - cycle_started_wall
+    publish_lag = published_wall - stamp_epoch
+    stages = ", ".join(
+        f"{label}={secs:.1f}s"
+        for label, secs in sorted(stage_timings.items(), key=lambda kv: kv[1], reverse=True)
+    )
+    return (
+        f"Cycle timing [{symbol}] snapshot={stamp.isoformat(timespec='seconds')} "
+        f"phase={phase:+.1f}s duration={duration:.1f}s publish_lag={publish_lag:.1f}s "
+        f"stages: {stages or 'n/a'}"
+    )
 
 
 def _compute_worker_stagger(interval_seconds: int, num_workers: int) -> float:
