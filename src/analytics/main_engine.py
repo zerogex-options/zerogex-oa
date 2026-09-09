@@ -3153,8 +3153,8 @@ class AnalyticsEngine:
              call_wall, put_wall, call_wall_strength, put_wall_strength,
              max_pain_by_expiration, gamma_flip_span_used,
              gamma_flip_raw, pin_strike, pin_score, pin_confidence,
-             pin_strike_reason, computed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+             pin_strike_reason, computed_at, data_as_of)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -3181,7 +3181,8 @@ class AnalyticsEngine:
                 pin_score = EXCLUDED.pin_score,
                 pin_confidence = EXCLUDED.pin_confidence,
                 pin_strike_reason = EXCLUDED.pin_strike_reason,
-                computed_at = NOW()
+                computed_at = NOW(),
+                data_as_of = EXCLUDED.data_as_of
             WHERE
                 EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                 OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -3208,6 +3209,7 @@ class AnalyticsEngine:
                 OR EXCLUDED.pin_score IS DISTINCT FROM gex_summary.pin_score
                 OR EXCLUDED.pin_confidence IS DISTINCT FROM gex_summary.pin_confidence
                 OR EXCLUDED.pin_strike_reason IS DISTINCT FROM gex_summary.pin_strike_reason
+                OR EXCLUDED.data_as_of IS DISTINCT FROM gex_summary.data_as_of
         """,
             (
                 summary["underlying"],
@@ -3237,6 +3239,7 @@ class AnalyticsEngine:
                 (float(pin_score_val) if pin_score_val is not None else None),
                 (float(pin_confidence_val) if pin_confidence_val is not None else None),
                 (str(pin_strike_reason_val) if pin_strike_reason_val is not None else None),
+                summary.get("data_as_of"),
             ),
         )
         logger.info("✅ Stored GEX summary")
@@ -4107,6 +4110,10 @@ class AnalyticsEngine:
             # Store results
             logger.info("Storing results to database...")
             t0 = _time.monotonic()
+            # What the numbers are as of: the newest quote write the snapshot
+            # read, not the minute bucket it is filed under. See
+            # gex_summary.data_as_of in schema.sql.
+            gex_summary["data_as_of"] = data_updated_at
             self._store_calculation_results(gex_by_strike, gex_summary, options=options)
             stage_timings["store_results"] = _time.monotonic() - t0
 

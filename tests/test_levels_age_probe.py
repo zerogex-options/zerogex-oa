@@ -383,6 +383,20 @@ def test_bust_cache_makes_every_url_unique_and_records_the_cache_header():
     assert "eval " in probe.format_sample(samples[0])
 
 
+def test_data_as_of_yields_a_quote_age_alongside_the_bucket_age():
+    bucket = T0
+    quotes = T0 + timedelta(seconds=37)
+    now = T0 + timedelta(seconds=70)
+    body = _v1_body(bucket, now)
+    body["data_as_of"] = _z(quotes)
+    sample = probe.take_sample(body, now, 1, previous=None)
+    assert sample.data_as_of == quotes
+    assert sample.data_age_seconds == 33.0
+    assert "quotes 33.0s" in probe.format_sample(sample)
+    report = probe.format_report(probe.summarize([sample]), interval=5.0)
+    assert "quote age seen by a random poll" in report
+
+
 def test_once_takes_exactly_one_sample():
     clock = FakeClock(T0 + timedelta(seconds=40))
     server = FakeServer(clock, period=60.0, publish_lag=35.0)

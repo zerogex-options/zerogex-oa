@@ -583,6 +583,8 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   "as_of": "2026-07-06T19:30:00Z",
   "age_seconds": 42,
   "computed_at": "2026-07-06T19:30:45Z",
+  "data_as_of": "2026-07-06T19:30:41Z",
+  "computed_at": "2026-07-06T19:30:45Z",
   "net_gex_at_spot": -1200000000.0,
   "levels": {
     "gamma_flip": 675.0,
@@ -622,13 +624,20 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   gamma per 1% move, calls positive / puts negative, and
   `net_gex == call_gex + put_gex` by construction.
 - `computed_at` is when the analytics engine last wrote the snapshot (server
-  clock; `null` on rows that predate the column). `as_of` is the chain bucket
-  the numbers were computed *from*; `computed_at` is when they were
-  *produced*. They differ by the engine cycle's phase within the minute plus
-  its own duration (26–59s measured in production), and a sub-minute cadence
-  rewrites the same minute row, so `computed_at` is the one field that
-  changes on a rewrite. Freshness (`age_seconds`, v2 `source_timestamp`)
-  stays measured from `as_of`; v2 `generated_at` reports `computed_at`.
+  clock; null on rows that predate the column). `as_of` is the minute bucket
+  the numbers are filed under; `computed_at` is when they were *produced*.
+  A sub-minute cadence rewrites the same minute row, so `computed_at` is the
+  one field that changes on a rewrite. v2 `generated_at` reports it.
+- `data_as_of` is what the numbers are actually *as of*: the newest quote
+  write the engine read for this snapshot (null on rows that predate the
+  column). A minute bucket is already up to a minute old when the cycle reads
+  it, so measuring staleness from `as_of` overstated every snapshot's age by
+  the cycle's phase in the minute — 26–59s measured in production while the
+  quotes inside were under 5s old. **`age_seconds` and the v2
+  `source_timestamp` / `freshness_status` are measured from `data_as_of`
+  when present**, and from `as_of` only on rows that predate it. Consumers
+  that display `age_seconds` (the NinjaTrader and Sierra Chart studies)
+  therefore read lower, and truer, with no change on their side.
 - `as_of` / `age_seconds` describe snapshot freshness — see *Data
   freshness & update cadence* above.
 

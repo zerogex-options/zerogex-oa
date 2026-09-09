@@ -110,6 +110,14 @@ class LevelsResponse(BaseModel):
     # one field that changes on a rewrite. Freshness stays measured from
     # ``as_of`` (see src/api/freshness.py); this is additive.
     computed_at: Optional[datetime] = None
+    # What the numbers are actually as of: the newest quote write the engine
+    # read for this snapshot. ``as_of`` is the minute bucket the snapshot is
+    # filed under, and a bucket is already up to a minute old when the cycle
+    # reads it, so measuring staleness from it overstated every snapshot's age
+    # by the cycle's phase in the minute (26-59s measured) while the quotes
+    # inside were under 5s old. ``age_seconds`` is measured from this when
+    # present, and from ``as_of`` on rows that predate the column.
+    data_as_of: Optional[datetime] = None
     net_gex_at_spot: Optional[float] = None
     levels: DealerLevels
     # Pin Strike metadata (scalars, not drawable lines): the raw maximum pin
@@ -187,7 +195,13 @@ async def get_levels(
     as_of = summary["timestamp"]
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
-    age_seconds = max(0, int((datetime.now(timezone.utc) - as_of).total_seconds()))
+    data_as_of = summary.get("data_as_of")
+    if data_as_of is not None and data_as_of.tzinfo is None:
+        data_as_of = data_as_of.replace(tzinfo=timezone.utc)
+    # Staleness is measured from the quotes, not from the bucket they are
+    # filed under (see LevelsResponse.data_as_of).
+    freshness_anchor = data_as_of if data_as_of is not None else as_of
+    age_seconds = max(0, int((datetime.now(timezone.utc) - freshness_anchor).total_seconds()))
 
     return LevelsResponse(
         symbol=sym,
@@ -195,6 +209,7 @@ async def get_levels(
         as_of=as_of,
         age_seconds=age_seconds,
         computed_at=summary.get("computed_at"),
+        data_as_of=data_as_of,
         net_gex_at_spot=_maybe_float(summary.get("net_gex_at_spot")),
         levels=DealerLevels(
             gamma_flip=_maybe_float(summary.get("gamma_flip")),

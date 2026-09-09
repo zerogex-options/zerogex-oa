@@ -747,6 +747,12 @@ _GENERATED_KEYS = ("generated_at", "evaluated_at", "as_of", "snapshot_time", "co
 # the only keys freshness is graded against when any of them is present.
 _SOURCE_KEYS = (
     "source_timestamp",
+    # A cycle-backed snapshot's own statement of what its data are as of: the
+    # newest quote write it read. Distinct from as_of, the minute bucket it is
+    # filed under, which the levels body also carries and which runs up to a
+    # minute behind the quotes. Under the max() below this outranks as_of
+    # whenever both are present, which is what makes age_seconds honest.
+    "data_as_of",
     # Ranked/top-N responses expose this so freshness is graded on the feed's
     # recency rather than on which selected row happens to be newest. It is
     # always >= any row timestamp, so the max() below picks it up naturally.

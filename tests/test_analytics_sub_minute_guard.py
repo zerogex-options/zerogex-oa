@@ -38,6 +38,10 @@ def test_same_bucket_recomputes_only_when_the_rows_were_rewritten():
     engine._get_snapshot = MagicMock(return_value=_snapshot(first_write))
     assert engine.run_calculation() is True
     assert engine._store_calculation_results.call_count == 1
+    # The stored summary says what its numbers are as of: the quote write
+    # clock, not the bucket it is filed under.
+    stored_summary = engine._store_calculation_results.call_args.args[1]
+    assert stored_summary["data_as_of"] == first_write
 
     # Identical input: skipped, as before.
     assert engine.run_calculation() is True
