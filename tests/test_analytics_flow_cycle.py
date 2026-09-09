@@ -34,6 +34,7 @@ def _bare_engine() -> AnalyticsEngine:
     eng.db_symbol = "SPY"
     eng._refresh_flow_caches = MagicMock()
     eng._refresh_flow_series_snapshot = MagicMock()
+    eng._refresh_gamma_regime_snapshot = MagicMock()
     return eng
 
 
@@ -282,9 +283,9 @@ def test_run_flow_cycle_anchor_uses_max_option_chains_timestamp():
 def test_run_flow_cycle_uses_dedicated_db_connection():
     """``_run_flow_cycle`` opens its own short-lived connection for the
     anchor lookup, then ``_refresh_flow_caches`` /
-    ``_refresh_flow_series_snapshot`` each open their own. We don't
-    hand a long-held connection across stages — keeps pool pressure
-    bounded if any stage stalls."""
+    ``_refresh_flow_series_snapshot`` / ``_refresh_gamma_regime_snapshot``
+    each open their own. We don't hand a long-held connection across
+    stages — keeps pool pressure bounded if any stage stalls."""
     eng = _bare_engine()
     anchor = datetime(2026, 6, 15, 19, 55, tzinfo=timezone.utc)
 
@@ -332,6 +333,7 @@ def test_run_flow_cycle_idempotent_across_repeated_invocations():
 
     assert eng._refresh_flow_caches.call_count == 3
     assert eng._refresh_flow_series_snapshot.call_count == 3
+    assert eng._refresh_gamma_regime_snapshot.call_count == 3
     for call in eng._refresh_flow_caches.mock_calls:
         assert call.args == (anchor,)
         assert call.kwargs == {"underlying_price": 500.0}

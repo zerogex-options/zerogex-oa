@@ -3829,6 +3829,243 @@ class AnalyticsEngine:
         # one does not block the other.
         self._refresh_flow_caches(anchor_ts, underlying_price=underlying_price)
         self._refresh_flow_series_snapshot(anchor_ts)
+        self._refresh_gamma_regime_snapshot(anchor_ts)
+
+    #: How many 5-minute bars back the rolling lens compares against.
+    #: Kept beside the writer because it is stored per row: changing it
+    #: changes what already-written rows mean, and a reader can tell which
+    #: setting produced a given bar.
+    GAMMA_REGIME_ROLLING_BARS = 6
+
+    def _gamma_chain_at_bar(self, cursor, bar_start: datetime):
+        """The per-strike dealer-gamma chain for one 5-minute bar.
+
+        Resolves the latest ``gex_by_strike`` timestamp inside the bar, then
+        derives dollar GEX from the stored RAW gamma at that bar's own spot --
+        ``gamma x 100 x S^2 x 0.01``, the same canonical form
+        ``get_gex_chain_at_ts`` uses. The derivation matters: gex_by_strike
+        stores gamma, not dollars, so reading net_gex straight out would be
+        off by the spot-squared factor and silently wrong rather than absent.
+
+        Returns ``(spot, rows)`` or ``(None, [])`` when the bar has no chain.
+        """
+        cursor.execute(
+            """
+            WITH anchor AS (
+                SELECT timestamp
+                FROM gex_by_strike
+                WHERE underlying = %(symbol)s
+                  AND timestamp >= %(bar_start)s
+                  AND timestamp <  %(bar_end)s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            anchor_spot AS (
+                SELECT
+                    a.timestamp,
+                    (SELECT uq.close
+                       FROM underlying_quotes uq
+                      WHERE uq.symbol = %(symbol)s
+                        AND uq.timestamp <= a.timestamp
+                      ORDER BY uq.timestamp DESC
+                      LIMIT 1) AS spot_price
+                FROM anchor a
+            )
+            SELECT
+                a.spot_price,
+                g.strike,
+                g.expiration,
+                ((g.call_gamma - g.put_gamma) * 100 * a.spot_price * a.spot_price * 0.01)
+                    AS net_gex,
+                (g.call_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS call_gex,
+                (-1 * g.put_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS put_gex,
+                g.call_oi,
+                g.put_oi
+            FROM gex_by_strike g
+            CROSS JOIN anchor_spot a
+            WHERE g.underlying = %(symbol)s
+              AND g.timestamp = a.timestamp
+              AND a.spot_price IS NOT NULL
+            ORDER BY g.expiration ASC, g.strike ASC
+            LIMIT %(max_rows)s
+            """,
+            {
+                "symbol": self.db_symbol,
+                "bar_start": bar_start,
+                "bar_end": bar_start + timedelta(minutes=5),
+                "max_rows": 6000,
+            },
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None, []
+
+        cols = [d[0] for d in cursor.description]
+        dicts = [dict(zip(cols, r)) for r in rows]
+        spot = dicts[0].get("spot_price")
+        return (float(spot) if spot is not None else None), dicts
+
+    def _refresh_gamma_regime_snapshot(self, timestamp: datetime):
+        """Materialise gamma_regime_5min for the current session.
+
+        Writes ONE bar per cycle. That is the whole design: a bar's reading is
+        a diff of two ~1500-row chains, so computing a session on demand is
+        ~78 of those per viewer per poll -- the exact shape that took
+        /api/gex/strike-profile-timeseries down on 2026-08-21, where a read
+        too slow for its own guard returned empty, cached nothing, and every
+        next poll re-entered the same work. Doing it here instead means the
+        expensive part happens once, in the background, off the request path.
+
+        Cold-start and gap-fill walk the session's missing bars rather than
+        rebuilding everything: an engine restart mid-session must not leave a
+        hole in the line, but it also must not redo bars already written.
+
+        Best-effort, exactly like the flow snapshot: log and return, never
+        raise. A failure here must not break the analytics cycle or the GEX
+        path that the rest of the product depends on.
+        """
+        if not self._analytics_flow_cache_refresh_enabled:
+            return
+
+        try:
+            from src.analytics.gamma_regime_series import ChainSnapshot, build_latest_bar
+
+            ts_et = timestamp.astimezone(ET)
+            session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
+            session_start = session_open_et.astimezone(timezone.utc)
+            session_close = session_start + timedelta(hours=6, minutes=45)
+            now_utc = datetime.now(timezone.utc)
+            curr_bar = datetime.fromtimestamp(
+                int(now_utc.timestamp() // 300) * 300, tz=timezone.utc
+            )
+            session_end = min(curr_bar, session_close)
+            if session_end < session_start:
+                return
+
+            rolling = self.GAMMA_REGIME_ROLLING_BARS
+
+            with db_connection() as conn:
+                cursor = conn.cursor()
+
+                # Which bars still need writing. Normally exactly one (the
+                # open bar, rewritten as it fills); more after downtime.
+                cursor.execute(
+                    """
+                    SELECT bar_start FROM gamma_regime_5min
+                    WHERE symbol = %s AND bar_start >= %s AND bar_start <= %s
+                    """,
+                    (self.db_symbol, session_start, session_end),
+                )
+                written = {r[0] for r in cursor.fetchall()}
+
+                bar = session_start
+                todo = []
+                while bar <= session_end:
+                    # Always rewrite the newest bar: it is still filling.
+                    if bar not in written or bar == session_end:
+                        todo.append(bar)
+                    bar += timedelta(minutes=5)
+
+                if not todo:
+                    return
+
+                anchor_spot, anchor_rows = self._gamma_chain_at_bar(cursor, session_start)
+                if not anchor_rows or anchor_spot is None:
+                    # No chain at the open yet — nothing to anchor against.
+                    return
+                anchor = ChainSnapshot(bar_start=session_start, spot=anchor_spot, rows=anchor_rows)
+
+                # One cache per cycle: consecutive bars share lookbacks, and a
+                # gap-fill of N bars would otherwise re-read the same chains.
+                chains: dict = {session_start: anchor}
+
+                def chain_for(bar_ts):
+                    if bar_ts not in chains:
+                        spot, rows = self._gamma_chain_at_bar(cursor, bar_ts)
+                        chains[bar_ts] = (
+                            ChainSnapshot(bar_start=bar_ts, spot=spot, rows=rows)
+                            if rows and spot is not None
+                            else None
+                        )
+                    return chains[bar_ts]
+
+                written_count = 0
+                for bar_ts in todo:
+                    current = chain_for(bar_ts)
+                    if current is None:
+                        continue
+                    lookback_ts = bar_ts - timedelta(minutes=5 * rolling)
+                    lookback = chain_for(lookback_ts) if lookback_ts >= session_start else None
+
+                    result = build_latest_bar(anchor=anchor, lookback=lookback, current=current)
+
+                    cursor.execute(
+                        """
+                        INSERT INTO gamma_regime_5min (
+                            symbol, bar_start, spot,
+                            anchored_lean, anchored_stability,
+                            anchored_net_shift, anchored_gross_shift,
+                            rolling_lean, rolling_stability,
+                            rolling_net_shift, rolling_gross_shift,
+                            sigma_price, near_spot_stock, strike_count,
+                            expired_expirations, rolling_bars
+                        ) VALUES (
+                            %(symbol)s, %(bar_start)s, %(spot)s,
+                            %(anchored_lean)s, %(anchored_stability)s,
+                            %(anchored_net_shift)s, %(anchored_gross_shift)s,
+                            %(rolling_lean)s, %(rolling_stability)s,
+                            %(rolling_net_shift)s, %(rolling_gross_shift)s,
+                            %(sigma_price)s, %(near_spot_stock)s, %(strike_count)s,
+                            %(expired_expirations)s, %(rolling_bars)s
+                        )
+                        ON CONFLICT (symbol, bar_start) DO UPDATE SET
+                            spot = EXCLUDED.spot,
+                            anchored_lean = EXCLUDED.anchored_lean,
+                            anchored_stability = EXCLUDED.anchored_stability,
+                            anchored_net_shift = EXCLUDED.anchored_net_shift,
+                            anchored_gross_shift = EXCLUDED.anchored_gross_shift,
+                            rolling_lean = EXCLUDED.rolling_lean,
+                            rolling_stability = EXCLUDED.rolling_stability,
+                            rolling_net_shift = EXCLUDED.rolling_net_shift,
+                            rolling_gross_shift = EXCLUDED.rolling_gross_shift,
+                            sigma_price = EXCLUDED.sigma_price,
+                            near_spot_stock = EXCLUDED.near_spot_stock,
+                            strike_count = EXCLUDED.strike_count,
+                            expired_expirations = EXCLUDED.expired_expirations,
+                            rolling_bars = EXCLUDED.rolling_bars,
+                            updated_at = NOW()
+                        """,
+                        {
+                            "symbol": self.db_symbol,
+                            "bar_start": result.bar_start,
+                            "spot": result.spot,
+                            "anchored_lean": result.anchored_lean,
+                            "anchored_stability": result.anchored_stability,
+                            "anchored_net_shift": result.anchored_net_shift,
+                            "anchored_gross_shift": result.anchored_gross_shift,
+                            "rolling_lean": result.rolling_lean,
+                            "rolling_stability": result.rolling_stability,
+                            "rolling_net_shift": result.rolling_net_shift,
+                            "rolling_gross_shift": result.rolling_gross_shift,
+                            "sigma_price": result.sigma_price,
+                            "near_spot_stock": result.near_spot_stock,
+                            "strike_count": result.strike_count,
+                            "expired_expirations": list(result.expired_expirations),
+                            "rolling_bars": rolling,
+                        },
+                    )
+                    written_count += 1
+
+                conn.commit()
+                if written_count:
+                    logger.info(
+                        "gamma_regime_5min upserted %d bar(s) for %s (through %s)",
+                        written_count,
+                        self.db_symbol,
+                        session_end.isoformat(),
+                    )
+        except Exception as e:
+            logger.error(f"Error refreshing gamma regime snapshot: {e}", exc_info=True)
 
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.

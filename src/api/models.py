@@ -524,6 +524,57 @@ class HedgingFlowResponse(BaseModel):
     flips: List[HedgingFlowFlip]
 
 
+class GammaRegimeBar(BaseModel):
+    """One 5-minute bar of the intraday Gamma Shift read.
+
+    Two independent lenses. ``anchored_*`` compares against the session's
+    first bar ("how has structure changed today"); ``rolling_*`` against a
+    fixed number of bars back ("how is it changing right now"). They do NOT
+    sum — both are proximity-weighted around each bar's own spot, so the
+    kernel re-centres per bar.
+
+    Positive ``stability`` = more long gamma near spot, so dealers hedge
+    against moves: pinning and vol suppression. Negative = the book has turned
+    accelerant. Positive ``lean`` = the change is supportive (building below
+    spot / eroding above); negative = capping.
+
+    Scores are RAW dollar-GEX. ``rolling_*`` is null for the session's first
+    ``rolling_bars`` bars, where no lookback exists.
+    """
+
+    timestamp: str
+    bar_start: str
+    bar_end: str
+    spot: Optional[float] = None
+    anchored_lean: float
+    anchored_stability: float
+    anchored_net_shift: float
+    anchored_gross_shift: float
+    rolling_lean: Optional[float] = None
+    rolling_stability: Optional[float] = None
+    rolling_net_shift: Optional[float] = None
+    rolling_gross_shift: Optional[float] = None
+    sigma_price: Optional[float] = None
+    near_spot_stock: Optional[float] = None
+    strike_count: int
+    expired_expirations: List[str] = []
+    rolling_bars: Optional[int] = None
+
+
+class GammaRegimeSeriesResponse(BaseModel):
+    """Intraday dealer-gamma structure across a session.
+
+    Shares ``/api/flow/hedging``'s session window and 5-minute grid, so the
+    two stack into one timeline: flow says how hard the tape is pushing,
+    this says whether the book absorbs or amplifies it.
+    """
+
+    symbol: str
+    session: str
+    rolling_bars: Optional[int] = None
+    bars: List[GammaRegimeBar]
+
+
 class MarketTideComponent(BaseModel):
     symbol: str
     flow_score: float

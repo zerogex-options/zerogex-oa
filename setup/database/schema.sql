@@ -1053,6 +1053,68 @@ CREATE TABLE IF NOT EXISTS flow_series_5min (
 CREATE INDEX IF NOT EXISTS idx_flow_series_5min_symbol_bar
     ON flow_series_5min(symbol, bar_start DESC);
 
+-- Intraday Gamma Regime series -- the Gamma Shift read at every 5-minute bar,
+-- materialised so it can share a timeline with the Hedging Flow panel.
+--
+-- WHY THIS IS A TABLE AND NOT A QUERY. Each bar's reading is a diff of two
+-- per-strike chains, and a chain is ~40-60 strikes x ~10-25 expirations. A
+-- session computed on read is ~78 bars x up to ~1500 rows, per viewer, per
+-- poll -- the same shape that took /api/gex/strike-profile-timeseries down on
+-- 2026-08-21 (docs/runbooks/strike_profile_timeseries_stampede.md), where a
+-- read too slow for its own guard returned empty, never populated its cache,
+-- and every subsequent poll re-entered the identical work. The Analytics
+-- Engine writes one row per bar per cycle instead, and the API range-scans
+-- ~78 tiny rows.
+--
+-- Scores are RAW, in dollar-GEX units, exactly as gex_regime_session stores
+-- them: z-scoring needs a trailing distribution of stored sessions, which is
+-- the API layer's job and must not be frozen into history at write time.
+--
+-- Two independent lenses per bar (see src/analytics/gamma_regime_series.py):
+--   anchored_* -- versus the session's first bar ("changed today")
+--   rolling_*  -- versus N bars back      ("changing right now")
+-- They do NOT sum. Both are proximity-weighted around the bar's own spot, so
+-- the kernel re-centres each bar; summing bar-to-bar diffs would assert a
+-- fixed kernel and match neither lens.
+CREATE TABLE IF NOT EXISTS gamma_regime_5min (
+    symbol                 VARCHAR(10)  NOT NULL,
+    bar_start              TIMESTAMPTZ  NOT NULL,
+    spot                   DOUBLE PRECISION,
+    anchored_lean          DOUBLE PRECISION,
+    anchored_stability     DOUBLE PRECISION,
+    anchored_net_shift     DOUBLE PRECISION,
+    anchored_gross_shift   DOUBLE PRECISION,
+    -- NULL for the first rolling_bars of a session: no lookback exists yet.
+    -- NULL rather than 0 so a chart cannot draw a measured "no change".
+    rolling_lean           DOUBLE PRECISION,
+    rolling_stability      DOUBLE PRECISION,
+    rolling_net_shift      DOUBLE PRECISION,
+    rolling_gross_shift    DOUBLE PRECISION,
+    -- Proximity-kernel width actually used, in price units (display + audit).
+    sigma_price            DOUBLE PRECISION,
+    -- Weighted |dealer gamma| the change happened against: the bootstrap
+    -- z-score denominator before any session history exists.
+    near_spot_stock        DOUBLE PRECISION,
+    strike_count           INTEGER,
+    -- Expirations that left the board since the comparison point, reported so
+    -- a roll-off is never read as dealers shedding gamma.
+    expired_expirations    DATE[],
+    rolling_bars           SMALLINT,
+    updated_at             TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (symbol, bar_start)
+);
+CREATE INDEX IF NOT EXISTS idx_gamma_regime_5min_symbol_bar
+    ON gamma_regime_5min(symbol, bar_start DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gamma_regime_5min_symbol') THEN
+        ALTER TABLE gamma_regime_5min
+        ADD CONSTRAINT fk_gamma_regime_5min_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
 -- Symbol FKs on the flow tables. Mirrors the pattern other tables use
 -- (option_chains, gex_summary, gex_by_strike) so deleting a symbol
 -- cascades through the flow rollups instead of leaving dangling rows.

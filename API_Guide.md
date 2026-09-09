@@ -698,6 +698,24 @@ Server-accumulated flow series — one row per 5-minute bar (cumulative call/put
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
 
+### GET /api/gex/regime-series
+The Gamma Shift read at every 5-minute bar of a session. Where `/api/gex/regime-shift` answers "how did dealer gamma change between these two moments" as a single card, this is the same maths as a line — so structure sits on the same timeline as `/api/flow/hedging` and can be read against it. Flow says how hard the tape is pushing; this says whether the book absorbs or amplifies it.
+
+**Parameters:**
+- `symbol` (required): `[A-Z.]{1,10}`
+- `session` (optional): `current` | `prior`, default `current`
+- `intervals` (optional): trailing N 5-minute bars, `1`–`390`
+
+**Two lenses per bar.** `anchored_*` is versus the session's first bar ("changed today"), the counterpart of the Hedging Flow cumulative curve. `rolling_*` is versus `rolling_bars` bars back ("changing right now"), the counterpart of the rate line and the one to read beside a flip. **They do not sum** — both weight strikes by proximity to each bar's *own* spot, so the kernel re-centres every bar; summing bar-to-bar diffs would assert a fixed kernel and match neither lens.
+
+Positive `stability` = more long gamma near spot, so dealers hedge against moves (pinning, vol suppression); negative = the book has turned accelerant. Positive `lean` = the change is supportive (building below spot / eroding above); negative = capping. `rolling_*` is null for the session's first `rolling_bars` bars — null rather than zero, so a chart cannot draw a measured "no change" through the open.
+
+Scores are RAW dollar-GEX. Normalising against a trailing distribution of sessions is `/api/gex/regime-history`'s job. `expired_expirations` lists expiries that left the board since the comparison point — reported, never booked as dealers shedding gamma.
+
+**Served from a materialised table.** The Analytics Engine writes one bar per cycle into `gamma_regime_5min`; this endpoint range-scans it. Computing the series on read would mean diffing two ~1500-row chains per bar, per viewer, per poll — the shape that took `/api/gex/strike-profile-timeseries` down on 2026-08-21 (see `docs/runbooks/strike_profile_timeseries_stampede.md`). **A miss therefore returns an empty `bars` list rather than falling back to compute**, and a test pins that. An empty response on a live session means the engine has not written yet, not that the data is unavailable.
+
+Same session resolution as `/api/flow/hedging`, so the two cover identical bars. Rows newest→oldest.
+
 ### GET /api/flow/hedging
 Estimated dealer hedging pressure per 5-minute bar, with sign flips. The aggressor-inferred companion to `/api/flow/series`: for every option that traded, the net customer position change is converted to the stock a delta-flat hedge implies — `(buy - sell) * delta * 100 * spot` — and accumulated across the session.
 
