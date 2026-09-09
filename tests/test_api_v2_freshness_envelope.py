@@ -1298,3 +1298,19 @@ def test_every_profile_is_documented():
     while it changed the verdict on three endpoints for nine hours a day."""
     documented = {name for name, _, _ in _guide_cadence_rows()}
     assert not sorted(set(fr.CADENCE_PROFILES) - documented)
+
+
+def test_data_as_of_is_the_observation_when_a_snapshot_states_it():
+    """as_of is the bucket, computed_at the production stamp, data_as_of the
+    quotes. Freshness follows the quotes; generated_at follows production."""
+    bucket = THU_REGULAR - timedelta(seconds=100)
+    quotes = THU_REGULAR - timedelta(seconds=63)
+    computed = THU_REGULAR - timedelta(seconds=55)
+    f = fr.build_freshness(
+        {"as_of": bucket, "computed_at": computed, "data_as_of": quotes},
+        profile=fr.ANALYTICS_CYCLE,
+        now=THU_REGULAR,
+    )
+    assert f.generated_at == computed
+    assert f.source_timestamp == quotes
+    assert f.age_seconds == 63.0

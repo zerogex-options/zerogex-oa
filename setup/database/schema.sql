@@ -569,6 +569,16 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_strike_reason TEXT;
 -- predate the column. Not bumped by the no-op upsert guard: a recompute that
 -- changed nothing leaves the row, and this, alone.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS computed_at TIMESTAMPTZ;
+-- What the numbers are actually as of: the newest quote write the snapshot
+-- read (max option_chains_latest.updated_at for the underlying at the
+-- cycle's read). ``timestamp`` is the minute bucket the row is filed under,
+-- which overstates a snapshot's age by the cycle's phase in the minute --
+-- measured 26-59s in production while the quotes inside were under 5s old.
+-- age_seconds and the v2 freshness grade are measured from this. NULL on
+-- rows older than the column.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS data_as_of TIMESTAMPTZ;
+COMMENT ON COLUMN gex_summary.data_as_of IS
+    'Newest option_chains_latest.updated_at the snapshot read; what the row is as of. timestamp is the minute bucket.';
 
 -- Volume column semantics. ``total_call_volume`` and ``total_put_volume``
 -- are per-snapshot session-cumulative aggregates summed across every

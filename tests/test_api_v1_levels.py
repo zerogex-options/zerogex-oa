@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -198,6 +198,26 @@ def test_endpoint_passes_computed_at_through_and_tolerates_its_absence(
     with client:
         body = client.get("/api/v1/levels/SPY?strikes=1").json()
     assert body["computed_at"] is None
+
+
+def test_age_seconds_is_measured_from_the_quotes_not_the_bucket(monkeypatch: pytest.MonkeyPatch):
+    """The bucket is up to a minute old when the cycle reads it; the quotes
+    inside are seconds old. Staleness follows the quotes."""
+    bucket = datetime(2026, 7, 6, 19, 30, tzinfo=timezone.utc)
+    quotes = bucket + timedelta(seconds=40)
+    client = _build_app(monkeypatch, summary=_summary(data_as_of=quotes), profile=_profile_rows())
+    with client:
+        body = client.get("/api/v1/levels/SPY?strikes=1").json()
+    assert body["data_as_of"].startswith("2026-07-06T19:30:40")
+    age_from_bucket = (datetime.now(timezone.utc) - bucket).total_seconds()
+    assert abs((age_from_bucket - body["age_seconds"]) - 40) <= 2
+
+    # Rows older than the column keep the old measure.
+    client = _build_app(monkeypatch, summary=_summary(), profile=_profile_rows())
+    with client:
+        body = client.get("/api/v1/levels/SPY?strikes=1").json()
+    assert body["data_as_of"] is None
+    assert abs((datetime.now(timezone.utc) - bucket).total_seconds() - body["age_seconds"]) <= 2
 
 
 def test_endpoint_surfaces_null_pin_with_reason(monkeypatch: pytest.MonkeyPatch):
