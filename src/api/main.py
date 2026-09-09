@@ -40,6 +40,7 @@ from .models import (
     FlowSeriesPoint,
     FlowContractsResponse,
     HedgingFlowResponse,
+    GammaRegimeSeriesResponse,
     MarketTideResponse,
     MarketTideHistoryResponse,
     SmartMoneyFlowPoint,
@@ -1444,6 +1445,133 @@ async def get_hedging_flow(
             **envelope,
             "bars": bars,
             "flips": [_format_hedging_flip(e) for e in flips],
+        }
+    )
+
+
+def _format_gamma_regime_row(row: dict) -> dict:
+    """Coerce a stored gamma_regime_5min row into the JSON bar shape.
+
+    Timestamps trailing-Z UTC on the same 5-minute grid as
+    ``_format_hedging_flow_row``, so a client can key the two series
+    identically and stack them without re-aligning.
+    """
+    bar_start: datetime = row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    bar_end = bar_start + timedelta(minutes=5)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+    def _f(key: str) -> float:
+        v = row.get(key)
+        return float(v) if v is not None else 0.0
+
+    def _opt(key: str):
+        v = row.get(key)
+        return float(v) if v is not None else None
+
+    expired = row.get("expired_expirations") or []
+
+    return {
+        "timestamp": bar_start.strftime(fmt),
+        "bar_start": bar_start.strftime(fmt),
+        "bar_end": bar_end.strftime(fmt),
+        "spot": _opt("spot"),
+        "anchored_lean": _f("anchored_lean"),
+        "anchored_stability": _f("anchored_stability"),
+        "anchored_net_shift": _f("anchored_net_shift"),
+        "anchored_gross_shift": _f("anchored_gross_shift"),
+        "rolling_lean": _opt("rolling_lean"),
+        "rolling_stability": _opt("rolling_stability"),
+        "rolling_net_shift": _opt("rolling_net_shift"),
+        "rolling_gross_shift": _opt("rolling_gross_shift"),
+        "sigma_price": _opt("sigma_price"),
+        "near_spot_stock": _opt("near_spot_stock"),
+        "strike_count": int(row.get("strike_count") or 0),
+        "expired_expirations": [
+            e.isoformat() if hasattr(e, "isoformat") else str(e) for e in expired
+        ],
+        "rolling_bars": int(row["rolling_bars"]) if row.get("rolling_bars") is not None else None,
+    }
+
+
+@app.get(
+    "/api/gex/regime-series",
+    response_model=GammaRegimeSeriesResponse,
+    tags=["GEX"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/gex/regime-series")
+async def get_gamma_regime_series(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=390,
+        description="If provided, return only the last N 5-minute bars (tail window).",
+    ),
+):
+    """The Gamma Shift read at every 5-minute bar of a session.
+
+    Where ``/api/gex/regime-shift`` answers "how did dealer gamma change
+    between these two moments" as a single card, this is the same maths as a
+    line — so structure can sit on the same timeline as
+    ``/api/flow/hedging`` and be read against it. Flow says how hard the tape
+    is pushing; this says whether the book absorbs or amplifies it.
+
+    Two lenses per bar. ``anchored_*`` is versus the session's first bar
+    ("changed today"), the counterpart of the flow panel's cumulative curve.
+    ``rolling_*`` is versus ``rolling_bars`` bars back ("changing right now"),
+    the counterpart of the rate line and the one to read beside a flip. They
+    do not sum: both weight strikes by proximity to each bar's OWN spot, so
+    the kernel re-centres every bar.
+
+    Positive ``stability`` means more long gamma near spot — dealers hedge
+    against moves, so the tape pins. Negative means the book has turned
+    accelerant. Positive ``lean`` means the change is supportive; negative
+    means capping.
+
+    Scores are RAW dollar-GEX; normalising against a trailing distribution of
+    sessions is ``/api/gex/regime-history``'s job.
+
+    Served from a table the Analytics Engine materialises one bar at a time.
+    Computing it on read would mean diffing two ~1500-row chains per bar per
+    viewer per poll — the shape that took the strike-profile timeseries down
+    in Aug 2026 — so a miss returns empty rather than falling back to compute.
+
+    Same session resolution as ``/api/flow/hedging``, so the two cover
+    identical bars. Rows newest → oldest. Unknown symbols 404; a session with
+    nothing written yet returns an empty ``bars`` list.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    rows = await _db().get_gamma_regime_series(
+        symbol=normalized,
+        session=session,
+        intervals=intervals,
+    )
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    bars = [_format_gamma_regime_row(r) for r in rows]
+    rolling_bars = next(
+        (b["rolling_bars"] for b in bars if b.get("rolling_bars") is not None), None
+    )
+
+    return JSONResponse(
+        content={
+            "symbol": normalized,
+            "session": session,
+            "rolling_bars": rolling_bars,
+            "bars": bars,
         }
     )
 

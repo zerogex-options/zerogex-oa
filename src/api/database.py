@@ -5915,6 +5915,96 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Hedging flow query timed out for {symbol}, returning empty")
             return []
 
+    async def get_gamma_regime_series(
+        self,
+        symbol: str = "SPY",
+        session: str = "current",
+        intervals: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Read the materialised intraday Gamma Regime series for a session.
+
+        Deliberately a plain indexed range scan over ~78 pre-computed rows.
+        The expensive part -- diffing two per-strike chains per bar -- happens
+        once per bar in the Analytics Engine (see
+        :mod:`src.analytics.gamma_regime_series` for why that inversion is not
+        optional). If this method ever grows a compute-on-miss fallback it
+        reintroduces the 2026-08-21 stampede shape, where a read too slow for
+        its own guard returned empty, cached nothing, and every next poll
+        redid the work.
+
+        Session resolution is :meth:`_resolve_flow_series_session` -- the SAME
+        window the flow series uses -- so the structure line and the flow line
+        cover identical bars and can be stacked without re-aligning.
+
+        Returns ``None`` for a symbol with no flow history at all (404), and
+        ``[]`` when the session resolves but nothing has been written for it
+        yet (a session before the writer was deployed, or a cold engine).
+        Rows are newest-first, matching the other series endpoints.
+        """
+        symbol = symbol.upper()
+
+        use_cache = intervals is None
+        cache_key = None
+        if use_cache:
+            cache_key = f"gamma_regime_series:{symbol}:{session}"
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
+
+        try:
+            async with self._acquire_connection() as conn:
+                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data:
+                    if use_cache:
+                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                    return []
+
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(
+                        conn,
+                        """
+                        SELECT
+                            bar_start,
+                            spot,
+                            anchored_lean,
+                            anchored_stability,
+                            anchored_net_shift,
+                            anchored_gross_shift,
+                            rolling_lean,
+                            rolling_stability,
+                            rolling_net_shift,
+                            rolling_gross_shift,
+                            sigma_price,
+                            near_spot_stock,
+                            strike_count,
+                            expired_expirations,
+                            rolling_bars
+                        FROM gamma_regime_5min
+                        WHERE symbol = $1
+                          AND bar_start >= $2
+                          AND bar_start <= $3
+                        ORDER BY bar_start DESC
+                        """,
+                        symbol,
+                        session_start,
+                        session_end,
+                        timeout=10.0,
+                    ),
+                    timeout=10.0,
+                )
+                result = [dict(row) for row in rows]
+                if intervals is not None and intervals > 0 and len(result) > intervals:
+                    result = result[:intervals]
+                if use_cache:
+                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Gamma regime series query timed out for {symbol}, returning empty")
+            return []
+
     async def get_flow_contracts(
         self,
         symbol: str = "SPY",
