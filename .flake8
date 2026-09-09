@@ -21,6 +21,7 @@ per-file-ignores =
     src/api/routers/trade_signals.py:E501
     src/analytics/main_engine.py:E501
     src/flow_series_sql.py:E501
+    src/hedging_flow_sql.py:E501
     src/ingestion/main_engine.py:E501
     src/ingestion/tradestation_client.py:E501
     src/signals/portfolio_engine.py:E501

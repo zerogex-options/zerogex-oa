@@ -39,6 +39,7 @@ from .models import (
     FlowPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
+    HedgingFlowResponse,
     MarketTideResponse,
     MarketTideHistoryResponse,
     SmartMoneyFlowPoint,
@@ -54,6 +55,14 @@ from .models import (
     OpenInterestRecord,
     OpenInterestResponse,
     StrikeProfileBucket,
+)
+from src.analytics.hedging_flow import (
+    DEFAULT_SIGNIFICANCE_RATIO,
+    DEFAULT_SMOOTHING_BARS,
+    HedgingFlowBar as HedgingFlowBarCalc,
+    sign_flip_events,
+    smooth,
+    zero_cross_events,
 )
 from .routers.trade_signals import router as trade_signals_router
 from .routers.trade_bias import router as trade_bias_router
@@ -1217,6 +1226,226 @@ async def get_flow_series(
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     return JSONResponse(content=[_format_flow_series_row(r) for r in rows])
+
+
+#: Public label for what this series is, carried in every payload. The
+#: terminology is binding (docs/design/aggressor-inferred-positioning-
+#: experiment.md): the passive-side-is-a-market-maker assumption is under
+#: test, not established, so nothing downstream may call this observed
+#: dealer flow.
+_HEDGING_FLOW_BASIS = "aggressor_inferred"
+_HEDGING_FLOW_DISCLOSURE = (
+    "Estimated hedging pressure. Inferred from aggressor-classified option "
+    "trades under the assumption that the passive side of each print was a "
+    "market maker; that assumption is unvalidated. Not observed dealer flow."
+)
+
+
+def _format_hedging_flow_row(row: dict, ma: Optional[float]) -> dict:
+    """Coerce a raw DB row + its smoothed rate into the JSON bar shape.
+
+    Timestamps are emitted trailing-Z UTC and Decimals cast to float, matching
+    ``_format_flow_series_row`` so the two series key identically on the
+    client and can be joined bar-for-bar without normalisation.
+    """
+    bar_start: datetime = row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    bar_end = bar_start + timedelta(minutes=5)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+    def _f(key: str) -> float:
+        v = row.get(key)
+        return float(v) if v is not None else 0.0
+
+    def _opt(key: str) -> Optional[float]:
+        v = row.get(key)
+        return float(v) if v is not None else None
+
+    return {
+        "timestamp": bar_start.strftime(fmt),
+        "bar_start": bar_start.strftime(fmt),
+        "bar_end": bar_end.strftime(fmt),
+        "call_flow_usd": _f("call_flow_usd"),
+        "put_flow_usd": _f("put_flow_usd"),
+        "net_flow_usd": _f("net_flow_usd"),
+        "net_flow_ma_usd": float(ma) if ma is not None else None,
+        "cum_call_usd": _f("cum_call_usd"),
+        "cum_put_usd": _f("cum_put_usd"),
+        "cum_net_usd": _f("cum_net_usd"),
+        "underlying_price": _opt("underlying_price"),
+        "contract_count": int(row.get("contract_count") or 0),
+        "classified_ratio": _opt("classified_ratio"),
+        "is_synthetic": bool(row.get("is_synthetic")),
+    }
+
+
+def _format_hedging_flip(event) -> dict:
+    """Serialize a FlipEvent, timestamp normalised like the bars."""
+    bar_start = event.bar_start
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    return {
+        "bar_start": bar_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "kind": event.kind,
+        "direction": event.direction,
+        "magnitude_usd": float(event.magnitude_usd),
+        "session_ratio": float(event.session_ratio),
+        "is_significant": bool(event.is_significant),
+        "underlying_price": (
+            float(event.underlying_price) if event.underlying_price is not None else None
+        ),
+    }
+
+
+@app.get(
+    "/api/flow/hedging",
+    response_model=HedgingFlowResponse,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/hedging")
+async def get_hedging_flow(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+    strikes: Optional[str] = Query(
+        default=None,
+        description="Comma-separated strikes to include. Empty/missing = all strikes.",
+    ),
+    expirations: Optional[str] = Query(
+        default=None,
+        description=(
+            "Comma-separated YYYY-MM-DD expirations to include. Empty/missing = all. "
+            "Pass today's date to isolate 0DTE."
+        ),
+    ),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=390,
+        description="If provided, return only the last N 5-minute bars (tail window).",
+    ),
+    smoothing: int = Query(
+        default=DEFAULT_SMOOTHING_BARS,
+        ge=1,
+        le=24,
+        description=(
+            "Trailing SMA length in 5-minute bars for the rate line and flip "
+            "detection. Default 3 (15 minutes)."
+        ),
+    ),
+    significance: float = Query(
+        default=DEFAULT_SIGNIFICANCE_RATIO,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "A rate flip is marked significant when its magnitude is at least "
+            "this multiple of the session's own typical push. 1.0 = as big as "
+            "a typical push so far today."
+        ),
+    ),
+):
+    """Estimated dealer hedging pressure per 5-minute bar, with sign flips.
+
+    The aggressor-inferred companion to ``/api/flow/series``: for every option
+    that traded, the net customer position change is converted to the stock a
+    delta-flat hedge implies (``(buy - sell) * delta * 100 * spot``) and
+    accumulated across the session. Positive means the hedge BUYS stock --
+    the same sign convention and units as the Forced Flow engine, so the
+    modeled and estimated sources are directly additive.
+
+    ``call_flow_usd`` / ``put_flow_usd`` split the pressure by the option type
+    that produced it, not by its direction: customers selling puts push the
+    net positive and land in the put series.
+
+    ``flips`` carries two kinds. ``rate`` flips are the smoothed per-bar
+    series changing sign -- the immediate push turning over, and the frequent
+    one. ``cumulative`` flips are the session's net lean crossing zero: rare,
+    and context rather than a trigger.
+
+    Same session resolution, 5-minute grid and unfiltered underlying price as
+    ``/api/flow/series``, so the two overlay bar-for-bar. Rows are newest →
+    oldest. Unknown symbols 404; known symbols with no session data return an
+    empty ``bars`` list.
+
+    This series is an ESTIMATE that assumes the passive side of each
+    classified print was a market maker. That assumption is under test and is
+    not established — see ``basis`` and ``disclosure`` in the payload, which
+    any rendering surface is expected to carry through.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    strikes_list = _parse_flow_strikes(strikes)
+    expirations_list = _parse_flow_expirations(expirations)
+
+    rows = await _db().get_hedging_flow_series(
+        symbol=normalized,
+        session=session,
+        strikes=strikes_list,
+        expirations=expirations_list,
+        intervals=intervals,
+    )
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    envelope = {
+        "symbol": normalized,
+        "session": session,
+        "basis": _HEDGING_FLOW_BASIS,
+        "disclosure": _HEDGING_FLOW_DISCLOSURE,
+        "smoothing_bars": smoothing,
+    }
+    if not rows:
+        return JSONResponse(content={**envelope, "bars": [], "flips": []})
+
+    # The DB hands back newest-first; every derivation here (trailing SMA,
+    # flip detection) is inherently chronological, so flip once, derive, and
+    # flip back at the end rather than reasoning about reversed windows.
+    chronological = list(reversed(rows))
+
+    calc_bars = [
+        HedgingFlowBarCalc(
+            bar_start=r["bar_start"],
+            call_flow_usd=float(r.get("call_flow_usd") or 0.0),
+            put_flow_usd=float(r.get("put_flow_usd") or 0.0),
+            net_flow_usd=float(r.get("net_flow_usd") or 0.0),
+            cum_call_usd=float(r.get("cum_call_usd") or 0.0),
+            cum_put_usd=float(r.get("cum_put_usd") or 0.0),
+            cum_net_usd=float(r.get("cum_net_usd") or 0.0),
+            underlying_price=(
+                float(r["underlying_price"]) if r.get("underlying_price") is not None else None
+            ),
+            contract_count=int(r.get("contract_count") or 0),
+            classified_ratio=float(r.get("classified_ratio") or 0.0),
+            is_synthetic=bool(r.get("is_synthetic")),
+        )
+        for r in chronological
+    ]
+
+    ma_series = smooth([b.net_flow_usd for b in calc_bars], smoothing)
+    flips = sign_flip_events(calc_bars, window=smoothing, significance_ratio=significance)
+    flips = flips + zero_cross_events(calc_bars)
+    flips.sort(key=lambda e: e.bar_start)
+
+    bars = [_format_hedging_flow_row(r, ma) for r, ma in zip(chronological, ma_series)]
+    bars.reverse()  # back to newest-first, matching /api/flow/series
+
+    return JSONResponse(
+        content={
+            **envelope,
+            "bars": bars,
+            "flips": [_format_hedging_flip(e) for e in flips],
+        }
+    )
 
 
 @app.get(

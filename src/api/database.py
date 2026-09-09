@@ -28,6 +28,7 @@ from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
+from src.hedging_flow_sql import HEDGING_FLOW_CTE_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
 from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
@@ -5831,6 +5832,85 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
+            return []
+
+    async def get_hedging_flow_series(
+        self,
+        symbol: str = "SPY",
+        session: str = "current",
+        strikes: Optional[List[float]] = None,
+        expirations: Optional[List[date]] = None,
+        intervals: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return 5-minute estimated hedging-pressure bars for a session.
+
+        The aggressor-inferred companion to :meth:`get_flow_series`: same
+        session resolution, same 404/empty semantics, same 5-minute grid and
+        the same unfiltered underlying price, so the two series overlay
+        exactly. Rows are newest-first; ``intervals=N`` returns the leading N.
+
+        Returns ``None`` when the symbol has never appeared in
+        flow_by_contract (caller surfaces 404), and ``[]`` when the symbol
+        exists but the resolved session has no flow.
+
+        There is no snapshot path here yet -- unlike flow-series this always
+        runs the CTE. It reads ``flow_contract_facts`` (already per-bucket
+        deltas, so no LAG-and-recumulate), which is a materially cheaper scan
+        than the flow-series pipeline; if it ever stops being cheap enough,
+        the query's window invariance makes it snapshot-able with the same
+        argument flow_series_5min uses.
+        """
+        symbol = symbol.upper()
+
+        # Cache only full-series fetches, matching get_flow_series: an
+        # incremental (intervals=N) poll must see the newest tail bar.
+        use_cache = intervals is None
+        cache_key = None
+        if use_cache:
+            strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
+            exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
+            cache_key = f"hedging_flow:{symbol}:{session}:{strikes_key}:{exps_key}"
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
+
+        strikes_arg = [float(s) for s in strikes] if strikes else None
+        expirations_arg = list(expirations) if expirations else None
+
+        try:
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data:
+                    if use_cache:
+                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                    return []
+
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(
+                        conn,
+                        HEDGING_FLOW_CTE_ASYNCPG,
+                        symbol,
+                        session_start,
+                        session_end,
+                        strikes_arg,
+                        expirations_arg,
+                        timeout=15.0,
+                    ),
+                    timeout=15.0,
+                )
+                result = [dict(row) for row in rows]
+                if intervals is not None and intervals > 0 and len(result) > intervals:
+                    # Newest-first; leading N == most recent N buckets.
+                    result = result[:intervals]
+                if use_cache:
+                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Hedging flow query timed out for {symbol}, returning empty")
             return []
 
     async def get_flow_contracts(

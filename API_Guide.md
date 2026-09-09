@@ -698,6 +698,28 @@ Server-accumulated flow series — one row per 5-minute bar (cumulative call/put
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
 
+### GET /api/flow/hedging
+Estimated dealer hedging pressure per 5-minute bar, with sign flips. The aggressor-inferred companion to `/api/flow/series`: for every option that traded, the net customer position change is converted to the stock a delta-flat hedge implies — `(buy - sell) * delta * 100 * spot` — and accumulated across the session.
+
+Positive means the hedge **buys** stock, the same sign convention and units as the Forced Flow engine, so the modeled and estimated sources are directly additive (see `combine_flow_sources`).
+
+`call_flow_usd` / `put_flow_usd` split the pressure by the option type that produced it, **not** by its direction: customers selling puts push the net positive and land in the put series.
+
+**Parameters:**
+- `symbol` (required): `[A-Z.]{1,10}`
+- `session` (optional): `current` | `prior`, default `current`
+- `strikes` (optional): comma-separated strikes to include; omit for all
+- `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all. Pass today's date to isolate 0DTE
+- `intervals` (optional): trailing N 5-minute bars, `1`–`390`
+- `smoothing` (optional): trailing SMA length in bars for the rate line and flip detection, `1`–`24`, default `3` (15 minutes)
+- `significance` (optional): a rate flip is marked significant at or above this multiple of the session's typical swing, `0`–`10`, default `1.0`
+
+**Response:** an object with `bars` (newest→oldest) and `flips`, plus `basis` and `disclosure`.
+
+`flips` carries two kinds. `rate` — the smoothed per-bar series changing sign, i.e. the immediate push turning over; this is the frequent, actionable one. `cumulative` — the session's net lean crossing zero; rare, and context rather than a trigger. `magnitude_usd` is the swing across zero, not the level at it (a series is near zero *at* a crossing by definition), and `session_ratio` scores that swing against the session's typical swing using only bars before the flip, so it is computable live.
+
+**Basis — binding on any consumer.** This series is AGGRESSOR-INFERRED. It assumes the passive side of each classified print was a market maker; that assumption is under test and not established (see `docs/design/aggressor-inferred-positioning-experiment.md`). Surfaces rendering it must carry the `disclosure` through: it is *estimated hedging pressure*, never "observed dealer flow" or "dealer positioning". Note also that `classified_ratio` reports how much of a bar's volume carried an aggressor classification — a low value means a thin sample behind that bar.
+
 ### GET /api/flow/contracts
 Distinct strikes and expirations that traded in the resolved session (powers the Flow-page filter chips).
 

@@ -450,6 +450,80 @@ class FlowSeriesPoint(BaseModel):
     is_synthetic: bool
 
 
+class HedgingFlowBar(BaseModel):
+    """One 5-minute bar of estimated hedging pressure from /api/flow/hedging.
+
+    All ``*_usd`` values are USD of stock a delta-flat hedge implies, positive
+    for BUYING -- the same sign convention and units as the Forced Flow
+    engine, so the modeled and estimated sources are directly comparable.
+
+    ``call_flow_usd`` / ``put_flow_usd`` split by which option type produced
+    the pressure, NOT by the direction of the pressure: customers selling puts
+    push the net positive and land in ``put_flow_usd``.
+
+    ``net_flow_ma_usd`` is the trailing SMA of ``net_flow_usd`` and is null
+    until the smoothing window fills. ``classified_ratio`` is the share of the
+    bar's volume that carried an aggressor classification -- a low value means
+    a thin sample behind that bar's reading.
+    """
+
+    timestamp: str
+    bar_start: str
+    bar_end: str
+    call_flow_usd: float
+    put_flow_usd: float
+    net_flow_usd: float
+    net_flow_ma_usd: Optional[float] = None
+    cum_call_usd: float
+    cum_put_usd: float
+    cum_net_usd: float
+    underlying_price: Optional[float] = None
+    contract_count: int
+    classified_ratio: Optional[float] = None
+    is_synthetic: bool
+
+
+class HedgingFlowFlip(BaseModel):
+    """A sign change in estimated hedging pressure.
+
+    ``kind='rate'`` is the immediate push turning over (read off the smoothed
+    per-bar series) -- the frequent, actionable one. ``kind='cumulative'`` is
+    the session's whole lean changing hands: rare, and context rather than a
+    trigger. ``session_ratio`` is the flip's magnitude over the session's own
+    typical push, so a client can show every flip but draw only the ones that
+    carried size.
+    """
+
+    bar_start: str
+    kind: str
+    direction: str
+    magnitude_usd: float
+    session_ratio: float
+    is_significant: bool
+    underlying_price: Optional[float] = None
+
+
+class HedgingFlowResponse(BaseModel):
+    """Estimated hedging pressure across a session, plus its sign flips.
+
+    ``basis`` and ``disclosure`` are part of the contract, not decoration.
+    This series is AGGRESSOR-INFERRED: it assumes the passive side of every
+    classified print was a market maker, an assumption that has not been
+    validated against exchange-classified data (see
+    ``docs/design/aggressor-inferred-positioning-experiment.md``). Any surface
+    rendering this payload has to carry that through -- it is estimated
+    hedging pressure, never observed dealer flow.
+    """
+
+    symbol: str
+    session: str
+    basis: str
+    disclosure: str
+    smoothing_bars: int
+    bars: List[HedgingFlowBar]
+    flips: List[HedgingFlowFlip]
+
+
 class MarketTideComponent(BaseModel):
     symbol: str
     flow_score: float
