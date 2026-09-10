@@ -1810,6 +1810,29 @@ ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS = max(
 )
 ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35)
 
+# ---------------------------------------------------------------------------
+# Market data provider selection
+# ---------------------------------------------------------------------------
+# Which upstream vendor the ingestion layer reads from. Resolved by
+# ``src.ingestion.providers.get_provider``; see that package for the
+# interface a new vendor implements.
+#
+# Defaults to "tradestation" so an unset environment behaves exactly as it
+# did before the provider abstraction existed. Changing this is a
+# production cutover: stand the new feed up in parallel and diff its
+# analytics against the incumbent (``make feed-compare``) before flipping
+# it, per step 14 of docs/compliance/market-data-remediation-runbook.md.
+#
+# An unrecognised value is FATAL rather than a silent fallback -- a typo
+# that quietly kept reading the old feed would look like a successful
+# cutover.
+MARKET_DATA_PROVIDER = _getenv_str("MARKET_DATA_PROVIDER", "tradestation")
+
+# Provider used by the comparison harness as the CANDIDATE feed, run
+# alongside MARKET_DATA_PROVIDER (the incumbent). Empty disables the
+# harness. Never read by the live ingestion path.
+MARKET_DATA_COMPARE_PROVIDER = _getenv_str("MARKET_DATA_COMPARE_PROVIDER", "")
+
 # TradeStation credential variables (used by service startup and helper scripts).
 TRADESTATION_CLIENT_ID = os.getenv("TRADESTATION_CLIENT_ID")
 TRADESTATION_CLIENT_SECRET = os.getenv("TRADESTATION_CLIENT_SECRET")

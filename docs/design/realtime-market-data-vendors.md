@@ -208,6 +208,13 @@ pay them through you per device?"* Expected shape of the answers [K, confirm]:
 
 ## 4. Migration notes (what changes in `src/`)
 
+> **Status update 2026-09-10 — the seam is built.** `src/ingestion/providers/` now defines the
+> interface described below, with TradeStation implemented as an adapter over the existing
+> accumulators and `MARKET_DATA_PROVIDER` selecting the vendor (default `tradestation`; the live
+> path is untouched). Adding a vendor is one module. See
+> `docs/design/market-data-provider-abstraction.md`, and `make feed-compare` for the parallel-run
+> diff. Items 1, 2 and 6 below are done; 3, 4 and 5 are notes for whoever writes the vendor module.
+
 The ingestion layer already isolates the provider: `tradestation_client.py`, `stream_manager.py`,
 `volatility_index_ingester.py` and `futures_underlying_ingester.py` are the only modules that speak
 TradeStation; storage, Greeks, analytics and the API are provider-agnostic (the audit's F1 "stand it up

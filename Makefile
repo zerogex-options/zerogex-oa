@@ -895,6 +895,10 @@ help: ## Show this help message
 	@echo "  make ingestion-disable  - Disable ingestion service from starting on boot"
 	@echo "  make ingestion-health   - Show ingestion service health and recent errors"
 	@echo ""
+	@echo "$(GREEN)Market Data Provider Migration:$(NC)"
+	@echo "  make feed-compare       - Diff a candidate feed vs the incumbent (CANDIDATE=<name>)"
+	@echo "  make feed-compare-schema - Create the shadow tables the harness writes to"
+	@echo ""
 	@echo "$(GREEN)Analytics Service Management:$(NC)"
 	@echo "  make analytics-start    - Start the analytics service"
 	@echo "  make analytics-stop     - Stop the analytics service"
@@ -1856,6 +1860,24 @@ disk-clean-noconfirm: ## Non-interactive disk/cache cleanup (driven by zerogex-o
 run-auth: ## Test TradeStation authentication
 	@echo "$(BLUE)=== Testing TradeStation Authentication ===$(NC)"
 	@$(VENV_PYTHON) -m src.ingestion.tradestation_auth
+
+.PHONY: feed-compare
+feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDIDATE, MINUTES, PERSIST, JSON)
+	@echo "$(BLUE)=== Feed comparison (runbook step 14) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.feed_compare \
+		--underlying '$(or $(UNDERLYING),SPY)' \
+		$(if $(INCUMBENT),--incumbent '$(INCUMBENT)') \
+		$(if $(CANDIDATE),--candidate '$(CANDIDATE)') \
+		$(if $(MINUTES),--duration-minutes '$(MINUTES)') \
+		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)') \
+		$(if $(PERSIST),--persist) \
+		$(if $(JSON),--json) \
+		$(if $(DEBUG),--debug)
+
+.PHONY: feed-compare-schema
+feed-compare-schema: ## Create the shadow tables the comparison harness writes to
+	@echo "$(BLUE)=== Applying shadow tables ===$(NC)"
+	@psql -d "$(or $(DB_NAME),zerogex)" -f setup/database/shadow_tables.sql
 
 .PHONY: run-client
 run-client: ## Test TradeStation API client (TEST, SYMBOL, BARS_BACK, INTERVAL, UNIT, QUERY, DEBUG, TEST_HISTORICAL)
