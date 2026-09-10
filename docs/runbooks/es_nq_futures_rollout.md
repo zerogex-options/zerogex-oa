@@ -36,17 +36,34 @@ futures chart with nothing to mark it.
 
 | Surface | ES/NQ behaviour |
 |---|---|
-| GEX (`/api/gex/*` bar the two surfaces below), `/api/v1/levels`, `/api/technicals*`, `/api/max-pain/*` | projected |
+| GEX (`/api/gex/*` bar the premium surface below), `/api/v1/levels`, `/api/technicals*`, `/api/max-pain/*` | projected |
 | `/api/signals/*`, `/api/forecast*`, `/api/forced-flow/*`, `/api/scorecard/*`, `/api/replay/*` | projected |
 | `/api/flow/buying-pressure`, `/api/flow/series`, `/api/flow/market-tide` | projected |
 | `/api/market/quote`, `/historical`, `/session-closes`, `/session-levels` | served natively from the future's own bars |
-| **per-contract surfaces** — `/api/option/*`, `/api/tools/option-calculator`, `/api/flow/by-contract`, `/api/flow/contracts`, `/api/flow/smart-money`, `/api/market/open-interest`, `/api/gex/premium_surface`, `/api/gex/vol_surface` | **400** |
+| **per-contract surfaces** — `/api/option/*`, `/api/tools/option-calculator`, `/api/flow/by-contract`, `/api/flow/contracts`, `/api/flow/smart-money`, `/api/market/open-interest`, `/api/gex/premium_surface` | **400** |
 
 The refusals are the per-contract surfaces only, and they refuse for a reason
 that does not go away: an SPX contract with its strike multiplied by the basis
 is not a contract anyone can trade, and the strike no longer round-trips to the
 chain it came from. There is no ES chain to substitute. The Strategy Builder,
 Option Contracts and Smart Money pages render an explicit panel saying so.
+
+`/api/gex/premium_surface` refuses on the same grounds one step removed: its
+value axis is a dollar premium on an SPX contract, so the basis ratio is not
+the transform that carries it and there is no ES premium to substitute.
+
+**`/api/gex/vol_surface` is projected**, and was mistakenly grouped with the
+premium surface in the first rollout — which left the `/volatility` page's
+"Put vs Call IV — Skew" chart answering 400 for ES and NQ while the GEX
+ladders beside it, off the same SPX chain, rendered fine. The two surfaces are
+not alike. An implied vol is **dimensionless**: it is the same number on the
+cash and the futures axis, so it is not carried at all — `call_iv`, `put_iv`,
+`atm_iv` and the 25-delta `skew` are in `NEVER_PROJECT` and ship untouched.
+What that endpoint puts on the price axis is its **strike ladder**, and that is
+the ordinary `/api/gex/` strike projection every other surface already
+performs, so the smile lands over the ES strikes it was computed against.
+`spot_price` takes the observed futures print like everywhere else, which is
+what keeps the chart's ATM read where ES actually trades.
 
 **Prices quoted in prose are converted too.** Signal and forecast cards write
 narratives like `target $6,650.00`, and a card reading that beside a chart
@@ -72,6 +89,31 @@ Reference: `src/jobs/futures_projection.py`, `src/api/futures_middleware.py`.
 
 **1a. CME market-data entitlement on the TradeStation account —
 REAL-TIME, not delayed.**
+
+> **Status: real-time CME live and confirmed (2026-08-27).** The rollout ran
+> on the delayed package; ES/NQ now print in real time.
+> `FUTURES_REALTIME_PENDING` in `frontend/core/futuresDataStatus.ts`
+> (zerogex-web) is `false` to match, so the site no longer discloses a standing
+> delay.
+>
+> Everything below is now a DIAGNOSTIC path rather than a rollout step — read
+> it if ES/NQ ever start lagging again, in this order:
+>
+> 1. `make ts-whoami` — the FUTURES credential must report the username that
+>    carries the CME entitlement. Entitlements attach to a username, so one
+>    added to the account's *other* username changes nothing, silently.
+> 2. The freshness query below, run twice during the cash session — ES/NQ
+>    should read ~1 min, not a fixed ~10.
+> 3. `FUTURES_QUOTE_STALE_MINUTES` must stay at `5` in every deployed `.env`.
+>    Raising it was a way to stop the flapping on the delayed feed; now that
+>    real-time is live it would only hide a real outage, because `stale` has
+>    gone back to meaning the feed has DIED.
+>
+> Note the asymmetry that makes step 1 first: a lagging feed and an unentitled
+> credential look identical from the API, and only `ts-whoami` separates them.
+> The delay badge still fires either way (it is measured from each quote's own
+> age), but with the flag false it now attributes the lag to a stalled feed —
+> correct for an outage, misleading for an entitlement that lapsed.
 
 Futures data is a separate exchange subscription from equities/indices, and it
 fails in two different ways.
@@ -132,12 +174,44 @@ arrive, prices are simply old.
 make ts-whoami
 ```
 
-Prints the username the deployment is authenticated as (decoded from the
-access token's claims; the token itself is never printed). Match it against
-the username carrying the entitlement. If they differ, restarting will not
-move the entitlement across — re-run the OAuth authorisation flow signed in as
-the entitled username and replace `TRADESTATION_REFRESH_TOKEN` with the new
-value.
+Prints the username behind each credential (decoded from the access token's
+claims; the token itself is never printed). Match the futures one against the
+username carrying the CME entitlement.
+
+If they differ, restarting will not move the entitlement across — and
+**repointing `TRADESTATION_REFRESH_TOKEN` at the entitled username is the wrong
+fix.** That one token also drives option chains, equity and index bars,
+VIX/VXN, session levels and every backfill tool, so it would trade a ten-minute
+ES delay for silently unentitled option ingestion: the same invisible failure,
+across everything instead of two symbols.
+
+Give the futures feeds their own identity instead:
+
+```bash
+# 1. Sign into TradeStation IN YOUR BROWSER as the CME-entitled username
+#    FIRST. The script has no idea which session you are logged into — it
+#    just opens an authorise URL, and whichever username is signed in is the
+#    one the token belongs to.
+#
+#    --var is what keeps the MAIN credential out of the blast radius. Without
+#    it the script rewrites TRADESTATION_REFRESH_TOKEN, which drives option
+#    chains, equity bars and every backfill.
+python setup/app/get_tradestation_tokens.py --var TRADESTATION_FUTURES_REFRESH_TOKEN
+
+# It prints the username it just authorised — check it before going further,
+# and it writes a timestamped .env backup either way.
+
+# 2. confirm both identities, then restart
+make ts-whoami && make services-restart
+```
+
+Expect `ts-whoami` to report two different usernames, one per credential. If
+both read the same, the browser was signed in as the wrong account — re-run
+step 1 after signing in as the other one.
+
+Unset, it falls back to the main credential and nothing changes, so this costs
+single-username deployments nothing. It also splits the load across two
+per-account stream caps, which buys back the two slots Step 2 spends.
 
 If they match, the entitlement simply has not propagated yet. TradeStation's
 own guidance is to sign out and back in after 10–15 minutes; the API

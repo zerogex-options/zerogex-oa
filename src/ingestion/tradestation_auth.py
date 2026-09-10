@@ -8,6 +8,7 @@ import logging
 import os
 import requests
 import time
+import hashlib
 import json
 import tempfile
 from pathlib import Path
@@ -72,12 +73,24 @@ class TradeStationAuth:
         )
         self._refresh_max_attempts = max(1, _getenv_int("TS_REFRESH_MAX_ATTEMPTS", 3))
         self._refresh_retry_base_delay = _getenv_float("TS_REFRESH_RETRY_DELAY", 1.0)
-        token_cache_name = (
-            "tradestation_token_cache_sandbox.json" if sandbox else "tradestation_token_cache.json"
-        )
-        lock_cache_name = (
-            "tradestation_token_cache_sandbox.lock" if sandbox else "tradestation_token_cache.lock"
-        )
+        # The disk cache is shared across PROCESSES, so its name has to include
+        # WHO the token belongs to. It used to key on `sandbox` alone, which was
+        # correct only while the whole deployment had one identity.
+        #
+        # It no longer does: the ES/NQ feeds may run under a second TradeStation
+        # username holding the real-time CME entitlement (see
+        # futures_tradestation_credentials). With one shared file, whichever
+        # process refreshed last wrote its access token there and every other
+        # process picked it up — so the futures ingester silently ran on the
+        # MAIN username's token and TRADESTATION_FUTURES_REFRESH_TOKEN did
+        # nothing at all. Nothing failed; the entitlement just never applied.
+        #
+        # Keyed by a short digest of the refresh token: distinct per identity,
+        # stable across restarts, and never puts the credential in a filename.
+        identity = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()[:12]
+        env = "_sandbox" if sandbox else ""
+        token_cache_name = f"tradestation_token_cache{env}_{identity}.json"
+        lock_cache_name = f"tradestation_token_cache{env}_{identity}.lock"
         self._token_cache_path = Path(tempfile.gettempdir()) / token_cache_name
         self._token_cache_lock_path = Path(tempfile.gettempdir()) / lock_cache_name
 

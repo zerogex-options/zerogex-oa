@@ -101,6 +101,10 @@ def _shape_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "pin_score": _f(row.get("pin_score")),
         "pin_confidence": _f(row.get("pin_confidence")),
         "pin_strike_reason": row.get("pin_strike_reason"),
+        # GEX King — the whole-chain heaviest-|net-gamma| strike. The slow
+        # structural counterpart to the same-day pin above; null on rows
+        # predating the column, and the client then draws no line.
+        "max_gamma_strike": _f(row.get("max_gamma_strike")),
         "net_gex": _f(row.get("net_gex")),
         "net_gex_at_spot": _f(row.get("net_gex_at_spot")),
         "put_call_ratio": _f(row.get("put_call_ratio")),
@@ -351,6 +355,10 @@ async def get_replay_range(
             # omits the line when null.
             "pin_strike": _f(bar.get("pin_strike")),
             "pin_confidence": _f(bar.get("pin_confidence")),
+            # GEX King rides along per-minute as well, so a replayed session
+            # shows the structural node the live chart draws instead of
+            # silently dropping it. Null on older rows; no line is drawn.
+            "max_gamma_strike": _f(bar.get("max_gamma_strike")),
             # Per-strike net plus the call/put split (dollar GEX). call_gex/
             # put_gex let the scrubber render the Split / Combined gamma views
             # like the Strike Profile chart; they're null on rows too old to

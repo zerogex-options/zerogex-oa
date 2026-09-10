@@ -17,14 +17,18 @@ import logging
 import json
 
 from src.analytics.walls import (
-    compute_call_put_walls,
+    DEFAULT_WALL_LADDER_DEPTH,
+    align_wall_ladder,
     compute_gamma_flip_from_strikes,
+    compute_wall_ladder,
+    wall_label,
 )
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
+from src.hedging_flow_sql import HEDGING_FLOW_CTE_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
 from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
@@ -527,6 +531,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
             "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
         )
+        # Newest gex_summary.timestamp this process has served, per symbol,
+        # and when it last warned about the database reading older than that.
+        # See get_latest_gex_summary for why a cache alone is not enough.
+        self._latest_gex_summary_served_ts: Dict[str, datetime] = {}
+        self._latest_gex_summary_backwards_warned_mono: Dict[str, float] = {}
         # index<->future carry ratio (src/jobs/futures_projection.py). Moves on
         # the order of a point a day, so it is cached far longer than a quote;
         # every ES/NQ request resolves it, hence caching it at all.
@@ -1825,12 +1834,42 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # ========================================================================
 
     async def get_latest_gex_summary(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
-        """Get latest GEX summary"""
+        """Get latest GEX summary.
+
+        Cached per process for ``LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS``, but a
+        cached body is served only while its ``timestamp`` and ``computed_at``
+        still match the newest row in ``gex_summary``. That check is one
+        single-row lookup through ``(underlying, timestamp DESC)`` per call
+        (``computed_at`` is what changes when a sub-minute cadence rewrites
+        the same minute row), and it exists because the
+        cache alone let the API go backwards: with several uvicorn workers
+        each holding its own copy, a worker whose copy predates a new snapshot
+        serves the previous minute's levels after another worker has already
+        served the new ones. A probe polling ``/api/v2/levels/NQ`` every 5s
+        caught it four times in an hour, ten seconds each, with the server's
+        own ``evaluated_at`` proving each body was produced fresh by the app.
+        Levels that revert to the previous minute for one poll look like a
+        data bug on every chart that draws them.
+
+        The lookup makes every worker agree with the database. The served
+        high-water mark makes each worker monotonic on its own, and turns the
+        one way left to go backwards -- a connection whose view of the table
+        is behind another's -- into a WARNING carrying both timestamps, so it
+        can be found rather than guessed at.
+        """
         symbol = symbol.upper()
         cache_key = f"latest_gex_summary:{symbol}"
         cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached  # type: ignore[no-any-return]
+
+        # The leading comment is a test seam: fakes recognise the probe by it.
+        newest_query = """
+            -- newest-row probe
+            SELECT timestamp, computed_at
+            FROM gex_summary
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
 
         # Call/Put Walls are persisted to ``gex_summary`` by the Analytics
         # Engine using the canonical definition in
@@ -1848,6 +1887,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     gs.timestamp,
                     gs.underlying,
+                    gs.computed_at,
+                    gs.data_as_of,
                     gs.gamma_flip_point,
                     gs.gamma_flip_raw,
                     gs.flip_distance,
@@ -1861,6 +1902,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.net_gex_at_spot,
                     gs.call_wall AS stored_call_wall,
                     gs.put_wall  AS stored_put_wall,
+                    gs.max_gamma_strike,
                     gs.gamma_flip_span_used,
                     gs.pin_strike,
                     gs.pin_score,
@@ -1891,16 +1933,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                  AND gbs.timestamp = ls.timestamp
                 JOIN latest_quote lq ON TRUE
             ),
-            -- Canonical Call Wall fallback: max call-gamma strike at-or-above
-            -- spot, tiebreaker nearest-to-spot (lowest strike above spot).
-            -- Only used when gex_summary.call_wall is NULL.  Aggregates
-            -- ``call_gamma`` across expirations per strike — gex_by_strike
-            -- is keyed (strike, expiration), and ranking per-row picks the
-            -- single largest-expiration outlier, disagreeing with the
-            -- cross-expiration view consumers see.  Matches
-            -- ``compute_call_put_walls`` in src/analytics/walls.py.
-            fallback_call_wall AS (
-                SELECT strike::numeric AS call_wall
+            -- Canonical Call Wall ladder: call-gamma strikes at-or-above spot
+            -- ranked strongest-first, tiebreaker nearest-to-spot (lowest
+            -- strike above spot).  Rank 1 is the Call Wall — used as the
+            -- fallback when gex_summary.call_wall is NULL — and ranks 2..N
+            -- are the optional secondary walls (C2/C3) the charts can draw.
+            -- One CTE serves both so the headline wall and the ladder can
+            -- never be ranked on different bases.
+            --
+            -- Aggregates ``call_gamma`` across expirations per strike —
+            -- gex_by_strike is keyed (strike, expiration), and ranking
+            -- per-row picks the single largest-expiration outlier,
+            -- disagreeing with the cross-expiration view consumers see.
+            -- Matches ``compute_wall_ladder`` in src/analytics/walls.py.
+            ranked_call_walls AS (
+                SELECT
+                    strike::numeric AS strike,
+                    call_gamma,
+                    ROW_NUMBER() OVER (ORDER BY call_gamma DESC, strike ASC) AS rn
                 FROM (
                     SELECT gbs.strike, SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma
                     FROM gex_by_strike gbs
@@ -1912,14 +1962,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     GROUP BY gbs.strike
                 ) per_strike
                 WHERE call_gamma > 0
-                ORDER BY call_gamma DESC, strike ASC
-                LIMIT 1
             ),
-            -- Canonical Put Wall fallback: max put-gamma strike at-or-below
-            -- spot, tiebreaker nearest-to-spot (highest strike below spot).
-            -- Cross-expiration aggregation (see fallback_call_wall above).
-            fallback_put_wall AS (
-                SELECT strike::numeric AS put_wall
+            -- Canonical Put Wall ladder: put-gamma strikes at-or-below spot,
+            -- tiebreaker nearest-to-spot (highest strike below spot).
+            -- Cross-expiration aggregation (see ranked_call_walls above).
+            ranked_put_walls AS (
+                SELECT
+                    strike::numeric AS strike,
+                    put_gamma,
+                    ROW_NUMBER() OVER (ORDER BY put_gamma DESC, strike DESC) AS rn
                 FROM (
                     SELECT gbs.strike, SUM(COALESCE(gbs.put_gamma, 0)) AS put_gamma
                     FROM gex_by_strike gbs
@@ -1931,12 +1982,30 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     GROUP BY gbs.strike
                 ) per_strike
                 WHERE put_gamma > 0
-                ORDER BY put_gamma DESC, strike DESC
-                LIMIT 1
+            ),
+            -- Top-$2 ranks collapsed to parallel arrays (rank-ordered), so the
+            -- whole ladder rides back on this query's single row.  Plain
+            -- arrays rather than JSON: asyncpg decodes them natively, with no
+            -- codec registration and no per-request JSON parse.
+            call_wall_ladder AS (
+                SELECT
+                    COALESCE(array_agg(strike ORDER BY rn), ARRAY[]::numeric[]) AS strikes,
+                    COALESCE(array_agg(call_gamma ORDER BY rn), ARRAY[]::numeric[]) AS gammas
+                FROM ranked_call_walls
+                WHERE rn <= $2
+            ),
+            put_wall_ladder AS (
+                SELECT
+                    COALESCE(array_agg(strike ORDER BY rn), ARRAY[]::numeric[]) AS strikes,
+                    COALESCE(array_agg(put_gamma ORDER BY rn), ARRAY[]::numeric[]) AS gammas
+                FROM ranked_put_walls
+                WHERE rn <= $2
             )
             SELECT
                 ls.timestamp,
                 ls.underlying AS symbol,
+                ls.computed_at,
+                ls.data_as_of,
                 lq.spot_price,
                 st.total_call_gex,
                 st.total_put_gex,
@@ -1953,8 +2022,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.local_gex,
                 ls.convexity_risk,
                 ls.max_pain,
-                COALESCE(ls.stored_call_wall, fcw.call_wall) AS call_wall,
-                COALESCE(ls.stored_put_wall,  fpw.put_wall)  AS put_wall,
+                COALESCE(ls.stored_call_wall, fcw.strike) AS call_wall,
+                COALESCE(ls.stored_put_wall,  fpw.strike)  AS put_wall,
+                -- Ranked ladders behind the optional C2/C3 · P2/P3 levels.
+                -- Assembled into WallLevel dicts below, where rank 1 is also
+                -- pinned to the call_wall / put_wall reported above.
+                cwl.strikes AS call_wall_ladder_strikes,
+                cwl.gammas  AS call_wall_ladder_gammas,
+                pwl.strikes AS put_wall_ladder_strikes,
+                pwl.gammas  AS put_wall_ladder_gammas,
+                -- GEX King — largest |net GEX| strike aggregated across ALL
+                -- expirations (argmax_strike |sum_expirations net_gex|, written
+                -- by ``_calculate_gex_summary``).  Nullable, and deliberately
+                -- WITHOUT a recompute fallback like the walls have: the walls
+                -- need one because their columns post-date a backfill, whereas
+                -- a NULL King is simply hidden by the client (hide-don't-zero),
+                -- which costs one level on old rows rather than adding a third
+                -- aggregation path that could disagree with the engine's.
+                ls.max_gamma_strike,
                 ls.total_call_oi,
                 ls.total_put_oi,
                 ls.put_call_ratio,
@@ -1968,14 +2053,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             FROM latest_summary ls
             JOIN latest_quote lq ON TRUE
             JOIN strike_totals st ON TRUE
-            LEFT JOIN fallback_call_wall fcw ON TRUE
-            LEFT JOIN fallback_put_wall  fpw ON TRUE
+            LEFT JOIN (SELECT strike FROM ranked_call_walls WHERE rn = 1) fcw ON TRUE
+            LEFT JOIN (SELECT strike FROM ranked_put_walls  WHERE rn = 1) fpw ON TRUE
+            JOIN call_wall_ladder cwl ON TRUE
+            JOIN put_wall_ladder  pwl ON TRUE
         """
 
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
+                probe = await conn.fetchrow(newest_query, symbol)
+                newest = probe["timestamp"] if probe else None
+                newest_computed = probe["computed_at"] if probe else None
+                served = self._latest_gex_summary_served_ts.get(symbol)
+                if newest is not None and served is not None and newest < served:
+                    self._warn_gex_summary_went_backwards(symbol, newest, served)
+                    if cached is not None and cached.get("timestamp") == served:
+                        return cached  # type: ignore[no-any-return]
+                if (
+                    cached is not None
+                    and cached.get("timestamp") == newest
+                    and cached.get("computed_at") == newest_computed
+                ):
+                    return cached  # type: ignore[no-any-return]
+
+                row = await conn.fetchrow(query, symbol, DEFAULT_WALL_LADDER_DEPTH)
                 payload = dict(row) if row else None
+                if payload is not None:
+                    self._attach_wall_ladders(payload)
+                    ts = payload.get("timestamp")
+                    if isinstance(ts, datetime) and (served is None or ts > served):
+                        self._latest_gex_summary_served_ts[symbol] = ts
                 self._cache_set(
                     cache_key,
                     payload,
@@ -1985,6 +2092,152 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
             raise
+
+    def _warn_gex_summary_went_backwards(
+        self, symbol: str, newest: datetime, served: datetime
+    ) -> None:
+        """Once per symbol per 30s: the table read older than this process
+        already served. With the cache ruled out by the timestamp check, that
+        leaves a connection whose view lags another's, which is worth a look
+        at pool and isolation settings rather than a log line per request."""
+        now = time_module.monotonic()
+        last = self._latest_gex_summary_backwards_warned_mono.get(symbol, 0.0)
+        if now - last < 30.0:
+            return
+        self._latest_gex_summary_backwards_warned_mono[symbol] = now
+        logger.warning(
+            "gex_summary newest timestamp for %s read as %s, behind the %s this process "
+            "already served; serving the newer one. Only a connection whose view of the "
+            "table lags another's does this once the cache is ruled out: check the pool "
+            "and isolation settings.",
+            symbol,
+            newest,
+            served,
+        )
+
+    @staticmethod
+    def _attach_wall_ladders(payload: Dict[str, Any]) -> None:
+        """Turn the summary query's ladder arrays into ``WallLevel`` dicts.
+
+        The query returns each side as two rank-ordered arrays (strikes and
+        their aggregated gamma).  Here they become the
+        ``{rank, label, strike, strength}`` shape
+        :class:`src.api.models.WallLevel` serialises, with gamma converted to
+        dollar GEX per 1% move on the canonical ``× 100 × S² × 0.01`` scale —
+        the same units ``compute_wall_ladder`` produces, so a ladder read off
+        ``/api/gex/summary`` and one read off a strike-profile bucket are
+        directly comparable.
+
+        Rank 1 is then pinned to the ``call_wall`` / ``put_wall`` this row
+        actually reports (see
+        :func:`src.analytics.walls.align_wall_ladder` for when those can
+        differ), so no client can draw ``C1`` at one price and "Call Wall" at
+        another.  Mutates ``payload`` in place and drops the raw array keys.
+        """
+        spot = payload.get("spot_price")
+        try:
+            spot_f = float(spot) if spot is not None else 0.0
+        except (TypeError, ValueError):
+            spot_f = 0.0
+        # Same scale factor the analytics writer and compute_wall_ladder use.
+        dollar_scale = 100.0 * spot_f * spot_f * 0.01
+
+        for side, primary_key in (("call", "call_wall"), ("put", "put_wall")):
+            strikes = payload.pop(f"{side}_wall_ladder_strikes", None) or []
+            gammas = payload.pop(f"{side}_wall_ladder_gammas", None) or []
+            ladder: List[Dict[str, Any]] = []
+            for rank, strike in enumerate(strikes, start=1):
+                gamma = gammas[rank - 1] if rank - 1 < len(gammas) else None
+                ladder.append(
+                    {
+                        "rank": rank,
+                        "label": wall_label(side, rank),
+                        "strike": float(strike),
+                        "strength": (
+                            abs(float(gamma) * dollar_scale) if gamma is not None else None
+                        ),
+                    }
+                )
+            primary = payload.get(primary_key)
+            payload[f"{side}_walls"] = align_wall_ladder(
+                ladder,
+                float(primary) if primary is not None else None,
+                side,
+                DEFAULT_WALL_LADDER_DEPTH,
+            )
+
+    async def get_pin_path_for_session(self, symbol: str = "SPY") -> List[Dict[str, Any]]:
+        """The most recent session's per-minute Pin Strike path.
+
+        Feeds :func:`src.analytics.pin_stability.build_pin_stability`, which
+        turns the path into "held 7730 since 09:41, -30 pts today".  Returns
+        chronological ``{timestamp, pin_strike}`` rows for the cash session
+        (09:30-16:00 ET), or ``[]`` when there is nothing to read.
+
+        The session is anchored on the LATEST stored row's ET date rather than
+        on "today", so the read is correct after the bell, over a weekend and
+        on a holiday without needing a market calendar: whatever session the
+        engine last wrote for is the session a trader is looking at.
+
+        Deliberately two indexed round trips rather than one.  Resolving the
+        date inside SQL would mean filtering on
+        ``(timestamp AT TIME ZONE 'America/New_York')::date``, which is not
+        sargable -- the planner would drop the (underlying, timestamp) index
+        and scan the whole DATA_RETENTION_DAYS window, so the read would get
+        slower every day the table grows.  Converting in Python and bounding
+        by explicit UTC timestamps keeps both probes on the index.  Same
+        structural reasoning as ``get_gex_frames_for_session``.
+        """
+        symbol = symbol.upper()
+        cache_key = f"pin_path:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        try:
+            async with self._acquire_connection() as conn:
+                latest_ts = await conn.fetchval(
+                    """
+                    SELECT timestamp FROM gex_summary
+                    WHERE underlying = $1
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    symbol,
+                )
+                if latest_ts is None:
+                    self._cache_set(cache_key, [], self._analytics_cache_ttl_seconds)
+                    return []
+
+                utc = ZoneInfo("UTC")
+                session_date = latest_ts.astimezone(_ET).date()
+                start_utc = datetime.combine(
+                    session_date, time(9, 30), tzinfo=_ET
+                ).astimezone(utc)
+                # +1 minute so the 16:00 row itself is included.
+                end_utc = datetime.combine(
+                    session_date, time(16, 1), tzinfo=_ET
+                ).astimezone(utc)
+
+                rows = await conn.fetch(
+                    """
+                    SELECT timestamp, pin_strike
+                    FROM gex_summary
+                    WHERE underlying = $1
+                      AND timestamp >= $2
+                      AND timestamp < $3
+                    ORDER BY timestamp
+                    """,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                )
+                payload = [dict(r) for r in rows]
+                self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+                return payload
+        except Exception as e:
+            logger.warning("get_pin_path_for_session(%s) failed: %s", symbol, e)
+            return []
 
     async def get_latest_forced_flow(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """Latest persisted forced-flow snapshot (levels + close-charm headline).
@@ -2269,7 +2522,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             per_strike AS (
                 -- Aggregate across expirations so one strike = one row, the
-                -- same cross-expiration basis compute_call_put_walls uses.
+                -- same cross-expiration basis compute_wall_ladder uses.
                 SELECT
                     g.strike,
                     SUM(COALESCE(g.call_gamma, 0)) AS call_gamma,
@@ -2321,7 +2574,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                        gamma_flip_point, gamma_flip_raw, gamma_flip_span_used,
                        flip_distance, max_pain, call_wall, put_wall,
                        total_call_oi, total_put_oi, put_call_ratio,
-                       pin_strike, pin_score, pin_confidence, pin_strike_reason
+                       pin_strike, pin_score, pin_confidence, pin_strike_reason,
+                       max_gamma_strike
                 FROM gex_summary
                 WHERE underlying = $1
                   AND timestamp <= $2
@@ -2352,7 +2606,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 f.pin_strike,
                 f.pin_score,
                 f.pin_confidence,
-                f.pin_strike_reason
+                f.pin_strike_reason,
+                f.max_gamma_strike
             FROM frame f
         """
         try:
@@ -2746,6 +3001,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         call_gex/put_gex are the dollar-scaled call/put split (nullable on
         pre-gamma-column rows) that drives the scrubber's Split/Combined views.
 
+        Cost is flat in the size of ``gex_by_strike``: the per-minute ladder is
+        a correlated LATERAL, so the read is ~390 index probes no matter how
+        much history the table holds.  That is load-bearing, not incidental —
+        see the comment on the join for the retention-scaling read it replaced
+        and the timeout it produced.
+
         Returns ``[]`` only when the query ran and the session genuinely has
         no rows.  A failed read (timeout, pool exhaustion, connection loss)
         raises :class:`ReplayFramesUnavailable` rather than passing itself
@@ -2789,33 +3050,37 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
-            -- MATERIALIZED is load-bearing, not stylistic.  ``spot`` below is
-            -- a correlated sub-select over underlying_quotes: one lookup per
+            -- MATERIALIZED, kept as defence in depth.  ``spot`` below is a
+            -- correlated sub-select over underlying_quotes: one lookup per
             -- MINUTE is the whole intent, and the CTE is where that intent
-            -- lives.  Without the keyword PG inlines this CTE, which pushes
-            -- the sub-select down past the gex_by_strike join and substitutes
-            -- it once per REFERENCE -- and ``s.spot`` is referenced four times
-            -- (twice in each of the call_gex / put_gex expressions).  The
-            -- lookup then runs 4 x (minutes x strikes x expirations) times
-            -- instead of once per minute.
+            -- lives.  Without the keyword PG inlines this CTE and substitutes
+            -- the sub-select once per REFERENCE -- and ``s.spot`` is referenced
+            -- four times (twice in each of the call_gex / put_gex expressions).
             --
-            -- Measured on a seeded 5.6M-row gex_by_strike (one SPY session,
-            -- 391 minutes x 51 in-band strikes x 16 expirations): four
-            -- SubPlans at 319,056 loops each -- 1.28M executions, 3,867,893
-            -- buffers, 8,274 ms.  With MATERIALIZED: 391 loops, 40,394
-            -- buffers, 1,158 ms.  7.1x faster, 96x fewer buffers, and the
-            -- result set is byte-identical (19,941 rows, verified row for row).
+            -- When the ladder below was a plain join, inlining pushed those
+            -- four copies BELOW it, so the lookup ran 4 x (minutes x strikes x
+            -- expirations) times instead of once per minute.  Measured then, on
+            -- a seeded 5.6M-row gex_by_strike (one SPY session, 391 minutes x
+            -- 51 in-band strikes x 16 expirations): four SubPlans at 319,056
+            -- loops each -- 1.28M executions, 3,867,893 buffers, 8,274 ms.
+            -- With MATERIALIZED: 391 loops, 40,394 buffers, 1,158 ms.
             --
-            -- It matters because the cost scales on the fan-out dimension
-            -- rather than the session: a chain with more live expirations
-            -- multiplies the loop count for the same 390-minute day, and the
-            -- pool runs with command_timeout=30 / statement_timeout=30000.
-            -- Past that ceiling asyncpg raises, and an empty replay reads to a
-            -- visitor as "the analytics engine did not write that day".
+            -- The ladder is a LATERAL now, and that shape defends the same
+            -- ground from the other side: the sub-select is correlated on the
+            -- OUTER row, so the lateral's own GROUP BY keeps it above the
+            -- gex_by_strike scan and it cannot be pushed under the fan-out even
+            -- when the CTE inlines.  Re-measured on the current shape with the
+            -- keyword stripped: four InitPlans at 391 loops each, 94 ms vs
+            -- 96 ms -- i.e. no longer the thing standing between this read and
+            -- the blow-up.  It stays because it still pins the intent (one
+            -- lookup per minute) at the place the intent is written, and
+            -- because the pool runs command_timeout=30 / statement_timeout=
+            -- 30000 with no margin to spend on rediscovering this.
             session_summary AS MATERIALIZED (
                 SELECT gs.timestamp, gs.gamma_flip_point AS gamma_flip,
                        gs.call_wall, gs.put_wall, gs.max_pain,
                        gs.pin_strike, gs.pin_confidence,
+                       gs.max_gamma_strike,
                        (SELECT uq.close::numeric
                           FROM underlying_quotes uq
                          WHERE uq.symbol = $1
@@ -2835,28 +3100,82 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.max_pain,
                 s.pin_strike,
                 s.pin_confidence,
-                gbs.strike,
-                AVG(gbs.net_gex) AS net_gex,
-                AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
-                AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex
+                s.max_gamma_strike,
+                ladder.strike,
+                ladder.net_gex,
+                ladder.call_gex,
+                ladder.put_gex
             FROM session_summary s
-            LEFT JOIN gex_by_strike gbs
-              ON gbs.underlying = $1
-             AND gbs.timestamp = s.timestamp
-             -- Strike band centered on the session's closing spot; filter
-             -- in SQL so we don't ship every strike (~40k for SPX) over the
-             -- wire.  Missing session_spot (rare — index with no cash quotes
-             -- yet) short-circuits to no-band, matching get_gex_heatmap.
-             AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
-                 <= (SELECT spot_close FROM session_spot) * $4
-            -- call_wall / put_wall / max_pain / pin_strike / pin_confidence are
-            -- functionally dependent on timestamp (one gex_summary row per
-            -- minute) but must be listed in GROUP BY because they're not
-            -- aggregated.  s.spot is likewise per-timestamp; it only appears
-            -- inside AVG(...) so it needs no GROUP BY entry.
-            GROUP BY s.timestamp, s.gamma_flip, s.call_wall, s.put_wall, s.max_pain,
-                     s.pin_strike, s.pin_confidence, gbs.strike
-            ORDER BY s.timestamp ASC, gbs.strike ASC
+            -- The per-minute strike ladder is a LATERAL probe, not a join, and
+            -- that is structural rather than stylistic.
+            --
+            -- ``session_summary`` is an optimisation fence (MATERIALIZED, see
+            -- above), so the planner cannot see through it to learn that the
+            -- join key is ~390 consecutive minutes of ONE session.  Written as
+            -- a plain ``LEFT JOIN gex_by_strike ON gbs.timestamp = s.timestamp``
+            -- it therefore periodically abandons the intended ~390 index probes
+            -- for a hash/merge join that reads every row this underlying has in
+            -- gex_by_strike -- the whole DATA_RETENTION_DAYS window, because the
+            -- session bound lived only behind the fence.  That is the shape
+            -- behind ``get_gex_frames_for_session(NDX, ...) failed after 31.9s``:
+            -- the read scales with retention, not with the session, so it gets
+            -- slower every day the table grows and it blows command_timeout=30
+            -- on the underlyings with the most stored rows first.  Same
+            -- structural gap, same fallback, same fix as
+            -- get_strike_profile_timeseries (28a2c33) and get_gex_heatmap
+            -- (15cb6c3) -- this read was the last one still carrying it.
+            --
+            -- A lateral reference is evaluated per outer row, and this one
+            -- carries its own GROUP BY, which blocks subquery pull-up: PG cannot
+            -- re-plan it as a hash/merge join over the table or the window.  The
+            -- read is ~390 equality probes whatever else the planner decides.
+            --
+            -- Measured on a seeded 8.4M-row gex_by_strike (90 sessions x 391
+            -- minutes x 40 strikes x 3 expirations, for each of two underlyings)
+            -- with the nested loop forced off -- i.e. the production fallback --
+            -- rows read from gex_by_strike drop from 4,222,800 (every NDX row in
+            -- the table) to 120 x 391, and the read goes 2,204 ms -> 459 ms.
+            -- Under free planning it is also faster: 122 ms -> 93 ms, because
+            -- the aggregate now groups 120 rows per minute instead of sorting
+            -- 46,920 rows under an eight-column group key.  Byte-for-byte
+            -- identical output either way, verified row for row.
+            --
+            -- LEFT JOIN ... ON TRUE, not CROSS JOIN LATERAL: a minute whose
+            -- ladder is empty (no in-band strikes, or gex_by_strike missing for
+            -- that cycle) must still emit its frame, because the frame also
+            -- carries the level lines -- flip, walls, max pain, pin -- and those
+            -- come from gex_summary.  CROSS would drop the minute entirely and
+            -- punch a hole in the scrubber's level path.
+            LEFT JOIN LATERAL (
+                SELECT
+                    gbs.strike,
+                    AVG(gbs.net_gex) AS net_gex,
+                    AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
+                    AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex
+                FROM gex_by_strike gbs
+                WHERE gbs.underlying = $1
+                  AND gbs.timestamp = s.timestamp
+                  -- Logically redundant (every s.timestamp came out of the same
+                  -- [$2, $3) window) and kept as defence in depth: if a future
+                  -- refactor ever makes the lateral pull-uppable, this bound
+                  -- still caps the fallback at the session's rows instead of
+                  -- the retention window's.
+                  AND gbs.timestamp >= $2
+                  AND gbs.timestamp < $3
+                  -- Strike band centered on the session's closing spot; filter
+                  -- in SQL so we don't ship every strike (~40k for SPX) over the
+                  -- wire.  Missing session_spot (rare — index with no cash quotes
+                  -- yet) short-circuits to no-band, matching get_gex_heatmap.
+                  AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
+                      <= (SELECT spot_close FROM session_spot) * $4
+                -- One row per strike, AVG across that minute's expirations --
+                -- identical to the old GROUP BY (s.timestamp, ..., gbs.strike),
+                -- since the lateral only ever sees one timestamp.  The summary
+                -- columns no longer need to ride along in a GROUP BY just to
+                -- survive the aggregate; they are projected straight from s.
+                GROUP BY gbs.strike
+            ) ladder ON TRUE
+            ORDER BY s.timestamp ASC, ladder.strike ASC
         """
         started = time_module.monotonic()
         try:
@@ -2898,6 +3217,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "max_pain": r["max_pain"],
                     "pin_strike": r["pin_strike"],
                     "pin_confidence": r["pin_confidence"],
+                    "max_gamma_strike": r["max_gamma_strike"],
                     "strikes": [],
                 }
             if r["strike"] is not None:
@@ -3690,17 +4010,56 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ) q
                 GROUP BY bucket_ts
             ),
-            strike_agg AS (
-                SELECT
-                    gbs.timestamp,
-                    -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
-                    COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_put_gex
-                FROM gex_by_strike gbs
+            -- Every gex_by_strike read below is a LATERAL correlated on the
+            -- bucket representative in ``base``, and that is structural.
+            --
+            -- ``base``/``bucketed`` are optimisation-fence CTEs (multiply
+            -- referenced, so PG materialises them), which hides the
+            -- [start_ts, end_ts] bound from the planner.  Keyed on ``base``
+            -- through a plain join or IN, the intended ~window_units index
+            -- probes were only an intention: under production stats PG
+            -- periodically picks a hash/merge join and reads every row this
+            -- underlying has in gex_by_strike, filtering after.  Same gap that
+            -- put get_strike_profile_timeseries (28a2c33), get_gex_heatmap
+            -- (15cb6c3) and the replay frames read in the timeout log.
+            --
+            -- A redundant window bound would NOT be enough here, for the
+            -- reason 15cb6c3 spells out: the window is not the rep set.
+            -- ``base`` is rn=1, ONE timestamp per bucket out of every snapshot
+            -- inside it, so the window holds ~timeframe/cycle times more
+            -- timestamps than these reads need -- ~1x at 1min but ~390x at
+            -- 1day, and this endpoint accepts timeframe=1day with
+            -- window_units up to 90, which spans essentially the whole
+            -- retention window.  A bound capped at "the window" would there be
+            -- capped at "the table".
+            --
+            -- A lateral reference is evaluated per outer row, and each of
+            -- these carries its own aggregation (and, for the walls, a LIMIT),
+            -- which blocks subquery pull-up -- so PG cannot re-plan any of
+            -- them as a hash/merge join over the window or the table.  The
+            -- window bound rides along as defence in depth.
+            -- MATERIALIZED on all three: each is referenced exactly once in
+            -- the final SELECT, so PG inlines it, and an inlined lateral is
+            -- re-evaluated once per OUTER row -- 26 buckets x 26 = 676 probes
+            -- where 26 are needed, measured at 1day/window_units=90.  Correct
+            -- either way, but it multiplies the read by the bucket count, and
+            -- the whole point of the lateral is that the probe count is
+            -- exactly the rep count.  Materialised, each runs once.
+            strike_agg AS MATERIALIZED (
+                SELECT b.timestamp, agg.total_call_gex, agg.total_put_gex
+                FROM base b
                 CROSS JOIN spot s
-                WHERE gbs.underlying = $1
-                  AND gbs.timestamp IN (SELECT timestamp FROM base)
-                GROUP BY gbs.timestamp
+                CROSS JOIN LATERAL (
+                    SELECT
+                        -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+                        COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_call_gex,
+                        COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_put_gex
+                    FROM gex_by_strike gbs
+                    WHERE gbs.underlying = $1
+                      AND gbs.timestamp = b.timestamp
+                      AND gbs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                            AND (SELECT end_ts FROM bounds)
+                ) agg
             ),
             -- Canonical Call/Put Wall computation (matches src/analytics/walls.py
             -- and /api/gex/strike-profile-timeseries with expirations=all):
@@ -3714,43 +4073,52 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- other consumer.  gex_by_strike is keyed (strike, expiration);
             -- aggregating per-strike is what makes the wall agree with
             -- the cross-expiration view consumers see.
-            call_walls AS (
-                SELECT DISTINCT ON (bucket_ts)
-                    bucket_ts,
-                    strike::numeric AS call_wall
-                FROM (
-                    SELECT
-                        b.bucket_ts,
-                        gbs.strike,
-                        SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma
+            -- DISTINCT ON (bucket_ts) over a grouped scan becomes ORDER BY +
+            -- LIMIT 1 inside the lateral, which is the same pick: ``base`` is
+            -- rn=1, so bucket_ts <-> timestamp is 1:1 and grouping by strike
+            -- within the lateral is identical to grouping by (bucket_ts,
+            -- strike) outside it.  The tie-breakers are carried over exactly
+            -- (call: highest gamma, then LOWEST strike; put: highest gamma,
+            -- then HIGHEST strike), and ``WHERE call_gamma > 0`` on the
+            -- grouped rows is the same filter as HAVING SUM(...) > 0.  A
+            -- bucket where nothing qualifies still yields no row, so the outer
+            -- LEFT JOIN still sees NULL -- CROSS is correct here, unlike the
+            -- replay frames ladder where the row itself had to survive.
+            call_walls AS MATERIALIZED (
+                SELECT b.bucket_ts, w.call_wall
+                FROM base b
+                JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
+                CROSS JOIN LATERAL (
+                    SELECT gbs.strike::numeric AS call_wall
                     FROM gex_by_strike gbs
-                    JOIN base b ON b.timestamp = gbs.timestamp
-                    JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
                     WHERE gbs.underlying = $1
+                      AND gbs.timestamp = b.timestamp
+                      AND gbs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                            AND (SELECT end_ts FROM bounds)
                       AND gbs.strike >= bc.bucket_close
-                    GROUP BY b.bucket_ts, gbs.strike
-                ) per_strike
-                WHERE call_gamma > 0
-                ORDER BY bucket_ts, call_gamma DESC, strike ASC
+                    GROUP BY gbs.strike
+                    HAVING SUM(COALESCE(gbs.call_gamma, 0)) > 0
+                    ORDER BY SUM(COALESCE(gbs.call_gamma, 0)) DESC, gbs.strike ASC
+                    LIMIT 1
+                ) w
             ),
-            put_walls AS (
-                SELECT DISTINCT ON (bucket_ts)
-                    bucket_ts,
-                    strike::numeric AS put_wall
-                FROM (
-                    SELECT
-                        b.bucket_ts,
-                        gbs.strike,
-                        SUM(COALESCE(gbs.put_gamma, 0)) AS put_gamma
+            put_walls AS MATERIALIZED (
+                SELECT b.bucket_ts, w.put_wall
+                FROM base b
+                JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
+                CROSS JOIN LATERAL (
+                    SELECT gbs.strike::numeric AS put_wall
                     FROM gex_by_strike gbs
-                    JOIN base b ON b.timestamp = gbs.timestamp
-                    JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
                     WHERE gbs.underlying = $1
+                      AND gbs.timestamp = b.timestamp
+                      AND gbs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                            AND (SELECT end_ts FROM bounds)
                       AND gbs.strike <= bc.bucket_close
-                    GROUP BY b.bucket_ts, gbs.strike
-                ) per_strike
-                WHERE put_gamma > 0
-                ORDER BY bucket_ts, put_gamma DESC, strike DESC
+                    GROUP BY gbs.strike
+                    HAVING SUM(COALESCE(gbs.put_gamma, 0)) > 0
+                    ORDER BY SUM(COALESCE(gbs.put_gamma, 0)) DESC, gbs.strike DESC
+                    LIMIT 1
+                ) w
             )
             SELECT
                 b.bucket_ts as timestamp,
@@ -4093,6 +4461,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
           * ``call_wall`` / ``put_wall`` computed live for the bucket from
             the same (filtered, summed-by-strike) gamma rows the bucket's
             bars render (see below);
+          * ``pin_strike`` / ``pin_confidence`` as of the bucket's close,
+            read verbatim from the representative ``gex_summary`` row and
+            NEVER expiration-scoped — see the pin-scope rules below;
           * every strike's gamma exposure in the same dollar-GEX units
             ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
             evaluated against the bucket's own ``close`` so the surface
@@ -4109,7 +4480,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Walls follow the request's expiration scope.  Each bucket's
         ``call_wall`` / ``put_wall`` is computed live from the same
         (filtered, summed-by-strike) gamma rows the bucket's bars
-        render — via :func:`src.analytics.walls.compute_call_put_walls`,
+        render — via :func:`src.analytics.walls.compute_wall_ladder`,
         the single source of record — against the bucket's own
         close.  This guarantees the wall always sits at the strike the
         bars say it should: with ``expirations=None`` walls are the
@@ -4129,6 +4500,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             (cumulative net-GEX zero crossing), against the bucket's own
             close.  ``None`` when that curve is one-signed / the bucket has
             no close.
+
+        Pin scope — deliberately NOT the wall/flip rule:
+
+          The pin is whole-chain in EVERY expiration scope.  Unlike the
+          walls and the flip, which describe the currently-selected
+          expiration set and are therefore recomputed from the filtered
+          strikes, Pin Strike is 0DTE-by-construction: it models dealer
+          hedging into expiration, so restricting it to a subset of
+          expirations would not narrow it, it would make it a different
+          metric wearing the same name.  ``expirations`` therefore does not
+          reach it — ``pin_strike`` and ``pin_confidence`` are the stored
+          ``gex_summary`` values for the bucket's representative row in
+          both modes.  This is what the live surfaces already do (the pin
+          does not move when the Expiry selector changes), and the rewind
+          chart reads the same level from here, so the two agree.
+
+          Bucket semantics follow ``close``: the representative row is the
+          LAST ``gex_summary`` row in the bucket, so the pin is the pin as
+          of the bucket's close, not an average or a max across it.
+
+          ``None`` for buckets whose rows predate the pin columns and for
+          cycles that found no active pin; consumers draw no line rather
+          than a zero.
 
         Cash-index session filter is applied to both the window anchor
         and the bucket-rep CTE — same shape ``get_historical_gex`` uses —
@@ -4229,15 +4623,34 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             -- Walls aren't read from gex_summary here — they're computed
             -- in Python below from each bucket's expiration-filtered
-            -- strikes via compute_call_put_walls.  That keeps the wall
+            -- strikes via compute_wall_ladder.  That keeps the wall
             -- consistent with the bars rendered in the same bucket
             -- (e.g. ``expirations=2026-06-13`` → walls scoped to 2026-06-13
             -- gamma only) and routes every consumer through one helper.
+            -- Pin Strike rides along verbatim from the bucket's
+            -- representative gex_summary row, and is deliberately NOT
+            -- recomputed or expiration-scoped below.  The pin is
+            -- 0DTE-by-construction (it models into-expiration hedging) and
+            -- whole-chain by definition, so it must read the same in every
+            -- expiration scope — matching the live surfaces, where the pin
+            -- does not move when the Expiry selector changes.  DISTINCT ON
+            -- ... ORDER BY gs.timestamp DESC makes this the pin AS OF THE
+            -- BUCKET'S CLOSE, the same "last row wins" rule ``close`` uses,
+            -- rather than an average or a max across the bucket.  NULL on
+            -- buckets whose rows predate the pin columns, and on cycles that
+            -- found no active pin (pin_strike_reason then carries the
+            -- REASON_* code, which this endpoint does not surface).
             bucket_reps AS (
                 SELECT DISTINCT ON ({bucket})
                     {bucket} AS bucket_ts,
                     gs.timestamp AS rep_ts,
-                    gs.gamma_flip_point AS gamma_flip
+                    gs.gamma_flip_point AS gamma_flip,
+                    gs.pin_strike,
+                    gs.pin_confidence,
+                    -- GEX King as of the bucket's close.  Whole-chain like the
+                    -- pin, so it is carried straight through rather than
+                    -- recomputed under an expirations filter.
+                    gs.max_gamma_strike
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                     AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
@@ -4380,6 +4793,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 o.low,
                 o.close,
                 br.gamma_flip,
+                br.pin_strike,
+                br.pin_confidence,
+                br.max_gamma_strike,
                 s.strike,
                 -- Raw summed gamma at this (bucket, strike) — used by the
                 -- Python wall computation below.  Not exposed in the
@@ -4426,7 +4842,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 grouped: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
 
                 # Raw per-strike gamma rows for the bucket currently being
-                # read, used as input to compute_call_put_walls.  Kept
+                # read, used as input to compute_wall_ladder.  Kept
                 # separate from the response ``strikes`` list because that
                 # list ships dollar-GEX quantities (and the put values are
                 # sign-flipped) — the wall helper needs the unsigned summed
@@ -4473,9 +4889,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     bucket = grouped[ts]
                     close_val = bucket.get("close")
                     if close_val is not None and inputs:
-                        cw, pw = compute_call_put_walls(inputs, float(close_val))
-                        bucket["call_wall"] = cw
-                        bucket["put_wall"] = pw
+                        # One ranked pass serves both the scalar walls and the
+                        # optional C2/C3 · P2/P3 ladder, so rank 1 IS the
+                        # bucket's Call/Put Wall by construction — no
+                        # alignment step is needed here (unlike the summary
+                        # path, which reports an engine-persisted wall against
+                        # a separately-recomputed ladder).
+                        call_walls, put_walls = compute_wall_ladder(
+                            inputs, float(close_val), DEFAULT_WALL_LADDER_DEPTH
+                        )
+                        bucket["call_walls"] = call_walls
+                        bucket["put_walls"] = put_walls
+                        bucket["call_wall"] = call_walls[0]["strike"] if call_walls else None
+                        bucket["put_wall"] = put_walls[0]["strike"] if put_walls else None
                     if exp_filter is not None:
                         bucket["gamma_flip"] = (
                             compute_gamma_flip_from_strikes(inputs, float(close_val))
@@ -4496,10 +4922,30 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "low": r["low"],
                             "close": r["close"],
                             "gamma_flip": r["gamma_flip"],
+                            # Pin Strike as of the bucket's close, straight
+                            # from the representative gex_summary row. Unlike
+                            # the walls (and the flip under a filter) it is
+                            # never recomputed in _finalize_bucket: the pin is
+                            # whole-chain 0DTE by definition and must not move
+                            # with the expirations filter. None on buckets
+                            # older than the pin columns and on cycles with no
+                            # active pin — consumers draw no line for None
+                            # rather than a zero.
+                            "pin_strike": r["pin_strike"],
+                            "pin_confidence": r["pin_confidence"],
+                            # GEX King as of the bucket's close.  Like the pin
+                            # it is never recomputed in _finalize_bucket: it is
+                            # whole-chain by definition and must not move with
+                            # the expirations filter.  None on buckets predating
+                            # the column — consumers draw no line for None.
+                            "max_gamma_strike": r["max_gamma_strike"],
                             # Filled in below, after the bucket's strikes
-                            # are known.
+                            # are known.  The ladders stay empty lists (never
+                            # null) so a client can iterate unconditionally.
                             "call_wall": None,
                             "put_wall": None,
+                            "call_walls": [],
+                            "put_walls": [],
                             "strikes": [],
                         }
                         grouped[ts] = bucket
@@ -5390,6 +5836,175 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
             return []
 
+    async def get_hedging_flow_series(
+        self,
+        symbol: str = "SPY",
+        session: str = "current",
+        strikes: Optional[List[float]] = None,
+        expirations: Optional[List[date]] = None,
+        intervals: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return 5-minute estimated hedging-pressure bars for a session.
+
+        The aggressor-inferred companion to :meth:`get_flow_series`: same
+        session resolution, same 404/empty semantics, same 5-minute grid and
+        the same unfiltered underlying price, so the two series overlay
+        exactly. Rows are newest-first; ``intervals=N`` returns the leading N.
+
+        Returns ``None`` when the symbol has never appeared in
+        flow_by_contract (caller surfaces 404), and ``[]`` when the symbol
+        exists but the resolved session has no flow.
+
+        There is no snapshot path here yet -- unlike flow-series this always
+        runs the CTE. It reads ``flow_contract_facts`` (already per-bucket
+        deltas, so no LAG-and-recumulate), which is a materially cheaper scan
+        than the flow-series pipeline; if it ever stops being cheap enough,
+        the query's window invariance makes it snapshot-able with the same
+        argument flow_series_5min uses.
+        """
+        symbol = symbol.upper()
+
+        # Cache only full-series fetches, matching get_flow_series: an
+        # incremental (intervals=N) poll must see the newest tail bar.
+        use_cache = intervals is None
+        cache_key = None
+        if use_cache:
+            strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
+            exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
+            cache_key = f"hedging_flow:{symbol}:{session}:{strikes_key}:{exps_key}"
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
+
+        strikes_arg = [float(s) for s in strikes] if strikes else None
+        expirations_arg = list(expirations) if expirations else None
+
+        try:
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data:
+                    if use_cache:
+                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                    return []
+
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(
+                        conn,
+                        HEDGING_FLOW_CTE_ASYNCPG,
+                        symbol,
+                        session_start,
+                        session_end,
+                        strikes_arg,
+                        expirations_arg,
+                        timeout=15.0,
+                    ),
+                    timeout=15.0,
+                )
+                result = [dict(row) for row in rows]
+                if intervals is not None and intervals > 0 and len(result) > intervals:
+                    # Newest-first; leading N == most recent N buckets.
+                    result = result[:intervals]
+                if use_cache:
+                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Hedging flow query timed out for {symbol}, returning empty")
+            return []
+
+    async def get_gamma_regime_series(
+        self,
+        symbol: str = "SPY",
+        session: str = "current",
+        intervals: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Read the materialised intraday Gamma Regime series for a session.
+
+        Deliberately a plain indexed range scan over ~78 pre-computed rows.
+        The expensive part -- diffing two per-strike chains per bar -- happens
+        once per bar in the Analytics Engine (see
+        :mod:`src.analytics.gamma_regime_series` for why that inversion is not
+        optional). If this method ever grows a compute-on-miss fallback it
+        reintroduces the 2026-08-21 stampede shape, where a read too slow for
+        its own guard returned empty, cached nothing, and every next poll
+        redid the work.
+
+        Session resolution is :meth:`_resolve_flow_series_session` -- the SAME
+        window the flow series uses -- so the structure line and the flow line
+        cover identical bars and can be stacked without re-aligning.
+
+        Returns ``None`` for a symbol with no flow history at all (404), and
+        ``[]`` when the session resolves but nothing has been written for it
+        yet (a session before the writer was deployed, or a cold engine).
+        Rows are newest-first, matching the other series endpoints.
+        """
+        symbol = symbol.upper()
+
+        use_cache = intervals is None
+        cache_key = None
+        if use_cache:
+            cache_key = f"gamma_regime_series:{symbol}:{session}"
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
+
+        try:
+            async with self._acquire_connection() as conn:
+                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data:
+                    if use_cache:
+                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                    return []
+
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(
+                        conn,
+                        """
+                        SELECT
+                            bar_start,
+                            spot,
+                            anchored_lean,
+                            anchored_stability,
+                            anchored_net_shift,
+                            anchored_gross_shift,
+                            rolling_lean,
+                            rolling_stability,
+                            rolling_net_shift,
+                            rolling_gross_shift,
+                            sigma_price,
+                            near_spot_stock,
+                            strike_count,
+                            expired_expirations,
+                            rolling_bars
+                        FROM gamma_regime_5min
+                        WHERE symbol = $1
+                          AND bar_start >= $2
+                          AND bar_start <= $3
+                        ORDER BY bar_start DESC
+                        """,
+                        symbol,
+                        session_start,
+                        session_end,
+                        timeout=10.0,
+                    ),
+                    timeout=10.0,
+                )
+                result = [dict(row) for row in rows]
+                if intervals is not None and intervals > 0 and len(result) > intervals:
+                    result = result[:intervals]
+                if use_cache:
+                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Gamma regime series query timed out for {symbol}, returning empty")
+            return []
+
     async def get_flow_contracts(
         self,
         symbol: str = "SPY",
@@ -5537,7 +6152,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 score,
                 notional_class,
                 size_class,
-                underlying_price
+                underlying_price,
+                -- Session-wide recency of the underlying flow data.
+                --
+                -- This result is a TOP-N-BY-SIZE leaderboard, not a recency
+                -- window: ORDER BY ABS(notional) means the newest `timestamp`
+                -- among the returned rows is whichever of the biggest prints
+                -- happened last, which for the index names is usually the
+                -- opening burst. A consumer taking MAX(timestamp) over the
+                -- response therefore reads a healthy midday leaderboard as
+                -- hours stale — reported from the field by an integrator whose
+                -- automated review flagged SPX/SPY/QQQ every afternoon.
+                --
+                -- A window function is evaluated BEFORE ORDER BY and LIMIT, so
+                -- this is the max across the whole filtered session, not just
+                -- the fifty rows that survive truncation, and it costs nothing
+                -- extra — the rows are already scanned.
+                MAX(timestamp) OVER () AS session_latest_at
             FROM scored
             ORDER BY ABS(notional) DESC, score DESC, timestamp DESC
             LIMIT $4
@@ -5945,6 +6576,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         *,
         lookback_minutes: int = 5760,
         limit: int = 15,
+        at: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Concurrent future/index print pairs, newest first.
 
@@ -5973,10 +6605,31 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Several samples are returned, not just the newest, so the caller can
         take a median and shrug off a single bad print.
 
+        ``at`` anchors the window: samples are the newest pairs at or BEFORE
+        that instant, rather than the newest pairs outright.  This is what
+        makes a HISTORICAL projection honest — the basis a caller wants for a
+        frame from three months ago is the basis that stood then, not today's.
+        Carry walks down through each quarterly cycle toward expiry, so
+        anchoring at ``NOW()`` for a past timestamp offsets every projected
+        level by however much the basis has moved since.  ``None`` keeps the
+        live behaviour (anchor at ``NOW()``), which is the common path.
+
         Reads ``futures_quotes`` + ``underlying_quotes`` only.
         """
         index_symbol = (index_symbol or "").upper()
-        cache_key = f"futures_basis_samples:{index_symbol}:{lookback_minutes}:{limit}"
+        # A naive anchor is read as UTC by the driver, which silently shifts
+        # the window by the local offset on any box that isn't UTC. Stamp it
+        # explicitly so the column's timezone and the parameter's agree.
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        # The anchor is part of the identity of the result: a cache keyed only
+        # on symbol/window would serve a historical read from the live entry
+        # (or vice versa), which is the precise bug this parameter exists to
+        # fix. ``None`` keeps the original key shape for the live path.
+        anchor_key = at.isoformat() if at is not None else "now"
+        cache_key = (
+            f"futures_basis_samples:{index_symbol}:{lookback_minutes}:{limit}:{anchor_key}"
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -5998,13 +6651,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 LIMIT 1
             ) u ON TRUE
             WHERE f.index_symbol = $1
-              AND f.timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+              AND f.timestamp <= COALESCE($4::timestamptz, NOW())
+              AND f.timestamp >= COALESCE($4::timestamptz, NOW())
+                                - ($2::int * INTERVAL '1 minute')
             ORDER BY f.timestamp DESC
             LIMIT $3
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, index_symbol, int(lookback_minutes), int(limit))
+                rows = await conn.fetch(
+                    query, index_symbol, int(lookback_minutes), int(limit), at
+                )
                 payload = [dict(r) for r in rows]
                 self._cache_set(cache_key, payload, self._futures_basis_cache_ttl_seconds)
                 return payload

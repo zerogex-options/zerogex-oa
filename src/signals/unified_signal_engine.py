@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Optional
+import logging
 import os
 import json
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,13 @@ class UnifiedSignalEngine:
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
+        # This engine cycles once a SECOND. Anything logged unconditionally in
+        # run_cycle is therefore ~3,600 lines/hour/symbol, which is what filled
+        # the shared 300M journal in ~2 hours and left the 2026-08-17 outage
+        # with no history to read. These two latches keep the per-cycle lines
+        # to state CHANGES; the steady state is DEBUG (LOG_LEVEL=DEBUG).
+        self._legacy_disabled_logged = False
+        self._last_playbook_state: Optional[tuple] = None
         components = [
             NetGexSignComponent(),
             # Phase 2.1: gamma_anchor blends flip_distance + local_gamma +
@@ -1552,7 +1560,16 @@ class UnifiedSignalEngine:
                     basic_results=basic_results,
                     conn=conn,
                 )
-            logger.info(
+            # A playbook card is worth a line when it CHANGES. Re-stating the
+            # same action/pattern every second buried the transitions -- the
+            # only part an operator reads -- in thousands of identical lines.
+            # Confidence is deliberately not part of the key: it drifts on
+            # nearly every cycle and would defeat the comparison.
+            state = (card.action.value, card.pattern)
+            changed = state != self._last_playbook_state
+            self._last_playbook_state = state
+            logger.log(
+                logging.INFO if changed else logging.DEBUG,
                 "Playbook [%s] action=%s pattern=%s confidence=%.2f",
                 self.db_symbol,
                 card.action.value,
@@ -1646,7 +1663,14 @@ class UnifiedSignalEngine:
             os.getenv("SIGNALS_PORTFOLIO_TRADING_ENABLED", "false").lower() == "true"
         )
         if not legacy_trading_enabled:
-            logger.info(
+            # Announce the mode once per process, then fall to DEBUG. This
+            # branch is the DEFAULT, so at INFO every cycle it restated a
+            # setting that cannot change while the process runs -- the single
+            # longest repeated line in the journal, ~3,300 times an hour.
+            level = logging.INFO if not self._legacy_disabled_logged else logging.DEBUG
+            self._legacy_disabled_logged = True
+            logger.log(
+                level,
                 "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s "
                 "action=<disabled: SIGNALS_PORTFOLIO_TRADING_ENABLED=false, "
                 "TradeWorkz supersedes>",

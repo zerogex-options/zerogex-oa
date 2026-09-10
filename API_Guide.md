@@ -42,6 +42,32 @@ rewrites at any layer.
 Requests with an invalid or missing key return `401 Unauthorized` with
 `WWW-Authenticate: Bearer`.
 
+### `?api_key=` on the levels routes only
+
+`/api/v1/levels/*` and `/api/v2/levels/*` — and **nothing else** — additionally
+accept the key as an `api_key` query parameter:
+
+```
+GET /api/v1/levels/ES?strikes=1&api_key=<your-key>
+```
+
+This exists for charting platforms that physically cannot send a request
+header. The Sierra Chart study is the caller it was added for: the ACSIL HTTP
+call that is portable across Sierra Chart versions, `sc.MakeHTTPRequest(URL)`,
+is a bare GET with no header support, so a header-only endpoint is unreachable
+from that platform.
+
+**Use a header if you can.** A credential in a URL is materially weaker: every
+proxy in the path sees it, access logs record it by default (ours redact it —
+see `deploy/steps/120.nginx_api`), and it survives in `Referer`. A header
+always wins when both are present, so a stale URL parameter cannot downgrade a
+caller that sends one.
+
+The allowlist is deliberately narrow and is pinned by
+`tests/test_api_query_key_auth.py`: the levels endpoints return derived,
+redistributable analytics only, and no endpoint serving raw per-contract
+quotes, flow, or key administration will accept a credential in a URL.
+
 Two key types are supported, validated against the same headers:
 
 - **Per-user keys** *(primary)* — long-lived keys issued via the admin
@@ -145,9 +171,55 @@ async def example(identity: RequestIdentity = Depends(current_identity)):
     ...
 ```
 
-Every request also emits one structured line on the `src.api.audit`
-logger: `api_request method=… path=… status=… caller_kind=…
-caller_user_id=… end_user_id=… duration_ms=…`.
+**Audit trail.** Every request emits one structured line on the
+`src.api.audit` logger (into the journal, under `zerogex-oa-api`):
+
+```
+api_request method=… path=… status=… client_ip=… caller_kind=…
+caller_user_id=… caller_key_id=… caller_name=… end_user_id=… duration_ms=…
+```
+
+Values are always single whitespace-free tokens — internal whitespace is
+collapsed to `_` and absent values render as `-` — so the line stays
+parseable with `grep`/`awk` straight out of `journalctl`.
+
+This is the **only** record that ties a key to a request: nginx's access
+log is deliberately credential-free (its `zerogex_scrubbed` format logs no
+key and rewrites any `?api_key=` to `REDACTED`), so `client_ip` here is
+what makes "which key is this IP using" answerable. `caller_key_id` and
+`caller_name` say *which* of an owner's keys was used, which is what a
+rotation or revocation has to target.
+
+To read it, use `make api-caller-report` (see
+`src/tools/api_caller_report.py`), which joins these lines against the
+access log's User-Agents and enriches them from the `api_keys` table:
+
+```bash
+make api-caller-report IP=23.115.8.132        # who is this IP?
+make api-caller-report USER=alice@example.com HOURS=12
+make api-caller-report UA=NT8 JSON=/tmp/callers.json
+```
+
+Until the API restarts, those lines carry no `client_ip` and the tool falls
+back to inferring who owns each address: requests that pair unambiguously on
+(second, method, path, status) vote for (caller, address), and an address is
+awarded only on a decisive majority. Expect most requests to drop on a busy
+window — popular paths collide constantly and cannot vote — and treat the
+result as a heuristic: it never sees a request that skipped nginx, and the
+website BFF talks to uvicorn at `127.0.0.1:8000` directly
+(`deploy/API_BEHIND_CLOUDFLARE.md`), so its calls have no access-log row at
+all. **Restart the API to get real attribution** — the fallback is a stopgap
+for reading history that was already written, not a substitute.
+
+Note that `client_ip` is the real client address only because uvicorn's
+`ProxyHeadersMiddleware` rewrites it from `X-Forwarded-For` (on by default,
+trusting `127.0.0.1`, which is where nginx proxies from). Serving the API
+without that proxy in front would record the proxy's own address instead.
+
+`status=0` on a line means the handler raised and no response had started
+when the audit ran — the client still receives the `500` that Starlette's
+outer error middleware synthesizes. Ordinary 4xx/5xx responses (including
+`HTTPException`) record their real status.
 
 **Identity-keyed rate limiting.** A global dependency (`src.api.ratelimit`)
 can throttle per end-user (falling back to caller, then client IP — see
@@ -172,25 +244,32 @@ always passes, so these declarations are inert until keys are backfilled.
 
 | Scope | Covers | Redistributable? |
 | --- | --- | --- |
-| `gex` | GEX summary / by-strike / profile, walls, flip term-structure & surface, vol & premium surface, replay, and **`/api/v1/levels`** | ✅ derived |
+| `gex` | GEX summary / by-strike / profile, walls, flip term-structure & surface, vol surface, replay, **`/api/market/open-interest`**, and **`/api/v1/levels`** | ✅ derived |
 | `flow` | options-flow aggregates, forced flow | ✅ derived |
 | `maxpain` | max-pain analytics | ✅ derived |
 | `technicals` | VWAP / ORB / volume / momentum | ✅ derived |
 | `signals` | signal engine, backtest, scorecard, forecast, TradeWorkz | ✅ derived (premium) |
-| `market_raw` | raw per-contract quotes & underlying OHLC (`/api/market/*`, `/api/option/*`) | ❌ **withheld** |
+| `market_reference` | the underlying's own tape — `/api/market/quote`, `/api/market/historical`, `/api/market/session-closes`, `/api/market/session-levels` | ✅ reference |
+| `market_raw` | per-contract **quoted prices** (bid/ask/last/mid) — `/api/option/*`, `/api/tools/option-calculator`, `/api/gex/premium_surface` | ❌ **withheld** |
 
 Tier bundles (the unit of commercial packaging):
 
-- **`analytics`** — `gex` + `flow` + `maxpain` + `technicals`: the clean
-  derived product for external / B2B2C consumers. **No raw data.**
+- **`analytics`** — `gex` + `flow` + `maxpain` + `technicals` +
+  `market_reference`: the clean derived product for external / B2B2C
+  consumers. **No option chain, no signals.**
 - **`signals`** — `analytics` + `signals`.
 - **`full`** — everything *including* `market_raw`; the internal website
   backend only, never resold.
 
 `market_raw` is isolated precisely so it can be granted to the internal
-BFF and **withheld from every external customer** — the derived scopes are
-broadly redistributable, raw upstream market data is not. A third-party
-charting integration is issued an **`analytics`-tier key**.
+BFF and **withheld from every external customer**. The line is drawn at
+whether a payload carries a **quoted price**: bid, ask, last or mid for an
+individual contract is withheld, while a computed output and the reference
+price a level is drawn against are not. Open interest sits on the derived
+side — it is dealer-positioning input, carries no quote, and the same
+per-strike figures already ship under `gex` via `/api/gex/by-strike`. A third-party charting integration
+is issued an **`analytics`-tier key** and has everything it needs to place
+a level against a price.
 
 ## API versions & the freshness envelope
 
@@ -274,12 +353,14 @@ upstream can change.
 
 | Profile | Endpoints | Regular | Extended | Overnight |
 | --- | --- | --- | --- | --- |
-| `realtime_quote` | `/api/market/*`, `/api/option/*` | 5 s | 30 s | — |
+| `realtime_quote` | `/api/market/quote` and the rest of `/api/market/*` | 60 s | 60 s | — |
+| `option_chain` | `/api/option/*`, `/api/market/open-interest` | 60 s | 60 s (to 16:15 only) | — |
+| `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
 | `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
-| `flow_aggregate` | `/api/flow/*` | 60 s | — | — |
-| `signals_cycle` | `/api/signals/*`, `/api/tradeworkz/*` | 15 s | 60 s | — |
+| `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
+| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
-| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical` | — | — | — |
+| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
 
 A dash means no update is expected, which surfaces as
@@ -291,6 +372,43 @@ A dash means no update is expected, which surfaces as
 but it recomputes the same 20:00 observation, so an ageing payload there is
 correct rather than late. The same holds on weekends, NYSE holidays, and
 after the 13:00 ET close on an early-close day.
+
+**`option_chain` is narrower still: 09:30–16:15 ET.** A chain row is written
+when an option quote ticks, and options trade only during the cash session
+plus the 15-minute late session — while the underlying bar feed runs
+04:00–20:00. So `/api/option/*` and `/api/market/open-interest` report
+`session_closed` from 16:15 to 09:30 the next morning even though
+`/api/market/quote` beside them is still updating, and even though
+`market_session_status` still reads `pre-market` or `after-hours`. Those two
+fields answer different questions: the session label is what the *equity
+market* is doing, and `freshness_status` is whether *this endpoint's* feed
+owes you an update. Two narrower cases the calendar also handles: cash-index
+chains (SPX, NDX) stop at 16:00 with the index they price, and every chain
+stops at the early close on a half day.
+
+Cadence describes how often a new observation can be **stored**, not how
+often ingestion polls, and not how fast the producing engine loops. The quote
+tape is polled every few seconds but written in 60-second buckets, so 60 s is
+the fastest a new value can appear. VIX/VXN and the whole of `/api/flow/*` are
+5-minute bars. The signal engine loops about once a second, but a score is
+stamped with the underlying-quote timestamp it read, so it cannot be fresher
+than that same 60-second bucket.
+
+Poll faster than the cadence if you like — it is cheap against the cache — but
+expect `aging` between stores. That band is normal, not a warning.
+
+**ES and NQ are graded on the CME calendar**, not the NYSE one — they trade
+Sunday 18:00 to Friday 17:00 ET. A futures symbol therefore reports
+`market_session_status: regular` (and a real `stale` verdict) through the
+overnight hours when the cash market is shut, so a stalled futures feed is
+visible rather than hidden behind `session_closed`. Cash symbols are
+unaffected.
+
+`stale_after` is anchored to the later of `source_timestamp` and the instant
+the current feed window opened, so a payload one second into a new window
+gets a full grace period before it is called late — nothing can be late
+before anything has had time to arrive. `age_seconds` still measures the true
+age from the observation.
 
 `daily_cycle` endpoints age in **trading sessions, not wall-clock hours**:
 Friday's session close is the correct answer all through Monday morning, and
@@ -313,7 +431,9 @@ populated.
 ### Response headers
 
 Every v2 response also carries the envelope as headers, so a proxy, CDN or
-uptime monitor can act on staleness without parsing a body:
+uptime monitor can act on staleness without parsing a body. All of them are
+listed in `Access-Control-Expose-Headers`, so a cross-origin browser client
+can read them too (alongside `X-Request-Id` for correlation):
 
 ```
 X-Freshness-Status: fresh
@@ -385,6 +505,37 @@ reason about staleness; `/api/v1/levels` additionally returns
 paid = realtime) is a timestamp gate on these fields, not a streaming
 change.
 
+### ES / NQ and the basis a response is projected on
+
+ES and NQ are answered from the SPX / NDX option chains — ZeroGEX never
+computes gamma from options on futures. ES and SPX track the same index, so
+it is the same dealer book; only the price axis differs, by cost of carry.
+Every price-space field (strikes, walls, flip, max pain, pin, spot) is carried
+onto the futures axis by the **basis**, and rounded to the contract tick.
+Dollar exposures (net GEX, wall strength, OI, volume) are **not** rescaled —
+exposure belongs to the option book, not to the axis you plot it on.
+
+Which basis is used depends on what you asked for, and this matters if you
+are backtesting:
+
+| Request | Basis applied |
+| --- | --- |
+| Live (no time named) | measured off the current tape |
+| Pinned to an instant (`ts=`) | the basis in force at that instant |
+| Pinned to a session (`date=`, `end_date=`) | the basis in force that session |
+| A timestamped series (e.g. `/api/gex/historical`) | **per row**, each on its own session's basis |
+
+A series is projected row by row rather than under one ratio because basis
+walks down through each quarterly cycle toward expiry. Over a single session
+that drift is ~0.003% — below the tick a level is published at. Over a quarter
+it is ~0.5%, which on ES is tens of points: enough to move every level in a
+backtest without anything in the payload indicating it. Each row therefore
+carries its own `projection` block naming the ratio it was projected on.
+
+Historical responses also keep their **projected** spot rather than taking the
+live futures print — today's price stamped on a past frame would state
+something false about that frame.
+
 > **Authoritative source.** This guide is the curated derived/charting
 > surface. The live, complete, always-current endpoint list is the
 > OpenAPI schema at `/openapi.json` (rendered at `/docs`); when the two
@@ -431,6 +582,9 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   "spot": 676.04,
   "as_of": "2026-07-06T19:30:00Z",
   "age_seconds": 42,
+  "computed_at": "2026-07-06T19:30:45Z",
+  "data_as_of": "2026-07-06T19:30:41Z",
+  "computed_at": "2026-07-06T19:30:45Z",
   "net_gex_at_spot": -1200000000.0,
   "levels": {
     "gamma_flip": 675.0,
@@ -469,6 +623,21 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
 - `profile` is ascending by strike (histogram order). `net_gex` is dollar
   gamma per 1% move, calls positive / puts negative, and
   `net_gex == call_gex + put_gex` by construction.
+- `computed_at` is when the analytics engine last wrote the snapshot (server
+  clock; null on rows that predate the column). `as_of` is the minute bucket
+  the numbers are filed under; `computed_at` is when they were *produced*.
+  A sub-minute cadence rewrites the same minute row, so `computed_at` is the
+  one field that changes on a rewrite. v2 `generated_at` reports it.
+- `data_as_of` is what the numbers are actually *as of*: the newest quote
+  write the engine read for this snapshot (null on rows that predate the
+  column). A minute bucket is already up to a minute old when the cycle reads
+  it, so measuring staleness from `as_of` overstated every snapshot's age by
+  the cycle's phase in the minute — 26–59s measured in production while the
+  quotes inside were under 5s old. **`age_seconds` and the v2
+  `source_timestamp` / `freshness_status` are measured from `data_as_of`
+  when present**, and from `as_of` only on rows that predate it. Consumers
+  that display `age_seconds` (the NinjaTrader and Sierra Chart studies)
+  therefore read lower, and truer, with no change on their side.
 - `as_of` / `age_seconds` describe snapshot freshness — see *Data
   freshness & update cadence* above.
 
@@ -538,6 +707,46 @@ Server-accumulated flow series — one row per 5-minute bar (cumulative call/put
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
 
+### GET /api/gex/regime-series
+The Gamma Shift read at every 5-minute bar of a session. Where `/api/gex/regime-shift` answers "how did dealer gamma change between these two moments" as a single card, this is the same maths as a line — so structure sits on the same timeline as `/api/flow/hedging` and can be read against it. Flow says how hard the tape is pushing; this says whether the book absorbs or amplifies it.
+
+**Parameters:**
+- `symbol` (required): `[A-Z.]{1,10}`
+- `session` (optional): `current` | `prior`, default `current`
+- `intervals` (optional): trailing N 5-minute bars, `1`–`390`
+
+**Two lenses per bar.** `anchored_*` is versus the session's first bar ("changed today"), the counterpart of the Hedging Flow cumulative curve. `rolling_*` is versus `rolling_bars` bars back ("changing right now"), the counterpart of the rate line and the one to read beside a flip. **They do not sum** — both weight strikes by proximity to each bar's *own* spot, so the kernel re-centres every bar; summing bar-to-bar diffs would assert a fixed kernel and match neither lens.
+
+Positive `stability` = more long gamma near spot, so dealers hedge against moves (pinning, vol suppression); negative = the book has turned accelerant. Positive `lean` = the change is supportive (building below spot / eroding above); negative = capping. `rolling_*` is null for the session's first `rolling_bars` bars — null rather than zero, so a chart cannot draw a measured "no change" through the open.
+
+Scores are RAW dollar-GEX. Normalising against a trailing distribution of sessions is `/api/gex/regime-history`'s job. `expired_expirations` lists expiries that left the board since the comparison point — reported, never booked as dealers shedding gamma.
+
+**Served from a materialised table.** The Analytics Engine writes one bar per cycle into `gamma_regime_5min`; this endpoint range-scans it. Computing the series on read would mean diffing two ~1500-row chains per bar, per viewer, per poll — the shape that took `/api/gex/strike-profile-timeseries` down on 2026-08-21 (see `docs/runbooks/strike_profile_timeseries_stampede.md`). **A miss therefore returns an empty `bars` list rather than falling back to compute**, and a test pins that. An empty response on a live session means the engine has not written yet, not that the data is unavailable.
+
+Same session resolution as `/api/flow/hedging`, so the two cover identical bars. Rows newest→oldest.
+
+### GET /api/flow/hedging
+Estimated dealer hedging pressure per 5-minute bar, with sign flips. The aggressor-inferred companion to `/api/flow/series`: for every option that traded, the net customer position change is converted to the stock a delta-flat hedge implies — `(buy - sell) * delta * 100 * spot` — and accumulated across the session.
+
+Positive means the hedge **buys** stock, the same sign convention and units as the Forced Flow engine, so the modeled and estimated sources are directly additive (see `combine_flow_sources`).
+
+`call_flow_usd` / `put_flow_usd` split the pressure by the option type that produced it, **not** by its direction: customers selling puts push the net positive and land in the put series.
+
+**Parameters:**
+- `symbol` (required): `[A-Z.]{1,10}`
+- `session` (optional): `current` | `prior`, default `current`
+- `strikes` (optional): comma-separated strikes to include; omit for all
+- `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all. Pass today's date to isolate 0DTE
+- `intervals` (optional): trailing N 5-minute bars, `1`–`390`
+- `smoothing` (optional): trailing SMA length in bars for the rate line and flip detection, `1`–`24`, default `3` (15 minutes)
+- `significance` (optional): a rate flip is marked significant at or above this multiple of the session's typical swing, `0`–`10`, default `1.0`
+
+**Response:** an object with `bars` (newest→oldest) and `flips`, plus `basis` and `disclosure`.
+
+`flips` carries two kinds. `rate` — the smoothed per-bar series changing sign, i.e. the immediate push turning over; this is the frequent, actionable one. `cumulative` — the session's net lean crossing zero; rare, and context rather than a trigger. `magnitude_usd` is the swing across zero, not the level at it (a series is near zero *at* a crossing by definition), and `session_ratio` scores that swing against the session's typical swing using only bars before the flip, so it is computable live.
+
+**Basis — binding on any consumer.** This series is AGGRESSOR-INFERRED. It assumes the passive side of each classified print was a market maker; that assumption is under test and not established (see `docs/design/aggressor-inferred-positioning-experiment.md`). Surfaces rendering it must carry the `disclosure` through: it is *estimated hedging pressure*, never "observed dealer flow" or "dealer positioning". Note also that `classified_ratio` reports how much of a bar's volume carried an aggressor classification — a low value means a thin sample behind that bar.
+
 ### GET /api/flow/contracts
 Distinct strikes and expirations that traded in the resolved session (powers the Flow-page filter chips).
 
@@ -553,6 +762,17 @@ Unusual-activity / smart-money flow — 1-minute intervals (session 07:15–16:1
 - `session` (optional): `current` | `prior`, default `current`
 - `limit` (optional): max `50`, default `50`
 
+
+**Ranked, not chronological.** This returns the largest-notional prints of
+the session ordered by size, so the newest `timestamp` among the rows is
+whichever of the biggest prints landed last — usually the opening burst on
+the index names. Do **not** take `MAX(timestamp)` over the rows as a
+freshness signal; it will read a healthy midday response as hours stale.
+Use `session_latest_at` instead, which every row carries: the newest flow
+event in the whole session, not just among the rows returned. On v2 this is
+already what the envelope grades, so `freshness.source_timestamp` and
+`freshness.freshness_status` are correct without any special handling.
+
 ### GET /api/flow/buying-pressure
 Underlying buying/selling pressure.
 
@@ -564,9 +784,17 @@ Underlying buying/selling pressure.
 
 ## Market Data
 
-Scope: `market_raw` — **raw upstream data, not redistributable.** These
-endpoints are for the internal `full`-tier BFF only and are excluded from
-the `analytics` tier issued to external customers.
+Scope: mixed — check each endpoint below.
+
+The underlying's own tape (`quote`, `historical`, `session-closes`,
+`session-levels`) is `market_reference` and rides with the `analytics`
+tier, because placing a level on a chart is meaningless without the price
+it sits against. `open-interest` is `gex` — it returns open interest and a derived
+exposure, no quoted price, and the same per-strike figures ship under the
+same scope via `/api/gex/by-strike`. Everything under `/api/option/`
+returns per-contract quoted prices and is `market_raw` — **not
+redistributable**, internal `full`-tier BFF only, excluded from the
+`analytics` tier issued to external customers.
 
 ### GET /api/market/quote
 Get latest underlying quote (the live tick).
@@ -648,15 +876,41 @@ Most recent quote for a single option contract.
 - `expiration` (optional): `YYYY-MM-DD`
 - `type` (optional): `C` (call) or `P` (put)
 
+**These read `option_chains`, so they keep the options session, not the
+tape's.** `/api/market/open-interest`, `/api/option/quote` and
+`/api/option/contract` are graded on the `option_chain` cadence profile:
+09:30–16:15 ET (16:00 for SPX/NDX, the early close on a half day). Outside
+that they report `session_closed`, not `stale` — no chain row can be written
+when no option is trading, so the last snapshot before the close is the
+correct answer all evening. `/api/market/quote` sits beside them on the wider
+04:00–20:00 tape window and will still be updating; that difference is real,
+not an inconsistency.
+
 ---
 
 ## Spread Monitor (quoted spreads & liquidity) — Beta
 
-Scope: `gex` (the `analytics` tier), **not** `market_raw`. These endpoints
-share the `/api/market` path prefix but return derived aggregates — medians,
-percentiles and coverage shares computed *from* the bid/ask — rather than
-re-exposing per-contract quotes, so they are redistributable on the same
-terms as the premium and vol surfaces.
+Scope: `market_raw` — **internal BFF only, not redistributable.** Excluded
+from the `analytics` tier issued to external customers, for the same reason
+`/api/gex/premium_surface` is.
+
+Nothing here is per-contract: every figure is a median or a p90 over a
+population of contracts, and a median does not invert to the values behind
+it. But the *caller* chooses the population — `moneyness_band_pct` goes down
+to `0.25`, `dte_max` to `0`, and each bucket reports its own
+`tradable_count`. Narrow a bucket to a single contract and the quote falls
+out by arithmetic:
+
+```
+median_spread              = ask - bid
+median_relative_spread_pct = 200 * (ask - bid) / (ask + bid)
+=> ask + bid = 200 * median_spread / median_relative_spread_pct
+=> bid and ask, for a contract the same response identifies by expiration,
+   strike band and option type.
+```
+
+There is no field to redact that closes that, so the gate is on the route.
+See the `scopes.py` docstring for where the MARKET_RAW line is drawn and why.
 
 Three measures, each answering a different question:
 
@@ -891,6 +1145,21 @@ purpose.
   remaining patterns land in PR-3+.
 - `GET /api/signals/trades-history` — realized trade ideas with P&L / hit rate.
 - `GET /api/signals/trades-live` — open trade ideas derived from current signal state.
+
+**Grade this on `last_refreshed_at`, not on the row timestamps.** Every row's
+`signal_timestamp` and `opened_at` are the instant the position was *entered*,
+so a position held since the open reads hours old at midday on a perfectly
+healthy engine. The response carries a top-level `last_refreshed_at`: the
+newest mark-to-market write across the open book, which the reconcile loop
+bumps on every open position every cycle. It is `null` when the book is empty
+— an engine holding nothing and a dead engine holding nothing produce the same
+payload, so no claim is made. On v2 this is already what the envelope grades,
+so `freshness.source_timestamp` and `freshness.freshness_status` are correct
+without any special handling.
+
+Unlike `trades-history`, this is a live view: it is graded on the
+`signals_cycle` cadence, so a stopped signal engine reports `stale` rather
+than `static`.
 
 ### Advanced Signals (7, triggered + hysteresis)
 

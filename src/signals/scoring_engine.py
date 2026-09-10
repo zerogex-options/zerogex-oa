@@ -52,9 +52,47 @@ class ScoringEngine:
         "dealer_delta_pressure": 17.0,  # Phase 3.1 12 -> 17 (+5)
     }
 
+    # The magnitude-axis subset, published alongside the composite as
+    # ``aggregation.magnitude_score`` and NOT used for anything yet.
+    #
+    # ``research/msi_regime_excursion`` measured every reading from 2026-06-29
+    # to 2026-09-03 against the price action that followed it, and this subset
+    # ordered realized forward excursion better than the shipped composite on
+    # all 30 instrument-horizon cells -- by +13% on ES and +75% on NQ.  The two
+    # components it drops are the two whose own docstrings describe them as
+    # bullish/bearish rather than as a read on how far price travels
+    # (``order_flow_imbalance``, ``dealer_delta_pressure``), and a composite
+    # rebuilt from those two alone shows no relationship with excursion at all.
+    #
+    # Publishing it costs nothing and changes nothing: it lets the two scores be
+    # compared on live data, and lets the playbook re-gating be replayed
+    # off-line, before anyone decides whether to move the regime bands onto it.
+    # See docs/design/msi-regime-excursion.md.
+    BAND_CANDIDATE_COMPONENTS: frozenset[str] = frozenset({
+        "net_gex_sign",
+        "gamma_anchor",
+        "volatility_regime",
+        "put_call_ratio",
+    })
+
     def __init__(self, underlying: str, components: list[ComponentBase]):
         self.underlying = underlying
         self.components = components
+
+    @staticmethod
+    def _saturate(sum_offset: float, active_points: float, total_points: float) -> float:
+        """Renormalize the active points onto the full scale, then soft-saturate.
+
+        Extracted so the published ``magnitude_score`` is computed by exactly the
+        same arithmetic as the composite rather than a second copy of it.  The
+        expression is unchanged from the inline version it replaces.
+        """
+        if active_points > 0.0:
+            sum_offset_full = sum_offset * (total_points / active_points)
+        else:
+            sum_offset_full = 0.0
+        value = 50.0 + 50.0 * math.tanh(sum_offset_full / _COMPOSITE_SAT_SCALE)
+        return max(0.0, min(100.0, value))
 
     @staticmethod
     def _regime_label(msi: float) -> str:
@@ -86,6 +124,10 @@ class ScoringEngine:
         sum_offset = 0.0
         active_points = 0.0
         total_points = 0.0
+        # Shadow accumulators for the magnitude-axis subset. Same abstention
+        # rule, same renormalization -- they simply see fewer components.
+        band_offset = 0.0
+        band_active = 0.0
         for component in self.components:
             raw = component.compute(ctx)
             clamped_raw = max(-1.0, min(1.0, float(raw)))
@@ -96,6 +138,9 @@ class ScoringEngine:
             if not abstained:
                 sum_offset += points * clamped_raw
                 active_points += points
+                if component.name in self.BAND_CANDIDATE_COMPONENTS:
+                    band_offset += points * clamped_raw
+                    band_active += points
 
             # Per-component DISPLAY score keeps the spectrum guarantee
             # ("0 is near-impossible" — see spectrum.py): abstainers still
@@ -131,20 +176,18 @@ class ScoringEngine:
         # active_points == total_points and this is a no-op (identical to
         # the prior formula).  All components abstaining => genuinely no
         # information => exact neutral 50, not a synthetic drift.
-        if active_points > 0.0:
-            sum_offset_full = sum_offset * (total_points / active_points)
-        else:
-            sum_offset_full = 0.0
-
         # Soft tanh saturation in place of a hard [0, 100] clamp.  Sum of
         # weighted component contributions can mathematically run from
         # -100 to +100; mapping through tanh keeps the composite in
         # (0, 100) open-interval — exact 0 / 100 become asymptotic
         # extremes instead of common saturation points.
-        composite = 50.0 + 50.0 * math.tanh(sum_offset_full / _COMPOSITE_SAT_SCALE)
-        composite = max(0.0, min(100.0, composite))
+        composite = self._saturate(sum_offset, active_points, total_points)
         normalized = composite / 100.0
         direction = self._regime_label(composite)
+
+        # Published for comparison only. Nothing reads it: the regime label
+        # above is still the shipped composite's.
+        magnitude_score = self._saturate(band_offset, band_active, total_points)
 
         snapshot = ScoreSnapshot(
             timestamp=ctx.timestamp,
@@ -153,7 +196,13 @@ class ScoringEngine:
             normalized_score=round(normalized, 6),
             direction=direction,
             components=payload,
-            aggregation={"mode": "market_state_index"},
+            aggregation={
+                "mode": "market_state_index",
+                # Shadow score — see BAND_CANDIDATE_COMPONENTS. Not used.
+                "magnitude_score": round(magnitude_score, 6),
+                "magnitude_direction": self._regime_label(magnitude_score),
+                "magnitude_active_points": round(band_active, 2),
+            },
         )
         return snapshot, component_results
 

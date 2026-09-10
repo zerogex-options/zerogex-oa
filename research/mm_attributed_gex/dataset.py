@@ -23,13 +23,35 @@ correct — and it is also the conservative direction: a series whose history
 turns out to be incomplete is marked incomplete at *every* snapshot, including
 the ones before the evidence appeared.
 
+Arms
+----
+Every row carries up to four positioning arms priced with the same kernels:
+
+* **A — Production Modeled GEX** (``existing_*``): the persisted production
+  reading, plus a recomputation from the same chain as an integrity check.
+* **B1 — Aggressor-Inferred MM flow since open** (``aggressor_mm_flow_*``):
+  a *change*, not a level, built from ZeroGEX's own tape classification with
+  the passive side assumed to be a market maker.
+* **B2 — Production-anchored Aggressor-Inferred MM GEX**
+  (``production_anchored_aggressor_*``): A's quantity plus the B1 change — a
+  labelled hybrid whose starting inventory is Model A.
+* **C — Market-Maker Attributed GEX** (``mm_attributed_*``): the
+  exchange-classified reconstruction, plus its own flow-since-open change
+  (``mm_attributed_flow_*``) so the dynamic tests can compare B1 and C on the
+  same footing.
+
+Either B or C may be absent: the builder runs A-vs-B with no exchange file,
+and A-vs-C with no tape.  Absent arms leave their columns ``None``.
+
 Causality
 ---------
 The replay only ever uses records whose bucket timestamp is ``<=`` the
 snapshot.  For a session-summary feed those buckets are stamped at the session
 close (see ``cboe.loader._bucket_timestamp``), so an end-of-day file can never
 inform a mid-session snapshot of the same day.  This is what keeps the forward
-tests in :mod:`~.backtest` honest.
+tests in :mod:`~.backtest` honest.  The aggressor replay obeys the same rule
+with the row's *known-at* stamp, resets at every cash open, and never carries
+one session's flow into the next.
 """
 
 from __future__ import annotations
@@ -43,7 +65,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from src.analytics.main_engine import AnalyticsEngine
+from src.validation import cash_session_date
 
+from research.mm_attributed_gex.aggressor import (
+    AggressorBucket,
+    AggressorGateConfig,
+    AggressorTimeline,
+    SessionCoverage,
+    coverage_by_session,
+    flow_positions_to_contracts,
+    production_anchored_contracts,
+    session_open_instant,
+)
 from research.mm_attributed_gex.confidence import (
     ConfidenceWeights,
     UniverseConfidence,
@@ -80,6 +113,7 @@ __all__ = [
 ]
 
 RecordsFactory = Callable[[], Iterable[ParticipantActivity]]
+AggressorFactory = Callable[[], Iterable[AggressorBucket]]
 ChainProvider = Callable[[datetime], Sequence[ChainQuote]]
 SummaryProvider = Callable[[datetime], Optional[Mapping[str, Any]]]
 
@@ -99,6 +133,8 @@ class DatasetSpec:
     use_net_flow_estimator: bool = False
     confidence_weights: ConfidenceWeights = field(default_factory=ConfidenceWeights)
     recompute_existing: bool = True
+    #: Per-session minimum-data gates for the Aggressor-Inferred arms.
+    aggressor_gates: AggressorGateConfig = field(default_factory=AggressorGateConfig)
 
 
 @dataclass
@@ -146,6 +182,59 @@ class SnapshotRow:
     mm_accelerant_down: Optional[float] = None
     mm_flip_unresolved: bool = True
     mm_regime: Optional[str] = None
+
+    # Market-Maker Attributed change since the cash open (C as a flow, not a
+    # level).  The unknown pre-window constant cancels in a difference, so this
+    # is computed over every live series regardless of censoring.
+    mm_attributed_flow_gamma_at_spot: Optional[float] = None
+    mm_attributed_flow_net_gex: Optional[float] = None
+    mm_attributed_flow_net_contracts: float = 0.0
+    mm_attributed_flow_n_series: int = 0
+
+    # Aggressor-Inferred MM GEX — B1, flow since open.  A change, not a level:
+    # the assumed MM signed quantity accumulated from zero at 09:30 ET.
+    aggressor_mm_flow_gamma_at_spot: Optional[float] = None
+    aggressor_mm_flow_net_gex: Optional[float] = None
+    aggressor_mm_flow_net_contracts: float = 0.0
+    aggressor_mm_flow_gross_contracts: float = 0.0
+    aggressor_mm_flow_n_series: int = 0
+    aggressor_mm_flow_n_unpriceable: int = 0
+
+    # Aggressor-Inferred MM GEX — B2, production-anchored.  Model A's quantity
+    # plus the B1 change; its starting inventory is the production convention.
+    production_anchored_aggressor_gamma_at_spot: Optional[float] = None
+    production_anchored_aggressor_gamma_flip: Optional[float] = None
+    production_anchored_aggressor_gamma_flip_raw: Optional[float] = None
+    production_anchored_aggressor_gamma_at_spot_unweighted: Optional[float] = None
+    production_anchored_aggressor_net_gex: Optional[float] = None
+    production_anchored_aggressor_call_wall: Optional[float] = None
+    production_anchored_aggressor_put_wall: Optional[float] = None
+    production_anchored_aggressor_call_wall_strength: Optional[float] = None
+    production_anchored_aggressor_put_wall_strength: Optional[float] = None
+    production_anchored_aggressor_b_call_wall: Optional[float] = None
+    production_anchored_aggressor_b_put_wall: Optional[float] = None
+    production_anchored_aggressor_flip_unresolved: bool = True
+    production_anchored_aggressor_regime: Optional[str] = None
+    production_anchored_aggressor_negative_gamma_share: float = 0.0
+    production_anchored_aggressor_concentration_hhi: float = 0.0
+
+    # Aggressor tape diagnostics — the session so far, up to this snapshot.
+    aggressor_available: bool = False
+    aggressor_session_gate_passed: bool = False
+    aggressor_session_gate_reasons: list[str] = field(default_factory=list)
+    aggressor_source: str = "none"
+    aggressor_extrapolated: bool = False
+    aggressor_buckets_observed: int = 0
+    aggressor_series_observed: int = 0
+    aggressor_classified_contracts: float = 0.0
+    aggressor_unclassified_contracts: float = 0.0
+    aggressor_classified_share: float = 0.0
+    aggressor_buyer_share: float = 0.0
+    aggressor_seller_share: float = 0.0
+    aggressor_series_matched_to_chain: int = 0
+    aggressor_series_unmatched: int = 0
+    aggressor_locked_quote_buckets: int = 0
+    aggressor_crossed_quote_buckets: int = 0
 
     # Diagnostics — the "did the methodology fail, or the data?" columns.
     number_of_contracts: int = 0
@@ -339,8 +428,58 @@ def _universe_gamma_abs(
     return sum(abs(r["net_gex"]) for r in strike_rows)
 
 
+def _flow_since_open_positions(
+    current: Sequence[MMPosition],
+    open_net: Mapping[SeriesKey, float],
+    *,
+    reason: str,
+) -> list[MMPosition]:
+    """``net(now) − net(open)`` per series, as positions the pricing path accepts.
+
+    Series that were live at the open and are gone now (retired to zero) still
+    contribute their full reversal.  The unknown pre-window constant of a
+    left-censored series cancels in the difference, so no censoring filter is
+    applied here — this is the *change* arm, and changes are what censoring
+    does not corrupt.
+    """
+    out: list[MMPosition] = []
+    seen: set[SeriesKey] = set()
+    for pos in current:
+        seen.add(pos.key)
+        delta = pos.net_contracts - open_net.get(pos.key, 0.0)
+        if delta == 0.0:
+            continue
+        clone = pos.snapshot()
+        clone.long_contracts = max(delta, 0.0)
+        clone.short_contracts = max(-delta, 0.0)
+        clone.left_censored = False
+        clone.left_censor_reason = reason
+        out.append(clone)
+    for key, opened in open_net.items():
+        if key in seen or opened == 0.0:
+            continue
+        symbol, expiration, strike, option_type = key
+        out.append(
+            MMPosition(
+                key=key,
+                symbol=symbol,
+                expiration=expiration,
+                strike=float(strike),
+                option_type=option_type,
+                long_contracts=max(-opened, 0.0),
+                short_contracts=max(opened, 0.0),
+                left_censored=False,
+                left_censor_reason=reason,
+            )
+        )
+    return out
+
+
+MM_FLOW_REASON = "mm_attributed_flow_since_open"
+
+
 def build_dataset(
-    records_factory: RecordsFactory,
+    records_factory: Optional[RecordsFactory],
     timestamps: Sequence[datetime],
     chain_provider: ChainProvider,
     spot_provider: Callable[[datetime], Optional[float]],
@@ -352,6 +491,7 @@ def build_dataset(
     listing_dates: Optional[Mapping[SeriesKey, date]] = None,
     engine: Optional[AnalyticsEngine] = None,
     progress: Optional[Callable[[int, int], None]] = None,
+    aggressor_factory: Optional[AggressorFactory] = None,
 ) -> tuple[list[SnapshotRow], dict[str, Any]]:
     """Build the side-by-side dataset.
 
@@ -359,39 +499,94 @@ def build_dataset(
     testable with synthetic data and no database — the same code path runs in
     tests and in production research.
 
+    ``records_factory`` (exchange-classified activity, Model C) and
+    ``aggressor_factory`` (ZeroGEX's classified tape, Model B) are each
+    optional; whichever is supplied is replayed causally alongside the
+    production arm.  At least one must be supplied for the row to carry
+    anything beyond Model A.
+
     Returns ``(rows, provenance)``.  ``provenance`` carries the reconstruction
-    summary, so a result set always travels with a description of the data it
-    rests on.
+    summary and the per-session aggressor gates, so a result set always
+    travels with a description of the data it rests on.
     """
     eng = engine or build_engine(spec.symbol)
     stamps = sorted(timestamps)
+    have_c = records_factory is not None
+    have_b = aggressor_factory is not None
 
-    # Pass 1 — classify censoring and gaps over the whole window.
-    classifier = InventoryReconstructor(symbol=spec.symbol, listing_dates=listing_dates)
-    classifier.consume(records_factory()).finalize()
-    censoring = {p.key: (p.left_censored, p.left_censor_reason) for p in classifier.book}
-    missing = {p.key: p.missing_sessions for p in classifier.book}
-    reconstruction_summary = classifier.summary()
+    # Pass 1 (C) — classify censoring and gaps over the whole window.
+    reconstruction_summary: Optional[dict[str, Any]] = None
+    data_completeness = 0.0
+    censoring: dict[SeriesKey, tuple[bool, str]] = {}
+    missing: dict[SeriesKey, tuple[date, ...]] = {}
+    if have_c:
+        assert records_factory is not None
+        classifier = InventoryReconstructor(symbol=spec.symbol, listing_dates=listing_dates)
+        classifier.consume(records_factory()).finalize()
+        censoring = {p.key: (p.left_censored, p.left_censor_reason) for p in classifier.book}
+        missing = {p.key: p.missing_sessions for p in classifier.book}
+        reconstruction_summary = classifier.summary()
 
-    # Data completeness: the share of expected sessions the feed actually
-    # covered.  A single number that answers "was the history there at all?"
-    rep = classifier.report
-    expected_n = len(rep.observed_sessions) + len(rep.session_gaps)
-    data_completeness = (len(rep.observed_sessions) / expected_n) if expected_n else 0.0
+        # Data completeness: the share of expected sessions the feed actually
+        # covered.  A single number that answers "was the history there at all?"
+        rep = classifier.report
+        expected_n = len(rep.observed_sessions) + len(rep.session_gaps)
+        data_completeness = (len(rep.observed_sessions) / expected_n) if expected_n else 0.0
 
-    # Pass 2 — replay.
-    timeline = InventoryTimeline(
-        symbol=spec.symbol,
-        censoring=censoring,
-        listing_dates=listing_dates,
-        missing_sessions=missing,
-    )
+    # Pass 1 (B) — classification coverage and the per-session gates.
+    aggressor_coverage: dict[date, SessionCoverage] = {}
+    aggressor_gates: dict[date, tuple[bool, list[str]]] = {}
+    if have_b:
+        assert aggressor_factory is not None
+        aggressor_coverage = coverage_by_session(aggressor_factory())
+        aggressor_gates = {
+            d: cov.gate(spec.aggressor_gates) for d, cov in aggressor_coverage.items()
+        }
+
+    # Pass 2 — replay.  The C replay also freezes the book at every cash open
+    # (09:30 ET) so the flow-since-open arm can difference against it; those
+    # extra instants never become rows.
+    session_opens = {session_open_instant(cash_session_date(ts)) for ts in stamps}
+    requested = set(stamps)
+    c_stamps = sorted(requested | session_opens)
+    if have_c:
+        assert records_factory is not None
+        timeline = InventoryTimeline(
+            symbol=spec.symbol,
+            censoring=censoring,
+            listing_dates=listing_dates,
+            missing_sessions=missing,
+        )
+        c_replay = timeline.replay(records_factory(), c_stamps)
+    else:
+        c_replay = ((ts, []) for ts in c_stamps)
+    if have_b:
+        assert aggressor_factory is not None
+        b_replay = AggressorTimeline(symbol=spec.symbol).replay(aggressor_factory(), stamps)
+    else:
+        b_replay = ((ts, [], None) for ts in stamps)
+    b_iter = iter(b_replay)
 
     rows: list[SnapshotRow] = []
     total = len(stamps)
-    for i, (ts, positions) in enumerate(timeline.replay(records_factory(), stamps)):
+    done = 0
+    open_net: dict[SeriesKey, float] = {}
+    open_session: Optional[date] = None
+    for ts, positions in c_replay:
+        session = cash_session_date(ts)
+        if session != open_session:
+            open_session = session
+            open_net = {}
+        if ts in session_opens:
+            open_net = {p.key: p.net_contracts for p in positions}
+        if ts not in requested:
+            continue
+        b_ts, b_positions, b_cov = next(b_iter)
+        if b_ts != ts:  # pragma: no cover - both generators walk the same sorted stamps
+            raise RuntimeError(f"replay desynchronised: {b_ts} vs {ts}")
+        done += 1
         if progress is not None:
-            progress(i + 1, total)
+            progress(done, total)
         spot = spot_provider(ts)
         if not spot or spot <= 0:
             continue
@@ -410,11 +605,17 @@ def build_dataset(
             composite_provider=composite_provider,
             vix_provider=vix_provider,
             data_completeness=data_completeness,
+            have_c=have_c,
+            open_net=open_net,
+            aggressor_positions=b_positions,
+            aggressor_coverage=b_cov,
+            aggressor_gate=aggressor_gates.get(session),
+            have_b=have_b,
         )
         if row is not None:
             rows.append(row)
 
-    provenance = {
+    provenance: dict[str, Any] = {
         "spec": {
             "symbol": spec.symbol,
             "headline_universe": spec.headline_universe,
@@ -422,9 +623,41 @@ def build_dataset(
             "apply_horizon_weighting": spec.apply_horizon_weighting,
             "use_net_flow_estimator": spec.use_net_flow_estimator,
             "universes": [u.name for u in spec.universes],
+            "aggressor_gates": {
+                "min_classified_share": spec.aggressor_gates.min_classified_share,
+                "min_buckets": spec.aggressor_gates.min_buckets,
+                "min_series": spec.aggressor_gates.min_series,
+                "allow_extrapolated": spec.aggressor_gates.allow_extrapolated,
+            },
+        },
+        "arms": {
+            "production": True,
+            "aggressor_inferred": have_b,
+            "mm_attributed": have_c,
         },
         "reconstruction": reconstruction_summary,
         "data_completeness": data_completeness,
+        "aggressor": (
+            {
+                "sessions": len(aggressor_coverage),
+                "sessions_passed": sum(1 for ok, _ in aggressor_gates.values() if ok),
+                "sessions_failed": {
+                    d.isoformat(): reasons
+                    for d, (ok, reasons) in sorted(aggressor_gates.items())
+                    if not ok
+                },
+                "coverage_by_session": {
+                    d.isoformat(): cov.as_dict(spec.aggressor_gates)
+                    for d, cov in sorted(aggressor_coverage.items())
+                },
+                "sources": sorted({s for cov in aggressor_coverage.values() for s in cov.sources}),
+                "extrapolated_sessions": sum(
+                    1 for cov in aggressor_coverage.values() if cov.extrapolated
+                ),
+            }
+            if have_b
+            else None
+        ),
         "snapshots_requested": len(stamps),
         "snapshots_built": len(rows),
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -444,6 +677,12 @@ def _build_row(
     composite_provider: Optional[Callable[[datetime], Optional[float]]],
     vix_provider: Optional[Callable[[datetime], Optional[float]]],
     data_completeness: float,
+    have_c: bool = True,
+    open_net: Optional[Mapping[SeriesKey, float]] = None,
+    aggressor_positions: Sequence[MMPosition] = (),
+    aggressor_coverage: Optional[SessionCoverage] = None,
+    aggressor_gate: Optional[tuple[bool, list[str]]] = None,
+    have_b: bool = False,
 ) -> Optional[SnapshotRow]:
     as_of = ts.date()
     row = SnapshotRow(
@@ -492,6 +731,34 @@ def _build_row(
     if vix_provider is not None:
         row.vix_close = vix_provider(ts)
 
+    # --- Aggressor-Inferred (B1 / B2) ------------------------------------
+    by_name: dict[str, Any] = {}
+    headline_key = spec.headline_universe
+    if have_b:
+        _apply_aggressor_arms(
+            row,
+            by_name,
+            chain=chain,
+            spot=spot,
+            ts=ts,
+            spec=spec,
+            engine=engine,
+            aggressor_positions=aggressor_positions,
+            coverage=aggressor_coverage,
+            gate=aggressor_gate,
+        )
+
+    # --- controls that do not depend on the attributed arm ----------------
+    row.is_opex = _third_friday(as_of)
+    row.is_month_end = _is_last_trading_day_of_month(as_of)
+    chain_expirations = sorted({q.expiration for q in chain if q.expiration >= as_of})
+    if chain_expirations:
+        row.dte_front = (chain_expirations[0] - as_of).days
+
+    if not have_c:
+        row.universes = by_name
+        return row
+
     # --- MM-attributed ----------------------------------------------------
     selected_positions = (
         [p for p in positions if not p.left_censored] if spec.clean_only else list(positions)
@@ -504,12 +771,37 @@ def _build_row(
     row.number_of_unpriceable_contracts = len(unpriceable)
     row.estimator_disagreement_contracts = sum(p.estimator_disagreement for p in positions)
 
+    # C as a change since the cash open — the same footing as B1.
+    flow_positions = _flow_since_open_positions(positions, open_net or {}, reason=MM_FLOW_REASON)
+    flow_contracts, _flow_unpriceable = join_positions_to_chain(flow_positions, chain)
+    row.mm_attributed_flow_n_series = len(flow_positions)
+    for universe in spec.universes:
+        if not flow_contracts:
+            break
+        flow_result = compute_mm_gex(
+            flow_contracts,
+            spot,
+            ts,
+            engine=engine,
+            universe=universe,
+            apply_horizon_weighting=spec.apply_horizon_weighting,
+            compute_raw_flip=False,
+        )
+        by_name.setdefault(universe.name, {})["mm_attributed_flow"] = {
+            "gamma_at_spot": flow_result.mm_attributed_gamma_at_spot,
+            "net_gex": flow_result.mm_attributed_net_gex,
+            "net_contracts": flow_result.mm_net_contracts_total,
+            "n_series": flow_result.n_contracts,
+        }
+        if universe.name == headline_key:
+            row.mm_attributed_flow_gamma_at_spot = flow_result.mm_attributed_gamma_at_spot
+            row.mm_attributed_flow_net_gex = flow_result.mm_attributed_net_gex
+            row.mm_attributed_flow_net_contracts = flow_result.mm_net_contracts_total
+
     if not contracts:
-        row.universes = {}
+        row.universes = by_name
         return row
 
-    by_name: dict[str, Any] = {}
-    headline_key = spec.headline_universe
     for universe in spec.universes:
         result = compute_mm_gex(
             contracts,
@@ -521,7 +813,7 @@ def _build_row(
             n_unpriceable=len(unpriceable),
         )
         struct = build_strike_structure(result.strike_rows, spot, universe=universe.name)
-        by_name[universe.name] = {**result.as_dict(), **struct.as_dict()}
+        by_name.setdefault(universe.name, {}).update({**result.as_dict(), **struct.as_dict()})
         if universe.name == headline_key:
             _apply_headline(row, result, struct)
     row.universes = by_name
@@ -544,9 +836,136 @@ def _build_row(
     expirations = sorted({c.expiration for c in contracts})
     if expirations:
         row.dte_front = (expirations[0] - as_of).days
-    row.is_opex = _third_friday(as_of)
-    row.is_month_end = _is_last_trading_day_of_month(as_of)
     return row
+
+
+def _apply_aggressor_arms(
+    row: SnapshotRow,
+    by_name: dict[str, Any],
+    *,
+    chain: Sequence[ChainQuote],
+    spot: float,
+    ts: datetime,
+    spec: DatasetSpec,
+    engine: AnalyticsEngine,
+    aggressor_positions: Sequence[MMPosition],
+    coverage: Optional[SessionCoverage],
+    gate: Optional[tuple[bool, list[str]]],
+) -> None:
+    """Price B1 and B2 for every universe and fill the headline columns.
+
+    A session that fails its minimum-data gate gets diagnostics only: the arm
+    columns stay ``None`` so a poorly classified tape cannot enter the
+    headline results, and the reasons travel with the row.
+    """
+    row.aggressor_available = coverage is not None
+    if coverage is not None:
+        row.aggressor_source = ",".join(sorted(coverage.sources)) or "none"
+        row.aggressor_extrapolated = coverage.extrapolated
+        row.aggressor_buckets_observed = coverage.buckets
+        row.aggressor_series_observed = len(coverage.series)
+        row.aggressor_classified_contracts = float(coverage.classified)
+        row.aggressor_unclassified_contracts = float(coverage.unclassified)
+        row.aggressor_classified_share = coverage.classified_share
+        row.aggressor_buyer_share = coverage.buyer_share
+        row.aggressor_seller_share = coverage.seller_share
+        row.aggressor_locked_quote_buckets = coverage.locked_quote_buckets
+        row.aggressor_crossed_quote_buckets = coverage.crossed_quote_buckets
+    if gate is not None:
+        row.aggressor_session_gate_passed, row.aggressor_session_gate_reasons = gate[0], list(
+            gate[1]
+        )
+    else:
+        row.aggressor_session_gate_passed = False
+        row.aggressor_session_gate_reasons = ["no classified tape for this session"]
+    if not row.aggressor_session_gate_passed:
+        return
+
+    # B1 — flow since open, priced on the same chain.
+    flow_contracts, flow_unpriceable = flow_positions_to_contracts(aggressor_positions, chain)
+    row.aggressor_mm_flow_n_series = len(aggressor_positions)
+    row.aggressor_mm_flow_n_unpriceable = len(flow_unpriceable)
+    row.aggressor_series_matched_to_chain = len(flow_contracts)
+    row.aggressor_series_unmatched = len(flow_unpriceable)
+
+    headline_key = spec.headline_universe
+    for universe in spec.universes:
+        detail = by_name.setdefault(universe.name, {})
+        if flow_contracts:
+            result = compute_mm_gex(
+                flow_contracts,
+                spot,
+                ts,
+                engine=engine,
+                universe=universe,
+                apply_horizon_weighting=spec.apply_horizon_weighting,
+                n_unpriceable=len(flow_unpriceable),
+                compute_raw_flip=False,
+            )
+            detail["aggressor_flow"] = {
+                "gamma_at_spot": result.mm_attributed_gamma_at_spot,
+                "net_gex": result.mm_attributed_net_gex,
+                "net_contracts": result.mm_net_contracts_total,
+                "gross_contracts": result.mm_gross_contracts_total,
+                "n_series": result.n_contracts,
+            }
+            if universe.name == headline_key:
+                row.aggressor_mm_flow_gamma_at_spot = result.mm_attributed_gamma_at_spot
+                row.aggressor_mm_flow_net_gex = result.mm_attributed_net_gex
+                row.aggressor_mm_flow_net_contracts = result.mm_net_contracts_total
+                row.aggressor_mm_flow_gross_contracts = result.mm_gross_contracts_total
+
+    # B2 — production anchor plus the B1 change.
+    anchored, _diag = production_anchored_contracts(chain, aggressor_positions)
+    if not anchored:
+        return
+    for universe in spec.universes:
+        detail = by_name.setdefault(universe.name, {})
+        result = compute_mm_gex(
+            anchored,
+            spot,
+            ts,
+            engine=engine,
+            universe=universe,
+            apply_horizon_weighting=spec.apply_horizon_weighting,
+        )
+        struct = build_strike_structure(result.strike_rows, spot, universe=universe.name)
+        detail["production_anchored"] = {
+            "gamma_at_spot": result.mm_attributed_gamma_at_spot,
+            "gamma_flip": result.mm_attributed_gamma_flip,
+            "gamma_flip_raw": result.mm_attributed_gamma_flip_raw,
+            "net_gex": result.mm_attributed_net_gex,
+            "call_wall": struct.definition_a.call_wall,
+            "put_wall": struct.definition_a.put_wall,
+            "b_call_wall": struct.definition_b.call_wall,
+            "b_put_wall": struct.definition_b.put_wall,
+            "flip_unresolved": result.flip_unresolved,
+            "regime": result.regime,
+            "negative_gamma_share": struct.negative_gamma_share,
+            "concentration_hhi": struct.concentration_hhi,
+        }
+        if universe.name == headline_key:
+            row.production_anchored_aggressor_gamma_at_spot = result.mm_attributed_gamma_at_spot
+            row.production_anchored_aggressor_gamma_flip = result.mm_attributed_gamma_flip
+            row.production_anchored_aggressor_gamma_flip_raw = result.mm_attributed_gamma_flip_raw
+            row.production_anchored_aggressor_gamma_at_spot_unweighted = (
+                result.mm_attributed_gamma_at_spot_unweighted
+            )
+            row.production_anchored_aggressor_net_gex = result.mm_attributed_net_gex
+            row.production_anchored_aggressor_call_wall = struct.definition_a.call_wall
+            row.production_anchored_aggressor_put_wall = struct.definition_a.put_wall
+            row.production_anchored_aggressor_call_wall_strength = (
+                struct.definition_a.call_wall_strength
+            )
+            row.production_anchored_aggressor_put_wall_strength = (
+                struct.definition_a.put_wall_strength
+            )
+            row.production_anchored_aggressor_b_call_wall = struct.definition_b.call_wall
+            row.production_anchored_aggressor_b_put_wall = struct.definition_b.put_wall
+            row.production_anchored_aggressor_flip_unresolved = result.flip_unresolved
+            row.production_anchored_aggressor_regime = result.regime
+            row.production_anchored_aggressor_negative_gamma_share = struct.negative_gamma_share
+            row.production_anchored_aggressor_concentration_hhi = struct.concentration_hhi
 
 
 def _is_last_trading_day_of_month(d: date) -> bool:

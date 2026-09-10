@@ -1,0 +1,54 @@
+[Unit]
+Description=ZeroGEX Gamma Regime per-session read refresh
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Recompute TODAY's since-open Gamma Regime read and upsert it into
+# gex_regime_session.  Two surfaces depend on these rows and neither can be
+# produced any other way:
+#
+#   * the Gamma Shift page's Session History strip renders one bar per stored
+#     session -- with no rows it renders "No stored sessions yet", forever;
+#   * the same rows are the z-score denominator that lets the live card say
+#     "dramatically" and mean it.  Under MIN_SESSIONS_FOR_SIGMA rows the card
+#     falls back to a bootstrap proxy and labels its magnitude provisional.
+#
+# Idempotent by construction: ON CONFLICT (underlying, session_date) upsert
+# over immutable gex_by_strike / gex_summary history, so re-running converges.
+# Today's row is rewritten through the session and freezes into "what today
+# was" once the analytics engine stops writing at the close -- which is why
+# there is no separate end-of-day unit to drift from this one.
+#
+# The tool self-gates to 09:45-16:20 ET on non-holiday weekdays, so the fires
+# either side of the session are cheap no-ops.  Inside the window a run that
+# writes nothing exits non-zero: an empty history strip is exactly the kind of
+# silent, exit-0 failure that goes unnoticed for months.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa regime-session-refresh
+
+# One symbol is a handful of small indexed reads plus one upsert; the whole
+# symbol set finishes in seconds.  The ceiling is here to bound a wedged DB,
+# not to accommodate normal work.
+TimeoutStartSec=300
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-regime-session-refresh

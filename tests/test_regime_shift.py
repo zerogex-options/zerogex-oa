@@ -18,11 +18,14 @@ produce OPPOSITE leans — is :func:`test_lean_flips_sign_across_spot`.
 from __future__ import annotations
 
 import math
+import random
 from datetime import date
 
 import pytest
 
 from src.analytics import regime_shift as rs
+
+QUIET_CUT = rs.QUIET_Z
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +173,36 @@ class TestPositioningSplit:
         row = rs.shift_rows(a, b).rows[0]
 
         assert row.positioning == 0.0
+
+    def test_an_unchanged_oi_window_reports_that_it_cannot_see_positioning(self):
+        """Open interest is a once-a-day settlement figure, so an INTRADAY
+        A->B pair carries the identical number at every strike and the
+        positioning component is zero by construction — not because dealers
+        sat still.
+
+        Without this count the surface draws a flat line at every strike and
+        the reader takes it as "nothing was traded", which is a claim the
+        data cannot support.
+        """
+        a = [_row(k, 100.0, call_oi=1000, call_gex=100.0) for k in (99, 100, 101)]
+        b = [_row(k, 140.0, call_oi=1000, call_gex=140.0) for k in (99, 100, 101)]
+
+        diff = rs.shift_rows(a, b)
+
+        assert diff.oi_moved_strikes == 0
+        assert all(r.positioning == 0.0 for r in diff.rows)
+        # ...and the total change is real: it is all re-pricing.
+        assert all(r.d_net == pytest.approx(40.0) for r in diff.rows)
+
+    def test_counts_only_the_strikes_whose_open_interest_actually_moved(self):
+        a = [_row(k, 100.0, call_oi=1000, call_gex=100.0) for k in (99, 100, 101)]
+        b = [
+            _row(99, 100.0, call_oi=1000, call_gex=100.0),
+            _row(100, 120.0, call_oi=1200, call_gex=120.0),
+            _row(101, 100.0, call_oi=1000, call_gex=100.0),
+        ]
+
+        assert rs.shift_rows(a, b).oi_moved_strikes == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -424,6 +457,103 @@ class TestNormalization:
     def test_stdev_ignores_non_finite_values(self):
         assert rs.stdev([2.0, 4.0, float("nan"), float("inf")]) == pytest.approx(1.0)
 
+    def test_robust_scale_agrees_with_stdev_on_gaussian_data(self):
+        """It has to be a no-op where the standard deviation was already
+        right, or fixing one chain would move every other one."""
+        rng = random.Random(7)
+        sample = [rng.gauss(0, 1) for _ in range(4000)]
+        assert rs.robust_scale(sample) == pytest.approx(rs.stdev(sample), rel=0.05)
+        assert rs.mean_abs_scale(sample) == pytest.approx(rs.stdev(sample), rel=0.05)
+
+    def test_robust_scale_is_measured_about_zero_not_about_the_mean(self):
+        """The numerator is the RAW score, never ``raw - mean``, so the
+        denominator has to describe spread about the same origin.
+
+        It is also the right null on its own terms: the STATE's sign comes
+        from the raw score, so a mean-centred read would call a below-average
+        shedding day FIRMING — support building on a day it eroded.
+        """
+        drifting = [10.0, 10.2, 9.8, 10.1, 9.9, 10.0, 10.1, 9.9, 10.0, 10.0]
+
+        # About the mean this is a near-constant series with no dispersion;
+        # about zero it is a real, steady, repeated shift.
+        assert rs.stdev(drifting) < 0.3
+        assert rs.robust_scale(drifting) == pytest.approx(10.0 * 1.4826, rel=0.02)
+        # So a typical day reads as typical rather than as a 70-sigma event.
+        assert abs(rs.zscore(10.0, rs.robust_scale(drifting))) == pytest.approx(
+            0.67, abs=0.02
+        )
+
+    def test_the_median_session_lands_in_the_same_place_for_every_chain(self):
+        """The property that makes symbols comparable, and the one neither
+        mean-based estimator could deliver.
+
+        A z-score is only meaningful across symbols if a typical session on
+        one chain scores what a typical session on another does. Anchoring on
+        the median gives that BY CONSTRUCTION, whatever shape the rest of the
+        distribution has.
+        """
+        rng = random.Random(19)
+        chains = {
+            "gaussian": [rng.gauss(0, 1) for _ in range(60)],
+            "heavy": [
+                rng.gauss(0, 1) * (9.0 if rng.random() < 0.10 else 1.0)
+                for _ in range(60)
+            ],
+            "drifting": [4.0 + rng.gauss(0, 1) for _ in range(60)],
+        }
+        for name, chain in chains.items():
+            median = sorted(abs(v) for v in chain)[len(chain) // 2]
+            z = abs(rs.zscore(median, rs.robust_scale(chain)))
+            assert z == pytest.approx(1 / 1.4826, abs=0.03), name
+
+    def test_a_mean_based_scale_puts_the_cut_at_or_above_the_typical_day(self):
+        """Why half of every symbol's stored history came out QUIET.
+
+        Measured over 42 sessions on each of SPY, SPX, QQQ and NDX, the ratio
+        ``mean|x| / median|x|`` ran 1.07 to 2.61 — never 1. So a scale built
+        from a mean sits ABOVE the typical session, the typical session's
+        combined magnitude falls at or under QUIET_Z, and the cut swallows
+        half the distribution.
+        """
+        rng = random.Random(23)
+        chain = [
+            rng.gauss(0, 1) * (6.0 if rng.random() < 0.08 else 1.0) for _ in range(4000)
+        ]
+        magnitudes = sorted(abs(v) for v in chain)
+        median = magnitudes[len(magnitudes) // 2]
+        mean = sum(magnitudes) / len(magnitudes)
+
+        # Squarely inside the 1.07-2.61 band the eight production axes showed.
+        assert mean / median == pytest.approx(1.54, abs=0.05)
+
+        def combined(scale):
+            z = rs.zscore(median, scale)
+            return math.hypot(z, z)
+
+        assert combined(rs.mean_abs_scale(chain)) < QUIET_CUT
+        assert combined(rs.robust_scale(chain)) > QUIET_CUT
+        # The median session lands in the same place whatever the shape.
+        assert combined(rs.robust_scale(chain)) == pytest.approx(
+            math.sqrt(2) / 1.4826, abs=0.02
+        )
+
+    def test_robust_scale_has_no_scale_only_when_nothing_moved(self):
+        """Zero would make the next real move's z infinite, so the caller is
+        routed to its bootstrap proxy instead."""
+        assert rs.robust_scale([]) is None
+        assert rs.robust_scale([1.0]) is None
+        assert rs.robust_scale([0.0, 0.0, 0.0]) is None
+        # A CONSTANT series is not degenerate here, unlike for stdev:
+        # measured about zero it has a perfectly good scale.
+        assert rs.stdev([5.0, 5.0, 5.0]) is None
+        assert rs.robust_scale([5.0, 5.0, 5.0]) == pytest.approx(5.0 * 1.4826)
+
+    def test_robust_scale_ignores_non_finite_values(self):
+        assert rs.robust_scale([2.0, 4.0, float("nan"), float("inf")]) == pytest.approx(
+            3.0 * 1.4826
+        )
+
     def test_percentile_of(self):
         pop = [1.0, 2.0, 3.0, 4.0]
         assert rs.percentile_of(4.0, pop) == pytest.approx(1.0)
@@ -432,6 +562,84 @@ class TestNormalization:
 
     def test_percentile_of_an_empty_population_is_none(self):
         assert rs.percentile_of(1.0, []) is None
+
+
+# --------------------------------------------------------------------------- #
+# The bootstrap denominator and the horizon it is measured over
+# --------------------------------------------------------------------------- #
+class TestProxySigma:
+    def _scores(self, rows, spot):
+        return rs.weighted_scores(rows, spot)
+
+    def test_the_proxy_scales_with_the_book_it_is_measured_against(self):
+        """Same shift shape on a book ten times the size needs a denominator
+        ten times the size, or the bigger symbol reads as a bigger event
+        purely for being bigger."""
+        small = rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=100.0)
+        large = rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=1000.0)
+
+        assert rs.proxy_sigma(large) == pytest.approx(rs.proxy_sigma(small) * 10)
+
+    def test_an_empty_book_has_no_proxy_rather_than_a_made_up_one(self):
+        assert rs.proxy_sigma(rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=0.0)) is None
+        assert (
+            rs.proxy_sigma(rs.ShiftScores(0, 0, 0, 0, 1.0, near_spot_stock=float("nan")))
+            is None
+        )
+
+    def test_near_spot_stock_is_weighted_like_the_scores_are(self):
+        """It has to be the same kind of quantity as lean/stability or the
+        ratio between them means nothing."""
+        rows = _diff_rows({100: 0.0, 130: 0.0}, {100: 10.0, 130: 10.0})
+        scores = rs.weighted_scores(rows, 100.0)
+
+        # Strike 130 is ~30 kernel widths out on a spot of 100 — it carries
+        # essentially no weight in the score, so it must carry essentially
+        # none of the stock either.
+        near = rs.weighted_scores(_diff_rows({100: 0.0}, {100: 10.0}), 100.0)
+        assert scores.near_spot_stock == pytest.approx(near.near_spot_stock)
+        assert scores.near_spot_stock > 0
+
+    def test_a_read_off_a_real_shift_is_not_quiet(self):
+        """The regression this exists for: a genuine repositioning printing
+        QUIET because the bootstrap denominator was borrowed from a
+        different kind of quantity entirely."""
+        rows = _diff_rows(
+            {99: 0.0, 100: 0.0, 101: 0.0},
+            {99: 400.0, 100: 300.0, 101: 200.0},
+        )
+        scores = rs.weighted_scores(rows, 101.0)
+        sigma = rs.proxy_sigma(scores)
+
+        read = rs.classify(
+            rs.zscore(scores.lean, sigma), rs.zscore(scores.stability, sigma)
+        )
+        assert read.state != "QUIET"
+
+
+class TestHorizonFactor:
+    def test_a_full_session_is_the_unit(self):
+        assert rs.horizon_factor(rs.SESSION_HOURS) == pytest.approx(1.0)
+
+    def test_shorter_windows_get_a_shorter_yardstick(self):
+        assert rs.horizon_factor(1.0) < 1.0
+        assert rs.horizon_factor(0.5) < rs.horizon_factor(2.0) < 1.0
+
+    def test_longer_windows_get_a_longer_one(self):
+        assert rs.horizon_factor(rs.SESSION_HOURS * 5) > 1.0
+
+    def test_square_root_of_time(self):
+        assert rs.horizon_factor(rs.SESSION_HOURS * 4) == pytest.approx(2.0)
+
+    @pytest.mark.parametrize("hours", [0.0, -3.0, float("nan"), float("inf")])
+    def test_a_nonsense_horizon_leaves_the_yardstick_alone(self, hours):
+        assert rs.horizon_factor(hours) == 1.0
+
+    def test_clamped_at_both_ends(self):
+        """An unclamped factor would let a 1-minute window manufacture sigma
+        out of a denominator near zero."""
+        assert rs.horizon_factor(1 / 3600) == rs._HORIZON_MIN
+        assert rs.horizon_factor(10_000.0) == rs._HORIZON_MAX
 
 
 # --------------------------------------------------------------------------- #

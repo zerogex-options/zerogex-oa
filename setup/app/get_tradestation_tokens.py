@@ -15,10 +15,38 @@ documentation for Auth Code Flow:
 https://api.tradestation.com/docs/fundamentals/authentication/auth-code
 """
 
+import argparse
 import os
+import shutil
+import sys
+import time
 import requests
 from urllib.parse import urlencode, urlparse, parse_qs
 from dotenv import load_dotenv
+
+# Repo root, so the identity helper is importable and .env is found wherever
+# the repo is checked out rather than only under /home/ubuntu.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _REPO_ROOT)
+
+_parser = argparse.ArgumentParser(description="Mint a TradeStation refresh token.")
+_parser.add_argument(
+    "--var",
+    default="TRADESTATION_REFRESH_TOKEN",
+    help="Which .env variable to write. Use TRADESTATION_FUTURES_REFRESH_TOKEN "
+    "when authorising the SECOND username (the one holding real-time CME) so "
+    "the main credential is left alone.",
+)
+_parser.add_argument(
+    "--no-write", action="store_true", help="Print the token; do not touch .env."
+)
+_parser.add_argument(
+    "--print-token",
+    action="store_true",
+    help="Print the FULL refresh token. It is a secret — it will be in your "
+    "shell scrollback.",
+)
+_ARGS = _parser.parse_args()
 
 print("\n" + "="*60)
 print("TradeStation OAuth Setup")
@@ -118,20 +146,65 @@ if response.status_code == 200:
         print(f"   Refresh Token: {refresh_token[:20]}...")
         print(f"   Expires in: {expires_in} seconds")
 
-        # Read lines from .env
-        env_path = '/home/ubuntu/zerogex-oa/.env'
+        # WHICH USERNAME did you just authorise? Market-data entitlements
+        # attach to the username, not to the API application, so a token minted
+        # from the wrong browser session is the single easiest mistake to make
+        # here — and without this line it is invisible until prices come back
+        # stale days later.
+        username = None
+        try:
+            from src.tools.tradestation_whoami import decode_jwt_payload, username_of
+
+            username = username_of(decode_jwt_payload(access_token))
+        except Exception:
+            pass
+        print(f"   Username:      {username or '(could not be determined)'}")
+
+        if _ARGS.print_token or _ARGS.no_write:
+            print(f"\n   FULL refresh token (secret — now in your scrollback):\n   {refresh_token}")
+
+        if _ARGS.no_write:
+            print("\n--no-write: .env not modified.")
+            print(f"Set it yourself:  {_ARGS.var}=<the token above>")
+            raise SystemExit(0)
+
+        env_path = os.path.join(_REPO_ROOT, '.env')
         with open(env_path, 'r') as f:
             lines = f.readlines()
 
-        # Update .env with updated refresh tokens
+        # BACK UP FIRST. This script rewrites a live production credential, and
+        # the value it replaces cannot be recovered from anywhere else — a
+        # refresh token is shown once. Overwriting the main credential while
+        # meaning to add a second one is a real incident, not a hypothetical.
+        backup = f"{env_path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+        shutil.copy2(env_path, backup)
+        os.chmod(backup, 0o600)
+
+        prefix = f"{_ARGS.var}="
+        previous = next((ln for ln in lines if ln.startswith(prefix)), None)
+        replaced = False
         with open(env_path, 'w') as f:
             for line in lines:
-                if line.startswith('TRADESTATION_REFRESH_TOKEN='):
-                    f.write(f"TRADESTATION_REFRESH_TOKEN={refresh_token}\n")
+                if line.startswith(prefix):
+                    f.write(f"{prefix}{refresh_token}\n")
+                    replaced = True
                 else:
                     f.write(line)
+            # Append when the variable is absent. Without this, --var for a new
+            # variable matched no line and the script reported success having
+            # written nothing at all.
+            if not replaced:
+                if lines and not lines[-1].endswith("\n"):
+                    f.write("\n")
+                f.write(f"{prefix}{refresh_token}\n")
 
-        print(f"\n💾 Refresh token saved to {env_path}")
+        print(f"\n💾 {_ARGS.var} {'updated in' if replaced else 'ADDED to'} {env_path}")
+        print(f"   Previous .env backed up to {backup}")
+        if replaced and previous:
+            print(f"   It REPLACED an existing {_ARGS.var} — recover it from the backup")
+            print("   above if that was not what you intended.")
+        print("\nConfirm which username each feed now runs as:")
+        print("   make ts-whoami")
         print("\n✅ Done! You can now start your services.")
 
     else:

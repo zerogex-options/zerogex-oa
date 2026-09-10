@@ -1,0 +1,284 @@
+"""The MARKET_RAW boundary, asserted against the mounted route table.
+
+``/api/market/open-interest`` shipped gated on ``MARKET_RAW`` while
+returning no quoted price at all — ``open_interest`` plus a derived
+``exposure``. It was the only quoteless route in that bundle, and the
+identical per-strike OI was already served on ``GEX`` by
+``/api/gex/by-strike`` and ``/api/gex/strike-profile-timeseries``. So the
+gate withheld nothing and 403'd paying integrations that asked for the
+data by its own name (reported by a customer on 2026-09-03, after the same
+misclassification contributed to the 2026-08-31 enforcement incident).
+
+These tests exist because reading ``main.py`` is not enough to catch that.
+A route inherits its gate from ``include_router``, moves between routers,
+and is declared far from the model it returns — the three facts you need
+are in three files. So the checks below walk the REAL mounted app, read
+each route's required scopes off the dependency graph (via the
+``required_scopes`` attribute ``require_scopes`` attaches), and inspect the
+response model's fields recursively.
+
+The invariant is deliberately narrow and mechanical: **a payload carrying a
+quoted price must require MARKET_RAW.** That is what the scope can defend
+and test. It is not a claim about what is licensable — see the scopes.py
+docstring and ``docs/compliance/market-data-licensing-audit-2026-09-02.md``
+(F5) for the question that is still open.
+"""
+
+from __future__ import annotations
+
+import typing
+from typing import Any, Set
+
+import pytest
+from fastapi.routing import APIRoute
+from pydantic import BaseModel
+
+from src.api import scopes
+from src.api.main import app
+
+# Field names that ARE a quoted price. A payload exposing any of these is
+# handing over the vendor's quote, whatever the endpoint is called.
+RAW_QUOTE_FIELDS = frozenset({"bid", "ask", "last", "mid", "bid_price", "ask_price"})
+
+# A quoted price under another name, or one recoverable from what sits beside
+# it. ``premium`` on /api/gex/premium_surface is the mid quote; its siblings
+# make it recoverable even if it were dropped, since ``intrinsic`` is
+# max(0, spot-strike) and ``extrinsic`` is max(0, premium - intrinsic) — so
+# extrinsic == premium at every OTM strike. Held in its own set so the reason
+# is written down, but enforced identically: the rule is about the value
+# reaching the caller, not the label on it.
+DERIVED_QUOTE_FIELDS = frozenset({"premium"})
+
+# Quote WIDTHS. These are aggregates — a median over a population of
+# contracts — and a median does not invert to the values behind it. They are
+# listed anyway, because the caller chooses the population: /api/market/spreads
+# takes moneyness_band_pct down to 0.25 and dte_max to 0, and reports
+# tradable_count per bucket. Narrowed to a single contract,
+# ``median_spread`` is ask-bid and ``median_relative_spread_pct`` is
+# 200*(ask-bid)/(ask+bid) — two equations, two unknowns, and the response
+# names the expiration, strike band and option type they belong to.
+#
+# So "it is only an aggregate" is not on its own a reason to sit outside
+# MARKET_RAW, and this set is where that gets enforced rather than argued.
+AGGREGATE_QUOTE_FIELDS = frozenset(
+    {"median_spread", "median_relative_spread_pct", "p90_relative_spread_pct"}
+)
+
+QUOTE_FIELDS = RAW_QUOTE_FIELDS | DERIVED_QUOTE_FIELDS | AGGREGATE_QUOTE_FIELDS
+
+
+class _Endpoint(typing.NamedTuple):
+    path: str
+    methods: typing.Tuple[str, ...]
+    response_model: Any
+    required_scopes: frozenset
+
+
+def _scopes_from_dependant(route: Any) -> Set[str]:
+    """Walk a mounted route's resolved dependency graph."""
+    required: Set[str] = set()
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        return required
+    stack = list(dependant.dependencies)
+    while stack:
+        dep = stack.pop()
+        if dep.call is not None:
+            required |= set(getattr(dep.call, "required_scopes", frozenset()))
+        stack.extend(dep.dependencies)
+    return required
+
+
+def _scopes_from_depends(dependencies) -> Set[str]:
+    """Read scopes off a list of unresolved ``Depends`` markers."""
+    required: Set[str] = set()
+    for dep in dependencies or []:
+        call = getattr(dep, "dependency", None)
+        required |= set(getattr(call, "required_scopes", frozenset()))
+    return required
+
+
+def _iter_api_routes():
+    """Every mounted API route, however FastAPI happens to store it.
+
+    FastAPI >=0.140 stops flattening ``include_router`` into ``app.routes``
+    — it appends one internal wrapper per call and exposes the real routes
+    through ``effective_route_contexts()``. Reading only ``app.routes``
+    therefore sees a handful of ``@app.get`` routes and misses every
+    router-mounted endpoint, which on this tree is most of the surface
+    (including ``/api/option/contract`` — one of the two things MARKET_RAW
+    exists for). ``src/api/v2.py:_iter_route_specs`` solves the same
+    problem for the v2 mirror and is the reference for this walk.
+
+    The v2 twins are deliberately walked too: they inherit v1's
+    dependencies, so covering them proves the mirror carries the gate
+    rather than publishing an ungated copy of the same payload.
+    """
+    for route in list(app.routes):
+        if isinstance(route, APIRoute):
+            yield _Endpoint(
+                path=route.path,
+                methods=tuple(sorted(route.methods or ())),
+                response_model=route.response_model,
+                required_scopes=frozenset(_scopes_from_dependant(route)),
+            )
+            continue
+        contexts = getattr(route, "effective_route_contexts", None)
+        if contexts is None:
+            continue  # websockets, /docs, /openapi.json
+        for ctx in contexts():
+            yield _Endpoint(
+                path=ctx.path,
+                methods=tuple(sorted(ctx.methods or ())),
+                response_model=ctx.response_model,
+                required_scopes=frozenset(_scopes_from_depends(ctx.dependencies)),
+            )
+
+
+def _model_fields(annotation: Any, _seen: Set[Any] | None = None) -> Set[str]:
+    """Every field name reachable from a response annotation, recursively.
+
+    Unwraps ``List[Model]``, ``Optional[Model]`` and nested models, so a
+    quote field buried in ``Response.contracts[].bid`` is still found —
+    which is exactly the shape ``OpenInterestResponse`` uses.
+    """
+    seen = _seen if _seen is not None else set()
+    found: Set[str] = set()
+    if annotation is None or annotation in seen:
+        return found
+    seen.add(annotation)
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        for name, field in annotation.model_fields.items():
+            found.add(name)
+            found |= _model_fields(field.annotation, seen)
+        return found
+
+    for arg in typing.get_args(annotation):
+        found |= _model_fields(arg, seen)
+    return found
+
+
+def _data_routes():
+    return [e for e in _iter_api_routes() if e.response_model is not None]
+
+
+def _by_path(path: str) -> _Endpoint:
+    match = next((e for e in _iter_api_routes() if e.path == path), None)
+    assert match is not None, f"{path} is not mounted — has it moved or been pulled?"
+    return match
+
+
+def test_the_route_table_is_actually_introspectable():
+    """Guard the guard: if `required_scopes` ever stops being attached, every
+    assertion below would pass vacuously."""
+    gated = [e for e in _data_routes() if e.required_scopes]
+    assert gated, (
+        "no route reported any required scope — require_scopes stopped "
+        "exposing `required_scopes`, and this whole suite is now vacuous"
+    )
+
+
+def test_no_quote_bearing_payload_escapes_market_raw():
+    """The invariant. A response carrying a quoted price needs MARKET_RAW.
+
+    Covers both spellings — a literal ``bid``/``ask``/``last``/``mid``, and
+    a quote wearing another name (see ``DERIVED_QUOTE_FIELDS``). A new
+    endpoint that publishes either is caught here without needing its own
+    test.
+    """
+    leaks = []
+    for endpoint in _data_routes():
+        fields = _model_fields(endpoint.response_model)
+        quoted = fields & QUOTE_FIELDS
+        if not quoted:
+            continue
+        if scopes.MARKET_RAW not in endpoint.required_scopes:
+            leaks.append(f"{list(endpoint.methods)} {endpoint.path} exposes {sorted(quoted)}")
+    assert not leaks, (
+        "these routes return a quoted option price without requiring "
+        f"MARKET_RAW, so any analytics-tier key can read it: {leaks}"
+    )
+
+
+@pytest.mark.parametrize("path", ["/api/market/open-interest", "/api/v2/market/open-interest"])
+def test_open_interest_is_reachable_on_the_analytics_bundle(path):
+    """The fix. OI is dealer-positioning input, not a quote.
+
+    Pinned against the tier BUNDLES rather than the scope name, because what
+    broke the customer was a bundle that could not reach the endpoint — the
+    scope it happened to be called was incidental to that. The v2 twin is
+    covered too: a caller told to migrate must not walk into the same 403.
+    """
+    endpoint = _by_path(path)
+    required = endpoint.required_scopes
+
+    # Ordered so the first failure names the consequence, not the mechanism:
+    # what the customer hit was "my tier cannot reach this endpoint".
+    for tier in (scopes.TIER_ANALYTICS, scopes.TIER_SIGNALS):
+        assert required <= scopes.TIERS[tier], (
+            f"{path} requires {sorted(required)}, which the {tier!r} tier "
+            f"cannot satisfy (it grants {sorted(scopes.TIERS[tier])}) — "
+            "an external key gets 403 here again"
+        )
+    assert scopes.MARKET_RAW not in required, (
+        f"{path} is back under MARKET_RAW; it returns no quoted price, and "
+        "the same per-strike OI is served on GEX by /api/gex/by-strike"
+    )
+
+    fields = _model_fields(endpoint.response_model)
+    assert "open_interest" in fields
+    assert not (fields & QUOTE_FIELDS), (
+        "open-interest started returning a quoted price; it belongs back under " "MARKET_RAW if so"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/option/quote", "/api/option/contract", "/api/tools/option-calculator"],
+)
+def test_the_quote_surfaces_still_require_market_raw(path):
+    """Regression pin on what MARKET_RAW is actually for. If a later change
+    empties the scope of every route, the invariant above passes trivially."""
+    assert (
+        scopes.MARKET_RAW in _by_path(path).required_scopes
+    ), f"{path} returns per-contract prices and must require MARKET_RAW"
+
+
+@pytest.mark.parametrize("path", ["/api/gex/premium_surface", "/api/v2/gex/premium_surface"])
+def test_premium_surface_needs_market_raw_because_its_z_axis_is_the_quote(path):
+    """The surface cannot be served without the quote, so the route is gated.
+
+    ``premium`` is the mid quote. ``intrinsic`` is ``max(0, spot - strike)``,
+    computed from the underlying. ``extrinsic`` is
+    ``max(0, premium - intrinsic)``. So at every OTM strike intrinsic is 0
+    and ``extrinsic == premium``; elsewhere ``premium == extrinsic +
+    intrinsic``. Dropping the ``premium`` field alone would leave the quote
+    recoverable by addition — which is why this is gated at the ROUTE and
+    not by field selection, and why it sits beside /api/option/quote rather
+    than beside the vol surface.
+
+    The vol surface is the contrast worth keeping in view: IV only, and an
+    IV does not invert to a price without the rate, dividend and time
+    conventions behind it. It stays on GEX (asserted below).
+    """
+    endpoint = _by_path(path)
+    assert scopes.MARKET_RAW in endpoint.required_scopes, (
+        f"{path} publishes a quoted option premium and must require "
+        "MARKET_RAW; field-level redaction does not work here (see docstring)"
+    )
+    assert (
+        not endpoint.required_scopes <= scopes.TIERS[scopes.TIER_SIGNALS]
+    ), f"{path} is reachable from a customer bundle again"
+
+
+def test_the_vol_surface_stays_derived():
+    """Guard against over-correcting: IV is ours, and must not be swept in
+    with the premium surface just because both are 'surfaces'."""
+    endpoint = _by_path("/api/gex/vol_surface")
+    fields = _model_fields(endpoint.response_model)
+    assert not (
+        fields & QUOTE_FIELDS
+    ), f"vol_surface now returns a price: {sorted(fields & QUOTE_FIELDS)}"
+    assert scopes.MARKET_RAW not in endpoint.required_scopes
+    assert endpoint.required_scopes <= scopes.TIERS[scopes.TIER_ANALYTICS]

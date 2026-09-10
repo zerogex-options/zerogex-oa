@@ -294,27 +294,28 @@ async def build_playbook_context(
     if timestamp.tzinfo is None:
         timestamp = pytz.UTC.localize(timestamp)
 
-    # Fetch every known advanced + basic signal in parallel-ish (sequential
-    # but cheap; PR-3 can batch into a single query if it matters).
+    # Every advanced + basic signal in ONE query. This loop used to call
+    # get_advanced_signal / get_basic_signal per name — 13 connection
+    # acquisitions, plus 13 more queries because each of those also fetches
+    # that component's score history, which _snapshot_from_row does not read.
+    # It mattered: it made this the slowest endpoint on the API (individual
+    # requests past 150s on 2026-08-31), because 13 sequential acquisitions
+    # each queue behind every other request once the pool is contended.
+    # The three histories the patterns DO aggregate over are still fetched
+    # by name below, where they are actually used.
+    signal_rows = await db.get_component_signals_bulk(
+        underlying, list(ADVANCED_SIGNAL_NAMES) + list(BASIC_SIGNAL_NAMES)
+    )
+
     advanced: dict[str, SignalSnapshot] = {}
     for name in ADVANCED_SIGNAL_NAMES:
-        try:
-            row = await db.get_advanced_signal(underlying, name)
-        except Exception as exc:
-            logger.warning("get_advanced_signal(%s, %s) failed: %s", underlying, name, exc)
-            row = None
-        snap = _snapshot_from_row(name, row)
+        snap = _snapshot_from_row(name, signal_rows.get(name))
         if snap:
             advanced[name] = snap
 
     basic: dict[str, SignalSnapshot] = {}
     for name in BASIC_SIGNAL_NAMES:
-        try:
-            row = await db.get_basic_signal(underlying, name)
-        except Exception as exc:
-            logger.warning("get_basic_signal(%s, %s) failed: %s", underlying, name, exc)
-            row = None
-        snap = _snapshot_from_row(name, row)
+        snap = _snapshot_from_row(name, signal_rows.get(name))
         if snap:
             basic[name] = snap
 

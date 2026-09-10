@@ -51,7 +51,13 @@ import requests as _requests
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
-from src.config import _getenv_int, _getenv_bool, _getenv_str, API_REQUEST_TIMEOUT
+from src.config import (
+    _getenv_int,
+    _getenv_bool,
+    _getenv_str,
+    API_REQUEST_TIMEOUT,
+    futures_tradestation_credentials,
+)
 from src.market_calendar import is_futures_ingest_window
 from src.symbols import resolve_index_future
 from src.utils import get_logger
@@ -506,10 +512,12 @@ def run_futures_ingester(index_symbol: str) -> None:
         )
         return
 
+    # The futures feeds may run under a SECOND TradeStation username — the one
+    # carrying the real-time CME entitlement — while everything else keeps the
+    # main credential. Falls back to the main one when unset. See
+    # futures_tradestation_credentials() for why this is not one global token.
     client = TradeStationClient(
-        os.getenv("TRADESTATION_CLIENT_ID", ""),
-        os.getenv("TRADESTATION_CLIENT_SECRET", ""),
-        os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
+        *futures_tradestation_credentials(),
         sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 

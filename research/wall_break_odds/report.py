@@ -1,0 +1,674 @@
+"""Rendering — plain text, and deliberately hard to over-read.
+
+Two rules shape everything here:
+
+* **A number that cannot be supported is not printed.**  Every rate carries
+  its ``n`` and a Wilson interval; every bucket under the reporting floor
+  prints ``insufficient data`` instead of a percentage.  A study whose headline
+  finding is "we do not have enough events yet" has to be able to SAY that,
+  or it will say something else.
+* **Out-of-sample first.**  The walk-forward block is printed above the
+  coefficients, and the coefficient block is labelled as direction-only, so a
+  reader skimming for a number lands on the honest one.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping, Optional, Sequence
+
+__all__ = ["render_report"]
+
+_RULE = "=" * 78
+_THIN = "-" * 78
+
+
+def _pct(x: Optional[float], digits: int = 1) -> str:
+    return "n/a" if x is None else f"{x * 100:.{digits}f}%"
+
+
+def _num(x: Optional[float], digits: int = 4) -> str:
+    return "n/a" if x is None else f"{x:.{digits}f}"
+
+
+def _rate_line(label: str, block: Mapping[str, Any]) -> str:
+    n = block.get("n", 0)
+    if not block.get("reportable"):
+        return f"  {label:<10} n={n:<6} insufficient data"
+    ci = block.get("ci95") or [None, None]
+    return (
+        f"  {label:<10} n={n:<6} breaks={block.get('breaks', 0):<5} "
+        f"P(break | tested) = {_pct(block.get('rate'))}  "
+        f"[95% {_pct(ci[0])} – {_pct(ci[1])}]"
+    )
+
+
+def _sample_block(meta: Mapping[str, Any]) -> list[str]:
+    lines = ["SAMPLE", _THIN]
+    lines.append(f"  symbol                {meta.get('symbol')}")
+    lines.append(f"  window                {meta.get('start')} .. {meta.get('end')}")
+    if meta.get("config_conflict"):
+        lines.append(
+            "  ** pooled datasets were built with DIFFERENT label settings;"
+            " the outcomes are not comparable"
+        )
+    lines.append(f"  sessions with frames  {meta.get('sessions_seen', 0)}")
+    lines.append(f"  sessions contributing {meta.get('sessions_used', 0)}")
+    skipped = meta.get("skipped") or {}
+    if skipped:
+        for reason, count in sorted(skipped.items(), key=lambda kv: -kv[1]):
+            lines.append(f"    skipped: {reason:<20} {count}")
+    lines.append(f"  wall tests found      {meta.get('events_total', 0)}")
+    lines.append(
+        f"  censored              {meta.get('events_censored', 0)}"
+        "   — horizon ran past 16:00 ET; USED by the curve,"
+    )
+    lines.append("                              excluded from the base rate below")
+    lines.append(f"  resolved              {meta.get('events_resolved', 0)}")
+    fetched = meta.get("flow_rows_fetched")
+    if fetched is not None:
+        usable = meta.get("flow_contracts_usable", 0)
+        with_flow = meta.get("events_with_flow", 0)
+        lines.append(
+            f"  flow rows fetched     {fetched}"
+            f"  (usable contracts {usable}; events with a flow value {with_flow})"
+        )
+        if fetched and not usable:
+            lines.append(
+                "    ** flow rows were fetched but NONE were usable — this is an "
+                "encoding mismatch, not a quiet tape"
+            )
+    return lines
+
+
+def _config_block(cfg: Mapping[str, Any]) -> list[str]:
+    lines = ["EVENT DEFINITION", _THIN]
+    lines.append(f"  tested        price within {cfg.get('touch_pct', 0) * 1e4:.1f} bp of the wall")
+    lines.append(
+        f"  broke         closed {cfg.get('break_buffer_pct', 0) * 1e4:.1f} bp beyond it for "
+        f"{cfg.get('confirm_minutes')} consecutive minutes"
+    )
+    lines.append(f"  held          {cfg.get('resolution_minutes')} min elapsed without that")
+    lines.append(f"  re-arm        {cfg.get('rearm_minutes')} min after a resolved test")
+    lines.append("  a wall that breaks is spent — it emits no further tests that session")
+    return lines
+
+
+#: Horizons the survival block quotes. Chosen to bracket a 0DTE holding
+#: period rather than to flatter the curve.
+SURVIVAL_MARKS = (5, 15, 30, 45, 60)
+
+
+def _survival_block(
+    curve: Sequence[Any],
+    n_obs: int,
+    n_breaks: int,
+    confirm_minutes: Optional[int] = None,
+) -> list[str]:
+    """P(break within t) as a curve, which is the horizon-free answer.
+
+    The point estimate this replaces moved from 15% to 34% on nothing but a
+    change of horizon, so the curve is printed FIRST and the single-horizon
+    rate is kept below it only as a cross-check.
+    """
+    from research.wall_break_odds.survival import break_probability_at
+
+    lines = [
+        "P(BREAK WITHIN t)  Kaplan-Meier, all tests including late-session",
+        _THIN,
+        "  Every test contributes the time it was actually watched. A test that",
+        "  held 15 minutes and then hit the bell is right-censored at 15, not",
+        "  discarded — so this uses the whole sample, not just the tests with",
+        "  room to resolve.",
+        "",
+    ]
+    if not curve:
+        lines.append(f"  no curve — {n_breaks} breaks among {n_obs} observations")
+        return lines
+    lines.append(f"  observations {n_obs}   breaks {n_breaks}")
+    lines.append("")
+    lines.append(f"    {'within':<10}{'P(break)':>12}{'95% CI':>22}{'at risk':>10}")
+    floor = int(confirm_minutes or 0)
+    for mark in SURVIVAL_MARKS:
+        # A break needs confirm_minutes of consecutive closes beyond the
+        # buffer, so no break can be OBSERVED before then. Printing a
+        # definitional zero beside estimated values invites reading it as a
+        # measurement; it is an artefact of the label and now says so.
+        if mark < floor:
+            lines.append(
+                f"    {str(mark) + ' min':<10}{'—':>12}"
+                f"   not observable: confirmation takes {floor} min"
+            )
+            continue
+        point = break_probability_at(curve, mark)
+        if point is None:
+            lines.append(f"    {str(mark) + ' min':<10}{'no breaks yet':>12}")
+            continue
+        ci = f"[{point.break_lo * 100:.1f}% – {point.break_hi * 100:.1f}%]"
+        lines.append(
+            f"    {str(mark) + ' min':<10}{point.break_prob * 100:>11.1f}%{ci:>22}"
+            f"{point.at_risk:>10}"
+        )
+    return lines
+
+
+def _consistency_block(cons: Mapping[str, Any]) -> list[str]:
+    """Per-feature sign agreement across every symbol — the decisive read.
+
+    Printed above the pairwise matrix because it answers the question the
+    matrix cannot: a feature that genuinely predicts breaking points the same
+    way everywhere, and the count that does so is directly comparable to the
+    count chance would produce.
+    """
+    symbols = cons["symbols"]
+    observed = cons["n_consistent"]
+    expected = cons["expected_by_chance"]
+    lines = [
+        "FEATURE CONSISTENCY  (does each feature point the same way everywhere?)",
+        _THIN,
+        "  A real predictor keeps its sign in every symbol. Under the null that",
+        "  is a coin flip per symbol, so this compares how many features agree",
+        "  against how many would agree by chance. Pairwise correlation cannot",
+        "  settle this — these features move together, so two samples can",
+        "  correlate with nothing real underneath.",
+        "",
+        f"  features compared     {cons['n_features']}",
+        f"  sign-consistent       {observed}",
+        f"  expected by chance    {expected:.1f}",
+        "",
+    ]
+    if observed <= expected + 1e-9:
+        lines.append("    -> at or below chance. No feature has survived.")
+    elif observed >= 2 * expected:
+        lines.append("    -> above chance; the consistent features below are worth pursuing.")
+    else:
+        lines.append("    -> barely above chance; not enough to call any feature real.")
+    lines.append("")
+    header = f"    {'feature':<32}" + "".join(f"{sym:>9}" for sym in symbols) + "   same sign"
+    lines.append(header)
+    for row in cons["rows"]:
+        cells = "".join(
+            (f"{row['by_symbol'][sym] * 100:>+9.0f}" if sym in row["by_symbol"] else f"{'—':>9}")
+            for sym in symbols
+        )
+        lines.append(f"    {row['feature']:<32}{cells}   {'yes' if row['consistent'] else ''}")
+    lines += [
+        "",
+        "  The chance count assumes the features are independent, and they are",
+        "  not — several measure the same underlying quantity, so they tend to",
+        "  agree together. That inflates the OBSERVED count relative to this",
+        "  expectation, which makes the test generous: a result at or below",
+        "  chance here is if anything an overstatement of what was found.",
+    ]
+    return lines
+
+
+def _replication_matrix(rep: Mapping[str, Any]) -> list[str]:
+    """Pairwise replication across more than two symbols.
+
+    The pair sharing an underlying index is the one to read: it holds the
+    index fixed and varies only the option market, so agreement there is the
+    fairest test a feature can be given.
+    """
+    lines = [
+        "REPLICATION  (do the samples agree about which features matter?)",
+        _THIN,
+        "  Each pair asks whether two independent samples tell the same story.",
+        "  Rank correlation near zero with sign agreement near 50% means the",
+        "  deltas are noise, however large they look in either sample alone.",
+        "",
+        "  Two columns: ALL features, then SUBSTANTIVE only (the mechanical",
+        "  ones removed). Read the substantive column — the mechanical",
+        "  features agree in any two samples and will manufacture agreement.",
+        "",
+        f"    {'pair':<16}{'all r':>9}{'all agr':>9}"
+        f"{'subst r':>10}{'subst agr':>11}   verdict (substantive)",
+    ]
+    for (a, b), rep_pair in sorted((rep.get("matrix") or {}).items()):
+        label = f"{a} vs {b}"
+        if not rep_pair:
+            lines.append(f"    {label:<16}{'—':>9}{'—':>9}{'—':>10}{'—':>11}   too few features")
+            continue
+        sp = rep_pair.get("spearman")
+        ag = rep_pair.get("sign_agreement")
+        sub = rep_pair.get("substantive") or {}
+        ssp = sub.get("spearman")
+        sag = sub.get("sign_agreement")
+        if ssp is None or sag is None:
+            verdict = "too few substantive features"
+            ssp_txt, sag_txt = "—", "—"
+        else:
+            verdict = "replicates" if (ssp >= 0.3 and sag >= 0.65) else "NO replication"
+            ssp_txt, sag_txt = f"{ssp:+.3f}", f"{sag:.0%}"
+        lines.append(
+            f"    {label:<16}{sp:>+9.3f}{ag:>9.0%}" f"{ssp_txt:>10}{sag_txt:>11}   {verdict}"
+        )
+    lines += [
+        "",
+        "  Caveat: mechanical features (time of day, minutes to close, test",
+        "  ordinal) agree in ANY two samples because their link to the",
+        "  resolution window is structural, not about markets.",
+    ]
+    return lines
+
+
+def _replication_block(rep: Mapping[str, Any]) -> list[str]:
+    """Do the two samples agree about which features matter?
+
+    This is the stronger question. A significance test asks whether one delta
+    could be noise; replication asks whether it shows up again in data it has
+    never seen. When pooling is rejected this is what remains, and it is more
+    informative than either screen on its own.
+    """
+    if rep.get("matrix") is not None:
+        out: list[str] = []
+        if rep.get("consistency"):
+            out += _consistency_block(rep["consistency"]) + [""]
+        return out + _replication_matrix(rep)
+    a, b = rep["symbols"]
+    spearman = rep.get("spearman")
+    agreement = rep.get("sign_agreement")
+    lines = [
+        "REPLICATION  (do the two samples agree about which features matter?)",
+        _THIN,
+        "  The screens cannot be pooled, but they can be asked whether they",
+        "  tell the same story. Rank correlation near zero and sign agreement",
+        "  near 50% means the deltas are noise — however large the biggest",
+        "  ones look in either sample alone.",
+        "",
+        f"  features compared   {rep.get('n_features')}",
+    ]
+    if spearman is not None:
+        lines.append(f"  Spearman r          {spearman:+.3f}")
+    if agreement is not None:
+        lines.append(f"  sign agreement      {agreement:.0%}   (chance = 50%)")
+    lines.append("")
+    if agreement is not None and spearman is not None:
+        # Replication requires BOTH a positive rank correlation and sign
+        # agreement above chance. Testing |r| would score a strongly
+        # ANTI-correlated pair — the two samples disagreeing systematically —
+        # as agreement, which is the opposite of the finding.
+        if spearman >= 0.3 and agreement >= 0.65:
+            lines.append("    -> some agreement; the features below are worth a closer look.")
+        else:
+            lines.append("    -> NO replication. Treat every delta below as noise.")
+        lines.append("")
+    lines.append(f"    {'feature':<32}{a:>9}{b:>9}   agree")
+    for row in rep.get("rows", []):
+        va, vb = row[a], row[b]
+        mark = "yes" if va * vb > 0 else ("--" if va * vb == 0 else "NO")
+        lines.append(f"    {row['feature']:<32}{va * 100:>+9.0f}{vb * 100:>+9.0f}   {mark}")
+    lines += [
+        "",
+        "  Caveat: mechanical features (time of day, minutes to close, test",
+        "  ordinal) agree in ANY two samples because their link to the",
+        "  resolution window is structural. Agreement concentrated there is",
+        "  not evidence of a finding about walls.",
+    ]
+    return lines
+
+
+def _pooling_rejected(pooling: Optional[Mapping[str, Any]]) -> bool:
+    """Did the symbols fail the same-process test?"""
+    if not pooling:
+        return False
+    test = pooling.get("logrank")
+    return bool(test is not None and test.p_value < 0.05)
+
+
+def _suppressed_block(pooling: Optional[Mapping[str, Any]]) -> list[str]:
+    """What is withheld when pooling is rejected, and what to run instead."""
+    symbols = sorted((pooling or {}).get("curves", {}))
+    return [
+        "POOLED ANALYSIS WITHHELD",
+        _THIN,
+        "  The symbols above failed the same-process test, so every pooled",
+        "  quantity would describe none of them:",
+        "",
+        "    * the pooled break curve averages two different hazards",
+        "    * the pooled base rate does the same at one horizon",
+        "    * the pooled feature screen is CONFOUNDED BY SYMBOL — a feature",
+        "      that merely tracks which symbol a row came from will show up",
+        "      as a predictor of breaking, and dollar-scale features like",
+        "      wall strength are exactly the ones that do this",
+        "    * the model would fit that confound and validate it",
+        "",
+        "  Per-symbol curves are in the block above. For the full report on",
+        "  each, run them one at a time:",
+        "",
+    ] + [f"    python -m research.wall_break_odds.cli analyze <{sym}>.jsonl" for sym in symbols]
+
+
+def _pooling_block(pooling: Mapping[str, Any]) -> list[str]:
+    """Per-symbol curves and whether combining them is defensible.
+
+    Pooling symbols to reach the model's event floor is only honest if they
+    behave like one process; otherwise the extra events buy an average that
+    describes neither. This asks rather than assumes.
+    """
+    from research.wall_break_odds.survival import break_probability_at
+
+    lines = [
+        "POOLING CHECK  (do these symbols behave like one process?)",
+        _THIN,
+        "  Combining symbols to clear the model's event floor is only",
+        "  legitimate if their hazards agree. If they do not, report them",
+        "  separately — more events would buy a worse answer, not a better one.",
+        "",
+        f"    {'symbol':<16}{'n':>6}{'breaks':>8}{'P(30m)':>10}{'P(60m)':>10}",
+    ]
+    for sym, entry in sorted((pooling.get("curves") or {}).items()):
+        curve, n_obs, n_breaks = entry
+        p30 = break_probability_at(curve, 30)
+        p60 = break_probability_at(curve, 60)
+        lines.append(
+            f"    {sym:<16}{n_obs:>6}{n_breaks:>8}"
+            f"{(_pct(p30.break_prob, 1) if p30 else 'n/a'):>10}"
+            f"{(_pct(p60.break_prob, 1) if p60 else 'n/a'):>10}"
+        )
+    pairs = pooling.get("pairs") or {}
+    lines.append("")
+    if len(pairs) > 1:
+        # With more than two symbols the PAIRS are the analysis: a pair
+        # sharing an underlying index isolates option-market structure from
+        # the index itself.
+        lines.append(f"    {'pair':<18}{'chi2':>8}{'p':>10}   verdict")
+        for (a, b), test in sorted(pairs.items()):
+            if test is None:
+                lines.append(f"    {a + ' vs ' + b:<18}{'—':>8}{'—':>10}   too few events")
+                continue
+            verdict = "DIFFER" if test.p_value < 0.05 else "no evidence of a difference"
+            lines.append(
+                f"    {a + ' vs ' + b:<18}{test.chi2:>8.2f}{test.p_value:>10.4f}   {verdict}"
+            )
+        lines.append("")
+        if pooling.get("any_pair_differs"):
+            lines.append("    -> at least one pair differs; these cannot all be pooled")
+        else:
+            lines.append("    -> no pair differs; pooling is defensible")
+        return lines
+    test = pooling.get("logrank")
+    pair = pooling.get("pair")
+    if test is None:
+        lines.append("  log-rank: not computable — too few events")
+        return lines
+    verdict = (
+        "these are NOT one process — report them separately"
+        if test.p_value < 0.05
+        else "no evidence they differ — pooling is defensible"
+    )
+    label = f"{pair[0]} vs {pair[1]}" if pair else "symbols"
+    lines.append(f"  log-rank ({label}): chi2={test.chi2:.2f}  p={test.p_value:.4f}")
+    lines.append(f"    -> {verdict}")
+    return lines
+
+
+def _censoring_block(halves: Mapping[str, Any]) -> list[str]:
+    """Morning vs afternoon curves — the Kaplan-Meier assumption, inspected.
+
+    KM needs censoring independent of the outcome. Here censoring IS "the
+    session ended", so it falls entirely on late-day tests. If the two halves
+    look like the same process the pooled curve is trustworthy; if they do
+    not, the pooled curve is averaging two regimes and has to be reported as
+    one. This block exists so the check happens on every run rather than
+    remaining an intention.
+    """
+    from research.wall_break_odds.survival import break_probability_at
+
+    lines = [
+        "CENSORING CHECK  (does the curve differ by session half?)",
+        _THIN,
+        "  Censoring here is entirely late-session, so KM's independence",
+        "  assumption is not automatic. Similar halves support the pooled",
+        "  curve; divergent ones mean it is averaging two regimes.",
+        "",
+        "  CONFOUND: a wall that breaks is spent for the session, so the",
+        "  afternoon sample is enriched for walls that ALREADY survived a",
+        "  morning test. Some of any gap is that survivorship, not the clock.",
+        "  The first-tests-only row below removes it; read that one.",
+        "",
+        f"    {'half':<12}{'n':>6}{'breaks':>8}{'P(30m)':>10}{'P(60m)':>10}",
+    ]
+    for name in ("morning", "afternoon"):
+        entry = halves.get(name)
+        if not entry:
+            lines.append(f"    {name:<12}{'insufficient data':>34}")
+            continue
+        curve, n_obs, n_breaks = entry
+        p30 = break_probability_at(curve, 30)
+        p60 = break_probability_at(curve, 60)
+        lines.append(
+            f"    {name:<12}{n_obs:>6}{n_breaks:>8}"
+            f"{(_pct(p30.break_prob, 1) if p30 else 'n/a'):>10}"
+            f"{(_pct(p60.break_prob, 1) if p60 else 'n/a'):>10}"
+        )
+    for label, key in (
+        ("all tests", "logrank"),
+        ("first tests only", "logrank_first"),
+    ):
+        test = halves.get(key)
+        lines.append("")
+        if test is None:
+            lines.append(f"  log-rank ({label}): not computable — too few events")
+            continue
+        verdict = (
+            "the halves differ by more than noise"
+            if test.p_value < 0.05
+            else "no evidence the halves differ"
+        )
+        lines.append(
+            f"  log-rank ({label}): chi2={test.chi2:.2f}  p={test.p_value:.4f}"
+            f"  (n {test.n_a} vs {test.n_b})"
+        )
+        lines.append(f"    -> {verdict}")
+    return lines
+
+
+def _screen_block(screen: Sequence[Mapping[str, Any]]) -> list[str]:
+    lines = [
+        "UNIVARIATE SCREEN  (break rate above vs below a balanced split)",
+        _THIN,
+        "  Marginal associations only, and mutually correlated. Benjamini-Hochberg",
+        "  FDR control at 5% across the family — without it roughly one in twenty",
+        "  'findings' here is noise by construction.",
+        "",
+        f"  {'feature':<32}{'n':>6}{'below':>9}{'above':>9}{'delta':>9}  sig",
+    ]
+    ranked = sorted(
+        [s for s in screen if s.get("reportable")],
+        key=lambda s: -abs(s.get("delta") or 0.0),
+    )
+    if not ranked:
+        lines.append("  insufficient data on every feature")
+        return lines
+    for s in ranked:
+        flag = "  *" if s.get("significant_fdr_05") else ""
+        lines.append(
+            f"  {s['feature']:<32}{s['n']:>6}{_pct(s['rate_below'], 0):>9}"
+            f"{_pct(s['rate_above'], 0):>9}{_pct(s['delta'], 0):>9}{flag}"
+        )
+    unreported = [s["feature"] for s in screen if not s.get("reportable")]
+    if unreported:
+        lines.append("")
+        lines.append("  not enough coverage to screen:")
+        # Wrapped rather than run out to one long line: a missing-coverage list
+        # is usually most of the vector on a first run, and it is the part a
+        # reader most needs to actually read.
+        row: list[str] = []
+        for name in unreported:
+            row.append(name)
+            if len(row) == 3:
+                lines.append("    " + ", ".join(row))
+                row = []
+        if row:
+            lines.append("    " + ", ".join(row))
+    return lines
+
+
+def _oos_block(ev: Mapping[str, Any]) -> list[str]:
+    lines = ["OUT-OF-SAMPLE  (walk-forward, split on session boundaries)", _THIN]
+    status = ev.get("status")
+    if status != "ok":
+        lines.append(f"  no model reported — {status}")
+        lines.append(f"  events available: {ev.get('n', 0)}, required: {ev.get('required', 'n/a')}")
+        bottleneck = ev.get("bottleneck")
+        if bottleneck:
+            resolved = ev.get("n_resolved")
+            if resolved:
+                lines.append(
+                    f"  {resolved} events resolved, but only {ev.get('n')} have every"
+                    " feature present"
+                )
+            lines.append("")
+            lines.append("  Complete cases recovered by dropping ONE feature:")
+            for entry in bottleneck:
+                lines.append(f"    {entry['feature']:<34}+{entry['rows_gained_if_dropped']}")
+            lines.append("")
+            lines.append("  A sparse column costs more rows than it contributes; dropping the")
+            lines.append("  top one may reach the floor sooner than waiting for more sessions.")
+        lines.append("")
+        lines.append("  This is the honest outcome of a short sample, not a failure to run.")
+        return lines
+    oos = ev.get("oos", {})
+    skill = oos.get("skill")
+    lines.append(f"  test observations     {ev.get('n')}")
+    lines.append(f"  folds                 {len(ev.get('folds') or [])}")
+    lines.append(f"  AUC                   {_num(oos.get('auc'), 3)}")
+    lines.append(
+        f"  Brier   model {_num(oos.get('brier_model'))}"
+        f"   baseline {_num(oos.get('brier_baseline'))}"
+    )
+    lines.append(
+        f"  LogLoss model {_num(oos.get('log_loss_model'))}"
+        f"   baseline {_num(oos.get('log_loss_baseline'))}"
+    )
+    lines.append(f"  SKILL vs base rate    {_num(skill, 4)}")
+    if skill is not None:
+        verdict = (
+            "the model beats knowing only the base rate"
+            if skill > 0
+            else "the model does NOT beat knowing only the base rate"
+        )
+        lines.append(f"    -> {verdict}")
+    bins = oos.get("calibration") or []
+    if bins:
+        lines.append("")
+        lines.append("  Reliability (predicted vs realised):")
+        lines.append(f"    {'bin':<14}{'n':>6}{'predicted':>12}{'observed':>12}")
+        for b in bins:
+            lines.append(
+                f"    {b['bin_low']:.1f}-{b['bin_high']:.1f}      {b['n']:>4}"
+                f"{_pct(b['predicted'], 0):>12}{_pct(b['observed'], 0):>12}"
+            )
+    return lines
+
+
+def _coef_block(fit: Optional[Mapping[str, Any]]) -> list[str]:
+    lines = ["COEFFICIENT DIRECTION  (in-sample, standardised)", _THIN]
+    if not fit:
+        lines.append("  not fitted — insufficient data")
+        return lines
+    lines.append("  Signs and relative sizes only. This is NOT a performance claim;")
+    lines.append("  the out-of-sample block above is the only performance claim.")
+    lines.append("")
+    lines.append(f"  {'term':<32}{'coef':>10}{'se':>10}{'z':>8}{'p':>10}")
+    terms = sorted(fit.get("terms", []), key=lambda t: -abs(t.get("coef") or 0.0))
+    for t in terms:
+        lines.append(
+            f"  {t['name']:<32}{t['coef']:>10.3f}{t['se']:>10.3f}{t['z']:>8.2f}{t['p']:>10.4f}"
+        )
+    lines.append("")
+    lines.append(
+        f"  McFadden R2 {_num(fit.get('mcfadden_r2'), 4)}   converged={fit.get('converged')}"
+    )
+    return lines
+
+
+_LIMITS = (
+    """LIMITS — what this study does NOT establish
+"""
+    + _THIN
+    + """
+  * Dealer sign is MODELLED, not observed. Walls are computed from the
+    call-positive / put-negative open-interest convention. On a day when
+    customers were net BUYERS of the wall-side options, the 'wall' was never
+    resistance and the event was mislabelled at source. No feature here can
+    detect that; see research/mm_attributed_gex for the attribution work.
+  * P(break | tested) is not P(break). Conditioning on the test removes the
+    distance term entirely, which is why distance-to-wall is absent from the
+    feature set. For the unconditional question, the production forecast's
+    reflection-principle touch odds are the right tool.
+  * Events within a session are not fully independent. Re-arming spaces them,
+    but a trending day produces correlated tests; the session-boundary
+    walk-forward controls the fit, not the standard errors in the screen.
+  * Labels are sensitive to confirm_minutes and break_buffer_pct. A break
+    under one setting is a pierce under another. Re-run with --confirm and
+    --buffer before quoting any figure as settled.
+  * The single-horizon BASE RATE is horizon-dependent by construction, and
+    measurably so: on SPX over 2026-06-29..09-03 it read 15.3% at a 30-minute
+    horizon, 29.7% at 45 and 34.4% at 60, on non-overlapping intervals. Quote
+    the curve, or quote the rate WITH its horizon; the bare number means
+    nothing on its own.
+  * Nothing here is calibrated for use as a trading signal, and no result in
+    this report has been validated live."""
+)
+
+
+def render_report(
+    meta: Mapping[str, Any],
+    rates: Mapping[str, Any],
+    screen: Sequence[Mapping[str, Any]],
+    evaluation: Mapping[str, Any],
+    fit: Optional[Mapping[str, Any]] = None,
+    survival: Optional[tuple] = None,
+    halves: Optional[Mapping[str, Any]] = None,
+    pooling: Optional[Mapping[str, Any]] = None,
+    replication: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """The full text report."""
+    lines = [
+        _RULE,
+        "P(BREAK | TESTED) — call and put wall break odds",
+        "research only; no production behaviour depends on this",
+        _RULE,
+        "",
+    ]
+    lines += _sample_block(meta)
+    lines += ["", *_config_block(meta.get("config", {}))]
+
+    # A rejected pooling check invalidates EVERYTHING computed on the pooled
+    # rows -- the curve, the base rates and, most dangerously, the screen,
+    # where "low wall strength" can simply stand in for "is the smaller
+    # symbol" and read as a finding about walls. So the check is printed
+    # first and the pooled analysis is withheld rather than footnoted;
+    # a footnote under a table of numbers does not stop the numbers being
+    # quoted.
+    rejected = _pooling_rejected(pooling)
+    if pooling:
+        lines += ["", *_pooling_block(pooling)]
+    if rejected:
+        lines += ["", *_suppressed_block(pooling)]
+        if replication:
+            lines += ["", *_replication_block(replication)]
+        lines += ["", _LIMITS, ""]
+        return "\n".join(lines)
+    if survival is not None:
+        lines += [
+            "",
+            *_survival_block(
+                survival[0],
+                survival[1],
+                survival[2],
+                (meta.get("config") or {}).get("confirm_minutes"),
+            ),
+        ]
+    if halves:
+        lines += ["", *_censoring_block(halves)]
+    lines += ["", "BASE RATES  (single horizon — read the curve above first)", _THIN]
+    lines.append(_rate_line("overall", rates.get("overall", {})))
+    lines.append(_rate_line("call wall", rates.get("call", {})))
+    lines.append(_rate_line("put wall", rates.get("put", {})))
+    lines += ["", *_screen_block(screen)]
+    lines += ["", *_oos_block(evaluation)]
+    lines += ["", *_coef_block(fit)]
+    lines += ["", _LIMITS, ""]
+    return "\n".join(lines)

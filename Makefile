@@ -827,6 +827,22 @@ flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contr
 	@echo "  • $(RED)Index size >> table size$(NC) in [1] AND $(RED)low idx_scan$(NC) in [4] → consider DROP."
 	@echo "  • $(RED)High dead_pct$(NC) in [2] AND large idx size in [4] → REINDEX CONCURRENTLY may shrink the index."
 
+.PHONY: replay-frames-explain
+replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced to the session or scaling with retention? Vars: SYMBOL=NDX DATE=YYYY-MM-DD [BAND=0.04]. Read-only.
+	@if [ -z "$(DATE)" ]; then \
+		echo "$(RED)DATE is required — use the session date from the warning, e.g.$(NC)"; \
+		echo "$(YELLOW)  make replay-frames-explain SYMBOL=NDX DATE=2026-07-24$(NC)"; \
+		exit 2; \
+	fi
+	@echo "$(BLUE)=== Replay frames read: query planner diagnosis ===$(NC)"
+	@echo "$(YELLOW)The failure this checks for is PLAN-dependent, so 'it was fast just now'$(NC)"
+	@echo "$(YELLOW)proves nothing. Step [4] forces the fallback plan — that is the real test.$(NC)"
+	@$(PY) -m src.tools.replay_frames_explain \
+		--symbol "$(or $(SYMBOL),NDX)" \
+		--date "$(DATE)" \
+		$(if $(BAND),--band $(BAND)) \
+		| $(PSQL) -v ON_ERROR_STOP=0
+
 .PHONY: flow-index-prune
 flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner doesn't use it). Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Pruning idx_flow_by_contract_symbol_ts_strike ===$(NC)"
@@ -879,6 +895,10 @@ help: ## Show this help message
 	@echo "  make ingestion-disable  - Disable ingestion service from starting on boot"
 	@echo "  make ingestion-health   - Show ingestion service health and recent errors"
 	@echo ""
+	@echo "$(GREEN)Market Data Provider Migration:$(NC)"
+	@echo "  make feed-compare       - Diff a candidate feed vs the incumbent (CANDIDATE=<name>)"
+	@echo "  make feed-compare-schema - Create the shadow tables the harness writes to"
+	@echo ""
 	@echo "$(GREEN)Analytics Service Management:$(NC)"
 	@echo "  make analytics-start    - Start the analytics service"
 	@echo "  make analytics-stop     - Stop the analytics service"
@@ -922,6 +942,7 @@ help: ## Show this help message
 	@echo "  make api-keys-create USER=<id> NAME=<label> - Issue a per-user API key"
 	@echo "  make api-keys-list [USER=<id>] [ACTIVE=yes] - List per-user API keys"
 	@echo "  make api-keys-revoke ID=<n>    - Revoke a per-user API key"
+	@echo "  make api-caller-report [IP=<ip>] [USER=<id>] - Which key is a caller using?"
 	@echo "  make db-maintain-install - Install daily DB maintenance timer (prune + vacuum)"
 	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
 	@echo "  make normalizer-cache-status  - Show normalizer-refresh timer status + recent log"
@@ -1078,6 +1099,7 @@ help: ## Show this help message
 	@echo "  make db-tail-api-calls            - Last 50 rows from tradestation_api_calls"
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
+	@echo "  make replay-frames-explain        - EXPLAIN ANALYZE the /api/replay/range frames read (SYMBOL=NDX DATE=YYYY-MM-DD)"
 	@echo "  make flow-index-prune             - Drop idx_flow_by_contract_symbol_ts_strike (CONFIRM=yes)"
 	@echo "  make flow-series-drop-covering-index - DISABLED (index retained; see target)"
 	@echo ""
@@ -1183,6 +1205,70 @@ tw-magnet-backtest: ## Backtest the PutWallMagnetReversal thesis. Vars: SYMBOLS=
 MMGEX_PROFILE ?= research_output/cboe_profile.json
 MMGEX_OUT     ?= research_output
 
+# =============================================================================
+# Opening-range extension x gamma confluence (research/or_gamma_confluence)
+# =============================================================================
+# Research only: read-only against production, outputs to files, changes no
+# production behaviour. Methodology in
+# docs/design/or-extension-gamma-confluence.md.
+#
+# Run orgc-coverage FIRST. gex_summary and underlying_quotes are
+# retention-exempt but gex_by_strike (the only source of ranked GEX levels) is
+# pruned, so the two arms of the study have different windows -- and coverage
+# also checks whether created_at is a usable publish clock or has been made
+# fiction by backfilling.
+ORGC_OUT     ?= research_output
+ORGC_SYMBOLS ?= SPY QQQ SPX NDX ES NQ
+ORGC_EVENTS  ?= $(ORGC_OUT)/orgc_events.jsonl
+
+.PHONY: orgc-selftest
+orgc-selftest: ## OR-gamma: synthetic end-to-end plumbing check (NOT a research result)
+	$(PY) -m research.or_gamma_confluence.cli selftest
+
+.PHONY: orgc-coverage
+orgc-coverage: ## OR-gamma: how much history exists per symbol/table + is created_at a usable publish clock. Read-only. Vars: ORGC_SYMBOLS
+	$(PY) -m research.or_gamma_confluence.cli coverage $(ORGC_SYMBOLS) \
+		--out $(ORGC_OUT)/orgc_coverage.json
+
+.PHONY: orgc-dataset
+orgc-dataset: ## OR-gamma: label OR-extension touch events (read-only). Vars: START=ISO END=ISO ORGC_SYMBOLS [OR_MINUTES=5 GAMMA_LEAD=120 CLOCK=visible]
+	$(PY) -m research.or_gamma_confluence.cli build-dataset $(ORGC_SYMBOLS) \
+		--start $(START) --end $(END) \
+		--out $(ORGC_EVENTS) \
+		$(if $(OR_MINUTES),--or-minutes $(OR_MINUTES)) \
+		$(if $(GAMMA_LEAD),--gamma-lead $(GAMMA_LEAD)) \
+		$(if $(CLOCK),--clock $(CLOCK)) \
+		$(if $(EXTENSION_STEP),--extension-step $(EXTENSION_STEP)) \
+		$(if $(filter yes,$(NO_GEX_RANKS)),--no-gex-ranks)
+
+.PHONY: orgc-analyze
+orgc-analyze: ## OR-gamma: cohorts, sensitivity grids, chronological out-of-sample. Vars: ORGC_EVENTS [CONFLUENCE_DISTANCE=10 TREND_FILTER=ema_slope]
+	$(PY) -m research.or_gamma_confluence.cli analyze $(ORGC_EVENTS) \
+		--out $(ORGC_OUT)/orgc_report.md \
+		--json-out $(ORGC_OUT)/orgc_summary.json \
+		--csv-out $(ORGC_OUT)/orgc_events.csv \
+		$(if $(CONFLUENCE_DISTANCE),--confluence-distance $(CONFLUENCE_DISTANCE)) \
+		$(if $(TREND_FILTER),--trend-filter $(TREND_FILTER))
+
+.PHONY: orgc-sweep
+orgc-sweep: ## OR-gamma: ladder-geometry sweep, 9 cells (OR 5/15/30 x step .25/.5/1). One REBUILD per cell. Vars: START=ISO END=ISO [FAST=yes skips gex_by_strike]
+	$(PY) -m research.or_gamma_confluence.cli sweep $(ORGC_SYMBOLS) \
+		--start $(START) --end $(END) \
+		--outdir $(ORGC_OUT)/orgc_sweep \
+		$(if $(filter yes,$(FAST)),--no-gex-ranks)
+
+.PHONY: orgc-sweep-lead
+orgc-sweep-lead: ## OR-gamma: gamma lead-time sweep, 5 cells (0/30/60/120/180s). Also a rebuild per cell -- the lead selects a different snapshot per touch. Vars: START=ISO END=ISO
+	$(PY) -m research.or_gamma_confluence.cli sweep $(ORGC_SYMBOLS) \
+		--start $(START) --end $(END) \
+		--outdir $(ORGC_OUT)/orgc_sweep_lead \
+		--or-minutes-grid 5 --step-grid 0.5 \
+		--lead-grid 0 30 60 120 180
+
+.PHONY: orgc-test
+orgc-test: ## OR-gamma: run just this study's test suite
+	$(PY) -m pytest tests/test_or_gamma_confluence.py -q -o "addopts="
+
 .PHONY: mmgex-pipeline-check
 mmgex-pipeline-check: ## MM-GEX: synthetic end-to-end plumbing check (NOT a research result)
 	$(PY) -m research.mm_attributed_gex.cli pipeline-check
@@ -1218,8 +1304,38 @@ mmgex-dataset: ## MM-GEX: build the side-by-side dataset. Vars: MMGEX_FILES=path
 		--start $(START) --end $(END) \
 		--out $(MMGEX_OUT)/mm_dataset.jsonl
 
+.PHONY: mmgex-dataset-ab
+mmgex-dataset-ab: ## MM-GEX: A-vs-B dataset from ZeroGEX's own tape, no Cboe files needed. Vars: START=ISO END=ISO [MMGEX_AGGRESSOR=path]
+	$(PY) -m research.mm_attributed_gex.cli build-dataset \
+		--start $(START) --end $(END) \
+		$(if $(MMGEX_AGGRESSOR),--aggressor $(MMGEX_AGGRESSOR),--aggressor-source option_chains) \
+		--out $(MMGEX_OUT)/mm_dataset.jsonl
+
+.PHONY: mmgex-dataset-abc
+mmgex-dataset-abc: ## MM-GEX: A / B / C dataset. Vars: MMGEX_FILES=path START=ISO END=ISO [MMGEX_AGGRESSOR=path]
+	$(PY) -m research.mm_attributed_gex.cli build-dataset $(MMGEX_FILES) \
+		--profile $(MMGEX_PROFILE) \
+		--start $(START) --end $(END) \
+		$(if $(MMGEX_AGGRESSOR),--aggressor $(MMGEX_AGGRESSOR),--aggressor-source option_chains) \
+		--out $(MMGEX_OUT)/mm_dataset.jsonl
+
+.PHONY: mmgex-aggressor
+mmgex-aggressor: ## MM-GEX: extract ZeroGEX's aggressor-classified tape (Model B). Vars: START=ISO END=ISO [AGGRESSOR_SOURCE=option_chains|flow_contract_facts]
+	$(PY) -m research.mm_attributed_gex.cli build-aggressor \
+		--start $(START) --end $(END) \
+		--source $(or $(AGGRESSOR_SOURCE),option_chains) \
+		--symbol $(or $(SYMBOL),SPX) \
+		--out $(MMGEX_OUT)/aggressor_buckets.jsonl
+
+.PHONY: mmgex-attribution
+mmgex-attribution: ## MM-GEX: B-vs-C attribution test (aggressor assumption vs exchange-classified MM). Vars: MMGEX_FILES=path [MMGEX_AGGRESSOR=path]
+	$(PY) -m research.mm_attributed_gex.cli compare-attribution $(MMGEX_FILES) \
+		--profile $(MMGEX_PROFILE) \
+		--aggressor $(or $(MMGEX_AGGRESSOR),$(MMGEX_OUT)/aggressor_buckets.jsonl) \
+		--out $(MMGEX_OUT)/attribution_report.md
+
 .PHONY: mmgex-backtest
-mmgex-backtest: ## MM-GEX: run the experiment battery and render the report
+mmgex-backtest: ## MM-GEX: run the experiment battery (two-arm and three-arm) and render the report
 	$(PY) -m research.mm_attributed_gex.cli backtest $(MMGEX_OUT)/mm_dataset.jsonl \
 		--out $(MMGEX_OUT)/mm_report.md
 
@@ -1517,6 +1633,98 @@ logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greek
 	@echo "$(BLUE)=== Searching Analytics Logs ===$(NC)"
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in analytics logs"
 
+.PHONY: journal-volume
+journal-volume: ## Why journal retention is short: what caps it, and which unit burns it
+	@echo "$(BLUE)=== Journal retention ===$(NC)"
+	@echo "$(YELLOW)Journal filesystem:$(NC)"; df -h $$([ -d /var/log/journal ] && echo /var/log/journal || echo /var/log) | tail -1
+	@echo "$(YELLOW)Configured cap:$(NC)  SystemMaxUse=$(JOURNAL_MAX_USE)  (from $(JOURNAL_DROPIN))"
+# journald honours the TIGHTER of SystemMaxUse and SystemKeepFree, and KeepFree
+# defaults to 15% of the filesystem. On a volume already fuller than that,
+# journald trims no matter what the cap says and raising SystemMaxUse buys
+# nothing -- so establish which of the two actually binds before changing either.
+#
+# WHICH filesystem is the whole question, and this target got it wrong until
+# 2026-09-03: it measured `du /var/log/journal` (right) but sized headroom
+# against `/` (wrong). /var/log is its own volume -- deploy/steps/015.data_volume
+# -- so the numbers reported were the ROOT volume's, on which the journal does
+# not sit. That made a 10G volume at 39% read as a 6.8G volume at 86%, and made
+# KeepFree look like it was about to bind when it had ~4G of slack. Everything
+# below now resolves the journal's own mount first.
+	@jdir=$$([ -d /var/log/journal ] && echo /var/log/journal || echo /var/log); \
+	avail=$$(df --output=avail -k "$$jdir" | tail -1); \
+	size=$$(df --output=size -k "$$jdir" | tail -1); \
+	mnt=$$(df --output=target "$$jdir" | tail -1); \
+	keep=$$((size * 15 / 100)); \
+	used=$$(du -sk /var/log/journal 2>/dev/null | cut -f1); used=$${used:-0}; \
+	raw="$(JOURNAL_MAX_USE)"; \
+	case "$$raw" in \
+	  *G|*g) cap=$$(( $${raw%[Gg]} * 1024 * 1024 )) ;; \
+	  *M|*m) cap=$$(( $${raw%[Mm]} * 1024 )) ;; \
+	  *K|*k) cap=$$(( $${raw%[Kk]} )) ;; \
+	  *)     cap=$$(( raw / 1024 )) ;; \
+	esac; \
+	echo "$(YELLOW)Journal usage:$(NC)   $$((used / 1024))M of the $$((cap / 1024))M cap"; \
+	echo "$(YELLOW)KeepFree floor:$(NC)  ~$$((keep / 1024))M (15% of $$mnt), free now $$((avail / 1024))M"; \
+	if [ "$$used" -ge $$((cap * 9 / 10)) ]; then \
+	  echo "  $(GREEN)-> SystemMaxUse BINDS: the journal is sitting at its cap.$(NC)"; \
+	  echo "  $(GREEN)   Raising it buys proportional history, if the disk has room.$(NC)"; \
+	elif [ "$$avail" -lt "$$keep" ]; then \
+	  echo "  $(RED)-> KeepFree BINDS: the journal is well under its cap while free space$(NC)"; \
+	  echo "  $(RED)   is below the 15% floor, so journald keeps trimming itself.$(NC)"; \
+	  echo "  $(RED)   Raising SystemMaxUse does NOTHING here. Free disk, set an explicit$(NC)"; \
+	  echo "  $(RED)   SystemKeepFree under 15%, or cut the burn rate shown below.$(NC)"; \
+	else \
+	  echo "  $(GREEN)-> Neither binds: retention is bounded by the burn rate below and the$(NC)"; \
+	  echo "  $(GREEN)   nightly vacuum, not by configuration.$(NC)"; \
+	fi
+	@echo "$(YELLOW)Oldest entry:$(NC)    $$(journalctl --no-pager -o short-iso 2>/dev/null | head -1 | cut -d' ' -f1-2)"
+	@echo ""
+	@echo "$(YELLOW)Burn rate over the last hour:$(NC)"
+# Bytes AND lines. The two together say which fix applies: many small lines
+# is a cadence problem (demote a per-cycle log), while few large ones is a
+# message problem (one fat payload logged per request). Bytes alone cannot
+# tell them apart, and journald's own per-entry metadata -- ~200-400 bytes
+# of fields per record -- means line COUNT drives disk more than text size.
+	@for u in $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE); do \
+	  out=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null | wc -lc); \
+	  set -- $$out; echo "$$2 $$1 $$u"; \
+	done | sort -rn \
+	  | awk '{ printf "  %8.1f MB/h  %8d lines/h  %6d B/line  %s\n", \
+	            $$1/1048576, $$2, ($$2 ? $$1/$$2 : 0), $$3 }'
+	@echo ""
+	@echo "$(YELLOW)How much of that is HTTP access logging:$(NC)"
+# Called out on its own because a top-N of repeated shapes structurally
+# CANNOT find it: every distinct URL is its own shape, so 240k access lines
+# hid behind a top row of 2,288. nginx already records the same requests to
+# /var/log/nginx/access.log, so in the journal they are pure duplication.
+#
+# TWO shapes count, and missing the second is how this stayed hidden after
+# --no-access-log silenced the first. uvicorn writes `"GET /path HTTP/1.1"`;
+# AuditLogMiddleware writes `api_request method=GET path=... status=...`, with
+# no quotes. Matching only the quoted form reported 0% while 420k audit lines
+# an hour -- 99% of the unit's volume -- went uncounted.
+	@for u in $(API_SERVICE); do \
+	  all=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null | wc -l); \
+	  acc=$$(journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null \
+	        | grep -cE '"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) |api_request method=' || true); \
+	  if [ "$$all" -gt 0 ]; then \
+	    awk -v a="$$acc" -v t="$$all" -v u="$$u" \
+	      'BEGIN { printf "  %8d of %8d lines/h (%.0f%%) are access logs  %s\n", a, t, 100*a/t, u }'; \
+	  fi; \
+	done
+	@echo ""
+	@echo "$(YELLOW)Noisiest repeated lines, PER UNIT (shape, not text):$(NC)"
+# Per unit, not global: one chatty service otherwise owns every row of a
+# global top-N and hides the unit actually burning the most. The 2026-09-01
+# run showed five signals lines while the API, at 4x the volume, never
+# appeared -- its bytes are spread across many distinct shapes.
+	@for u in $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE); do \
+	  echo "  $(BLUE)$$u$(NC)"; \
+	  journalctl -u $$u --since "-1h" -o cat --no-pager 2>/dev/null \
+	    | sed -E 's/\?[^ "]*/?_/; s/[0-9]+/N/g' \
+	    | sort | uniq -c | sort -rn | head -3 \
+	    | awk '{ n=$$1; $$1=""; printf "    %7d x %.86s\n", n, substr($$0,2) }'; \
+	done
 .PHONY: logs-clear
 logs-clear: ## Interactive log cleanup (prompts; calls logs-clear-noconfirm)
 	@echo "$(RED)⚠️  WARNING: This permanently deletes service journals AND system logs.$(NC)"
@@ -1653,6 +1861,24 @@ disk-clean-noconfirm: ## Non-interactive disk/cache cleanup (driven by zerogex-o
 run-auth: ## Test TradeStation authentication
 	@echo "$(BLUE)=== Testing TradeStation Authentication ===$(NC)"
 	@$(VENV_PYTHON) -m src.ingestion.tradestation_auth
+
+.PHONY: feed-compare
+feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDIDATE, MINUTES, PERSIST, JSON)
+	@echo "$(BLUE)=== Feed comparison (runbook step 14) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.feed_compare \
+		--underlying '$(or $(UNDERLYING),SPY)' \
+		$(if $(INCUMBENT),--incumbent '$(INCUMBENT)') \
+		$(if $(CANDIDATE),--candidate '$(CANDIDATE)') \
+		$(if $(MINUTES),--duration-minutes '$(MINUTES)') \
+		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)') \
+		$(if $(PERSIST),--persist) \
+		$(if $(JSON),--json) \
+		$(if $(DEBUG),--debug)
+
+.PHONY: feed-compare-schema
+feed-compare-schema: ## Create the shadow tables the comparison harness writes to
+	@echo "$(BLUE)=== Applying shadow tables ===$(NC)"
+	@psql -d "$(or $(DB_NAME),zerogex)" -f setup/database/shadow_tables.sql
 
 .PHONY: run-client
 run-client: ## Test TradeStation API client (TEST, SYMBOL, BARS_BACK, INTERVAL, UNIT, QUERY, DEBUG, TEST_HISTORICAL)
@@ -3034,6 +3260,25 @@ gex-historical-stats-dry-run: ## Compute gex_historical_stats distributions with
 	@$(PY) -m src.tools.gex_historical_stats_refresh \
 		$(if $(GEX_HIST_SYMBOLS),--symbols $(GEX_HIST_SYMBOLS)) --dry-run
 
+# Measured odds a gamma wall gives way once price reaches it, per symbol.
+# Nightly, after gex-historical-stats-refresh. The levels surfaces read this
+# so a call wall can carry its own hit rate instead of implying one -- S&P
+# walls and Nasdaq walls are not the same object and the product should not
+# present them as if they were. See docs/design/wall-break-odds.md.
+.PHONY: wall-break-stats-refresh
+wall-break-stats-refresh: ## Recompute wall_break_stats break curves (run nightly)
+	@echo "$(BLUE)=== Refreshing wall_break_stats ===$(NC)"
+	@$(PY) -m src.tools.wall_break_stats_refresh \
+		$(if $(WALL_BREAK_SYMBOLS),--symbols $(WALL_BREAK_SYMBOLS)) \
+		$(if $(WALL_BREAK_WINDOW),--window $(WALL_BREAK_WINDOW))
+
+.PHONY: wall-break-stats-dry-run
+wall-break-stats-dry-run: ## Measure wall break curves without writing
+	@echo "$(BLUE)=== wall_break_stats (dry-run) ===$(NC)"
+	@$(PY) -m src.tools.wall_break_stats_refresh \
+		$(if $(WALL_BREAK_SYMBOLS),--symbols $(WALL_BREAK_SYMBOLS)) \
+		$(if $(WALL_BREAK_WINDOW),--window $(WALL_BREAK_WINDOW)) --dry-run
+
 # Read-only re-validation of the relative gamma-flip thresholds after the
 # 7106711 flip redefinition. Splits persisted gex_summary.flip_distance at
 # the deploy boundary (NORMALIZER_DEPLOY_CUTOFF) and reports the gate
@@ -3084,6 +3329,15 @@ futures-backfill: ## Backfill historical 1-min ES/NQ bars into futures_quotes. S
 		--start $(START) \
 		--end $(END) \
 		$(if $(filter yes,$(DRY_RUN)),--dry-run)
+
+.PHONY: probe-option-batches
+probe-option-batches: ## Find the option-quote batch size TradeStation still answers. UNDERLYING=SPY SIZES=1,10,50,100 REPEAT=1
+	@echo "$(BLUE)=== Option quote batch probe ===$(NC)"
+	@$(PY) -m src.tools.probe_option_quote_batches \
+		--underlying $(or $(UNDERLYING),SPY) \
+		$(if $(SIZES),--sizes $(SIZES),) \
+		$(if $(REPEAT),--repeat $(REPEAT),) \
+		$(if $(CREDENTIAL),--credential $(CREDENTIAL),)
 
 .PHONY: ts-whoami
 ts-whoami: ## Which TradeStation USERNAME is TRADESTATION_REFRESH_TOKEN for? (market-data entitlements attach to the user, not the app)
@@ -3272,6 +3526,15 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 		"\\gexec" \
 		"SELECT 'legacy artifacts pruned' AS status;" \
 	| $(PSQL)
+
+.PHONY: db-pin-vs-king-export
+db-pin-vs-king-export: ## Export the Pin-vs-GEX-King study CSVs (SPX+QQQ, 90d). Read-only. Writes 3 CSVs into the current directory.
+	@echo "$(BLUE)=== Pin Strike vs GEX King study export (read-only) ===$(NC)"
+	@echo "$(YELLOW)Writes zerogex_sessions.csv, zerogex_levels.csv and zerogex_bars.csv$(NC)"
+	@echo "$(YELLOW)into $$(pwd) via client-side \\copy. Check rows_with_king in the$(NC)"
+	@echo "$(YELLOW)sessions file before using the export: max_gamma_strike is nullable$(NC)"
+	@echo "$(YELLOW)and never backfilled, so old sessions may not carry the King.$(NC)"
+	@$(PSQL) -f setup/database/diagnostics/pin_vs_king_export.sql
 
 .PHONY: db-symbols-audit
 db-symbols-audit: ## Read-only audit of malformed symbols rows + the FK-cascade blast radius of deleting them. Nothing is deleted.
@@ -3727,6 +3990,44 @@ api-keys-revoke: ## Revoke a per-user API key (ID=<numeric id from api-keys-list
 	fi
 	@$(VENV_PYTHON) -m src.api.admin_keys revoke "$(ID)"
 
+# -----------------------------------------------------------------------------
+# Who is calling the API? (src/tools/api_caller_report.py)
+# -----------------------------------------------------------------------------
+# Neither log answers this alone: nginx's access.log has the client IP and
+# User-Agent but no credential (the zerogex_scrubbed format in
+# deploy/steps/120.nginx_api logs no key and rewrites ?api_key= to REDACTED),
+# while the API's audit line has the key identity. The report reads both.
+#
+# Runs under sudo because reading another unit's journal and
+# /var/log/nginx/access.log both need it. --preserve-env=HOME keeps ~/.pgpass
+# pointing at the invoking user's home so the api_keys enrichment can still
+# resolve DB credentials (resolve_db_credentials reads the .pgpass line
+# matching the DB_* target); without it sudo would look in root's home and the
+# report would silently degrade to "api_keys lookup unavailable".
+#
+# `subst` cannot take a literal comma inside a function call's argument list,
+# so IP=a,b and ID=1,2 need this to expand into repeated flags.
+COMMA := ,
+
+.PHONY: api-caller-report
+# ENDPOINT= (not PATH=) on purpose: PATH is the shell's own variable and
+# setting it on the make command line would replace the PATH this recipe
+# needs to find sudo and the venv python.
+api-caller-report: ## Which API key is a caller using? Vars: IP=<ip[,ip]> USER=<owner> ID=<key id> UA=<substring> STATUS=<code[,code]> ENDPOINT=<path prefix[,prefix]> HOURS=2 JSON=<path> NO_DB=yes
+	@echo "$(BLUE)=== API caller attribution ===$(NC)"
+	@sudo --preserve-env=HOME $(VENV_PYTHON) -m src.tools.api_caller_report \
+		--hours $(or $(HOURS),2) \
+		$(foreach s,$(subst $(COMMA), ,$(STATUS)),--status "$(s)") \
+		$(foreach e,$(subst $(COMMA), ,$(ENDPOINT)),--path "$(e)") \
+		$(foreach i,$(subst $(COMMA), ,$(IP)),--ip "$(i)") \
+		$(if $(KEY_USER),--user "$(KEY_USER)") \
+		$(foreach k,$(subst $(COMMA), ,$(ID)),--key-id "$(k)") \
+		$(if $(UA),--ua-contains "$(UA)") \
+		$(if $(UNIT),--unit "$(UNIT)") \
+		$(if $(ACCESS_LOG),--access-log "$(ACCESS_LOG)") \
+		$(if $(NO_DB),--no-db) \
+		$(if $(JSON),--json "$(JSON)")
+
 .PHONY: db-maintain-install
 db-maintain-install: ## Install daily DB maintenance timer (prune old data + vacuum)
 	@echo "$(BLUE)=== Installing DB Maintenance Timer ===$(NC)"
@@ -3803,9 +4104,16 @@ normalizer-cache-healthcheck-strict: ## Healthcheck that also fails on missing r
 INGEST_FRESHNESS_MAX_STALE_MINUTES ?= 15
 
 .PHONY: ingestion-freshness-healthcheck
-ingestion-freshness-healthcheck: ## Alert if a symbol stopped writing bars mid-session (0=ok, 1=stale, 2=db error)
+ingestion-freshness-healthcheck: ## Alert if ANY TradeStation stream stopped writing (bars, chains, VIX/VXN, ES/NQ). 0=ok 1=stale 2=db error
 	@$(PY) -m src.tools.ingestion_freshness_healthcheck \
 		--max-stale-minutes $(INGEST_FRESHNESS_MAX_STALE_MINUTES) \
+		$(if $(JSON),--json)
+
+.PHONY: freshness-replay
+freshness-replay: ## Replay the freshness check over a session from the DB (DATE=YYYY-MM-DD)
+	@$(PY) -m src.tools.freshness_replay \
+		$(if $(DATE),--date $(DATE)) \
+		$(if $(LEGACY),--legacy-chain-window) \
 		$(if $(JSON),--json)
 
 .PHONY: normalizer-cache-healthcheck-json
@@ -3901,6 +4209,73 @@ market-tide-refresh-status: ## Show Market Tide refresh timer status + last/next
 	@systemctl status zerogex-oa-market-tide-refresh.service --no-pager -l || true
 	@echo ""
 	@sudo journalctl -u zerogex-oa-market-tide-refresh -n 30 --no-pager || true
+
+# =============================================================================
+# Gamma Regime per-session reads (Gamma Shift page)
+# =============================================================================
+# One row per trading day in gex_regime_session.  Two surfaces need them and
+# nothing else produces them:
+#
+#   * the Session History strip on /gamma-shift renders one bar per stored
+#     session — with no rows it renders "No stored sessions yet", forever;
+#   * the same rows are the trailing z-score denominator that lets the live
+#     Gamma Regime Shift card say "dramatically" and mean it.  Under
+#     MIN_SESSIONS_FOR_SIGMA (10) rows the card bootstraps off the chain and
+#     labels its magnitude provisional.
+#
+# So a fresh deploy wants BOTH: `regime-session-backfill` once to seed the
+# window, then the 15-min timer to keep today's row current.  Override the
+# symbol set with SYMBOLS or the $BULLETIN_TWEET_SYMBOLS env var.
+.PHONY: regime-session-refresh
+regime-session-refresh: ## Recompute today's Gamma Regime session read (every 15 min via timer; RTH-gated)
+	@echo "$(BLUE)=== Refreshing Gamma Regime session read ===$(NC)"
+	@$(PY) -m src.tools.regime_session_refresh \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(REGIME_SESSION_FORCE),--force)
+
+# Seed / repair the stored window.  60 weekdays takes a symbol straight from
+# the provisional bootstrap magnitude to the strong trailing claim.
+.PHONY: regime-session-backfill
+regime-session-backfill: ## Seed gex_regime_session from history (default: last 60 weekdays)
+	@echo "$(BLUE)=== Backfilling Gamma Regime session reads ===$(NC)"
+	@$(PY) -m src.tools.regime_session_refresh \
+		--backfill $(or $(REGIME_SESSION_DAYS),60) \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(REGIME_SESSION_AS_OF),--as-of $(REGIME_SESSION_AS_OF)) \
+		$(if $(DRY_RUN),--dry-run)
+
+.PHONY: regime-session-refresh-install
+regime-session-refresh-install: ## Install the 15-min Gamma Regime session refresh timer (cash session)
+	@echo "$(BLUE)=== Installing Gamma Regime Session Refresh Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-regime-session-refresh.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-regime-session-refresh.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-regime-session-refresh.timer
+	@echo "$(GREEN)✅ Regime-session-refresh timer (every 15 min, cash session) installed and started$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-regime-session-refresh.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-regime-session-refresh$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-regime-session-refresh.service$(NC)"
+	@echo "$(YELLOW)Backfill:    make regime-session-backfill$(NC)"
+
+# Which z-score denominator the QUIET cut should use, measured rather than
+# argued.  Read-only: it reports the shape of each symbol's stored shift
+# distribution and the QUIET rate each candidate scale would have produced.
+# `quiet%` should land near 25%; SPY against SPX is the cross-check that
+# settles a disagreement, since they track the same index.
+.PHONY: regime-scale-report
+regime-scale-report: ## Compare candidate z-score denominators against the stored regime history (read-only)
+	@$(PY) -m src.tools.regime_scale_report \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(REGIME_SCALE_JSON),--json $(REGIME_SCALE_JSON))
+
+.PHONY: regime-session-refresh-status
+regime-session-refresh-status: ## Show Gamma Regime session refresh timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Gamma Regime Session Refresh Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-regime-session-refresh.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-regime-session-refresh.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-regime-session-refresh -n 30 --no-pager || true
 
 # =============================================================================
 # Yesterday's Scorecard auto-tweet (16:15 ET weekdays)
@@ -4388,6 +4763,44 @@ system-monitor-status: ## Show system-monitor timer status + last/next fire + re
 	@echo ""
 	@sudo journalctl -u zerogex-oa-system-monitor -n 30 --no-pager || true
 
+.PHONY: systemd-sync
+systemd-sync: ## Install CHANGED unit files only, reload, report what needs restarting (restarts nothing)
+# `make deploy` is the wrong tool for a one-line unit change: it reinstalls
+# units, enables timers, restarts services and touches nginx/journald. When
+# only a .service or .timer file moved, the whole of what deploy does for it
+# is a verbatim copy plus a daemon-reload (see deploy/steps/100.systemd and
+# 110.api_server -- both plain `cp`). This does exactly that, for units
+# ALREADY installed, and restarts nothing: it prints what a restart would
+# pick up and leaves the timing to you.
+	@echo "$(BLUE)=== Syncing systemd unit files ===$(NC)"
+	@changed=""; missing=""; \
+	for f in setup/systemd/*.service setup/systemd/*.timer; do \
+	  [ -e "$$f" ] || continue; \
+	  n=$$(basename "$$f"); \
+	  if [ ! -f "/etc/systemd/system/$$n" ]; then missing="$$missing $$n"; continue; fi; \
+	  if ! cmp -s "$$f" "/etc/systemd/system/$$n"; then \
+	    sudo cp "$$f" "/etc/systemd/system/$$n" && changed="$$changed $$n"; \
+	  fi; \
+	done; \
+	if [ -n "$$changed" ]; then \
+	  sudo systemctl daemon-reload; \
+	  echo "$(GREEN)Updated:$(NC)"; \
+	  for n in $$changed; do \
+	    if systemctl is-active --quiet "$$n" 2>/dev/null; then \
+	      echo "  $$n  $(YELLOW)(running the old unit — sudo systemctl restart $$n)$(NC)"; \
+	    else \
+	      echo "  $$n"; \
+	    fi; \
+	  done; \
+	else \
+	  echo "  Nothing to do — every installed unit already matches the repo."; \
+	fi; \
+	if [ -n "$$missing" ]; then \
+	  echo "$(YELLOW)In the repo but NOT installed$(NC) (deliberately not installed here —"; \
+	  echo "$(YELLOW)installing a new unit is activation, not a sync; use make deploy or$(NC)"; \
+	  echo "$(YELLOW)the unit's own install target):$(NC)"; \
+	  for n in $$missing; do echo "  $$n"; done; \
+	fi
 .PHONY: alert-template-install
 alert-template-install: ## Install zerogex-alert@.service template + sample env (does NOT enable OnFailure= hooks)
 	@echo "$(BLUE)=== Installing failure-alert template ===$(NC)"
@@ -4420,9 +4833,30 @@ alert-template-install: ## Install zerogex-alert@.service template + sample env 
 .PHONY: alert-template-test
 alert-template-test: ## Fire one synthetic alert through the template (verifies dispatcher + backend)
 	@echo "$(BLUE)=== Sending synthetic alert via current ALERT_BACKEND ===$(NC)"
+# Clear the cooldown first, or a smoke test repeated inside
+# ALERT_MIN_INTERVAL_SEC is correctly suppressed and reads as broken wiring.
+	@$(MAKE) --no-print-directory alert-cooldown-reset
 	@sudo systemctl start 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service'
 	@echo "$(GREEN)✅ Triggered. View result:$(NC)"
 	@echo "  journalctl -u 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service' -n 30 --no-pager"
+
+.PHONY: alert-cooldown-reset
+alert-cooldown-reset: ## Forget alert cooldowns so the next failure pages immediately
+	@sudo rm -f /var/lib/zerogex-alert/*.state 2>/dev/null || true
+	@echo "$(GREEN)✅ Alert cooldown state cleared$(NC)"
+
+.PHONY: alert-cooldown-status
+alert-cooldown-status: ## Show which units are inside an alert cooldown, and how many alerts are held
+	@if ! ls /var/lib/zerogex-alert/*.state >/dev/null 2>&1; then \
+		echo "No cooldowns active (no unit has alerted recently)."; \
+	else \
+		now=$$(date +%s); \
+		for f in /var/lib/zerogex-alert/*.state; do \
+			read -r epoch sig held _ < "$$f" || continue; \
+			unit=$$(basename "$$f" .state); \
+			printf '  %-52s last sent %5ss ago, %s held\n' "$$unit" "$$((now - epoch))" "$$held"; \
+		done; \
+	fi
 
 .PHONY: liveness-watch-install
 liveness-watch-install: ## Install the per-minute liveness watchdog (alerts when a critical service is DOWN)

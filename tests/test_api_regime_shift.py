@@ -280,20 +280,58 @@ class TestRegimeShift:
         assert body["read"]["normalization"] == "trailing"
         assert body["read"]["sessions_in_window"] > 0
 
-    def test_normalization_is_none_without_history_or_proxy(self, client_no_history):
-        """No window and no proxy: the read still renders, but the card is
-        told not to make a magnitude claim off it."""
+    def test_normalization_bootstraps_off_the_chain_without_history(
+        self, client_no_history
+    ):
+        """A symbol with no stored sessions still gets a real read.
+
+        The bootstrap denominator comes from the chain the shift was measured
+        on, so it is the same kind of quantity as the score.  The regression
+        this guards: it used to borrow the dispersion of a stored LEVEL,
+        which had no fixed relationship to a proximity-weighted change and in
+        practice collapsed every z toward zero — so a freshly-deployed symbol
+        printed QUIET on every session no matter what the book did.
+        """
         body = client_no_history.get(
             "/api/gex/regime-shift?symbol=SPY&lookback=session"
         ).json()
-        assert body["read"]["normalization"] == "none"
-        assert body["read"]["state"] == "QUIET"  # z is 0 without a denominator
+        assert body["read"]["normalization"] == "proxy"
+        assert body["read"]["sessions_in_window"] == 0
+        # 800 of gamma built one point below a spot of 100 is not "quiet".
+        assert body["read"]["state"] == "FIRMING"
+        assert body["read"]["magnitude"] > 0
+
+    def test_the_window_is_normalized_over_the_hours_it_actually_spans(
+        self, client_with_history
+    ):
+        """Every stored read is a full since-open session, so a shorter
+        window has to be measured against a shorter yardstick or it reads
+        QUIET on the clock rather than on the book."""
+        body = client_with_history.get(
+            "/api/gex/regime-shift?symbol=SPY&lookback=session"
+        ).json()
+        # 09:30 -> 12:00 ET.
+        assert body["scores"]["window_hours"] == pytest.approx(2.5)
 
     def test_positioning_lens_is_selectable(self, client_with_history):
         body = client_with_history.get(
             "/api/gex/regime-shift?symbol=SPY&lookback=session&lens=positioning"
         ).json()
         assert body["lens"] == "positioning"
+
+    def test_reports_whether_the_window_can_see_repositioning_at_all(
+        self, client_with_history
+    ):
+        """Open interest is a once-a-day settlement figure, so an intraday
+        A->B pair has the identical OI at every strike and the positioning
+        lens is structurally empty.  The payload says so rather than letting
+        the client draw a flat line that reads as "dealers did nothing"."""
+        body = client_with_history.get(
+            "/api/gex/regime-shift?symbol=SPY&lookback=session"
+        ).json()
+        assert body["positioning"]["resolved"] is False
+        assert body["positioning"]["oi_moved_strikes"] == 0
+        assert body["positioning"]["strike_count"] > 0
 
     def test_rolloff_block_rides_along(self, client_with_history):
         body = client_with_history.get(

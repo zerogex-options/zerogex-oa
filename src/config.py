@@ -551,9 +551,7 @@ PIN_STRIKE_BANDWIDTH_STRIKE_MULT = _getenv_float(
 # Candidate strikes are restricted to within ±this many expected moves of spot
 # (|ln(K/spot)| ≤ max_z · sigma · √tau).  Keeps the per-cycle simulation cheap
 # and the pin realistically reachable; scale-free across underlyings.
-PIN_STRIKE_CANDIDATE_MAX_Z = _getenv_float(
-    "PIN_STRIKE_CANDIDATE_MAX_Z", 2.5, min=0.5, max=6.0
-)
+PIN_STRIKE_CANDIDATE_MAX_Z = _getenv_float("PIN_STRIKE_CANDIDATE_MAX_Z", 2.5, min=0.5, max=6.0)
 # Raw-magnitude floor below which the best pin is suppressed as
 # PIN_SCORE_TOO_WEAK.  Default 0 == gate DISABLED: no arbitrary user-facing
 # threshold is invented (the spec's guidance); an operator can raise it once
@@ -562,9 +560,7 @@ PIN_STRIKE_MIN_SCORE = _getenv_float("PIN_STRIKE_MIN_SCORE", 0.0, min=0.0)
 # Half-width (fraction of spot) of the ATM band used to derive the
 # representative implied volatility for the reachability weight — mirrors the
 # ±1% band the daily_atm_iv anchor already uses.
-PIN_STRIKE_ATM_IV_BAND_PCT = _getenv_float(
-    "PIN_STRIKE_ATM_IV_BAND_PCT", 0.01, min=0.001, max=0.1
-)
+PIN_STRIKE_ATM_IV_BAND_PCT = _getenv_float("PIN_STRIKE_ATM_IV_BAND_PCT", 0.01, min=0.001, max=0.1)
 
 # =============================================================================
 # Spread Monitor — quoted-spread / liquidity rollup scope
@@ -696,12 +692,8 @@ TS_STRIKES_CACHE_TTL = _getenv_int("TS_STRIKES_CACHE_TTL", 3600, min=0)
 # stale data after a long quiet period.  Default 600 (10 minutes -- well
 # longer than any normal TradeStation period of 60-300s).
 TS_RATE_LIMIT_HEADER_GATE_ENABLED = _getenv_bool("TS_RATE_LIMIT_HEADER_GATE_ENABLED", True)
-TS_RATE_LIMIT_HEADER_MIN_REMAINING = _getenv_int(
-    "TS_RATE_LIMIT_HEADER_MIN_REMAINING", 1, min=0
-)
-TS_RATE_LIMIT_HEADER_STALE_SECONDS = _getenv_int(
-    "TS_RATE_LIMIT_HEADER_STALE_SECONDS", 600, min=1
-)
+TS_RATE_LIMIT_HEADER_MIN_REMAINING = _getenv_int("TS_RATE_LIMIT_HEADER_MIN_REMAINING", 1, min=0)
+TS_RATE_LIMIT_HEADER_STALE_SECONDS = _getenv_int("TS_RATE_LIMIT_HEADER_STALE_SECONDS", 600, min=1)
 
 # Streaming quotes endpoint encodes the symbol list in the URL path. With
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
@@ -884,6 +876,15 @@ MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS = max(
 # Time Bucket Size
 AGGREGATION_BUCKET_SECONDS = _getenv_int("AGGREGATION_BUCKET_SECONDS", 60)  # 1 minute
 
+# Options-flow aggregates are keyed to FIVE-minute bucket starts, not to
+# AGGREGATION_BUCKET_SECONDS. database.get_flow and get_flow_series both floor
+# their windows to 300, and flow_by_contract rows are stored on that grid.
+# Named here because the v2 freshness envelope publishes it as a cadence
+# contract: it was advertising the 60s bucket, which no flow row can meet, so
+# a healthy feed read `stale` for half of every bar. Not operator-tunable —
+# the bucket grid is baked into the stored rows.
+FLOW_BAR_SECONDS = 300
+
 # Buffer Flush Settings
 MAX_BUFFER_SIZE = _getenv_int("MAX_BUFFER_SIZE", 1000)  # flush if buffer exceeds
 BUFFER_FLUSH_INTERVAL = _getenv_int("BUFFER_FLUSH_INTERVAL", 60)  # seconds
@@ -1035,9 +1036,7 @@ SIGNALS_PORTFOLIO_SIZE = _getenv_float("SIGNALS_PORTFOLIO_SIZE", 1000000)
 # OFF by default — turning it on changes live trade-signal confidence, so it
 # is an explicit operator decision. See docs/design/pattern-calibration.md.
 # ---------------------------------------------------------------------------
-SIGNALS_PATTERN_CALIBRATION_ENABLED = _getenv_bool(
-    "SIGNALS_PATTERN_CALIBRATION_ENABLED", False
-)
+SIGNALS_PATTERN_CALIBRATION_ENABLED = _getenv_bool("SIGNALS_PATTERN_CALIBRATION_ENABLED", False)
 # Minimum resolved trades in a (pattern, underlying) window before its measured
 # base is trusted. Below this the hand-set prior is kept.
 SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES = _getenv_int(
@@ -1069,7 +1068,9 @@ SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL = _getenv_float(
 )
 SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL = _getenv_float(
     "SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL",
-    SIGNALS_PATTERN_CALIBRATION_CEIL, min=0.0, max=1.0
+    SIGNALS_PATTERN_CALIBRATION_CEIL,
+    min=0.0,
+    max=1.0,
 )
 # Standardized premium stop-loss applied by the option_pnl calibration feed: a
 # losing option is cut once its premium falls this fraction below the entry fill
@@ -1108,9 +1109,9 @@ SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS = _getenv_int(
 #                        has a trustworthy window, else fall back to
 #                        'underlying_touch'.
 # Default keeps the historical behavior (underlying_touch only).
-SIGNALS_PATTERN_CALIBRATION_SOURCE = _getenv_str(
-    "SIGNALS_PATTERN_CALIBRATION_SOURCE", "underlying_touch"
-).strip().lower()
+SIGNALS_PATTERN_CALIBRATION_SOURCE = (
+    _getenv_str("SIGNALS_PATTERN_CALIBRATION_SOURCE", "underlying_touch").strip().lower()
+)
 # Auto-source soft veto: under SOURCE=auto, a (pattern, underlying) pair whose
 # option_pnl window is below MIN_SAMPLES leaves the touch base in place — and
 # the touch proxy can overstate edge (a target/stop hit is not a profitable
@@ -1123,8 +1124,7 @@ SIGNALS_PATTERN_CALIBRATION_SOURCE = _getenv_str(
 # Threshold is an absolute base-units delta (so 0.15 ≈ 15 percentage points of
 # the [0.0, 1.0] base scale). Set to 0 to disable the veto entirely.
 SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD = _getenv_float(
-    "SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD",
-    0.15, min=0.0, max=1.0
+    "SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD", 0.15, min=0.0, max=1.0
 )
 # Minimum option_pnl trades required for the disagreement veto to consider a
 # pair. Below this, a single losing trade could veto an otherwise-good touch
@@ -1150,9 +1150,7 @@ BACKTEST_SIGNAL_COOLDOWN_MINUTES = _getenv_int(
 # Absolute cap on contracts per simulated trade — keeps a near-zero-debit
 # spread (tiny per-contract risk) from being sized into an unrealistic position
 # whose commission alone would dominate. Realistic retail-scale default.
-BACKTEST_MAX_CONTRACTS_PER_TRADE = _getenv_int(
-    "BACKTEST_MAX_CONTRACTS_PER_TRADE", 100, min=1
-)
+BACKTEST_MAX_CONTRACTS_PER_TRADE = _getenv_int("BACKTEST_MAX_CONTRACTS_PER_TRADE", 100, min=1)
 
 # Dedicated worker (Phase 4): when enabled, the API only ENQUEUES runs and a
 # standalone `python -m src.backtesting.worker` process drains them, so long
@@ -1832,11 +1830,85 @@ ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS = max(
 )
 ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35)
 
+# ---------------------------------------------------------------------------
+# Market data provider selection
+# ---------------------------------------------------------------------------
+# Which upstream vendor the ingestion layer reads from. Resolved by
+# ``src.ingestion.providers.get_provider``; see that package for the
+# interface a new vendor implements.
+#
+# Defaults to "tradestation" so an unset environment behaves exactly as it
+# did before the provider abstraction existed. Changing this is a
+# production cutover: stand the new feed up in parallel and diff its
+# analytics against the incumbent (``make feed-compare``) before flipping
+# it, per step 14 of docs/compliance/market-data-remediation-runbook.md.
+#
+# An unrecognised value is FATAL rather than a silent fallback -- a typo
+# that quietly kept reading the old feed would look like a successful
+# cutover.
+MARKET_DATA_PROVIDER = _getenv_str("MARKET_DATA_PROVIDER", "tradestation")
+
+# Provider used by the comparison harness as the CANDIDATE feed, run
+# alongside MARKET_DATA_PROVIDER (the incumbent). Empty disables the
+# harness. Never read by the live ingestion path.
+MARKET_DATA_COMPARE_PROVIDER = _getenv_str("MARKET_DATA_COMPARE_PROVIDER", "")
+
 # TradeStation credential variables (used by service startup and helper scripts).
 TRADESTATION_CLIENT_ID = os.getenv("TRADESTATION_CLIENT_ID")
 TRADESTATION_CLIENT_SECRET = os.getenv("TRADESTATION_CLIENT_SECRET")
 TRADESTATION_REFRESH_TOKEN = os.getenv("TRADESTATION_REFRESH_TOKEN")
 TRADESTATION_USE_SANDBOX = _getenv_bool("TRADESTATION_USE_SANDBOX", False)
+
+# Optional SECOND TradeStation identity, used by the futures feeds alone.
+#
+# Market-data entitlements attach to a USERNAME, not to the API application,
+# and OAuth carries the username in the REFRESH TOKEN — the client id/secret
+# only identify the app. An account holder with two usernames can therefore
+# hold real-time CME on one and the equity / index / OPRA entitlements on the
+# other, and there is no single token that sees both.
+#
+# Pointing the whole platform at the CME-entitled username would be the wrong
+# trade: that one refresh token drives option chains, equity and index bars,
+# VIX/VXN, session levels and every backfill tool, so it would swap a ten
+# minute ES delay for silently unentitled option ingestion — the same
+# invisible failure, across everything instead of two symbols.
+#
+# So the futures path gets its own credential and everything else keeps the
+# main one. Unset (the normal case) it falls back to the main credential and
+# nothing changes. The second benefit is capacity: TradeStation caps
+# concurrent streams PER ACCOUNT at nominally 10, so running the futures
+# streams under a second username buys back the two slots this feature spends
+# (see Step 2 of docs/runbooks/es_nq_futures_rollout.md).
+TRADESTATION_FUTURES_CLIENT_ID = os.getenv("TRADESTATION_FUTURES_CLIENT_ID")
+TRADESTATION_FUTURES_CLIENT_SECRET = os.getenv("TRADESTATION_FUTURES_CLIENT_SECRET")
+TRADESTATION_FUTURES_REFRESH_TOKEN = os.getenv("TRADESTATION_FUTURES_REFRESH_TOKEN")
+
+
+def futures_tradestation_credentials() -> tuple:
+    """``(client_id, client_secret, refresh_token)`` for the ES / NQ feeds.
+
+    Each field falls back independently to the main credential, so the common
+    case is a single extra line in ``.env``::
+
+        TRADESTATION_FUTURES_REFRESH_TOKEN=<token minted by the CME-entitled username>
+
+    The id/secret overrides exist for the less common case of the second
+    username being authorised under a separate API application.
+    """
+    return (
+        os.getenv("TRADESTATION_FUTURES_CLIENT_ID") or os.getenv("TRADESTATION_CLIENT_ID", ""),
+        os.getenv("TRADESTATION_FUTURES_CLIENT_SECRET")
+        or os.getenv("TRADESTATION_CLIENT_SECRET", ""),
+        os.getenv("TRADESTATION_FUTURES_REFRESH_TOKEN")
+        or os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
+    )
+
+
+def futures_credentials_are_separate() -> bool:
+    """True when the futures feeds run under their own refresh token."""
+    token = os.getenv("TRADESTATION_FUTURES_REFRESH_TOKEN")
+    return bool(token and token.strip() and token != os.getenv("TRADESTATION_REFRESH_TOKEN"))
+
 
 # TradeStation CLI test defaults.
 TS_TEST = os.getenv("TS_TEST", "all")

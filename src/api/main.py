@@ -24,19 +24,23 @@ from .errors import handle_api_errors
 from .futures_middleware import FuturesProjectionMiddleware
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
 from .ratelimit import rate_limit
-from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
+from .scopes import FLOW, GEX, MARKET_RAW, MARKET_REFERENCE, MAXPAIN, SIGNALS, TECHNICALS
 from .security import api_key_auth, key_store, require_scopes
 from .usage import usage_meter
 from .quote_broadcaster import QuoteBroadcaster, set_broadcaster
+from src.analytics.pin_stability import build_pin_stability
 from .routers import websockets as ws_router
 from .models import (
     GEXSummary,
+    PinStabilityResponse,
     GEXByStrike,
     GEXProfile,
     GEXHistoricalContext,
     FlowPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
+    HedgingFlowResponse,
+    GammaRegimeSeriesResponse,
     MarketTideResponse,
     MarketTideHistoryResponse,
     SmartMoneyFlowPoint,
@@ -52,6 +56,14 @@ from .models import (
     OpenInterestRecord,
     OpenInterestResponse,
     StrikeProfileBucket,
+)
+from src.analytics.hedging_flow import (
+    DEFAULT_SIGNIFICANCE_RATIO,
+    DEFAULT_SMOOTHING_BARS,
+    HedgingFlowBar as HedgingFlowBarCalc,
+    sign_flip_events,
+    smooth,
+    zero_cross_events,
 )
 from .routers.trade_signals import router as trade_signals_router
 from .routers.trade_bias import router as trade_bias_router
@@ -425,6 +437,27 @@ app.add_middleware(
         "Content-Type",
         "Accept",
     ],
+    # Headers a cross-origin browser client may READ. Without this list the
+    # browser strips them from the response before JS sees them, however
+    # correctly the server sets them — so the v2 freshness headers and the
+    # correlation id were reaching curl and server-side consumers but were
+    # invisible to any browser integration, which is precisely the audience
+    # a charting widget serves.
+    #
+    # Kept in step with v2._freshness_headers by a test; add a header there
+    # and CI fails until it is listed here.
+    expose_headers=[
+        "X-Freshness-Status",
+        "X-Freshness-Evaluated-At",
+        "X-Freshness-Source-Timestamp",
+        "X-Freshness-Age-Seconds",
+        "X-Freshness-Stale-After",
+        "X-Freshness-Expected-Cadence",
+        "X-Freshness-Cadence-Profile",
+        "X-Market-Session",
+        # Echoed by RequestIdMiddleware for correlation; same problem.
+        "X-Request-Id",
+    ],
 )
 
 # Compress responses so that large JSON payloads from endpoints like
@@ -456,14 +489,20 @@ app.add_middleware(RequestIdMiddleware)
 # scope (see scopes.py for the taxonomy and tier bundles). Wiring these
 # onto the routes below is a no-op until keys are backfilled with scopes
 # AND API_SCOPE_ENFORCEMENT=1 (see security.require_scopes); a key with
-# the wildcard "*" scope always passes. This draws the authorization map
-# — including isolating raw market data behind MARKET_RAW so it can be
-# withheld from external/B2B keys — without 403ing today's scopeless keys.
+# the wildcard "*" scope always passes.
+#
+# The one boundary that carries a licence rather than a price is
+# MARKET_REFERENCE vs MARKET_RAW: the underlying's own tape (its quote,
+# bars, session levels) is reference data every levels integration needs
+# and rides with the derived scopes, while the option chain enumerated
+# contract by contract is withheld from external keys. See scopes.py for
+# why the line sits there and not around "upstream data" generally.
 _scope_gex = Depends(require_scopes(GEX))
 _scope_flow = Depends(require_scopes(FLOW))
 _scope_maxpain = Depends(require_scopes(MAXPAIN))
 _scope_technicals = Depends(require_scopes(TECHNICALS))
 _scope_signals = Depends(require_scopes(SIGNALS))
+_scope_market_reference = Depends(require_scopes(MARKET_REFERENCE))
 _scope_market_raw = Depends(require_scopes(MARKET_RAW))
 
 # The /api/signals surface is the premium (basic/pro) tier.
@@ -481,23 +520,59 @@ app.include_router(trade_bias_router, dependencies=[_scope_signals])
 app.include_router(levels_router, dependencies=[_scope_gex])
 app.include_router(volatility_gauge_router, dependencies=[_scope_gex])
 app.include_router(vol_surface_router, dependencies=[_scope_gex])
-# Options premium (extrinsic-value) surface — Beta. Derived analytics built
-# from quoted option prices, redistributable on the same GEX scope as the
-# vol surface.
-app.include_router(premium_surface_router, dependencies=[_scope_gex])
+# Options premium (extrinsic-value) surface — Beta. MARKET_RAW, not GEX: its
+# z-axis IS a quoted option price, and no amount of field selection changes
+# that. `premium` is the mid quote ((bid+ask)/2, falling back to the stored
+# mid then the last trade); `intrinsic` is max(0, spot-strike), computed from
+# the underlying and the strike; `extrinsic` is max(0, premium - intrinsic).
+# For every OUT-OF-THE-MONEY strike intrinsic is 0, so extrinsic == premium
+# exactly — and where it is non-zero, premium == extrinsic + intrinsic. So
+# withholding the `premium` field while serving the surface would be
+# arithmetic theatre: the caller recovers the quote by addition, or reads it
+# directly off the OTM half of the chain. The whole surface therefore rides
+# the same scope as /api/option/quote.
+#
+# This is the one case the derived/raw split cannot straddle. Contrast the
+# vol surface immediately above, which stays on GEX: it publishes implied
+# volatilities only, and an IV is not invertible to a price without the rate,
+# dividend and time conventions that produced it.
+app.include_router(premium_surface_router, dependencies=[_scope_market_raw])
 # Spread Monitor — quoted bid/ask width and liquidity across the chain (Beta).
-# Derived aggregates (medians, percentiles, coverage shares) computed FROM the
-# raw bid/ask, not a re-export of it, so it rides the redistributable GEX
-# scope alongside the premium and vol surfaces rather than MARKET_RAW.
-app.include_router(spread_liquidity_router, dependencies=[_scope_gex])
+# MARKET_RAW for the same reason as the premium surface above, and it is worth
+# writing down why an AGGREGATE lands on the raw side of the line.
+#
+# Nothing here is per-contract: every figure is a median or a p90 over a
+# population, and a median does not invert to the values behind it. But the
+# CALLER chooses the population. `moneyness_band_pct` goes down to 0.25 and
+# `dte_max` to 0, and the response reports `tradable_count` per bucket — so a
+# caller can narrow a bucket until exactly one contract is left, and read it:
+#
+#     median_spread                 = ask - bid
+#     median_relative_spread_pct    = 200 * (ask - bid) / (ask + bid)
+#     => ask + bid = 200 * median_spread / median_relative_spread_pct
+#     => bid, ask   recovered exactly, for a contract the same response
+#                   identifies by expiration, strike band and option type.
+#
+# That is the premium surface's failure mode wearing an aggregate's clothes,
+# and the same conclusion follows: the gate belongs on the route, because
+# there is no field to redact that closes it. Suppressing thin buckets would
+# not close it either — a caller can vary the band and difference the results.
+# tests/test_market_data_scope_boundary.py pins this against the mounted route
+# table so the reasoning does not have to survive in a comment alone.
+#
+# No product cost: the website BFF holds TIER_FULL, so /spread-monitor is
+# unaffected. It is withheld from the external analytics tier, which is the
+# correct answer for a surface whose entire subject is the vendor's quotes.
+app.include_router(spread_liquidity_router, dependencies=[_scope_market_raw])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # Gamma Regime Shift — the derivative of the dealer-gamma surface (what
 # CHANGED between two snapshots, what expires next, and the classified read
 # stored per session). Same derived-GEX scope as the surfaces it differences.
 app.include_router(gamma_shift_router, dependencies=[_scope_gex])
-# Raw market data routers — per-contract option history (option_contract)
-# and the option-calculator (which embeds raw contract prices). Gated
-# behind MARKET_RAW so they are excluded from derived-only tiers.
+# Option-chain routers — per-contract option history (option_contract) and
+# the option-calculator (which embeds raw contract prices). Both enumerate
+# the chain contract by contract, which is what MARKET_RAW exists to
+# withhold, so they stay excluded from derived-only tiers.
 app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
 # Backtesting platform — premium (basic/pro) tier, same scope as /api/signals.
@@ -641,6 +716,29 @@ async def get_gex_summary(symbol: str = Query(default="SPY")):
     if not data:
         raise HTTPException(status_code=404, detail="No GEX data available")
     return GEXSummary(**data)
+
+
+@app.get(
+    "/api/gex/pin-stability",
+    response_model=PinStabilityResponse,
+    tags=["GEX"],
+    dependencies=[_scope_gex],
+)
+@handle_api_errors("GET /api/gex/pin-stability")
+async def get_pin_stability(symbol: str = Query(default="SPY")):
+    """How stable the Pin Strike has been across the current session.
+
+    Kept off ``/api/gex/summary`` on purpose: that endpoint is a single-row
+    read on a hot cached path, and folding a whole-session scan into it would
+    make every chart poll pay for a figure that changes at most once a minute.
+    404 when the session carries no active pin at any point — the client then
+    shows nothing rather than a zeroed record.
+    """
+    frames = await _db().get_pin_path_for_session(symbol)
+    stability = build_pin_stability(frames)
+    if stability is None:
+        raise HTTPException(status_code=404, detail="No pin activity for this session")
+    return PinStabilityResponse(symbol=symbol.upper(), **stability.to_dict())
 
 
 @app.get(
@@ -821,6 +919,14 @@ async def get_strike_profile_timeseries(
         the cross-expiration aggregate walls (matches
         ``/api/gex/summary``); a specific set yields walls scoped to
         that set's gamma alone;
+      * ``pin_strike`` / ``pin_confidence`` as of the bucket's close,
+        from the representative ``gex_summary`` row.  Unlike the walls
+        and the flip these are NOT scoped by ``expirations``: the pin is
+        0DTE-by-construction and whole-chain by definition, so it reads
+        the same in every expiration scope (matching the live surfaces,
+        where the pin does not move with the Expiry selector).  Both are
+        ``null`` when the bucket has no active pin and on rows written
+        before the pin columns shipped — draw no line, never a zero;
       * every strike's gamma exposure in the same dollar-GEX units
         ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
         evaluated against the bucket's own ``close`` so the surface
@@ -1151,6 +1257,353 @@ async def get_flow_series(
     return JSONResponse(content=[_format_flow_series_row(r) for r in rows])
 
 
+#: Public label for what this series is, carried in every payload. The
+#: terminology is binding (docs/design/aggressor-inferred-positioning-
+#: experiment.md): the passive-side-is-a-market-maker assumption is under
+#: test, not established, so nothing downstream may call this observed
+#: dealer flow.
+_HEDGING_FLOW_BASIS = "aggressor_inferred"
+_HEDGING_FLOW_DISCLOSURE = (
+    "Estimated hedging pressure. Inferred from aggressor-classified option "
+    "trades under the assumption that the passive side of each print was a "
+    "market maker; that assumption is unvalidated. Not observed dealer flow."
+)
+
+
+def _format_hedging_flow_row(row: dict, ma: Optional[float]) -> dict:
+    """Coerce a raw DB row + its smoothed rate into the JSON bar shape.
+
+    Timestamps are emitted trailing-Z UTC and Decimals cast to float, matching
+    ``_format_flow_series_row`` so the two series key identically on the
+    client and can be joined bar-for-bar without normalisation.
+    """
+    bar_start: datetime = row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    bar_end = bar_start + timedelta(minutes=5)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+    def _f(key: str) -> float:
+        v = row.get(key)
+        return float(v) if v is not None else 0.0
+
+    def _opt(key: str) -> Optional[float]:
+        v = row.get(key)
+        return float(v) if v is not None else None
+
+    return {
+        "timestamp": bar_start.strftime(fmt),
+        "bar_start": bar_start.strftime(fmt),
+        "bar_end": bar_end.strftime(fmt),
+        "call_flow_usd": _f("call_flow_usd"),
+        "put_flow_usd": _f("put_flow_usd"),
+        "net_flow_usd": _f("net_flow_usd"),
+        "net_flow_ma_usd": float(ma) if ma is not None else None,
+        "cum_call_usd": _f("cum_call_usd"),
+        "cum_put_usd": _f("cum_put_usd"),
+        "cum_net_usd": _f("cum_net_usd"),
+        "underlying_price": _opt("underlying_price"),
+        "contract_count": int(row.get("contract_count") or 0),
+        "classified_ratio": _opt("classified_ratio"),
+        "is_synthetic": bool(row.get("is_synthetic")),
+    }
+
+
+def _format_hedging_flip(event) -> dict:
+    """Serialize a FlipEvent, timestamp normalised like the bars."""
+    bar_start = event.bar_start
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    return {
+        "bar_start": bar_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "kind": event.kind,
+        "direction": event.direction,
+        "magnitude_usd": float(event.magnitude_usd),
+        "session_ratio": float(event.session_ratio),
+        "is_significant": bool(event.is_significant),
+        "underlying_price": (
+            float(event.underlying_price) if event.underlying_price is not None else None
+        ),
+    }
+
+
+@app.get(
+    "/api/flow/hedging",
+    response_model=HedgingFlowResponse,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/hedging")
+async def get_hedging_flow(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+    strikes: Optional[str] = Query(
+        default=None,
+        description="Comma-separated strikes to include. Empty/missing = all strikes.",
+    ),
+    expirations: Optional[str] = Query(
+        default=None,
+        description=(
+            "Comma-separated YYYY-MM-DD expirations to include. Empty/missing = all. "
+            "Pass today's date to isolate 0DTE."
+        ),
+    ),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=390,
+        description="If provided, return only the last N 5-minute bars (tail window).",
+    ),
+    smoothing: int = Query(
+        default=DEFAULT_SMOOTHING_BARS,
+        ge=1,
+        le=24,
+        description=(
+            "Trailing SMA length in 5-minute bars for the rate line and flip "
+            "detection. Default 3 (15 minutes)."
+        ),
+    ),
+    significance: float = Query(
+        default=DEFAULT_SIGNIFICANCE_RATIO,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "A rate flip is marked significant when its magnitude is at least "
+            "this multiple of the session's own typical push. 1.0 = as big as "
+            "a typical push so far today."
+        ),
+    ),
+):
+    """Estimated dealer hedging pressure per 5-minute bar, with sign flips.
+
+    The aggressor-inferred companion to ``/api/flow/series``: for every option
+    that traded, the net customer position change is converted to the stock a
+    delta-flat hedge implies (``(buy - sell) * delta * 100 * spot``) and
+    accumulated across the session. Positive means the hedge BUYS stock --
+    the same sign convention and units as the Forced Flow engine, so the
+    modeled and estimated sources are directly additive.
+
+    ``call_flow_usd`` / ``put_flow_usd`` split the pressure by the option type
+    that produced it, not by its direction: customers selling puts push the
+    net positive and land in the put series.
+
+    ``flips`` carries two kinds. ``rate`` flips are the smoothed per-bar
+    series changing sign -- the immediate push turning over, and the frequent
+    one. ``cumulative`` flips are the session's net lean crossing zero: rare,
+    and context rather than a trigger.
+
+    Same session resolution, 5-minute grid and unfiltered underlying price as
+    ``/api/flow/series``, so the two overlay bar-for-bar. Rows are newest →
+    oldest. Unknown symbols 404; known symbols with no session data return an
+    empty ``bars`` list.
+
+    This series is an ESTIMATE that assumes the passive side of each
+    classified print was a market maker. That assumption is under test and is
+    not established — see ``basis`` and ``disclosure`` in the payload, which
+    any rendering surface is expected to carry through.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    strikes_list = _parse_flow_strikes(strikes)
+    expirations_list = _parse_flow_expirations(expirations)
+
+    rows = await _db().get_hedging_flow_series(
+        symbol=normalized,
+        session=session,
+        strikes=strikes_list,
+        expirations=expirations_list,
+        intervals=intervals,
+    )
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    envelope = {
+        "symbol": normalized,
+        "session": session,
+        "basis": _HEDGING_FLOW_BASIS,
+        "disclosure": _HEDGING_FLOW_DISCLOSURE,
+        "smoothing_bars": smoothing,
+    }
+    if not rows:
+        return JSONResponse(content={**envelope, "bars": [], "flips": []})
+
+    # The DB hands back newest-first; every derivation here (trailing SMA,
+    # flip detection) is inherently chronological, so flip once, derive, and
+    # flip back at the end rather than reasoning about reversed windows.
+    chronological = list(reversed(rows))
+
+    calc_bars = [
+        HedgingFlowBarCalc(
+            bar_start=r["bar_start"],
+            call_flow_usd=float(r.get("call_flow_usd") or 0.0),
+            put_flow_usd=float(r.get("put_flow_usd") or 0.0),
+            net_flow_usd=float(r.get("net_flow_usd") or 0.0),
+            cum_call_usd=float(r.get("cum_call_usd") or 0.0),
+            cum_put_usd=float(r.get("cum_put_usd") or 0.0),
+            cum_net_usd=float(r.get("cum_net_usd") or 0.0),
+            underlying_price=(
+                float(r["underlying_price"]) if r.get("underlying_price") is not None else None
+            ),
+            contract_count=int(r.get("contract_count") or 0),
+            classified_ratio=float(r.get("classified_ratio") or 0.0),
+            is_synthetic=bool(r.get("is_synthetic")),
+        )
+        for r in chronological
+    ]
+
+    ma_series = smooth([b.net_flow_usd for b in calc_bars], smoothing)
+    flips = sign_flip_events(calc_bars, window=smoothing, significance_ratio=significance)
+    flips = flips + zero_cross_events(calc_bars)
+    flips.sort(key=lambda e: e.bar_start)
+
+    bars = [_format_hedging_flow_row(r, ma) for r, ma in zip(chronological, ma_series)]
+    bars.reverse()  # back to newest-first, matching /api/flow/series
+
+    return JSONResponse(
+        content={
+            **envelope,
+            "bars": bars,
+            "flips": [_format_hedging_flip(e) for e in flips],
+        }
+    )
+
+
+def _format_gamma_regime_row(row: dict) -> dict:
+    """Coerce a stored gamma_regime_5min row into the JSON bar shape.
+
+    Timestamps trailing-Z UTC on the same 5-minute grid as
+    ``_format_hedging_flow_row``, so a client can key the two series
+    identically and stack them without re-aligning.
+    """
+    bar_start: datetime = row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    bar_end = bar_start + timedelta(minutes=5)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+    def _f(key: str) -> float:
+        v = row.get(key)
+        return float(v) if v is not None else 0.0
+
+    def _opt(key: str):
+        v = row.get(key)
+        return float(v) if v is not None else None
+
+    expired = row.get("expired_expirations") or []
+
+    return {
+        "timestamp": bar_start.strftime(fmt),
+        "bar_start": bar_start.strftime(fmt),
+        "bar_end": bar_end.strftime(fmt),
+        "spot": _opt("spot"),
+        "anchored_lean": _f("anchored_lean"),
+        "anchored_stability": _f("anchored_stability"),
+        "anchored_net_shift": _f("anchored_net_shift"),
+        "anchored_gross_shift": _f("anchored_gross_shift"),
+        "rolling_lean": _opt("rolling_lean"),
+        "rolling_stability": _opt("rolling_stability"),
+        "rolling_net_shift": _opt("rolling_net_shift"),
+        "rolling_gross_shift": _opt("rolling_gross_shift"),
+        "sigma_price": _opt("sigma_price"),
+        "near_spot_stock": _opt("near_spot_stock"),
+        "strike_count": int(row.get("strike_count") or 0),
+        "expired_expirations": [
+            e.isoformat() if hasattr(e, "isoformat") else str(e) for e in expired
+        ],
+        "rolling_bars": int(row["rolling_bars"]) if row.get("rolling_bars") is not None else None,
+    }
+
+
+@app.get(
+    "/api/gex/regime-series",
+    response_model=GammaRegimeSeriesResponse,
+    tags=["GEX"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/gex/regime-series")
+async def get_gamma_regime_series(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=390,
+        description="If provided, return only the last N 5-minute bars (tail window).",
+    ),
+):
+    """The Gamma Shift read at every 5-minute bar of a session.
+
+    Where ``/api/gex/regime-shift`` answers "how did dealer gamma change
+    between these two moments" as a single card, this is the same maths as a
+    line — so structure can sit on the same timeline as
+    ``/api/flow/hedging`` and be read against it. Flow says how hard the tape
+    is pushing; this says whether the book absorbs or amplifies it.
+
+    Two lenses per bar. ``anchored_*`` is versus the session's first bar
+    ("changed today"), the counterpart of the flow panel's cumulative curve.
+    ``rolling_*`` is versus ``rolling_bars`` bars back ("changing right now"),
+    the counterpart of the rate line and the one to read beside a flip. They
+    do not sum: both weight strikes by proximity to each bar's OWN spot, so
+    the kernel re-centres every bar.
+
+    Positive ``stability`` means more long gamma near spot — dealers hedge
+    against moves, so the tape pins. Negative means the book has turned
+    accelerant. Positive ``lean`` means the change is supportive; negative
+    means capping.
+
+    Scores are RAW dollar-GEX; normalising against a trailing distribution of
+    sessions is ``/api/gex/regime-history``'s job.
+
+    Served from a table the Analytics Engine materialises one bar at a time.
+    Computing it on read would mean diffing two ~1500-row chains per bar per
+    viewer per poll — the shape that took the strike-profile timeseries down
+    in Aug 2026 — so a miss returns empty rather than falling back to compute.
+
+    Same session resolution as ``/api/flow/hedging``, so the two cover
+    identical bars. Rows newest → oldest. Unknown symbols 404; a session with
+    nothing written yet returns an empty ``bars`` list.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    rows = await _db().get_gamma_regime_series(
+        symbol=normalized,
+        session=session,
+        intervals=intervals,
+    )
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    bars = [_format_gamma_regime_row(r) for r in rows]
+    rolling_bars = next(
+        (b["rolling_bars"] for b in bars if b.get("rolling_bars") is not None), None
+    )
+
+    return JSONResponse(
+        content={
+            "symbol": normalized,
+            "session": session,
+            "rolling_bars": rolling_bars,
+            "bars": bars,
+        }
+    )
+
+
 @app.get(
     "/api/flow/contracts",
     response_model=FlowContractsResponse,
@@ -1456,7 +1909,7 @@ def get_market_session(
 
 @app.get(
     "/api/market/quote",
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
     response_model=UnderlyingQuote,
     response_model_exclude_none=True,
     tags=["Market Data"],
@@ -1533,7 +1986,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     "/api/market/session-closes",
     response_model=SessionCloses,
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
 )
 @handle_api_errors("GET /api/market/session-closes")
 async def get_session_closes(symbol: str = Query(default="SPY")):
@@ -1561,7 +2014,7 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
     "/api/market/session-levels",
     response_model=SessionLevels,
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
 )
 @handle_api_errors("GET /api/market/session-levels")
 async def get_session_levels(symbol: str = Query(default="SPY")):
@@ -1600,7 +2053,7 @@ async def get_session_levels(symbol: str = Query(default="SPY")):
     "/api/market/historical",
     response_model=List[UnderlyingQuote],
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_market_reference],
 )
 async def get_historical_quotes(
     symbol: str = Query(default="SPY"),
@@ -1691,11 +2144,21 @@ async def get_option_quote(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+# Open interest is dealer-positioning input, not a quoted price. The payload
+# (OpenInterestRecord) carries `open_interest` and a derived `exposure` and no
+# bid/ask/last at all — the only route in MARKET_RAW that never returned a
+# quote. The identical per-strike OI is already served on GEX by
+# /api/gex/by-strike (call_oi/put_oi/call_volume/put_volume, <=200 rows) and
+# by /api/gex/strike-profile-timeseries (every strike, uncapped), so gating it
+# on MARKET_RAW withheld nothing a GEX-scoped key could not already read while
+# 403ing integrations that asked for it by its own name. Moving it to GEX is
+# entitlement-neutral by construction: no key gains a field or a strike it
+# lacked. See scopes.py for the boundary this now sits on.
 @app.get(
     "/api/market/open-interest",
     response_model=OpenInterestResponse,
     tags=["Market Data"],
-    dependencies=[_scope_market_raw],
+    dependencies=[_scope_gex],
 )
 @handle_api_errors("GET /api/market/open-interest")
 async def get_open_interest(

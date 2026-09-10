@@ -40,11 +40,26 @@ Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
 # Execution
+# --no-access-log: uvicorn's access log was the API's dominant journal
+# consumer -- 239,983 lines/hour measured 2026-09-01, 42 MB/h, against a 300M
+# cap shared with three other services. Only ~6,300 of those lines fell into
+# any repeated shape, because every distinct URL is its own shape, which is
+# exactly why a top-N view never showed it.
+#
+# Nothing is lost: nginx fronts this service (deploy/steps/120.nginx_api
+# proxy_passes to 127.0.0.1:8000) and writes the same requests to
+# /var/log/nginx/access.log, on the filesystem rather than in the journal, and
+# already rotated by the nightly logs-clear. The journal keeps uvicorn's
+# errors and the application's own logs, which is what a post-mortem reads.
+#
+# Drop this flag to get per-request lines back in the journal when debugging
+# something nginx's log cannot answer.
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/uvicorn \
     src.api.main:app \
     --host 0.0.0.0 \
     --port 8000 \
     --workers 2 \
+    --no-access-log \
     --log-level info
 ExecReload=/bin/kill -HUP $MAINPID
 

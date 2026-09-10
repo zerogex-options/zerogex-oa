@@ -155,9 +155,42 @@ for cash indices before 09:30 / after 16:00 ET.
   services. In the 2026-08-17 incident it held only minutes of history, so the
   evening's traceback was gone by morning and the root cause was never
   recovered — only the fact of the death, inferred from PID sequence. If you
-  are diagnosing something intermittent, raise the cap **first**, then wait for
-  a recurrence. Check `df -h /` before raising it; the root volume runs hot.
-- The freshness check pages every 10 minutes while a symbol is stale. That is
-  intentional for data loss, but it means a long known outage is noisy.
+  are diagnosing something intermittent, fix retention **first**, then wait for
+  a recurrence.
+
+  Raising the cap alone may do nothing. journald stops at whichever of
+  `SystemMaxUse` and `SystemKeepFree` is tighter, and KeepFree defaults to 15%
+  of the filesystem — a floor this ~90%-full root volume is already beneath, so
+  journald trimmed its own journals continuously whatever the cap said. That is
+  why the earlier 100M -> 300M raise still left only ~2 hours of history on
+  2026-08-31. Both are now set explicitly (1G cap, 1G floor).
+  **`make journal-volume` reports which one binds**, plus per-unit burn rate
+  and the most repeated log lines — past a point the fix is to log less, not to
+  keep more.
+- The freshness check evaluates every 10 minutes while a symbol is stale, but
+  since 2026-09-01 the dispatcher folds a repeat of the SAME failure into one
+  alert for `ALERT_MIN_INTERVAL_SEC` (default 3600s). A DIFFERENT failure — a
+  second symbol going dark — still pages immediately, and the next alert that
+  gets through reports how many were held. Suppressed alerts are logged:
+  `journalctl -t zerogex-alert`. `make alert-cooldown-status` shows what is
+  held right now; `make alert-cooldown-reset` clears it.
+
+  The cooldown's state lives in `/var/lib/zerogex-alert`, created by
+  `StateDirectory=` in `zerogex-alert@.service`. That unit is **not** installed
+  by `make deploy` — only by `make alert-template-install` (deploy mentions it
+  in a comment and nothing more). Until it is reinstalled the cooldown fails
+  open, i.e. behaves exactly as it did before. The dispatcher *script* runs
+  from the repo path, so a `git pull` is enough for everything except that one
+  directory.
+- **Option chains are graded on the OPTIONS session (09:30-16:15 ET), not the
+  underlying's window.** A chain row is written only when an option quote
+  ticks, so outside that session the gaps are minutes to hours wide and mean
+  nothing. Grading them against the bar feed's 04:00-20:00 template window
+  paged ~12 times a day on healthy feeds (21 of the 69 >15-minute chain gaps
+  in a 3-day sample). If a chain stream dies after 16:15, the check stays
+  quiet until 09:30 — the worker's underlying bar stream is still watched to
+  20:00, so a dead *worker* is caught either way; only a chains-only stall
+  overnight is invisible, and nothing is lost while the options market is
+  shut.
 - Nothing here detects a child that is alive, streaming, and writing
   *wrong* data — only absence.

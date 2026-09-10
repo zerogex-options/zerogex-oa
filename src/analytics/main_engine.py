@@ -11,6 +11,7 @@ Runs on a configured interval and writes to gex_summary and gex_by_strike tables
 """
 
 import bisect
+import logging
 import os
 import signal
 import threading
@@ -81,6 +82,11 @@ from src.market_calendar import (
 )
 
 logger = get_logger(__name__)
+
+# Underlyings whose AnalyticsEngine startup banner has already been logged at
+# INFO in this process. Per-process, per-symbol: the daemon's one engine per
+# symbol still announces itself, the API's per-request constructions do not.
+_BANNER_LOGGED_FOR: set = set()
 
 # Normalization constant for the inline standard-normal pdf in the BS-gamma
 # hot path (see _calculate_bs_gamma): exp(-d1²/2) / sqrt(2π).
@@ -226,6 +232,13 @@ class AnalyticsEngine:
         # unchanged timestamp skips; an RTH bar advances the timestamp
         # every minute so legitimate intraday recompute is unaffected.
         self._last_processed_snapshot_ts: Optional[datetime] = None
+        # ...paired with the chain's latest-table write clock at that cycle.
+        # The bucket timestamp moves once a minute, so on its own it would
+        # make any interval shorter than a minute skip every other cycle;
+        # the write clock moves every few seconds while quotes flow, so the
+        # same bucket with fresher rows is recomputed and the same bucket
+        # with the same rows is not.
+        self._last_processed_data_updated_at: Optional[datetime] = None
         # Latch for the "snapshot has no Greek-bearing options" state.
         # A weekday night is inside the 24x5 run window, so the engine
         # keeps cycling after the close; once the underlying feed stops
@@ -269,13 +282,24 @@ class AnalyticsEngine:
         )
         self._analytics_flow_cache_refresh_enabled: bool = ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 
-        logger.info(f"Initialized AnalyticsEngine for {underlying}")
-        logger.info(f"Calculation interval: {calculation_interval}s")
-        logger.info(f"Risk-free rate: {risk_free_rate:.4f}")
+        # This banner is per-INSTANCE, and the API constructs an AnalyticsEngine
+        # per request -- ~1,800 an hour measured 2026-09-01, so these four lines
+        # were ~7,000/hour in the API's journal for a daemon startup message.
+        # Log them at INFO the first time a given underlying is seen in this
+        # process, DEBUG after: the analytics daemon builds one engine per
+        # symbol at startup and still gets its full banner, while the API's
+        # repeat constructions say it once.
+        first_time = underlying not in _BANNER_LOGGED_FOR
+        _BANNER_LOGGED_FOR.add(underlying)
+        banner = logging.INFO if first_time else logging.DEBUG
+        logger.log(banner, "Initialized AnalyticsEngine for %s", underlying)
+        logger.log(banner, "Calculation interval: %ss", calculation_interval)
+        logger.log(banner, "Risk-free rate: %.4f", risk_free_rate)
         if not self._analytics_flow_cache_refresh_enabled:
-            logger.info(
+            logger.log(
+                banner,
                 "Analytics legacy flow cache refresh is DISABLED "
-                "(ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false)"
+                "(ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false)",
             )
 
         # Setup signal handlers for clean shutdown of the long-running
@@ -1024,11 +1048,28 @@ class AnalyticsEngine:
                         f"(threshold {self.min_oi_coverage_pct_alert:.1%})"
                     )
 
+                # Sub-minute change signal. The chain rows are minute
+                # buckets rewritten in place every few seconds, so the bucket
+                # timestamp alone cannot say whether anything changed since
+                # the last cycle; the latest table's write clock can. One
+                # indexed aggregate over this underlying's contracts.
+                cursor.execute(
+                    """
+                    SELECT MAX(updated_at)
+                    FROM option_chains_latest
+                    WHERE underlying = %s
+                    """,
+                    (self.db_symbol,),
+                )
+                updated_row = cursor.fetchone()
+                data_updated_at = updated_row[0] if updated_row else None
+
                 return {
                     "timestamp": timestamp,
                     "underlying_price": underlying_price,
                     "options": options,
                     "spot_anchored": spot_anchored,
+                    "data_updated_at": data_updated_at,
                 }
 
         except Exception as e:
@@ -2552,9 +2593,7 @@ class AnalyticsEngine:
         # "into expiration" horizon here.  calculate_time_to_expiration returns
         # the intraday-accurate remainder in years (not 1/365) and 0.0 once
         # past the settlement instant, which the pure function reads as EXPIRED.
-        tau = calculate_time_to_expiration(
-            timestamp, today_et, market_close_time="16:00:00"
-        )
+        tau = calculate_time_to_expiration(timestamp, today_et, market_close_time="16:00:00")
 
         # Representative ATM IV via the engine's established ±band policy
         # (mirrors _store_daily_atm_iv): mean ATM call IV, calls preferred.
@@ -2581,9 +2620,7 @@ class AnalyticsEngine:
             )
             T = tte_cache.get(close_t)
             if T is None:
-                T = calculate_time_to_expiration(
-                    timestamp, today_et, market_close_time=close_t
-                )
+                T = calculate_time_to_expiration(timestamp, today_et, market_close_time=close_t)
                 tte_cache[close_t] = T
             contracts.append(
                 {
@@ -3119,8 +3156,8 @@ class AnalyticsEngine:
              call_wall, put_wall, call_wall_strength, put_wall_strength,
              max_pain_by_expiration, gamma_flip_span_used,
              gamma_flip_raw, pin_strike, pin_score, pin_confidence,
-             pin_strike_reason)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             pin_strike_reason, computed_at, data_as_of)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -3146,7 +3183,9 @@ class AnalyticsEngine:
                 pin_strike = EXCLUDED.pin_strike,
                 pin_score = EXCLUDED.pin_score,
                 pin_confidence = EXCLUDED.pin_confidence,
-                pin_strike_reason = EXCLUDED.pin_strike_reason
+                pin_strike_reason = EXCLUDED.pin_strike_reason,
+                computed_at = NOW(),
+                data_as_of = EXCLUDED.data_as_of
             WHERE
                 EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                 OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -3173,6 +3212,7 @@ class AnalyticsEngine:
                 OR EXCLUDED.pin_score IS DISTINCT FROM gex_summary.pin_score
                 OR EXCLUDED.pin_confidence IS DISTINCT FROM gex_summary.pin_confidence
                 OR EXCLUDED.pin_strike_reason IS DISTINCT FROM gex_summary.pin_strike_reason
+                OR EXCLUDED.data_as_of IS DISTINCT FROM gex_summary.data_as_of
         """,
             (
                 summary["underlying"],
@@ -3202,6 +3242,7 @@ class AnalyticsEngine:
                 (float(pin_score_val) if pin_score_val is not None else None),
                 (float(pin_confidence_val) if pin_confidence_val is not None else None),
                 (str(pin_strike_reason_val) if pin_strike_reason_val is not None else None),
+                summary.get("data_as_of"),
             ),
         )
         logger.info("✅ Stored GEX summary")
@@ -3954,6 +3995,243 @@ class AnalyticsEngine:
         # one does not block the other.
         self._refresh_flow_caches(anchor_ts, underlying_price=underlying_price)
         self._refresh_flow_series_snapshot(anchor_ts)
+        self._refresh_gamma_regime_snapshot(anchor_ts)
+
+    #: How many 5-minute bars back the rolling lens compares against.
+    #: Kept beside the writer because it is stored per row: changing it
+    #: changes what already-written rows mean, and a reader can tell which
+    #: setting produced a given bar.
+    GAMMA_REGIME_ROLLING_BARS = 6
+
+    def _gamma_chain_at_bar(self, cursor, bar_start: datetime):
+        """The per-strike dealer-gamma chain for one 5-minute bar.
+
+        Resolves the latest ``gex_by_strike`` timestamp inside the bar, then
+        derives dollar GEX from the stored RAW gamma at that bar's own spot --
+        ``gamma x 100 x S^2 x 0.01``, the same canonical form
+        ``get_gex_chain_at_ts`` uses. The derivation matters: gex_by_strike
+        stores gamma, not dollars, so reading net_gex straight out would be
+        off by the spot-squared factor and silently wrong rather than absent.
+
+        Returns ``(spot, rows)`` or ``(None, [])`` when the bar has no chain.
+        """
+        cursor.execute(
+            """
+            WITH anchor AS (
+                SELECT timestamp
+                FROM gex_by_strike
+                WHERE underlying = %(symbol)s
+                  AND timestamp >= %(bar_start)s
+                  AND timestamp <  %(bar_end)s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            anchor_spot AS (
+                SELECT
+                    a.timestamp,
+                    (SELECT uq.close
+                       FROM underlying_quotes uq
+                      WHERE uq.symbol = %(symbol)s
+                        AND uq.timestamp <= a.timestamp
+                      ORDER BY uq.timestamp DESC
+                      LIMIT 1) AS spot_price
+                FROM anchor a
+            )
+            SELECT
+                a.spot_price,
+                g.strike,
+                g.expiration,
+                ((g.call_gamma - g.put_gamma) * 100 * a.spot_price * a.spot_price * 0.01)
+                    AS net_gex,
+                (g.call_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS call_gex,
+                (-1 * g.put_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS put_gex,
+                g.call_oi,
+                g.put_oi
+            FROM gex_by_strike g
+            CROSS JOIN anchor_spot a
+            WHERE g.underlying = %(symbol)s
+              AND g.timestamp = a.timestamp
+              AND a.spot_price IS NOT NULL
+            ORDER BY g.expiration ASC, g.strike ASC
+            LIMIT %(max_rows)s
+            """,
+            {
+                "symbol": self.db_symbol,
+                "bar_start": bar_start,
+                "bar_end": bar_start + timedelta(minutes=5),
+                "max_rows": 6000,
+            },
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None, []
+
+        cols = [d[0] for d in cursor.description]
+        dicts = [dict(zip(cols, r)) for r in rows]
+        spot = dicts[0].get("spot_price")
+        return (float(spot) if spot is not None else None), dicts
+
+    def _refresh_gamma_regime_snapshot(self, timestamp: datetime):
+        """Materialise gamma_regime_5min for the current session.
+
+        Writes ONE bar per cycle. That is the whole design: a bar's reading is
+        a diff of two ~1500-row chains, so computing a session on demand is
+        ~78 of those per viewer per poll -- the exact shape that took
+        /api/gex/strike-profile-timeseries down on 2026-08-21, where a read
+        too slow for its own guard returned empty, cached nothing, and every
+        next poll re-entered the same work. Doing it here instead means the
+        expensive part happens once, in the background, off the request path.
+
+        Cold-start and gap-fill walk the session's missing bars rather than
+        rebuilding everything: an engine restart mid-session must not leave a
+        hole in the line, but it also must not redo bars already written.
+
+        Best-effort, exactly like the flow snapshot: log and return, never
+        raise. A failure here must not break the analytics cycle or the GEX
+        path that the rest of the product depends on.
+        """
+        if not self._analytics_flow_cache_refresh_enabled:
+            return
+
+        try:
+            from src.analytics.gamma_regime_series import ChainSnapshot, build_latest_bar
+
+            ts_et = timestamp.astimezone(ET)
+            session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
+            session_start = session_open_et.astimezone(timezone.utc)
+            session_close = session_start + timedelta(hours=6, minutes=45)
+            now_utc = datetime.now(timezone.utc)
+            curr_bar = datetime.fromtimestamp(
+                int(now_utc.timestamp() // 300) * 300, tz=timezone.utc
+            )
+            session_end = min(curr_bar, session_close)
+            if session_end < session_start:
+                return
+
+            rolling = self.GAMMA_REGIME_ROLLING_BARS
+
+            with db_connection() as conn:
+                cursor = conn.cursor()
+
+                # Which bars still need writing. Normally exactly one (the
+                # open bar, rewritten as it fills); more after downtime.
+                cursor.execute(
+                    """
+                    SELECT bar_start FROM gamma_regime_5min
+                    WHERE symbol = %s AND bar_start >= %s AND bar_start <= %s
+                    """,
+                    (self.db_symbol, session_start, session_end),
+                )
+                written = {r[0] for r in cursor.fetchall()}
+
+                bar = session_start
+                todo = []
+                while bar <= session_end:
+                    # Always rewrite the newest bar: it is still filling.
+                    if bar not in written or bar == session_end:
+                        todo.append(bar)
+                    bar += timedelta(minutes=5)
+
+                if not todo:
+                    return
+
+                anchor_spot, anchor_rows = self._gamma_chain_at_bar(cursor, session_start)
+                if not anchor_rows or anchor_spot is None:
+                    # No chain at the open yet — nothing to anchor against.
+                    return
+                anchor = ChainSnapshot(bar_start=session_start, spot=anchor_spot, rows=anchor_rows)
+
+                # One cache per cycle: consecutive bars share lookbacks, and a
+                # gap-fill of N bars would otherwise re-read the same chains.
+                chains: dict = {session_start: anchor}
+
+                def chain_for(bar_ts):
+                    if bar_ts not in chains:
+                        spot, rows = self._gamma_chain_at_bar(cursor, bar_ts)
+                        chains[bar_ts] = (
+                            ChainSnapshot(bar_start=bar_ts, spot=spot, rows=rows)
+                            if rows and spot is not None
+                            else None
+                        )
+                    return chains[bar_ts]
+
+                written_count = 0
+                for bar_ts in todo:
+                    current = chain_for(bar_ts)
+                    if current is None:
+                        continue
+                    lookback_ts = bar_ts - timedelta(minutes=5 * rolling)
+                    lookback = chain_for(lookback_ts) if lookback_ts >= session_start else None
+
+                    result = build_latest_bar(anchor=anchor, lookback=lookback, current=current)
+
+                    cursor.execute(
+                        """
+                        INSERT INTO gamma_regime_5min (
+                            symbol, bar_start, spot,
+                            anchored_lean, anchored_stability,
+                            anchored_net_shift, anchored_gross_shift,
+                            rolling_lean, rolling_stability,
+                            rolling_net_shift, rolling_gross_shift,
+                            sigma_price, near_spot_stock, strike_count,
+                            expired_expirations, rolling_bars
+                        ) VALUES (
+                            %(symbol)s, %(bar_start)s, %(spot)s,
+                            %(anchored_lean)s, %(anchored_stability)s,
+                            %(anchored_net_shift)s, %(anchored_gross_shift)s,
+                            %(rolling_lean)s, %(rolling_stability)s,
+                            %(rolling_net_shift)s, %(rolling_gross_shift)s,
+                            %(sigma_price)s, %(near_spot_stock)s, %(strike_count)s,
+                            %(expired_expirations)s, %(rolling_bars)s
+                        )
+                        ON CONFLICT (symbol, bar_start) DO UPDATE SET
+                            spot = EXCLUDED.spot,
+                            anchored_lean = EXCLUDED.anchored_lean,
+                            anchored_stability = EXCLUDED.anchored_stability,
+                            anchored_net_shift = EXCLUDED.anchored_net_shift,
+                            anchored_gross_shift = EXCLUDED.anchored_gross_shift,
+                            rolling_lean = EXCLUDED.rolling_lean,
+                            rolling_stability = EXCLUDED.rolling_stability,
+                            rolling_net_shift = EXCLUDED.rolling_net_shift,
+                            rolling_gross_shift = EXCLUDED.rolling_gross_shift,
+                            sigma_price = EXCLUDED.sigma_price,
+                            near_spot_stock = EXCLUDED.near_spot_stock,
+                            strike_count = EXCLUDED.strike_count,
+                            expired_expirations = EXCLUDED.expired_expirations,
+                            rolling_bars = EXCLUDED.rolling_bars,
+                            updated_at = NOW()
+                        """,
+                        {
+                            "symbol": self.db_symbol,
+                            "bar_start": result.bar_start,
+                            "spot": result.spot,
+                            "anchored_lean": result.anchored_lean,
+                            "anchored_stability": result.anchored_stability,
+                            "anchored_net_shift": result.anchored_net_shift,
+                            "anchored_gross_shift": result.anchored_gross_shift,
+                            "rolling_lean": result.rolling_lean,
+                            "rolling_stability": result.rolling_stability,
+                            "rolling_net_shift": result.rolling_net_shift,
+                            "rolling_gross_shift": result.rolling_gross_shift,
+                            "sigma_price": result.sigma_price,
+                            "near_spot_stock": result.near_spot_stock,
+                            "strike_count": result.strike_count,
+                            "expired_expirations": list(result.expired_expirations),
+                            "rolling_bars": rolling,
+                        },
+                    )
+                    written_count += 1
+
+                conn.commit()
+                if written_count:
+                    logger.info(
+                        "gamma_regime_5min upserted %d bar(s) for %s (through %s)",
+                        written_count,
+                        self.db_symbol,
+                        session_end.isoformat(),
+                    )
+        except Exception as e:
+            logger.error(f"Error refreshing gamma regime snapshot: {e}", exc_info=True)
 
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.
@@ -4082,6 +4360,7 @@ class AnalyticsEngine:
             True if successful, False otherwise
         """
         stage_timings: Dict[str, float] = {}
+        cycle_started_wall = _time.time()
 
         try:
             # Single DB call: get timestamp, underlying price, and option data
@@ -4103,6 +4382,7 @@ class AnalyticsEngine:
             latest_timestamp = snapshot["timestamp"]
             underlying_price = snapshot["underlying_price"]
             options = snapshot["options"]
+            data_updated_at = snapshot.get("data_updated_at")
 
             # Skip the recompute when the snapshot timestamp is unchanged
             # since the last successful cycle.  Off-hours the latest
@@ -4119,9 +4399,14 @@ class AnalyticsEngine:
             # the timestamp every minute, so latest_timestamp moves and the
             # guard falls through.  Only set on SUCCESS (see end of method)
             # so a failed/partial cycle re-attempts the same timestamp.
+            # The write clock is part of the key so an interval shorter than
+            # the bucket still recomputes: the bucket row is rewritten every
+            # few seconds, so the same timestamp can carry fresher quotes.
             if (
                 self._last_processed_snapshot_ts is not None
                 and latest_timestamp == self._last_processed_snapshot_ts
+                # getattr: tests build bare engines without __init__.
+                and data_updated_at == getattr(self, "_last_processed_data_updated_at", None)
             ):
                 # Off-hours the snapshot timestamp is frozen until the
                 # next session, so this guard fires every interval for
@@ -4181,6 +4466,7 @@ class AnalyticsEngine:
                     )
                     self._empty_snapshot_state = True
                 self._last_processed_snapshot_ts = latest_timestamp
+                self._last_processed_data_updated_at = data_updated_at
                 return True
 
             # Greek-bearing data is back — clear the closed-market latch so
@@ -4224,6 +4510,10 @@ class AnalyticsEngine:
             # Store results
             logger.info("Storing results to database...")
             t0 = _time.monotonic()
+            # What the numbers are as of: the newest quote write the snapshot
+            # read, not the minute bucket it is filed under. See
+            # gex_summary.data_as_of in schema.sql.
+            gex_summary["data_as_of"] = data_updated_at
             self._store_calculation_results(gex_by_strike, gex_summary, options=options)
             stage_timings["store_results"] = _time.monotonic() - t0
 
@@ -4271,9 +4561,12 @@ class AnalyticsEngine:
             # Record only after a fully successful cycle so a transient
             # mid-cycle failure re-attempts the same timestamp next round.
             self._last_processed_snapshot_ts = latest_timestamp
+            self._last_processed_data_updated_at = data_updated_at
 
             # Emit per-stage timings so cycle-overrun warnings can be
-            # diagnosed without guessing which step is slow.
+            # diagnosed without guessing which step is slow. The exact
+            # wording is parsed by src/tools/system_monitor.py; the richer
+            # line below is additive, not a replacement.
             self._last_stage_timings = stage_timings
             total_stage_time = sum(stage_timings.values())
             timings_str = ", ".join(f"{label}={secs:.2f}s" for label, secs in stage_timings.items())
@@ -4281,6 +4574,18 @@ class AnalyticsEngine:
                 "Stage timings (total %.2fs): %s",
                 total_stage_time,
                 timings_str,
+            )
+            # And one line per cycle with the symbol and the two halves of
+            # the snapshot's age at publish (phase and duration) that nothing
+            # outside this process can separate. See format_cycle_timing.
+            logger.info(
+                format_cycle_timing(
+                    self.underlying,
+                    latest_timestamp,
+                    cycle_started_wall,
+                    _time.time(),
+                    stage_timings,
+                )
             )
 
             return True
@@ -4351,6 +4656,7 @@ class AnalyticsEngine:
 
                 # Run calculation
                 success = self.run_calculation()
+                calc_seconds = time.time() - cycle_start
 
                 if success:
                     logger.info(f"✅ Calculation cycle {self.calculations_completed} complete")
@@ -4364,11 +4670,28 @@ class AnalyticsEngine:
                 # data sources (flow_contract_facts → flow_by_contract)
                 # remain live well past the GEX side's cash-close freeze.
                 # See _run_flow_cycle for the full rationale.
+                flow_start = time.time()
                 self._run_flow_cycle()
+                flow_seconds = time.time() - flow_start
 
                 # Calculate sleep time
                 cycle_duration = time.time() - cycle_start
                 sleep_time = max(0, effective_interval - cycle_duration)
+
+                # One line per loop for what the cycle line cannot see. The
+                # loop's period is calc + flow + sleep, so a flow refresh that
+                # runs past the interval is what moves the publish phase: the
+                # probe saw the phase jump by 10 to 30s between minutes while
+                # calc measured 0.3s. Symbol-tagged, as "Sleeping for" is not.
+                logger.info(
+                    format_loop_timing(
+                        self.underlying,
+                        calc_seconds,
+                        flow_seconds,
+                        sleep_time,
+                        effective_interval,
+                    )
+                )
 
                 if sleep_time > 0:
                     logger.info(f"Sleeping for {sleep_time:.1f}s until next calculation...\n")
@@ -4413,6 +4736,78 @@ class AnalyticsEngine:
             logger.info("=" * 80 + "\n")
 
             close_connection_pool()
+
+
+def format_cycle_timing(
+    symbol: str,
+    snapshot_ts: datetime,
+    cycle_started_wall: float,
+    published_wall: float,
+    stage_timings: Dict[str, float],
+) -> str:
+    """The one log line per cycle that says where a snapshot's age comes from.
+
+    A snapshot is stamped with the chain timestamp the cycle started from,
+    so by the time it is written it is already ``publish_lag`` seconds old,
+    and that lag has two halves the API cannot tell apart:
+
+    * ``phase`` -- how far past the snapshot stamp the cycle *started*. With
+      minute-bucketed chain rows this is mostly where in the minute the
+      fixed 60s clock happens to fire; the rows themselves are rewritten
+      every 5s, so it is label age, not data age.
+    * ``duration`` -- the cycle's own in-flight time, start to store. This is
+      data age, and the part worth shortening.
+
+    A probe polling ``/api/v2/levels/NQ`` every 5s measured publish_lag at
+    26-59s and saw it swing by up to 30s between consecutive minutes on a
+    period of exactly 60s; only duration can swing like that, and only the
+    stage breakdown here says which stage does. Stages are listed slowest
+    first. Grep the journal for ``Cycle timing [NDX]``.
+
+    The log format carries no worker name and every symbol's worker logs
+    into the same journal, so the symbol is in the line itself.
+    """
+    stamp = snapshot_ts if snapshot_ts.tzinfo is not None else snapshot_ts.replace(tzinfo=timezone.utc)
+    stamp_epoch = stamp.timestamp()
+    phase = cycle_started_wall - stamp_epoch
+    duration = published_wall - cycle_started_wall
+    publish_lag = published_wall - stamp_epoch
+    stages = ", ".join(
+        f"{label}={secs:.1f}s"
+        for label, secs in sorted(stage_timings.items(), key=lambda kv: kv[1], reverse=True)
+    )
+    return (
+        f"Cycle timing [{symbol}] snapshot={stamp.isoformat(timespec='seconds')} "
+        f"phase={phase:+.1f}s duration={duration:.1f}s publish_lag={publish_lag:.1f}s "
+        f"stages: {stages or 'n/a'}"
+    )
+
+
+def format_loop_timing(
+    symbol: str,
+    calc_seconds: float,
+    flow_seconds: float,
+    sleep_seconds: float,
+    interval_seconds: float,
+) -> str:
+    """One line per loop iteration: how the interval was spent.
+
+    ``calc`` is run_calculation (the cycle line has its stages), ``flow`` is
+    the flow-cache refresh that follows it, ``sleep`` is what was left of the
+    interval. When calc + flow exceeds the interval the loop sleeps zero and
+    the next cycle starts late, so the publish phase moves by the overrun;
+    that is the only thing that moves it, and the line says so.
+    """
+    over = calc_seconds + flow_seconds - interval_seconds
+    tail = (
+        f" OVERRUN by {over:.1f}s: next cycle starts late, publish phase moves"
+        if over > 0
+        else ""
+    )
+    return (
+        f"Loop timing [{symbol}] calc={calc_seconds:.1f}s flow={flow_seconds:.1f}s "
+        f"sleep={sleep_seconds:.1f}s interval={interval_seconds:.0f}s{tail}"
+    )
 
 
 def _compute_worker_stagger(interval_seconds: int, num_workers: int) -> float:

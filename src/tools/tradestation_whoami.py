@@ -105,43 +105,85 @@ def describe(claims: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main(argv: Optional[list] = None) -> int:
-    load_dotenv()
+def username_of(claims: Dict[str, Any]) -> Optional[str]:
+    """The TradeStation username, wherever the token happens to carry it."""
+    for key, value in claims.items():
+        if key.rsplit("/", 1)[-1] in ("username", "preferred_username"):
+            return str(value)
+    return None
+
+
+def _identify(label: str, credentials: tuple) -> Optional[str]:
+    """Print one credential's identity. Returns the username, or None."""
     from src.ingestion.tradestation_auth import TradeStationAuth
 
-    client_id = os.getenv("TRADESTATION_CLIENT_ID", "")
-    client_secret = os.getenv("TRADESTATION_CLIENT_SECRET", "")
-    refresh_token = os.getenv("TRADESTATION_REFRESH_TOKEN", "")
+    client_id, client_secret, refresh_token = credentials
+    print("=" * 72)
+    print(label)
+    print("=" * 72)
     if not (client_id and client_secret and refresh_token):
+        print("  (not configured)")
+        return None
+    try:
+        claims = decode_jwt_payload(
+            TradeStationAuth(client_id, client_secret, refresh_token).get_access_token()
+        )
+    except Exception as e:
+        print(f"  could not identify: {e}")
+        return None
+    print(describe(claims))
+    return username_of(claims)
+
+
+def main(argv: Optional[list] = None) -> int:
+    load_dotenv()
+    from src.config import futures_credentials_are_separate, futures_tradestation_credentials
+
+    main_creds = (
+        os.getenv("TRADESTATION_CLIENT_ID", ""),
+        os.getenv("TRADESTATION_CLIENT_SECRET", ""),
+        os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
+    )
+    if not all(main_creds):
         print(
             "TRADESTATION_CLIENT_ID / _SECRET / _REFRESH_TOKEN must all be set in .env",
             file=sys.stderr,
         )
         return 2
 
-    auth = TradeStationAuth(client_id, client_secret, refresh_token)
-    try:
-        token = auth.get_access_token()
-    except Exception as e:
-        print(f"Could not obtain an access token: {e}", file=sys.stderr)
-        return 1
+    main_user = _identify("MAIN credential — options, equities, indexes, VIX/VXN", main_creds)
 
-    try:
-        claims = decode_jwt_payload(token)
-    except Exception as e:
-        print(f"Access token is not a decodable JWT ({e}) — cannot identify the user.")
-        return 1
-
-    print("=" * 72)
-    print("TradeStation identity for this deployment")
-    print("=" * 72)
-    print(describe(claims))
+    separate = futures_credentials_are_separate()
     print()
-    print("Market-data entitlements attach to the USERNAME above, not to the API")
-    print("application. If that is not the username carrying the real-time CME")
-    print("package, re-run the OAuth authorisation flow signed in as the entitled")
-    print("username and replace TRADESTATION_REFRESH_TOKEN with the new value —")
-    print("restarting will not move the entitlement across.")
+    if separate:
+        futures_user = _identify(
+            "FUTURES credential (TRADESTATION_FUTURES_REFRESH_TOKEN) — ES / NQ",
+            futures_tradestation_credentials(),
+        )
+    else:
+        futures_user = main_user
+        print("=" * 72)
+        print("FUTURES credential — ES / NQ")
+        print("=" * 72)
+        print("  TRADESTATION_FUTURES_REFRESH_TOKEN is unset, so the futures feeds")
+        print(f"  run under the MAIN credential ({main_user or 'unknown'}).")
+
+    print()
+    print("=" * 72)
+    print("What to check")
+    print("=" * 72)
+    print("  Market-data entitlements attach to a USERNAME, not to the API")
+    print("  application, and the refresh token is what carries the username.")
+    print(f"    real-time CME (ES/NQ)  must be on: {futures_user or 'unknown'}")
+    print(f"    equity / index / OPRA  must be on: {main_user or 'unknown'}")
+    if not separate and main_user:
+        print()
+        print("  Both are the same username here. If your CME entitlement sits on a")
+        print("  DIFFERENT username, do not repoint the main token at it — that one")
+        print("  token also drives option chains, equity bars and every backfill.")
+        print("  Mint a token for the CME-entitled username and set")
+        print("  TRADESTATION_FUTURES_REFRESH_TOKEN instead, which also splits the")
+        print("  per-account stream cap across the two.")
     print("=" * 72)
     return 0
 

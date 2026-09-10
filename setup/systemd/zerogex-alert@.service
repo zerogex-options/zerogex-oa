@@ -25,6 +25,14 @@ ExecStart=/home/ubuntu/zerogex-oa/setup/systemd/zerogex-alert.sh %i
 # can't pile up alert-handler instances.
 TimeoutStartSec=30
 
+# /var/lib/zerogex-alert, created and owned by systemd. The dispatcher keeps
+# one small file per unit here recording when it last sent and what the failure
+# looked like, so a repeat of the same failure inside ALERT_MIN_INTERVAL_SEC is
+# folded in rather than re-sent. ProtectSystem=strict makes the rest of the
+# filesystem read-only, so without this the cooldown has nowhere to write —
+# it fails open and every firing alerts, which is the old behaviour.
+StateDirectory=zerogex-alert
+
 # Security
 NoNewPrivileges=true
 PrivateTmp=true

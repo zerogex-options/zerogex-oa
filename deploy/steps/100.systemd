@@ -122,6 +122,36 @@ TIMER_UNITS=(
     # /api/market/session-levels and the frontend chart level overlays.
     # See src/jobs/session_levels.py.
     "zerogex-oa-session-levels"
+    # Gamma Regime per-session reads (every 15 min through the cash session,
+    # RTH-gated in-process).  Writes one gex_regime_session row per trading
+    # day: the Gamma Shift page's Session History strip renders those rows,
+    # and the same rows are the trailing z-score denominator behind the live
+    # Gamma Regime Shift card.  Nothing else produces them -- with the timer
+    # missing the strip reads "No stored sessions yet" indefinitely and the
+    # card never gets past its provisional bootstrap magnitude.  Seed the
+    # trailing window once after deploy with `make regime-session-backfill`.
+    # See src/tools/regime_session_refresh.py.
+    "zerogex-oa-regime-session-refresh"
+    # Nightly per-symbol gamma-wall break curves (04:55 ET).  Writes
+    # wall_break_stats: the measured probability that a wall gives way once
+    # price reaches it, per symbol and per horizon.  The levels surfaces read
+    # it so a call wall can carry its own hit rate rather than implying one --
+    # S&P walls held about two times in three within the hour and Nasdaq walls
+    # closer to one in two, so a single figure cannot serve both.  With the
+    # timer missing the table simply stays empty and the surfaces hide the
+    # figure (reportable=false), which is the correct degradation but is not a
+    # reason to leave it uninstalled.  See src/tools/wall_break_stats_refresh.py
+    # and docs/design/wall-break-odds.md.
+    "zerogex-oa-wall-break-stats-refresh"
+    # Nightly percentile bands for the headline GEX metrics (04:45 ET), read
+    # by /api/gex/historical-context and by TradeWorkz via
+    # gex_stats.fetch_wall_strength_pctile -- which wall_reversion gates live
+    # trades on.  Unit files have existed for a while and the timer is enabled
+    # on the current box, but it was never in this list, so a rebuilt or
+    # replacement host would come up without it and the percentile lookups
+    # would silently fall back to neutral sizing.  See
+    # src/tools/gex_historical_stats_refresh.py.
+    "zerogex-oa-gex-historical-stats-refresh"
     # Per-symbol ingestion freshness (every 10 min, all day): alerts when a
     # configured underlying stops writing bars inside its delivery window.
     # This is the ONLY check that sees a single dead per-symbol worker --
@@ -178,8 +208,14 @@ JOURNALD_DROPIN_DST="/etc/systemd/journald.conf.d/10-zerogex-oa.conf"
 if [ -f "$JOURNALD_DROPIN_SRC" ]; then
     log "  → Installing journald disk cap ($JOURNALD_DROPIN_DST)..."
     sudo install -D -m 0644 "$JOURNALD_DROPIN_SRC" "$JOURNALD_DROPIN_DST"
+    # Read the values back out of the file just installed rather than repeating
+    # them here. This line said "SystemMaxUse=100M" for two raises after the
+    # real cap had moved -- the same drift the drop-in warns about, reporting a
+    # number that had not been true since the 2026-08-17 post-mortem.
+    JOURNALD_CAP="$(sed -n 's/^[[:space:]]*SystemMaxUse=//p' "$JOURNALD_DROPIN_DST" | tail -1)"
+    JOURNALD_KEEP="$(sed -n 's/^[[:space:]]*SystemKeepFree=//p' "$JOURNALD_DROPIN_DST" | tail -1)"
     if sudo systemctl restart systemd-journald 2>/dev/null; then
-        log "     ✓ journald cap applied (SystemMaxUse=100M); $(journalctl --disk-usage 2>/dev/null)"
+        log "     ✓ journald applied (SystemMaxUse=${JOURNALD_CAP:-unset}, SystemKeepFree=${JOURNALD_KEEP:-15% default}); $(journalctl --disk-usage 2>/dev/null)"
     else
         log "     ✗ journald restart failed — cap applies on next journald restart"
     fi

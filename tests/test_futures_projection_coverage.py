@@ -44,6 +44,7 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         # --- dollar exposures and notionals -------------------------------
         "gex",
         "exposure",
+        "strength",  # WallLevel: dollar gamma at a C1/C2/P1/P2 wall strike
         "net_gamma",
         "call_gamma",
         "put_gamma",
@@ -116,10 +117,9 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "charm_flow",
         "gamma_component",
         "vanna_component",
-        "atm_iv",
-        "call_iv",
-        "put_iv",
-        "skew",
+        # atm_iv / call_iv / put_iv / skew moved to NEVER_PROJECT when
+        # /api/gex/vol_surface became projectable: on that route they ARE the
+        # payload, so an explicit deny is worth more than an acknowledgement.
         "vol_change_pts",  # volatility points, not price points
         "abs_dollar_gex",
         "close_flow_usd",
@@ -144,6 +144,7 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "profiles",
         "span_used",
         "now_index",  # positional index into the session, not an index level
+        "rank",  # WallLevel: 1/2/3 position on the wall ladder, not a level
         # --- time and bookkeeping -----------------------------------------
         "available_max_dte",
         "available_strike_count",
@@ -325,6 +326,11 @@ def test_known_price_levels_are_projected(field):
         "ask",
         "call_notional",
         "total_notional",
+        # vol_surface's value axis: dimensionless rates, not index levels.
+        "call_iv",
+        "put_iv",
+        "atm_iv",
+        "skew",
     ],
 )
 def test_look_alikes_are_denied(field):

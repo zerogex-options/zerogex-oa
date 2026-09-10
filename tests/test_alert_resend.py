@@ -67,6 +67,14 @@ class _Harness:
         env["CURL_BODY_FILE"] = str(self.body_file)
         # Ensure a stray /etc/zerogex/alert.env on a dev box can't interfere.
         env["ALERT_APP_ENV"] = env.get("ALERT_APP_ENV", str(self.tmp / "nonexistent.env"))
+        # These cases are about the request the resend backend builds, so opt
+        # out of the cooldown: several of them dispatch the same unit with the
+        # same journal fixture, which is by design one repeated failure, and
+        # would otherwise be folded into the first send and assert on a body
+        # that was never written. State dir is redirected too, so a test run
+        # can never touch /var/lib/zerogex-alert. See test_alert_cooldown.py.
+        env["ALERT_MIN_INTERVAL_SEC"] = "0"
+        env["ALERT_STATE_DIR"] = str(self.tmp / "alert-state")
         if extra_env:
             env.update(extra_env)
         subprocess.run(["bash", str(ALERT), unit, reason], env=env, check=True)

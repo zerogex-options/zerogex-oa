@@ -560,6 +560,25 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_strike NUMERIC(12, 4);
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_score DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_confidence DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS pin_strike_reason TEXT;
+-- When the analytics engine last wrote this row (server clock). ``timestamp``
+-- is the chain bucket the snapshot was computed FROM, i.e. what the data are
+-- as of; this is when the numbers were PRODUCED. The two differ by the cycle's
+-- phase within the minute plus its own duration (26-59s measured in
+-- production), and a sub-minute cadence rewrites the same minute row, so this
+-- is also the only column that says a rewrite happened. NULL on rows that
+-- predate the column. Not bumped by the no-op upsert guard: a recompute that
+-- changed nothing leaves the row, and this, alone.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS computed_at TIMESTAMPTZ;
+-- What the numbers are actually as of: the newest quote write the snapshot
+-- read (max option_chains_latest.updated_at for the underlying at the
+-- cycle's read). ``timestamp`` is the minute bucket the row is filed under,
+-- which overstates a snapshot's age by the cycle's phase in the minute --
+-- measured 26-59s in production while the quotes inside were under 5s old.
+-- age_seconds and the v2 freshness grade are measured from this. NULL on
+-- rows older than the column.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS data_as_of TIMESTAMPTZ;
+COMMENT ON COLUMN gex_summary.data_as_of IS
+    'Newest option_chains_latest.updated_at the snapshot read; what the row is as of. timestamp is the minute bucket.';
 
 -- Volume column semantics. ``total_call_volume`` and ``total_put_volume``
 -- are per-snapshot session-cumulative aggregates summed across every
@@ -1043,6 +1062,68 @@ CREATE TABLE IF NOT EXISTS flow_series_5min (
 );
 CREATE INDEX IF NOT EXISTS idx_flow_series_5min_symbol_bar
     ON flow_series_5min(symbol, bar_start DESC);
+
+-- Intraday Gamma Regime series -- the Gamma Shift read at every 5-minute bar,
+-- materialised so it can share a timeline with the Hedging Flow panel.
+--
+-- WHY THIS IS A TABLE AND NOT A QUERY. Each bar's reading is a diff of two
+-- per-strike chains, and a chain is ~40-60 strikes x ~10-25 expirations. A
+-- session computed on read is ~78 bars x up to ~1500 rows, per viewer, per
+-- poll -- the same shape that took /api/gex/strike-profile-timeseries down on
+-- 2026-08-21 (docs/runbooks/strike_profile_timeseries_stampede.md), where a
+-- read too slow for its own guard returned empty, never populated its cache,
+-- and every subsequent poll re-entered the identical work. The Analytics
+-- Engine writes one row per bar per cycle instead, and the API range-scans
+-- ~78 tiny rows.
+--
+-- Scores are RAW, in dollar-GEX units, exactly as gex_regime_session stores
+-- them: z-scoring needs a trailing distribution of stored sessions, which is
+-- the API layer's job and must not be frozen into history at write time.
+--
+-- Two independent lenses per bar (see src/analytics/gamma_regime_series.py):
+--   anchored_* -- versus the session's first bar ("changed today")
+--   rolling_*  -- versus N bars back      ("changing right now")
+-- They do NOT sum. Both are proximity-weighted around the bar's own spot, so
+-- the kernel re-centres each bar; summing bar-to-bar diffs would assert a
+-- fixed kernel and match neither lens.
+CREATE TABLE IF NOT EXISTS gamma_regime_5min (
+    symbol                 VARCHAR(10)  NOT NULL,
+    bar_start              TIMESTAMPTZ  NOT NULL,
+    spot                   DOUBLE PRECISION,
+    anchored_lean          DOUBLE PRECISION,
+    anchored_stability     DOUBLE PRECISION,
+    anchored_net_shift     DOUBLE PRECISION,
+    anchored_gross_shift   DOUBLE PRECISION,
+    -- NULL for the first rolling_bars of a session: no lookback exists yet.
+    -- NULL rather than 0 so a chart cannot draw a measured "no change".
+    rolling_lean           DOUBLE PRECISION,
+    rolling_stability      DOUBLE PRECISION,
+    rolling_net_shift      DOUBLE PRECISION,
+    rolling_gross_shift    DOUBLE PRECISION,
+    -- Proximity-kernel width actually used, in price units (display + audit).
+    sigma_price            DOUBLE PRECISION,
+    -- Weighted |dealer gamma| the change happened against: the bootstrap
+    -- z-score denominator before any session history exists.
+    near_spot_stock        DOUBLE PRECISION,
+    strike_count           INTEGER,
+    -- Expirations that left the board since the comparison point, reported so
+    -- a roll-off is never read as dealers shedding gamma.
+    expired_expirations    DATE[],
+    rolling_bars           SMALLINT,
+    updated_at             TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (symbol, bar_start)
+);
+CREATE INDEX IF NOT EXISTS idx_gamma_regime_5min_symbol_bar
+    ON gamma_regime_5min(symbol, bar_start DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gamma_regime_5min_symbol') THEN
+        ALTER TABLE gamma_regime_5min
+        ADD CONSTRAINT fk_gamma_regime_5min_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
 
 -- Symbol FKs on the flow tables. Mirrors the pattern other tables use
 -- (option_chains, gex_summary, gex_by_strike) so deleting a symbol
@@ -2031,6 +2112,66 @@ CREATE TABLE IF NOT EXISTS component_normalizer_cache (
 -- Idempotent on subsequent runs (DELETE of zero rows is a no-op).
 DELETE FROM component_normalizer_cache
  WHERE field_name IN ('smart_money_volume_delta', 'smart_money_premium');
+
+-- =============================================================================
+-- wall_break_stats
+-- =============================================================================
+-- Per-symbol measured odds that a gamma wall gives way once price reaches it.
+--
+-- The product draws call and put walls identically for every symbol, which
+-- implies they mean the same thing.  Measured over mid-2026, they do not:
+-- S&P walls (SPY, SPX) broke about 31% of the time within an hour of being
+-- tested, Nasdaq walls (QQQ, NDX) closer to 48-50%.  That gap is a property
+-- of the underlying index -- SPY and SPX agree despite $1 and $5 strike
+-- ladders, as do QQQ and NDX -- so it cannot be presented as one number.
+--
+-- Granularity
+--   * underlying        -- symbol
+--   * side              -- 'call', 'put', or 'both' (the pooled curve)
+--   * horizon_minutes   -- minutes after the test the probability refers to
+--
+-- The answer is deliberately a CURVE and not a rate.  "Does the wall break"
+-- has no meaning without a clock: on SPX the same tests read 15.3% at a
+-- thirty-minute horizon and 34.4% at sixty, on non-overlapping intervals.
+-- Consumers must quote the horizon with the number.
+--
+-- break_prob is a Kaplan-Meier estimate, so tests that ran into the closing
+-- bell before they could resolve still contribute for the time they WERE
+-- observed rather than being discarded -- dropping them biases the estimate
+-- away from the late-session tape, where 0DTE gamma is heaviest.
+--
+-- Refresh
+--   Populated by src/tools/wall_break_stats_refresh.py, run nightly from the
+--   zerogex-oa-wall-break-stats-refresh timer (04:55 ET, after the historical
+--   stats refresh).  Idempotent UPSERT.
+--
+-- Methodology and measured results: docs/design/wall-break-odds.md
+CREATE TABLE IF NOT EXISTS wall_break_stats (
+    underlying      VARCHAR(10)      NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    side            VARCHAR(8)       NOT NULL,
+    horizon_minutes SMALLINT         NOT NULL,
+    break_prob      DOUBLE PRECISION,
+    ci_low          DOUBLE PRECISION,
+    ci_high         DOUBLE PRECISION,
+    -- Observations still being watched at this horizon; small values here are
+    -- why a probability can be present while remaining unreportable.
+    at_risk         INTEGER,
+    n_tests         INTEGER          NOT NULL,
+    n_breaks        INTEGER          NOT NULL,
+    n_censored      INTEGER          NOT NULL,
+    window_sessions INTEGER          NOT NULL,
+    window_start    DATE,
+    window_end      DATE,
+    -- False when the sample is too thin to publish; consumers must hide the
+    -- figure rather than render a misleading one.
+    reportable      BOOLEAN          NOT NULL DEFAULT FALSE,
+    refreshed_at    TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, side, horizon_minutes)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wall_break_stats_lookup
+    ON wall_break_stats (underlying, side, horizon_minutes);
+
 
 -- =============================================================================
 -- gex_historical_stats

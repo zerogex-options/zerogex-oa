@@ -286,8 +286,16 @@ def test_provision_with_tier_expands_scopes(monkeypatch):
         )
     assert resp.status_code == 200, resp.text
     scopes = resp.json()["scopes"]
-    # The signals tier bundle (derived analytics + signals, no market_raw).
-    assert set(scopes) == {"gex", "flow", "maxpain", "technicals", "signals"}
+    # The signals tier bundle: derived analytics + signals + the underlying's
+    # own tape. Not market_raw — a customer key never gets the option chain.
+    assert set(scopes) == {
+        "gex",
+        "flow",
+        "maxpain",
+        "technicals",
+        "signals",
+        "market_reference",
+    }
     assert "market_raw" not in scopes
 
 

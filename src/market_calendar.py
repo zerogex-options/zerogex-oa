@@ -368,6 +368,59 @@ def feed_session_window(
     return open_t, close_t
 
 
+# US options stop trading at the close; the ETF and index chains this
+# platform ingests run the 15-minute late session (SPY, QQQ, SPX, NDX all
+# close at 16:15 ET). Outside that, an option-chain row is only written when
+# a residual quote happens to tick, which is nothing like a bar feed.
+OPTION_CHAIN_CLOSE = time(16, 15)
+
+
+def option_chain_feed_window(
+    symbol: Optional[str] = None,
+    day: Optional[date] = None,
+) -> tuple[time, time]:
+    """ET (open, close) the OPTION-CHAIN feed should be writing rows in.
+
+    Deliberately NOT the underlying's window. Chain rows are written when an
+    option quote ticks, and options trade 09:30-16:15 ET only -- while the
+    underlying bar feed under ``USEQ24Hour`` runs 04:00-20:00. Grading chains
+    against the underlying's window means the pre-market and post-close tails,
+    where quotes arrive minutes apart or not at all, read as an outage: gaps of
+    16-45 minutes appear in ``option_chains`` on every observed session in both
+    tails, so a 15-minute threshold alerted daily for a feed that was working.
+
+    Cash indices close at 16:00 here rather than 16:15: their chains stop when
+    the index stops printing, because Greeks are refused without an underlying
+    price (see ``collect_feeds``).
+    """
+    open_t = time(9, 30)
+    if day is not None and day in NYSE_HALF_DAYS:
+        # Same conservative reading as NYSE_HALF_DAY_EXTENDED_END: the options
+        # tape stops at the early close, so expect nothing after it.
+        return open_t, NYSE_HALF_DAY_CLOSE
+    if symbol and is_cash_index(symbol):
+        return open_t, NYSE_REGULAR_CLOSE
+    return open_t, OPTION_CHAIN_CLOSE
+
+
+def option_chain_feed_expected(
+    dt: Optional[datetime],
+    symbol: Optional[str] = None,
+) -> bool:
+    """True when the option-chain feed should be writing rows now.
+
+    When this is False, chain silence is EXPECTED and must not alert -- the
+    options market is shut. A worker that dies out of hours is still caught:
+    it owns the underlying bar stream too, and that feed is watched across the
+    full 04:00-20:00 template window.
+    """
+    dt = _to_et(dt)
+    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
+        return False
+    open_t, close_t = option_chain_feed_window(symbol, dt.date())
+    return open_t <= dt.time() <= close_t
+
+
 def underlying_feed_expected(
     dt: Optional[datetime],
     session_template: str = "Default",

@@ -411,12 +411,65 @@ regardless, under `universes` in the JSONL — a 0DTE-only conclusion never need
 | `none of the N file(s) found matched profile` | wrong profile for this directory | re-run `mmgex-inspect` on a file from *this* delivery |
 | `files_skipped` > 0 in check-load | some directory members had a different header | check the `errors` list; readmes/manifests are filtered out automatically, so a skip means a real header mismatch |
 
-## 10. Tests
+## 10. The three-arm study (Production vs Aggressor-Inferred vs Attributed)
+
+Design, definitions and audit: [`docs/design/aggressor-inferred-positioning-experiment.md`](../design/aggressor-inferred-positioning-experiment.md).
+
+**Model B — Aggressor-Inferred MM GEX** is built from ZeroGEX's *own* tape
+classification (the `ask_volume` / `mid_volume` / `bid_volume` counters on
+`option_chains`) with the passive side of every print *assumed* to be a market maker.
+That assumption is what the study measures; the label never says "dealer flow".
+
+The A-vs-B half needs nothing but the database and runs today:
+
+```bash
+# Extract the classified tape for the window (read-only; one session per statement).
+make mmgex-aggressor START=2026-06-01T13:30:00Z END=2026-08-29T20:00:00Z
+#   -> research_output/aggressor_buckets.jsonl (+ _coverage.json with per-session gates)
+
+# A vs B dataset and the battery. The report's §8 carries the three-arm section.
+make mmgex-dataset-ab START=2026-06-01T13:30:00Z END=2026-08-29T20:00:00Z \
+    MMGEX_AGGRESSOR=research_output/aggressor_buckets.jsonl
+make mmgex-backtest
+```
+
+Pick a window that is still inside `option_chains` retention: the archive table does
+not carry the volume counters, so the tape cannot be rebuilt from it. Keep the JSONL —
+it is the durable record once the chain rows age out. The `_coverage.json` names any
+session that fails its minimum-data gate (classified share, buckets, series) and why;
+those sessions contribute diagnostics only.
+
+With real Cboe files (steps 1–3 above done), add the two C steps:
+
+```bash
+# Phase 2 — the direct answer: how often the aggressor assumption reproduces
+# exchange-classified Market Maker activity, on the exchange's own interval.
+make mmgex-attribution MMGEX_FILES=<cboe-dir>/ MMGEX_AGGRESSOR=research_output/aggressor_buckets.jsonl
+#   -> research_output/attribution_report.md / .json / _cells.csv
+
+# Phase 3 — the A / B / C dataset over ONE window and the same battery.
+make mmgex-dataset-abc MMGEX_FILES=<cboe-dir>/ START=... END=... \
+    MMGEX_AGGRESSOR=research_output/aggressor_buckets.jsonl
+make mmgex-backtest
+```
+
+`mmgex-backtest` prints two verdicts: the existing two-arm one (Attributed vs
+Production) and the three-arm one (`PRODUCTION_BETTER` / `AGGRESSOR_BETTER` /
+`ATTRIBUTED_BETTER` / `PRACTICALLY_EQUIVALENT` / `INCONCLUSIVE` / `INCONCLUSIVE_DATA`).
+Read the attribution report first: it says whether the assumption identifies
+market-maker activity at all, which is a different question from whether it helps
+explain what price does next.
+
+**Nothing here has been run on real data.** No Cboe file has been supplied and the
+A-vs-B extraction has not been executed against the production database; the only
+outputs so far come from `make mmgex-pipeline-check`, which is synthetic and says so.
+
+## 11. Tests
 
 ```bash
 make mmgex-test
 ```
 
-161 tests. They use small synthetic examples whose correct answers can be checked by
+235 tests. They use small synthetic examples whose correct answers can be checked by
 hand. **Synthetic data is never used as evidence about the methodology** — only to prove
 the code does what it says.

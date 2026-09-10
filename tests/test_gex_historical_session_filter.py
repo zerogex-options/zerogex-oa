@@ -95,8 +95,13 @@ def test_historical_walls_computed_live_against_per_bucket_close():
     assert "JOIN bucket_closes bc" in walls_block
     # The wall CTEs must aggregate by strike before ranking — the
     # cross-expiration aggregation that is the whole point of routing
-    # through the canonical helper.
-    assert walls_block.count("GROUP BY b.bucket_ts, gbs.strike") == 2
+    # through the canonical helper.  The read is a correlated LATERAL now
+    # (see tests/test_gex_historical_query_fence.py for why), so the
+    # grouping is per-strike INSIDE the lateral rather than by
+    # (bucket_ts, strike) outside it.  Equivalent: ``base`` is rn=1, one
+    # timestamp per bucket, so bucket_ts <-> timestamp is 1:1.
+    assert walls_block.count("GROUP BY gbs.strike") == 2
+    assert walls_block.count("gbs.timestamp = b.timestamp") == 2
 
     # The bucketed CTE must NOT read stored_call_wall / stored_put_wall;
     # they were a basis-disagreement footgun (analytics-cycle spot vs.

@@ -56,6 +56,27 @@ What these endpoints do not claim
   ``src/api/futures_middleware.py``); inventing a width by scaling an SPX
   quote would be a fabricated answer to the one question this page exists
   to answer honestly.
+
+--------------------------------------------------------------------------
+Why this rides MARKET_RAW despite publishing only aggregates
+--------------------------------------------------------------------------
+
+Nothing below is per-contract — every figure is a median or a p90 over a
+population, and a median does not invert to the values behind it.  But the
+CALLER picks the population: ``moneyness_band_pct`` goes to 0.25,
+``dte_max`` to 0, and each bucket reports its own ``tradable_count``.  Narrow
+one to a single contract and the quote falls out by arithmetic, since
+``median_spread`` is then ``ask - bid`` and ``median_relative_spread_pct`` is
+``200 * (ask - bid) / (ask + bid)`` for that one contract — two equations,
+two unknowns, and the response names the expiration, strike band and option
+type it belongs to.
+
+Which is the premium surface's failure mode wearing an aggregate's clothes,
+so it gets the premium surface's answer: gate the route, because there is no
+field to redact that closes it, and suppressing thin buckets would not either
+(a caller can vary the band and difference the results).  See the
+``src/api/scopes.py`` docstring for where that line is drawn, and
+``tests/test_market_data_scope_boundary.py`` for its enforcement.
 """
 
 from __future__ import annotations

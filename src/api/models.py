@@ -9,6 +9,34 @@ from typing import Dict, List, Optional
 from decimal import Decimal
 
 
+class WallLevel(BaseModel):
+    """One rung of the Call/Put Wall ladder (``C1``/``C2``/``P1``/``P2``…).
+
+    Produced by :func:`src.analytics.walls.compute_wall_ladder`, which ranks
+    the eligible strikes on each side of spot by aggregated dollar gamma.
+    Rank 1 is by construction the canonical Call/Put Wall — the same value
+    the sibling ``call_wall`` / ``put_wall`` scalar carries — so a client can
+    draw the ladder without the primary wall ever disagreeing with it.
+
+    ``label`` ships from the server (``C1``, ``P2``, …) so every surface —
+    chart page, dashboard widget, any future export — spells a wall the same
+    way instead of each re-deriving the name.  ``strength`` is the dollar
+    gamma at the strike on the canonical ``γ × 100 × S² × 0.01`` scale,
+    letting a client dim or size a marker by how much book is actually there.
+    """
+
+    rank: int
+    label: str
+    strike: Decimal
+    strength: Optional[Decimal] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+        }
+
+
 class GEXSummary(BaseModel):
     timestamp: datetime
     symbol: str
@@ -44,6 +72,24 @@ class GEXSummary(BaseModel):
     max_pain: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
+    # Ranked wall ladders — the OPTIONAL secondary/tertiary walls (C2/C3,
+    # P2/P3) charts can draw beside the primary.  ``call_walls[0]`` is the
+    # same strike as ``call_wall`` above (both come from the one ranking in
+    # :mod:`src.analytics.walls`), so the two can never disagree; a client
+    # that only wants the headline wall keeps reading the scalar and ignores
+    # these.  Shorter than the requested depth when the chain has fewer
+    # eligible strikes on that side, and empty when the side has no wall at
+    # all — render what arrives, never pad.
+    call_walls: List[WallLevel] = Field(default_factory=list)
+    put_walls: List[WallLevel] = Field(default_factory=list)
+    # GEX King — the strike carrying the largest |net dealer gamma| with the
+    # per-strike totals aggregated across ALL expirations (the SpotGamma /
+    # SqueezeMetrics convention; see ``_calculate_gex_summary``).  Whole-chain
+    # by construction, so it is the heavy, slow structural node — deliberately
+    # NOT the 0DTE Pin Strike below, which is reachability-weighted and
+    # same-day.  Already stored on ``gex_summary``; surfaced here so the chart
+    # can draw it beside the walls/flip/pin.  Nullable — hide, don't zero.
+    max_gamma_strike: Optional[Decimal] = None
     total_call_oi: Optional[int] = None
     total_put_oi: Optional[int] = None
     put_call_ratio: Optional[Decimal] = None
@@ -69,6 +115,40 @@ class GEXSummary(BaseModel):
             Decimal: lambda v: float(v) if v is not None else None,
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
+
+
+class PinStabilityResponse(BaseModel):
+    """What the Pin Strike has *done* during the session.
+
+    The third question in the reading order — regime, then confidence, then
+    stability — and the only one the API could not previously answer.  A pin
+    that has held one strike since the open and a pin that has migrated thirty
+    points are different signals wearing the same label; without this a drifting
+    pin reads as a level that failed rather than one tracking a repricing book.
+
+    ``current_*`` is the pin standing right now, ``held_*`` the most recent
+    value that has SETTLED, and ``current_established`` says whether they are
+    the same. Migration is measured between settled levels only, so a
+    one-sample tick at the bell is not reported as a move; ``net_migration`` is
+    signed (negative = the pin has walked down).  Sample counts, not minutes:
+    the analytics cycle is ~60s but is not guaranteed to be, so the honest unit
+    is "stored frames".  Null-bodied (``stability`` omitted) when the session
+    carried no active pin at all — hide, don't zero.
+    """
+
+    symbol: str
+    current_pin: float
+    current_since: datetime
+    current_samples: int
+    current_established: bool
+    held_pin: float
+    held_since: datetime
+    held_samples: int
+    session_open_pin: float
+    net_migration: float
+    distinct_values: int
+    quiet_samples: int
+    total_samples: int
 
 
 class GEXByStrike(BaseModel):
@@ -370,6 +450,131 @@ class FlowSeriesPoint(BaseModel):
     is_synthetic: bool
 
 
+class HedgingFlowBar(BaseModel):
+    """One 5-minute bar of estimated hedging pressure from /api/flow/hedging.
+
+    All ``*_usd`` values are USD of stock a delta-flat hedge implies, positive
+    for BUYING -- the same sign convention and units as the Forced Flow
+    engine, so the modeled and estimated sources are directly comparable.
+
+    ``call_flow_usd`` / ``put_flow_usd`` split by which option type produced
+    the pressure, NOT by the direction of the pressure: customers selling puts
+    push the net positive and land in ``put_flow_usd``.
+
+    ``net_flow_ma_usd`` is the trailing SMA of ``net_flow_usd`` and is null
+    until the smoothing window fills. ``classified_ratio`` is the share of the
+    bar's volume that carried an aggressor classification -- a low value means
+    a thin sample behind that bar's reading.
+    """
+
+    timestamp: str
+    bar_start: str
+    bar_end: str
+    call_flow_usd: float
+    put_flow_usd: float
+    net_flow_usd: float
+    net_flow_ma_usd: Optional[float] = None
+    cum_call_usd: float
+    cum_put_usd: float
+    cum_net_usd: float
+    underlying_price: Optional[float] = None
+    contract_count: int
+    classified_ratio: Optional[float] = None
+    is_synthetic: bool
+
+
+class HedgingFlowFlip(BaseModel):
+    """A sign change in estimated hedging pressure.
+
+    ``kind='rate'`` is the immediate push turning over (read off the smoothed
+    per-bar series) -- the frequent, actionable one. ``kind='cumulative'`` is
+    the session's whole lean changing hands: rare, and context rather than a
+    trigger. ``session_ratio`` is the flip's magnitude over the session's own
+    typical push, so a client can show every flip but draw only the ones that
+    carried size.
+    """
+
+    bar_start: str
+    kind: str
+    direction: str
+    magnitude_usd: float
+    session_ratio: float
+    is_significant: bool
+    underlying_price: Optional[float] = None
+
+
+class HedgingFlowResponse(BaseModel):
+    """Estimated hedging pressure across a session, plus its sign flips.
+
+    ``basis`` and ``disclosure`` are part of the contract, not decoration.
+    This series is AGGRESSOR-INFERRED: it assumes the passive side of every
+    classified print was a market maker, an assumption that has not been
+    validated against exchange-classified data (see
+    ``docs/design/aggressor-inferred-positioning-experiment.md``). Any surface
+    rendering this payload has to carry that through -- it is estimated
+    hedging pressure, never observed dealer flow.
+    """
+
+    symbol: str
+    session: str
+    basis: str
+    disclosure: str
+    smoothing_bars: int
+    bars: List[HedgingFlowBar]
+    flips: List[HedgingFlowFlip]
+
+
+class GammaRegimeBar(BaseModel):
+    """One 5-minute bar of the intraday Gamma Shift read.
+
+    Two independent lenses. ``anchored_*`` compares against the session's
+    first bar ("how has structure changed today"); ``rolling_*`` against a
+    fixed number of bars back ("how is it changing right now"). They do NOT
+    sum — both are proximity-weighted around each bar's own spot, so the
+    kernel re-centres per bar.
+
+    Positive ``stability`` = more long gamma near spot, so dealers hedge
+    against moves: pinning and vol suppression. Negative = the book has turned
+    accelerant. Positive ``lean`` = the change is supportive (building below
+    spot / eroding above); negative = capping.
+
+    Scores are RAW dollar-GEX. ``rolling_*`` is null for the session's first
+    ``rolling_bars`` bars, where no lookback exists.
+    """
+
+    timestamp: str
+    bar_start: str
+    bar_end: str
+    spot: Optional[float] = None
+    anchored_lean: float
+    anchored_stability: float
+    anchored_net_shift: float
+    anchored_gross_shift: float
+    rolling_lean: Optional[float] = None
+    rolling_stability: Optional[float] = None
+    rolling_net_shift: Optional[float] = None
+    rolling_gross_shift: Optional[float] = None
+    sigma_price: Optional[float] = None
+    near_spot_stock: Optional[float] = None
+    strike_count: int
+    expired_expirations: List[str] = []
+    rolling_bars: Optional[int] = None
+
+
+class GammaRegimeSeriesResponse(BaseModel):
+    """Intraday dealer-gamma structure across a session.
+
+    Shares ``/api/flow/hedging``'s session window and 5-minute grid, so the
+    two stack into one timeline: flow says how hard the tape is pushing,
+    this says whether the book absorbs or amplifies it.
+    """
+
+    symbol: str
+    session: str
+    rolling_bars: Optional[int] = None
+    bars: List[GammaRegimeBar]
+
+
 class MarketTideComponent(BaseModel):
     symbol: str
     flow_score: float
@@ -448,6 +653,11 @@ class SmartMoneyFlowPoint(BaseModel):
     notional_class: str
     size_class: str
     underlying_price: Optional[Decimal] = None
+    # Newest flow event in the whole session, not just among the rows returned.
+    # These rows are ranked by notional, so their own timestamps say when the
+    # BIGGEST prints landed, not how current the feed is; this is the recency
+    # signal. Additive, so existing v1 consumers are unaffected.
+    session_latest_at: Optional[datetime] = None
 
 
 class MomentumDivergencePoint(BaseModel):
@@ -622,6 +832,24 @@ class StrikeProfileBucket(BaseModel):
     ``expirations=<YYYY-MM-DD>`` yields walls scoped to that
     expiration's gamma alone.  ``call_wall`` / ``put_wall`` are
     ``None`` when the bucket has no strikes or no underlying close.
+    ``pin_strike`` / ``pin_confidence`` are the Pin Strike (the reachable
+    0DTE strike with the strongest modeled positive/restoring dealer gamma
+    into expiration — see :mod:`src.analytics.pin_strike`) and its 0..1
+    dominance over the other viable pins, as of this bucket's close.  They
+    are read verbatim from the bucket's representative ``gex_summary`` row
+    and, unlike the walls and the flip, are NOT scoped by ``expirations``:
+    the pin is 0DTE-by-construction and whole-chain by definition, so it
+    reads the same in every expiration scope — matching the live surfaces,
+    where the pin does not move when the Expiry selector changes.  Both are
+    ``None`` when the bucket has no active pin and on rows written before
+    the pin columns shipped; a ``None`` pin is drawn as no line, never as
+    ``0``.
+
+    ``call_walls`` / ``put_walls`` are the ranked ladders (``C1``/``C2``/…,
+    ``P1``/``P2``/…) behind the optional secondary-wall levels, computed from
+    the same rows and the same ``close`` as the scalars, so they follow the
+    ``expirations`` filter identically and rank 1 equals the scalar.
+
     ``strikes`` is the per-strike payload; one row per strike
     available in this bucket's snapshot universe (after the optional
     expiration filter).
@@ -636,6 +864,16 @@ class StrikeProfileBucket(BaseModel):
     gamma_flip: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
+    # Ranked ladders for this bucket, computed from the same rows and the
+    # same bucket ``close`` as the scalars above, so they follow the
+    # ``expirations`` filter identically and rank 1 equals the scalar.
+    call_walls: List[WallLevel] = Field(default_factory=list)
+    put_walls: List[WallLevel] = Field(default_factory=list)
+    pin_strike: Optional[Decimal] = None
+    # DOUBLE PRECISION in gex_summary (a 0..1 ratio, not a price), so it
+    # stays a float rather than joining the NUMERIC price fields above —
+    # no Decimal round-trip for a value that is never money.
+    pin_confidence: Optional[float] = None
     strikes: list[StrikeProfileStrike]
 
     class Config:

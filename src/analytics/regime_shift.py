@@ -140,6 +140,40 @@ BAND_MAX_WIDTH_PCT = 0.035
 #: must label the read accordingly (see ``normalization`` on the API payload).
 MIN_SESSIONS_FOR_SIGMA = 10
 
+#: Length of a regular cash session, in hours.  The stored per-session reads
+#: are all SINCE-OPEN measurements, so this is the horizon every trailing
+#: sigma is implicitly measured over — see :func:`horizon_factor`.
+SESSION_HOURS = 6.5
+
+#: Bootstrap denominator, as a fraction of the near-spot dealer-gamma STOCK.
+#:
+#: The proxy has one job: stand in for "how big is a typical session's shift
+#: for this symbol" before enough sessions are stored to answer it properly.
+#: The scale it borrows therefore has to be a scale of the same KIND — a
+#: proximity-weighted dollar change.  The obvious cheap sources are not:
+#: the dispersion of ``net_gex_at_spot`` (what this used to borrow) is the
+#: spread of a LEVEL read at a single point on the spot-shift curve, while
+#: lean/stability are signed sums across ~30 weighted strikes.  Nothing ties
+#: those two magnitudes together, so the ratio was arbitrary — and in
+#: practice large enough to push every z toward zero, which is why a
+#: freshly-deployed symbol read QUIET on every session regardless of what
+#: the book did.
+#:
+#: A fraction of the near-spot stock is the same kind of quantity as the
+#: score (same weights, same units, same strikes), so the ratio is a real
+#: "how much of the book near spot got re-worked".  12% is the bootstrap
+#: guess for one session's worth of that; it is deliberately a single named
+#: number because it stops mattering the moment ``MIN_SESSIONS_FOR_SIGMA``
+#: sessions exist and the trailing sigma takes over.
+PROXY_SHIFT_FRACTION = 0.12
+
+#: Clamp on :func:`horizon_factor`.  Below 0.35 (~48 minutes) and above 2.5
+#: (~40 hours, eight sessions) the square-root rule stops being a useful
+#: approximation, and an unclamped factor would let a 30-minute window
+#: manufacture sigma out of a tiny denominator.
+_HORIZON_MIN = 0.35
+_HORIZON_MAX = 2.5
+
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -200,6 +234,17 @@ class ShiftDiff:
     #: counting it would book brand-new listings as dealer repositioning.
     added_expirations: tuple[date, ...]
     added_net_gex: float
+    #: How many strikes saw their call or put open interest actually change
+    #: between the two snapshots.
+    #:
+    #: This is what makes the "repositioning" lens honest.  Open interest is
+    #: a once-a-day settlement figure: the feed republishes the same number
+    #: all session, so an INTRADAY A->B pair has zero OI change at every
+    #: strike and ``positioning`` is identically 0 by construction — not
+    #: because dealers sat on their hands.  Reported so the surface can say
+    #: "this window cannot answer that question" instead of drawing a flat
+    #: line that reads as "nothing happened".
+    oi_moved_strikes: int = 0
 
 
 @dataclass(frozen=True)
@@ -216,6 +261,12 @@ class ShiftScores:
     gross_shift: float
     #: Kernel width actually used, in price units (for display + audit).
     sigma_price: float
+    #: Proximity-weighted |dealer gamma| present across the two snapshots —
+    #: the STOCK the change happened against, in the same weights and units
+    #: as ``lean``/``stability``.  Not a score: it is the only scale available
+    #: before any session history exists, and :func:`proxy_sigma` turns it
+    #: into the bootstrap z-score denominator.
+    near_spot_stock: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -430,6 +481,7 @@ def shift_rows(
 
     zero = StrikeAgg()
     rows: list[ShiftRow] = []
+    oi_moved = 0
     for strike in sorted(set(agg_a) | set(agg_b)):
         a = agg_a.get(strike, zero)
         b = agg_b.get(strike, zero)
@@ -437,6 +489,8 @@ def shift_rows(
         positioning = _positioning_leg(
             a.call_gex, a.call_oi, b.call_gex, b.call_oi
         ) + _positioning_leg(a.put_gex, a.put_oi, b.put_gex, b.put_oi)
+        if a.call_oi != b.call_oi or a.put_oi != b.put_oi:
+            oi_moved += 1
         rows.append(
             ShiftRow(
                 strike=strike,
@@ -463,6 +517,7 @@ def shift_rows(
         expired_abs_gex=sum(abs(_row_net(r)) for r in expired_rows),
         added_expirations=tuple(sorted(added)),
         added_net_gex=sum(_row_net(r) for r in added_rows),
+        oi_moved_strikes=oi_moved,
     )
 
 
@@ -593,6 +648,7 @@ def weighted_scores(
     stability = 0.0
     net_shift = 0.0
     gross_shift = 0.0
+    near_spot_stock = 0.0
     for row in rows:
         value = row.positioning if use_positioning else row.d_net
         net_shift += value
@@ -605,6 +661,12 @@ def weighted_scores(
         # A strike exactly at spot is neither and contributes nothing to lean.
         side = 0.0 if row.strike == spot else (1.0 if row.strike < spot else -1.0)
         lean += side * w * value
+        # The book the change is measured against, under the SAME kernel, so
+        # it can act as the bootstrap denominator.  Averaged over the two
+        # snapshots rather than taken from either end: anchoring on A alone
+        # would scale a day-over-day read against a book that has since
+        # expired, and on B alone against one that did not exist at A.
+        near_spot_stock += w * (abs(row.net_a) + abs(row.net_b)) / 2.0
 
     return ShiftScores(
         lean=lean,
@@ -612,6 +674,7 @@ def weighted_scores(
         net_shift=net_shift,
         gross_shift=gross_shift,
         sigma_price=sigma_price,
+        near_spot_stock=near_spot_stock,
     )
 
 
@@ -743,12 +806,154 @@ def zscore(raw: float, sigma: Optional[float]) -> float:
     return max(-6.0, min(6.0, z))
 
 
+def proxy_sigma(scores: ShiftScores) -> Optional[float]:
+    """Bootstrap z-score denominator, derived from the chain itself.
+
+    Returns ``None`` when the snapshot carries no near-spot gamma at all, so
+    the caller degrades to "direction measured, magnitude not" rather than
+    dividing by a number it invented.
+
+    Used only until :data:`MIN_SESSIONS_FOR_SIGMA` sessions are stored; every
+    surface that renders a read built on it must label the magnitude
+    provisional (``normalization == "proxy"``).  See
+    :data:`PROXY_SHIFT_FRACTION` for why the scale is a fraction of the
+    near-spot stock rather than the dispersion of some stored level.
+    """
+    stock = scores.near_spot_stock
+    if not math.isfinite(stock) or stock <= 0:
+        return None
+    sigma = PROXY_SHIFT_FRACTION * stock
+    return sigma if sigma > 0 else None
+
+
+def horizon_factor(hours: float) -> float:
+    """Rescale a session-length sigma to a window of ``hours`` trading hours.
+
+    Every stored session read is a SINCE-OPEN measurement, so the trailing
+    sigma answers "how big is a full session's shift".  The live card applies
+    it to windows that are nothing like a full session: a 1h lookback, or a
+    "since open" read taken at 09:45.  Comparing a 15-minute change against a
+    6.5-hour yardstick makes the morning read QUIET every day and the weekly
+    one read dramatic every week — the denominator is measuring the clock, not
+    the book.
+
+    Repositioning accumulates roughly like a random walk, so the yardstick
+    scales with the square root of elapsed trading time.  That is a
+    first-order rule and it is wrong in the details (dealer gamma churns
+    hardest at the open and into the close), but it is right about the shape,
+    and being right about the shape is the difference between a magnitude
+    that means something across lookbacks and one that does not.  Clamped at
+    both ends — see :data:`_HORIZON_MIN`.
+    """
+    if not math.isfinite(hours) or hours <= 0:
+        return 1.0
+    factor = math.sqrt(hours / SESSION_HOURS)
+    if not math.isfinite(factor):
+        return 1.0
+    return max(_HORIZON_MIN, min(_HORIZON_MAX, factor))
+
+
+#: Rescales a mean absolute value onto the standard deviation's scale.
+#: ``sqrt(pi/2)`` is the exact ratio for a zero-mean normal.
+_MEAN_ABS_TO_SIGMA = math.sqrt(math.pi / 2)
+
+#: Rescales a median absolute value onto the same scale.  ``1/0.6745`` — for a
+#: zero-mean normal the median |x| is 0.6745 sigma.
+_MEDIAN_ABS_TO_SIGMA = 1.4826
+
+
+def mean_abs_scale(values: Sequence[float]) -> Optional[float]:
+    """First absolute moment about zero, on the standard deviation's scale.
+
+    Resists a heavy TAIL — one enormous session no longer counts for
+    twenty-five ordinary ones — but not a right-skewed MAGNITUDE, because a
+    mean is still a mean. Kept as a named estimator so
+    :mod:`src.tools.regime_scale_report` can grade it against the others
+    rather than the comparison living only in a commit message.
+    """
+    finite = _finite(values)
+    if len(finite) < 2:
+        return None
+    scale = (sum(abs(v) for v in finite) / len(finite)) * _MEAN_ABS_TO_SIGMA
+    return scale if scale > 0 else None
+
+
+def median_abs_scale(values: Sequence[float]) -> Optional[float]:
+    """Median absolute value about zero, on the standard deviation's scale."""
+    finite = sorted(abs(v) for v in _finite(values))
+    if len(finite) < 2:
+        return None
+    mid = len(finite) // 2
+    median = finite[mid] if len(finite) % 2 else (finite[mid - 1] + finite[mid]) / 2
+    scale = median * _MEDIAN_ABS_TO_SIGMA
+    return scale if scale > 0 else None
+
+
+def robust_scale(values: Sequence[float]) -> Optional[float]:
+    """Typical magnitude of a session's shift — the z-score denominator.
+
+    Measured about ZERO, not about the mean. The numerator these divide is
+    the RAW score, never ``raw - mean``, so the denominator has to describe
+    spread about the same origin or the ratio is not a z at all. Zero is also
+    the right null on its own terms: the STATE's sign comes from the raw
+    score, so a mean-centred read would call a below-average shedding day
+    FIRMING — telling a trader support was building on a day it eroded, which
+    is worse than any magnitude error.
+
+    Built from the MEDIAN absolute value rather than the mean or the standard
+    deviation. Three estimators were measured against 42 stored sessions on
+    each of SPY, SPX, QQQ and NDX (``make regime-scale-report``), and the
+    resulting QUIET rates were:
+
+        symbol   stdev   mean_abs   median_abs      (target ~25%)
+        SPY       52%       48%        29%
+        SPX       55%       50%        29%
+        QQQ       50%       43%        31%
+        NDX       37%       37%        37%
+
+    The reason is one statistic nobody had looked at: ``mean|x| / median|x|``
+    ran 1.07 to 2.61 across those eight axes — never 1. The typical session on
+    every one of these chains is materially smaller than the average session,
+    so a scale built from ANY mean sits above the typical day and reports it as
+    nothing happening. Both mean-based estimators put the median session at a
+    combined magnitude of 0.43-0.81 against a :data:`QUIET_Z` of 0.75 — the cut
+    landed at or above the median, which is precisely how half of every
+    symbol's history came out QUIET.
+
+    A median anchors it by construction: the median session lands at
+    ``sqrt(2) / 1.4826`` = 0.95 for EVERY symbol, whatever its distribution's
+    shape, so the cut sits at 0.79x the typical day and symbols become
+    comparable to each other — which is the entire point of a z-score and the
+    thing the two mean-based scales could not deliver.
+
+    The cost is statistical efficiency: roughly a third of the standard
+    deviation's, so on a 60-session window the denominator wobbles by order
+    15-20% as the window rolls. That is the right trade. A denominator that
+    is noisy moves a read between "barely" and "modestly"; one that is biased
+    moves it to "nothing happened", and the reader stops looking.
+
+    Returns ``None`` only when at least half the sessions are exactly zero —
+    there is no scale to be had then, and zero would make the next real move's
+    z infinite.
+    """
+    return median_abs_scale(values)
+
+
+def _finite(values: Sequence[float]) -> list[float]:
+    return [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
+
+
 def stdev(values: Sequence[float]) -> Optional[float]:
     """Population standard deviation, or None when there is nothing to learn.
 
     Population rather than sample: the stored session reads are the whole
     history we have, not a draw from it, and on the small N this operates at
     (10-60 sessions) the Bessel correction is noise dressed as rigor.
+
+    NOT the z-score denominator — :func:`robust_scale` is, for the reasons
+    documented there.  Kept because "how disperse is this series" is still a
+    question worth being able to ask directly, and because ``stdev`` against
+    :func:`mean_abs_scale` is what measures a chain's tail weight.
     """
     finite = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
     if len(finite) < 2:

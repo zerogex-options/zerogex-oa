@@ -23,11 +23,13 @@ from typing import Any, Optional
 
 import numpy as np
 
+from research.mm_attributed_gex.aggressor import AggressorBucket, AggressorGateConfig
+from research.mm_attributed_gex.attribution import AttributionConfig, compare_attribution
 from research.mm_attributed_gex.backtest import ExperimentConfig, run_experiment
 from research.mm_attributed_gex.dataset import DatasetSpec, build_dataset
 from research.mm_attributed_gex.gex import ChainQuote, build_engine
 from research.mm_attributed_gex.outcomes import Bar, BarSeries
-from research.mm_attributed_gex.report import decide, render_markdown
+from research.mm_attributed_gex.report import decide, decide_arms, render_markdown
 from research.mm_attributed_gex.schema import (
     Exchange,
     Interval,
@@ -37,7 +39,13 @@ from research.mm_attributed_gex.schema import (
     Side,
 )
 
-__all__ = ["synthetic_records", "synthetic_chain", "synthetic_bars", "run_pipeline_check"]
+__all__ = [
+    "synthetic_records",
+    "synthetic_aggressor_buckets",
+    "synthetic_chain",
+    "synthetic_bars",
+    "run_pipeline_check",
+]
 
 try:
     from zoneinfo import ZoneInfo
@@ -122,6 +130,58 @@ def synthetic_records(
     return out
 
 
+def synthetic_aggressor_buckets(
+    sessions: list[date],
+    expirations: list[date],
+    strikes: list[float],
+    *,
+    symbol: str = "SPX",
+    seed: int = 77,
+    buckets_per_session: int = 13,
+) -> list[AggressorBucket]:
+    """Invented aggressor-classified tape, drawn independently of everything else.
+
+    Independent of the exchange records AND of the price path by design, so the
+    attribution comparison should land near 50% agreement and the market-outcome
+    battery should find nothing.  A run of this reporting a strong result means
+    the harness leaks.
+    """
+    rng = np.random.default_rng(seed)
+    out: list[AggressorBucket] = []
+    for session in sessions:
+        for bucket in range(buckets_per_session):
+            stamp = _et(session, 9, 30) + timedelta(minutes=30 * bucket)
+            for expiration in expirations:
+                if expiration < session:
+                    continue
+                for strike in strikes:
+                    for option_type in ("C", "P"):
+                        buyer = int(rng.integers(0, 60))
+                        seller = int(rng.integers(0, 60))
+                        unknown = int(rng.integers(0, 20))
+                        if buyer + seller + unknown == 0:
+                            continue
+                        out.append(
+                            AggressorBucket(
+                                symbol=symbol,
+                                option_symbol=(
+                                    f"SPXW {expiration:%y%m%d}{option_type}{int(strike):08d}"
+                                ),
+                                expiration=expiration,
+                                strike=strike,
+                                option_type=option_type,
+                                timestamp=stamp,
+                                trading_date=session,
+                                buyer_initiated=buyer,
+                                seller_initiated=seller,
+                                unclassified=unknown,
+                                gamma=0.0005,
+                            )
+                        )
+    out.sort(key=lambda b: (b.timestamp, b.option_symbol))
+    return out
+
+
 def synthetic_chain(
     expirations: list[date],
     strikes: list[float],
@@ -188,6 +248,7 @@ def run_pipeline_check(symbol: str = "SPX", *, n_sessions: int = 6) -> dict[str,
     strikes = [5900.0 + 25.0 * i for i in range(9)]
 
     records = synthetic_records(sessions, expirations, strikes, symbol=symbol)
+    aggressor = synthetic_aggressor_buckets(sessions, expirations, strikes, symbol=symbol)
     chain = synthetic_chain(expirations, strikes)
     bars = synthetic_bars(sessions)
     series = BarSeries(bars)
@@ -215,8 +276,23 @@ def run_pipeline_check(symbol: str = "SPX", *, n_sessions: int = 6) -> dict[str,
         stamps,
         chain_provider,
         spot_provider,
-        spec=DatasetSpec(symbol=symbol, headline_universe="all", clean_only=False),
+        spec=DatasetSpec(
+            symbol=symbol,
+            headline_universe="all",
+            clean_only=False,
+            aggressor_gates=AggressorGateConfig(min_buckets=1, min_series=1),
+        ),
         engine=engine,
+        aggressor_factory=lambda: iter(aggressor),
+    )
+
+    # Phase 2 on synthetic inputs: the two feeds are independent, so agreement
+    # near one half is the expected (null) plumbing outcome.
+    attribution, cells = compare_attribution(
+        aggressor,
+        records,
+        config=AttributionConfig(n_boot=50),
+        spot_provider=spot_provider,
     )
 
     result = run_experiment(
@@ -226,11 +302,14 @@ def run_pipeline_check(symbol: str = "SPX", *, n_sessions: int = 6) -> dict[str,
         sampling_minutes=15,
     )
     verdict = decide(result)
+    arms_verdict = decide_arms(result)
     markdown = render_markdown(result, provenance=provenance)
 
     non_null_mm = sum(1 for r in rows if r.mm_attributed_gamma_at_spot is not None)
+    non_null_b2 = sum(1 for r in rows if r.production_anchored_aggressor_gamma_at_spot is not None)
+    head = attribution.headline.get("active_cells") or {}
     return {
-        "ok": bool(rows) and non_null_mm > 0 and bool(markdown),
+        "ok": bool(rows) and non_null_mm > 0 and non_null_b2 > 0 and bool(markdown),
         "synthetic": True,
         "records": len(records),
         "chain_quotes": len(chain),
@@ -238,6 +317,10 @@ def run_pipeline_check(symbol: str = "SPX", *, n_sessions: int = 6) -> dict[str,
         "snapshots_requested": len(stamps),
         "dataset_rows": len(rows),
         "rows_with_mm_gamma": non_null_mm,
+        "rows_with_aggressor_anchored_gamma": non_null_b2,
+        "rows_with_aggressor_flow_gamma": sum(
+            1 for r in rows if r.aggressor_mm_flow_gamma_at_spot is not None
+        ),
         "rows_with_mm_flip": sum(1 for r in rows if r.mm_attributed_gamma_flip is not None),
         "rows_with_existing_gamma": sum(
             1 for r in rows if r.existing_dealer_gamma_at_spot is not None
@@ -245,6 +328,15 @@ def run_pipeline_check(symbol: str = "SPX", *, n_sessions: int = 6) -> dict[str,
         "scored_observations": result.n_scored,
         "verdict_code": verdict.code,
         "verdict_label": verdict.label,
+        "arms_present": (result.arms or {}).get("present"),
+        "arms_verdict_code": arms_verdict.code,
+        "arms_verdict_label": arms_verdict.label,
+        "attribution": {
+            "matched_cells": attribution.n_cells,
+            "active_cells": head.get("n"),
+            "sign_agreement_both_nonzero": head.get("sign_agreement_both_nonzero"),
+            "note": "independent synthetic feeds; agreement near 0.5 is the expected null",
+        },
         "report_chars": len(markdown),
         "provenance": provenance,
         "warning": (
