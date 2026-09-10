@@ -114,6 +114,12 @@ _UNSUPPORTED_PREFIXES = (
     # real SPX contract, not an index level, so the axis does not carry.
     "/api/gex/premium_surface",
     "/api/gex/vol_surface",
+    # Quoted-spread / liquidity metrics: the value being measured is the WIDTH
+    # a market maker is showing on a real SPX or NDX contract.  Scaling it by
+    # the futures basis would produce a number for a quote nobody published,
+    # in answer to the one question the surface exists to answer honestly —
+    # whether you can get filled.  Refuse instead.
+    "/api/market/spreads",
 )
 
 

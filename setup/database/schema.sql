@@ -2297,6 +2297,94 @@ CREATE INDEX IF NOT EXISTS idx_daily_atm_iv_underlying_date
     ON daily_atm_iv(underlying, trading_date DESC);
 
 -- =============================================================================
+-- Daily quoted-spread / liquidity history (Spread Monitor)
+-- =============================================================================
+-- One row per (underlying, trading_date, option_type) summarising how wide
+-- that day's option markets were quoted.  ``option_type`` is 'C', 'P', or
+-- 'A' for the blended chain — three rows per symbol per day.  Medians do not
+-- combine, so the blended row is STORED rather than derived from the other
+-- two at read time.
+--
+-- Why a rollup rather than a live query: the question the Spread Monitor
+-- exists to answer is comparative — "spreads have gone bonkers RECENTLY" —
+-- and answering it from option_chains means scanning every minute bucket of
+-- every session in the window.  This table is ~3 rows per symbol per day and
+-- the trailing-window read is a sub-ms scalar, the same trade daily_atm_iv
+-- makes for iv_rank.
+--
+-- Writer: src/analytics/main_engine.py (`_store_daily_spread_stats`, UPSERTed
+-- once per analytics cycle for the current trading day, gated to the cash
+-- session for the same post-close-drift reason daily_atm_iv is).  Backfill:
+-- src/tools/daily_spread_stats_backfill.py seeds history from the ~90 days of
+-- option_chains already on disk.
+--
+-- SCOPE COLUMNS ARE LOAD-BEARING.  ``dte_max`` and ``moneyness_band_pct``
+-- record the filter the row was computed under.  A trailing percentile is
+-- only meaningful against rows measured the same way, so the API compares
+-- like with like and a scope change starts a new comparable series instead
+-- of silently corrupting the old one.
+--
+-- ``median_relative_spread_pct`` is the headline: quoted width as a share of
+-- the option's own mid.  ``*_bps_underlying`` is width in basis points of the
+-- index level, which is the only one of these that is comparable ACROSS
+-- symbols (SPX near 6,800 and NDX near 25,000 are not on one dollar scale).
+-- ``zero_bid_pct`` carries the failure that has no width at all: a contract
+-- quoted 0.00 x 2.40 has no market, and counting those separately is what
+-- stops a chain looking tighter as its wings go untradeable.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS daily_spread_stats (
+    underlying                   VARCHAR(10)      NOT NULL,
+    trading_date                 DATE             NOT NULL,
+    option_type                  CHAR(1)          NOT NULL,
+    spot_price                   NUMERIC(12, 4)   NOT NULL,
+    dte_max                      SMALLINT         NOT NULL,
+    moneyness_band_pct           DOUBLE PRECISION NOT NULL,
+    contract_count               INTEGER          NOT NULL DEFAULT 0,
+    tradable_count               INTEGER          NOT NULL DEFAULT 0,
+    two_sided_pct                DOUBLE PRECISION NOT NULL DEFAULT 0,
+    zero_bid_pct                 DOUBLE PRECISION NOT NULL DEFAULT 0,
+    crossed_or_locked_pct        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    median_spread                DOUBLE PRECISION,
+    median_relative_spread_pct   DOUBLE PRECISION,
+    p90_relative_spread_pct      DOUBLE PRECISION,
+    median_spread_bps_underlying DOUBLE PRECISION,
+    p90_spread_bps_underlying    DOUBLE PRECISION,
+    total_open_interest          BIGINT           NOT NULL DEFAULT 0,
+    total_volume                 BIGINT           NOT NULL DEFAULT 0,
+    source_timestamp             TIMESTAMPTZ      NOT NULL,
+    created_at                   TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, trading_date, option_type)
+);
+
+-- Trailing-window read: ``WHERE underlying = $1 AND option_type = $2
+-- ORDER BY trading_date DESC LIMIT $3`` — served by the primary key's
+-- leading equality plus a backward scan on this index.
+CREATE INDEX IF NOT EXISTS idx_daily_spread_stats_lookup
+    ON daily_spread_stats(underlying, option_type, trading_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'daily_spread_stats_option_type_check'
+    ) THEN
+        ALTER TABLE daily_spread_stats
+        ADD CONSTRAINT daily_spread_stats_option_type_check
+        CHECK (option_type IN ('C', 'P', 'A'));
+    END IF;
+END $$;
+
+COMMENT ON TABLE daily_spread_stats IS
+    'Daily quoted-spread / liquidity rollup per (underlying, trading_date, option_type). option_type ''A'' is the blended chain, stored rather than derived because medians do not combine. 100% derived state: safe to TRUNCATE, the backfill rebuilds it from option_chains.';
+COMMENT ON COLUMN daily_spread_stats.median_relative_spread_pct IS
+    'Median quoted width as a percentage of the option mid — 100 * (ask - bid) / mid. The headline "how much of the premium is the toll" number.';
+COMMENT ON COLUMN daily_spread_stats.median_spread_bps_underlying IS
+    'Median quoted width in basis points of the underlying level — 10000 * (ask - bid) / spot. The cross-symbol comparable measure.';
+COMMENT ON COLUMN daily_spread_stats.zero_bid_pct IS
+    'Share of contracts quoted with an offer but no bid. These have NO width by construction and are excluded from every median here; the count is the liquidity failure a width statistic cannot express.';
+
+-- =============================================================================
 -- BACKTESTING PLATFORM (see docs/design/backtesting-platform.md)
 --
 -- Four tables power the customer-facing backtester:

@@ -8113,3 +8113,304 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching premium surface data: {e}", exc_info=True)
             raise
+
+    # -----------------------------------------------------------------
+    # Spread Monitor — quoted-width / liquidity reads
+    # -----------------------------------------------------------------
+    #
+    # Two read shapes, and the split is deliberate:
+    #
+    #   * :meth:`get_spread_snapshot_chain` returns RAW contract rows at one
+    #     timestamp and lets ``src.analytics.spread_stats`` reduce them in
+    #     Python.  It is the same module the analytics writer and the
+    #     backfill use, so "today's reading" and the daily history it is
+    #     scored against are produced by one implementation.  That matters
+    #     more than it might look: a percentile is a comparison, and a
+    #     comparison across two implementations of the same statistic is a
+    #     comparison of the implementations.
+    #
+    #   * :meth:`get_spread_intraday_series` aggregates in SQL, because a
+    #     full session for SPX is a few hundred thousand contract-rows and
+    #     shipping them to Python per request is not a trade worth making.
+    #     Nothing in the response is compared against the daily history —
+    #     it is a within-session shape — so the second definition here is
+    #     confined to a place where drift cannot corrupt a comparison.
+    #
+    # The SQL predicates below mirror ``spread_stats.classify_quote``
+    # exactly.  Keep them in step:
+    #     TWO_SIDED  ->  bid > 0 AND ask > bid          (the only state with a width)
+    #     ZERO_BID   ->  ask > 0 AND (bid IS NULL OR bid <= 0)
+    #     LOCKED     ->  ask = bid  (folded into crossed_or_locked below)
+    #     CROSSED    ->  ask < bid  AND bid > 0
+    #     NO_QUOTE   ->  ask IS NULL OR ask <= 0
+
+    _SPREAD_TWO_SIDED_SQL = (
+        "oc.bid IS NOT NULL AND oc.ask IS NOT NULL AND oc.bid > 0 AND oc.ask > oc.bid"
+    )
+    _SPREAD_ZERO_BID_SQL = (
+        "oc.ask IS NOT NULL AND oc.ask > 0 AND (oc.bid IS NULL OR oc.bid <= 0)"
+    )
+    _SPREAD_CROSSED_LOCKED_SQL = (
+        "oc.ask IS NOT NULL AND oc.bid IS NOT NULL AND oc.ask > 0 "
+        "AND oc.bid > 0 AND oc.ask <= oc.bid"
+    )
+    # relative width = 100 * (ask - bid) / mid, and mid = (ask + bid) / 2,
+    # so the ratio simplifies to 200 * (ask - bid) / (ask + bid).  Guarded by
+    # the two-sided FILTER, under which (ask + bid) > 0 always holds.
+    _SPREAD_RELATIVE_SQL = "200.0 * (oc.ask - oc.bid) / (oc.ask + oc.bid)"
+
+    async def get_spread_snapshot_chain(
+        self,
+        symbol: str,
+        dte_max: int,
+        moneyness_band_pct: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Latest stable chain snapshot, as raw rows for the spread reducer.
+
+        Returns spot, the snapshot timestamp, its ET session date, and one
+        row per contract inside the ±``moneyness_band_pct`` strike band with
+        ``0 <= dte <= dte_max``.
+
+        Rows are returned RAW — quotes are not filtered, scored or dropped
+        here.  A contract with no bid is exactly the observation the caller
+        is looking for, and a read path that quietly discarded it would make
+        a chain look tighter the worse its wings got.
+
+        Anchors on ``_STABLE_SNAPSHOT_CTE`` (as the premium surface does) so
+        a quiescing post-close feed doesn't hand back a half-written
+        terminal bucket, which would read as a chain-wide liquidity event.
+        """
+        spot_query = """
+            SELECT close, timestamp
+            FROM underlying_quotes
+            WHERE symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+
+        chain_query = f"""
+            WITH {_STABLE_SNAPSHOT_CTE}
+            SELECT
+                oc.option_symbol,
+                oc.strike,
+                oc.option_type,
+                oc.expiration,
+                oc.bid,
+                oc.ask,
+                oc.open_interest,
+                oc.volume,
+                latest_ts.ts AS snapshot_ts,
+                (latest_ts.ts AT TIME ZONE 'America/New_York')::date AS session_date
+            FROM option_chains oc
+            CROSS JOIN latest_ts
+            WHERE oc.underlying = $1
+              AND oc.timestamp = latest_ts.ts
+              AND oc.strike BETWEEN $2::numeric AND $3::numeric
+              AND oc.expiration >= (latest_ts.ts AT TIME ZONE 'America/New_York')::date
+              AND oc.expiration <= (latest_ts.ts AT TIME ZONE 'America/New_York')::date
+                                   + $4::int
+            ORDER BY oc.expiration, oc.strike, oc.option_type
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                spot_row = await conn.fetchrow(spot_query, symbol)
+                if not spot_row or not spot_row["close"]:
+                    return None
+
+                spot_price = float(spot_row["close"])
+                if spot_price <= 0:
+                    return None
+
+                band = float(moneyness_band_pct) / 100.0
+                rows = await conn.fetch(
+                    chain_query,
+                    symbol,
+                    spot_price * (1.0 - band),
+                    spot_price * (1.0 + band),
+                    int(dte_max),
+                )
+                if not rows:
+                    return None
+
+                return {
+                    "spot_price": spot_price,
+                    "spot_timestamp": spot_row["timestamp"],
+                    "snapshot_ts": rows[0]["snapshot_ts"],
+                    "session_date": rows[0]["session_date"],
+                    "rows": [dict(r) for r in rows],
+                }
+        except Exception as e:
+            logger.error(
+                f"Error fetching spread snapshot chain for {symbol}: {e}", exc_info=True
+            )
+            raise
+
+    async def get_spread_intraday_series(
+        self,
+        symbol: str,
+        dte_max: int,
+        moneyness_band_pct: float,
+        bucket_minutes: int,
+        session: str = "current",
+    ) -> List[Dict[str, Any]]:
+        """Per-bucket quoted-width series for one session, split by option type.
+
+        One reading per bucket, taken at the LAST chain snapshot inside it
+        rather than averaged over the minutes within.  Two reasons, and both
+        are load-bearing:
+
+        * ``option_chains`` is written every minute, so a 15-minute average
+          would re-measure the same contracts fifteen times and scan fifteen
+          times the rows to say the same thing.
+        * A bucket average smears a genuine step change — the exact event
+          the page exists to show — across the bucket that contains it.
+
+        The moneyness band is re-centred on the spot AT EACH BUCKET, not on
+        the current spot.  A band pinned to the close would sit off the money
+        for the morning of a trending day and would report the resulting
+        change in which contracts were sampled as a change in how wide they
+        were quoted.
+        """
+        session_start, session_end = _get_flow_session_bounds(session)
+        bucket_seconds = max(60, int(bucket_minutes) * 60)
+        band = float(moneyness_band_pct) / 100.0
+
+        query = f"""
+            WITH bucket_anchor AS (
+                SELECT
+                    to_timestamp(
+                        floor(extract(epoch FROM oc.timestamp) / $4::int) * $4::int
+                    ) AS bucket_start,
+                    MAX(oc.timestamp) AS anchor_ts
+                FROM option_chains oc
+                WHERE oc.underlying = $1
+                  AND oc.timestamp >= $2
+                  AND oc.timestamp <= $3
+                GROUP BY 1
+            ),
+            spot_at AS (
+                SELECT
+                    ba.bucket_start,
+                    ba.anchor_ts,
+                    (
+                        SELECT uq.close
+                        FROM underlying_quotes uq
+                        WHERE uq.symbol = $1
+                          AND uq.timestamp <= ba.anchor_ts
+                        ORDER BY uq.timestamp DESC
+                        LIMIT 1
+                    ) AS spot
+                FROM bucket_anchor ba
+            )
+            SELECT
+                sa.bucket_start,
+                sa.anchor_ts,
+                sa.spot::double precision AS spot,
+                oc.option_type,
+                COUNT(*)::int AS contract_count,
+                COUNT(*) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::int
+                    AS tradable_count,
+                COUNT(*) FILTER (WHERE {self._SPREAD_ZERO_BID_SQL})::int
+                    AS zero_bid_count,
+                COUNT(*) FILTER (WHERE {self._SPREAD_CROSSED_LOCKED_SQL})::int
+                    AS crossed_or_locked_count,
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY (oc.ask - oc.bid)
+                ) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::double precision
+                    AS median_spread,
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY {self._SPREAD_RELATIVE_SQL}
+                ) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::double precision
+                    AS median_relative_spread_pct,
+                percentile_cont(0.9) WITHIN GROUP (
+                    ORDER BY {self._SPREAD_RELATIVE_SQL}
+                ) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::double precision
+                    AS p90_relative_spread_pct,
+                COALESCE(SUM(oc.open_interest), 0)::bigint AS total_open_interest,
+                COALESCE(SUM(oc.volume), 0)::bigint AS total_volume
+            FROM spot_at sa
+            JOIN option_chains oc
+              ON oc.underlying = $1
+             AND oc.timestamp = sa.anchor_ts
+            WHERE sa.spot IS NOT NULL
+              AND sa.spot > 0
+              AND oc.strike BETWEEN sa.spot * (1 - $5::numeric)
+                                AND sa.spot * (1 + $5::numeric)
+              AND oc.expiration >= (sa.anchor_ts AT TIME ZONE 'America/New_York')::date
+              AND oc.expiration <= (sa.anchor_ts AT TIME ZONE 'America/New_York')::date
+                                   + $6::int
+            GROUP BY sa.bucket_start, sa.anchor_ts, sa.spot, oc.option_type
+            ORDER BY sa.bucket_start, oc.option_type
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    query,
+                    symbol,
+                    session_start,
+                    session_end,
+                    bucket_seconds,
+                    band,
+                    int(dte_max),
+                )
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(
+                f"Error fetching spread intraday series for {symbol}: {e}",
+                exc_info=True,
+            )
+            raise
+
+    async def get_daily_spread_history(
+        self,
+        symbol: str,
+        option_type: str,
+        days: int,
+    ) -> List[Dict[str, Any]]:
+        """Trailing daily quoted-width history from the ``daily_spread_stats`` rollup.
+
+        Returned OLDEST-FIRST so the caller can chart it without reversing.
+        ``option_type`` is 'C', 'P' or 'A' (blended).
+
+        An empty list is a normal answer, not an error: the rollup is written
+        by the analytics engine and seeded by
+        ``src.tools.daily_spread_stats_backfill``, so a fresh deployment has
+        no history until one of the two has run.  The caller renders the
+        live reading without a percentile rather than failing.
+        """
+        query = """
+            SELECT trading_date,
+                   option_type,
+                   spot_price::double precision AS spot_price,
+                   dte_max,
+                   moneyness_band_pct,
+                   contract_count,
+                   tradable_count,
+                   two_sided_pct,
+                   zero_bid_pct,
+                   crossed_or_locked_pct,
+                   median_spread,
+                   median_relative_spread_pct,
+                   p90_relative_spread_pct,
+                   median_spread_bps_underlying,
+                   p90_spread_bps_underlying,
+                   total_open_interest,
+                   total_volume,
+                   source_timestamp
+            FROM daily_spread_stats
+            WHERE underlying = $1
+              AND option_type = $2
+            ORDER BY trading_date DESC
+            LIMIT $3::int
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, option_type, int(days))
+                return [dict(r) for r in reversed(rows)]
+        except Exception as e:
+            logger.error(
+                f"Error fetching daily spread history for {symbol}: {e}", exc_info=True
+            )
+            raise

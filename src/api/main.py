@@ -61,6 +61,7 @@ from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
+from .routers.spread_liquidity import router as spread_liquidity_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.gamma_shift import router as gamma_shift_router
 from .routers.backtest import router as backtest_router
@@ -484,6 +485,11 @@ app.include_router(vol_surface_router, dependencies=[_scope_gex])
 # from quoted option prices, redistributable on the same GEX scope as the
 # vol surface.
 app.include_router(premium_surface_router, dependencies=[_scope_gex])
+# Spread Monitor — quoted bid/ask width and liquidity across the chain (Beta).
+# Derived aggregates (medians, percentiles, coverage shares) computed FROM the
+# raw bid/ask, not a re-export of it, so it rides the redistributable GEX
+# scope alongside the premium and vol surfaces rather than MARKET_RAW.
+app.include_router(spread_liquidity_router, dependencies=[_scope_gex])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # Gamma Regime Shift — the derivative of the dealer-gamma surface (what
 # CHANGED between two snapshots, what expires next, and the classified read
