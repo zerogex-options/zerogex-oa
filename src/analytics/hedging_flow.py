@@ -112,12 +112,30 @@ from src.greeks_fd import CONTRACT_MULTIPLIER
 #: defensible default rather than a hard rule.
 DEFAULT_SMOOTHING_BARS = 3
 
-#: A flip whose smoothed magnitude is below this multiple of the session's own
-#: typical push is reported but marked ``is_significant=False``, so a UI can
-#: show every flip or only the ones that carried size without either the
-#: server or the client having to re-derive a threshold. 1.0 == "at least as
-#: big as a typical push so far today".
+#: A flip whose swing is below this multiple of the session's own typical
+#: swing is reported but marked ``is_significant=False``, so a UI can show
+#: every flip or only the ones that carried size.
+#:
+#: Note what 1.0 actually means here: :func:`session_scale` is a MEDIAN, so
+#: roughly half the distribution sits above it by construction. 1.0 is
+#: therefore the middle of the day's swings, not the tail, and on a live tape
+#: it lets through more than "significant" suggests. It is left at 1.0 because
+#: the deadband below is the right tool for chatter and this one should stay a
+#: size filter; raise it if you want only the day's largest turns.
 DEFAULT_SIGNIFICANCE_RATIO = 1.0
+
+#: Half-width of the flat band around zero, as a multiple of the session's own
+#: typical |rate|. Values inside the band are treated as FLAT rather than as a
+#: side, so a series hugging zero and nicking across it repeatedly produces no
+#: flips at all.
+#:
+#: This is the fix for the real complaint about flip counts. The significance
+#: filter grades crossings that already happened; it cannot help when the
+#: problem is that a near-zero line crosses a dozen times. Requiring the rate
+#: to actually establish itself on the new side is what removes those, and it
+#: stays computable live: the flip is timestamped at the bar the move leaves
+#: the band, which is the first moment it is knowable at all.
+DEFAULT_FLAT_BAND_RATIO = 0.5
 
 #: Floor for the robust session scale, in USD. Prevents a quiet open (where
 #: the running median of |rate| is a handful of dollars) from scoring an
@@ -247,48 +265,63 @@ def _scan_flips(
     values: Sequence[Optional[float]],
     kind: str,
     significance_ratio: float,
+    flat_band_ratio: float = DEFAULT_FLAT_BAND_RATIO,
     always_significant: bool = False,
 ) -> List[FlipEvent]:
-    """Walk a series and emit its zero crossings.
+    """Walk a series and emit the direction changes that actually established.
 
-    Two properties this walk has to get right, both learned from tests:
+    Three properties this walk has to get right, all three learned from real
+    sessions or from tests:
 
-    * ``prev`` tracks the last NON-ZERO value, not the last value. A series
-      stepping +100 -> 0 -> -100 has flipped once; tracking the last value
-      would set ``prev = 0``, and since zero is on neither side of zero the
-      real crossing on the next bar would go unreported entirely.
-    * the scale is built from swings strictly BEFORE the current one, so the
+    * a value inside the FLAT BAND is on neither side. The band generalises
+      the older "zero is not a side" rule: a rate hovering around zero and
+      nicking across it is not changing direction a dozen times, it is flat
+      and noisy, and reporting each nick is what made "significant flips only"
+      still show a dozen dots on a live tape. ``prev_side`` therefore tracks
+      the last value OUTSIDE the band, and a flip is registered at the bar the
+      series establishes itself on the far side.
+    * swing size is measured from that established side to the current value,
+      so it describes the whole traverse rather than one bar of it. Bar-to-bar
+      movement is tracked separately, in ``prior_swings``, purely to build the
+      scale to score against.
+    * every scale is built from bars strictly BEFORE the current one, so a
       score is computable in the moment rather than needing the rest of the
-      session. With no prior swing to compare against, the floor in
-      :func:`session_scale` decides, which is the honest answer for the first
-      move of a session.
+      session. An alert that needed hindsight could not fire when it mattered.
     """
     events: List[FlipEvent] = []
-    prev: Optional[float] = None
+    prev_value: Optional[float] = None  # last value, for typical bar-to-bar swing
+    prev_side: Optional[float] = None  # last value outside the band, for which side we are on
     prior_swings: List[float] = []
+    prior_magnitudes: List[float] = []
 
     for bar, value in zip(bars, values):
         if value is None:
             continue
-        if prev is not None:
-            swing = abs(value - prev)
-            if _crossed(prev, value):
-                ratio = swing / session_scale(prior_swings)
-                events.append(
-                    FlipEvent(
-                        bar_start=bar.bar_start,
-                        kind=kind,
-                        direction="to_buying" if value > 0 else "to_selling",
-                        magnitude_usd=swing,
-                        session_ratio=ratio,
-                        is_significant=always_significant or ratio >= significance_ratio,
-                        underlying_price=bar.underlying_price,
-                    )
+
+        band = flat_band_ratio * session_scale(prior_magnitudes)
+        outside = abs(value) > band
+
+        if outside and prev_side is not None and _crossed(prev_side, value):
+            swing = abs(value - prev_side)
+            ratio = swing / session_scale(prior_swings)
+            events.append(
+                FlipEvent(
+                    bar_start=bar.bar_start,
+                    kind=kind,
+                    direction="to_buying" if value > 0 else "to_selling",
+                    magnitude_usd=swing,
+                    session_ratio=ratio,
+                    is_significant=always_significant or ratio >= significance_ratio,
+                    underlying_price=bar.underlying_price,
                 )
-            prior_swings.append(swing)
-        # Zero is not a side: hold the previous established sign through it.
-        if value != 0:
-            prev = value
+            )
+
+        if prev_value is not None:
+            prior_swings.append(abs(value - prev_value))
+        prior_magnitudes.append(abs(value))
+        prev_value = value
+        if outside:
+            prev_side = value
 
     return events
 
@@ -297,6 +330,7 @@ def sign_flip_events(
     bars: Sequence[HedgingFlowBar],
     window: int = DEFAULT_SMOOTHING_BARS,
     significance_ratio: float = DEFAULT_SIGNIFICANCE_RATIO,
+    flat_band_ratio: float = DEFAULT_FLAT_BAND_RATIO,
 ) -> List[FlipEvent]:
     """Flips of the SMOOTHED per-bar rate -- the immediate push turning over.
 
@@ -309,10 +343,13 @@ def sign_flip_events(
     the ones that carried size.
     """
     smoothed = smooth([b.net_flow_usd for b in bars], window)
-    return _scan_flips(bars, smoothed, "rate", significance_ratio)
+    return _scan_flips(bars, smoothed, "rate", significance_ratio, flat_band_ratio)
 
 
-def zero_cross_events(bars: Sequence[HedgingFlowBar]) -> List[FlipEvent]:
+def zero_cross_events(
+    bars: Sequence[HedgingFlowBar],
+    flat_band_ratio: float = DEFAULT_FLAT_BAND_RATIO,
+) -> List[FlipEvent]:
     """Zero crossings of the CUMULATIVE curve -- the session's lean changing.
 
     Rare by construction, and context rather than trigger: by the time a
@@ -325,7 +362,14 @@ def zero_cross_events(bars: Sequence[HedgingFlowBar]) -> List[FlipEvent]:
     is no noise here to filter, so suppressing one would only hide it.
     """
     cumulative = [b.cum_net_usd for b in bars]
-    return _scan_flips(bars, cumulative, "cumulative", 0.0, always_significant=True)
+    return _scan_flips(
+        bars,
+        cumulative,
+        "cumulative",
+        0.0,
+        flat_band_ratio,
+        always_significant=True,
+    )
 
 
 def hedge_usd(net_contracts: float, delta: float, spot: float) -> float:

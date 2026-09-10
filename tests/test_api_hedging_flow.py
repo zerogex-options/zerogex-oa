@@ -304,7 +304,12 @@ def test_http_reports_a_rate_flip(monkeypatch: pytest.MonkeyPatch):
 
 def test_http_smoothing_param_changes_flip_detection(monkeypatch: pytest.MonkeyPatch):
     """smoothing=1 is raw, so a single-bar spike flips twice; the default
-    smoothing absorbs it. This is the parameter doing its job."""
+    smoothing absorbs it. This is the parameter doing its job.
+
+    The deadband is pinned off here so the assertion isolates smoothing —
+    otherwise the band suppresses the same spike and the test would pass for
+    the wrong reason.
+    """
     app, mainmod = _build_app_with_mock_db(monkeypatch)
     nets = [90_000.0, 90_000.0, -30_000.0, 90_000.0, 90_000.0]
     canned = [_row(i * 5, call=n) for i, n in enumerate(nets)]
@@ -312,12 +317,31 @@ def test_http_smoothing_param_changes_flip_detection(monkeypatch: pytest.MonkeyP
 
     with TestClient(app) as client:
         _attach(mainmod, canned)
-        raw = client.get("/api/flow/hedging?symbol=SPY&smoothing=1").json()
-        smoothed = client.get("/api/flow/hedging?symbol=SPY").json()
+        raw = client.get("/api/flow/hedging?symbol=SPY&smoothing=1&flat_band=0").json()
+        smoothed = client.get("/api/flow/hedging?symbol=SPY&flat_band=0").json()
 
     assert len([f for f in raw["flips"] if f["kind"] == "rate"]) == 2
     assert [f for f in smoothed["flips"] if f["kind"] == "rate"] == []
     assert raw["smoothing_bars"] == 1
+
+
+def test_http_flat_band_suppresses_chatter(monkeypatch: pytest.MonkeyPatch):
+    """The live-session fix, at the wire: a rate nicking across zero reports a
+    flip per nick with the band off, and none with it on."""
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    nets = [900_000.0, -900_000.0] * 3 + [9_000.0, -7_000.0, 8_000.0, -6_000.0]
+    canned = [_row(i * 5, call=n) for i, n in enumerate(nets)]
+    canned.reverse()
+
+    with TestClient(app) as client:
+        _attach(mainmod, canned)
+        off = client.get("/api/flow/hedging?symbol=SPY&smoothing=1&flat_band=0").json()
+        on = client.get("/api/flow/hedging?symbol=SPY&smoothing=1").json()
+
+    assert len([f for f in off["flips"] if f["kind"] == "rate"]) > len(
+        [f for f in on["flips"] if f["kind"] == "rate"]
+    )
+    assert on["flat_band_ratio"] == 0.5
 
 
 def test_http_empty_session_returns_envelope_with_no_bars(
