@@ -730,9 +730,12 @@ Positive means the hedge **buys** stock, the same sign convention and units as t
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all. Pass today's date to isolate 0DTE
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
 - `smoothing` (optional): trailing SMA length in bars for the rate line and flip detection, `1`–`24`, default `3` (15 minutes)
-- `significance` (optional): a rate flip is marked significant at or above this multiple of the session's typical swing, `0`–`10`, default `1.0`
+- `significance` (optional): a rate flip is marked significant at or above this multiple of the session's typical swing, `0`–`10`, default `1.0`. Note the scale is a *median*, so 1.0 sits at the middle of the day's swings rather than the tail
+- `flat_band` (optional): half-width of the flat band around zero as a multiple of the session's typical rate, `0`–`5`, default `0.5`; `0` disables it
 
 **Response:** an object with `bars` (newest→oldest) and `flips`, plus `basis` and `disclosure`.
+
+A flip requires the series to **establish** itself outside a flat band around zero (`flat_band`), not merely to touch the far side. Without that, a rate hovering near zero reports a direction change on every nick across it, which on a live session buried the real turns among a dozen dots even with the significance filter on.
 
 `flips` carries two kinds. `rate` — the smoothed per-bar series changing sign, i.e. the immediate push turning over; this is the frequent, actionable one. `cumulative` — the session's net lean crossing zero; rare, and context rather than a trigger. `magnitude_usd` is the swing across zero, not the level at it (a series is near zero *at* a crossing by definition), and `session_ratio` scores that swing against the session's typical swing using only bars before the flip, so it is computable live.
 

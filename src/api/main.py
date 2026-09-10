@@ -58,6 +58,7 @@ from .models import (
     StrikeProfileBucket,
 )
 from src.analytics.hedging_flow import (
+    DEFAULT_FLAT_BAND_RATIO,
     DEFAULT_SIGNIFICANCE_RATIO,
     DEFAULT_SMOOTHING_BARS,
     HedgingFlowBar as HedgingFlowBarCalc,
@@ -1344,9 +1345,21 @@ async def get_hedging_flow(
         ge=0.0,
         le=10.0,
         description=(
-            "A rate flip is marked significant when its magnitude is at least "
-            "this multiple of the session's own typical push. 1.0 = as big as "
-            "a typical push so far today."
+            "A rate flip is marked significant when its swing is at least this "
+            "multiple of the session's own typical swing. Note the scale is a "
+            "median, so 1.0 is the middle of the day's swings rather than the "
+            "tail; raise it for only the largest turns."
+        ),
+    ),
+    flat_band: float = Query(
+        default=DEFAULT_FLAT_BAND_RATIO,
+        ge=0.0,
+        le=5.0,
+        description=(
+            "Half-width of the flat band around zero, as a multiple of the "
+            "session's own typical rate. Values inside it count as flat rather "
+            "than as a side, so a rate hugging zero stops producing a flip on "
+            "every nick across it. 0 disables the band."
         ),
     ),
 ):
@@ -1367,6 +1380,12 @@ async def get_hedging_flow(
     series changing sign -- the immediate push turning over, and the frequent
     one. ``cumulative`` flips are the session's net lean crossing zero: rare,
     and context rather than a trigger.
+
+    A flip requires the series to ESTABLISH itself outside a flat band around
+    zero (``flat_band``), not merely to touch the far side. Without that, a
+    rate hovering near zero reports a direction change on every nick across
+    it, which on a live session buried the real turns among a dozen dots even
+    with the significance filter applied.
 
     Same session resolution, 5-minute grid and unfiltered underlying price as
     ``/api/flow/series``, so the two overlay bar-for-bar. Rows are newest →
@@ -1404,6 +1423,7 @@ async def get_hedging_flow(
         "basis": _HEDGING_FLOW_BASIS,
         "disclosure": _HEDGING_FLOW_DISCLOSURE,
         "smoothing_bars": smoothing,
+        "flat_band_ratio": flat_band,
     }
     if not rows:
         return JSONResponse(content={**envelope, "bars": [], "flips": []})
@@ -1433,8 +1453,13 @@ async def get_hedging_flow(
     ]
 
     ma_series = smooth([b.net_flow_usd for b in calc_bars], smoothing)
-    flips = sign_flip_events(calc_bars, window=smoothing, significance_ratio=significance)
-    flips = flips + zero_cross_events(calc_bars)
+    flips = sign_flip_events(
+        calc_bars,
+        window=smoothing,
+        significance_ratio=significance,
+        flat_band_ratio=flat_band,
+    )
+    flips = flips + zero_cross_events(calc_bars, flat_band_ratio=flat_band)
     flips.sort(key=lambda e: e.bar_start)
 
     bars = [_format_hedging_flow_row(r, ma) for r, ma in zip(chronological, ma_series)]
