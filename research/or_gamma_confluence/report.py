@@ -200,6 +200,42 @@ def _discrimination(
     }
 
 
+def _mechanical_null(rows: Sequence[Mapping[str, Any]], cfg: ResearchConfig) -> dict[str, Any]:
+    """The reversal rate this event definition produces with NO mean reversion.
+
+    A touch fires when the bar's extreme reaches the rung, but the forward scan
+    starts from that bar's CLOSE, which has usually retreated back inside by
+    some offset ``d``.  Price therefore begins the race to prev-vs-next already
+    displaced toward prev.  For a driftless walk between barriers at ``-step``
+    and ``+step`` starting at ``-d``, gambler's ruin gives
+
+        P(reversal) = 0.5 + d / (2 * step)
+
+    which is a pure artefact of the measurement and carries no information
+    about the market.  Reporting the observed rate against 50% would credit
+    that artefact as mean reversion; this is the honest baseline instead.
+
+    Confirmed empirically by the parameter sweep: a single ``d = 0.026R``
+    predicts the 0.25R and 0.5R cells to within 0.1 points (55.2 vs 55.1,
+    52.6 vs 52.6), and a driftless simulation reproduces the whole column.
+    """
+    offsets = [
+        r.get("touch_offset_r")
+        for r in rows
+        if r.get("next_exists") and r.get("touch_offset_r") is not None
+    ]
+    if not offsets:
+        return {"available": False}
+    step = cfg.extension_step
+    per_event = [min(1.0, max(0.0, 0.5 + float(d) / (2.0 * step))) for d in offsets]
+    return {
+        "available": True,
+        "n": len(per_event),
+        "median_offset_r": stats.describe(offsets).median,
+        "expected_reversal_rate": sum(per_event) / len(per_event),
+    }
+
+
 def build_summary(
     rows: Sequence[Mapping[str, Any]],
     cfg: ResearchConfig,
@@ -275,6 +311,7 @@ def build_summary(
         "depth_table": _depth_table(rows, (0.5, 1.0, 2.0, 3.0, 5.0)),
         "distance_grid": _distance_grid(rows, cfg.confluence_buckets_pts),
         "discrimination": _discrimination(rows, cfg.confluence_buckets_pts),
+        "mechanical_null": _mechanical_null(rows, cfg),
         "out_of_sample": oos,
         "multiplicity": bh,
         "min_reportable_n": MIN_REPORTABLE_N,
@@ -367,6 +404,32 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         f"ambiguous (both rungs inside one minute): {overall['n_ambiguous']}\n"
     )
 
+    mech = summary.get("mechanical_null") or {}
+    if mech.get("available"):
+        exp = mech["expected_reversal_rate"]
+        obs = overall.get("reversal_rate")
+        A("### The baseline is not 50%\n")
+        A(
+            f"A touch fires on the bar's extreme reaching the rung, but the "
+            f"forward scan starts from that bar's CLOSE — typically "
+            f"{_num(mech.get('median_offset_r'), 4)}R back inside the level. Price "
+            f"therefore starts the prev-vs-next race already displaced toward "
+            f"prev. For a driftless walk, gambler's ruin puts the reversal rate "
+            f"at **{_pct(exp)}** with no mean reversion anywhere.\n"
+        )
+        if obs is not None:
+            excess = obs - exp
+            A(
+                f"- Observed: {_pct(obs)}  |  mechanical null: {_pct(exp)}  |  "
+                f"**excess: {excess * 100:+.1f} pts**\n"
+            )
+            if abs(excess) < 0.01:
+                A(
+                    "> **The headline rate is the artefact.** Measured against "
+                    "the right baseline there is no mean reversion here at all. "
+                    "Any cohort must be read against this number, never against "
+                    "50%.\n"
+                )
     A("## Q1 — Does extension distance predict reversion?\n")
     A("| depth | n | sessions | reversal | 95% CI | median MFE (30m) | median MAE (30m) |")
     A("|---|---:|---:|---:|---|---:|---:|")
