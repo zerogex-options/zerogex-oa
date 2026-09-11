@@ -406,6 +406,38 @@ def test_history_endpoint_returns_rows_oldest_first(monkeypatch):
     assert body["option_type"] == "P"
 
 
+def test_history_endpoint_omits_thin_sessions_and_says_how_many(monkeypatch):
+    """A row we decided is not a measurement must not reach a chart as one.
+
+    The writers reject these now, but rows seeded before the floor existed
+    are still in the table — the QQQ 2026-08-25 21-contract session among
+    them. The count is reported rather than the rows dropped silently, so a
+    gap in the chart is explicable and a rising count is a visible
+    ingestion problem rather than an invisible one.
+    """
+
+    def history(symbol, option_type, days):
+        rows = _history_rows("P", [1.0, 1.2, 1.1])
+        rows[1]["contract_count"] = 21
+        return rows
+
+    client = _client(monkeypatch, history=history)
+    body = client.get("/api/market/spreads/history?symbol=SPX&option_type=P").json()
+
+    assert len(body["rows"]) == 2
+    assert body["excluded_thin_sessions"] == 1
+    assert all(r["contract_count"] >= 100 for r in body["rows"])
+
+
+def test_history_endpoint_reports_zero_exclusions_on_a_clean_window(monkeypatch):
+    client = _client(
+        monkeypatch, history=lambda *a, **k: _history_rows("P", [1.0, 1.2])
+    )
+    body = client.get("/api/market/spreads/history?symbol=SPX").json()
+    assert body["excluded_thin_sessions"] == 0
+    assert len(body["rows"]) == 2
+
+
 def test_history_endpoint_rejects_an_unknown_option_type(monkeypatch):
     client = _client(monkeypatch, history=[])
     assert (
