@@ -843,6 +843,25 @@ replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced t
 		$(if $(BAND),--band $(BAND)) \
 		| $(PSQL) -v ON_ERROR_STOP=0
 
+.PHONY: pin-strike-explain
+pin-strike-explain: ## Explain one historical Pin Strike: the per-candidate table gex_summary does not persist. Vars: SYMBOL=NDX AT="YYYY-MM-DD HH:MM" (ET) [TOP=25] [NEAR=29500]. Read-only.
+	@if [ -z "$(AT)" ]; then \
+		echo "$(RED)AT is required — the minute to explain, in ET, e.g.$(NC)"; \
+		echo "$(YELLOW)  make pin-strike-explain SYMBOL=NDX AT=\"2026-09-03 14:30\"$(NC)"; \
+		exit 2; \
+	fi
+	@echo "$(BLUE)=== Pin Strike: per-candidate breakdown ===$(NC)"
+	@echo "$(YELLOW)Confidence is a SHARE of the candidate field, not a measure of size —$(NC)"
+	@echo "$(YELLOW)the share column is what explains a 'Weak' label on a heavy strike.$(NC)"
+	@echo "$(YELLOW)Needs open interest, so only sessions inside DATA_RETENTION_DAYS (~90d)$(NC)"
+	@echo "$(YELLOW)can be explained; the archive keeps no OI. A DRIFT warning means the$(NC)"
+	@echo "$(YELLOW)recompute no longer reproduces what shipped — do not quote it.$(NC)"
+	@$(PY) -m src.tools.pin_strike_explain \
+		--underlying "$(or $(SYMBOL),NDX)" \
+		--at "$(AT)" \
+		$(if $(TOP),--top $(TOP)) \
+		$(if $(NEAR),--near $(NEAR))
+
 .PHONY: flow-index-prune
 flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner doesn't use it). Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Pruning idx_flow_by_contract_symbol_ts_strike ===$(NC)"
@@ -1100,6 +1119,7 @@ help: ## Show this help message
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
 	@echo "  make replay-frames-explain        - EXPLAIN ANALYZE the /api/replay/range frames read (SYMBOL=NDX DATE=YYYY-MM-DD)"
+	@echo "  make pin-strike-explain           - Why a Pin Strike scored as it did: full candidate table (SYMBOL=NDX AT=\"YYYY-MM-DD HH:MM\")"
 	@echo "  make flow-index-prune             - Drop idx_flow_by_contract_symbol_ts_strike (CONFIRM=yes)"
 	@echo "  make flow-series-drop-covering-index - DISABLED (index retained; see target)"
 	@echo ""
