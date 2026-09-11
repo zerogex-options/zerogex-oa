@@ -34,6 +34,7 @@ from typing import Any, Mapping, Optional, Sequence
 from research.or_gamma_confluence.cohorts import (
     MIN_REPORTABLE_N,
     book_of,
+    kinds_agreeing,
     build_cohorts,
     compare_to_baseline,
     has_confluence,
@@ -175,6 +176,17 @@ def _discrimination(
             }
         )
 
+    # Base rate of multi-metric agreement. If four metrics land together on a
+    # third of all prices, "four metrics agree" is not a selective signal.
+    agreement = []
+    for d in distances:
+        row = {"distance": d}
+        for k in (2, 3, 4):
+            n = sum(1 for r in rows if kinds_agreeing(r, d) >= k)
+            row[f"kinds_{k}"] = n
+            row[f"kinds_{k}_share"] = (n / len(rows)) if rows else None
+        agreement.append(row)
+
     def _depth_of(r: Mapping[str, Any]) -> Optional[float]:
         k = r.get("extension_k")
         return abs(float(k)) if k is not None else None
@@ -196,6 +208,7 @@ def _discrimination(
         "levels_per_snapshot_median": stats.describe(counts).median,
         "nearest_distance_median": stats.describe(nearest).median,
         "coverage": coverage,
+        "agreement": agreement,
         "depth_by_group": by_group,
     }
 
@@ -515,6 +528,22 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             "about level density rather than about gamma. Reduce "
             "`gex_ladder_depth`, or read only the tightest threshold row.\n"
         )
+    agree = disc.get("agreement") or []
+    if agree:
+        A(
+            "**How often do several metrics agree by chance?** The product's copy "
+            "says 'when four metrics agree on one strike, that's the level'. That "
+            "is only selective if the base rate is low.\n"
+        )
+        A("| threshold | >=2 metrics | >=3 metrics | >=4 metrics |")
+        A("|---:|---:|---:|---:|")
+        for a in agree:
+            A(
+                f"| <={a['distance']:g} pts | {_pct(a.get('kinds_2_share'))} | "
+                f"{_pct(a.get('kinds_3_share'))} | {_pct(a.get('kinds_4_share'))} |"
+            )
+        A("")
+
     dg = disc.get("depth_by_group") or {}
     if dg:
         A("| group | n | median depth | mean depth |")

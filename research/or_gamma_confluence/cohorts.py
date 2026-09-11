@@ -52,6 +52,7 @@ __all__ = [
     "compare_to_baseline",
     "confluence_count",
     "has_confluence",
+    "kinds_agreeing",
     "BOOKS",
     "book_of",
     "pooling_check",
@@ -79,6 +80,22 @@ def confluence_count(row: Mapping[str, Any], distance: float, *, kinds: bool = F
 
 def has_confluence(row: Mapping[str, Any], distance: float) -> bool:
     return confluence_count(row, distance) > 0
+
+
+def kinds_agreeing(row: Mapping[str, Any], distance: float) -> int:
+    """How many DISTINCT level kinds sit within ``distance`` of the extension.
+
+    Not the same as the level count, and the difference is the whole point.
+    Four ranked GEX strikes that happen to be adjacent are ONE kind of
+    evidence; a Call Wall, Max Pain, a Pin Strike and GEX 1 landing together
+    are four. The product's own copy makes the second claim — "when four
+    metrics agree on one strike, that's the level" (ZeroGEX to a customer,
+    2026-09-06) — so that is the version worth testing, and it never has been.
+
+    Reads the stored ``gamma_confluence_kinds_*`` column, so it re-cohorts an
+    existing dataset with no rebuild.
+    """
+    return confluence_count(row, distance, kinds=True)
 
 
 def _regime(row: Mapping[str, Any]) -> Optional[int]:
@@ -192,6 +209,24 @@ def build_cohorts(
             "12. Confluence on non-chasing levels only",
             lambda r: conf(r) and r.get("nearest_gamma_recenters") is False,
             "Max pain / flip / pin — levels that do not re-centre on spot.",
+        ),
+        # The product's own claim, tested directly. Distinct KINDS agreeing,
+        # not levels: four adjacent GEX strikes are one kind of evidence.
+        Cohort(
+            "kinds_2",
+            f"15. >=2 metrics agree within {d:g} pts",
+            lambda r: kinds_agreeing(r, d) >= 2,
+        ),
+        Cohort(
+            "kinds_3",
+            f"16. >=3 metrics agree within {d:g} pts",
+            lambda r: kinds_agreeing(r, d) >= 3,
+        ),
+        Cohort(
+            "kinds_4",
+            f"17. >=4 metrics agree within {d:g} pts",
+            lambda r: kinds_agreeing(r, d) >= 4,
+            "The folded-label case: 'when four metrics agree on one strike, " "that's the level.'",
         ),
         Cohort(
             "extreme",

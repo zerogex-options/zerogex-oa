@@ -27,18 +27,32 @@ Three hypotheses, none assumed:
 
 ## Status
 
-**Pipeline complete, tested, and verified end to end on synthetic data. No
-result yet** — this session had no database access, so Phases 3–6 have not run.
-Every number the `selftest` prints is invented.
+**Complete through Phase 4. Two hypotheses falsified, one underpowered, and the
+study's own headline number turned out to be a measurement artefact.**
+
+Findings: [`docs/design/or-extension-gamma-confluence-findings.md`](../../docs/design/or-extension-gamma-confluence-findings.md).
 
 | Phase | State |
 |---|---|
 | 1 — repository discovery | done (design doc) |
-| 2 — data / event harness | **done** (this package, 53 tests) |
-| 3 — statistical research | not run — needs a production database |
-| 4 — trade simulation | not built — see *Costs*, below |
-| 5 — TradeWorkz candidates | not built |
-| 6 — final report | not written |
+| 2 — data / event harness | done (this package, 80 tests) |
+| 3 — statistical research | **done** — 49 sessions, 6 symbols, 1,499 events |
+| 4 — trade simulation | **not needed** — gross expectancy is algebraically zero |
+| 5 — TradeWorkz candidates | **not built, deliberately** — see the findings doc |
+| 6 — final report | **done** |
+
+### Headline
+
+* **H1 (deeper → more reversion): falsified.** Non-monotone, ρ ≈ 0 across nine
+  ladder geometries.
+* **H3 (gamma confluence helps): falsified as specified.** Sign-flipping across
+  thresholds, reverses out of sample, nothing survives Benjamini-Hochberg.
+* **H2 (broken ladders → continuation): underpowered**, direction consistent
+  (−6.0 pts, p=0.26). The one thread worth revisiting with more sessions.
+* **The 52.6% baseline is an artefact.** A touch fires on the bar's extreme but
+  the outcome is scanned from its close, so price starts displaced toward the
+  reversion target. Gambler's ruin puts the rate at 0.5 + d/(2·step) with no
+  mean reversion at all, and gross expectancy at exactly zero.
 
 ## Quick start
 
