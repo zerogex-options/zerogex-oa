@@ -157,6 +157,25 @@ def test_day_list_comes_from_the_small_table():
     assert "DISTINCT" in first_sql
 
 
+def test_the_anchor_window_closes_at_16_00_not_16_15():
+    """The seeded history must not be anchored on the closing rotation.
+
+    Sampling to 16:15 put ``MAX(timestamp)`` inside the 16:00-16:15 window
+    whenever the feed had rows there, and quotes in it are wide and stale by
+    definition. It showed up in production as SPY 2026-09-02 reading a 18.7%
+    median with a 104% p90. The window now matches ``daily_atm_iv_backfill``,
+    and the live writer freezes at the same bound, so seeded rows and live
+    rows describe the same moment of the session.
+    """
+    assert backfill._ANCHOR_WINDOW_START == "15:30:00"
+    assert backfill._ANCHOR_WINDOW_END == "16:00:00"
+
+    cursor = FakeCursor()
+    _run(cursor)
+    for sql, _ in _anchor_probes(cursor):
+        assert "16:00:00" in sql and "16:15" not in sql
+
+
 def test_statement_timeout_is_set_before_any_query():
     cursor = FakeCursor()
     _run(cursor)

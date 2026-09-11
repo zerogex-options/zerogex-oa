@@ -6,10 +6,15 @@ are the population the Spread Monitor's trailing percentile is scored
 against, which makes two of its behaviours load-bearing rather than
 cosmetic:
 
-* **The cash-session gate.**  After 16:15 ET market makers stop quoting
-  competitively and every chain goes wide.  Writing that would seed the
-  comparison history with a mechanical post-close blowout, and every later
-  session would then be judged "normal" against it.
+* **The cash-session gate, and where it closes.**  Once 16:00 ET passes,
+  market makers stop quoting competitively and every chain goes wide.  The
+  bound was 16:15 at first, to cover SPX's true session end; in production
+  that let the closing rotation define the day whenever a cycle fell there
+  (SPY 2026-09-02 recorded a 18.7% median with a 104% p90 — a tenth of the
+  chain quoted wider than its own mid).  Because it only happened on the
+  days a cycle landed late, it added noise to the trailing distribution
+  rather than a bias that would at least cancel.  16:00 matches
+  ``daily_atm_iv`` and the backfill's sampling window.
 
 * **The pinned scope.**  A percentile only means something if each day
   measured the same contracts, so the DTE ceiling and moneyness band are
@@ -75,7 +80,7 @@ def _option_types(cur: MagicMock) -> list[str]:
 
 def test_writes_during_cash_session():
     engine = _engine()
-    for hour, minute in [(9, 30), (12, 0), (15, 59), (16, 15)]:
+    for hour, minute in [(9, 30), (12, 0), (15, 59), (16, 0)]:
         cur = MagicMock()
         engine._store_daily_spread_stats(_options(), _summary(_et(hour, minute)), cur)
         assert cur.execute.called, f"expected UPSERT at {hour:02d}:{minute:02d} ET"
@@ -84,11 +89,14 @@ def test_writes_during_cash_session():
 def test_skips_outside_the_cash_session():
     """Pre-open and post-close both write nothing.
 
-    The post-close half is the one that matters: a 18:05 ET cycle would
-    otherwise record the widest quotes of the day as that day's reading.
+    The post-close half is the one that matters: a cycle after the bell
+    would otherwise record the widest quotes of the day as that day's
+    reading.  16:01 is in the list deliberately — the 16:00-16:15 closing
+    rotation used to be inside the gate, and that is exactly the window
+    that produced 104% p90 readings in production.
     """
     engine = _engine()
-    for hour, minute in [(4, 0), (9, 29), (16, 16), (18, 5), (23, 59)]:
+    for hour, minute in [(4, 0), (9, 29), (16, 1), (16, 15), (18, 5), (23, 59)]:
         cur = MagicMock()
         engine._store_daily_spread_stats(_options(), _summary(_et(hour, minute)), cur)
         assert (

@@ -20,8 +20,9 @@ choices exist entirely to guarantee that:
    on the exact day the backfill stopped and the live writer took over.
 
 2. **Same anchor.**  The live row settles at the last analytics cycle before
-   the 16:15 ET gate closes, so each historical day is read at ONE
-   timestamp: the last chain snapshot in the late-session window.  Sampling
+   the cash-session gate closes, so each historical day is read at ONE
+   timestamp: the last chain snapshot in the late-session window (see
+   ``_ANCHOR_WINDOW_START`` for why that window stops at 16:00, not 16:15).  Sampling
    a whole day instead would blend the 09:32 open — reliably the widest
    quotes of the session — into days the live writer never saw it on.
 
@@ -56,11 +57,22 @@ logger = logging.getLogger(__name__)
 # to measure a width from.  See src/api/futures_middleware.py.
 DEFAULT_SYMBOLS = ["SPY", "QQQ", "SPX", "NDX"]
 
-# The late-session window the day's anchor snapshot is drawn from.  Ends at
-# the live writer's 16:15 ET gate; starts early enough that a day with a
-# thin tail of snapshots still finds one.
-_ANCHOR_WINDOW_START = "15:00:00"
-_ANCHOR_WINDOW_END = "16:15:00"
+# The late-session window the day's anchor snapshot is drawn from.
+#
+# 15:30-16:00 ET, matching ``daily_atm_iv_backfill`` exactly, and the upper
+# bound is the point.  An earlier version ran to 16:15 to cover SPX's true
+# session end, which meant ``MAX(timestamp)`` landed in the closing rotation
+# on any day ingestion had rows past 16:00 — and quotes there are wide and
+# stale by definition (the same post-close drift ``_store_daily_atm_iv``
+# documents).  Observed in production: SPY 2026-09-02 read a 18.7% median
+# with a 104% p90, meaning a tenth of the chain was quoted wider than its own
+# mid.  That is a closing auction, not a market anyone traded.
+#
+# Worse, it did not happen every day — only when the feed ran past 16:00 —
+# so it injected NOISE into the trailing distribution the percentile ranks
+# against, which is the one thing that distribution cannot tolerate.
+_ANCHOR_WINDOW_START = "15:30:00"
+_ANCHOR_WINDOW_END = "16:00:00"
 
 _UPSERT_SQL = """
     INSERT INTO daily_spread_stats (
