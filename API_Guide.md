@@ -619,7 +619,18 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
 - `pin_score` (raw max pin score = restoring gamma × reachability) and
   `pin_confidence` (its dominance over all viable pins, `0..1`) are top-level
   scalar metadata a client can use to classify pin strength; both `null` when
-  there is no active pin.
+  there is no active pin. `pin_confidence` is
+  `winning_score / Σ(all positive candidate scores)` over every listed strike
+  within ±2.5 expected moves of spot, same-day expiration only — the buckets
+  the ZeroGEX UI renders are `>= 0.50` Strong, `>= 0.33` Moderate, else Weak.
+  **It measures dominance, not magnitude**, so a strike carrying several times
+  its neighbors' gamma can still score low: the kernel spreads that gamma
+  across the neighboring strikes, and each of those is itself a candidate in
+  the denominator. Two consequences worth handling if you classify your own:
+  the value is per-snapshot with no time smoothing (it can flicker on a
+  near-tie), and the candidate band narrows as `τ → 0`, so the same book reads
+  more confident late in the session than early. See the
+  [Pin Strike](https://zerogex.io/help/platform/pin-strike) methodology page.
 - `profile` is ascending by strike (histogram order). `net_gex` is dollar
   gamma per 1% move, calls positive / puts negative, and
   `net_gex == call_gex + put_gex` by construction.
