@@ -53,6 +53,28 @@ def _build_tradestation(**kwargs: Any) -> MarketDataProvider:
     )
 
 
+def _build_thetadata(**kwargs: Any) -> MarketDataProvider:
+    from src.ingestion.providers.thetadata import ThetaDataProvider
+
+    client = kwargs.pop("client", None)
+    if client is not None:
+        return ThetaDataProvider(client, **kwargs)
+    return ThetaDataProvider.from_env(**kwargs)
+
+
+def _build_thetadata_mv(**kwargs: Any) -> MarketDataProvider:
+    """ThetaData pointed at the Market Value terminal.
+
+    Registered as its own name so the comparison harness can run the two
+    stages against each other -- ``--incumbent thetadata --candidate
+    thetadata_mv`` measures exactly what the penny adjustment costs in
+    published levels, which is the question the evaluation exists to
+    answer. Selection is by port, not by endpoint; see the provider module.
+    """
+    kwargs.setdefault("stage", "mv")
+    return _build_thetadata(**kwargs)
+
+
 def _build_stub(**kwargs: Any) -> MarketDataProvider:
     from src.ingestion.providers.stub import StubProvider
 
@@ -64,6 +86,8 @@ def _build_stub(**kwargs: Any) -> MarketDataProvider:
 #: deployment that actually selected that vendor.
 _REGISTRY: Dict[str, Callable[..., MarketDataProvider]] = {
     "tradestation": _build_tradestation,
+    "thetadata": _build_thetadata,
+    "thetadata_mv": _build_thetadata_mv,
     "stub": _build_stub,
 }
 
