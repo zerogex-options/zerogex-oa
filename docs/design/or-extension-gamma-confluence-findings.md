@@ -139,6 +139,48 @@ the two cohorts overlap almost entirely (329 vs 303 events).
 
 **It reverses out of sample.** Discovery +4.6 pts, validation −3.8, test −1.6.
 
+### Every cohort that looked good in-sample flips out of sample
+
+Excess over the baseline **of its own column** (the baseline drifts: 49.7% /
+56.0% / 57.9%):
+
+| cohort | discovery | validation | test | holds sign? |
+|---|---:|---:|---:|---|
+| 5. confluence + negative GEX | +10.4 | +7.0 | **−4.7** | no — reverses |
+| 7. confluence + below flip | +11.6 | +9.4 | **−5.6** | no — reverses |
+| 4. confluence + positive GEX | −7.0 | −6.0 | **+3.6** | no — reverses |
+| 17. ≥4 metrics agree | +7.9 | **−14.6** | −3.2 | no — reverses |
+| 11. prior extensions broken | −2.6 | −13.1 | −10.5 | **yes** |
+
+The two rows that reached p≈0.05 in-sample are the two that reverse hardest.
+That is what the split is for.
+
+### The product's own claim, tested
+
+"When four metrics agree on one strike, that's the level." Base rate of
+**distinct kinds** agreeing (not level count — four adjacent GEX strikes are one
+kind of evidence):
+
+| threshold | ≥2 metrics | ≥3 metrics | ≥4 metrics |
+|---|---:|---:|---:|
+| ≤2 pts | 33.2% | 22.3% | **13.2%** |
+| ≤5 pts | 45.9% | 38.6% | 28.2% |
+| ≤10 pts | 57.1% | 46.7% | 36.8% |
+| ≤20 pts | 71.0% | 59.6% | 49.2% |
+
+So four-metric agreement within 2 points happens at about **1 in 8** touched
+prices — selective, but not rare. Within 10 points it is better than 1 in 3.
+
+Does it predict anything? Cohorts 15/16/17 read 52.1% / 52.5% / **54.1%** — a
+mild rise with the number of agreeing metrics, but +1.5 points at p=0.68, no BH
+survival, and it swings 57.6% → 41.4% → 54.7% across the out-of-sample split.
+
+**Scope matters here.** This tests one narrow question: does multi-metric
+agreement *at an opening-range extension* predict reversion-versus-continuation.
+It does not. That is not the same as "the folded label is uninformative" — it
+says nothing about whether those prices matter in other ways (reaction size,
+volume, dwell time), which this study never measured.
+
 **And it is insensitive to lead time.** Across 0 / 30 / 60 / 120 / 180 s the
 effect reads +0.3, +0.2, +0.5, −0.1, −0.1 — while H1 and H2 stay bit-identical
 in all five cells, which is the consistency check passing (neither depends on
@@ -167,6 +209,12 @@ The null above is from the corrected run. It is a fair test.
 
 Across the nine ladder geometries every non-null cell is negative: −1.7, −6.0,
 −1.7, −1.3, −11.8, −4.8, −4.7, −0.4.
+
+**And it is the only cohort that keeps its sign out of sample** — −2.6, −13.1,
+−10.5 against each column's own baseline, getting *stronger* in the holdout
+while every confluence cohort flips. That is weak evidence, on 104 / 21 / 38
+events, but it is the only thing in the study that behaves the way a real
+effect behaves.
 
 **That 8-for-8 sign consistency is not evidence, and must not be reported as
 such.** Those cells are the same 49 sessions re-cut with different ladders — one
