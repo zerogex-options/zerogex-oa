@@ -128,40 +128,72 @@ def _backfill_symbol(
         with conn.cursor() as cur:
             cur.execute(f"SET LOCAL statement_timeout = {statement_timeout_ms}")
 
-            # One anchor snapshot per ET trading day: the last chain
-            # timestamp inside the late-session window.  Converting the ET
-            # date back to a UTC range (rather than wrapping the column in
-            # AT TIME ZONE) is what lets the planner use the
-            # (underlying, timestamp DESC) index for a range probe — the
-            # same trick daily_atm_iv_backfill documents at length.
+            # Day list from underlying_quotes, NOT option_chains.  It is
+            # the small table (one minute bar per symbol per minute, ~35k
+            # rows over the window against millions of chain rows), and a
+            # day with no underlying bar has no spot to centre the strike
+            # band on, so it could not be measured anyway.
             cur.execute(
-                f"""
-                SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS day,
-                       MAX(timestamp) AS anchor_ts
-                FROM option_chains
-                WHERE underlying = %s
+                """
+                SELECT DISTINCT (timestamp AT TIME ZONE 'America/New_York')::date AS day
+                FROM underlying_quotes
+                WHERE symbol = %s
                   AND timestamp >= NOW() - (%s::int * INTERVAL '1 day')
-                  AND (timestamp AT TIME ZONE 'America/New_York')::time
-                        >= TIME '{_ANCHOR_WINDOW_START}'
-                  AND (timestamp AT TIME ZONE 'America/New_York')::time
-                        <  TIME '{_ANCHOR_WINDOW_END}'
-                GROUP BY (timestamp AT TIME ZONE 'America/New_York')::date
                 ORDER BY day DESC
                 """,
                 (symbol, days),
             )
-            anchors = cur.fetchall()
+            trading_days = [row[0] for row in cur.fetchall()]
 
-            if not anchors:
+            if not trading_days:
                 logger.warning(
-                    "daily_spread_stats backfill [%s]: no late-session option_chains "
-                    "rows in the last %d days; skipping (no live data yet?)",
+                    "daily_spread_stats backfill [%s]: no underlying_quotes in the "
+                    "last %d days; skipping (no live data yet?)",
                     symbol,
                     days,
                 )
                 return 0, 0
 
-            for day, anchor_ts in anchors:
+            for day in trading_days:
+                # One anchor snapshot per day: the last chain timestamp in
+                # the late-session window.
+                #
+                # The ET window is converted back to a UTC timestamp RANGE
+                # rather than filtering on
+                # ``(timestamp AT TIME ZONE 'NY')::time``.  That is not a
+                # style preference — the function-wrapped form is not
+                # sargable, so the planner cannot use it as an index
+                # condition and falls back to scanning the whole window and
+                # discarding ~94% of it (measured: 261k rows removed by
+                # filter per worker, 107ms on a 938k-row fixture, and it
+                # grows with the DENSITY of the chain).  As a range the same
+                # probe is an index-only scan of 4 buffers in 0.06ms that
+                # touches only the 75 minutes it wants.  ``daily_atm_iv_backfill``
+                # documents the same trick at length.
+                #
+                # ``(date + time)::timestamp AT TIME ZONE 'NY'`` also resolves
+                # the offset for that specific local date, so the window lands
+                # correctly on both sides of a DST change.
+                cur.execute(
+                    f"""
+                    SELECT MAX(timestamp)
+                    FROM option_chains
+                    WHERE underlying = %s
+                      AND timestamp >= ((%s::date + TIME '{_ANCHOR_WINDOW_START}')::timestamp
+                                        AT TIME ZONE 'America/New_York')
+                      AND timestamp <  ((%s::date + TIME '{_ANCHOR_WINDOW_END}')::timestamp
+                                        AT TIME ZONE 'America/New_York')
+                    """,
+                    (symbol, day, day),
+                )
+                anchor_row = cur.fetchone()
+                anchor_ts = anchor_row[0] if anchor_row else None
+                if anchor_ts is None:
+                    # No late-session chain rows: a holiday, a half day that
+                    # closed before the window, or an ingestion gap.
+                    skipped += 1
+                    continue
+
                 # Spot at the anchor, not a day average: the moneyness band
                 # has to be centred where the market actually was when the
                 # quotes were taken, or the band drifts off the money on a
