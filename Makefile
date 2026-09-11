@@ -950,6 +950,7 @@ help: ## Show this help message
 	@echo "  make max-pain-refresh-install - Install daily max-pain snapshot refresh timer (05:00 ET)"
 	@echo "  make max-pain-refresh-status  - Show max-pain refresh timer status + recent log"
 	@echo "  make daily-atm-iv-backfill-install - Install pre-open daily_atm_iv backfill timer (06:00 ET)"
+	@echo "  make daily-spread-stats-backfill   - Seed the Spread Monitor's daily quoted-width history from option_chains (SPREAD_STATS_SYMBOLS=, SPREAD_STATS_DAYS=)"
 	@echo "  make daily-atm-iv-backfill-status  - Show daily_atm_iv backfill timer status + recent log"
 	@echo "  make system-monitor-install   - Install per-minute system-monitor timer (CPU/mem/disk/errs/cycle)"
 	@echo "  make system-monitor-show      - Print latest hourly + daily aggregates"
@@ -4627,6 +4628,18 @@ daily-atm-iv-backfill: ## Re-seed daily_atm_iv 30-day history (idempotent, runs 
 	@$(PY) -m src.tools.daily_atm_iv_backfill \
 		$(if $(DAILY_ATM_IV_SYMBOLS),--symbols $(DAILY_ATM_IV_SYMBOLS)) \
 		$(if $(DAILY_ATM_IV_DAYS),--days $(DAILY_ATM_IV_DAYS))
+
+# Spread Monitor history.  The analytics writer UPSERTs today's three rows
+# (calls / puts / blended) each cash-session cycle; this seeds the trailing
+# window the page compares today against, and is the safety net for gaps a
+# missed EOD cycle would leave.  Idempotent — safe to re-run.
+# Override with SPREAD_STATS_SYMBOLS / SPREAD_STATS_DAYS.
+.PHONY: daily-spread-stats-backfill
+daily-spread-stats-backfill: ## Seed daily_spread_stats history from option_chains (idempotent; default 90 days)
+	@echo "$(BLUE)=== Backfilling daily_spread_stats history ===$(NC)"
+	@$(PY) -m src.tools.daily_spread_stats_backfill \
+		$(if $(SPREAD_STATS_SYMBOLS),--symbols $(SPREAD_STATS_SYMBOLS)) \
+		$(if $(SPREAD_STATS_DAYS),--days $(SPREAD_STATS_DAYS))
 
 # Backtesting platform: archive + calibration jobs (run nightly via timers).
 # Override with ARCHIVE_DAYS / ARCHIVE_UNDERLYINGS, CALIB_DAYS / CALIB_UNDERLYINGS.

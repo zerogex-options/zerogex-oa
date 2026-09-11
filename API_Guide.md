@@ -891,6 +891,101 @@ not an inconsistency.
 
 ---
 
+## Spread Monitor (quoted spreads & liquidity) — Beta
+
+Scope: `market_raw` — **internal BFF only, not redistributable.** Excluded
+from the `analytics` tier issued to external customers, for the same reason
+`/api/gex/premium_surface` is.
+
+Nothing here is per-contract: every figure is a median or a p90 over a
+population of contracts, and a median does not invert to the values behind
+it. But the *caller* chooses the population — `moneyness_band_pct` goes down
+to `0.25`, `dte_max` to `0`, and each bucket reports its own
+`tradable_count`. Narrow a bucket to a single contract and the quote falls
+out by arithmetic:
+
+```
+median_spread              = ask - bid
+median_relative_spread_pct = 200 * (ask - bid) / (ask + bid)
+=> ask + bid = 200 * median_spread / median_relative_spread_pct
+=> bid and ask, for a contract the same response identifies by expiration,
+   strike band and option type.
+```
+
+There is no field to redact that closes that, so the gate is on the route.
+See the `scopes.py` docstring for where the MARKET_RAW line is drawn and why.
+
+Three measures, each answering a different question:
+
+| Field | Question it answers |
+| --- | --- |
+| `median_relative_spread_pct` | How much of the premium does crossing cost? `100 * (ask - bid) / mid`. The headline. |
+| `median_spread_bps_underlying` | Is this symbol worse than that one? `10000 * (ask - bid) / spot` — the only cross-symbol comparable measure, since SPX near 6,800 and NDX near 25,000 are not on one dollar scale. |
+| `zero_bid_pct` | What share of the chain has no market at all? Contracts quoted with an offer and no bid have no width by construction; they are excluded from every median and counted here instead. |
+
+**Quoted, not effective.** Every response carries a `disclosure` saying so.
+This measures the width market makers are showing, not what trades filled
+at, and the feed carries no sizes — a tight quote for one contract and a
+tight quote for a thousand are indistinguishable here.
+
+**Futures are refused, not projected.** ES / NQ carry no option chain of
+their own (their surfaces are SPX / NDX levels carried onto the futures
+price axis), so `symbol=ES` answers 400. Scaling an SPX quote by the futures
+basis would invent a width nobody published.
+
+### GET /api/market/spreads
+Current quoted width and liquidity across one symbol's near-dated chain,
+split into calls, puts and the blended chain, plus the curve across strike
+distance and a per-expiration breakdown.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `dte_max` (optional): `0`–`90`, default from `SPREAD_STATS_DTE_MAX` (7)
+- `moneyness_band_pct` (optional): `0.25`–`25`, default from `SPREAD_STATS_MONEYNESS_BAND_PCT` (5) — half-width of the strike band around spot
+- `history_days` (optional): `0`–`180`, default `60`; trailing sessions to rank today's reading against, `0` to skip
+
+`history` is null when the `daily_spread_stats` rollup has nothing
+comparable to rank against — a fresh deployment, or rows measured under a
+different scope. "No comparison available" and "an ordinary day" are
+deliberately distinguishable.
+
+### GET /api/market/spreads/series
+How today's widths moved through the session, one reading per bucket taken
+at the last chain snapshot inside it. Calls and puts are returned
+separately; no blended row is computed, because the divergence between the
+two is the point.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `session` (optional): `current` or `prior`, default `current`
+- `bucket_minutes` (optional): `1`–`60`, default `15`
+- `dte_max`, `moneyness_band_pct`: as above
+
+### GET /api/market/spreads/compare
+The same reading side by side across symbols. A symbol whose chain cannot be
+read comes back with `unavailable` set rather than being dropped (which
+would read as "not compared") or zeroed (which would read as "perfectly
+tight").
+
+**Parameters:**
+- `symbols` (optional): comma-separated, max 8, default `SPX,NDX,SPY,QQQ`
+- `dte_max`, `moneyness_band_pct`, `history_days`: as above
+
+### GET /api/market/spreads/history
+Trailing daily quoted-width history from the `daily_spread_stats` rollup —
+what turns "spreads are 6.2% wide" into "spreads are wider than they have
+been all quarter". Rows are oldest first.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `option_type` (optional): `C`, `P` or `A` (blended), default `P`
+- `days` (optional): `1`–`180`, default `60`
+
+An empty `rows` list is a normal answer where neither the analytics writer
+nor `make daily-spread-stats-backfill` has run yet — not an error.
+
+---
+
 ## Max Pain
 
 Scope: `maxpain` (the `analytics` tier).

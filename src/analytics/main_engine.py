@@ -53,6 +53,8 @@ from src.config import (
     PIN_STRIKE_CANDIDATE_MAX_Z,
     PIN_STRIKE_MIN_SCORE,
     PIN_STRIKE_ATM_IV_BAND_PCT,
+    SPREAD_STATS_DTE_MAX,
+    SPREAD_STATS_MONEYNESS_BAND_PCT,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.tradeworkz.strikes import default_strike_increment
@@ -61,6 +63,7 @@ from src.analytics.walls import (
     compute_call_put_walls_with_strength,
 )
 from src.analytics import pin_strike as pin_strike_mod
+from src.analytics import spread_stats as spread_stats_mod
 from src.greeks_fd import fd_charm, fd_vanna
 from src.analytics.forced_flow import (
     ContractLeg,
@@ -3543,6 +3546,162 @@ class AnalyticsEngine:
                 exc,
             )
 
+    def _store_daily_spread_stats(
+        self,
+        options: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+        cursor,
+    ) -> None:
+        """Upsert today's rows in ``daily_spread_stats`` (calls, puts, blended).
+
+        Feeds the Spread Monitor's trailing comparison — the "are markets
+        wider than usual, or does it only feel that way?" read.  Three rows
+        per (underlying, trading_date): ``'C'``, ``'P'`` and ``'A'``.  The
+        blended row is stored rather than derived at read time because
+        medians do not combine.
+
+        The measured population is pinned by ``SPREAD_STATS_DTE_MAX`` and
+        ``SPREAD_STATS_MONEYNESS_BAND_PCT`` and both are written into the row.
+        That is not bookkeeping: a percentile against history is only
+        meaningful if every day in the window measured the same contracts, so
+        the scope has to travel with the reading.
+
+        Same cash-session gate as :meth:`_store_daily_atm_iv`, and for a
+        sharper version of the same reason.  After the 16:15 ET close market
+        makers stop quoting competitively and the chain goes wide by
+        definition — writing that would put a mechanical post-close blowout
+        into the very history the page uses to judge whether a blowout is
+        unusual, and every later session would then be scored against it.
+
+        Skips silently when spot is missing, the timestamp is outside the
+        cash session, or no contract in scope carries a usable quote.
+        Failures are logged and swallowed: the GEX persistence this shares a
+        transaction with must not fail over a liquidity rollup.
+        """
+        try:
+            spot = float(summary.get("underlying_price") or 0.0)
+            if spot <= 0:
+                return
+            underlying = summary["underlying"]
+            timestamp = summary["timestamp"]
+
+            ts_aware = (
+                timestamp if timestamp.tzinfo is not None else pytz.UTC.localize(timestamp)
+            )
+            et = ts_aware.astimezone(pytz.timezone("America/New_York"))
+            et_minute = et.hour * 60 + et.minute
+            # 09:30 ET = 570 min; 16:15 ET = 975 min. Mirrors daily_atm_iv.
+            if not (570 <= et_minute <= 975):
+                return
+
+            today_et = et.date()
+            band = float(SPREAD_STATS_MONEYNESS_BAND_PCT)
+            low = spot * (1.0 - band / 100.0)
+            high = spot * (1.0 + band / 100.0)
+
+            in_scope: List[Dict[str, Any]] = []
+            for opt in options:
+                strike = opt.get("strike")
+                expiration = opt.get("expiration")
+                if strike is None or expiration is None:
+                    continue
+                try:
+                    strike_f = float(strike)
+                except (TypeError, ValueError):
+                    continue
+                if not (low <= strike_f <= high):
+                    continue
+                dte = (expiration - today_et).days
+                if dte < 0 or dte > SPREAD_STATS_DTE_MAX:
+                    continue
+                in_scope.append(opt)
+
+            if not in_scope:
+                return
+
+            spreads = spread_stats_mod.contract_spreads(in_scope, spot)
+            by_type = spread_stats_mod.aggregate_by_option_type(spreads)
+
+            # 'A' is the blended chain; the other two keys map to the option
+            # types stored in option_chains.
+            rows = [
+                ("C", by_type["calls"]),
+                ("P", by_type["puts"]),
+                ("A", by_type["all"]),
+            ]
+
+            for option_type, agg in rows:
+                # A type with no contracts in scope (an expiration listing
+                # only calls, say) writes nothing rather than a zeroed row
+                # that would later read as "a day when the puts were fine".
+                if agg.contract_count == 0:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO daily_spread_stats (
+                        underlying, trading_date, option_type, spot_price,
+                        dte_max, moneyness_band_pct,
+                        contract_count, tradable_count,
+                        two_sided_pct, zero_bid_pct, crossed_or_locked_pct,
+                        median_spread, median_relative_spread_pct,
+                        p90_relative_spread_pct, median_spread_bps_underlying,
+                        p90_spread_bps_underlying,
+                        total_open_interest, total_volume, source_timestamp
+                    )
+                    VALUES (
+                        %s,
+                        (%s::timestamptz AT TIME ZONE 'America/New_York')::date,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s
+                    )
+                    ON CONFLICT (underlying, trading_date, option_type) DO UPDATE
+                    SET spot_price                   = EXCLUDED.spot_price,
+                        dte_max                      = EXCLUDED.dte_max,
+                        moneyness_band_pct           = EXCLUDED.moneyness_band_pct,
+                        contract_count               = EXCLUDED.contract_count,
+                        tradable_count               = EXCLUDED.tradable_count,
+                        two_sided_pct                = EXCLUDED.two_sided_pct,
+                        zero_bid_pct                 = EXCLUDED.zero_bid_pct,
+                        crossed_or_locked_pct        = EXCLUDED.crossed_or_locked_pct,
+                        median_spread                = EXCLUDED.median_spread,
+                        median_relative_spread_pct   = EXCLUDED.median_relative_spread_pct,
+                        p90_relative_spread_pct      = EXCLUDED.p90_relative_spread_pct,
+                        median_spread_bps_underlying = EXCLUDED.median_spread_bps_underlying,
+                        p90_spread_bps_underlying    = EXCLUDED.p90_spread_bps_underlying,
+                        total_open_interest          = EXCLUDED.total_open_interest,
+                        total_volume                 = EXCLUDED.total_volume,
+                        source_timestamp             = EXCLUDED.source_timestamp,
+                        updated_at                   = NOW()
+                    """,
+                    (
+                        underlying,
+                        timestamp,
+                        option_type,
+                        spot,
+                        int(SPREAD_STATS_DTE_MAX),
+                        band,
+                        agg.contract_count,
+                        agg.tradable_count,
+                        agg.two_sided_pct,
+                        agg.zero_bid_pct,
+                        agg.crossed_or_locked_pct,
+                        agg.median_spread,
+                        agg.median_relative_spread_pct,
+                        agg.p90_relative_spread_pct,
+                        agg.median_spread_bps_underlying,
+                        agg.p90_spread_bps_underlying,
+                        agg.total_open_interest,
+                        agg.total_volume,
+                        timestamp,
+                    ),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to upsert daily_spread_stats for %s: %s",
+                summary.get("underlying", "?"),
+                exc,
+            )
+
     def _store_calculation_results(
         self,
         gex_data: List[Dict[str, Any]],
@@ -3560,10 +3719,13 @@ class AnalyticsEngine:
         grouping must not be split into independent transactions.
 
         ``options`` is the raw per-contract snapshot list from
-        ``_get_snapshot()``.  When provided, also UPSERTs today's row
-        into ``daily_atm_iv`` so the signals engine can compute iv_rank
-        without scanning 30 days of option_chains itself.  Kept optional
-        so legacy callers without a snapshot still work.
+        ``_get_snapshot()``.  When provided, also UPSERTs today's rows into
+        two daily rollups the read paths would otherwise have to rebuild by
+        scanning option_chains: ``daily_atm_iv`` (the signals engine's
+        iv_rank percentile) and ``daily_spread_stats`` (the Spread Monitor's
+        trailing quoted-width comparison).  Both are derived from the same
+        snapshot that is already in memory here, so neither costs a query.
+        Kept optional so legacy callers without a snapshot still work.
         """
         try:
             with db_connection() as conn:
@@ -3573,6 +3735,7 @@ class AnalyticsEngine:
                 self._store_gex_profile(summary, cursor)
                 if options is not None:
                     self._store_daily_atm_iv(options, summary, cursor)
+                    self._store_daily_spread_stats(options, summary, cursor)
                 # db_connection() commits on a clean __exit__; the explicit
                 # commit makes the single-transaction boundary unambiguous
                 # and is a harmless no-op when the CM commits again.

@@ -74,6 +74,7 @@ from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
+from .routers.spread_liquidity import router as spread_liquidity_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.gamma_shift import router as gamma_shift_router
 from .routers.backtest import router as backtest_router
@@ -537,6 +538,33 @@ app.include_router(vol_surface_router, dependencies=[_scope_gex])
 # volatilities only, and an IV is not invertible to a price without the rate,
 # dividend and time conventions that produced it.
 app.include_router(premium_surface_router, dependencies=[_scope_market_raw])
+# Spread Monitor — quoted bid/ask width and liquidity across the chain (Beta).
+# MARKET_RAW for the same reason as the premium surface above, and it is worth
+# writing down why an AGGREGATE lands on the raw side of the line.
+#
+# Nothing here is per-contract: every figure is a median or a p90 over a
+# population, and a median does not invert to the values behind it. But the
+# CALLER chooses the population. `moneyness_band_pct` goes down to 0.25 and
+# `dte_max` to 0, and the response reports `tradable_count` per bucket — so a
+# caller can narrow a bucket until exactly one contract is left, and read it:
+#
+#     median_spread                 = ask - bid
+#     median_relative_spread_pct    = 200 * (ask - bid) / (ask + bid)
+#     => ask + bid = 200 * median_spread / median_relative_spread_pct
+#     => bid, ask   recovered exactly, for a contract the same response
+#                   identifies by expiration, strike band and option type.
+#
+# That is the premium surface's failure mode wearing an aggregate's clothes,
+# and the same conclusion follows: the gate belongs on the route, because
+# there is no field to redact that closes it. Suppressing thin buckets would
+# not close it either — a caller can vary the band and difference the results.
+# tests/test_market_data_scope_boundary.py pins this against the mounted route
+# table so the reasoning does not have to survive in a comment alone.
+#
+# No product cost: the website BFF holds TIER_FULL, so /spread-monitor is
+# unaffected. It is withheld from the external analytics tier, which is the
+# correct answer for a surface whose entire subject is the vendor's quotes.
+app.include_router(spread_liquidity_router, dependencies=[_scope_market_raw])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # Gamma Regime Shift — the derivative of the dealer-gamma surface (what
 # CHANGED between two snapshots, what expires next, and the classified read

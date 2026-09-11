@@ -562,6 +562,26 @@ PIN_STRIKE_MIN_SCORE = _getenv_float("PIN_STRIKE_MIN_SCORE", 0.0, min=0.0)
 # ±1% band the daily_atm_iv anchor already uses.
 PIN_STRIKE_ATM_IV_BAND_PCT = _getenv_float("PIN_STRIKE_ATM_IV_BAND_PCT", 0.01, min=0.001, max=0.1)
 
+# =============================================================================
+# Spread Monitor — quoted-spread / liquidity rollup scope
+# =============================================================================
+# The daily_spread_stats rollup exists to answer a COMPARATIVE question ("are
+# spreads wider than usual?"), so the population it measures has to be the
+# same population every day.  These two constants pin that scope, and the
+# values are written into every row (daily_spread_stats.dte_max /
+# .moneyness_band_pct) so a later change starts a fresh comparable series
+# rather than silently poisoning the trailing percentile.
+#
+# The defaults deliberately match where the complaint lives: near-dated
+# contracts within a few percent of spot, which is what a 0DTE/1DTE index
+# trader is actually quoted in.  Widening the band would pull in far wings
+# whose quotes are structurally wide on the calmest day and would drown out
+# the change the page is built to show.
+SPREAD_STATS_DTE_MAX = _getenv_int("SPREAD_STATS_DTE_MAX", 7, min=0, max=365)
+SPREAD_STATS_MONEYNESS_BAND_PCT = _getenv_float(
+    "SPREAD_STATS_MONEYNESS_BAND_PCT", 5.0, min=0.25, max=50.0
+)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = _getenv_int("QUOTE_BATCH_SIZE", 100)  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = _getenv_int("OPTION_BATCH_SIZE", 100)
