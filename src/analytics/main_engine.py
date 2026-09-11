@@ -54,6 +54,7 @@ from src.config import (
     PIN_STRIKE_MIN_SCORE,
     PIN_STRIKE_ATM_IV_BAND_PCT,
     SPREAD_STATS_DTE_MAX,
+    SPREAD_STATS_MIN_CONTRACTS,
     SPREAD_STATS_MONEYNESS_BAND_PCT,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
@@ -3623,7 +3624,19 @@ class AnalyticsEngine:
                     continue
                 in_scope.append(opt)
 
-            if not in_scope:
+            # An outage-thin snapshot is worse than no row: stored beside
+            # full sessions it becomes an equal peer in the distribution the
+            # trailing percentile ranks against, and a median over a handful
+            # of contracts is not the same measurement as one over hundreds.
+            if len(in_scope) < SPREAD_STATS_MIN_CONTRACTS:
+                logger.debug(
+                    "daily_spread_stats %s: %d contracts in scope is below the "
+                    "%d floor; skipping this cycle rather than recording a "
+                    "reading the chain cannot support",
+                    underlying,
+                    len(in_scope),
+                    SPREAD_STATS_MIN_CONTRACTS,
+                )
                 return
 
             spreads = spread_stats_mod.contract_spreads(in_scope, spot)

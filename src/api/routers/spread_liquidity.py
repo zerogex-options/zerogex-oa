@@ -91,7 +91,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from src.analytics import spread_stats as spread_stats_mod
-from src.config import SPREAD_STATS_DTE_MAX, SPREAD_STATS_MONEYNESS_BAND_PCT
+from src.config import (
+    SPREAD_STATS_DTE_MAX,
+    SPREAD_STATS_MIN_CONTRACTS,
+    SPREAD_STATS_MONEYNESS_BAND_PCT,
+)
 from src.market_calendar import is_spx_am_settled_expiration
 
 from ..database import DatabaseManager
@@ -424,6 +428,8 @@ async def _history_context(
     Compares like with like or not at all: rows measured under a different
     ``dte_max`` / moneyness band are excluded rather than blended in, since
     a percentile across two different populations ranks the populations.
+    Sessions whose anchor snapshot was too thin to measure are excluded for
+    the same reason — an ingestion outage is not a quiet market.
 
     Today's own rollup row is excluded from the population it is ranked
     against — including it would drag every reading toward the middle of
@@ -447,6 +453,11 @@ async def _history_context(
             and int(r.get("dte_max") or -1) == int(SPREAD_STATS_DTE_MAX)
             and float(r.get("moneyness_band_pct") or -1.0)
             == float(SPREAD_STATS_MONEYNESS_BAND_PCT)
+            # Outage-thin sessions are excluded here as well as at write
+            # time, so a row seeded before the floor existed — or by an
+            # operator running with a lower one — still cannot pull a
+            # percentile toward a reading its own chain could not support.
+            and int(r.get("contract_count") or 0) >= int(SPREAD_STATS_MIN_CONTRACTS)
         ]
 
     try:

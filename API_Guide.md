@@ -945,9 +945,11 @@ distance and a per-expiration breakdown.
 - `history_days` (optional): `0`–`180`, default `60`; trailing sessions to rank today's reading against, `0` to skip
 
 `history` is null when the `daily_spread_stats` rollup has nothing
-comparable to rank against — a fresh deployment, or rows measured under a
-different scope. "No comparison available" and "an ordinary day" are
-deliberately distinguishable.
+comparable to rank against — a fresh deployment, rows measured under a
+different scope, or sessions whose anchor snapshot was too thin to be a
+measurement (below `SPREAD_STATS_MIN_CONTRACTS`, default 100; an ingestion
+outage is not a quiet market). "No comparison available" and "an ordinary
+day" are deliberately distinguishable.
 
 ### GET /api/market/spreads/series
 How today's widths moved through the session, one reading per bucket taken

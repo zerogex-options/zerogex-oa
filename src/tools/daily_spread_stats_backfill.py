@@ -44,7 +44,11 @@ import sys
 from typing import Any, Dict, List, Sequence, Tuple
 
 from src.analytics import spread_stats as spread_stats_mod
-from src.config import SPREAD_STATS_DTE_MAX, SPREAD_STATS_MONEYNESS_BAND_PCT
+from src.config import (
+    SPREAD_STATS_DTE_MAX,
+    SPREAD_STATS_MIN_CONTRACTS,
+    SPREAD_STATS_MONEYNESS_BAND_PCT,
+)
 from src.database.connection import db_connection
 from src.market_calendar import is_spx_am_settled_expiration
 
@@ -261,7 +265,20 @@ def _backfill_symbol(
                     if _keep_contract(symbol, r["option_symbol"], r["expiration"], day)
                 ]
 
-                if not rows:
+                if len(rows) < max(1, SPREAD_STATS_MIN_CONTRACTS):
+                    # Ingestion outage, not a thin market. Recording it would
+                    # put a median over a handful of contracts into the same
+                    # population as one over hundreds.
+                    if rows:
+                        logger.warning(
+                            "daily_spread_stats backfill [%s] %s: only %d "
+                            "contracts in the anchor snapshot (floor %d) — "
+                            "skipping as an ingestion gap",
+                            symbol,
+                            day,
+                            len(rows),
+                            SPREAD_STATS_MIN_CONTRACTS,
+                        )
                     skipped += 1
                     continue
 

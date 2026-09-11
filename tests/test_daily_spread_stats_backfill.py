@@ -31,7 +31,20 @@ from contextlib import contextmanager
 from typing import Any, List, Tuple
 from unittest.mock import patch
 
+import pytest
+
 from src.tools import daily_spread_stats_backfill as backfill
+
+
+@pytest.fixture(autouse=True)
+def _floor_off(monkeypatch):
+    """Disable the minimum-contract floor except where a test sets its own.
+
+    The fixture chain here is three contracts, sized so the assertions stay
+    readable. The floor is about rejecting outages on a real chain, so tests
+    that are not about it opt out rather than inflating to 100 contracts.
+    """
+    monkeypatch.setattr(backfill, "SPREAD_STATS_MIN_CONTRACTS", 0)
 
 
 TRADING_DAYS = [dt.date(2026, 9, 10), dt.date(2026, 9, 9), dt.date(2026, 9, 8)]
@@ -210,6 +223,29 @@ def test_a_day_with_no_late_session_chain_is_skipped_not_written():
         if "INSERT INTO daily_spread_stats" in sql
     }
     assert missing not in written_days
+
+
+def test_an_outage_thin_day_is_skipped_not_written(monkeypatch):
+    """QQQ 2026-08-25 came back with 21 contracts against a 570-700 norm.
+
+    Written, it joins the population the trailing percentile ranks against
+    as an equal peer — a median over 21 contracts standing in for one over
+    684. Skipping loses a day; keeping it corrupts every later verdict.
+    """
+    monkeypatch.setattr(backfill, "SPREAD_STATS_MIN_CONTRACTS", 100)
+    cursor = FakeCursor()  # the fixture chain is 3 contracts
+    written, skipped = _run(cursor)
+
+    assert written == 0
+    assert skipped == len(TRADING_DAYS)
+    assert not [s for s, _ in cursor.statements if "INSERT INTO" in s]
+
+
+def test_the_floor_does_not_swallow_a_real_session(monkeypatch):
+    monkeypatch.setattr(backfill, "SPREAD_STATS_MIN_CONTRACTS", 2)
+    cursor = FakeCursor()  # 3 contracts clears a floor of 2
+    written, _ = _run(cursor)
+    assert written == len(TRADING_DAYS)
 
 
 def test_scope_travels_with_every_row():

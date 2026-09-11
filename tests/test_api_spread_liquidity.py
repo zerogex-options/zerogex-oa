@@ -85,8 +85,8 @@ def _history_rows(option_type: str, values: List[float]) -> List[Dict[str, Any]]
             "spot_price": SPOT,
             "dte_max": int(SPREAD_STATS_DTE_MAX),
             "moneyness_band_pct": float(SPREAD_STATS_MONEYNESS_BAND_PCT),
-            "contract_count": 100,
-            "tradable_count": 95,
+            "contract_count": 800,
+            "tradable_count": 760,
             "two_sided_pct": 95.0,
             "zero_bid_pct": 5.0,
             "crossed_or_locked_pct": 0.0,
@@ -261,6 +261,24 @@ def test_todays_own_row_is_excluded_from_its_own_window(monkeypatch):
 
     client = _client(monkeypatch, history=history)
     assert client.get("/api/market/spreads?symbol=SPX").json()["history"]["sessions"] == 2
+
+
+def test_outage_thin_sessions_are_excluded_from_the_percentile(monkeypatch):
+    """A row written before the floor existed must not rank today's reading.
+
+    The write path now rejects these, but rows already in the table (the
+    QQQ 2026-08-25 21-contract session, for one) would otherwise keep
+    dragging the distribution for as long as they sit inside the window.
+    """
+
+    def history(symbol, option_type, days):
+        rows = _history_rows(option_type, [1.0, 1.2, 1.1])
+        rows[0]["contract_count"] = 21  # the outage
+        return rows
+
+    client = _client(monkeypatch, history=history)
+    body = client.get("/api/market/spreads?symbol=SPX").json()
+    assert body["history"]["sessions"] == 2
 
 
 def test_a_broken_rollup_does_not_take_the_page_down(monkeypatch):

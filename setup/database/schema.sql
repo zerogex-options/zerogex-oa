@@ -2522,6 +2522,8 @@ COMMENT ON COLUMN daily_spread_stats.median_relative_spread_pct IS
     'Median quoted width as a percentage of the option mid — 100 * (ask - bid) / mid. The headline "how much of the premium is the toll" number.';
 COMMENT ON COLUMN daily_spread_stats.median_spread_bps_underlying IS
     'Median quoted width in basis points of the underlying level — 10000 * (ask - bid) / spot. The cross-symbol comparable measure.';
+COMMENT ON COLUMN daily_spread_stats.contract_count IS
+    'Contracts in scope for the row. Load-bearing, not diagnostic: a session below SPREAD_STATS_MIN_CONTRACTS is an ingestion outage rather than a quiet market, and both the writers and the trailing-percentile read exclude it -- a median over 21 contracts must not stand beside one over 684 in the distribution today is ranked against.';
 COMMENT ON COLUMN daily_spread_stats.zero_bid_pct IS
     'Share of contracts quoted with an offer but no bid. These have NO width by construction and are excluded from every median here; the count is the liquidity failure a width statistic cannot express.';
 
