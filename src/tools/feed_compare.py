@@ -41,9 +41,14 @@ Usage
 Shadow tables
 -------------
 
-``--persist`` writes each feed's normalised quotes to ``option_chains_shadow``
-and its spot bars to ``underlying_quotes_shadow``, both keyed by a
-``provider`` column.  They are deliberately SEPARATE tables rather than a
+``--persist`` writes each feed's normalised quotes to ``option_chains_shadow``,
+the spot bar each priced against to ``underlying_quotes_shadow``, and the
+run's metric diff to ``feed_comparisons`` -- all keyed by a ``provider``
+column. The spot table matters more than it looks: when two feeds disagree
+on GEX the first question is whether they disagreed on the price underneath
+it, and that is unanswerable after the fact without the bar.
+
+They are deliberately SEPARATE tables rather than a
 ``source`` column on ``option_chains``: the live tables feed the analytics
 engine, the API and every signal, and a candidate feed's rows must not be
 able to reach any of that while it is under evaluation.  Create them with
@@ -62,7 +67,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.ingestion.providers import MarketDataProvider, get_provider
-from src.ingestion.providers.base import OptionQuote
+from src.ingestion.providers.base import Bar, OptionQuote
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
 
@@ -272,6 +277,11 @@ class FeedSample:
     quotes: Dict[str, OptionQuote]
     metadata: Dict[str, Dict[str, Any]]
     error: Optional[str] = None
+    #: The bar ``spot`` was taken from, kept so the underlying tape can be
+    #: persisted alongside the chain. When two feeds disagree on GEX the
+    #: first question is always whether they disagreed on spot, and that is
+    #: unanswerable after the fact without the bar.
+    spot_bar: Optional[Bar] = None
 
     @property
     def contract_count(self) -> int:
@@ -352,9 +362,11 @@ def sample_provider(
     """
     captured_at = datetime.now(timezone.utc)
     try:
+        spot_bar = None
         spot = spot_hint
         if spot is None:
-            spot = _spot_from_provider(provider, underlying)
+            spot_bar = _spot_from_provider(provider, underlying)
+            spot = float(spot_bar.close) if spot_bar and spot_bar.close else None
         if not spot or spot <= 0:
             return FeedSample(
                 provider=provider.name,
@@ -379,6 +391,7 @@ def sample_provider(
             spot=spot,
             quotes=quotes,
             metadata=metadata,
+            spot_bar=spot_bar,
         )
     except Exception as e:  # noqa: BLE001 - a failing feed is a RESULT here,
         # not a crash: "the candidate could not answer" is exactly what the
@@ -394,11 +407,13 @@ def sample_provider(
         )
 
 
-def _spot_from_provider(provider: MarketDataProvider, underlying: str) -> Optional[float]:
-    """Best available spot for ``underlying`` from this provider.
+def _spot_from_provider(provider: MarketDataProvider, underlying: str) -> Optional[Bar]:
+    """Best available spot bar for ``underlying`` from this provider.
 
     Briefly runs the underlying bar stream rather than assuming a quote
     endpoint, because that is the path a migration actually depends on.
+    Returns the whole bar rather than just the close so the caller can
+    persist the tape it priced against.
     """
     if not provider.capabilities.underlying_bars:
         return None
@@ -409,7 +424,7 @@ def _spot_from_provider(provider: MarketDataProvider, underlying: str) -> Option
         while time.monotonic() < deadline:
             bar = stream.drain()
             if bar and bar.close:
-                return float(bar.close)
+                return bar
             time.sleep(0.5)
     finally:
         stream.stop()
@@ -487,6 +502,57 @@ def persist_sample(sample: FeedSample, underlying: str) -> int:
             sample.provider,
             e,
         )
+        return 0
+
+
+def persist_underlying_bar(sample: FeedSample, underlying: str) -> int:
+    """Write one feed's spot bar to ``underlying_quotes_shadow``.
+
+    Separate from :func:`persist_sample` because the two answer different
+    questions. The chain table explains a wall that moved; this one
+    explains whether the feeds even agreed on the price the walls were
+    measured against, which is the first thing to check and the thing you
+    cannot reconstruct afterwards.
+
+    Never raises: losing the tape must not abort a run that is still
+    producing usable chain comparisons.
+    """
+    bar = sample.spot_bar
+    if bar is None:
+        return 0
+    try:
+        from src.database import db_connection
+
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO underlying_quotes_shadow (
+                        provider, symbol, captured_at, bar_timestamp,
+                        open, high, low, close, volume, up_volume, down_volume
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (provider, symbol, captured_at) DO NOTHING
+                    """,
+                    (
+                        sample.provider,
+                        get_canonical_symbol(underlying),
+                        sample.captured_at,
+                        bar.timestamp,
+                        bar.open,
+                        bar.high,
+                        bar.low,
+                        bar.close,
+                        bar.volume,
+                        # None stays None: a feed that cannot report a signed
+                        # split is a different fact from one reporting zero,
+                        # and the column is nullable precisely to hold that.
+                        bar.up_volume,
+                        bar.down_volume,
+                    ),
+                )
+        return 1
+    except Exception as e:  # noqa: BLE001
+        logger.warning("underlying shadow persist failed for %s: %s", sample.provider, e)
         return 0
 
 
@@ -601,6 +667,8 @@ def run_once(
     if persist:
         persist_sample(incumbent, underlying)
         persist_sample(candidate, underlying)
+        persist_underlying_bar(incumbent, underlying)
+        persist_underlying_bar(candidate, underlying)
         persist_comparison(
             comparisons,
             underlying=underlying,

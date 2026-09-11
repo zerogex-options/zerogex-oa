@@ -275,3 +275,121 @@ def test_harness_analytics_entry_points_still_exist():
 
     walls_params = list(inspect.signature(compute_call_put_walls).parameters)
     assert walls_params[:2] == ["gex_by_strike", "spot_price"]
+
+
+# ---------------------------------------------------------------------------
+# Shadow schema / writer agreement
+# ---------------------------------------------------------------------------
+
+
+def _ddl_columns(table: str):
+    import re
+
+    ddl = open("setup/database/shadow_tables.sql").read()
+    match = re.search(rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);", ddl, re.S)
+    assert match, f"{table} missing from shadow_tables.sql"
+    columns = []
+    for line in match.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith("--") or line.upper().startswith("PRIMARY KEY"):
+            continue
+        columns.append(line.split()[0])
+    return columns
+
+
+def _insert_columns(table: str):
+    import re
+
+    src = open("src/tools/feed_compare.py").read()
+    match = re.search(rf"INSERT INTO {table} \((.*?)\) VALUES", src, re.S)
+    assert match, f"nothing inserts into {table}"
+    return [c.strip() for c in match.group(1).replace("\n", " ").split(",") if c.strip()]
+
+
+def test_every_shadow_table_has_a_writer():
+    """A table in the DDL with no INSERT is a silently empty evaluation record.
+
+    ``underlying_quotes_shadow`` shipped in exactly that state: created by
+    the schema, documented as persisted, and never written. The gap only
+    shows up weeks later when you try to explain a GEX divergence and
+    discover you never captured whether the feeds agreed on spot.
+    """
+    import re
+
+    ddl = open("setup/database/shadow_tables.sql").read()
+    src = open("src/tools/feed_compare.py").read()
+    created = set(re.findall(r"CREATE TABLE IF NOT EXISTS ([a-z_]+)", ddl))
+    written = set(re.findall(r"INSERT INTO ([a-z_]+)", src))
+    assert created <= written, f"tables with no writer: {sorted(created - written)}"
+
+
+@pytest.mark.parametrize(
+    "table",
+    ["option_chains_shadow", "underlying_quotes_shadow", "feed_comparisons"],
+)
+def test_insert_columns_exist_in_the_ddl(table):
+    """A column-list drift fails at the worst moment, mid-evaluation."""
+    ddl_cols = _ddl_columns(table)
+    for column in _insert_columns(table):
+        assert column in ddl_cols, f"{table}.{column} is not in the DDL"
+
+
+@pytest.mark.parametrize(
+    "table",
+    ["option_chains_shadow", "underlying_quotes_shadow", "feed_comparisons"],
+)
+def test_insert_placeholder_count_matches_column_count(table):
+    """Mismatched placeholders raise only when a row is actually written."""
+    import re
+
+    src = open("src/tools/feed_compare.py").read()
+    n_columns = len(_insert_columns(table))
+    block = re.search(rf"INSERT INTO {table} \(.*?\) VALUES\s*(%s|\((?P<ph>[^)]*)\))", src, re.S)
+    assert block, f"no VALUES clause found for {table}"
+    placeholders = block.group("ph")
+    if placeholders is None:
+        # execute_values form: a single %s stands in for the whole row list,
+        # so the arity is carried by the tuples the caller builds instead.
+        return
+    assert placeholders.count("%s") == n_columns, (
+        f"{table}: {n_columns} columns but " f"{placeholders.count('%s')} placeholders"
+    )
+
+
+def test_spot_bar_is_carried_on_the_sample():
+    """The bar, not just the close, so the tape can be persisted."""
+    from src.ingestion.providers.base import Bar
+
+    bar = Bar(
+        symbol="SPY",
+        timestamp=datetime.now(timezone.utc),
+        open=650.0,
+        high=651.0,
+        low=649.0,
+        close=650.5,
+    )
+    sample = FeedSample(
+        provider="p",
+        captured_at=datetime.now(timezone.utc),
+        spot=650.5,
+        quotes={},
+        metadata={},
+        spot_bar=bar,
+    )
+    assert sample.spot_bar is bar
+    assert sample.spot_bar.close == 650.5
+
+
+def test_persist_underlying_bar_noops_without_a_bar():
+    """A sample with no spot bar must not attempt a write."""
+    from src.tools.feed_compare import persist_underlying_bar
+
+    sample = FeedSample(
+        provider="p",
+        captured_at=datetime.now(timezone.utc),
+        spot=None,
+        quotes={},
+        metadata={},
+        error="no entitlement",
+    )
+    assert persist_underlying_bar(sample, "SPY") == 0
