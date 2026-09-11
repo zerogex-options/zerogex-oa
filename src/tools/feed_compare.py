@@ -671,7 +671,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--candidate",
         default=None,
-        help="candidate provider name (default: MARKET_DATA_COMPARE_PROVIDER)",
+        help=(
+            "candidate provider name (default: MARKET_DATA_COMPARE_PROVIDER). "
+            "Must already be implemented and registered in "
+            "src/ingestion/providers/__init__.py -- a vendor you have "
+            "credentials for but no provider module for is not yet comparable."
+        ),
     )
     parser.add_argument("--expirations", type=int, default=3)
     parser.add_argument("--strike-count-max", type=int, default=40)
@@ -716,7 +721,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     incumbent_provider = get_provider(incumbent_name)
-    candidate_provider = get_provider(candidate_name)
+    try:
+        candidate_provider = get_provider(candidate_name)
+    except ValueError as e:
+        # The registry is deliberately fatal on an unknown name, but the
+        # common case here is "I have trial credentials for a vendor nobody
+        # has written a module for yet", which is a build step rather than a
+        # typo. Say which.
+        print(
+            f"{e}\n\n"
+            f"If {candidate_name!r} is a vendor you have credentials for, its "
+            "provider module does not exist yet. Copy "
+            "src/ingestion/providers/stub.py, implement the six operations "
+            "against their client, and register it in "
+            "src/ingestion/providers/__init__.py. See "
+            "docs/design/market-data-provider-abstraction.md.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Fail loudly on a candidate that cannot serve the option chain at all,
     # rather than reporting a run of empty comparisons that reads like a
