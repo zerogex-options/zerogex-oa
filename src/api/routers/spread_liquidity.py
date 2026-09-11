@@ -276,6 +276,11 @@ class SpreadHistoryResponse(BaseModel):
     moneyness_band_pct: float
     basis: str = "quoted_nbbo"
     disclosure: str = DISCLOSURE
+    #: Sessions in the window whose anchor snapshot was too thin to be a
+    #: measurement, and which are therefore absent from `rows`. Reported
+    #: rather than dropped silently: a gap in the chart should be
+    #: explicable, and a rising count here is an ingestion problem.
+    excluded_thin_sessions: int = 0
     #: Oldest first, so a chart can render it without reversing.
     rows: List[HistoryRow]
 
@@ -821,6 +826,11 @@ async def get_spread_history(
     This is what turns "spreads are 6.2% wide" into "spreads are wider than
     they have been all quarter".  Rows are oldest first.
 
+    Sessions whose anchor snapshot was too thin to be a measurement are
+    omitted and counted in ``excluded_thin_sessions``; a chart should show
+    the gap rather than a point, because an ingestion outage is not a
+    session anyone traded.
+
     An empty ``rows`` list is a normal answer on a deployment where neither
     the analytics writer nor ``src.tools.daily_spread_stats_backfill`` has
     run yet — not an error, and the caller should render the live reading
@@ -835,16 +845,43 @@ async def get_spread_history(
         return cached
 
     try:
-        rows = await db.get_daily_spread_history(sym, option_type, days)
+        all_rows = await db.get_daily_spread_history(sym, option_type, days)
     except Exception as e:
         logger.error(f"Error fetching spread history for {sym}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+    # Same floor the percentile applies, for the same reason. The writers
+    # reject these now, but rows seeded before the floor existed are still
+    # in the table — and a row we have decided is not a measurement must
+    # not be handed to a chart as one.
+    #
+    # Filtered rather than deleted from the rollup: the live writer may hold
+    # a BETTER row for the same day, taken at its own cycle when the chain
+    # was still full, and a blind delete would destroy that instead of the
+    # bad reading. Dropping at read time costs nothing and cannot lose data.
+    rows = [
+        r
+        for r in all_rows
+        if int(r.get("contract_count") or 0) >= int(SPREAD_STATS_MIN_CONTRACTS)
+    ]
+    excluded = len(all_rows) - len(rows)
+    if excluded:
+        logger.info(
+            "Spread history %s/%s: %d of %d sessions excluded as too thin "
+            "to measure (floor %d)",
+            sym,
+            option_type,
+            excluded,
+            len(all_rows),
+            SPREAD_STATS_MIN_CONTRACTS,
+        )
 
     response = SpreadHistoryResponse(
         symbol=sym,
         option_type=option_type,
         dte_max=int(SPREAD_STATS_DTE_MAX),
         moneyness_band_pct=float(SPREAD_STATS_MONEYNESS_BAND_PCT),
+        excluded_thin_sessions=excluded,
         rows=[
             HistoryRow(
                 trading_date=r["trading_date"],
