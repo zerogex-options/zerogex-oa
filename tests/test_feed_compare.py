@@ -393,3 +393,62 @@ def test_persist_underlying_bar_noops_without_a_bar():
         error="no entitlement",
     )
     assert persist_underlying_bar(sample, "SPY") == 0
+
+
+# ---------------------------------------------------------------------------
+# Probe mode
+# ---------------------------------------------------------------------------
+
+
+def test_probe_needs_no_candidate(monkeypatch, capsys):
+    """Probing is about sizing one provider's load, so requiring a second
+    one would make it useless for the first thing you do."""
+    from src.tools import feed_compare
+
+    monkeypatch.setenv("MARKET_DATA_COMPARE_PROVIDER", "")
+    code = feed_compare.main(["--probe", "--incumbent", "stub", "--underlying", "SPY"])
+    out = capsys.readouterr().out
+    assert "provider" in out
+    assert "wall time" in out
+    # The stub serves nothing, so a failed probe is the honest result.
+    assert code == 1
+
+
+def test_probe_allows_the_same_provider_twice(monkeypatch):
+    """The self-comparison guard is about comparisons. Probing the same
+    name twice is a legitimate way to measure variance between runs."""
+    from src.tools import feed_compare
+
+    code = feed_compare.main(
+        ["--probe", "--incumbent", "stub", "--candidate", "stub", "--underlying", "SPY"]
+    )
+    assert code in (0, 1), "must not parser.error on a duplicate name"
+
+
+def test_probe_reports_coverage_not_analytics():
+    """A probe answers 'what does one cycle cost', so it must not pay for
+    the Greeks pass that would dominate the timing."""
+    from src.ingestion.providers.base import ProviderCapabilities
+    from src.ingestion.providers.stub import StubProvider
+    from src.tools import feed_compare
+
+    provider = StubProvider(ProviderCapabilities())
+    result = feed_compare.probe(
+        provider,
+        "SPY",
+        num_expirations=1,
+        strike_count_max=2,
+        strike_pct_range=1.0,
+    )
+    for key in (
+        "provider",
+        "seconds",
+        "contracts_requested",
+        "contracts_returned",
+        "two_sided",
+        "with_open_interest",
+    ):
+        assert key in result, key
+    # No analytics keys leak in.
+    for key in ("net_gex", "call_wall", "gamma_flip", "max_pain"):
+        assert key not in result
