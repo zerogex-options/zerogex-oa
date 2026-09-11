@@ -26,8 +26,10 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock
 
+import pytest
 import pytz
 
+from src.analytics import main_engine as main_engine_mod
 from src.analytics.main_engine import AnalyticsEngine
 
 
@@ -61,6 +63,18 @@ def _et(hour: int, minute: int) -> datetime:
 
 def _engine() -> AnalyticsEngine:
     return AnalyticsEngine(underlying="SPY")
+
+
+@pytest.fixture(autouse=True)
+def _floor_off(monkeypatch):
+    """Disable the minimum-contract floor for the fixture-based tests.
+
+    The fixtures here are deliberately tiny — three or four contracts, so the
+    put/call and coverage assertions are readable by eye. The floor exists to
+    reject outages on a real chain, so every test that is not ABOUT the floor
+    opts out of it rather than inflating its fixture to 100 contracts.
+    """
+    monkeypatch.setattr(main_engine_mod, "SPREAD_STATS_MIN_CONTRACTS", 0)
 
 
 def _params(cur: MagicMock) -> list[tuple]:
@@ -179,6 +193,51 @@ def test_contracts_beyond_the_dte_ceiling_are_excluded():
     _engine()._store_daily_spread_stats(options, _summary(_et(12, 0)), cur)
     blended = {p[2]: p for p in _params(cur)}["A"]
     assert blended[6] == 4
+
+
+def test_an_outage_thin_snapshot_writes_nothing(monkeypatch):
+    """A handful of contracts is an outage, not a quiet market.
+
+    Production hit this: QQQ 2026-08-25 produced a 21-contract anchor
+    against a 570-700 norm. Stored, it becomes an equal peer in the
+    distribution every percentile is ranked against — a median over 21
+    contracts standing in for one over 684.
+    """
+    from src.config import SPREAD_STATS_MIN_CONTRACTS
+
+    monkeypatch.setattr(
+        main_engine_mod, "SPREAD_STATS_MIN_CONTRACTS", SPREAD_STATS_MIN_CONTRACTS
+    )
+    assert SPREAD_STATS_MIN_CONTRACTS > len(_options()), (
+        "the fixture must sit below the floor for this test to mean anything"
+    )
+    cur = MagicMock()
+    _engine()._store_daily_spread_stats(_options(), _summary(_et(12, 0)), cur)
+    assert not cur.execute.called
+
+
+def test_a_full_chain_clears_the_floor(monkeypatch):
+    """The floor must not swallow legitimate sessions."""
+    from src.config import SPREAD_STATS_MIN_CONTRACTS
+
+    monkeypatch.setattr(
+        main_engine_mod, "SPREAD_STATS_MIN_CONTRACTS", SPREAD_STATS_MIN_CONTRACTS
+    )
+
+    # Strikes stay tight around the 600 spot so every one of them clears the
+    # +/-5% band filter — the floor is counted AFTER that filter, and a
+    # fixture that spilled outside the band would fail this test for the
+    # wrong reason (it did, at 0.5 spacing: only 61 of 110 were in scope).
+    day = TRADE_DAY
+    options = [
+        {"strike": 595.0 + i * 0.1, "option_type": "C" if i % 2 else "P",
+         "expiration": day, "bid": 1.00, "ask": 1.10,
+         "open_interest": 10, "volume": 1}
+        for i in range(SPREAD_STATS_MIN_CONTRACTS + 10)
+    ]
+    cur = MagicMock()
+    _engine()._store_daily_spread_stats(options, _summary(_et(12, 0)), cur)
+    assert cur.execute.called
 
 
 def test_nothing_in_scope_writes_nothing():

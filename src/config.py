@@ -582,6 +582,24 @@ SPREAD_STATS_MONEYNESS_BAND_PCT = _getenv_float(
     "SPREAD_STATS_MONEYNESS_BAND_PCT", 5.0, min=0.25, max=50.0
 )
 
+# Minimum contracts in scope before a session is recorded at all.
+#
+# A median over 21 contracts and a median over 684 are not the same
+# measurement, but stored side by side in daily_spread_stats they become
+# equal peers in the distribution every percentile is ranked against.
+# Observed in production: QQQ 2026-08-25 produced a 21-contract anchor
+# snapshot against a 570-700 norm — an ingestion outage, not a thin market.
+#
+# The floor is deliberately far below any legitimate session (the thinnest
+# real days here run 400+) rather than tuned close to the norm. Its job is
+# to reject outages, not to second-guess quiet days, and a threshold that
+# starts discarding real sessions would do more damage than the outage.
+# The same floor gates the read path, so rows written before it existed
+# cannot leak into a percentile either.
+SPREAD_STATS_MIN_CONTRACTS = _getenv_int(
+    "SPREAD_STATS_MIN_CONTRACTS", 100, min=0, max=100_000
+)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = _getenv_int("QUOTE_BATCH_SIZE", 100)  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = _getenv_int("OPTION_BATCH_SIZE", 100)
