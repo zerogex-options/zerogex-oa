@@ -1203,3 +1203,50 @@ def test_report_states_the_baseline_is_not_fifty_percent():
     assert "The baseline is not 50%" in md
     assert "mechanical null" in md
     assert "excess:" in md
+
+
+def test_kinds_agreeing_counts_distinct_metrics_not_levels():
+    """Four adjacent ranked GEX strikes are ONE kind of evidence; a wall, max
+    pain, a pin and GEX 1 together are four. The product's claim is about the
+    second, so the cohort has to read the kinds column, not the count."""
+    from research.or_gamma_confluence.cohorts import kinds_agreeing
+
+    row = {"gamma_confluence_count_10": 6, "gamma_confluence_kinds_10": 2}
+    assert kinds_agreeing(row, 10.0) == 2
+    cs = {
+        c.key: c for c in build_cohorts(confluence_distance=10.0, min_extension=2.0, min_broken=2)
+    }
+    assert cs["kinds_2"].predicate(row) is True
+    assert cs["kinds_4"].predicate(row) is False
+    # A row with no gamma frame has no agreement, and must not vanish.
+    assert kinds_agreeing({}, 10.0) == 0
+    assert cs["kinds_2"].predicate({}) is False
+
+
+def test_report_shows_the_base_rate_of_multi_metric_agreement():
+    """'Four metrics agree' is only selective if it is rare. The report has to
+    print how often it happens before any cohort built on it can be read."""
+    from research.or_gamma_confluence.report import build_summary, render_markdown
+
+    rows = [
+        {
+            "symbol": "NQ",
+            "gamma_symbol": "NDX",
+            "session": f"2026-07-{d % 28 + 1:02d}",
+            "outcome": OUTCOME_REVERSAL if d % 2 else OUTCOME_CONTINUATION,
+            "extension_k": 2.0,
+            "gamma_available": True,
+            "gamma_levels_total": 13,
+            "nearest_gamma_distance": 1.0,
+            "gamma_confluence_count_10": 5,
+            "gamma_confluence_kinds_10": 4,
+        }
+        for d in range(50)
+    ]
+    summary = build_summary(rows, ResearchConfig())
+    agree = summary["discrimination"]["agreement"]
+    at10 = next(a for a in agree if a["distance"] == 10.0)
+    assert at10["kinds_4_share"] == pytest.approx(1.0)
+    md = render_markdown(summary)
+    assert ">=4 metrics" in md
+    assert "only selective if the base rate is low" in md
