@@ -698,6 +698,66 @@ def run_once(
     }
 
 
+def probe(
+    provider: MarketDataProvider,
+    underlying: str,
+    *,
+    num_expirations: int,
+    strike_count_max: int,
+    strike_pct_range: float,
+) -> Dict[str, Any]:
+    """One timed fetch, so the cost of a real run is measured not guessed.
+
+    Deliberately skips analytics and persistence. The question a probe
+    answers is "what does one cycle cost me in seconds and coverage", and
+    the Greeks pass would dominate the timing while telling you nothing
+    about the vendor.
+
+    The number to watch is wall time. The polling streams issue their calls
+    sequentially, so a chain poll has to finish inside
+    ``THETADATA_POLL_SECONDS`` or cycles start overlapping. If this comes
+    back slow, raise the poll interval or narrow the strike range before
+    pointing production at it.
+    """
+    started = time.monotonic()
+    sample = sample_provider(
+        provider,
+        underlying,
+        num_expirations=num_expirations,
+        strike_count_max=strike_count_max,
+        strike_pct_range=strike_pct_range,
+    )
+    elapsed = time.monotonic() - started
+    return {
+        "provider": provider.name,
+        "underlying": underlying,
+        "seconds": round(elapsed, 2),
+        "spot": sample.spot,
+        "contracts_requested": len(sample.metadata),
+        "contracts_returned": sample.contract_count,
+        "two_sided": sample.quoted_count,
+        "with_open_interest": sample.oi_count,
+        "error": sample.error,
+    }
+
+
+def _print_probe(result: Dict[str, Any]) -> None:
+    print(f"\n  provider           {result['provider']}")
+    print(f"  underlying         {result['underlying']}")
+    print(f"  spot               {result['spot']}")
+    print(f"  wall time          {result['seconds']}s")
+    print(f"  contracts asked    {result['contracts_requested']}")
+    print(f"  contracts returned {result['contracts_returned']}")
+    print(f"  two-sided quotes   {result['two_sided']}")
+    print(f"  with open interest {result['with_open_interest']}")
+    if result["error"]:
+        print(f"  ERROR              {result['error']}")
+    elif result["contracts_requested"]:
+        coverage = result["contracts_returned"] / result["contracts_requested"]
+        print(f"  coverage           {coverage:.1%}")
+    print()
+
+
 def _verdict(comparisons: Sequence[MetricComparison]) -> str:
     """One-word summary: agree, diverge, or incomparable."""
     evaluated = [c for c in comparisons if c.within_tolerance is not None]
@@ -765,6 +825,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--exposure-tolerance-pct", type=float, default=_DEFAULT_EXPOSURE_TOLERANCE_PCT
     )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help=(
+            "measure ONE fetch per provider and exit: wall time and coverage, "
+            "with no analytics and no database writes. Run this before the "
+            "first real comparison to size the load."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON, one object per sample")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
@@ -778,15 +847,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     incumbent_name = args.incumbent or MARKET_DATA_PROVIDER
     candidate_name = args.candidate or MARKET_DATA_COMPARE_PROVIDER
-    if not candidate_name:
+    if not candidate_name and not args.probe:
         parser.error(
             "no candidate provider: pass --candidate or set " "MARKET_DATA_COMPARE_PROVIDER"
         )
-    if candidate_name == incumbent_name:
+    if candidate_name and candidate_name == incumbent_name and not args.probe:
         parser.error(
             f"incumbent and candidate are both {incumbent_name!r}; "
             "a feed compared against itself proves nothing"
         )
+
+    if args.probe:
+        names = [n for n in (incumbent_name, candidate_name) if n]
+        exit_code = 0
+        for name in names:
+            try:
+                provider = get_provider(name)
+            except ValueError as e:
+                print(f"{name}: {e}", file=sys.stderr)
+                exit_code = 2
+                continue
+            try:
+                result = probe(
+                    provider,
+                    args.underlying,
+                    num_expirations=args.expirations,
+                    strike_count_max=args.strike_count_max,
+                    strike_pct_range=args.strike_pct_range,
+                )
+            finally:
+                provider.close()
+            if args.json:
+                print(json.dumps(result, default=str))
+            else:
+                _print_probe(result)
+            if result["error"]:
+                exit_code = 1
+        return exit_code
 
     incumbent_provider = get_provider(incumbent_name)
     try:

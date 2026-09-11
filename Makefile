@@ -896,6 +896,7 @@ help: ## Show this help message
 	@echo "  make ingestion-health   - Show ingestion service health and recent errors"
 	@echo ""
 	@echo "$(GREEN)Market Data Provider Migration:$(NC)"
+	@echo "  make feed-probe         - Size ONE fetch before a real run (PROVIDER=<name>)"
 	@echo "  make feed-compare       - Diff a candidate feed vs the incumbent (CANDIDATE=<name>)"
 	@echo "  make feed-compare-schema - Create the shadow tables the harness writes to"
 	@echo ""
@@ -1873,6 +1874,16 @@ feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDID
 		$(if $(PERSIST),--persist) \
 		$(if $(JSON),--json) \
 		$(if $(DEBUG),--debug)
+
+.PHONY: feed-probe
+feed-probe: ## Measure ONE fetch from a provider before a real run (PROVIDER, UNDERLYING)
+	@echo "$(BLUE)=== Feed probe (sizing, no DB writes) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.feed_compare --probe \
+		--underlying '$(or $(UNDERLYING),SPY)' \
+		--incumbent '$(or $(PROVIDER),$(INCUMBENT),tradestation)' \
+		$(if $(EXPIRATIONS),--expirations '$(EXPIRATIONS)') \
+		$(if $(STRIKE_COUNT_MAX),--strike-count-max '$(STRIKE_COUNT_MAX)') \
+		$(if $(JSON),--json)
 
 .PHONY: feed-compare-schema
 feed-compare-schema: ## Create the shadow tables the comparison harness writes to
