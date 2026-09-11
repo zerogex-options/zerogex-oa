@@ -3242,7 +3242,7 @@ class AnalyticsEngine:
                 summary.get("data_as_of"),
             ),
         )
-        logger.info("✅ Stored GEX summary")
+        logger.debug("✅ Stored GEX summary")
 
     def _store_gex_profile(self, summary: Dict[str, Any], cursor) -> None:
         """Write the spot-shift dealer gamma-exposure profile on ``cursor``.
@@ -4032,8 +4032,17 @@ class AnalyticsEngine:
                     )
                 return True
 
-            logger.info(f"Running calculation for timestamp: {latest_timestamp}")
-            logger.info(f"Underlying price: ${underlying_price:.2f}")
+            # Per-cycle narration is DEBUG, not INFO. At ANALYTICS_INTERVAL=30
+            # with four symbol workers this block ran ~40 INFO lines per cycle
+            # and put 130k lines a day into the journal, which is capped: two
+            # days later the window an operator needs is already rotated away.
+            # A gamma-flip question about Wednesday could not be answered on
+            # Friday for exactly this reason. Everything here is also in
+            # gex_summary, so the log is the redundant copy. The structured
+            # one-liners below (Stage timings, Cycle timing, Loop timing) and
+            # every warning stay at INFO.
+            logger.debug("Running calculation for timestamp: %s", latest_timestamp)
+            logger.debug("Underlying price: $%.2f", underlying_price)
 
             if not options:
                 # Expected closed-market state, NOT an error.  After the
@@ -4074,7 +4083,7 @@ class AnalyticsEngine:
             self._empty_snapshot_state = False
 
             # Calculate GEX by strike
-            logger.info("Calculating GEX by strike...")
+            logger.debug("Calculating GEX by strike...")
             t0 = _time.monotonic()
             gex_by_strike = self._calculate_gex_by_strike(
                 options,
@@ -4089,10 +4098,10 @@ class AnalyticsEngine:
                 self._last_stage_timings = stage_timings
                 return False
 
-            logger.info(f"Calculated GEX for {len(gex_by_strike)} strikes")
+            logger.debug("Calculated GEX for %d strikes", len(gex_by_strike))
 
             # Calculate GEX summary
-            logger.info("Calculating GEX summary metrics...")
+            logger.debug("Calculating GEX summary metrics...")
             t0 = _time.monotonic()
             gex_summary = self._calculate_gex_summary(
                 gex_by_strike, options, underlying_price, latest_timestamp
@@ -4108,7 +4117,7 @@ class AnalyticsEngine:
             self._validate_gex_calculations(gex_by_strike, gex_summary, underlying_price)
 
             # Store results
-            logger.info("Storing results to database...")
+            logger.debug("Storing results to database...")
             t0 = _time.monotonic()
             # What the numbers are as of: the newest quote write the snapshot
             # read, not the minute bucket it is filed under. See
@@ -4124,37 +4133,37 @@ class AnalyticsEngine:
             # cycle no longer skips the flow side. See _run_flow_cycle.
 
             # Log summary
-            logger.info("")
-            logger.info("=" * 80)
-            logger.info("GEX SUMMARY")
-            logger.info("=" * 80)
-            logger.info(f"Max Gamma Strike: ${gex_summary['max_gamma_strike']:.2f}")
-            logger.info(f"Max Gamma Value: {gex_summary['max_gamma_value']:,.0f}")
-            logger.info(
+            logger.debug("")
+            logger.debug("=" * 80)
+            logger.debug("GEX SUMMARY")
+            logger.debug("=" * 80)
+            logger.debug(f"Max Gamma Strike: ${gex_summary['max_gamma_strike']:.2f}")
+            logger.debug(f"Max Gamma Value: {gex_summary['max_gamma_value']:,.0f}")
+            logger.debug(
                 f"Gamma Flip Point: ${gex_summary['gamma_flip_point']:.2f}"
                 if gex_summary["gamma_flip_point"]
                 else "Gamma Flip Point: N/A"
             )
-            logger.info(
+            logger.debug(
                 f"Flip Distance: {gex_summary['flip_distance']:.4f}"
                 if gex_summary.get("flip_distance") is not None
                 else "Flip Distance: N/A"
             )
-            logger.info(f"Local GEX (±1%): {gex_summary.get('local_gex', 0.0):,.0f}")
-            logger.info(
+            logger.debug(f"Local GEX (±1%): {gex_summary.get('local_gex', 0.0):,.0f}")
+            logger.debug(
                 f"Convexity Risk: {gex_summary['convexity_risk']:,.0f}"
                 if gex_summary.get("convexity_risk") is not None
                 else "Convexity Risk: N/A"
             )
-            logger.info(
+            logger.debug(
                 f"Max Pain: ${gex_summary['max_pain']:.2f}"
                 if gex_summary.get("max_pain") is not None
                 else "Max Pain: N/A"
             )
-            logger.info(f"Put/Call Ratio: {gex_summary['put_call_ratio']:.2f}")
-            logger.info(f"Total Net GEX: {gex_summary['total_net_gex']:,.0f}")
-            logger.info("=" * 80)
-            logger.info("")
+            logger.debug(f"Put/Call Ratio: {gex_summary['put_call_ratio']:.2f}")
+            logger.debug(f"Total Net GEX: {gex_summary['total_net_gex']:,.0f}")
+            logger.debug("=" * 80)
+            logger.debug("")
 
             self.calculations_completed += 1
             self.last_calculation_time = datetime.now(ET)
@@ -4294,7 +4303,9 @@ class AnalyticsEngine:
                 )
 
                 if sleep_time > 0:
-                    logger.info(f"Sleeping for {sleep_time:.1f}s until next calculation...\n")
+                    # Loop timing above already reports the sleep; this was the
+                    # same number a second time, once per cycle per worker.
+                    logger.debug("Sleeping for %.1fs until next calculation", sleep_time)
                     time.sleep(sleep_time)
                 else:
                     stage_breakdown = getattr(self, "_last_stage_timings", None) or {}
