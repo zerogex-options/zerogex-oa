@@ -1877,7 +1877,7 @@ feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDID
 .PHONY: feed-compare-schema
 feed-compare-schema: ## Create the shadow tables the comparison harness writes to
 	@echo "$(BLUE)=== Applying shadow tables ===$(NC)"
-	@psql -d "$(or $(DB_NAME),zerogex)" -f setup/database/shadow_tables.sql
+	@$(PSQL) -f setup/database/shadow_tables.sql
 
 .PHONY: run-client
 run-client: ## Test TradeStation API client (TEST, SYMBOL, BARS_BACK, INTERVAL, UNIT, QUERY, DEBUG, TEST_HISTORICAL)
