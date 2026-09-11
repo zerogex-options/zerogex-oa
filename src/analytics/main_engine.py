@@ -3567,8 +3567,8 @@ class AnalyticsEngine:
         the scope has to travel with the reading.
 
         Same cash-session gate as :meth:`_store_daily_atm_iv`, and for a
-        sharper version of the same reason.  After the 16:15 ET close market
-        makers stop quoting competitively and the chain goes wide by
+        sharper version of the same reason.  Once the 16:00 ET close passes,
+        market makers stop quoting competitively and the chain goes wide by
         definition — writing that would put a mechanical post-close blowout
         into the very history the page uses to judge whether a blowout is
         unusual, and every later session would then be scored against it.
@@ -3590,8 +3590,15 @@ class AnalyticsEngine:
             )
             et = ts_aware.astimezone(pytz.timezone("America/New_York"))
             et_minute = et.hour * 60 + et.minute
-            # 09:30 ET = 570 min; 16:15 ET = 975 min. Mirrors daily_atm_iv.
-            if not (570 <= et_minute <= 975):
+            # 09:30 ET = 570 min; 16:00 ET = 960 min.  The row updates all
+            # session and then FREEZES at 16:00 rather than 16:15, so the
+            # value that lands in the history is a quote someone could have
+            # traded on.  Running to 16:15 let the closing rotation define
+            # the day whenever a cycle happened to fall there — and only
+            # then, which made the trailing distribution noisy rather than
+            # merely biased.  ``daily_spread_stats_backfill`` samples the
+            # same 15:30-16:00 window, so seeded and live rows agree.
+            if not (570 <= et_minute <= 960):
                 return
 
             today_et = et.date()
