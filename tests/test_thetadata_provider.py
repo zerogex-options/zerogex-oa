@@ -340,3 +340,48 @@ def test_index_symbols_are_stripped_of_the_tradestation_decoration():
     assert bar.close == pytest.approx(17.2)
     assert bar.symbol == "VIX"
     assert bar.up_volume is None
+
+
+# ---------------------------------------------------------------------------
+# Market Value selection
+# ---------------------------------------------------------------------------
+
+
+def test_market_value_endpoints_swap_the_quote_call():
+    """Both selection mechanisms must work, because ThetaData's own
+    answers disagree: support said "terminal stage", but the terminal's
+    config.toml shows stage pointing at a server it labels unstable and
+    testing-only."""
+    calls = []
+
+    class _C:
+        def option_snapshot_quote(self, **kw):
+            calls.append("quote")
+            return []
+
+        def option_snapshot_market_value(self, **kw):
+            calls.append("market_value")
+            return []
+
+        def option_snapshot_ohlc(self, **kw):
+            return []
+
+        def option_snapshot_open_interest(self, **kw):
+            return []
+
+    symbol = build_occ_symbol("SPY", EXP, 650.0, "C")
+
+    ThetaDataProvider(_C()).fetch_chain_state([symbol], include_open_interest=False)
+    assert "quote" in calls and "market_value" not in calls
+
+    calls.clear()
+    ThetaDataProvider(_C(), market_value_endpoints=True).fetch_chain_state(
+        [symbol], include_open_interest=False
+    )
+    assert "market_value" in calls and "quote" not in calls
+
+
+def test_market_value_defaults_off():
+    """The ordinary quote endpoint is the safe default: it is the one
+    whose meaning is unambiguous."""
+    assert ThetaDataProvider(object())._market_value_endpoints is False

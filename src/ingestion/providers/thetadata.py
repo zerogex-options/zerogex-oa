@@ -34,15 +34,29 @@ sees only a fraction of consolidated volume — so this provider declares
 ``signed_underlying_volume=False`` and the caller must not treat its
 volume as a full-market figure.
 
-**Market Value.**  ThetaData sells a "Market Value" feed that adjusts each
-quote's bid and ask by up to a cent, which they characterise as a derived
-product carrying no exchange fees.  Per their support (2026-09-11), the
-toggle is *terminal-level*: you run a second Theta Terminal configured to
-that stage and point a client at its port.  It is therefore selected here
-by ``mdds_port``, not by calling a different method — note that the
-``*_snapshot_market_value`` endpoints on this client are a separate thing
-and are deliberately NOT used for that purpose (see
-``_MARKET_VALUE_ENDPOINT_NOTE`` below).
+**Market Value, and an unresolved contradiction.**  ThetaData sells a
+"Market Value" feed that adjusts each quote's bid and ask by up to a cent,
+which they characterise as a derived product carrying no exchange fees.
+How you select it is genuinely unsettled:
+
+* Their support said (2026-09-11) the toggle is *terminal-level*: run a
+  second Theta Terminal "using stage" and point a client at it.
+* But the terminal's own generated ``config.toml`` shows ``stage``
+  selecting ``mdds-stage.thetadata.us`` / ``fpss_stage_hosts``, which that
+  file documents as *"TESTING ONLY! Occasional reboots. Potential issues
+  with data and certain requests. This server is not stable."*  That is a
+  staging environment, not a fee-exempt production product.
+* Meanwhile the client exposes ``option_snapshot_market_value`` and
+  ``index_snapshot_market_value`` with signatures identical to the
+  ordinary quote endpoints.
+
+The endpoint reading now looks more likely than the stage reading, so
+``market_value_endpoints`` defaults on for the MV stage.  Both mechanisms
+are supported, selected by that flag, so whichever answer ThetaData gives
+needs no rewrite.  **Confirm before trusting a Market Value measurement:**
+running the comparison against a staging server would produce a divergence
+caused by test infrastructure rather than by the penny adjustment, which is
+exactly the wrong conclusion to draw.
 
 They also confirmed the adjustment never *introduces* a crossed quote and
 never takes a price to zero, and that every quote is adjusted.  Nothing in
@@ -84,15 +98,10 @@ logger = get_logger(__name__)
 
 __all__ = ["ThetaDataProvider"]
 
-#: Why the ``*_snapshot_market_value`` endpoints are not how Market Value is
-#: selected. "Market value" is overloaded: in options vernacular it usually
-#: means a mark or theoretical valuation, and ThetaData exposes
-#: ``option_snapshot_market_value`` / ``index_snapshot_market_value``
-#: alongside the ordinary quote endpoints. Their support described the
-#: fee-exempt product as a *terminal stage* instead, which implies it
-#: perturbs every endpoint rather than living behind one. Selecting by port
-#: is therefore the reading that matches what they said. If that turns out
-#: to be wrong, the fix is one line in :meth:`ThetaDataProvider._quote_call`.
+#: "Market value" is overloaded: in options vernacular it usually means a
+#: mark or theoretical valuation, which is why the ambiguity in the module
+#: docstring exists at all. Resolve it with ThetaData before reporting any
+#: Market Value comparison as a measurement of the penny adjustment.
 _MARKET_VALUE_ENDPOINT_NOTE = __doc__
 
 #: Response column names are server-supplied, so each logical field lists
@@ -508,12 +517,22 @@ class ThetaDataProvider(MarketDataProvider):
         poll_interval: float = 5.0,
         oi_poll_interval: float = 900.0,
         strike_range: Optional[int] = None,
+        market_value_endpoints: bool = False,
     ):
         self._client = client
         self.stage = stage
         self._poll_interval = poll_interval
         self._oi_poll_interval = oi_poll_interval
         self._strike_range = strike_range
+        # Which mechanism selects the Market Value feed. See the module
+        # docstring: ThetaData support said "terminal stage", but the
+        # terminal's own config.toml shows `stage` selecting
+        # mdds-stage.thetadata.us, documented in that file as "TESTING
+        # ONLY! Occasional reboots ... not stable" -- a staging
+        # environment, not a fee-exempt product. Until that is resolved,
+        # support BOTH so whichever answer comes back works without a
+        # rewrite.
+        self._market_value_endpoints = market_value_endpoints
 
     @classmethod
     def from_env(cls, *, stage: Optional[str] = None) -> "ThetaDataProvider":
@@ -534,6 +553,7 @@ class ThetaDataProvider(MarketDataProvider):
         port_var = (
             "THETADATA_MV_MDDS_PORT"
             if resolved_stage in ("mv", "market_value", "marketvalue")
+            and os.getenv("THETADATA_MV_MDDS_PORT")
             else "THETADATA_MDDS_PORT"
         )
         client = ThetaClient(
@@ -544,9 +564,17 @@ class ThetaDataProvider(MarketDataProvider):
             mdds_port=os.getenv(port_var) or None,
             dataframe_type="pandas",
         )
+        is_mv = resolved_stage in ("mv", "market_value", "marketvalue")
         return cls(
             client,
             stage=resolved_stage,
+            # Default the MV stage to the endpoint mechanism, since the
+            # terminal's config.toml makes the "stage" reading look wrong.
+            # THETADATA_MV_VIA_ENDPOINTS=0 restores port-based selection if
+            # ThetaData confirms otherwise.
+            market_value_endpoints=(
+                is_mv and os.getenv("THETADATA_MV_VIA_ENDPOINTS", "1").strip() != "0"
+            ),
             poll_interval=float(os.getenv("THETADATA_POLL_SECONDS", "5")),
             oi_poll_interval=float(os.getenv("THETADATA_OI_POLL_SECONDS", "900")),
             strike_range=(
@@ -621,12 +649,16 @@ class ThetaDataProvider(MarketDataProvider):
         return dict(out)
 
     def _quote_call(self, **kwargs: Any) -> Any:
-        """The quote endpoint.
+        """The quote endpoint, honouring whichever Market Value mechanism
+        is configured.
 
-        Market Value is selected by which terminal this client points at,
-        so the same endpoint serves both stages. See the module docstring
-        on why the ``*_snapshot_market_value`` endpoints are not used here.
+        With ``market_value_endpoints=True`` this calls
+        ``option_snapshot_market_value`` instead of
+        ``option_snapshot_quote``. The two share a signature, so the swap
+        is total: nothing downstream needs to know which one answered.
         """
+        if self._market_value_endpoints:
+            return self._client.option_snapshot_market_value(**kwargs)
         return self._client.option_snapshot_quote(**kwargs)
 
     def _merge_frame(
