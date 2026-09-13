@@ -225,10 +225,18 @@ def test_without_a_time_stop_the_runs_max_hold_applies():
 
 
 def test_bot_backed_keeps_only_strategies_a_bot_implements():
-    picked = bot_backed(
-        ["gex_gradient_trend", "call_wall_fade", "settlement_flow_snap", "nonsense"]
-    )
+    # vanna_charm_glide is pattern-only; nonsense is not in the catalog.
+    picked = bot_backed(["vanna_charm_glide", "call_wall_fade", "settlement_flow_snap", "nonsense"])
     assert [e.id for e in picked] == ["call_wall_fade", "settlement_flow_snap"]
+
+
+def test_bot_backed_keeps_a_strategy_once_a_bot_is_written_for_it():
+    """gex_gradient_trend was pattern-only until GexGradientDrift was written.
+
+    Its presence here is what makes the strategy screenable through the bot
+    harness, which is the gate on funding it.
+    """
+    assert [e.id for e in bot_backed(["gex_gradient_trend"])] == ["gex_gradient_trend"]
 
 
 def test_bot_backed_accepts_a_legacy_bot_id():

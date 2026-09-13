@@ -78,15 +78,68 @@ RESEARCH ──► CANDIDATE ──► VALIDATED          SUPERSEDED        RETI
 (default)    (promising)   (cleared gate)     (better impl)     (exhausted)
 ```
 
-Live capital is a **separate** question: `is_provisionable` requires
-`stage is VALIDATED` **and** a bot binding. Keeping them apart is what lets a
-strategy be actively refined — backtested, measured, tuned — with no paper
-capital riding on it. That is the state 22 of the 35 strategies are in, and
-`RESEARCH` is deliberately the resting state, not a failure grade.
+Live capital is a **separate** question. `is_provisionable` requires three
+things:
+
+1. `stage is VALIDATED` — the thesis has a measured edge;
+2. a bot binding — something can actually execute it;
+3. `bot_validated` — an EDGE screen from a **bot** harness
+   (`BOT_HARNESSES`: `tradeworkz-backtest`, `bot-replay`).
+
+(3) exists because a thesis and an implementation of it are different claims.
+`gex_gradient_trend` is VALIDATED on its *pattern's* realized-P&L
+calibration; that says the thesis pays, not that a newly written bot
+reproduces it. Capital rides on the bot, so the bot is what has to be
+screened — writing one never silently funds anything.
+
+Keeping stage and funding apart is what lets a strategy be actively refined —
+backtested, measured, tuned — with no paper capital riding on it. That is the
+state 22 of the 35 strategies are in, and `RESEARCH` is deliberately the
+resting state, not a failure grade.
 
 The practical consequence today: `DEFAULT_ROSTER` is **empty**, unchanged from
-before this work. The one `VALIDATED` strategy has no bot, so nothing is
-funded. The audit reports that as the highest-value gap in the catalog.
+before this work. `gex_gradient_trend` now has a bot but no bot-side screen,
+so the audit queues it under `awaiting_bot_screen` rather than funding it.
+
+### The `gex_gradient_trend` bot
+
+`src/tradeworkz/bots/gex_gradient_drift.py` — `GexGradientDrift`. Written
+because the catalog's only validated strategy had no bot, so nothing could
+trade the one measured edge in the product.
+
+Fidelity is the job: the measured edge belongs to the pattern's exact gates
+and geometry, so the bot reads the **same persisted signal scores** the
+pattern gates on (`signal_component_scores` / `signal_scores`, exposed on the
+snapshot by `_fetch_signal_state` and read via `component_score` /
+`msi_component_score`), on the same ×100 scale, and replicates the pattern's
+**own** ATR estimator — 30 closes, population sigma, ×√390 — rather than the
+base class's 15-return `_short_horizon_sigma_pct`. Strike offset and target
+are both multiples of that number, so using the base helper would have moved
+the trade off the geometry that was measured. A test asserts the two
+estimators are bit-identical, and a parity block asserts bot and pattern
+agree on fire/no-fire, direction, strike and target from the same state.
+
+Four deliberate divergences, each because the live engine needs something the
+Action Card did not:
+
+| Divergence | Why |
+|---|---|
+| Strikes snap to the underlying's real grid | A $1-rounded SPX strike does not exist and would never fill. On QQQ — where the edge was measured — the grid *is* $1, so measured behaviour is unchanged |
+| Entry restricted to the last 30 minutes | The pattern's trigger is `at_close`; a 5-second tick loop would otherwise open a multi-day drift trade at 09:35 |
+| A conviction floor the pattern lacks | The engine refuses to open below `confidence_threshold`. The bot is therefore strictly more selective near that floor — a `vol_expansion` warning can decline a middling-gradient setup the pattern would card |
+| Stop = premium stop + gradient-decay exit | The pattern's stop is `kind="signal_event"` (`gradient_decay_below_20_or_-50pct_premium`) with no spot level for the reconciler. Both halves are implemented |
+
+The conviction floor is the one that needed care: quality saturations are set
+at readings that actually print, not at theoretical maxima, because the
+catalog already records what happens otherwise — `weekly_charm_grind` had
+three ticks in 60 days clear every hard gate and all three die at conviction,
+producing a zero-trade screen that said nothing about the thesis.
+`test_a_typical_gate_passing_setup_also_clears_conviction` is the regression.
+
+Writing this bot also closed a gap in the backtest→live bridge: the snapshot
+now carries `msi_score` / `msi_regime`, which is what `SpecStrategyBot` needed
+to deploy MSI-based custom strategies (step 3 of
+[`tradeworkz-backtest-bridge.md`](tradeworkz-backtest-bridge.md)).
 
 ### Backtest coverage: every strategy, one pricing path
 
@@ -206,12 +259,19 @@ can_retire(get("hedge_impulse_quiet_tape")).blockers
 
 Promotion to `VALIDATED` is not a judgement call: `can_promote` reads the
 research log, so the run that justified it stays in the catalog and the
-decision is auditable after the fact.
+decision is auditable after the fact. Funding additionally needs a bot-side
+screen — see `bot_validated` above.
+
+How to check any of this actually works:
+[`strategy_catalog_validation.md`](../runbooks/strategy_catalog_validation.md).
 
 ## What this does not change
 
 - **No live behavior changed.** `DEFAULT_ROSTER` was empty before and is empty
   now; the same 14 bot ids are force-disabled on provision; no capital moved.
+  Verify rather than trust: see
+  [`strategy_catalog_validation.md`](../runbooks/strategy_catalog_validation.md)
+  Tier 3, which diffs the funded state across the deploy.
 - **ES and NQ stay out.** They carry no option chain of their own — their
   levels are SPX/NDX-derived and projected onto the futures price axis, read-
   side only, never persisted. All three surfaces price real option round-trips

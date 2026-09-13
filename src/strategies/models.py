@@ -67,6 +67,14 @@ class Verdict(str, Enum):
 CONCLUSIVE_AGAINST: Tuple[Verdict, ...] = (Verdict.NO_EDGE,)
 
 
+#: Harnesses that exercise a BOT implementation end to end. Evidence from one
+#: of these is what a live capital sleeve rests on: the bot is the thing that
+#: will trade, so a pattern-side measurement of the same thesis — however
+#: strong — does not qualify the bot. ``playbook-calibration`` and
+#: ``thesis-backtest`` are deliberately absent.
+BOT_HARNESSES: Tuple[str, ...] = ("tradeworkz-backtest", "bot-replay")
+
+
 class Engine(str, Enum):
     """Which execution surface can run a strategy."""
 
@@ -281,13 +289,43 @@ class StrategyEntry:
         return bool(self.engines)
 
     @property
+    def bot_validated(self) -> bool:
+        """Whether a BOT harness has measured an edge for this strategy.
+
+        Separate from ``stage`` because a thesis and an implementation of it
+        are different claims. ``gex_gradient_trend`` is VALIDATED on its
+        pattern's realized-P&L calibration; that says the thesis pays, not
+        that a newly written bot reproduces it. Capital rides on the bot, so
+        the bot is what has to be screened.
+        """
+        from src.strategies.policy import PROMOTION_MIN_PROFIT_FACTOR, PROMOTION_MIN_TRADES
+
+        return any(
+            r.verdict is Verdict.EDGE
+            and r.harness in BOT_HARNESSES
+            and r.trades >= PROMOTION_MIN_TRADES
+            and (r.profit_factor or 0.0) >= PROMOTION_MIN_PROFIT_FACTOR
+            and (r.expectancy is None or r.expectancy > 0)
+            for r in self.research
+        )
+
+    @property
     def is_provisionable(self) -> bool:
         """Whether this may be given a live capital sleeve.
 
-        Requires validated evidence AND a bot to execute it. A validated
-        pattern with no bot binding is a gap to close, not a live strategy.
+        Three things, all required:
+
+        1. ``stage is VALIDATED`` — the thesis has a measured edge.
+        2. a bot binding — something can actually execute it.
+        3. ``bot_validated`` — that bot is what the edge was measured on.
+
+        (3) is why writing a bot for an already-validated pattern does not
+        silently fund it: the bot becomes screenable, and the screen is the
+        gate. A validated strategy failing (2) is a missing implementation; a
+        validated strategy failing only (3) is waiting on its first bot
+        screen, and the audit distinguishes them.
         """
-        return self.stage is Stage.VALIDATED and self.bot_class is not None
+        return self.stage is Stage.VALIDATED and self.bot_class is not None and self.bot_validated
 
     @property
     def deepest_window_days(self) -> int:

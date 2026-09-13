@@ -116,11 +116,11 @@ def test_every_strategy_is_backtestable():
 
 
 def test_bot_and_pattern_bindings_cover_both_implementations():
-    assert len(bot_bound()) == 27
+    assert len(bot_bound()) == 28
     assert len(pattern_bound()) == 18
-    # Ten strategies carry both bindings, so the union is the catalog.
+    # Eleven strategies carry both bindings, so the union is the catalog.
     both = [e for e in all_strategies() if e.bot_class and e.has_pattern]
-    assert len(both) == 10
+    assert len(both) == 11
     assert len(bot_bound()) + len(pattern_bound()) - len(both) == len(all_strategies())
 
 
@@ -163,7 +163,7 @@ def test_a_bot_with_no_overrides_inherits_catalog_params_exactly():
 
 
 def test_spec_for_rejects_a_pattern_only_strategy():
-    entry = get("gex_gradient_trend")
+    entry = get("vanna_charm_glide")
     assert entry.bot_class is None
     with pytest.raises(ValueError, match="no bot binding"):
         spec_for(entry)
@@ -185,16 +185,31 @@ def test_default_roster_is_exactly_the_provisionable_set():
     assert {s.id for s in DEFAULT_ROSTER} == {e.bot_id for e in provisionable()}
 
 
-def test_roster_is_empty_until_a_validated_strategy_has_a_bot():
-    """Locks in today's live behavior: no paper capital on unproven strategies.
+def test_roster_is_empty_until_a_bot_itself_has_been_screened():
+    """Locks in today's live behavior: no paper capital on unproven bots.
 
-    The one validated strategy has no bot binding, so the fleet stays unfunded.
-    Writing that bot is a deliberate act that will change this test.
+    ``gex_gradient_trend`` is VALIDATED and now HAS a bot, but the edge was
+    measured on its pattern. Capital rides on the bot, so the roster stays
+    empty until a bot harness measures the bot. Recording such a run is the
+    deliberate act that funds it.
     """
     assert DEFAULT_ROSTER == ()
     validated = [e for e in all_strategies() if e.stage is Stage.VALIDATED]
     assert validated, "expected at least one validated strategy"
-    assert all(e.bot_class is None for e in validated)
+    for entry in validated:
+        assert not entry.bot_validated, entry.id
+
+
+def test_pattern_side_evidence_never_qualifies_a_bot_for_capital():
+    from src.strategies import BOT_HARNESSES
+
+    entry = get("gex_gradient_trend")
+    assert entry.stage is Stage.VALIDATED
+    assert entry.has_edge_evidence  # the thesis is proven...
+    assert entry.bot_class is not None  # ...and a bot exists...
+    assert not entry.bot_validated  # ...but no BOT harness measured it.
+    assert all(r.harness not in BOT_HARNESSES for r in entry.research if r.verdict.value == "edge")
+    assert not entry.is_provisionable
 
 
 def test_disabled_ids_are_only_bots_that_actually_shipped():
@@ -404,11 +419,14 @@ def test_superseded_strategies_name_their_successor():
 # ---------------------------------------------------------------------------
 
 
-def test_audit_reports_the_validated_without_bot_gap():
-    """The highest-value gap: proven edge, nothing able to trade it."""
-    assert gaps()["validated_without_bot"] == ["gex_gradient_trend"]
-    assert gaps()["retirement_eligible"] == []
-    assert gaps()["no_engine"] == []
+def test_audit_queues_a_written_bot_for_its_own_screen():
+    """The actionable gap: proven thesis, bot written, screen outstanding."""
+    g = gaps()
+    assert g["awaiting_bot_screen"] == ["gex_gradient_trend"]
+    # No longer the "no bot exists" gap — that one is now closed.
+    assert g["validated_without_bot"] == []
+    assert g["retirement_eligible"] == []
+    assert g["no_engine"] == []
 
 
 def test_audit_renders_without_error():

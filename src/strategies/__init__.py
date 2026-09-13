@@ -27,6 +27,7 @@ from src.strategies.catalog import (
     provisionable,
 )
 from src.strategies.models import (
+    BOT_HARNESSES,
     CONCLUSIVE_AGAINST,
     FAMILY_LABELS,
     Engine,
@@ -62,6 +63,7 @@ __all__ = [
     "iter_aliases",
     "pattern_bound",
     "provisionable",
+    "BOT_HARNESSES",
     "CONCLUSIVE_AGAINST",
     "FAMILY_LABELS",
     "Engine",

@@ -1110,8 +1110,41 @@ _TREND: Tuple[StrategyEntry, ...] = (
             "less hedging resistance to absorb the move."
         ),
         stage=Stage.VALIDATED,
+        bot_class="GexGradientDrift",
         has_pattern=True,
-        params={},
+        # Catalog defaults are the pattern's own calibrated thresholds (its
+        # PLAYBOOK_GGT_* env defaults), so bot and pattern gate identically.
+        params={
+            "min_gradient_score": 40.0,
+            "min_volatility_regime": -0.5,
+            "otm_atr_mult": 0.5,
+            "target_atr_mult": 1.5,
+            "dte_target": 5,
+            "max_hold_minutes": 3 * 24 * 60,
+            "gradient_exit_score": 20.0,
+            "vol_expansion_penalty": 0.10,
+        },
+        # Live-engine specifics the Action Card had no need for. See the bot's
+        # module docstring for why each one exists.
+        bot_params={
+            # The pattern enters at_close; without a window a 5-second tick
+            # loop would open a multi-day drift trade at 09:35.
+            "max_minutes_to_close": 30,
+            # The pattern's stop is a signal event, so the premium half of
+            # "gradient_decay_below_20_or_-50pct_premium" lives here.
+            "max_premium_loss_pct": 0.50,
+            # Mirrors the pattern's pattern_base = 0.50.
+            "confidence_base_default": 0.50,
+            # Mirrors the pattern's size_multiplier = 0.5 on every card.
+            "static_size_multiplier": 0.5,
+            # Conviction scale. The engine refuses to open below
+            # confidence_threshold and the pattern has no such gate, so these
+            # saturations are set at gradient / vol readings that actually
+            # print — otherwise every gate-passing setup dies at conviction
+            # and the screen returns zero trades (see weekly_charm_grind).
+            "quality_gradient_saturation": 70.0,
+            "quality_vol_saturation": 0.5,
+        },
         research=(
             ResearchRun(
                 ran_on=date(2026, 9, 1),
@@ -1127,8 +1160,17 @@ _TREND: Tuple[StrategyEntry, ...] = (
                 notes=(
                     "The one conclusive realized-P&L edge in the catalog, on the "
                     "standardized single-long calibration backtest net of fills, slippage "
-                    "and commission. NOTE: no bot binding exists, so this cannot take live "
-                    "capital — writing one is the highest-value gap the audit reports."
+                    "and commission. This is PATTERN-side evidence: it says the thesis "
+                    "pays, not that the bot reproduces it. The bot (GexGradientDrift) is "
+                    "written and screenable but has no run of its own yet, so "
+                    "is_provisionable stays False until `make tradeworkz-backtest --bots "
+                    "gex_gradient_trend` clears the gate. Nothing goes live on another "
+                    "engine's receipt. CAVEAT on this sample: the pattern picks its "
+                    "expiry as entry_date + 5 CALENDAR days, which is a Saturday for a "
+                    "Monday entry and a Sunday for a Tuesday entry. The backtester "
+                    "matches expiry exactly, so those cards found no quote and were "
+                    "dropped — these 33 trades are therefore filtered by day of week, "
+                    "not a clean 60-day sample."
                 ),
             ),
         ),

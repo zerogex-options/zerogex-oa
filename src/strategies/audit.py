@@ -130,9 +130,17 @@ def gaps() -> Dict[str, List[str]]:
             for e in entries
             if e.stage in (Stage.RESEARCH, Stage.CANDIDATE) and can_promote(e).allowed
         ],
-        # Proven, but nothing can trade it live.
+        # Proven thesis, but no bot exists to trade it.
         "validated_without_bot": [
             e.id for e in entries if e.stage is Stage.VALIDATED and e.bot_class is None
+        ],
+        # Proven thesis, bot written — waiting on the bot's own screen before
+        # it can take capital. This is the actionable queue for
+        # `make tradeworkz-backtest --bots <id>`.
+        "awaiting_bot_screen": [
+            e.id
+            for e in entries
+            if e.stage is Stage.VALIDATED and e.bot_class is not None and not e.bot_validated
         ],
         # No engine at all — invisible to Backtesting and Insights.
         "no_engine": [e.id for e in entries if not e.engines],
@@ -228,12 +236,14 @@ def render(entries: List[StrategyEntry]) -> str:
     lines.append(f"  bot binding                {sum(1 for e in entries if e.bot_class)}")
     lines.append(f"  pattern binding            {sum(1 for e in entries if e.has_pattern)}")
     lines.append(f"  live-eligible (funded)     {sum(1 for e in entries if e.is_provisionable)}")
+    lines.append(f"  bot screened for edge      {sum(1 for e in entries if e.bot_validated)}")
 
     lines.append("")
     lines.append("Gaps")
     labels = {
         "promotable_not_marked": "evidence clears the gate, stage not updated",
         "validated_without_bot": "VALIDATED but no bot can trade it",
+        "awaiting_bot_screen": "VALIDATED, bot written, awaiting its own screen",
         "no_engine": "no engine implements it",
         "never_screened": "never screened",
         "inconclusive_only": "only inconclusive screens so far",
