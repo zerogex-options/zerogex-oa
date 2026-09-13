@@ -1,8 +1,16 @@
 """Catalog metadata for the backtest configuration form.
 
-Sources the pattern list from the live PlaybookEngine discovery (so the
-backtester and the live engine never drift), the tradable underlyings from
-config, and the available data window from the DB.
+The strategy list comes from ``src/strategies`` — the same catalog the
+TradeWorkz fleet and Pattern Insights read — so the three surfaces cannot
+drift. Tradable underlyings come from config; the available data window from
+the DB.
+
+Each published strategy carries enough for the UI to group it, badge its
+research stage, and say plainly whether it can be backtested and how. The
+description is the catalog's authored ``thesis``: previously this module
+scraped it out of each pattern module's docstring, which meant a strategy's
+customer-facing explanation lived in a different place from the strategy and
+could silently disagree with the bot trading the same idea.
 """
 
 from __future__ import annotations
@@ -13,6 +21,14 @@ from src.config import (
     BACKTEST_SIGNAL_COOLDOWN_MINUTES,
     DATA_RETENTION_DAYS,
     SIGNALS_UNDERLYINGS,
+)
+from src.strategies import (
+    FAMILY_LABELS,
+    RETIREMENT_MIN_HISTORY_DAYS,
+    StrategyEntry,
+    all_strategies,
+    can_retire,
+    retirement_shortfall,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,10 +70,20 @@ STRATEGY_STRUCTURES = [
 # pctToFraction. Params without it take their raw number as typed (e.g.
 # ``risk_per_trade_pct`` is stored as a percent number like 2.0, not a fraction).
 SWEEP_PARAMS = [
-    {"param": "profit_target_pct", "label": "Take profit", "unit": "%",
-     "scope": "any", "as_fraction": True},
-    {"param": "stop_loss_pct", "label": "Stop loss", "unit": "%",
-     "scope": "any", "as_fraction": True},
+    {
+        "param": "profit_target_pct",
+        "label": "Take profit",
+        "unit": "%",
+        "scope": "any",
+        "as_fraction": True,
+    },
+    {
+        "param": "stop_loss_pct",
+        "label": "Stop loss",
+        "unit": "%",
+        "scope": "any",
+        "as_fraction": True,
+    },
     {"param": "risk_per_trade_pct", "label": "Risk / trade", "unit": "%", "scope": "any"},
     {"param": "max_concurrent", "label": "Max concurrent", "unit": "", "scope": "any"},
     {"param": "max_hold_minutes", "label": "Max hold", "unit": "min", "scope": "any"},
@@ -67,131 +93,109 @@ SWEEP_PARAMS = [
     {"param": "dte", "label": "DTE", "unit": "", "scope": "strategy"},
     {"param": "width", "label": "Spread width", "unit": "pts", "scope": "strategy"},
     {"param": "wing", "label": "Wing width", "unit": "pts", "scope": "strategy"},
-    {"param": "target_offset_pct", "label": "Target offset", "unit": "%",
-     "scope": "strategy", "as_fraction": True},
-    {"param": "stop_offset_pct", "label": "Stop offset", "unit": "%",
-     "scope": "strategy", "as_fraction": True},
+    {
+        "param": "target_offset_pct",
+        "label": "Target offset",
+        "unit": "%",
+        "scope": "strategy",
+        "as_fraction": True,
+    },
+    {
+        "param": "stop_offset_pct",
+        "label": "Stop offset",
+        "unit": "%",
+        "scope": "strategy",
+        "as_fraction": True,
+    },
 ]
 
 
-def _extract_description(doc: str) -> str:
-    """Pull a customer-facing description out of a pattern module docstring.
-
-    The convention across ``src/signals/playbook/patterns/*.py`` is::
-
-        Pattern X.Y: ``pattern_id`` — Name.
-
-        <natural-language explanation of when / why this fires, possibly
-        spanning a few lines, sometimes followed by developer notes.>
-
-        Per ``docs/playbook_catalog.md`` §X.Y.Z.
-
-        PR-N simplification: <impl note>...
-
-    We want only the natural-language middle paragraph. So:
-
-    * drop the header line (``Pattern X.Y: ...``);
-    * stop at the first blank line, or at developer-cruft lines starting
-      with ``Per docs/...`` / ``PR-...``;
-    * strip backtick wrappers around inline ids and collapse whitespace.
-
-    Falls back to the header line (current behavior) if the docstring is
-    short or oddly shaped, so we never lose information — only upgrade it.
-    """
-    if not doc:
-        return ""
-    lines = [line.strip() for line in doc.strip().splitlines()]
-    # Drop leading blank lines (defensive — `inspect.cleandoc` usage varies).
-    while lines and not lines[0]:
-        lines.pop(0)
-    if not lines:
-        return ""
-
-    header = lines[0]
-    body: list[str] = []
-    for line in lines[1:]:
-        stripped = line.strip()
-        # Paragraph break ⇒ stop. The first paragraph after the header is
-        # the customer description; later paragraphs are developer notes.
-        if not stripped:
-            if body:
-                break
-            continue
-        # Developer-only lines: kill on first match.
-        lowered = stripped.lower()
-        if lowered.startswith("per docs") or lowered.startswith("per `docs"):
-            break
-        if lowered.startswith("pr-") and ":" in lowered:
-            break
-        body.append(stripped)
-
-    if not body:
-        # No usable body — fall back to the header line so the catalog
-        # entry at least carries SOMETHING (current behavior).
-        return header[:200]
-
-    text = " ".join(body)
-    # Strip ``inline-code`` backticks so the UI doesn't render them raw.
-    text = text.replace("``", "").replace("`", "")
-    # Collapse repeated whitespace from the line joins.
-    text = " ".join(text.split())
-    # Some docstrings append the "Per docs/playbook_catalog.md §X.Y" pointer
-    # to the final sentence of the customer paragraph (no blank-line break).
-    # Truncate on that sentinel so it doesn't reach the UI.
-    for sentinel in (" Per docs", " Per Docs", " Per the docs"):
-        idx = text.find(sentinel)
-        if idx != -1:
-            text = text[:idx].rstrip()
-            break
-    # Drop a trailing period+space orphan ("...wall.  ") left behind by the
-    # cut so the description reads cleanly.
-    text = text.rstrip()
-    return text[:280]
-
-
-def _docstring_for_pattern(p) -> str:
-    """Return the most useful docstring available for a pattern instance.
-
-    Convention across ``src/signals/playbook/patterns/*.py`` is that the
-    natural-language description lives in the MODULE docstring, not on the
-    class itself (the classes typically have no docstring of their own). So
-    we look up the module via ``__module__`` and read its docstring,
-    falling back to the class's own docstring if a future pattern is
-    written class-doc-first.
-    """
-    import sys
-
-    module_name = getattr(type(p), "__module__", "") or getattr(p, "__module__", "")
-    module_doc = ""
-    if module_name and module_name in sys.modules:
-        module_doc = (sys.modules[module_name].__doc__ or "").strip()
-    if module_doc:
-        return module_doc
-    return (type(p).__doc__ or getattr(p, "__doc__", "") or "").strip()
-
-
-def _pattern_catalog() -> list[dict]:
-    """Discover the built-in playbook patterns and describe each."""
-    try:
-        from src.signals.playbook.engine import PlaybookEngine
-
-        patterns = PlaybookEngine._discover_builtin_patterns()
-    except Exception:  # pragma: no cover - discovery is best-effort for the form
-        logger.warning("backtest meta: pattern discovery failed", exc_info=True)
-        return []
-    out = []
-    for p in patterns:
-        description = _extract_description(_docstring_for_pattern(p))
-        out.append(
-            {
-                "id": getattr(p, "id", "") or "",
-                "name": getattr(p, "name", "") or getattr(p, "id", ""),
-                "tier": getattr(p, "tier", "") or "n/a",
-                "description": description,
+def _evidence(entry: StrategyEntry) -> dict:
+    """The research ledger, flattened for display."""
+    latest = entry.latest_run
+    return {
+        "runs": len(entry.research),
+        "deepest_window_days": entry.deepest_window_days,
+        "total_screened_trades": entry.total_screened_trades,
+        "has_edge": entry.has_edge_evidence,
+        "conclusive_tuning_generations": len(entry.conclusive_tuning_generations),
+        "latest": (
+            None
+            if latest is None
+            else {
+                "ran_on": latest.ran_on.isoformat(),
+                "window_days": latest.window_days,
+                "trades": latest.trades,
+                "verdict": latest.verdict.value,
+                "profit_factor": latest.profit_factor,
+                "expectancy": latest.expectancy,
+                "win_rate": latest.win_rate,
+                "harness": latest.harness,
+                "notes": latest.notes,
             }
-        )
-    out.sort(key=lambda d: (d["tier"], d["name"]))
-    return out
+        ),
+    }
+
+
+def _backtest_route(entry: StrategyEntry) -> tuple[str | None, str | None]:
+    """How this strategy gets backtested, and why not when it cannot be.
+
+    A pattern binding wins when both exist: those cards are what actually
+    fired live, so replaying them is the more faithful measurement. Bot replay
+    is what gives the bot-only strategies a backtest at all.
+    """
+    if entry.pattern_id:
+        return "pattern", None
+    if entry.bot_class is not None:
+        return "bot_replay", None
+    return None, (
+        "No engine implements this strategy yet — it needs either a playbook "
+        "pattern (to emit Action Cards live) or a TradeWorkz bot class."
+    )
+
+
+def _strategy_payload(entry: StrategyEntry) -> dict:
+    route, blocked_reason = _backtest_route(entry)
+    retire = can_retire(entry)
+    return {
+        "id": entry.id,
+        "name": entry.name,
+        "family": entry.family.value,
+        "family_label": FAMILY_LABELS[entry.family],
+        "tier": entry.tier,
+        "direction_mode": entry.direction_mode,
+        "tagline": entry.tagline,
+        "thesis": entry.thesis,
+        # Back-compat: the pre-catalog form read `description`.
+        "description": entry.thesis,
+        "stage": entry.stage.value,
+        "engines": [e.value for e in entry.engines],
+        "backtestable": route is not None,
+        "backtest_via": route,
+        "not_backtestable_reason": blocked_reason,
+        "provisionable": entry.is_provisionable,
+        "bot_id": entry.bot_id,
+        "pattern_id": entry.pattern_id,
+        "supersedes": list(entry.supersedes),
+        "superseded_by": entry.superseded_by,
+        "evidence": _evidence(entry),
+        "retirement": {
+            "eligible": retire.allowed,
+            "blockers": list(retire.blockers),
+            "history_progress": round(retirement_shortfall(entry), 4),
+            "required_history_days": RETIREMENT_MIN_HISTORY_DAYS,
+        },
+    }
+
+
+def _strategy_catalog() -> list[dict]:
+    """The catalog, ordered for the picker: family, then tier, then name."""
+    tier_rank = {"0DTE": 0, "1DTE": 1, "swing": 2}
+    entries = sorted(
+        all_strategies(),
+        key=lambda e: (e.family.value, tier_rank.get(e.tier, 9), e.name),
+    )
+    return [_strategy_payload(e) for e in entries]
 
 
 def _underlyings() -> list[str]:
@@ -241,8 +245,13 @@ def _strategy_fields() -> list[dict]:
         ("flip_distance", "Flip distance (raw)", ""),
     ]
     out = [
-        {"field": f, "label": label, "type": "numeric",
-         "ops": ["<", "<=", ">", ">=", "==", "!="], "unit": unit}
+        {
+            "field": f,
+            "label": label,
+            "type": "numeric",
+            "ops": ["<", "<=", ">", ">=", "==", "!="],
+            "unit": unit,
+        }
         for f, label, unit in numeric
     ]
     labels = {
@@ -250,17 +259,26 @@ def _strategy_fields() -> list[dict]:
         "msi_regime": "MSI regime",
     }
     for field, values in STRATEGY_CATEGORICAL_FIELDS.items():
-        out.append({
-            "field": field, "label": labels.get(field, field), "type": "categorical",
-            "ops": ["==", "!="], "values": list(values),
-        })
+        out.append(
+            {
+                "field": field,
+                "label": labels.get(field, field),
+                "type": "categorical",
+                "ops": ["==", "!="],
+                "values": list(values),
+            }
+        )
     return out
 
 
 def build_meta(conn) -> dict:
+    strategies = _strategy_catalog()
     return {
         "underlyings": _underlyings(),
-        "patterns": _pattern_catalog(),
+        "strategies": strategies,
+        # Back-compat alias: saved configs, share links and older clients read
+        # `patterns`. Same list — the catalog is the only source.
+        "patterns": strategies,
         "strategy_fields": _strategy_fields(),
         "strategy_structures": list(STRATEGY_STRUCTURES),
         "sweep_params": list(SWEEP_PARAMS),

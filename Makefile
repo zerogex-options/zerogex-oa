@@ -3618,6 +3618,15 @@ tradeworkz-backtest: ## Replay bots over history to screen for entry edge (args:
 	@echo "$(BLUE)=== TradeWorkz backtest (research screen: 1 contract, scaling OFF, ML neutral) ===$(NC)"
 	@$(VENV_PYTHON) -m src.tradeworkz.backtest $(ARGS)
 
+.PHONY: strategy-catalog-audit
+strategy-catalog-audit: ## Audit the strategy catalog: bindings, stages, evidence depth, retirement eligibility (args: ARGS="--json --family wall")
+	@echo "$(BLUE)=== Strategy catalog audit (source of truth for all three surfaces) ===$(NC)"
+	@$(VENV_PYTHON) -m src.strategies.audit $(ARGS)
+
+.PHONY: strategy-catalog-check
+strategy-catalog-check: ## Fail if the catalog has integrity problems (for CI / pre-deploy)
+	@$(VENV_PYTHON) -m src.strategies.audit --strict >/dev/null && 		echo "$(GREEN)strategy catalog OK$(NC)" || 		{ $(VENV_PYTHON) -m src.strategies.audit | tail -20; exit 1; }
+
 .PHONY: query
 query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
 	@$(PSQL) -c "$(SQL)"

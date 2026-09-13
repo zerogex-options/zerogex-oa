@@ -299,21 +299,119 @@ def _derive_pattern_economics(
     }
 
 
-_VALID_INSIGHT_SOURCES = ("option_pnl", "underlying_touch")
+#: Measurement feeds a stats row can come from.
+#:   option_pnl        — realized leg-level option P&L from the pattern's own
+#:                       emitted Action Cards. The honest measure.
+#:   underlying_touch  — the conservative price-touch proxy (debug only).
+#:   bot_replay        — realized option P&L from replaying a bot-bound
+#:                       strategy's entry rule over as-of snapshots. Same
+#:                       pricing path as option_pnl; it exists as its own
+#:                       source because the ENTRIES were reconstructed rather
+#:                       than actually emitted live, which is a weaker claim
+#:                       and should not be silently averaged in with one.
+_VALID_INSIGHT_SOURCES = ("option_pnl", "underlying_touch", "bot_replay")
+
+
+def _catalog_meta(strategy_id: str) -> dict:
+    """Catalog identity for a stats row, or a minimal stub when unknown.
+
+    A row whose id is not in the catalog is surfaced rather than dropped: it
+    means history holds measurements for a strategy that has since been
+    removed from the catalog, and hiding that would make the page quietly
+    disagree with the database.
+    """
+    from src.strategies import FAMILY_LABELS, find
+
+    entry = find(strategy_id)
+    if entry is None:
+        return {
+            "strategy": strategy_id,
+            "name": strategy_id,
+            "family": None,
+            "family_label": None,
+            "tier": None,
+            "stage": None,
+            "engines": [],
+            "in_catalog": False,
+        }
+    return {
+        "strategy": entry.id,
+        "name": entry.name,
+        "family": entry.family.value,
+        "family_label": FAMILY_LABELS[entry.family],
+        "tier": entry.tier,
+        "stage": entry.stage.value,
+        "engines": [e.value for e in entry.engines],
+        "in_catalog": True,
+    }
+
+
+def _coverage_rows(measured: set, source: str) -> list[dict]:
+    """One placeholder row per catalog strategy with no measurement yet.
+
+    Pattern Insights is the catalog's scoreboard, so a strategy that has never
+    been measured has to appear as exactly that — an explicit "no data yet"
+    row — rather than being absent. An absent row reads as "we measured it and
+    it was uninteresting", which is the opposite of the truth and would hide
+    the strategies most in need of a screen.
+    """
+    from src.strategies import all_strategies
+
+    out: list[dict] = []
+    for entry in all_strategies():
+        if entry.id in measured:
+            continue
+        out.append(
+            {
+                **_catalog_meta(entry.id),
+                # Legacy key: the page's existing column is `pattern`.
+                "pattern": entry.id,
+                "underlying": None,
+                "window_start": None,
+                "window_end": None,
+                "n_emitted": 0,
+                "n_resolved": 0,
+                "n_wins": 0,
+                "n_losses": 0,
+                "hit_rate": None,
+                "proposed_base": None,
+                "gross_win_pnl": None,
+                "gross_loss_pnl": None,
+                "source": source,
+                "computed_at": None,
+                "measured": False,
+                "net_pnl": None,
+                "profit_factor": None,
+                "expectancy": None,
+                "avg_win_pnl": None,
+                "avg_loss_pnl": None,
+            }
+        )
+    return out
 
 
 def get_pattern_insights(
     *,
     source: str = "option_pnl",
     underlying: Optional[str] = None,
+    include_unmeasured: bool = True,
 ) -> list[dict]:
-    """Latest stats row per (pattern, underlying) for the leaderboard.
+    """The strategy catalog's scoreboard: latest stats per (strategy, underlying).
 
-    Returns one row per pair, ordered by net_pnl DESC and then by sample size
-    DESC — the engine-server's opinion of "most profitable, then most
-    trustworthy." The frontend can re-sort however it wants. Rows include the
-    raw counts + dollar economics from the table, plus derived PF / expectancy
-    / avg win / avg loss so the page doesn't need to recompute them.
+    Rows are folded onto **canonical catalog ids**, so a strategy measured
+    through its playbook pattern and the same strategy measured through its bot
+    replay land on one id instead of reading as two unrelated things. Each row
+    carries the catalog's identity (name, family, tier, research stage) next to
+    the measured numbers, and the derived PF / expectancy / avg win / avg loss
+    so the page does not recompute them.
+
+    With ``include_unmeasured`` (the default), every catalog strategy that has
+    no row in this source is appended as an explicit "no data yet" row. That is
+    deliberate: the page is the catalog's scoreboard, and silently omitting an
+    unmeasured strategy would read as a measured-and-dull result.
+
+    Ordering: measured rows first by net P&L DESC then sample size DESC, with
+    unmeasured rows last.
     """
     if source not in _VALID_INSIGHT_SOURCES:
         source = "option_pnl"
@@ -339,7 +437,10 @@ def get_pattern_insights(
             params,
         )
         rows = cur.fetchall()
+    from src.strategies import canonical_id
+
     out: list[dict] = []
+    seen: dict[tuple, dict] = {}
     for r in rows:
         (
             pattern,
@@ -364,32 +465,50 @@ def get_pattern_insights(
             gross_win_pnl,
             gross_loss_pnl,
         )
-        out.append(
-            {
-                "pattern": pattern,
-                "underlying": underlying_,
-                "window_start": window_start.isoformat() if window_start else None,
-                "window_end": window_end.isoformat() if window_end else None,
-                "n_emitted": int(n_emitted or 0),
-                "n_resolved": int(n_resolved or 0),
-                "n_wins": int(n_wins or 0),
-                "n_losses": int(n_losses or 0),
-                "hit_rate": float(hit_rate) if hit_rate is not None else None,
-                "proposed_base": float(proposed_base) if proposed_base is not None else None,
-                "gross_win_pnl": (float(gross_win_pnl) if gross_win_pnl is not None else None),
-                "gross_loss_pnl": (float(gross_loss_pnl) if gross_loss_pnl is not None else None),
-                "source": row_source,
-                "computed_at": computed_at.isoformat() if computed_at else None,
-                **econ,
-            }
-        )
-    # Server-side default ordering: net_pnl desc (NULLs last), then n_resolved
-    # desc. Stable enough that the client can show a usable view before it
-    # re-sorts.
+        strategy_id = canonical_id(pattern) or pattern
+        row = {
+            **_catalog_meta(strategy_id),
+            # ``pattern`` stays the canonical strategy id under its legacy
+            # key so existing clients and saved sorts keep working; the
+            # raw DB id is preserved separately for traceability.
+            "pattern": strategy_id,
+            "measured_as": pattern,
+            "measured": True,
+            "underlying": underlying_,
+            "window_start": window_start.isoformat() if window_start else None,
+            "window_end": window_end.isoformat() if window_end else None,
+            "n_emitted": int(n_emitted or 0),
+            "n_resolved": int(n_resolved or 0),
+            "n_wins": int(n_wins or 0),
+            "n_losses": int(n_losses or 0),
+            "hit_rate": float(hit_rate) if hit_rate is not None else None,
+            "proposed_base": float(proposed_base) if proposed_base is not None else None,
+            "gross_win_pnl": (float(gross_win_pnl) if gross_win_pnl is not None else None),
+            "gross_loss_pnl": (float(gross_loss_pnl) if gross_loss_pnl is not None else None),
+            "source": row_source,
+            "computed_at": computed_at.isoformat() if computed_at else None,
+            **econ,
+        }
+        # Two legacy ids can fold onto one strategy (a pattern id and a bot id
+        # for the same thesis). Keep the row from the most recent window so the
+        # scoreboard shows one current number per strategy per symbol.
+        key = (strategy_id, underlying_)
+        prior = seen.get(key)
+        if prior is None or (row["window_end"] or "") >= (prior["window_end"] or ""):
+            seen[key] = row
+    out = list(seen.values())
+
+    if include_unmeasured and not underlying:
+        out.extend(_coverage_rows({d["pattern"] for d in out}, source))
+
+    # Server-side default ordering: measured first, then net_pnl desc (NULLs
+    # last), then n_resolved desc. Stable enough that the client can show a
+    # usable view before it re-sorts.
 
     def _sort_key(d: dict) -> tuple:
         net = d.get("net_pnl")
         return (
+            0 if d.get("measured") else 1,
             0 if net is not None else 1,
             -(net if net is not None else 0.0),
             -(d.get("n_resolved") or 0),

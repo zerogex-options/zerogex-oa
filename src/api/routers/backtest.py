@@ -47,21 +47,33 @@ async def get_meta() -> dict:
 
 @router.get("/insights/patterns")
 async def get_pattern_insights(
-    source: str = Query("option_pnl", pattern="^(option_pnl|underlying_touch)$"),
+    source: str = Query("option_pnl", pattern="^(option_pnl|underlying_touch|bot_replay)$"),
     underlying: Optional[str] = Query(None, pattern="^[A-Za-z]{1,10}$"),
+    include_unmeasured: bool = Query(True),
 ) -> list:
-    """Pattern leaderboard: latest stats row per (pattern, underlying).
+    """Strategy scoreboard: latest stats row per (catalog strategy, underlying).
 
-    Read-only roll-up of ``playbook_pattern_stats`` — n, win rate, dollar
-    economics, derived PF / expectancy, the window dates, and the most-recent
-    ``computed_at`` per pair. Defaults to ``source=option_pnl`` (the realized
-    P&L feed); ``source=underlying_touch`` returns the proxy rows without
-    dollar economics. Optional ``underlying`` narrows to one symbol.
+    Read-only roll-up of ``playbook_pattern_stats`` folded onto canonical
+    strategy-catalog ids — n, win rate, dollar economics, derived PF /
+    expectancy, window dates, most-recent ``computed_at``, plus the catalog's
+    name / family / tier / research stage.
+
+    ``source`` picks the measurement feed: ``option_pnl`` (realized P&L from
+    the strategy's own live-emitted Action Cards — the default and the
+    strongest claim), ``bot_replay`` (realized P&L from replaying a bot-bound
+    strategy's entry rule over history — same pricing, reconstructed entries),
+    or ``underlying_touch`` (the price-touch proxy, no dollar economics).
+
+    ``include_unmeasured`` (default true) appends an explicit "no data yet"
+    row for every catalog strategy absent from this source, so the page shows
+    the whole catalog rather than only what happens to have been screened.
+    Ignored when ``underlying`` narrows to one symbol.
     """
     return await asyncio.to_thread(
         queries.get_pattern_insights,
         source=source,
         underlying=underlying,
+        include_unmeasured=include_unmeasured,
     )
 
 

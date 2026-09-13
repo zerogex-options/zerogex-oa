@@ -3,6 +3,12 @@
 **Status:** in progress — the spec-driven bot core is shipped; the deploy
 plumbing + UI are the remaining work. · **Repos:** `zerogex-oa`, `zerogex-web`
 
+> **Update:** the *catalog* half of the unification shipped separately — all
+> three surfaces (Bot Trading, Backtesting, Pattern Insights) now read one
+> strategy catalog, and every catalog strategy is backtestable. See
+> [`strategy-catalog.md`](strategy-catalog.md). This document covers the
+> remaining piece: deploying a **user's own** custom strategy as a live bot.
+
 ## The idea
 
 Backtesting and the TradeWorkz bot fleet are the **same product in two time
@@ -45,17 +51,25 @@ historical-replay engine (`src/backtesting/`) and the live bot engine
   every condition field maps to the live snapshot (`LIVE_MAPPABLE_FIELDS`) and
   the structure is directional. Fields the snapshot can't supply **fail closed**
   (the bot won't fire on a half-evaluated rule).
+- **Registry wiring** (shipped with the strategy catalog, see
+  [`strategy-catalog.md`](strategy-catalog.md)). `SpecStrategyBot` is now
+  registered in `registry.STRATEGY_CLASSES` under `'spec_strategy'`, so
+  `get_bot_class('spec_strategy')` resolves and the fleet loader can
+  instantiate a user-deployed bot row. It was previously absent, which meant
+  the class existed and was unit-tested but could never actually be loaded.
+  It is listed in `NON_CATALOG_STRATEGY_CLASSES` and so exempt from the
+  catalog-coverage check: its behavior comes from a saved `BacktestSpec`
+  rather than a catalog thesis, so it is deliberately not a catalog entry.
 
 The bot is **not** in the default roster, so nothing runs until a deploy flow
 explicitly creates its `tw_bots` row — production behavior is unchanged.
 
 ## What remains (sequenced)
 
-1. **Persistence + registry.** Let `tw_bots` carry a user-created bot with
-   `strategy_class='spec_strategy'` and `params.strategy`. Teach
-   `registry.get_bot` / the fleet loader to instantiate `SpecStrategyBot` from
-   such a row (owner-scoped via a new `end_user` column), alongside the
-   hardcoded roster.
+1. **Persistence.** Let `tw_bots` carry a user-created bot with
+   `strategy_class='spec_strategy'` and `params.strategy`, owner-scoped via a
+   new `end_user` column, alongside the catalog-projected roster. (The registry
+   half of this step is done — see above.)
 2. **Deploy API.** `POST /api/backtest/runs/{id}/deploy` (or on a saved config):
    validate `is_live_deployable`, provision a `tw_bots` + `tw_bot_capital` sleeve
    from the run's strategy + sizing, return the bot id. Guard rails: one bot per
