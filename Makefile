@@ -1112,6 +1112,7 @@ help: ## Show this help message
 	@echo "  make futures-forensics  - Was the ES/NQ chart actually late? (SYMBOL=NDX DATE=... OPEN=08:00)"
 	@echo "  make futures-feed-logs  - Futures ingester journal around that window (same args)"
 	@echo "  make futures-roll-check - Which contract month the feed is on; finds roll splices"
+	@echo "  make futures-carry-check- Is the ES/NQ carry fallback configured right?"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
@@ -3510,6 +3511,15 @@ futures-forensics: ## Was the ES/NQ chart actually late? Read-only DB forensics.
 		-v lag_warn_sec=$(or $(LAG_WARN),90) \
 		-v history_days=$(or $(DAYS),7) \
 		-f setup/database/diagnostics/futures_feed_forensics.sql
+
+.PHONY: futures-carry-check
+futures-carry-check: ## Is the ES/NQ carry fallback configured right? Compares RISK_FREE_RATE/DIVIDEND_YIELD_BY_SYMBOL against the basis measured from the tape
+	@echo "$(BLUE)=== Futures carry configuration check ===$(NC)"
+	@echo "$(YELLOW)theoretical_ratio is the basis used whenever no concurrent$(NC)"
+	@echo "$(YELLOW)index/futures pair exists — most of the overnight session.$(NC)"
+	@echo "$(YELLOW)This prints what the config implies beside what the tape says.$(NC)"
+	@echo ""
+	@$(VENV_PYTHON) -m src.tools.futures_carry_check
 
 .PHONY: futures-roll-check
 futures-roll-check: ## Which contract month is the ES/NQ feed on, and did it splice at a roll? SYMBOL=NDX DAYS=75 JUMP_BPS=25
