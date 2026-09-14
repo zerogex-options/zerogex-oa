@@ -9,7 +9,7 @@ must still be confirmed on first contact with a real terminal.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -58,10 +58,20 @@ def test_unparseable_symbol_returns_none_rather_than_raising():
         assert parse_occ_symbol(bad) is None
 
 
-def test_strike_normalisation_handles_thousandths():
-    """Feeds disagree on units. 650000 is $650, not $650,000."""
-    assert _normalise_strike(650000) == pytest.approx(650.0)
+def test_index_strikes_survive_normalisation():
+    """The v3 feed sends strikes in dollars, so nothing may rescale them.
+
+    This is a regression test for a real bug. _normalise_strike used to
+    divide anything >= 1000 by a thousand, on the assumption that
+    OPRA-derived feeds send thousandths. The live feed does not. SPY and
+    QQQ strikes sit below 1000 and were unaffected, so the chain looked
+    perfect -- while every SPX strike (6500 -> 6.50) and every NDX strike
+    (25000 -> 25.00) failed to join back to the requested contracts and
+    those chains came back empty.
+    """
     assert _normalise_strike(650.0) == pytest.approx(650.0)
+    assert _normalise_strike(6500.0) == pytest.approx(6500.0), "SPX strike rescaled"
+    assert _normalise_strike(25000.0) == pytest.approx(25000.0), "NDX strike rescaled"
     assert _normalise_strike(None) is None
 
 
@@ -133,15 +143,40 @@ class _FakeClient:
         return self._oi_rows
 
 
+#: The exact row shape a live terminal returns, captured from
+#: `make feed-probe PROVIDER=thetadata UNDERLYING=SPY` on 2026-09-14.
+#: Strikes in DOLLARS, rights spelled "CALL"/"PUT", and a timezone-aware
+#: quote timestamp. The earlier fixtures here were written from the wheel's
+#: signatures and encoded strikes as thousandths, so they confirmed a guess
+#: instead of the vendor -- which is how the index-strike bug survived.
+QUOTE_TS = datetime(2026, 9, 11, 16, 14, 59, tzinfo=timezone(timedelta(hours=-4)))
+
+
 def _chain_provider():
     quote_rows = [
-        {"strike": 650000, "right": "C", "bid": 1.20, "ask": 1.30, "bid_size": 5, "ask_size": 7},
-        {"strike": 650000, "right": "P", "bid": 0.80, "ask": 0.90, "bid_size": 3, "ask_size": 4},
+        {
+            "strike": 650.0,
+            "right": "CALL",
+            "bid": 1.20,
+            "ask": 1.30,
+            "bid_size": 5,
+            "ask_size": 7,
+            "timestamp": QUOTE_TS,
+        },
+        {
+            "strike": 650.0,
+            "right": "PUT",
+            "bid": 0.80,
+            "ask": 0.90,
+            "bid_size": 3,
+            "ask_size": 4,
+            "timestamp": QUOTE_TS,
+        },
         # A contract outside the requested set: expected with strike="*".
-        {"strike": 999000, "right": "C", "bid": 0.01, "ask": 0.02},
+        {"strike": 999.0, "right": "CALL", "bid": 0.01, "ask": 0.02, "timestamp": QUOTE_TS},
     ]
-    ohlc_rows = [{"strike": 650000, "right": "C", "close": 1.25, "volume": 4210}]
-    oi_rows = [{"strike": 650000, "right": "C", "open_interest": 8123}]
+    ohlc_rows = [{"strike": 650.0, "right": "CALL", "close": 1.25, "volume": 4210}]
+    oi_rows = [{"strike": 650.0, "right": "CALL", "open_interest": 8123}]
     client = _FakeClient(quote_rows=quote_rows, ohlc_rows=ohlc_rows, oi_rows=oi_rows)
     return ThetaDataProvider(client), client
 
@@ -205,8 +240,8 @@ def test_one_failing_endpoint_does_not_lose_the_others():
             raise RuntimeError("entitlement error")
 
     client = _PartlyBroken(
-        quote_rows=[{"strike": 650000, "right": "C", "bid": 1.2, "ask": 1.3}],
-        ohlc_rows=[{"strike": 650000, "right": "C", "close": 1.25, "volume": 10}],
+        quote_rows=[{"strike": 650.0, "right": "CALL", "bid": 1.2, "ask": 1.3}],
+        ohlc_rows=[{"strike": 650.0, "right": "CALL", "close": 1.25, "volume": 10}],
     )
     provider = ThetaDataProvider(client)
     call = build_occ_symbol("SPY", EXP, 650.0, "C")
@@ -219,7 +254,7 @@ def test_one_failing_endpoint_does_not_lose_the_others():
 def test_zero_prices_normalise_to_none():
     """A reported price of exactly zero means 'no quote'. Persisting it as
     a real zero hands the IV solver a free option."""
-    client = _FakeClient(quote_rows=[{"strike": 650000, "right": "C", "bid": 0, "ask": 0}])
+    client = _FakeClient(quote_rows=[{"strike": 650.0, "right": "CALL", "bid": 0, "ask": 0}])
     provider = ThetaDataProvider(client)
     call = build_occ_symbol("SPY", EXP, 650.0, "C")
     state = provider.fetch_chain_state([call], include_open_interest=False)
@@ -413,3 +448,97 @@ def test_market_value_defaults_off():
     """The ordinary quote endpoint is the safe default: it is the one
     whose meaning is unambiguous."""
     assert ThetaDataProvider(object())._market_value_endpoints is False
+
+
+# ---------------------------------------------------------------------------
+# Findings from the first live terminal contact, 2026-09-14
+# ---------------------------------------------------------------------------
+
+
+def test_index_chains_round_trip_end_to_end():
+    """An SPX chain must actually join, not just normalise.
+
+    The unit test above covers _normalise_strike; this covers the path that
+    broke. A rescaled strike still parses, so it fails silently at the
+    `wanted` lookup and the whole expiration drops -- which reads as a
+    missing entitlement rather than a unit bug.
+    """
+    for root, strike in (("SPXW", 6500.0), ("NDXP", 25000.0)):
+        client = _FakeClient(
+            quote_rows=[
+                {
+                    "strike": strike,
+                    "right": "CALL",
+                    "bid": 12.10,
+                    "ask": 12.40,
+                    "timestamp": QUOTE_TS,
+                }
+            ],
+            ohlc_rows=[],
+            oi_rows=[],
+        )
+        symbol = build_occ_symbol(root, EXP, strike, "C")
+        state = ThetaDataProvider(client).fetch_chain_state([symbol], include_open_interest=False)
+        assert symbol in state, f"{root} {strike} did not join"
+        assert state[symbol]["bid"] == pytest.approx(12.10)
+
+
+def test_quote_carries_the_vendors_timestamp_not_now():
+    """Snapshots return the last quote whether or not the market is open.
+
+    A probe run on Sunday returned quotes stamped the previous Friday at
+    16:14. Stamping now() would record a two-day-old quote as current and
+    defeat every staleness check downstream.
+    """
+    provider, _ = _chain_provider()
+    call = build_occ_symbol("SPY", EXP, 650.0, "C")
+    state = provider.fetch_chain_state([call], include_open_interest=False)
+
+    stamped = state[call]["timestamp"]
+    assert stamped is not None
+    assert stamped == QUOTE_TS
+    assert stamped.tzinfo is not None
+    # Same instant, expressed in UTC.
+    assert stamped.utcoffset() == timedelta(0)
+
+
+def test_nothing_joining_is_reported_rather_than_returned_empty(caplog):
+    """A unit or key mismatch must name itself.
+
+    Rows arriving but joining to nothing is indistinguishable from a closed
+    market or a missing entitlement unless the provider says so.
+    """
+    import logging
+
+    from src.ingestion.providers import thetadata as mod
+
+    mod._REPORTED_SHAPES.clear()
+    client = _FakeClient(
+        # Thousandths, as a feed that disagreed with this module would send.
+        quote_rows=[{"strike": 650000, "right": "CALL", "bid": 1.2, "ask": 1.3}],
+    )
+    symbol = build_occ_symbol("SPY", EXP, 650.0, "C")
+    with caplog.at_level(logging.WARNING):
+        state = ThetaDataProvider(client).fetch_chain_state([symbol], include_open_interest=False)
+
+    assert state.get(symbol, {}).get("bid") is None
+    assert "no strike / right column matched" in caplog.text
+    assert "'strike'" in caplog.text, "the columns that arrived must be named"
+
+
+def test_the_unmapped_warning_fires_once_per_shape(caplog):
+    """A poll loop must not emit this every five seconds."""
+    import logging
+
+    from src.ingestion.providers import thetadata as mod
+
+    mod._REPORTED_SHAPES.clear()
+    rows = [{"strike": 650000, "right": "CALL", "bid": 1.2, "ask": 1.3}]
+    symbol = build_occ_symbol("SPY", EXP, 650.0, "C")
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            ThetaDataProvider(_FakeClient(quote_rows=rows)).fetch_chain_state(
+                [symbol], include_open_interest=False
+            )
+
+    assert caplog.text.count("no strike / right column matched") == 1

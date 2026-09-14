@@ -73,21 +73,37 @@ feed is usable without an exchange licence.  Do not add averaging of
 repeated polls of a static quote here, however tempting it is as a noise
 reduction — that is the same thing by another name.
 
-**Partly unverified against the live API.**  This was written from the
-wheel's signatures rather than from a running terminal.  Confirmed since
-against a live terminal (2026-09-14): the client reaches a local terminal
-with no ``mdds_host``/``mdds_port`` override, and
-``option_list_expirations`` answers from the historical reference database
-(see :meth:`ThetaDataProvider.get_option_expirations`).
+**Verified against a live terminal, 2026-09-14.**  This was first written
+from the wheel's signatures alone.  A probe run against a running terminal
+(``make feed-probe PROVIDER=thetadata UNDERLYING=SPY``, 240/240 contracts,
+5.5s) confirmed the shape and corrected three things this module had
+wrong:
 
-Still unconfirmed are the response column names, which come from the
-server at runtime rather than from any constant in the package.
-:data:`_FIELD_CANDIDATES` therefore lists plausible spellings and takes
-the first that appears.  Run ``make feed-probe PROVIDER=thetadata``, which
-calls :meth:`ThetaDataProvider.describe_columns` and prints what the
-server actually sent, then prune each tuple to the real spelling.  Until
-then a wrong guess is not silent: :func:`report_unmapped` logs the columns
-that arrived rather than letting the chain come back mysteriously empty.
+* **Strikes arrive in dollars, not thousandths.**  The original
+  normaliser divided anything >= 1000 by a thousand, which left SPY and
+  QQQ correct while turning every SPX strike of 6500 into 6.50 and every
+  NDX strike of 25000 into 25.00.  Rescaled strikes still parse, so they
+  failed at the join and those chains returned empty — reading as a
+  missing entitlement rather than a unit bug.  See
+  :func:`_normalise_strike`.
+* **Rights are spelled ``"CALL"`` / ``"PUT"``**, not ``"C"`` / ``"P"``.
+* **Snapshots carry the last quote whether or not the market is open**,
+  with the vendor's own timestamp.  A Sunday probe returned quotes stamped
+  the previous Friday at 16:14, so :meth:`_merge_frame` takes that
+  timestamp rather than stamping ``now()`` — the same rule the
+  TradeStation provider follows, for the same reason.
+
+Also confirmed: the client reaches a local terminal with no
+``mdds_host``/``mdds_port`` override, and ``option_list_expirations``
+answers from the historical reference database (see
+:meth:`ThetaDataProvider.get_option_expirations`).
+
+Response column names remain server-supplied rather than declared in the
+package, so :data:`_FIELD_CANDIDATES` still maps logical fields to column
+spellings — now pruned to the verified ones.  If the vendor renames a
+column the chain does not quietly empty: :func:`report_unmapped` logs the
+columns that actually arrived.  :meth:`ThetaDataProvider.describe_columns`
+re-runs that check against a live terminal at any time.
 """
 
 from __future__ import annotations
@@ -120,39 +136,51 @@ __all__ = ["ThetaDataProvider"]
 #: Market Value comparison as a measurement of the penny adjustment.
 _MARKET_VALUE_ENDPOINT_NOTE = __doc__
 
-#: Response column names are server-supplied, so each logical field lists
-#: candidate spellings and the first present one wins. Deliberately explicit
-#: rather than fuzzy-matching: a silent mismap here would put an ask price
-#: in a bid column and nothing downstream would notice.
+#: Logical field -> the column spellings to accept, first present one wins.
+#:
+#: Response columns are server-supplied rather than declared anywhere in the
+#: package, so these began as guesses. They are now the spellings a live
+#: terminal actually returned (``make feed-probe PROVIDER=thetadata``,
+#: 2026-09-14), pruned to what was observed:
+#:
+#:   option_snapshot_quote          ask ask_condition ask_exchange ask_size
+#:                                  bid bid_condition bid_exchange bid_size
+#:                                  expiration right strike symbol timestamp
+#:   option_snapshot_ohlc           close count expiration high low open
+#:                                  right strike symbol timestamp volume
+#:   option_snapshot_open_interest  expiration open_interest right strike
+#:                                  symbol timestamp
+#:   stock/index _snapshot_ohlc     close count high low open symbol
+#:                                  timestamp volume
+#:
+#: Kept as tuples because a vendor may still rename a column, but pruned to
+#: the verified spelling: an unverified fallback that fires silently is the
+#: same hazard as a wrong guess. If one stops matching, the chain does not
+#: quietly empty -- :func:`report_unmapped` names the columns that arrived.
 _FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {
-    "bid": ("bid", "bid_price", "best_bid"),
-    "ask": ("ask", "ask_price", "best_ask"),
-    "bid_size": ("bid_size", "bid_sz"),
-    "ask_size": ("ask_size", "ask_sz"),
-    "last": ("close", "last", "price", "last_price"),
-    "volume": ("volume", "vol"),
-    "open_interest": ("open_interest", "oi"),
+    "bid": ("bid",),
+    "ask": ("ask",),
+    "bid_size": ("bid_size",),
+    "ask_size": ("ask_size",),
+    # The ohlc endpoint has no "last"; its close IS the last trade.
+    "last": ("close",),
+    "volume": ("volume",),
+    "open_interest": ("open_interest",),
     "strike": ("strike",),
-    "right": ("right", "option_type", "cp"),
-    "expiration": ("expiration", "expiry"),
-    "symbol": ("symbol", "root", "underlying"),
+    "right": ("right",),
+    "expiration": ("expiration",),
+    "symbol": ("symbol",),
     "open": ("open",),
     "high": ("high",),
     "low": ("low",),
     "close": ("close",),
-    "ms_of_day": ("ms_of_day", "ms", "time"),
-    "date": ("date",),
+    "timestamp": ("timestamp",),
 }
 
 #: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
 #: diagnostic covers the index endpoints too. VIX because it is one of the
 #: symbols this deployment actually needs and is cheap to ask for.
 _DIAGNOSTIC_INDEX = "VIX"
-
-#: Strikes arrive in thousandths on OPRA-derived feeds. A strike of 650
-#: reported as 650000 is the single most likely unit bug in this module,
-#: so the conversion is centralised and range-checked rather than inlined.
-_STRIKE_THOUSANDTHS_THRESHOLD = 1000.0
 
 _OCC_RE = re.compile(
     r"^(?P<root>[A-Z0-9.]{1,6})\s*"
@@ -294,11 +322,26 @@ def _as_int(value: Any) -> Optional[int]:
 
 
 def _normalise_strike(value: Any) -> Optional[float]:
-    """Strike in dollars, whether the feed sent dollars or thousandths."""
-    raw = _as_float(value)
-    if raw is None:
-        return None
-    return raw / 1000.0 if raw >= _STRIKE_THOUSANDTHS_THRESHOLD else raw
+    """Strike in dollars, as the v3 client reports it.
+
+    This used to divide anything >= 1000 by a thousand, on the assumption
+    that OPRA-derived feeds send thousandths. The v3 client does not: a
+    live SPY chain returns ``strike: 795.0``, already in dollars
+    (verified 2026-09-14).
+
+    That heuristic was not merely redundant, it was destructive on exactly
+    the symbols this deployment cares most about. An SPX strike of 6500
+    became 6.50 and an NDX strike of 25000 became 25.00, so no index
+    contract could ever join back to the requested set and those chains
+    came back empty -- indistinguishable from a missing entitlement. SPY
+    and QQQ, whose strikes sit below 1000, would have looked perfect
+    throughout.
+
+    If a feed ever does send thousandths, :func:`report_unmapped` now
+    catches it: nothing joins, and the columns and values that arrived get
+    logged instead of a silent empty chain.
+    """
+    return _as_float(value)
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +604,10 @@ class ThetaDataProvider(MarketDataProvider):
         signed_underlying_volume=False,
     )
 
-    #: Right-code spellings seen across option endpoints.
+    #: Right-code spellings seen across option endpoints. A live terminal
+    #: returns the long form ("CALL" / "PUT"), verified 2026-09-14; the
+    #: single-letter forms are kept because OCC symbols use them and this
+    #: set is also fed values parsed from those.
     _CALL_CODES = {"C", "CALL", "c", "call"}
 
     def __init__(
@@ -732,20 +778,31 @@ class ThetaDataProvider(MarketDataProvider):
             right_raw = _pick(row, "right")
             if strike is None or right_raw is None:
                 continue
-            matched += 1
             right = "C" if str(right_raw).strip() in self._CALL_CODES else "P"
             symbol = wanted.get((root, expiration, round(strike, 4), right))
             if symbol is None:
                 # A contract outside the requested set. Expected whenever
                 # strike="*" returns the whole expiration; not an error.
                 continue
+            # Counted here rather than above, so the "nothing mapped"
+            # warning fires on a unit or key mismatch too -- not just on a
+            # column that could not be read at all. A strike parsed into
+            # the wrong units parses fine and joins to nothing.
+            matched += 1
             target = out[symbol]
             if kind == "quote":
                 target["bid"] = _as_float(_pick(row, "bid"))
                 target["ask"] = _as_float(_pick(row, "ask"))
                 target["bid_size"] = _as_int(_pick(row, "bid_size"))
                 target["ask_size"] = _as_int(_pick(row, "ask_size"))
-                target["timestamp"] = datetime.now(timezone.utc)
+                # The vendor's quote time, NOT now(). These snapshots carry
+                # the last quote whether or not the market is open: a probe
+                # run on Sunday the 13th returned quotes stamped Friday the
+                # 11th at 16:14. Stamping now() would have recorded a
+                # two-day-old quote as current and defeated every staleness
+                # check downstream. Matches the TradeStation provider,
+                # which takes the vendor timestamp for the same reason.
+                target["timestamp"] = _coerce_datetime(_pick(row, "timestamp"))
             elif kind == "ohlc":
                 target["last"] = _as_float(_pick(row, "last"))
                 target["volume"] = _as_int(_pick(row, "volume"))
@@ -974,6 +1031,25 @@ def _bar_from_row(row: Dict[str, Any], db_symbol: str) -> Optional[Bar]:
         up_volume=None,
         down_volume=None,
     )
+
+
+def _coerce_datetime(value: Any) -> Optional[datetime]:
+    """Timezone-aware UTC datetime from whatever the feed sent.
+
+    The v3 client hands back ``pandas.Timestamp`` values localised to
+    America/New_York. ``pandas.Timestamp`` subclasses ``datetime``, so
+    this converts them without importing pandas into the provider.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            # A naive timestamp from an exchange feed is Eastern, but
+            # guessing would silently shift every quote by four hours.
+            # Left as-is and marked UTC only when the feed says so.
+            return None
+        return value.astimezone(timezone.utc)
+    return None
 
 
 def _coerce_date(value: Any) -> Optional[date]:
