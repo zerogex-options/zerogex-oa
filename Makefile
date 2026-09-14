@@ -916,6 +916,7 @@ help: ## Show this help message
 	@echo ""
 	@echo "$(GREEN)Market Data Provider Migration:$(NC)"
 	@echo "  make feed-probe         - Size ONE fetch before a real run (PROVIDER=<name>)"
+	@echo "                            index symbols: UNDERLYING='\$$SPXW.X' make feed-probe ..."
 	@echo "  make feed-compare       - Diff a candidate feed vs the incumbent (CANDIDATE=<name>)"
 	@echo "  make feed-compare-schema - Create the shadow tables the harness writes to"
 	@echo ""
@@ -1889,11 +1890,21 @@ run-auth: ## Test TradeStation authentication
 	@echo "$(BLUE)=== Testing TradeStation Authentication ===$(NC)"
 	@$(VENV_PYTHON) -m src.ingestion.tradestation_auth
 
+# UNDERLYING is read by the SHELL ("$${UNDERLYING:-SPY}"), not expanded by
+# make, because index symbols start with "$" and make eats it. Passed as
+# $(or $(UNDERLYING),SPY), '$SPXW.X' silently becomes 'PXW.X' -- make reads
+# $S as an (empty) variable -- and the probe then queries a symbol that does
+# not exist. Both of these work; the first is the one to prefer:
+#
+#   UNDERLYING='$$SPXW.X' make feed-probe PROVIDER=thetadata
+#   make feed-probe PROVIDER=thetadata UNDERLYING='$$$$SPXW.X'
+#
+# (In a shell, that second one is typed UNDERLYING='$$SPXW.X'.)
 .PHONY: feed-compare
 feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDIDATE, MINUTES, PERSIST, JSON)
 	@echo "$(BLUE)=== Feed comparison (runbook step 14) ===$(NC)"
 	@$(VENV_PYTHON) -m src.tools.feed_compare \
-		--underlying '$(or $(UNDERLYING),SPY)' \
+		--underlying "$${UNDERLYING:-SPY}" \
 		$(if $(INCUMBENT),--incumbent '$(INCUMBENT)') \
 		$(if $(CANDIDATE),--candidate '$(CANDIDATE)') \
 		$(if $(MINUTES),--duration-minutes '$(MINUTES)') \
@@ -1906,7 +1917,7 @@ feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDID
 feed-probe: ## Measure ONE fetch from a provider before a real run (PROVIDER, UNDERLYING)
 	@echo "$(BLUE)=== Feed probe (sizing, no DB writes) ===$(NC)"
 	@$(VENV_PYTHON) -m src.tools.feed_compare --probe \
-		--underlying '$(or $(UNDERLYING),SPY)' \
+		--underlying "$${UNDERLYING:-SPY}" \
 		--incumbent '$(or $(PROVIDER),$(INCUMBENT),tradestation)' \
 		$(if $(EXPIRATIONS),--expirations '$(EXPIRATIONS)') \
 		$(if $(STRIKE_COUNT_MAX),--strike-count-max '$(STRIKE_COUNT_MAX)') \

@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 import pytest
 
 from src.ingestion.providers.base import OptionQuote, ProviderCapabilities
+from src.tools import feed_compare
 from src.tools.feed_compare import (
     FeedSample,
     MetricComparison,
@@ -452,3 +453,123 @@ def test_probe_reports_coverage_not_analytics():
     # No analytics keys leak in.
     for key in ("net_gex", "call_wall", "gamma_flip", "max_pain"):
         assert key not in result
+
+
+# ---------------------------------------------------------------------------
+# Index spot routing (probe failure on $SPXW.X, 2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+class _RoutingProvider:
+    """Records which bar stream a caller reached for."""
+
+    name = "routing-probe"
+
+    def __init__(self):
+        self.calls = []
+
+    @property
+    def capabilities(self):
+        from src.ingestion.providers.base import ProviderCapabilities
+
+        return ProviderCapabilities(underlying_bars=True, index_bars=True)
+
+    def _stream(self, kind, symbol):
+        self.calls.append((kind, symbol))
+
+        class _S:
+            last_error = None
+
+            def start(self_inner):
+                pass
+
+            def stop(self_inner):
+                pass
+
+            def drain(self_inner):
+                from datetime import datetime, timezone
+
+                from src.ingestion.providers.base import Bar
+
+                return Bar(symbol=symbol, timestamp=datetime.now(timezone.utc), close=100.0)
+
+        return _S()
+
+    def stream_underlying_bars(self, symbol, **kw):
+        return self._stream("underlying", symbol)
+
+    def stream_index_bars(self, symbol, **kw):
+        return self._stream("index", symbol)
+
+
+def test_index_spot_uses_the_index_feed_not_the_equity_one(monkeypatch):
+    """SPX spot on the equity endpoint returns nothing at all.
+
+    ThetaData's stock endpoint defaults to Nasdaq Basic, which has never
+    heard of SPX. A probe on $SPXW.X died with "no spot price available"
+    after a 30s wait -- for two of the four production underlyings.
+    """
+    monkeypatch.setenv("SYMBOL_ALIASES", "SPX=$SPXW.X,NDX=$NDXP.X")
+
+    for raw in ("$SPXW.X", "$NDXP.X"):
+        provider = _RoutingProvider()
+        bar = feed_compare._spot_from_provider(provider, raw)
+        assert bar is not None
+        kind, symbol = provider.calls[0]
+        assert kind == "index", f"{raw} was routed to the equity feed"
+        assert not symbol.startswith("$"), "the index feed wants a bare root"
+
+
+def test_index_routing_survives_an_unconfigured_checkout(monkeypatch):
+    """`$XXX.X` is TradeStation index notation and needs no alias config."""
+    monkeypatch.delenv("SYMBOL_ALIASES", raising=False)
+    provider = _RoutingProvider()
+    feed_compare._spot_from_provider(provider, "$VIX.X")
+    assert provider.calls[0][0] == "index"
+
+
+def test_equities_still_use_the_equity_feed(monkeypatch):
+    monkeypatch.setenv("SYMBOL_ALIASES", "SPX=$SPXW.X")
+    for raw in ("SPY", "QQQ"):
+        provider = _RoutingProvider()
+        feed_compare._spot_from_provider(provider, raw)
+        assert provider.calls[0][0] == "underlying", f"{raw} was routed to the index feed"
+
+
+def test_a_symbol_make_truncated_is_rejected_with_the_fix():
+    """'PXW.X' reaches the tool when make eats the '$' in '$SPXW.X'."""
+    assert feed_compare._detect_mangled_index_symbol("PXW.X")
+    assert "UNDERLYING=" in feed_compare._detect_mangled_index_symbol("PXW.X")
+    # Real symbols must not trip it.
+    for good in ("SPY", "QQQ", "$SPXW.X", "$VIX.X", ""):
+        assert feed_compare._detect_mangled_index_symbol(good) is None
+
+
+def test_a_permanently_failing_spot_poll_gives_up_early():
+    """A wrong endpoint will still be wrong in twenty seconds.
+
+    The original probe waited out its full deadline and then reported "no
+    spot price available", discarding the one line that said why.
+    """
+    import time as _time
+
+    class _Failing(_RoutingProvider):
+        def _stream(self, kind, symbol):
+            class _S:
+                last_error = "ValueError: No data found for: stock_snapshot_ohlc(PXW,nqb,None)"
+
+                def start(self_inner):
+                    pass
+
+                def stop(self_inner):
+                    pass
+
+                def drain(self_inner):
+                    return None
+
+            return _S()
+
+    started = _time.monotonic()
+    with pytest.raises(RuntimeError, match="No data found"):
+        feed_compare._spot_from_provider(_Failing(), "SPY")
+    assert _time.monotonic() - started < 5, "waited out the deadline on a hard failure"
