@@ -336,7 +336,14 @@ class MarketDataProvider(abc.ABC):
     def get_option_expirations(
         self, underlying: str, strike_price: Optional[float] = None
     ) -> List[date]:
-        """Listed expirations for ``underlying``, ascending."""
+        """Currently listed expirations for ``underlying``, ascending.
+
+        NOT the vendor's full history. Some feeds answer this from a
+        reference database going back a decade; callers here are building
+        a live chain and slice the front of this list, so an implementation
+        that leaks expired dates hands them dead contracts that quote
+        empty. Filter to today or later in the implementation.
+        """
 
     @abc.abstractmethod
     def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:

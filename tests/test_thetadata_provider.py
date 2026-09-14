@@ -9,7 +9,7 @@ must still be confirmed on first contact with a real terminal.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -312,16 +312,44 @@ def test_strikes_require_an_expiration():
 
 
 def test_expirations_are_sorted_and_deduplicated():
+    near = date.today() + timedelta(days=4)
+    far = date.today() + timedelta(days=11)
+
     class _C:
         def option_list_expirations(self, **kw):
             return [
-                {"expiration": "2026-09-25"},
-                {"expiration": "2026-09-18"},
-                {"expiration": "20260918"},
+                {"expiration": far.isoformat()},
+                {"expiration": near.isoformat()},
+                {"expiration": near.strftime("%Y%m%d")},
             ]
 
     out = ThetaDataProvider(_C()).get_option_expirations("SPY")
-    assert out == [date(2026, 9, 18), date(2026, 9, 25)]
+    assert out == [near, far]
+
+
+def test_expired_contracts_are_never_returned():
+    """ThetaData answers expirations from its historical reference database.
+
+    A live SPY query comes back with ~2,100 rows starting in 2012.
+    Callers slice the front of this list to build a chain, so leaking
+    history would hand them contracts that expired years ago and quote
+    empty -- which looks exactly like an outage or a bad entitlement.
+    """
+    today = date.today()
+
+    class _C:
+        def option_list_expirations(self, **kw):
+            return [
+                {"expiration": "2012-06-01"},
+                {"expiration": "2020-03-20"},
+                {"expiration": (today - timedelta(days=1)).isoformat()},
+                {"expiration": today.isoformat()},
+                {"expiration": (today + timedelta(days=7)).isoformat()},
+            ]
+
+    out = ThetaDataProvider(_C()).get_option_expirations("SPY")
+    # Today still trades (0DTE is the product), yesterday does not.
+    assert out == [today, today + timedelta(days=7)]
 
 
 def test_index_symbols_are_stripped_of_the_tradestation_decoration():

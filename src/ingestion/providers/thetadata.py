@@ -4,13 +4,20 @@ Written against the v3 gRPC client (``thetadata`` on PyPI, 1.0.10) during
 the September 2026 evaluation.  Four things about this vendor shape the
 implementation, and none of them are obvious from the interface:
 
-**1. There is no streaming API on this client.**  Every method is a
-snapshot or a history query; the package exposes no ``stream_*`` at all.
+**1. There is no streaming API on this Python client.**  Every method is
+a snapshot or a history query; the package exposes no ``stream_*`` at all.
 So the stream objects below are polling loops.  That is a better fit than
 it sounds: the ingestion engine already samples its accumulators every
 five seconds and buckets to one minute, and ThetaData's stated limit is
 8 concurrent calls with *no cap on total calls*, so a once-per-interval
 chain poll sits well inside it.
+
+Note the qualifier.  The Theta Terminal itself *does* serve a streaming
+interface — FPSS, on ``ws_port`` (25520 by default), confirmed listening
+on a live terminal 2026-09-14.  The Python package simply does not wrap
+it.  Polling is the right call for one-minute buckets, but "ThetaData has
+no streaming" would be the wrong conclusion to carry into a later
+tick-level design.
 
 **2. Snapshots are per-expiration, not per-contract.**
 ``option_snapshot_quote(symbol, expiration, strike="*", right="both")``
@@ -66,12 +73,21 @@ feed is usable without an exchange licence.  Do not add averaging of
 repeated polls of a static quote here, however tempting it is as a noise
 reduction — that is the same thing by another name.
 
-**Unverified against the live API.**  This was written from the wheel's
-signatures, not from a running terminal.  The response column names in
-particular come from the server at runtime rather than from any constant
-in the package, so :data:`_FIELD_CANDIDATES` lists plausible spellings and
-takes the first that appears.  Confirm them on first contact and prune the
-lists.
+**Partly unverified against the live API.**  This was written from the
+wheel's signatures rather than from a running terminal.  Confirmed since
+against a live terminal (2026-09-14): the client reaches a local terminal
+with no ``mdds_host``/``mdds_port`` override, and
+``option_list_expirations`` answers from the historical reference database
+(see :meth:`ThetaDataProvider.get_option_expirations`).
+
+Still unconfirmed are the response column names, which come from the
+server at runtime rather than from any constant in the package.
+:data:`_FIELD_CANDIDATES` therefore lists plausible spellings and takes
+the first that appears.  Run ``make feed-probe PROVIDER=thetadata``, which
+calls :meth:`ThetaDataProvider.describe_columns` and prints what the
+server actually sent, then prune each tuple to the real spelling.  Until
+then a wrong guess is not silent: :func:`report_unmapped` logs the columns
+that arrived rather than letting the chain come back mysteriously empty.
 """
 
 from __future__ import annotations
@@ -127,6 +143,11 @@ _FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {
     "ms_of_day": ("ms_of_day", "ms", "time"),
     "date": ("date",),
 }
+
+#: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
+#: diagnostic covers the index endpoints too. VIX because it is one of the
+#: symbols this deployment actually needs and is cheap to ask for.
+_DIAGNOSTIC_INDEX = "VIX"
 
 #: Strikes arrive in thousandths on OPRA-derived feeds. A strike of 650
 #: reported as 650000 is the single most likely unit bug in this module,
@@ -215,6 +236,40 @@ def _pick(row: Dict[str, Any], field: str) -> Any:
         if key in row and row[key] is not None:
             return row[key]
     return None
+
+
+#: Column shapes already reported, so a mismapped endpoint warns once per
+#: shape rather than once per poll.
+_REPORTED_SHAPES: set = set()
+_REPORTED_LOCK = threading.Lock()
+
+
+def report_unmapped(kind: str, rows: Sequence[Dict[str, Any]], fields: Sequence[str]) -> None:
+    """Warn, once per column shape, when rows arrive but nothing maps.
+
+    This exists because the failure is otherwise invisible. If the server
+    spells the strike column something :data:`_FIELD_CANDIDATES` does not
+    list, every row is skipped and the chain comes back empty — which
+    reads exactly like a closed market or an unentitled symbol. Naming the
+    columns that actually arrived turns a silent zero into a one-line fix.
+    """
+    if not rows:
+        return
+    shape = (kind, frozenset(rows[0].keys()))
+    with _REPORTED_LOCK:
+        if shape in _REPORTED_SHAPES:
+            return
+        _REPORTED_SHAPES.add(shape)
+    logger.warning(
+        "thetadata %s: %d row(s) returned but no %s column matched. "
+        "Columns present: %s. Expected one of: %s. "
+        "Add the real spelling to _FIELD_CANDIDATES.",
+        kind,
+        len(rows),
+        " / ".join(fields),
+        sorted(rows[0].keys()),
+        {f: _FIELD_CANDIDATES.get(f, ()) for f in fields},
+    )
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -670,11 +725,14 @@ class ThetaDataProvider(MarketDataProvider):
         wanted: Dict[Tuple[str, date, float, str], str],
         out: Dict[str, Dict[str, Any]],
     ) -> None:
-        for row in _rows(frame):
+        rows = _rows(frame)
+        matched = 0
+        for row in rows:
             strike = _normalise_strike(_pick(row, "strike"))
             right_raw = _pick(row, "right")
             if strike is None or right_raw is None:
                 continue
+            matched += 1
             right = "C" if str(right_raw).strip() in self._CALL_CODES else "P"
             symbol = wanted.get((root, expiration, round(strike, 4), right))
             if symbol is None:
@@ -693,6 +751,81 @@ class ThetaDataProvider(MarketDataProvider):
                 target["volume"] = _as_int(_pick(row, "volume"))
             elif kind == "open_interest":
                 target["open_interest"] = _as_int(_pick(row, "open_interest"))
+        if matched == 0:
+            report_unmapped(kind, rows, ("strike", "right"))
+
+    def describe_columns(self, underlying: str = "SPY") -> Dict[str, Dict[str, Any]]:
+        """One call per endpoint, reporting the columns the server actually sends.
+
+        :data:`_FIELD_CANDIDATES` was written from the wheel's signatures
+        rather than from a live terminal, and the response columns are
+        server-supplied. This is how you replace those guesses with facts:
+        run it once against a running terminal, then prune each candidate
+        tuple down to the spelling that appears here.
+
+        Diagnostic only. It makes live calls but writes nothing, touches no
+        accumulator, and is never on the ingestion path.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+
+        expirations = self.get_option_expirations(underlying)
+        if not expirations:
+            return {"error": {"detail": f"no expirations returned for {underlying}"}}
+        expiration = expirations[0]
+
+        probes = [
+            (
+                "option_quote",
+                self._quote_call,
+                {
+                    "symbol": underlying,
+                    "expiration": expiration,
+                    "strike": "*",
+                    "right": "both",
+                },
+            ),
+            (
+                "option_ohlc",
+                self._client.option_snapshot_ohlc,
+                {
+                    "symbol": underlying,
+                    "expiration": expiration,
+                    "strike": "*",
+                    "right": "both",
+                },
+            ),
+            (
+                "option_open_interest",
+                self._client.option_snapshot_open_interest,
+                {
+                    "symbol": underlying,
+                    "expiration": expiration,
+                    "strike": "*",
+                    "right": "both",
+                },
+            ),
+            ("stock_quote", self._client.stock_snapshot_quote, {"symbol": underlying}),
+            ("stock_ohlc", self._client.stock_snapshot_ohlc, {"symbol": underlying}),
+            # The index endpoints serve SPX / NDX / VIX / VXN spot, which is
+            # a different licence and may well be a different row shape.
+            ("index_ohlc", self._client.index_snapshot_ohlc, {"symbol": _DIAGNOSTIC_INDEX}),
+        ]
+
+        for name, fn, kwargs in probes:
+            try:
+                rows = _rows(fn(**kwargs))
+            except Exception as e:  # noqa: BLE001 - a diagnostic reports
+                out[name] = {"error": f"{type(e).__name__}: {e}"}  # failures,
+                continue  # it does not raise
+            if not rows:
+                out[name] = {"rows": 0, "columns": [], "sample": {}}
+                continue
+            out[name] = {
+                "rows": len(rows),
+                "columns": sorted(rows[0].keys()),
+                "sample": {k: rows[0][k] for k in sorted(rows[0].keys())},
+            }
+        return out
 
     # -- streams -----------------------------------------------------------
 
@@ -782,11 +915,17 @@ class ThetaDataProvider(MarketDataProvider):
         self._CAPABILITIES.require("option_chain_discovery")
         root = underlying.upper().lstrip("$").split(".")[0]
         frame = self._client.option_list_expirations(symbol=root)
+        # ThetaData answers this from its historical reference database:
+        # SPY comes back with ~2,100 expirations starting in 2012. Callers
+        # slice the front of this list to build a live chain, so handing
+        # back history would hand them contracts that expired years ago and
+        # quote empty. Confirmed against a live terminal, 2026-09-14.
+        today = datetime.now(timezone.utc).date()
         out: List[date] = []
         for row in _rows(frame):
             value = _pick(row, "expiration")
             parsed = _coerce_date(value)
-            if parsed is not None:
+            if parsed is not None and parsed >= today:
                 out.append(parsed)
         return sorted(set(out))
 
