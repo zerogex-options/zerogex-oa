@@ -40,11 +40,7 @@ the Action Card did not:
    does not exist, so a faithfully-rounded leg would never fill. On QQQ — the
    symbol the edge was measured on — the grid IS $1, so the measured
    behaviour is unchanged.
-2. **Entry is restricted to the last half hour** of the session. The pattern's
-   entry trigger is ``at_close``; a bot ticking every 5 seconds would
-   otherwise open a multi-day drift trade at 09:35 on a thesis that was
-   measured on closing entries.
-3. **A conviction floor applies that the pattern does not have.** The engine
+2. **A conviction floor applies that the pattern does not have.** The engine
    refuses to open below ``confidence_threshold``; the pattern cards every
    setup that clears its triggers and lets confidence ride along. So this bot
    is strictly more selective than the pattern near that floor — notably, a
@@ -53,12 +49,15 @@ the Action Card did not:
    is calibrated against the floor so the passing set is not empty (see the
    conviction comment in ``open_criteria``), and the bot screen measures the
    bot as configured.
-4. **The stop is the premium stop plus a gradient-decay exit**, because the
+3. **The stop is the premium stop plus a gradient-decay exit**, because the
    pattern's stop is ``kind="signal_event"`` with no spot level to hand the
    reconciler: ``gradient_decay_below_20_or_-50pct_premium``. Both halves are
    implemented — ``max_premium_loss_pct`` 0.50 and an ``exit_criteria``
-   override that closes when the gradient decays under 20.
-5. **Expiry walks WEEKDAYS, not calendar days** (``resolve_expiration_iso``).
+   override that closes when the gradient decays under 20, plus a per-bot
+   ``premium_stop_grace_seconds`` so that stop measures MOVES and not the
+   entry bid/ask gap (the fleet's 45s default is shorter than one replay
+   step).
+4. **Expiry walks WEEKDAYS, not calendar days** (``resolve_expiration_iso``).
    The pattern adds 5 *calendar* days, which lands on a Saturday for a Monday
    entry and a Sunday for a Tuesday entry. The backtester matches expiry
    EXACTLY (``AND expiration = %s`` in ``_fetch_leg_quote_from``; only strike
@@ -69,6 +68,23 @@ the Action Card did not:
    alone; it is not evidence that the bot is wrong. The pattern's arithmetic
    is a latent bug, but fixing it changes live signal output and invalidates
    the existing calibration record, so it is a separate decision.
+
+First-screen corrections (2026-09-13, 1 trade / PF 0.00 / 5-minute hold)
+------------------------------------------------------------------------
+Two defects in this bot's own configuration, both found by that screen and
+both fixed here:
+
+* An earlier revision restricted entry to the last 30 minutes of the session,
+  on the reading that the pattern's ``Entry(trigger="at_close")`` meant
+  "enter at the closing print". It does not — ``at_close`` is a member of
+  ``playbook.backtest._IMMEDIATE_TRIGGERS``, so it means "fill at this bar, at
+  market". The pattern emits on every scoring cycle all session and the
+  backtester fills immediately, the per-pattern cooldown collapsing the
+  stream. The window cut the opportunity set by ~92% and is gone.
+* The only trade closed after one replay step on ``premium_stop``. The fleet
+  grace is 45s while the harness replays at 5-minute steps, so the stop was
+  measured bid-vs-ask on a fresh position — the exact failure the grace
+  exists to prevent. Hence ``premium_stop_grace_seconds`` above.
 
 Nothing here is funded on the pattern's evidence. ``is_provisionable``
 requires an EDGE screen from a *bot* harness, so writing this bot makes the
@@ -138,11 +154,6 @@ class GexGradientDrift(BaseBot):
     def open_criteria(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
         if snap.spot <= 0:
             return self._skip("no_close")
-
-        # -- Entry window: the pattern enters at_close (see divergence 2).
-        mtc = snap.minutes_to_close
-        if mtc is None or mtc > float(self.params.get("max_minutes_to_close", 30)):
-            return self._skip("not_at_close")
 
         # -- Gate 1: the gradient itself must be decisively one-sided.
         grad = snap.component_score("gex_gradient")

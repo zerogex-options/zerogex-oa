@@ -1127,12 +1127,18 @@ _TREND: Tuple[StrategyEntry, ...] = (
         # Live-engine specifics the Action Card had no need for. See the bot's
         # module docstring for why each one exists.
         bot_params={
-            # The pattern enters at_close; without a window a 5-second tick
-            # loop would open a multi-day drift trade at 09:35.
-            "max_minutes_to_close": 30,
             # The pattern's stop is a signal event, so the premium half of
             # "gradient_decay_below_20_or_-50pct_premium" lives here.
             "max_premium_loss_pct": 0.50,
+            # ...and this is what keeps that stop measuring MOVES rather than
+            # the entry bid/ask gap. The fleet default (45s) is sized for
+            # tight 0DTE ATM debits marked every few seconds; a 5-DTE OTM
+            # single leg can show a >50% spread at entry, and the research
+            # harness replays at 5-minute steps so a 45s grace has already
+            # expired by the first mark. The first screen (2026-09-13)
+            # closed its only trade in 5 minutes on premium_stop for exactly
+            # that reason. 20 minutes clears any sane replay interval.
+            "premium_stop_grace_seconds": 1200,
             # Mirrors the pattern's pattern_base = 0.50.
             "confidence_base_default": 0.50,
             # Mirrors the pattern's size_multiplier = 0.5 on every card.
@@ -1171,6 +1177,35 @@ _TREND: Tuple[StrategyEntry, ...] = (
                     "matches expiry exactly, so those cards found no quote and were "
                     "dropped — these 33 trades are therefore filtered by day of week, "
                     "not a clean 60-day sample."
+                ),
+            ),
+            ResearchRun(
+                ran_on=date(2026, 9, 13),
+                window_days=60,
+                trades=1,
+                verdict=Verdict.INVALID,
+                profit_factor=0.0,
+                expectancy=-34.70,
+                win_rate=0.0,
+                harness="tradeworkz-backtest",
+                tuning_generation=0,
+                symbols=("SPY", "QQQ", "SPX"),
+                notes=(
+                    "First bot screen. NOT a test of the thesis — two defects in the "
+                    "bot's own configuration made the run vacuous, so it is recorded "
+                    "INVALID and does not count toward anything. (1) Entry was "
+                    "restricted to the last 30 minutes of the session on a misreading "
+                    "of the pattern's Entry(trigger='at_close'), which is an IMMEDIATE "
+                    "fill trigger ('fill at this bar, at market'), not a closing-bell "
+                    "restriction — that cut the opportunity set ~92% and is why only "
+                    "one trade fired. (2) That trade closed after a single 5-minute "
+                    "replay step on premium_stop: the fleet's 45s premium-stop grace is "
+                    "shorter than one replay step, so the stop was measured bid-vs-ask "
+                    "on a fresh position instead of on an adverse move. Both fixed "
+                    "(entry window removed; premium_stop_grace_seconds=1200). Signal "
+                    "coverage was verified healthy first (gex_gradient 19,945 rows, "
+                    "volatility_regime on all 37,013 signal_scores rows over the "
+                    "window), so the gates had their inputs. Re-screen required."
                 ),
             ),
         ),

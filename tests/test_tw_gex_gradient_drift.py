@@ -221,16 +221,49 @@ def test_conviction_still_filters_the_weakest_corner():
     assert bot.miss_reasons == {"conviction": 1}
 
 
-def test_does_not_open_outside_the_at_close_window():
-    """The pattern's entry trigger is at_close.
+def test_opens_anywhere_in_the_session_like_the_pattern():
+    """Regression for the first screen's 1-trade result.
 
-    Without this the 5-second tick loop would open a multi-day drift trade at
-    09:35 on a thesis measured on closing entries.
+    An earlier revision restricted entry to the last 30 minutes, reading the
+    pattern's ``Entry(trigger="at_close")`` as "enter at the closing print".
+    It is not — ``at_close`` is in ``playbook.backtest._IMMEDIATE_TRIGGERS``,
+    meaning "fill at this bar, at market". The pattern emits all session, so
+    restricting the bot cut its opportunity set by ~92%.
     """
     ctx = _ctx()
     morning = datetime(2026, 5, 1, 13, 40, tzinfo=timezone.utc)  # 09:40 ET
-    assert _bot().open_criteria(_snap(ctx, timestamp=morning)) is None
-    assert _bot().open_criteria(_snap(ctx, timestamp=_AT_CLOSE)) is not None
+    midday = datetime(2026, 5, 1, 16, 30, tzinfo=timezone.utc)  # 12:30 ET
+    for ts in (morning, midday, _AT_CLOSE):
+        assert _bot().open_criteria(_snap(ctx, timestamp=ts)) is not None, ts
+
+
+def test_at_close_really_is_an_immediate_fill_trigger():
+    """Pins the fact the correction rests on, so it cannot be re-misread."""
+    from src.signals.playbook.backtest import _IMMEDIATE_TRIGGERS
+    from src.signals.playbook.patterns.gex_gradient_trend import PATTERN
+
+    card = PATTERN.match(_ctx())
+    assert card is not None
+    assert card.entry.trigger == "at_close"
+    assert card.entry.trigger in _IMMEDIATE_TRIGGERS
+
+
+def test_premium_stop_grace_outlasts_a_replay_step():
+    """The other half of the first screen's failure.
+
+    Its single trade closed after one 5-minute replay step on
+    ``premium_stop``: the fleet grace is 45s, so the stop was measured
+    bid-vs-ask on a fresh position — the exact thing the grace exists to
+    prevent. A grace shorter than one step protects nothing.
+    """
+    from src.tradeworkz.backtest import _DEFAULT_INTERVAL_MIN
+
+    grace = _bot()._premium_stop_grace_seconds()
+    assert grace > _DEFAULT_INTERVAL_MIN * 60, grace
+    # And it is a per-bot override, not a fleet-wide change.
+    from src.tradeworkz import config as tw_config
+
+    assert grace != tw_config.PREMIUM_STOP_GRACE_SECONDS
 
 
 def test_strike_snaps_to_the_underlyings_real_grid():
@@ -412,8 +445,11 @@ def test_bot_params_carry_the_live_engine_specifics_over_catalog_defaults():
     assert effective["target_atr_mult"] == 1.5
     assert effective["dte_target"] == 5
     # Live-only additions.
-    assert effective["max_minutes_to_close"] == 30
     assert effective["static_size_multiplier"] == 0.5
+    assert effective["max_premium_loss_pct"] == 0.50
+    assert effective["premium_stop_grace_seconds"] == 1200
+    # The entry window is gone — see the first-screen correction.
+    assert "max_minutes_to_close" not in effective
 
 
 def test_writing_the_bot_does_not_fund_it():

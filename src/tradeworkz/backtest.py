@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -832,6 +833,17 @@ def summarize_bot(runner: _BotRunner, split_at: Optional[datetime] = None) -> Di
         "avg_hold_min": round(sum(t.hold_minutes for t in trades) / n, 1) if n else 0.0,
         "bias_vetoed": runner.vetoed,
         "no_quote_opens": runner.no_quote_opens,
+        # Why each round-trip closed, most frequent first. Without this a
+        # short-hold screen is undiagnosable: a 1-trade run with a 5-minute
+        # hold could be a target, a stop, or the premium stop firing on the
+        # entry bid/ask gap, and the aggregate numbers cannot tell you which.
+        "exit_reasons": dict(
+            sorted(
+                Counter(t.reason for t in trades).items(),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+        ),
         # Signals that cleared open_criteria, and where any that did not become
         # positions were rejected at the entry-viability gate. A large
         # ``signals`` with 0 trades and non-empty ``entry_rejects`` means the
@@ -951,6 +963,19 @@ def format_report(result: Dict[str, Any]) -> str:
                 f"test {te['n_trades']}t/{te['expectancy']:+.0f}$ | "
                 f"{'ROBUST' if split['robust'] else 'not robust'}"
             )
+        # Exit-reason mix. On a thin or short-hold screen this is the line
+        # that says WHY, so the reader is not left inferring it from
+        # aggregates — e.g. 'premium_stop' dominating with a hold close to the
+        # replay interval means the stop is firing on the entry spread rather
+        # than on an adverse move.
+        exits = b.get("exit_reasons") or {}
+        if exits:
+            mix = ", ".join(f"{reason} {count}" for reason, count in exits.items())
+            lines.append(f"{'  └ exits':<26}{'':>40}  {mix}")
+        misses = b.get("miss_reasons") or {}
+        if misses and b.get("n_trades", 0) < _MIN_TRADES_FOR_VERDICT:
+            top = ", ".join(f"{r} {c}" for r, c in list(misses.items())[:4])
+            lines.append(f"{'  └ gates':<26}{'':>40}  {top}")
     f = result.get("fleet", {})
     lines.append("-" * 92)
     lines.append(
