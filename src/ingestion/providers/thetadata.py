@@ -113,8 +113,9 @@ import re
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.ingestion.providers.base import (
     Bar,
@@ -124,6 +125,7 @@ from src.ingestion.providers.base import (
     OptionQuoteStream,
     ProviderCapabilities,
 )
+from src.symbols import is_cash_index, resolve_underlying_from_option_root
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -177,6 +179,14 @@ _FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {
     "timestamp": ("timestamp",),
 }
 
+#: Concurrent chain requests. A live terminal reports "Max concurrent
+#: requests: 8" for this account, and the bar-stream pollers draw on that
+#: same budget, so the chain fetch deliberately leaves headroom rather than
+#: claiming all eight: a bar poll that loses the race backs off
+#: exponentially, which is a far worse outcome than one slower chain cycle.
+#: Override with THETADATA_MAX_CONCURRENCY; 1 restores sequential fetching.
+_DEFAULT_MAX_CONCURRENCY = 6
+
 #: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
 #: diagnostic covers the index endpoints too. VIX because it is one of the
 #: symbols this deployment actually needs and is cheap to ask for.
@@ -187,6 +197,54 @@ _OCC_RE = re.compile(
     r"(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})"
     r"(?P<cp>[CP])(?P<strike>\d{8})$"
 )
+
+
+def option_root_for(symbol: str) -> str:
+    """ThetaData option root for a ZeroGEX/TradeStation underlying.
+
+    ``$SPXW.X -> SPXW``, ``SPY -> SPY``. ThetaData keys option endpoints on
+    the OCC root, which is what survives stripping TradeStation's ``$`` and
+    ``.X`` decoration.
+    """
+    return (symbol or "").upper().lstrip("$").split(".")[0]
+
+
+def index_symbol_for(symbol: str) -> str:
+    """ThetaData index symbol for a ZeroGEX/TradeStation underlying.
+
+    This is NOT the option root, and conflating the two is why an SPX probe
+    failed with ``No data found for: index_snapshot_ohlc(SPXW)``. ``SPXW``
+    is the root of SPX's weekly *option* chain; the *index* whose level
+    those options settle against is ``SPX``, and ThetaData has no index
+    called SPXW. Same for ``NDXP`` -> ``NDX``.
+
+    Resolution order, most authoritative first:
+
+    1. ``resolve_underlying_from_option_root``, which reads the deployment's
+       configured ``OPTION_ROOT_ALIASES`` / ``SYMBOL_ALIASES``.
+    2. The root as-is, when it is already a known cash index.
+    3. Dropping a single trailing settlement marker (the ``W`` of weeklys,
+       the ``P`` of PM-settled) -- but ONLY when that yields a recognised
+       cash index. So ``SPXW -> SPX`` and ``NDXP -> NDX``, while ``VIX``,
+       ``VXN`` and ``RUT`` are returned untouched rather than mangled into
+       ``VI``, ``VX`` and ``RU``.
+
+    Step 3 exists because step 1 needs env configuration that a probe or a
+    fresh checkout may not have, and silently querying a symbol that does
+    not exist is the failure this function was written to end.
+    """
+    root = option_root_for(symbol)
+    if not root:
+        return root
+
+    resolved = resolve_underlying_from_option_root(root)
+    if resolved and resolved != root and is_cash_index(resolved):
+        return resolved
+    if is_cash_index(root):
+        return root
+    if len(root) > 3 and is_cash_index(root[:-1]):
+        return root[:-1]
+    return root
 
 
 def parse_occ_symbol(symbol: str) -> Optional[Tuple[str, date, float, str]]:
@@ -581,6 +639,10 @@ class _PollingBarStream(BarStream):
 # ---------------------------------------------------------------------------
 
 
+def _log_snapshot_failure(kind: str, root: str, expiration: date, error: Exception) -> None:
+    logger.warning("thetadata %s snapshot failed for %s %s: %s", kind, root, expiration, error)
+
+
 class ThetaDataProvider(MarketDataProvider):
     """ThetaData, via the v3 gRPC client and a local Theta Terminal.
 
@@ -626,20 +688,26 @@ class ThetaDataProvider(MarketDataProvider):
         oi_poll_interval: float = 900.0,
         strike_range: Optional[int] = None,
         market_value_endpoints: bool = False,
+        max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
     ):
         self._client = client
         self.stage = stage
         self._poll_interval = poll_interval
         self._oi_poll_interval = oi_poll_interval
         self._strike_range = strike_range
-        # Which mechanism selects the Market Value feed. See the module
-        # docstring: ThetaData support said "terminal stage", but the
-        # terminal's own config.toml shows `stage` selecting
-        # mdds-stage.thetadata.us, documented in that file as "TESTING
-        # ONLY! Occasional reboots ... not stable" -- a staging
-        # environment, not a fee-exempt product. Until that is resolved,
-        # support BOTH so whichever answer comes back works without a
-        # rewrite.
+        self._max_concurrency = max(1, int(max_concurrency))
+        # One pool for the whole provider, not one per call. Every option
+        # stream shares this instance, and the concurrency limit belongs to
+        # the ACCOUNT, not to a call site: four per-underlying streams each
+        # opening their own pool of eight would put 32 requests in flight
+        # against a budget of 8. Created lazily so constructing a provider
+        # (which tests do constantly) starts no threads.
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor_lock = threading.Lock()
+        # Which mechanism selects the Market Value feed. For the snapshot
+        # path this module uses, that is the dedicated *_market_value
+        # endpoints on a single terminal; the terminal "stage" selects it
+        # for websocket streaming instead. See the module docstring.
         self._market_value_endpoints = market_value_endpoints
 
     @classmethod
@@ -676,12 +744,15 @@ class ThetaDataProvider(MarketDataProvider):
         return cls(
             client,
             stage=resolved_stage,
-            # Default the MV stage to the endpoint mechanism, since the
-            # terminal's config.toml makes the "stage" reading look wrong.
-            # THETADATA_MV_VIA_ENDPOINTS=0 restores port-based selection if
-            # ThetaData confirms otherwise.
+            # The snapshot path selects Market Value per call, via the
+            # *_market_value endpoints on a single terminal (confirmed with
+            # ThetaData 2026-09-14). THETADATA_MV_VIA_ENDPOINTS=0 restores
+            # port/stage selection, which belongs to the streaming path.
             market_value_endpoints=(
                 is_mv and os.getenv("THETADATA_MV_VIA_ENDPOINTS", "1").strip() != "0"
+            ),
+            max_concurrency=int(
+                os.getenv("THETADATA_MAX_CONCURRENCY", str(_DEFAULT_MAX_CONCURRENCY))
             ),
             poll_interval=float(os.getenv("THETADATA_POLL_SECONDS", "5")),
             oi_poll_interval=float(os.getenv("THETADATA_OI_POLL_SECONDS", "900")),
@@ -726,35 +797,98 @@ class ThetaDataProvider(MarketDataProvider):
             groups[(root, expiration)].append(symbol)
             wanted[(root, expiration, round(strike, 4), right)] = symbol
 
-        out: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        endpoints: List[Tuple[str, Callable[..., Any]]] = [
+            ("quote", self._quote_call),
+            ("ohlc", self._client.option_snapshot_ohlc),
+        ]
+        if include_open_interest:
+            endpoints.append(("open_interest", self._client.option_snapshot_open_interest))
+
+        units: List[Tuple[str, Callable[..., Any], Dict[str, Any], str, date]] = []
         for root, expiration in groups:
-            calls = [("quote", self._quote_call), ("ohlc", self._client.option_snapshot_ohlc)]
-            if include_open_interest:
-                calls.append(("open_interest", self._client.option_snapshot_open_interest))
-            for kind, fn in calls:
-                try:
-                    kwargs: Dict[str, Any] = {
-                        "symbol": root,
-                        "expiration": expiration,
-                        "strike": "*",
-                        "right": "both",
-                    }
-                    if self._strike_range is not None:
-                        kwargs["strike_range"] = self._strike_range
-                    frame = fn(**kwargs)
-                except Exception as e:  # noqa: BLE001 - one endpoint failing
-                    # must not lose the others; a chain with quotes but no
-                    # OI is degraded, a chain with nothing is an outage.
-                    logger.warning(
-                        "thetadata %s snapshot failed for %s %s: %s",
-                        kind,
-                        root,
-                        expiration,
-                        e,
-                    )
-                    continue
-                self._merge_frame(frame, kind, root, expiration, wanted, out)
+            for kind, fn in endpoints:
+                kwargs: Dict[str, Any] = {
+                    "symbol": root,
+                    "expiration": expiration,
+                    "strike": "*",
+                    "right": "both",
+                }
+                if self._strike_range is not None:
+                    kwargs["strike_range"] = self._strike_range
+                units.append((kind, fn, kwargs, root, expiration))
+
+        out: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        for frame, kind, root, expiration in self._gather(units):
+            # Merged on THIS thread, not in the workers. The parallelism
+            # that pays is the network wait; merging concurrently would buy
+            # microseconds and cost every shared-state guarantee in
+            # _merge_frame. Endpoints write disjoint keys, so order does not
+            # matter.
+            self._merge_frame(frame, kind, root, expiration, wanted, out)
         return dict(out)
+
+    def _executor_for(self) -> ThreadPoolExecutor:
+        """The shared pool, created on first use."""
+        with self._executor_lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_concurrency,
+                    thread_name_prefix="thetadata-chain",
+                )
+            return self._executor
+
+    def _gather(
+        self,
+        units: Sequence[Tuple[str, Callable[..., Any], Dict[str, Any], str, date]],
+    ) -> List[Tuple[Any, str, str, date]]:
+        """Run the snapshot calls, up to ``max_concurrency`` at a time.
+
+        A cycle is one call per (root, expiration, endpoint) and each spends
+        about half a second waiting on the terminal, so running them one
+        after another made the real cadence a multiple of the configured
+        poll interval: four underlyings x three expirations x two endpoints
+        is ~16s against a THETADATA_POLL_SECONDS of 5, and cycles simply
+        overlapped.
+
+        A failing endpoint is logged and dropped, never raised: a chain with
+        quotes but no open interest is degraded, a chain with nothing is an
+        outage, and the caller can tell those apart only if the degraded
+        case still returns.
+        """
+        if not units:
+            return []
+
+        results: List[Tuple[Any, str, str, date]] = []
+
+        if self._max_concurrency <= 1 or len(units) == 1:
+            # Sequential. Also what tests exercise, so the merge logic is
+            # verified without a scheduler in the way.
+            for kind, fn, kwargs, root, expiration in units:
+                try:
+                    results.append((fn(**kwargs), kind, root, expiration))
+                except Exception as e:  # noqa: BLE001 - see docstring
+                    _log_snapshot_failure(kind, root, expiration, e)
+            return results
+
+        pool = self._executor_for()
+        futures = {
+            pool.submit(fn, **kwargs): (kind, root, expiration)
+            for kind, fn, kwargs, root, expiration in units
+        }
+        for future in as_completed(futures):
+            kind, root, expiration = futures[future]
+            try:
+                results.append((future.result(), kind, root, expiration))
+            except Exception as e:  # noqa: BLE001 - see docstring
+                _log_snapshot_failure(kind, root, expiration, e)
+        return results
+
+    def close(self) -> None:
+        """Shut the shared pool down. Safe to call more than once."""
+        with self._executor_lock:
+            executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     def _quote_call(self, **kwargs: Any) -> Any:
         """The quote endpoint, honouring whichever Market Value mechanism
@@ -837,12 +971,19 @@ class ThetaDataProvider(MarketDataProvider):
             return {"error": {"detail": f"no expirations returned for {underlying}"}}
         expiration = expirations[0]
 
+        # The endpoints speak ThetaData's vocabulary, not TradeStation's.
+        # Passing "$SPXW.X" straight through made every probe line read
+        # "No data found", which says nothing about entitlement or columns.
+        option_root = option_root_for(underlying)
+        index_root = index_symbol_for(underlying)
+        equity_root = option_root
+
         probes = [
             (
                 "option_quote",
                 self._quote_call,
                 {
-                    "symbol": underlying,
+                    "symbol": option_root,
                     "expiration": expiration,
                     "strike": "*",
                     "right": "both",
@@ -852,7 +993,7 @@ class ThetaDataProvider(MarketDataProvider):
                 "option_ohlc",
                 self._client.option_snapshot_ohlc,
                 {
-                    "symbol": underlying,
+                    "symbol": option_root,
                     "expiration": expiration,
                     "strike": "*",
                     "right": "both",
@@ -862,17 +1003,23 @@ class ThetaDataProvider(MarketDataProvider):
                 "option_open_interest",
                 self._client.option_snapshot_open_interest,
                 {
-                    "symbol": underlying,
+                    "symbol": option_root,
                     "expiration": expiration,
                     "strike": "*",
                     "right": "both",
                 },
             ),
-            ("stock_quote", self._client.stock_snapshot_quote, {"symbol": underlying}),
-            ("stock_ohlc", self._client.stock_snapshot_ohlc, {"symbol": underlying}),
+            ("stock_quote", self._client.stock_snapshot_quote, {"symbol": equity_root}),
+            ("stock_ohlc", self._client.stock_snapshot_ohlc, {"symbol": equity_root}),
             # The index endpoints serve SPX / NDX / VIX / VXN spot, which is
             # a different licence and may well be a different row shape.
-            ("index_ohlc", self._client.index_snapshot_ohlc, {"symbol": _DIAGNOSTIC_INDEX}),
+            # Probed with the symbol's OWN index when it has one, so an
+            # index underlying reports on the feed it will actually use.
+            (
+                "index_ohlc",
+                self._client.index_snapshot_ohlc,
+                {"symbol": index_root if index_root != equity_root else _DIAGNOSTIC_INDEX},
+            ),
         ]
 
         for name, fn, kwargs in probes:
@@ -924,7 +1071,7 @@ class ThetaDataProvider(MarketDataProvider):
     ) -> BarStream:
         self._CAPABILITIES.require("underlying_bars")
         resolved = db_symbol or symbol
-        root = symbol.upper().lstrip("$").split(".")[0]
+        root = option_root_for(symbol)
 
         def fetch() -> Optional[Bar]:
             frame = self._client.stock_snapshot_ohlc(symbol=root)
@@ -945,7 +1092,9 @@ class ThetaDataProvider(MarketDataProvider):
     ) -> BarStream:
         self._CAPABILITIES.require("index_bars")
         resolved = db_symbol or symbol
-        root = symbol.upper().lstrip("$").split(".")[0]
+        # The INDEX, not the option root: SPX's weekly chain is rooted
+        # "SPXW" but there is no index by that name. See index_symbol_for.
+        root = index_symbol_for(symbol)
 
         def fetch() -> Optional[Bar]:
             frame = self._client.index_snapshot_ohlc(symbol=root)
@@ -977,7 +1126,7 @@ class ThetaDataProvider(MarketDataProvider):
         self, underlying: str, strike_price: Optional[float] = None
     ) -> List[date]:
         self._CAPABILITIES.require("option_chain_discovery")
-        root = underlying.upper().lstrip("$").split(".")[0]
+        root = option_root_for(underlying)
         frame = self._client.option_list_expirations(symbol=root)
         # ThetaData answers this from its historical reference database:
         # SPY comes back with ~2,100 expirations starting in 2012. Callers
@@ -995,7 +1144,7 @@ class ThetaDataProvider(MarketDataProvider):
 
     def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:
         self._CAPABILITIES.require("option_chain_discovery")
-        root = underlying.upper().lstrip("$").split(".")[0]
+        root = option_root_for(underlying)
         parsed = _coerce_date(expiration) if expiration else None
         if parsed is None:
             raise ValueError(
@@ -1017,7 +1166,7 @@ class ThetaDataProvider(MarketDataProvider):
     def build_option_symbol(
         self, underlying: str, expiration: date, strike: float, option_type: str
     ) -> str:
-        root = underlying.upper().lstrip("$").split(".")[0]
+        root = option_root_for(underlying)
         return build_occ_symbol(root, expiration, strike, option_type)
 
 
