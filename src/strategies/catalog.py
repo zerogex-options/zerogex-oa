@@ -1208,6 +1208,37 @@ _TREND: Tuple[StrategyEntry, ...] = (
                     "window), so the gates had their inputs. Re-screen required."
                 ),
             ),
+            ResearchRun(
+                ran_on=date(2026, 9, 14),
+                window_days=20,
+                trades=0,
+                verdict=Verdict.UNDERPOWERED,
+                harness="tradeworkz-backtest",
+                tuning_generation=1,
+                symbols=("SPY", "QQQ", "SPX"),
+                notes=(
+                    "Second bot screen, with the entry window and premium-stop grace "
+                    "fixed. Zero trades: 2,921 of ~3,081 ticks died at gradient_weak "
+                    "(|gex_gradient| < 40). That gate is the PATTERN's own threshold, "
+                    "and it turns out to be unreachable in a positive-gamma regime by "
+                    "arithmetic, not by luck: the gex_gradient component damps its "
+                    "reading by SIGNAL_GEX_GRADIENT_LONG_GAMMA_DAMPING (0.40) when "
+                    "net_gex > 0, and the playbook compares clamped_score x 100 against "
+                    "PLAYBOOK_GGT_GRADIENT_SCORE_MIN (40). The two constants are "
+                    "numerically identical, so a long-gamma score can only reach 40 at "
+                    "the exact theoretical maximum (all surveyed gamma strictly on one "
+                    "side of spot, zero wing concentration, full magnitude confidence) "
+                    "and never does. In negative gamma the score is undamped and the "
+                    "gate clears easily. So this strategy is negative-gamma-only, "
+                    "apparently by accident. Sign agreement (Gate 2) then narrows it "
+                    "further to 'negative gamma with gamma concentrated BELOW spot'. "
+                    "The 20-day window evidently held no such episode; the pattern's 33 "
+                    "trades over 60 days would have to be those episodes. Re-screen over "
+                    "the pattern's own 60-day window before drawing any conclusion, and "
+                    "treat the constant collision as its own decision — changing either "
+                    "constant changes live signal output."
+                ),
+            ),
         ),
     ),
     StrategyEntry(
