@@ -415,10 +415,17 @@ def _third_friday(year: int, month: int) -> date:
 # 7 is measured, not assumed: on the Sep 2026 cycle (expiry Fri Sep 18) the
 # @NQ basis against NDX sat at 8.5bp through Thu Sep 10 and stepped to 108.2bp
 # on Fri Sep 11 -- an expiring contract converged to cash, then one a quarter
-# out. @ES stepped the same day, 8.1 -> 93.7bp. CME's own roll notice is 8
-# days, which would have named December a day early. Override with
-# FUTURES_ROLL_DAYS_BEFORE_EXPIRY if the provider's behaviour changes;
-# `make futures-roll-check` re-measures it from futures_quotes.
+# out. @ES stepped the same day, 8.1 -> 93.7bp. The conventional equity-index
+# roll is 8 days (the Thursday before the third Friday), which would have
+# named December a day early here.
+#
+# What we do NOT know is the provider's RULE. The date above is observed, not
+# derived: TradeStation rolls @ES / @NQ on its own schedule and we only see
+# when it happened, not whether it keys on volume, open interest or a fixed
+# day count. So this is a measurement to re-take, not a law -- and it is why
+# our quote can differ from a platform that rolls on a different schedule.
+# Override with FUTURES_ROLL_DAYS_BEFORE_EXPIRY if the provider's behaviour
+# changes; `make futures-roll-check` re-measures it from futures_quotes.
 _MONTH_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
 _ROLL_DAYS_BEFORE_EXPIRY = _getenv_int("FUTURES_ROLL_DAYS_BEFORE_EXPIRY", 7)
 
