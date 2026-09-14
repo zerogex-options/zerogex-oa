@@ -129,34 +129,45 @@ ORDER BY local_day;
 \echo  Session-over-session change in each series, side by side. The cash
 \echo  index NEVER rolls, so it is the control: a real market move shows
 \echo  in both columns, a contract splice shows only in the future.
-\echo  divergence_bps is the difference. Expected: 0 rows between rolls.
+\echo  divergence_bps is the difference. Both legs are read at the same
+\echo  MINUTE (the last of the day where both printed): the future trades
+\echo  nearly 23h and the index does not, so comparing each series own
+\echo  close would turn every after-hours futures move into divergence.
+\echo  Expected: 0 rows between rolls.
 \echo
 
-WITH f_daily AS (
-    SELECT DISTINCT ON ((timestamp AT TIME ZONE :'local_tz')::date)
-        (timestamp AT TIME ZONE :'local_tz')::date AS local_day,
-        close::numeric                             AS fut_close
-    FROM futures_quotes
-    WHERE index_symbol = :'index_symbol'
-      AND timestamp >= now() - (:history_days * interval '1 day')
-    ORDER BY (timestamp AT TIME ZONE :'local_tz')::date, timestamp DESC
-), u_daily AS (
-    SELECT DISTINCT ON ((timestamp AT TIME ZONE :'local_tz')::date)
-        (timestamp AT TIME ZONE :'local_tz')::date AS local_day,
-        close::numeric                             AS idx_close
-    FROM underlying_quotes
-    WHERE symbol = :'index_symbol'
-      AND timestamp >= now() - (:history_days * interval '1 day')
-    ORDER BY (timestamp AT TIME ZONE :'local_tz')::date, timestamp DESC
+WITH paired AS (
+    -- Both legs sampled at the SAME MINUTE. Taking each series' own last bar
+    -- of the day compares a ~17:00 ET futures close against a ~16:00 ET cash
+    -- close, so every after-hours futures move reads as divergence: that
+    -- version returned 21 rows for NDX over 75 days, only one of them a roll.
+    -- The future trades nearly 23h and the index does not, so the only honest
+    -- comparison is a minute where both printed.
+    SELECT
+        (f.timestamp AT TIME ZONE :'local_tz')::date AS local_day,
+        f.timestamp,
+        f.close::numeric                             AS fut_close,
+        u.close::numeric                             AS idx_close
+    FROM futures_quotes f
+    JOIN underlying_quotes u
+      ON u.symbol = f.index_symbol
+     AND u.timestamp = f.timestamp
+    WHERE f.index_symbol = :'index_symbol'
+      AND f.timestamp >= now() - (:history_days * interval '1 day')
+      AND u.close > 0
+), concurrent_close AS (
+    SELECT DISTINCT ON (local_day)
+        local_day, fut_close, idx_close
+    FROM paired
+    ORDER BY local_day, timestamp DESC
 ), joined AS (
     SELECT
-        f.local_day,
-        f.fut_close,
-        u.idx_close,
-        lag(f.fut_close) OVER (ORDER BY f.local_day) AS prev_fut,
-        lag(u.idx_close) OVER (ORDER BY f.local_day) AS prev_idx
-    FROM f_daily f
-    JOIN u_daily u USING (local_day)
+        local_day,
+        fut_close,
+        idx_close,
+        lag(fut_close) OVER (ORDER BY local_day) AS prev_fut,
+        lag(idx_close) OVER (ORDER BY local_day) AS prev_idx
+    FROM concurrent_close
 )
 SELECT
     local_day,
