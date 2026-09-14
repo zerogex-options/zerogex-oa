@@ -112,6 +112,42 @@ before it reaches a screen. If the screen still shows it, the quality
 saturations (`quality_gradient_saturation`, `quality_vol_saturation`) are
 mis-set for the live distribution.
 
+### 2b-i. If the screen dies before it starts
+
+```
+psycopg2.errors.QueryCanceled: canceling statement due to statement timeout
+  ... in _chain_window
+  cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM option_chains_archive")
+```
+
+Fixed in code (2026-09-14) — pull and re-run. The cause is worth knowing
+because it will resurface anywhere else that aggregates this table without a
+predicate: `option_chains_archive` is retention-EXEMPT and grows forever, and
+**no index on it has `timestamp` as its leading column** (the PK is
+`(option_symbol, timestamp)`; the only other index is
+`(underlying, timestamp)`). Postgres can only shortcut an unqualified min/max
+to an index endpoint when the target column leads, so that query seq-scanned
+the whole archive and got slower every night until it crossed the 90-second
+`statement_timeout`.
+
+The probe now walks the distinct underlyings off the leading column of the
+existing index and takes each one's endpoints with an equality predicate —
+O(symbols x log n), no new index — bounded by its own 10-second timeout and
+falling back to the hot-table window if it still fails. Adding
+`option_chains_archive(timestamp)` would also have fixed the plan, but
+`option_chains_indexing.md` records 3.5-21 GB indexes on this family of tables
+being dropped for exactly that cost, and this query runs once per screen.
+
+Check the table you are up against:
+
+```bash
+make query SQL="SELECT relname, n_live_tup, pg_size_pretty(pg_total_relation_size(relid)) AS total FROM pg_stat_user_tables WHERE relname IN ('option_chains','option_chains_archive')"
+```
+
+If the run logs `archive coverage probe failed; clamping the replay window to
+option_chains only`, the screen still works but cannot reach past live
+retention — so a thin result there is a coverage artifact, not a verdict.
+
 ### 2c. Is the bot seeing the signals it needs?
 
 The bot reads `signal_component_scores` and `signal_scores` as-of. If the
