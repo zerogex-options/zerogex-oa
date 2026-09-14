@@ -945,8 +945,28 @@ class ThetaDataProvider(MarketDataProvider):
                 # which takes the vendor timestamp for the same reason.
                 target["timestamp"] = _coerce_datetime(_pick(row, "timestamp"))
             elif kind == "ohlc":
+                # `last` is the last trade at whatever price it happened,
+                # which stays meaningful however old it is.
                 target["last"] = _as_float(_pick(row, "last"))
-                target["volume"] = _as_int(_pick(row, "volume"))
+                # `volume` does NOT. This endpoint returns the most recent
+                # DAILY bar, so a contract that has not traded today comes
+                # back carrying the volume of the last day it did -- a live
+                # SPX probe returned Friday's single contract on a Monday.
+                #
+                # OptionQuote.volume is cumulative volume for THIS session,
+                # and the engine differences successive snapshots to get
+                # flow. Passing a prior day's figure through would book that
+                # volume as today's trades, classify it Lee-Ready into
+                # ask/bid flow, and -- when the stale figure exceeds today's
+                # first real print -- trip the engine's vendor-reset branch
+                # and count the whole stale total a second time.
+                #
+                # A contract that has not traded this session has traded
+                # zero this session, which is a fact, not a gap: 0, not None.
+                if is_prior_session(_pick(row, "timestamp")):
+                    target["volume"] = 0
+                else:
+                    target["volume"] = _as_int(_pick(row, "volume"))
             elif kind == "open_interest":
                 target["open_interest"] = _as_int(_pick(row, "open_interest"))
         if matched == 0:
@@ -1187,6 +1207,24 @@ def _bar_from_row(row: Dict[str, Any], db_symbol: str) -> Optional[Bar]:
         up_volume=None,
         down_volume=None,
     )
+
+
+def is_prior_session(value: Any) -> bool:
+    """True when this row's timestamp falls on an earlier calendar day.
+
+    Compared in the feed's OWN timezone rather than UTC. The rows arrive
+    localised to America/New_York, and the UTC date rolls over at 20:00 ET
+    (19:00 in winter) -- while the session closed at 16:00. So from 20:00 ET
+    until midnight, a UTC comparison calls that afternoon's bars a prior
+    session and zeroes their volume, every evening. Evaluating in the
+    timestamp's own zone sidesteps the question without a tz database.
+
+    ``False`` when the timestamp is missing or naive: this gates whether to
+    discard a value, and guessing wrong in that direction loses real data.
+    """
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    return value.date() < datetime.now(value.tzinfo).date()
 
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:
