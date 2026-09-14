@@ -1111,6 +1111,7 @@ help: ## Show this help message
 	@echo "$(GREEN)Feed Diagnostics:$(NC)"
 	@echo "  make futures-forensics  - Was the ES/NQ chart actually late? (SYMBOL=NDX DATE=... OPEN=08:00)"
 	@echo "  make futures-feed-logs  - Futures ingester journal around that window (same args)"
+	@echo "  make futures-roll-check - Which contract month the feed is on; finds roll splices"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
@@ -3509,6 +3510,21 @@ futures-forensics: ## Was the ES/NQ chart actually late? Read-only DB forensics.
 		-v lag_warn_sec=$(or $(LAG_WARN),90) \
 		-v history_days=$(or $(DAYS),7) \
 		-f setup/database/diagnostics/futures_feed_forensics.sql
+
+.PHONY: futures-roll-check
+futures-roll-check: ## Which contract month is the ES/NQ feed on, and did it splice at a roll? SYMBOL=NDX DAYS=75 JUMP_BPS=25
+	@echo "$(BLUE)=== Futures contract / roll check ===$(NC)"
+	@echo "$(YELLOW)Answers \"why is our quote different from another platform\":$(NC)"
+	@echo "$(YELLOW)a continuous contract rolls to the next quarter and jumps by$(NC)"
+	@echo "$(YELLOW)one quarter of carry. Uses the cash index as the control.$(NC)"
+	@echo "$(YELLOW)Read-only.$(NC)"
+	@echo ""
+	@$(PSQL) \
+		-v index_symbol=$(or $(SYMBOL),NDX) \
+		-v history_days=$(or $(DAYS),75) \
+		-v local_tz=$(or $(TZ_LOCAL),America/New_York) \
+		-v jump_bps=$(or $(JUMP_BPS),25) \
+		-f setup/database/diagnostics/futures_contract_roll.sql
 
 .PHONY: futures-feed-logs
 futures-feed-logs: ## Futures ingester journal around a reported delay (reconnects, auth, respawns). SYMBOL=NDX DATE=2026-09-14 OPEN=08:00 TZ_LOCAL=Europe/London PRE=45 POST=120
