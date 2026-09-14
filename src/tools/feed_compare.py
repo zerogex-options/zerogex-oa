@@ -728,6 +728,18 @@ def probe(
         strike_pct_range=strike_pct_range,
     )
     elapsed = time.monotonic() - started
+
+    # Providers whose response columns are server-supplied can report what
+    # they actually saw. Without this a wrong column guess and a closed
+    # market both print "contracts returned 0", and you cannot tell which.
+    columns: Dict[str, Any] = {}
+    describe = getattr(provider, "describe_columns", None)
+    if callable(describe):
+        try:
+            columns = describe(underlying)
+        except Exception as e:  # noqa: BLE001 - a diagnostic never fails a probe
+            columns = {"error": {"detail": f"{type(e).__name__}: {e}"}}
+
     return {
         "provider": provider.name,
         "underlying": underlying,
@@ -738,6 +750,7 @@ def probe(
         "two_sided": sample.quoted_count,
         "with_open_interest": sample.oi_count,
         "error": sample.error,
+        "columns": columns,
     }
 
 
@@ -755,6 +768,19 @@ def _print_probe(result: Dict[str, Any]) -> None:
     elif result["contracts_requested"]:
         coverage = result["contracts_returned"] / result["contracts_requested"]
         print(f"  coverage           {coverage:.1%}")
+    columns = result.get("columns") or {}
+    if columns:
+        print("\n  --- raw response columns (paste this back) ---")
+        for endpoint in sorted(columns):
+            info = columns[endpoint]
+            if "error" in info:
+                print(f"  {endpoint:<22} ERROR {info['error']}")
+                continue
+            print(f"  {endpoint:<22} rows={info.get('rows', 0)}")
+            print(f"  {'':<22} {info.get('columns')}")
+            sample = info.get("sample") or {}
+            if sample:
+                print(f"  {'':<22} sample={sample}")
     print()
 
 

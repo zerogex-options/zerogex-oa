@@ -4,13 +4,20 @@ Written against the v3 gRPC client (``thetadata`` on PyPI, 1.0.10) during
 the September 2026 evaluation.  Four things about this vendor shape the
 implementation, and none of them are obvious from the interface:
 
-**1. There is no streaming API on this client.**  Every method is a
-snapshot or a history query; the package exposes no ``stream_*`` at all.
+**1. There is no streaming API on this Python client.**  Every method is
+a snapshot or a history query; the package exposes no ``stream_*`` at all.
 So the stream objects below are polling loops.  That is a better fit than
 it sounds: the ingestion engine already samples its accumulators every
 five seconds and buckets to one minute, and ThetaData's stated limit is
 8 concurrent calls with *no cap on total calls*, so a once-per-interval
 chain poll sits well inside it.
+
+Note the qualifier.  The Theta Terminal itself *does* serve a streaming
+interface — FPSS, on ``ws_port`` (25520 by default), confirmed listening
+on a live terminal 2026-09-14.  The Python package simply does not wrap
+it.  Polling is the right call for one-minute buckets, but "ThetaData has
+no streaming" would be the wrong conclusion to carry into a later
+tick-level design.
 
 **2. Snapshots are per-expiration, not per-contract.**
 ``option_snapshot_quote(symbol, expiration, strike="*", right="both")``
@@ -34,15 +41,29 @@ sees only a fraction of consolidated volume — so this provider declares
 ``signed_underlying_volume=False`` and the caller must not treat its
 volume as a full-market figure.
 
-**Market Value.**  ThetaData sells a "Market Value" feed that adjusts each
-quote's bid and ask by up to a cent, which they characterise as a derived
-product carrying no exchange fees.  Per their support (2026-09-11), the
-toggle is *terminal-level*: you run a second Theta Terminal configured to
-that stage and point a client at its port.  It is therefore selected here
-by ``mdds_port``, not by calling a different method — note that the
-``*_snapshot_market_value`` endpoints on this client are a separate thing
-and are deliberately NOT used for that purpose (see
-``_MARKET_VALUE_ENDPOINT_NOTE`` below).
+**Market Value, and an unresolved contradiction.**  ThetaData sells a
+"Market Value" feed that adjusts each quote's bid and ask by up to a cent,
+which they characterise as a derived product carrying no exchange fees.
+How you select it is genuinely unsettled:
+
+* Their support said (2026-09-11) the toggle is *terminal-level*: run a
+  second Theta Terminal "using stage" and point a client at it.
+* But the terminal's own generated ``config.toml`` shows ``stage``
+  selecting ``mdds-stage.thetadata.us`` / ``fpss_stage_hosts``, which that
+  file documents as *"TESTING ONLY! Occasional reboots. Potential issues
+  with data and certain requests. This server is not stable."*  That is a
+  staging environment, not a fee-exempt production product.
+* Meanwhile the client exposes ``option_snapshot_market_value`` and
+  ``index_snapshot_market_value`` with signatures identical to the
+  ordinary quote endpoints.
+
+The endpoint reading now looks more likely than the stage reading, so
+``market_value_endpoints`` defaults on for the MV stage.  Both mechanisms
+are supported, selected by that flag, so whichever answer ThetaData gives
+needs no rewrite.  **Confirm before trusting a Market Value measurement:**
+running the comparison against a staging server would produce a divergence
+caused by test infrastructure rather than by the penny adjustment, which is
+exactly the wrong conclusion to draw.
 
 They also confirmed the adjustment never *introduces* a crossed quote and
 never takes a price to zero, and that every quote is adjusted.  Nothing in
@@ -52,12 +73,21 @@ feed is usable without an exchange licence.  Do not add averaging of
 repeated polls of a static quote here, however tempting it is as a noise
 reduction — that is the same thing by another name.
 
-**Unverified against the live API.**  This was written from the wheel's
-signatures, not from a running terminal.  The response column names in
-particular come from the server at runtime rather than from any constant
-in the package, so :data:`_FIELD_CANDIDATES` lists plausible spellings and
-takes the first that appears.  Confirm them on first contact and prune the
-lists.
+**Partly unverified against the live API.**  This was written from the
+wheel's signatures rather than from a running terminal.  Confirmed since
+against a live terminal (2026-09-14): the client reaches a local terminal
+with no ``mdds_host``/``mdds_port`` override, and
+``option_list_expirations`` answers from the historical reference database
+(see :meth:`ThetaDataProvider.get_option_expirations`).
+
+Still unconfirmed are the response column names, which come from the
+server at runtime rather than from any constant in the package.
+:data:`_FIELD_CANDIDATES` therefore lists plausible spellings and takes
+the first that appears.  Run ``make feed-probe PROVIDER=thetadata``, which
+calls :meth:`ThetaDataProvider.describe_columns` and prints what the
+server actually sent, then prune each tuple to the real spelling.  Until
+then a wrong guess is not silent: :func:`report_unmapped` logs the columns
+that arrived rather than letting the chain come back mysteriously empty.
 """
 
 from __future__ import annotations
@@ -84,15 +114,10 @@ logger = get_logger(__name__)
 
 __all__ = ["ThetaDataProvider"]
 
-#: Why the ``*_snapshot_market_value`` endpoints are not how Market Value is
-#: selected. "Market value" is overloaded: in options vernacular it usually
-#: means a mark or theoretical valuation, and ThetaData exposes
-#: ``option_snapshot_market_value`` / ``index_snapshot_market_value``
-#: alongside the ordinary quote endpoints. Their support described the
-#: fee-exempt product as a *terminal stage* instead, which implies it
-#: perturbs every endpoint rather than living behind one. Selecting by port
-#: is therefore the reading that matches what they said. If that turns out
-#: to be wrong, the fix is one line in :meth:`ThetaDataProvider._quote_call`.
+#: "Market value" is overloaded: in options vernacular it usually means a
+#: mark or theoretical valuation, which is why the ambiguity in the module
+#: docstring exists at all. Resolve it with ThetaData before reporting any
+#: Market Value comparison as a measurement of the penny adjustment.
 _MARKET_VALUE_ENDPOINT_NOTE = __doc__
 
 #: Response column names are server-supplied, so each logical field lists
@@ -118,6 +143,11 @@ _FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {
     "ms_of_day": ("ms_of_day", "ms", "time"),
     "date": ("date",),
 }
+
+#: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
+#: diagnostic covers the index endpoints too. VIX because it is one of the
+#: symbols this deployment actually needs and is cheap to ask for.
+_DIAGNOSTIC_INDEX = "VIX"
 
 #: Strikes arrive in thousandths on OPRA-derived feeds. A strike of 650
 #: reported as 650000 is the single most likely unit bug in this module,
@@ -206,6 +236,40 @@ def _pick(row: Dict[str, Any], field: str) -> Any:
         if key in row and row[key] is not None:
             return row[key]
     return None
+
+
+#: Column shapes already reported, so a mismapped endpoint warns once per
+#: shape rather than once per poll.
+_REPORTED_SHAPES: set = set()
+_REPORTED_LOCK = threading.Lock()
+
+
+def report_unmapped(kind: str, rows: Sequence[Dict[str, Any]], fields: Sequence[str]) -> None:
+    """Warn, once per column shape, when rows arrive but nothing maps.
+
+    This exists because the failure is otherwise invisible. If the server
+    spells the strike column something :data:`_FIELD_CANDIDATES` does not
+    list, every row is skipped and the chain comes back empty — which
+    reads exactly like a closed market or an unentitled symbol. Naming the
+    columns that actually arrived turns a silent zero into a one-line fix.
+    """
+    if not rows:
+        return
+    shape = (kind, frozenset(rows[0].keys()))
+    with _REPORTED_LOCK:
+        if shape in _REPORTED_SHAPES:
+            return
+        _REPORTED_SHAPES.add(shape)
+    logger.warning(
+        "thetadata %s: %d row(s) returned but no %s column matched. "
+        "Columns present: %s. Expected one of: %s. "
+        "Add the real spelling to _FIELD_CANDIDATES.",
+        kind,
+        len(rows),
+        " / ".join(fields),
+        sorted(rows[0].keys()),
+        {f: _FIELD_CANDIDATES.get(f, ()) for f in fields},
+    )
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -508,12 +572,22 @@ class ThetaDataProvider(MarketDataProvider):
         poll_interval: float = 5.0,
         oi_poll_interval: float = 900.0,
         strike_range: Optional[int] = None,
+        market_value_endpoints: bool = False,
     ):
         self._client = client
         self.stage = stage
         self._poll_interval = poll_interval
         self._oi_poll_interval = oi_poll_interval
         self._strike_range = strike_range
+        # Which mechanism selects the Market Value feed. See the module
+        # docstring: ThetaData support said "terminal stage", but the
+        # terminal's own config.toml shows `stage` selecting
+        # mdds-stage.thetadata.us, documented in that file as "TESTING
+        # ONLY! Occasional reboots ... not stable" -- a staging
+        # environment, not a fee-exempt product. Until that is resolved,
+        # support BOTH so whichever answer comes back works without a
+        # rewrite.
+        self._market_value_endpoints = market_value_endpoints
 
     @classmethod
     def from_env(cls, *, stage: Optional[str] = None) -> "ThetaDataProvider":
@@ -534,6 +608,7 @@ class ThetaDataProvider(MarketDataProvider):
         port_var = (
             "THETADATA_MV_MDDS_PORT"
             if resolved_stage in ("mv", "market_value", "marketvalue")
+            and os.getenv("THETADATA_MV_MDDS_PORT")
             else "THETADATA_MDDS_PORT"
         )
         client = ThetaClient(
@@ -544,9 +619,17 @@ class ThetaDataProvider(MarketDataProvider):
             mdds_port=os.getenv(port_var) or None,
             dataframe_type="pandas",
         )
+        is_mv = resolved_stage in ("mv", "market_value", "marketvalue")
         return cls(
             client,
             stage=resolved_stage,
+            # Default the MV stage to the endpoint mechanism, since the
+            # terminal's config.toml makes the "stage" reading look wrong.
+            # THETADATA_MV_VIA_ENDPOINTS=0 restores port-based selection if
+            # ThetaData confirms otherwise.
+            market_value_endpoints=(
+                is_mv and os.getenv("THETADATA_MV_VIA_ENDPOINTS", "1").strip() != "0"
+            ),
             poll_interval=float(os.getenv("THETADATA_POLL_SECONDS", "5")),
             oi_poll_interval=float(os.getenv("THETADATA_OI_POLL_SECONDS", "900")),
             strike_range=(
@@ -621,12 +704,16 @@ class ThetaDataProvider(MarketDataProvider):
         return dict(out)
 
     def _quote_call(self, **kwargs: Any) -> Any:
-        """The quote endpoint.
+        """The quote endpoint, honouring whichever Market Value mechanism
+        is configured.
 
-        Market Value is selected by which terminal this client points at,
-        so the same endpoint serves both stages. See the module docstring
-        on why the ``*_snapshot_market_value`` endpoints are not used here.
+        With ``market_value_endpoints=True`` this calls
+        ``option_snapshot_market_value`` instead of
+        ``option_snapshot_quote``. The two share a signature, so the swap
+        is total: nothing downstream needs to know which one answered.
         """
+        if self._market_value_endpoints:
+            return self._client.option_snapshot_market_value(**kwargs)
         return self._client.option_snapshot_quote(**kwargs)
 
     def _merge_frame(
@@ -638,11 +725,14 @@ class ThetaDataProvider(MarketDataProvider):
         wanted: Dict[Tuple[str, date, float, str], str],
         out: Dict[str, Dict[str, Any]],
     ) -> None:
-        for row in _rows(frame):
+        rows = _rows(frame)
+        matched = 0
+        for row in rows:
             strike = _normalise_strike(_pick(row, "strike"))
             right_raw = _pick(row, "right")
             if strike is None or right_raw is None:
                 continue
+            matched += 1
             right = "C" if str(right_raw).strip() in self._CALL_CODES else "P"
             symbol = wanted.get((root, expiration, round(strike, 4), right))
             if symbol is None:
@@ -661,6 +751,81 @@ class ThetaDataProvider(MarketDataProvider):
                 target["volume"] = _as_int(_pick(row, "volume"))
             elif kind == "open_interest":
                 target["open_interest"] = _as_int(_pick(row, "open_interest"))
+        if matched == 0:
+            report_unmapped(kind, rows, ("strike", "right"))
+
+    def describe_columns(self, underlying: str = "SPY") -> Dict[str, Dict[str, Any]]:
+        """One call per endpoint, reporting the columns the server actually sends.
+
+        :data:`_FIELD_CANDIDATES` was written from the wheel's signatures
+        rather than from a live terminal, and the response columns are
+        server-supplied. This is how you replace those guesses with facts:
+        run it once against a running terminal, then prune each candidate
+        tuple down to the spelling that appears here.
+
+        Diagnostic only. It makes live calls but writes nothing, touches no
+        accumulator, and is never on the ingestion path.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+
+        expirations = self.get_option_expirations(underlying)
+        if not expirations:
+            return {"error": {"detail": f"no expirations returned for {underlying}"}}
+        expiration = expirations[0]
+
+        probes = [
+            (
+                "option_quote",
+                self._quote_call,
+                {
+                    "symbol": underlying,
+                    "expiration": expiration,
+                    "strike": "*",
+                    "right": "both",
+                },
+            ),
+            (
+                "option_ohlc",
+                self._client.option_snapshot_ohlc,
+                {
+                    "symbol": underlying,
+                    "expiration": expiration,
+                    "strike": "*",
+                    "right": "both",
+                },
+            ),
+            (
+                "option_open_interest",
+                self._client.option_snapshot_open_interest,
+                {
+                    "symbol": underlying,
+                    "expiration": expiration,
+                    "strike": "*",
+                    "right": "both",
+                },
+            ),
+            ("stock_quote", self._client.stock_snapshot_quote, {"symbol": underlying}),
+            ("stock_ohlc", self._client.stock_snapshot_ohlc, {"symbol": underlying}),
+            # The index endpoints serve SPX / NDX / VIX / VXN spot, which is
+            # a different licence and may well be a different row shape.
+            ("index_ohlc", self._client.index_snapshot_ohlc, {"symbol": _DIAGNOSTIC_INDEX}),
+        ]
+
+        for name, fn, kwargs in probes:
+            try:
+                rows = _rows(fn(**kwargs))
+            except Exception as e:  # noqa: BLE001 - a diagnostic reports
+                out[name] = {"error": f"{type(e).__name__}: {e}"}  # failures,
+                continue  # it does not raise
+            if not rows:
+                out[name] = {"rows": 0, "columns": [], "sample": {}}
+                continue
+            out[name] = {
+                "rows": len(rows),
+                "columns": sorted(rows[0].keys()),
+                "sample": {k: rows[0][k] for k in sorted(rows[0].keys())},
+            }
+        return out
 
     # -- streams -----------------------------------------------------------
 
@@ -750,11 +915,17 @@ class ThetaDataProvider(MarketDataProvider):
         self._CAPABILITIES.require("option_chain_discovery")
         root = underlying.upper().lstrip("$").split(".")[0]
         frame = self._client.option_list_expirations(symbol=root)
+        # ThetaData answers this from its historical reference database:
+        # SPY comes back with ~2,100 expirations starting in 2012. Callers
+        # slice the front of this list to build a live chain, so handing
+        # back history would hand them contracts that expired years ago and
+        # quote empty. Confirmed against a live terminal, 2026-09-14.
+        today = datetime.now(timezone.utc).date()
         out: List[date] = []
         for row in _rows(frame):
             value = _pick(row, "expiration")
             parsed = _coerce_date(value)
-            if parsed is not None:
+            if parsed is not None and parsed >= today:
                 out.append(parsed)
         return sorted(set(out))
 
