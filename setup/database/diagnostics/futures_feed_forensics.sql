@@ -73,6 +73,12 @@
 -- lag_warn_sec  write_lag above which a bar is called late. 90s = the ~60-75s
 --               healthy band plus headroom for normal delivery jitter.
 -- history_days  lookback for the recurring-pattern check in §7.
+-- burst_gap_sec bars written within this many seconds of each other count
+--               as one replay burst in §6. 5s comfortably spans a burst
+--               (observed: milliseconds) without merging healthy 60s writes.
+-- bulk_write_sec lag above which a bar is treated as backfilled rather than
+--               late, and kept out of the §7 percentiles. 3600s: no live
+--               stream recovers an hour behind, but a backfill routinely is.
 \if :{?index_symbol}  \else \set index_symbol  NDX          \endif
 \if :{?peer_symbol}   \else \set peer_symbol   SPX          \endif
 \if :{?incident_date} \else \set incident_date today        \endif
@@ -82,6 +88,8 @@
 \if :{?post_min}      \else \set post_min      120          \endif
 \if :{?lag_warn_sec}  \else \set lag_warn_sec  90           \endif
 \if :{?history_days}  \else \set history_days  7            \endif
+\if :{?burst_gap_sec} \else \set burst_gap_sec 5            \endif
+\if :{?bulk_write_sec} \else \set bulk_write_sec 3600       \endif
 
 \echo
 \echo ================================================================
@@ -253,7 +261,11 @@ ORDER BY ts;
 \echo
 \echo  is the delay the user saw and the reason it is invisible now.
 \echo  span_min tells a reconnect (minutes) from a manual futures_backfill
-\echo  run (hours/days). Expected: 0 rows.
+\echo  run (hours/days). burst_write_sec is how long the burst took to
+\echo  write, which is why bursts are clustered rather than grouped on an
+\echo  identical updated_at: the ingester commits row by row, so a real
+\echo  burst is spread over milliseconds, not written at one instant.
+\echo  Expected: 0 rows.
 \echo
 
 WITH params AS (
@@ -263,20 +275,47 @@ WITH params AS (
         cash_open - (:pre_min  * interval '1 minute') AS lo,
         cash_open + (:post_min * interval '1 minute') AS hi
     FROM params
+), rows_in_win AS (
+    SELECT f.timestamp, f.updated_at
+    FROM futures_quotes f, win w
+    WHERE f.index_symbol = :'index_symbol'
+      AND f.timestamp >= w.lo AND f.timestamp < w.hi
+), marked AS (
+    -- Bars written within burst_gap_sec of the previous write belong to the
+    -- same burst. Grouping on updated_at EQUALITY does not work: the ingester
+    -- commits one row at a time, so each row takes its own NOW() and a real
+    -- burst is spread over milliseconds. A healthy feed writes 60s apart and
+    -- so never clusters, which is what keeps this section quiet when nothing
+    -- is wrong.
+    SELECT
+        timestamp,
+        updated_at,
+        CASE
+            WHEN updated_at - lag(updated_at) OVER (ORDER BY updated_at)
+                 <= (:burst_gap_sec * interval '1 second') THEN 0
+            ELSE 1
+        END AS starts_burst
+    FROM rows_in_win
+), bursts AS (
+    SELECT
+        timestamp,
+        updated_at,
+        sum(starts_burst) OVER (ORDER BY updated_at
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS burst_id
+    FROM marked
 )
 SELECT
-    f.updated_at AT TIME ZONE :'local_tz'                   AS written_local,
+    min(updated_at) AT TIME ZONE :'local_tz'                AS written_local,
     count(*)                                                AS bars_in_burst,
-    min(f.timestamp) AT TIME ZONE :'local_tz'               AS covering_from_local,
-    max(f.timestamp) AT TIME ZONE :'local_tz'               AS covering_to_local,
-    round(extract(epoch FROM max(f.timestamp) - min(f.timestamp)) / 60.0)::int AS span_min,
-    round(max(extract(epoch FROM f.updated_at - f.timestamp))::numeric / 60.0, 1) AS worst_lag_min
-FROM futures_quotes f, win w
-WHERE f.index_symbol = :'index_symbol'
-  AND f.timestamp >= w.lo AND f.timestamp < w.hi
-GROUP BY f.updated_at
+    min(timestamp) AT TIME ZONE :'local_tz'                 AS covering_from_local,
+    max(timestamp) AT TIME ZONE :'local_tz'                 AS covering_to_local,
+    round(extract(epoch FROM max(timestamp) - min(timestamp)) / 60.0)::int AS span_min,
+    round(max(extract(epoch FROM updated_at - timestamp))::numeric / 60.0, 1) AS worst_lag_min,
+    round(extract(epoch FROM max(updated_at) - min(updated_at))::numeric, 3)  AS burst_write_sec
+FROM bursts
+GROUP BY burst_id
 HAVING count(*) > 1
-ORDER BY f.updated_at;
+ORDER BY min(updated_at);
 
 \echo
 \echo ================================================================
@@ -326,28 +365,46 @@ ORDER BY f.index_symbol;
 \echo  days_with_late of days_seen is the discriminator: 1-of-7 is an
 \echo  incident, 7-of-7 is a scheduled cause — token refresh, a
 \echo  maintenance window, or a nightly job sharing the box.
+\echo  bulk_written is counted separately and kept OUT of the percentiles:
+\echo  those bars were backfilled in one pass, not delivered late. A whole
+\echo  column of them is a futures_backfill run, not an outage.
+\echo  An hour missing entirely is the CME maintenance break (17:00-18:00
+\echo  ET), which is correct and expected.
 \echo
 
+WITH scored AS (
+    SELECT
+        date_trunc('hour', f.timestamp AT TIME ZONE :'local_tz')::time AS local_hour,
+        (f.timestamp AT TIME ZONE :'local_tz')::date                   AS local_day,
+        extract(epoch FROM f.updated_at - f.timestamp)                 AS lag_s
+    FROM futures_quotes f
+    WHERE f.index_symbol = :'index_symbol'
+      AND f.timestamp >= now() - (:history_days * interval '1 day')
+)
 SELECT
-    date_trunc('hour', f.timestamp AT TIME ZONE :'local_tz')::time AS local_hour,
-    count(*)                                                       AS bars,
-    round(percentile_cont(0.50) WITHIN GROUP (
-        ORDER BY extract(epoch FROM f.updated_at - f.timestamp))::numeric, 1) AS p50_lag_s,
-    round(percentile_cont(0.95) WITHIN GROUP (
-        ORDER BY extract(epoch FROM f.updated_at - f.timestamp))::numeric, 1) AS p95_lag_s,
-    count(*) FILTER (
-        WHERE extract(epoch FROM f.updated_at - f.timestamp) > :lag_warn_sec) AS bars_late,
-    count(DISTINCT (f.timestamp AT TIME ZONE :'local_tz')::date)   AS days_seen,
+    local_hour,
+    count(*)                                                        AS bars,
+    -- Percentiles over LIVE bars only. A bulk backfill writes days of bars at
+    -- one instant, so its lag grows an hour for every hour further back and
+    -- drags a whole column into five-figure seconds, hiding the live feed.
+    count(*) FILTER (WHERE lag_s <= :bulk_write_sec)                AS live_bars,
+    round(percentile_cont(0.50) WITHIN GROUP (ORDER BY lag_s)
+          FILTER (WHERE lag_s <= :bulk_write_sec)::numeric, 1)      AS live_p50_lag_s,
+    round(percentile_cont(0.95) WITHIN GROUP (ORDER BY lag_s)
+          FILTER (WHERE lag_s <= :bulk_write_sec)::numeric, 1)      AS live_p95_lag_s,
+    count(*) FILTER (WHERE lag_s > :lag_warn_sec
+                       AND lag_s <= :bulk_write_sec)                AS live_bars_late,
+    count(DISTINCT local_day)                                       AS days_seen,
     -- The discriminator: 1-of-N days is an incident, N-of-N is a pattern.
-    count(DISTINCT (f.timestamp AT TIME ZONE :'local_tz')::date) FILTER (
-        WHERE extract(epoch FROM f.updated_at - f.timestamp) > :lag_warn_sec) AS days_with_late,
-    max((f.timestamp AT TIME ZONE :'local_tz')::date) FILTER (
-        WHERE extract(epoch FROM f.updated_at - f.timestamp) > :lag_warn_sec) AS worst_day
-FROM futures_quotes f
-WHERE f.index_symbol = :'index_symbol'
-  AND f.timestamp >= now() - (:history_days * interval '1 day')
-GROUP BY 1
-ORDER BY 1;
+    count(DISTINCT local_day) FILTER (
+        WHERE lag_s > :lag_warn_sec AND lag_s <= :bulk_write_sec)   AS days_with_late,
+    -- Counted, never averaged in: these are backfilled/bulk-written rows, not
+    -- a feed that ran hours late. A whole column of them means someone ran
+    -- src/tools/futures_backfill.py over that span.
+    count(*) FILTER (WHERE lag_s > :bulk_write_sec)                 AS bulk_written
+FROM scored
+GROUP BY local_hour
+ORDER BY local_hour;
 
 \echo
 \echo ================================================================
