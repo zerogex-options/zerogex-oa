@@ -11,6 +11,10 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
+import threading
+
+import time
+
 import pytest
 
 from src.ingestion.providers import available_providers
@@ -542,3 +546,157 @@ def test_the_unmapped_warning_fires_once_per_shape(caplog):
             )
 
     assert caplog.text.count("no strike / right column matched") == 1
+
+
+# ---------------------------------------------------------------------------
+# Symbol translation and parallel chain fetch
+# ---------------------------------------------------------------------------
+
+
+def test_index_symbol_is_not_the_option_root():
+    """SPX's weekly chain is rooted SPXW; there is no index called SPXW.
+
+    A live probe on $SPXW.X died with
+    "No data found for: index_snapshot_ohlc(SPXW)". The option endpoints
+    want the root, the index endpoint wants the index, and they differ for
+    exactly the two underlyings this deployment cares most about.
+    """
+    from src.ingestion.providers.thetadata import index_symbol_for, option_root_for
+
+    assert option_root_for("$SPXW.X") == "SPXW"
+    assert index_symbol_for("$SPXW.X") == "SPX"
+    assert option_root_for("$NDXP.X") == "NDXP"
+    assert index_symbol_for("$NDXP.X") == "NDX"
+
+
+def test_three_letter_indices_are_not_truncated():
+    """The SPXW -> SPX rule must not turn VIX into VI."""
+    from src.ingestion.providers.thetadata import index_symbol_for
+
+    for symbol, expected in (
+        ("$VIX.X", "VIX"),
+        ("$VXN.X", "VXN"),
+        ("$RUT.X", "RUT"),
+        ("$SPX.X", "SPX"),
+        ("SPY", "SPY"),
+        ("QQQ", "QQQ"),
+    ):
+        assert index_symbol_for(symbol) == expected, symbol
+
+
+def test_index_bars_query_the_index_not_the_root():
+    """End-to-end: the symbol that reaches the client must be the index."""
+    seen = {}
+
+    class _C:
+        def index_snapshot_ohlc(self, **kw):
+            seen["symbol"] = kw.get("symbol")
+            return []
+
+    stream = ThetaDataProvider(_C()).stream_index_bars("$SPXW.X")
+    stream.start()
+    try:
+        deadline = time.monotonic() + 3
+        while "symbol" not in seen and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        stream.stop()
+    assert seen.get("symbol") == "SPX"
+
+
+def test_chain_fetch_never_exceeds_the_account_concurrency_limit():
+    """ThetaData allows 8 concurrent requests for this account.
+
+    Exceeding it does not queue politely -- requests fail, and a failed bar
+    poll then backs off exponentially. The bound has to hold across all the
+    streams sharing one provider, not per call.
+    """
+    live = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    class _C:
+        def _busy(self, **kw):
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            time.sleep(0.05)
+            with lock:
+                live["now"] -= 1
+            return []
+
+        option_snapshot_quote = _busy
+        option_snapshot_ohlc = _busy
+        option_snapshot_open_interest = _busy
+
+    provider = ThetaDataProvider(_C(), max_concurrency=3)
+    symbols = [build_occ_symbol("SPY", EXP + timedelta(days=7 * i), 650.0, "C") for i in range(8)]
+    try:
+        provider.fetch_chain_state(symbols, include_open_interest=True)
+    finally:
+        provider.close()
+
+    assert live["peak"] <= 3, f"ran {live['peak']} concurrent requests against a limit of 3"
+    assert live["peak"] > 1, "did not parallelise at all"
+
+
+def test_parallel_fetch_is_faster_than_sequential():
+    """The whole point: a cycle must fit inside its poll interval."""
+
+    class _C:
+        def _slow(self, **kw):
+            time.sleep(0.05)
+            return []
+
+        option_snapshot_quote = _slow
+        option_snapshot_ohlc = _slow
+        option_snapshot_open_interest = _slow
+
+    symbols = [build_occ_symbol("SPY", EXP + timedelta(days=7 * i), 650.0, "C") for i in range(6)]
+
+    serial = ThetaDataProvider(_C(), max_concurrency=1)
+    started = time.monotonic()
+    serial.fetch_chain_state(symbols, include_open_interest=True)
+    serial_elapsed = time.monotonic() - started
+
+    parallel = ThetaDataProvider(_C(), max_concurrency=6)
+    started = time.monotonic()
+    try:
+        parallel.fetch_chain_state(symbols, include_open_interest=True)
+    finally:
+        parallel.close()
+    parallel_elapsed = time.monotonic() - started
+
+    assert (
+        parallel_elapsed < serial_elapsed / 2
+    ), f"parallel {parallel_elapsed:.2f}s vs serial {serial_elapsed:.2f}s"
+
+
+def test_one_failing_endpoint_does_not_lose_the_others_in_parallel():
+    """A chain with quotes but no OI is degraded; with nothing, an outage."""
+
+    class _C:
+        def option_snapshot_quote(self, **kw):
+            return [{"strike": 650.0, "right": "CALL", "bid": 1.2, "ask": 1.3}]
+
+        def option_snapshot_ohlc(self, **kw):
+            return [{"strike": 650.0, "right": "CALL", "close": 1.25, "volume": 9}]
+
+        def option_snapshot_open_interest(self, **kw):
+            raise RuntimeError("entitlement check failed")
+
+    provider = ThetaDataProvider(_C(), max_concurrency=4)
+    symbol = build_occ_symbol("SPY", EXP, 650.0, "C")
+    try:
+        state = provider.fetch_chain_state([symbol], include_open_interest=True)
+    finally:
+        provider.close()
+
+    assert state[symbol]["bid"] == pytest.approx(1.2)
+    assert state[symbol]["volume"] == 9
+    assert state[symbol].get("open_interest") is None
+
+
+def test_close_is_idempotent():
+    provider = ThetaDataProvider(_FakeClient(), max_concurrency=4)
+    provider.close()
+    provider.close()
