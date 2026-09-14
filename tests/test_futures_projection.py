@@ -445,3 +445,65 @@ def test_carry_fallback_is_continuous_across_the_roll():
     assert day_of > 1.005
     # And it decays smoothly from there, with no second jump at Sep expiry.
     assert day_of > week_after > 1.005
+
+
+# ---------------------------------------------------------------------------
+# /api/gex/pin-stability — the pin under its other names
+# ---------------------------------------------------------------------------
+
+
+def _nq_basis():
+    return FuturesBasis(
+        futures_symbol="NQ",
+        index_symbol="NDX",
+        ratio=1.01047,  # measured on 2026-09-14
+        source="measured",
+        observed_at=datetime(2026, 9, 14, tzinfo=timezone.utc),
+        sample_count=5,
+        feed_symbol="@NQ",
+    )
+
+
+def test_pin_stability_levels_project_like_the_pin_they_are():
+    """Renaming the pin must not smuggle a cash strike onto the futures axis.
+
+    /api/gex/pin-stability sits under the projectable /api/gex/ prefix and
+    reports the pin three times under its own names. The allowlist matches on
+    KEY, so before those names were listed an NQ request returned raw NDX
+    strikes next to a correctly projected `pin_strike` in the same payload —
+    about 400 points below the axis they are drawn on.
+    """
+    payload = {
+        "pin_strike": 28900.0,
+        "current_pin": 28900.0,
+        "held_pin": 28850.0,
+        "session_open_pin": 28800.0,
+    }
+    out = project_payload(payload, _nq_basis())
+
+    # The decisive property: one value, one answer, whatever it is called.
+    assert out["current_pin"] == out["pin_strike"]
+    for field in ("current_pin", "held_pin", "session_open_pin"):
+        assert out[field] > payload[field], f"{field} was served on the cash axis"
+
+
+def test_pin_migration_projects_as_a_price_delta():
+    """net_migration is held_pin - session_open_pin, so it scales with them."""
+    payload = {"session_open_pin": 28800.0, "held_pin": 28850.0, "net_migration": 50.0}
+    out = project_payload(payload, _nq_basis())
+    assert out["net_migration"] == pytest.approx(
+        out["held_pin"] - out["session_open_pin"], rel=1e-9
+    )
+
+
+def test_pin_stability_counters_are_never_projected():
+    """Minutes observed and strikes occupied are counts, not prices."""
+    payload = {
+        "current_samples": 42,
+        "held_samples": 37,
+        "quiet_samples": 5,
+        "total_samples": 390,
+        "distinct_values": 3,
+    }
+    out = project_payload(payload, _nq_basis())
+    assert out == payload

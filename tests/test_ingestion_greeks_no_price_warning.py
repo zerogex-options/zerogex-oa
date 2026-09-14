@@ -35,6 +35,18 @@ def _engine(price=None):
     eng._greeks_no_price_warned = False
     eng._greeks_stale_episode_started_mono = None
     eng.greeks_stale_underlying_rejects = 0
+    # Progress-log throttle state, mirroring IngestionEngine.__init__. Only the
+    # SUCCESS branch touches these, so omitting them left three of these tests
+    # green while the one that lets a price arrive died on AttributeError --
+    # and the greeks it was asserting on came back None, which reads as a
+    # behaviour regression rather than a stale fixture.
+    #
+    # This helper builds the engine with object.__new__ to skip a constructor
+    # that wants a TradeStation client, so every attribute _enrich_with_greeks
+    # reads has to be listed here by hand. Anything added to that path needs
+    # adding here too.
+    eng._greeks_progress_logged_mono = 0.0
+    eng._greeks_progress_at_last_log = 0
     return eng
 
 
