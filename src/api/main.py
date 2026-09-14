@@ -16,7 +16,7 @@ from enum import IntEnum
 import os
 from src.config import _getenv_str
 import re
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 import pytz
 
 from .database import DatabaseManager
@@ -1355,6 +1355,7 @@ async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> Under
         in ("timestamp", "open", "high", "low", "close", "up_volume", "down_volume", "volume")
     }
     payload["symbol"] = futures_symbol
+    payload.update(_future_contract_fields(fut.get("future_symbol")))
 
     # ``session`` describes the MARKET, not the feed.
     #
@@ -1387,6 +1388,32 @@ def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
     if not future_symbol:
         return None
     return future_symbol.lstrip("@").upper() or None
+
+
+def _future_contract_fields(
+    future_symbol: Optional[str], at: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """``data_contract`` / ``data_contract_expiry`` for a continuous future.
+
+    The badge ticker is ambiguous by itself: ``@NQ`` is whichever contract the
+    continuous series has rolled to, and for the week between the roll and the
+    old contract's expiry two platforms both labelled "NQ" sit a quarter of
+    carry apart — on the Sep 2026 roll that was ~300 NQ points, which reads as
+    a broken feed rather than as two different contracts. Naming the contract
+    is what makes the number checkable.
+
+    ``at`` matters for a historical series: one spanning a roll genuinely
+    contains two contracts, so each row is labelled with the one in force at
+    its own timestamp rather than with today's.
+    """
+    from src.jobs.futures_projection import active_contract_code, active_contract_expiry
+
+    if not future_symbol:
+        return {}
+    return {
+        "data_contract": active_contract_code(future_symbol, at),
+        "data_contract_expiry": active_contract_expiry(at),
+    }
 
 
 if not _NYSE_HOLIDAYS:
@@ -1586,6 +1613,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
             if fut and fut.get("close") is not None:
                 data["display_source"] = "futures"
                 data["data_symbol"] = _future_display_label(fut.get("future_symbol"))
+                data.update(_future_contract_fields(fut.get("future_symbol")))
                 data["futures_close"] = fut.get("close")
                 data["futures_reference_close"] = fut.get("reference_close")
 
@@ -1702,7 +1730,17 @@ async def get_historical_quotes(
             fut_rows = await _db().get_historical_futures(
                 futures_index, start_dt, end_dt, window_units, timeframe
             )
-            return [UnderlyingQuote(**{**row, "symbol": label}) for row in fut_rows]
+            native_future = resolve_index_future(futures_index)
+            return [
+                UnderlyingQuote(
+                    **{
+                        **row,
+                        "symbol": label,
+                        **_future_contract_fields(native_future, row.get("timestamp")),
+                    }
+                )
+                for row in fut_rows
+            ]
 
         # Index→future DISPLAY swap for the candlestick series — ONLY when the
         # caller opts in via allow_futures (the candle chart). Read-only from
@@ -1713,9 +1751,17 @@ async def get_historical_quotes(
                 symbol, start_dt, end_dt, window_units, timeframe
             )
             if fut_rows:
-                label = _future_display_label(resolve_index_future(symbol))
+                swap_future = resolve_index_future(symbol)
+                label = _future_display_label(swap_future)
                 return [
-                    UnderlyingQuote(**{**row, "display_source": "futures", "data_symbol": label})
+                    UnderlyingQuote(
+                        **{
+                            **row,
+                            "display_source": "futures",
+                            "data_symbol": label,
+                            **_future_contract_fields(swap_future, row.get("timestamp")),
+                        }
+                    )
                     for row in fut_rows
                 ]
 

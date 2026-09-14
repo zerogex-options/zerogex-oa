@@ -333,6 +333,13 @@ class UnderlyingQuote(BaseModel):
     # card, and the candlestick chart read the futures fields.
     #   display_source: 'futures' when the future should be shown, else None.
     #   data_symbol:    the future's UI ticker (e.g. 'ES'), else None.
+    #   data_contract:  the CME contract that ticker resolves to right now
+    #       (e.g. 'ESZ26'), else None. The ticker alone is ambiguous across a
+    #       quarterly roll — two platforms showing "ES" can be on different
+    #       contracts, a quarter of carry apart — so this names the one being
+    #       shown. DISPLAY-only, derived from the roll calendar
+    #       (futures_projection.active_contract_code); never a data key.
+    #   data_contract_expiry: that contract's expiry, for the same reason.
     #   futures_close:  the future's last price (the number those surfaces show).
     #   futures_reference_close: the future's price at the 16:00 ET cash close
     #       — the baseline for the overnight change, measured futures-vs-futures
@@ -340,6 +347,8 @@ class UnderlyingQuote(BaseModel):
     #       basis.
     display_source: Optional[str] = None
     data_symbol: Optional[str] = None
+    data_contract: Optional[str] = None
+    data_contract_expiry: Optional[date] = None
     futures_close: Optional[Decimal] = None
     futures_reference_close: Optional[Decimal] = None
     # FEED freshness, for the natively-served futures quote (ES / NQ).

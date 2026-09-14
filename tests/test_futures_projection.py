@@ -12,7 +12,7 @@ so these tests pin the three things that make that safe:
 """
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -20,6 +20,8 @@ from src.jobs.futures_projection import (
     NEVER_PROJECT,
     PRICE_FIELDS,
     FuturesBasis,
+    active_contract_code,
+    active_contract_expiry,
     next_quarterly_expiry,
     project_payload,
     projection_metadata,
@@ -325,3 +327,70 @@ def test_booleans_are_not_treated_as_prices():
     """bool is an int subclass — projecting one would emit 1.0067 for True."""
     out = project_payload({"close": True}, _basis(), tick=None)
     assert out["close"] is True
+
+
+# ---------------------------------------------------------------------------
+# Active contract naming (the badge / tooltip label)
+# ---------------------------------------------------------------------------
+#
+# The roll offset is MEASURED, not assumed. On the Sep 2026 cycle (expiry Fri
+# Sep 18) the production @NQ basis against NDX sat at 8.5bp through Thu Sep 10
+# and stepped to 108.2bp on Fri Sep 11; @ES stepped 8.1 -> 93.7bp the same day.
+# So the continuous feed was on U26 through the 10th and Z26 from the 11th.
+
+
+@pytest.mark.parametrize(
+    "day, expected",
+    [
+        ("2026-09-09", "NQU26"),  # well before the roll
+        ("2026-09-10", "NQU26"),  # last day on the expiring contract
+        ("2026-09-11", "NQZ26"),  # the observed roll
+        ("2026-09-14", "NQZ26"),  # the day the mismatch was reported
+        ("2026-09-18", "NQZ26"),  # Sep expiry itself — already long gone
+        ("2026-12-10", "NQZ26"),  # last day before the next roll
+        ("2026-12-11", "NQH27"),  # rolls into the new year
+    ],
+)
+def test_active_contract_code_tracks_the_observed_roll(day, expected):
+    at = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+    assert active_contract_code("@NQ", at) == expected
+
+
+def test_active_contract_code_strips_the_continuous_prefix():
+    at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    assert active_contract_code("@ES", at) == "ESZ26"
+    assert active_contract_code("ES", at) == "ESZ26"
+
+
+def test_active_contract_code_is_none_without_a_future():
+    assert active_contract_code(None) is None
+    assert active_contract_code("") is None
+    assert active_contract_code("@") is None
+
+
+def test_active_contract_differs_from_next_quarterly_inside_the_roll_week():
+    """The two helpers disagree for exactly the week that caused the reports.
+
+    ``next_quarterly_expiry`` answers "next expiry on or after today", which
+    inside the roll window names the contract the feed has ALREADY LEFT.
+    Labelling a December quote September is the bug this guards.
+    """
+    at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    assert next_quarterly_expiry(at) == date(2026, 9, 18)
+    assert active_contract_expiry(at) == date(2026, 12, 18)
+
+
+def test_active_contract_expiry_is_always_a_third_friday():
+    for month_day in ("2026-01-05", "2026-03-16", "2026-06-30", "2026-09-14", "2026-12-31"):
+        at = datetime.fromisoformat(month_day).replace(tzinfo=timezone.utc)
+        expiry = active_contract_expiry(at)
+        assert expiry.weekday() == 4
+        assert 15 <= expiry.day <= 21
+        assert expiry.month in (3, 6, 9, 12)
+
+
+def test_active_contract_expiry_roll_days_is_overridable():
+    """CME publishes 8 days; TradeStation was observed at 7. Both reachable."""
+    at = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    assert active_contract_expiry(at, roll_days=7) == date(2026, 9, 18)
+    assert active_contract_expiry(at, roll_days=8) == date(2026, 12, 18)

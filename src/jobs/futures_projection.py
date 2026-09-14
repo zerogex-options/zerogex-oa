@@ -409,6 +409,58 @@ def _third_friday(year: int, month: int) -> date:
     return first + timedelta(days=(4 - first.weekday()) % 7 + 14)
 
 
+# CME month codes for the quarterly cycle, and how many days before expiry
+# the CONTINUOUS series (@ES / @NQ) switches to the next contract.
+#
+# 7 is measured, not assumed: on the Sep 2026 cycle (expiry Fri Sep 18) the
+# @NQ basis against NDX sat at 8.5bp through Thu Sep 10 and stepped to 108.2bp
+# on Fri Sep 11 -- an expiring contract converged to cash, then one a quarter
+# out. @ES stepped the same day, 8.1 -> 93.7bp. CME's own roll notice is 8
+# days, which would have named December a day early. Override with
+# FUTURES_ROLL_DAYS_BEFORE_EXPIRY if the provider's behaviour changes;
+# `make futures-roll-check` re-measures it from futures_quotes.
+_MONTH_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
+_ROLL_DAYS_BEFORE_EXPIRY = _getenv_int("FUTURES_ROLL_DAYS_BEFORE_EXPIRY", 7)
+
+
+def active_contract_expiry(at: Optional[datetime] = None, roll_days: Optional[int] = None) -> date:
+    """Expiry of the contract a CONTINUOUS feed is quoting at ``at``.
+
+    Deliberately NOT :func:`next_quarterly_expiry`, which answers "the next
+    expiry on or after this date". Those two differ for the week between the
+    roll and expiry, and in that week the nearest expiry belongs to the
+    contract the feed has already left -- so naming it would label a December
+    quote as September, and price a whole quarter of carry over a few days.
+    """
+    today = (at or datetime.now(timezone.utc)).date()
+    cutoff = today + timedelta(days=_ROLL_DAYS_BEFORE_EXPIRY if roll_days is None else roll_days)
+    for year in (today.year, today.year + 1):
+        for month in _QUARTER_MONTHS:
+            expiry = _third_friday(year, month)
+            if expiry > cutoff:
+                return expiry
+    # Unreachable for any real date; keeps the return type honest.
+    return _third_friday(today.year + 1, _QUARTER_MONTHS[0])
+
+
+def active_contract_code(
+    future_symbol: Optional[str],
+    at: Optional[datetime] = None,
+    roll_days: Optional[int] = None,
+) -> Optional[str]:
+    """``"@NQ"`` -> ``"NQZ26"`` — the contract the continuous series is on.
+
+    DISPLAY-ONLY, and derived from the roll calendar rather than read back
+    from the provider, so it is a label and never a key for data, pricing or
+    persistence. Returns None when there is no future to name.
+    """
+    root = (future_symbol or "").lstrip("@").strip().upper()
+    if not root:
+        return None
+    expiry = active_contract_expiry(at, roll_days)
+    return f"{root}{_MONTH_CODES[expiry.month]}{expiry.year % 100:02d}"
+
+
 def next_quarterly_expiry(at: Optional[datetime] = None) -> date:
     """Expiry of the front quarterly contract on/after ``at``."""
     today = (at or datetime.now(timezone.utc)).date()
