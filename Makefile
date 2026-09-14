@@ -1883,6 +1883,7 @@ feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDID
 		$(if $(MINUTES),--duration-minutes '$(MINUTES)') \
 		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)') \
 		$(if $(PERSIST),--persist) \
+		$(if $(SOLVE_IV_BOTH),--solve-iv-both) \
 		$(if $(JSON),--json) \
 		$(if $(DEBUG),--debug)
 

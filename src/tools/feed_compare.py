@@ -134,6 +134,9 @@ def _pct_diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
 def _quotes_to_option_rows(
     quotes: Dict[str, OptionQuote],
     metadata: Dict[str, Dict[str, Any]],
+    as_of: datetime,
+    *,
+    keep_vendor_iv: bool = True,
 ) -> List[Dict[str, Any]]:
     """Shape normalised quotes into the dicts the analytics engine expects.
 
@@ -141,6 +144,21 @@ def _quotes_to_option_rows(
     which the provider's chain discovery already resolved. Contracts with
     no metadata are dropped rather than guessed: a mis-parsed strike would
     silently move a wall.
+
+    ``as_of`` is stamped on every row and is REQUIRED: ``GreeksCalculator``
+    treats a missing ``timestamp`` as a missing required field, returns
+    ``None`` for every Greek, and ``_calculate_gex_by_strike`` then fails on
+    ``None * open_interest``. Both feeds are stamped with the same instant
+    so time-to-expiry is identical across them -- a per-feed clock would
+    put a difference in the Greeks that belongs to the harness, not the
+    vendor.
+
+    ``keep_vendor_iv=False`` discards a vendor-supplied implied vol so the
+    solver runs for both feeds. That matters because the feeds are not
+    symmetric: TradeStation ships IV on the quote and ThetaData sells it
+    separately (and this deployment does not buy it), so passing vendor IV
+    through means one side uses the vendor's surface and the other solves
+    from mid. A divergence then cannot be attributed to the quotes.
     """
     rows: List[Dict[str, Any]] = []
     for symbol, q in quotes.items():
@@ -159,7 +177,8 @@ def _quotes_to_option_rows(
                 "mid": q.effective_mid(),
                 "volume": q.volume or 0,
                 "open_interest": q.open_interest or 0,
-                "implied_volatility": q.implied_volatility,
+                "implied_volatility": q.implied_volatility if keep_vendor_iv else None,
+                "timestamp": as_of,
             }
         )
     return rows
@@ -179,12 +198,30 @@ def _enrich(rows: List[Dict[str, Any]], spot: float, underlying: str) -> List[Di
         dividend_yield=resolve_dividend_yield(get_canonical_symbol(underlying)),
     )
     enriched = []
+    dropped = 0
     for row in rows:
         try:
-            enriched.append(calculator.enrich_option_data(dict(row), spot))
+            out = calculator.enrich_option_data(dict(row), spot)
         except Exception as e:  # noqa: BLE001 - one bad contract must not
             # abort the comparison; note it and continue.
             logger.debug("enrichment failed for %s: %s", row.get("option_symbol"), e)
+            continue
+        # enrich_option_data does NOT raise on a missing required field: it
+        # returns the row with every Greek set to None. Passing that on
+        # kills the whole comparison downstream, where the GEX sum
+        # multiplies gamma by open interest. Drop the contract instead --
+        # one unpriceable strike is a gap, not a reason to lose the run.
+        if out.get("gamma") is None:
+            dropped += 1
+            continue
+        enriched.append(out)
+    if dropped:
+        logger.warning(
+            "%d of %d contracts produced no Greeks and were dropped "
+            "(they cannot contribute to GEX)",
+            dropped,
+            len(rows),
+        )
     return enriched
 
 
@@ -710,6 +747,7 @@ def run_once(
     persist: bool,
     price_tolerance_pct: float,
     exposure_tolerance_pct: float,
+    keep_vendor_iv: bool = True,
 ) -> Dict[str, Any]:
     """One paired sample plus its analytics diff."""
     incumbent = sample_provider(
@@ -738,8 +776,23 @@ def run_once(
         if sample.error or not sample.spot:
             analytics[sample.provider] = {m: None for m in _METRICS}
             continue
-        rows = _quotes_to_option_rows(sample.quotes, sample.metadata)
+        rows = _quotes_to_option_rows(
+            sample.quotes, sample.metadata, now, keep_vendor_iv=keep_vendor_iv
+        )
         enriched = _enrich(rows, sample.spot, underlying)
+        if rows and not enriched:
+            # Every contract failed to price. Left alone this yields None for
+            # each chain metric while spot still matches, which reads as
+            # agreement. Say so instead.
+            logger.error(
+                "%s: all %d contracts failed to price; no chain metric can be "
+                "computed from this sample",
+                sample.provider,
+                len(rows),
+            )
+            analytics[sample.provider] = {m: None for m in _METRICS}
+            analytics[sample.provider]["spot"] = sample.spot
+            continue
         analytics[sample.provider] = _compute_analytics(enriched, sample.spot, underlying, now)
 
     comparisons = compare_metrics(
@@ -881,10 +934,26 @@ def _print_probe(result: Dict[str, Any]) -> None:
     print()
 
 
+#: Metrics that come from the option chain. `spot` is deliberately excluded:
+#: it is read from a bar, not derived from the chain, so it agrees even when
+#: every contract failed to price.
+_CHAIN_METRICS = tuple(m for m in _METRICS if m != "spot")
+
+
 def _verdict(comparisons: Sequence[MetricComparison]) -> str:
-    """One-word summary: agree, diverge, or incomparable."""
+    """One-word summary: agree, diverge, or incomparable.
+
+    "agree" requires at least one CHAIN metric to have been evaluated, not
+    merely one metric. Spot comes from a bar rather than from the contracts,
+    so a run in which every contract failed to price still matches on spot --
+    and would otherwise report "agree" while having compared nothing that
+    matters. A crash is recoverable; a confident false agreement is what
+    gets a migration signed off on no evidence.
+    """
     evaluated = [c for c in comparisons if c.within_tolerance is not None]
     if not evaluated:
+        return "incomparable"
+    if not any(c.metric in _CHAIN_METRICS for c in evaluated):
         return "incomparable"
     return "agree" if all(c.within_tolerance for c in evaluated) else "diverge"
 
@@ -955,6 +1024,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "measure ONE fetch per provider and exit: wall time and coverage, "
             "with no analytics and no database writes. Run this before the "
             "first real comparison to size the load."
+        ),
+    )
+    parser.add_argument(
+        "--solve-iv-both",
+        action="store_true",
+        help=(
+            "discard vendor-supplied implied vol and solve it from price for "
+            "BOTH feeds. The feeds are not symmetric -- TradeStation ships IV "
+            "on the quote, ThetaData sells it separately -- so by default one "
+            "side uses the vendor's surface and the other solves. Use this to "
+            "tell a quote difference apart from an IV-source difference when a "
+            "run reports 'diverge'."
         ),
     )
     parser.add_argument("--json", action="store_true", help="emit JSON, one object per sample")
@@ -1057,6 +1138,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 persist=args.persist,
                 price_tolerance_pct=args.price_tolerance_pct,
                 exposure_tolerance_pct=args.exposure_tolerance_pct,
+                keep_vendor_iv=not args.solve_iv_both,
             )
             if args.json:
                 print(json.dumps(result, default=str))

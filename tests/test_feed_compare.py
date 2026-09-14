@@ -124,14 +124,14 @@ def test_quotes_without_metadata_are_dropped_not_guessed():
         "ORPHAN": OptionQuote("ORPHAN", bid=1.0, ask=1.2),
     }
     metadata = {"KNOWN": {"strike": 650.0, "expiration": date(2026, 9, 18), "option_type": "C"}}
-    rows = _quotes_to_option_rows(quotes, metadata)
+    rows = _quotes_to_option_rows(quotes, metadata, datetime.now(timezone.utc))
     assert [r["option_symbol"] for r in rows] == ["KNOWN"]
 
 
 def test_row_shaping_fills_analytics_contract():
     quotes = {"X": OptionQuote("X", bid=1.0, ask=1.5, last=1.2, volume=10, open_interest=99)}
     metadata = {"X": {"strike": 650.0, "expiration": date(2026, 9, 18), "option_type": "P"}}
-    row = _quotes_to_option_rows(quotes, metadata)[0]
+    row = _quotes_to_option_rows(quotes, metadata, datetime.now(timezone.utc))[0]
 
     for key in (
         "option_symbol",
@@ -157,7 +157,7 @@ def test_missing_volume_and_oi_become_zero_in_rows():
     because the row is an analytics input, not a persisted record."""
     quotes = {"X": OptionQuote("X", bid=1.0, ask=1.5)}
     metadata = {"X": {"strike": 650.0, "expiration": date(2026, 9, 18), "option_type": "C"}}
-    row = _quotes_to_option_rows(quotes, metadata)[0]
+    row = _quotes_to_option_rows(quotes, metadata, datetime.now(timezone.utc))[0]
     assert row["volume"] == 0
     assert row["open_interest"] == 0
 
@@ -573,3 +573,122 @@ def test_a_permanently_failing_spot_poll_gives_up_early():
     with pytest.raises(RuntimeError, match="No data found"):
         feed_compare._spot_from_provider(_Failing(), "SPY")
     assert _time.monotonic() - started < 5, "waited out the deadline on a hard failure"
+
+
+# ---------------------------------------------------------------------------
+# The analytics path (pre-flight, 2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+def _quote(symbol, **kw):
+    base = dict(bid=1.20, ask=1.30, last=1.25, bid_size=5, ask_size=5, volume=10, open_interest=100)
+    base.update(kw)
+    return OptionQuote(option_symbol=symbol, timestamp=datetime.now(timezone.utc), **base)
+
+
+def test_rows_carry_a_timestamp_or_greeks_never_compute():
+    """GreeksCalculator treats a missing `timestamp` as a missing required
+    field: it returns None for every Greek rather than raising, and the GEX
+    sum downstream then dies on `None * open_interest`.
+
+    Every --probe run passed because probes skip analytics entirely, so this
+    only surfaced when the full comparison path was exercised.
+    """
+    as_of = datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc)
+    quotes = {"SPY   260914C00650000": _quote("SPY   260914C00650000")}
+    meta = {
+        "SPY   260914C00650000": {
+            "strike": 650.0,
+            "expiration": date(2026, 9, 14),
+            "option_type": "C",
+        }
+    }
+    rows = feed_compare._quotes_to_option_rows(quotes, meta, as_of)
+    assert rows, "contract was dropped"
+    assert rows[0]["timestamp"] == as_of
+
+
+def test_both_feeds_are_stamped_with_the_same_instant():
+    """A per-feed clock would put a difference in time-to-expiry, and
+    therefore in the Greeks, that belongs to the harness rather than to
+    either vendor."""
+    as_of = datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc)
+    meta = {"X": {"strike": 650.0, "expiration": date(2026, 9, 14), "option_type": "C"}}
+    a = feed_compare._quotes_to_option_rows({"X": _quote("X")}, meta, as_of)
+    b = feed_compare._quotes_to_option_rows({"X": _quote("X", bid=9.9)}, meta, as_of)
+    assert a[0]["timestamp"] == b[0]["timestamp"] == as_of
+
+
+def test_vendor_iv_can_be_discarded_so_both_feeds_solve():
+    """TradeStation ships IV on the quote; ThetaData sells it separately.
+
+    Left alone, one feed uses the vendor's surface and the other solves from
+    mid, so a GEX divergence cannot be attributed to the quotes.
+    """
+    as_of = datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc)
+    meta = {"X": {"strike": 650.0, "expiration": date(2026, 9, 14), "option_type": "C"}}
+    quotes = {"X": _quote("X", implied_volatility=0.42)}
+
+    kept = feed_compare._quotes_to_option_rows(quotes, meta, as_of)
+    assert kept[0]["implied_volatility"] == pytest.approx(0.42)
+
+    solved = feed_compare._quotes_to_option_rows(quotes, meta, as_of, keep_vendor_iv=False)
+    assert solved[0]["implied_volatility"] is None
+
+
+def test_a_contract_with_no_greeks_is_dropped_not_passed_on():
+    """enrich_option_data returns None Greeks rather than raising, and the
+    GEX sum multiplies gamma by open interest. One unpriceable strike is a
+    gap; it must not cost the whole run."""
+    rows = [
+        {"option_symbol": "GOOD", "strike": 650.0, "open_interest": 10},
+        {"option_symbol": "BAD", "strike": 655.0, "open_interest": 10},
+    ]
+
+    class _Calc:
+        def enrich_option_data(self, row, spot):
+            row["gamma"] = 0.01 if row["option_symbol"] == "GOOD" else None
+            return row
+
+    import src.ingestion.greeks_calculator as gc
+
+    original = gc.GreeksCalculator
+    gc.GreeksCalculator = lambda **kw: _Calc()
+    try:
+        out = feed_compare._enrich(rows, 650.0, "SPY")
+    finally:
+        gc.GreeksCalculator = original
+
+    assert [r["option_symbol"] for r in out] == ["GOOD"]
+    assert all(r.get("gamma") is not None for r in out)
+
+
+def test_spot_agreement_alone_is_not_agreement():
+    """Spot comes from a bar, not from the chain.
+
+    When every contract fails to price, spot still matches and every chain
+    metric is None -- which the original verdict reported as "agree". That
+    is the most dangerous possible output: it signs off a migration on a
+    comparison that compared nothing. Found by mutating the timestamp fix
+    and watching a fully broken run report agreement.
+    """
+    only_spot = compare_metrics(
+        {"spot": 650.0, "net_gex": None, "call_wall": None, "max_pain": None},
+        {"spot": 650.0, "net_gex": None, "call_wall": None, "max_pain": None},
+    )
+    assert _verdict(only_spot) == "incomparable"
+
+
+def test_one_resolved_chain_metric_is_enough_to_judge():
+    """The guard must not make a partially-resolved run unjudgeable."""
+    partial = compare_metrics(
+        {"spot": 650.0, "net_gex": 1_000_000.0, "gamma_flip": None},
+        {"spot": 650.0, "net_gex": 1_005_000.0, "gamma_flip": None},
+    )
+    assert _verdict(partial) == "agree"
+
+    diverging = compare_metrics(
+        {"spot": 650.0, "call_wall": 650.0},
+        {"spot": 650.0, "call_wall": 700.0},
+    )
+    assert _verdict(diverging) == "diverge"
