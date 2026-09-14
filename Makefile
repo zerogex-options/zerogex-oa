@@ -1108,6 +1108,10 @@ help: ## Show this help message
 	@echo "  make db-symbols-audit   - Read-only audit of malformed symbols rows (cascade preview)"
 	@echo "  make db-symbols-cleanup - Delete malformed symbols rows (CONFIRM=yes; INCLUDE_DATA=yes to cascade)"
 	@echo ""
+	@echo "$(GREEN)Feed Diagnostics:$(NC)"
+	@echo "  make futures-forensics  - Was the ES/NQ chart actually late? (SYMBOL=NDX DATE=... OPEN=08:00)"
+	@echo "  make futures-feed-logs  - Futures ingester journal around that window (same args)"
+	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
 	@echo "  make query SQL=\"...\"  - Run custom query"
@@ -3481,6 +3485,44 @@ db-symbols-cleanup: ## Delete malformed symbols rows. Dry-run unless CONFIRM=yes
 .PHONY: psql
 psql: ## Open PostgreSQL shell
 	@$(PSQL)
+
+# =============================================================================
+# Futures feed forensics — answering "the NQ/ES chart was delayed" after the fact
+# =============================================================================
+
+.PHONY: futures-forensics
+futures-forensics: ## Was the ES/NQ chart actually late? Read-only DB forensics. SYMBOL=NDX DATE=2026-09-14 OPEN=08:00 TZ_LOCAL=Europe/London PRE=45 POST=120 LAG_WARN=90 DAYS=7
+	@echo "$(BLUE)=== Futures feed forensics ===$(NC)"
+	@echo "$(YELLOW)Reads futures_quotes.updated_at, which records when each bar$(NC)"
+	@echo "$(YELLOW)LANDED. A reconnect replays barsback and heals its own gap, so$(NC)"
+	@echo "$(YELLOW)the series looks whole afterwards — this is what still shows the$(NC)"
+	@echo "$(YELLOW)delay. Read-only.$(NC)"
+	@echo ""
+	@$(PSQL) \
+		-v index_symbol=$(or $(SYMBOL),NDX) \
+		-v peer_symbol=$(or $(PEER),SPX) \
+		-v incident_date=$(or $(DATE),today) \
+		-v open_local=$(or $(OPEN),08:00) \
+		-v local_tz=$(or $(TZ_LOCAL),Europe/London) \
+		-v pre_min=$(or $(PRE),45) \
+		-v post_min=$(or $(POST),120) \
+		-v lag_warn_sec=$(or $(LAG_WARN),90) \
+		-v history_days=$(or $(DAYS),7) \
+		-f setup/database/diagnostics/futures_feed_forensics.sql
+
+.PHONY: futures-feed-logs
+futures-feed-logs: ## Futures ingester journal around a reported delay (reconnects, auth, respawns). SYMBOL=NDX DATE=2026-09-14 OPEN=08:00 TZ_LOCAL=Europe/London PRE=45 POST=120
+	@echo "$(BLUE)=== Futures ingester logs ===$(NC)"
+	@echo "$(YELLOW)Run futures-forensics FIRST: the journal is capped and often holds$(NC)"
+	@echo "$(YELLOW)only hours, while futures_quotes keeps days. See journal-volume.$(NC)"
+	@echo ""
+	@bin/futures-feed-logs.sh \
+		--symbol $(or $(SYMBOL),all) \
+		--date $(or $(DATE),today) \
+		--open $(or $(OPEN),08:00) \
+		--tz $(or $(TZ_LOCAL),Europe/London) \
+		--pre $(or $(PRE),45) \
+		--post $(or $(POST),120)
 
 .PHONY: tradeworkz-check
 tradeworkz-check: ## Run TradeWorkz accounting invariants (on-demand DB audit)
