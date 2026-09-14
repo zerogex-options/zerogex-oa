@@ -66,6 +66,33 @@ def _two_session_cutoff(now: Optional[datetime] = None) -> datetime:
     return datetime(prior_date.year, prior_date.month, prior_date.day, 9, 30, tzinfo=_ET)
 
 
+def _session_closes_since(cutoff: datetime, now: Optional[datetime] = None) -> List[datetime]:
+    """Regular-session closes, in UTC, for every weekday in ``[cutoff, now]``.
+
+    Used to bound forward-return lookups to the session the event belongs to.
+    Holidays are not filtered: an extra close on a day that had no session is
+    harmless, because no signal rows exist to match against it.
+
+    Half-days are honored through ``session_close_for``, so an early close
+    bounds its own session at 13:00 ET rather than 16:00.
+    """
+    from src.api.freshness import session_close_for
+
+    start = cutoff.astimezone(_ET).date()
+    end = (now or datetime.now(_ET)).astimezone(_ET).date()
+    out: List[datetime] = []
+    day = start
+    while day <= end:
+        if day.weekday() < 5:
+            out.append(
+                datetime.combine(day, session_close_for(day), tzinfo=_ET).astimezone(
+                    ZoneInfo("UTC")
+                )
+            )
+        day += timedelta(days=1)
+    return out
+
+
 class SignalsQueriesMixin:
     """Read-side methods for the signals feature.
 
@@ -660,6 +687,17 @@ class SignalsQueriesMixin:
                 FROM underlying_quotes uq
                 WHERE uq.symbol = scs.underlying
                   AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                  -- Bound to the close of the session this event belongs to:
+                  -- the earliest session close at or after the event. Without
+                  -- it a late-session flip is graded against an after-hours
+                  -- print, or against the next session's open over a weekend.
+                  -- No such close (an after-hours row) leaves this NULL, which
+                  -- yields a NULL forward price -- an unscored event, not a
+                  -- fabricated return.
+                  AND uq.timestamp <= (
+                        SELECT MIN(c) FROM UNNEST($5::timestamptz[]) AS c
+                        WHERE c >= scs.timestamp
+                      )
                 ORDER BY uq.timestamp ASC
                 LIMIT 1
             ) q1 ON TRUE
@@ -671,7 +709,10 @@ class SignalsQueriesMixin:
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, component_name, limit, cutoff)
+                rows = await conn.fetch(
+                    query, symbol, component_name, limit, cutoff,
+                    _session_closes_since(cutoff),
+                )
             # Compute sign-flips chronologically (oldest → newest), but
             # return newest → oldest to match the convention used by the
             # rest of the timeseries APIs.
@@ -1326,6 +1367,181 @@ class SignalsQueriesMixin:
             logger.warning("get_recent_action_cards failed (%s): %s", underlying, exc)
             return []
 
+    @staticmethod
+    def _session_close_utc(start_utc: datetime) -> datetime:
+        """The regular-session close, in UTC, for the ET day ``start_utc`` opens.
+
+        ``start_utc`` is ET local midnight of the scorecard's day, so its ET
+        calendar date is the trading day. ``session_close_for`` is the shared
+        NYSE-calendar helper and already returns 13:00 on an early-close day,
+        so half-days need no special handling here.
+
+        Imported lazily: ``src.api.freshness`` reaches back into the API layer,
+        and importing it at module scope would close an import cycle through
+        ``DatabaseManager``.
+        """
+        et_day = start_utc.astimezone(_ET).date()
+        try:
+            from src.api.freshness import session_close_for
+
+            close_t = session_close_for(et_day)
+        except Exception:  # noqa: BLE001 - never fail a scorecard over the calendar
+            logger.warning(
+                "get_daily_scorecard: NYSE calendar unavailable for %s; "
+                "falling back to a 16:00 ET close",
+                et_day,
+                exc_info=True,
+            )
+            close_t = time(16, 0)
+        return datetime.combine(et_day, close_t, tzinfo=_ET).astimezone(ZoneInfo("UTC"))
+
+    async def get_signal_trailing_record(
+        self,
+        symbol: str,
+        signal_names: List[str],
+        sessions: int = 30,
+        horizon_minutes: int = 60,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Per-signal flip record across the last ``sessions`` trading days.
+
+        The daily scorecard answers "how did this signal do today", which is
+        one session and cannot answer "is this signal any good". Nothing
+        aggregated across sessions, so a subscriber asking that could only be
+        pointed at the strategy catalog — which measures *strategies*, not the
+        signals the product actually renders.
+
+        Same flip definition and same session-bounded forward return as
+        ``get_daily_scorecard``, so a trailing row is exactly the sum of the
+        daily rows over the window and the two surfaces can never disagree.
+
+        ``scored`` is reported alongside ``flips`` rather than folded away: a
+        signal that only fires near the close has flips that cannot be graded
+        within the session, and hiding that would reintroduce the bug this
+        method exists to make visible.
+        """
+        end_et = (now or datetime.now(_ET)).astimezone(_ET)
+        # Walk back `sessions` weekdays. Holidays are not filtered — an empty
+        # day contributes no rows, so it only makes the window slightly longer
+        # in calendar terms, never wrong.
+        day = end_et.date()
+        counted = 0
+        while counted < max(1, sessions):
+            if day.weekday() < 5:
+                counted += 1
+            if counted < max(1, sessions):
+                day -= timedelta(days=1)
+        start_utc = datetime.combine(day, time(0, 0), tzinfo=_ET).astimezone(ZoneInfo("UTC"))
+        end_utc = end_et.astimezone(ZoneInfo("UTC"))
+
+        out: Dict[str, Any] = {
+            "symbol": symbol,
+            "sessions_requested": sessions,
+            "window_start_utc": start_utc,
+            "window_end_utc": end_utc,
+            "horizon_minutes": horizon_minutes,
+            "signals": [],
+        }
+        if not signal_names:
+            return out
+
+        horizon_interval = f"{int(horizon_minutes)} minutes"
+        closes = _session_closes_since(start_utc, end_et)
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    WITH events AS (
+                        SELECT
+                            scs.component_name,
+                            scs.timestamp,
+                            SIGN(scs.clamped_score) AS sign_now,
+                            LAG(SIGN(scs.clamped_score)) OVER (
+                                PARTITION BY scs.component_name
+                                ORDER BY scs.timestamp
+                            ) AS sign_prev,
+                            q0.close AS close_at_ts,
+                            q1.close AS close_at_horizon
+                        FROM signal_component_scores scs
+                        LEFT JOIN LATERAL (
+                            SELECT close FROM underlying_quotes uq
+                            WHERE uq.symbol = scs.underlying
+                              AND uq.timestamp <= scs.timestamp
+                            ORDER BY uq.timestamp DESC LIMIT 1
+                        ) q0 ON TRUE
+                        LEFT JOIN LATERAL (
+                            SELECT close FROM underlying_quotes uq
+                            WHERE uq.symbol = scs.underlying
+                              AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                              -- Same session only. See get_daily_scorecard.
+                              AND uq.timestamp <= (
+                                    SELECT MIN(c) FROM UNNEST($5::timestamptz[]) AS c
+                                    WHERE c >= scs.timestamp
+                                  )
+                            ORDER BY uq.timestamp ASC LIMIT 1
+                        ) q1 ON TRUE
+                        WHERE scs.underlying = $1
+                          AND scs.component_name = ANY($2::varchar[])
+                          AND scs.timestamp >= $3
+                          AND scs.timestamp < $4
+                    ),
+                    flips AS (
+                        SELECT
+                            component_name,
+                            CASE
+                                WHEN close_at_ts IS NULL OR close_at_horizon IS NULL THEN NULL
+                                WHEN sign_now > 0 THEN (close_at_horizon - close_at_ts) / NULLIF(close_at_ts, 0)
+                                WHEN sign_now < 0 THEN (close_at_ts - close_at_horizon) / NULLIF(close_at_ts, 0)
+                                ELSE NULL
+                            END AS directional_return
+                        FROM events
+                        WHERE sign_now <> 0
+                          AND sign_prev IS NOT NULL
+                          AND sign_prev <> 0
+                          AND sign_now <> sign_prev
+                    )
+                    SELECT
+                        component_name,
+                        COUNT(*) AS flips,
+                        COUNT(directional_return) AS scored,
+                        SUM(CASE WHEN directional_return > 0 THEN 1 ELSE 0 END) AS wins,
+                        SUM(CASE WHEN directional_return < 0 THEN 1 ELSE 0 END) AS losses,
+                        AVG(directional_return) AS avg_directional_return
+                    FROM flips
+                    GROUP BY component_name
+                    """,
+                    symbol,
+                    list(signal_names),
+                    start_utc,
+                    end_utc,
+                    closes,
+                )
+            for r in rows:
+                avg = r["avg_directional_return"]
+                scored = int(r["scored"] or 0)
+                wins = int(r["wins"] or 0)
+                out["signals"].append(
+                    {
+                        "name": r["component_name"],
+                        "flips": int(r["flips"] or 0),
+                        "scored": scored,
+                        "wins": wins,
+                        "losses": int(r["losses"] or 0),
+                        # Only meaningful against `scored`; None rather than 0.0
+                        # when nothing could be graded, so a signal with no
+                        # scorable flips never reads as a 0% win rate.
+                        "win_rate": (wins / scored) if scored else None,
+                        "avg_directional_return": float(avg) if avg is not None else None,
+                    }
+                )
+            out["signals"].sort(key=lambda e: e["name"])
+        except Exception as exc:
+            logger.warning(
+                "get_signal_trailing_record failed (%s, %s sessions): %s",
+                symbol, sessions, exc,
+            )
+        return out
+
     async def get_daily_scorecard(
         self,
         symbol: str,
@@ -1347,6 +1563,14 @@ class SignalsQueriesMixin:
            (return same-sign as the flip direction), and the average
            directional return. Best/worst signal are picked from the names
            with at least two qualifying events.
+
+           The forward price is bounded to the same regular session, so a
+           flip within ``horizon_minutes`` of the close is reported as
+           ``flips`` without ``scored`` rather than being graded against an
+           after-hours print. ``scored`` is therefore ≤ ``flips``, and a
+           signal that fires only near the close (``eod_pressure``, whose
+           ramp is zero before 90 minutes to close) can legitimately return
+           ``avg_directional_return: None`` for a whole session.
         3. **Closing regime** — the most recent ``signal_scores`` row at or
            before ``end_utc``, used to label the day's MSI regime.
 
@@ -1407,6 +1631,25 @@ class SignalsQueriesMixin:
             )
 
         # 2. Per-signal flip events with realized return at horizon.
+        #
+        # The forward price must come from the SAME regular session. Without
+        # that bound the lateral join below takes the first quote at or after
+        # `event + horizon` with no upper limit, so a signal firing within
+        # `horizon` of the close is graded against an after-hours print — or,
+        # on a Friday, against the next Monday's open. A weekend gap then gets
+        # reported as an hour of trading.
+        #
+        # `eod_pressure` is the pathological case: its time ramp is zero until
+        # 90 minutes before the close, so EVERY flip it can register is inside
+        # the last 90 minutes and every one of them was mis-scored. Any other
+        # late-firing signal was affected intermittently.
+        #
+        # Bounding the join is the whole fix: when `event + horizon` lands past
+        # the close, no quote satisfies both predicates, `close_at_horizon` is
+        # NULL, and the CASE below already yields a NULL `directional_return`.
+        # Such a flip is then counted in `flips` but not in `scored` — the
+        # "not scorable" state the aggregate already models.
+        session_close_utc = self._session_close_utc(start_utc)
         if signal_names:
             horizon_interval = f"{int(horizon_minutes)} minutes"
             try:
@@ -1436,6 +1679,7 @@ class SignalsQueriesMixin:
                                 SELECT close FROM underlying_quotes uq
                                 WHERE uq.symbol = scs.underlying
                                   AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                                  AND uq.timestamp <= $5
                                 ORDER BY uq.timestamp ASC LIMIT 1
                             ) q1 ON TRUE
                             WHERE scs.underlying = $1
@@ -1480,6 +1724,7 @@ class SignalsQueriesMixin:
                         list(signal_names),
                         start_utc,
                         end_utc,
+                        session_close_utc,
                     )
                 events: List[Dict[str, Any]] = []
                 for r in sig_rows:

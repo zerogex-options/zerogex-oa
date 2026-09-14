@@ -102,11 +102,20 @@ def test_get_signal_component_events_query_includes_session_cutoff_bound():
     # rows newer than that timestamp.
     assert "scs.timestamp >= $4" in conn.last_query
     # And the matching argument must be a tz-aware datetime at 09:30 ET.
-    symbol, component, limit, cutoff = conn.last_args
+    symbol, component, limit, cutoff, session_closes = conn.last_args
     assert (symbol, component, limit) == ("SPY", "vol_expansion", 500)
     assert isinstance(cutoff, datetime)
     assert cutoff.tzinfo is not None
     assert cutoff.astimezone(_ET).time() == time(9, 30)
+    # $5 bounds each event's forward price to its own session's close, so a
+    # late-session flip is never graded against an after-hours print.
+    assert "uq.timestamp <= (" in conn.last_query
+    assert "UNNEST($5::timestamptz[])" in conn.last_query
+    assert session_closes, "session closes must be bound as $5"
+    assert all(c.tzinfo is not None for c in session_closes)
+    assert all(c.astimezone(_ET).time() in (time(16, 0), time(13, 0)) for c in session_closes)
+    assert all(c.astimezone(_ET).weekday() < 5 for c in session_closes)
+    assert session_closes[0] >= cutoff
 
 
 def test_get_signal_component_events_cutoff_matches_helper():
@@ -128,7 +137,7 @@ def test_get_signal_component_events_cutoff_matches_helper():
     asyncio.run(db.get_signal_component_events("SPY", "tape_flow_bias"))
     after = _two_session_cutoff()
 
-    _symbol, _component, _limit, cutoff = conn.last_args
+    _symbol, _component, _limit, cutoff, _closes = conn.last_args
     # Allow for a clock tick between calls — but the cutoff must land on the
     # same 09:30 ET boundary as the helper at the moment of the call.
     assert before <= cutoff <= after
