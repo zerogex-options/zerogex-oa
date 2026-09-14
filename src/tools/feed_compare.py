@@ -62,7 +62,7 @@ import json
 import logging
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -282,6 +282,11 @@ class FeedSample:
     #: first question is always whether they disagreed on spot, and that is
     #: unanswerable after the fact without the bar.
     spot_bar: Optional[Bar] = None
+    #: Seconds per phase. Discovery (expirations + strikes) runs once at
+    #: startup and on strike recalibration; the chain fetch runs every poll.
+    #: Reporting one total conflates a one-off cost with the recurring one,
+    #: which is the only number that has to fit inside the poll interval.
+    timings: Dict[str, float] = field(default_factory=dict)
 
     @property
     def contract_count(self) -> int:
@@ -364,9 +369,11 @@ def sample_provider(
     try:
         spot_bar = None
         spot = spot_hint
+        spot_started = time.monotonic()
         if spot is None:
             spot_bar = _spot_from_provider(provider, underlying)
             spot = float(spot_bar.close) if spot_bar and spot_bar.close else None
+        spot_seconds = time.monotonic() - spot_started
         if not spot or spot <= 0:
             return FeedSample(
                 provider=provider.name,
@@ -376,6 +383,7 @@ def sample_provider(
                 metadata={},
                 error="no spot price available",
             )
+        discovery_started = time.monotonic()
         symbols, metadata = _resolve_chain(
             provider,
             underlying,
@@ -384,7 +392,12 @@ def sample_provider(
             strike_pct_range=strike_pct_range,
             spot=spot,
         )
+        discovery = time.monotonic() - discovery_started
+
+        chain_started = time.monotonic()
         quotes = provider.snapshot_option_quotes(symbols)
+        chain = time.monotonic() - chain_started
+
         return FeedSample(
             provider=provider.name,
             captured_at=captured_at,
@@ -392,6 +405,11 @@ def sample_provider(
             quotes=quotes,
             metadata=metadata,
             spot_bar=spot_bar,
+            timings={
+                "spot": round(spot_seconds, 2),
+                "discovery": round(discovery, 2),
+                "chain": round(chain, 2),
+            },
         )
     except Exception as e:  # noqa: BLE001 - a failing feed is a RESULT here,
         # not a crash: "the candidate could not answer" is exactly what the
@@ -817,6 +835,7 @@ def probe(
         "two_sided": sample.quoted_count,
         "with_open_interest": sample.oi_count,
         "error": sample.error,
+        "timings": sample.timings,
         "columns": columns,
     }
 
@@ -825,7 +844,18 @@ def _print_probe(result: Dict[str, Any]) -> None:
     print(f"\n  provider           {result['provider']}")
     print(f"  underlying         {result['underlying']}")
     print(f"  spot               {result['spot']}")
+    timings = result.get("timings") or {}
     print(f"  wall time          {result['seconds']}s")
+    if timings:
+        # Only the chain fetch repeats every poll; the rest is startup.
+        print(
+            f"    spot {timings.get('spot', 0)}s"
+            f"  + discovery {timings.get('discovery', 0)}s  (once, at startup)"
+        )
+        print(
+            f"    chain {timings.get('chain', 0)}s"
+            f"  <- this is the per-poll cost; must fit THETADATA_POLL_SECONDS"
+        )
     print(f"  contracts asked    {result['contracts_requested']}")
     print(f"  contracts returned {result['contracts_returned']}")
     print(f"  two-sided quotes   {result['two_sided']}")

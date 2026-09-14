@@ -700,3 +700,84 @@ def test_close_is_idempotent():
     provider = ThetaDataProvider(_FakeClient(), max_concurrency=4)
     provider.close()
     provider.close()
+
+
+def test_a_prior_sessions_volume_is_not_reported_as_todays():
+    """option_snapshot_ohlc returns the last DAILY bar, not today's.
+
+    A live SPX probe on Monday returned a contract whose only trade was the
+    previous Friday: close 791.24, volume 1, timestamp Friday 12:43. That
+    volume is Friday's.
+
+    OptionQuote.volume is cumulative volume for THIS session and the engine
+    differences successive snapshots to derive flow, so passing a stale
+    figure through books old trades as today's and classifies them
+    Lee-Ready into ask/bid flow. Worse, when the stale total exceeds
+    today's first real print the engine reads the decrease as a vendor
+    session reset, re-anchors to zero, and counts the whole stale total
+    again.
+    """
+    stale = datetime(2026, 9, 11, 12, 43, tzinfo=timezone(timedelta(hours=-4)))
+    client = _FakeClient(
+        quote_rows=[
+            {"strike": 6875.0, "right": "CALL", "bid": 738.1, "ask": 754.1, "timestamp": QUOTE_TS}
+        ],
+        ohlc_rows=[
+            {
+                "strike": 6875.0,
+                "right": "CALL",
+                "close": 791.24,
+                "volume": 1,
+                "timestamp": stale,
+            }
+        ],
+    )
+    symbol = build_occ_symbol("SPXW", EXP, 6875.0, "C")
+    state = ThetaDataProvider(client).fetch_chain_state([symbol], include_open_interest=False)
+
+    assert state[symbol]["volume"] == 0, "a prior session's volume leaked in as today's"
+    # The last TRADE price stays: it is true whenever it happened, and the
+    # IV solver needs it when there is no two-sided quote.
+    assert state[symbol]["last"] == pytest.approx(791.24)
+
+
+def test_todays_volume_is_kept():
+    """The guard must not discard live volume."""
+    now = datetime.now(timezone(timedelta(hours=-4)))
+    client = _FakeClient(
+        quote_rows=[
+            {"strike": 650.0, "right": "CALL", "bid": 1.2, "ask": 1.3, "timestamp": QUOTE_TS}
+        ],
+        ohlc_rows=[
+            {"strike": 650.0, "right": "CALL", "close": 1.25, "volume": 4210, "timestamp": now}
+        ],
+    )
+    symbol = build_occ_symbol("SPY", EXP, 650.0, "C")
+    state = ThetaDataProvider(client).fetch_chain_state([symbol], include_open_interest=False)
+    assert state[symbol]["volume"] == 4210
+
+
+def test_prior_session_is_judged_in_the_feeds_own_timezone():
+    """A UTC comparison would zero that afternoon's volume every evening.
+
+    Rows arrive localised to America/New_York. The UTC date rolls at 20:00
+    ET, four hours after the 16:00 close, so between 20:00 and midnight a
+    UTC-date comparison marks the session that just ended as a prior one.
+    """
+    from src.ingestion.providers.thetadata import is_prior_session
+
+    eastern = timezone(timedelta(hours=-4))
+    now_et = datetime.now(eastern)
+    assert is_prior_session(now_et) is False
+    assert is_prior_session(now_et - timedelta(days=1)) is True
+
+    # The evening window: a 16:00 ET bar judged at 21:00 ET the same day.
+    # In UTC both are already "tomorrow" for `now` but not for the bar, so
+    # a UTC comparison would call this a prior session. It is not.
+    bar = datetime(2026, 9, 14, 16, 0, tzinfo=eastern)
+    evening = datetime(2026, 9, 14, 21, 0, tzinfo=eastern)
+    assert bar.date() == evening.date()
+    assert bar.astimezone(timezone.utc).date() < evening.astimezone(timezone.utc).date()
+    # Unknown or naive timestamps must not cause data to be discarded.
+    assert is_prior_session(None) is False
+    assert is_prior_session(datetime.now()) is False
