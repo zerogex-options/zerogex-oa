@@ -68,7 +68,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.ingestion.providers import MarketDataProvider, get_provider
 from src.ingestion.providers.base import Bar, OptionQuote
-from src.symbols import get_canonical_symbol
+from src.symbols import get_canonical_symbol, is_cash_index
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -407,17 +407,77 @@ def sample_provider(
         )
 
 
+def _is_index_underlying(underlying: str, canonical: str) -> bool:
+    """True when this symbol's spot comes from an index feed, not an equity one.
+
+    A cash index and an ETF are different products on different feeds, and
+    asking the wrong one does not degrade gracefully -- it returns nothing.
+    ThetaData's equity endpoint defaults to Nasdaq Basic, which has never
+    heard of SPX.
+
+    ``is_cash_index`` is the codebase's source of truth, but it keys on the
+    canonical symbol, which needs ``SYMBOL_ALIASES`` configured. The
+    ``$XXX.X`` form is TradeStation's own index notation and is unambiguous
+    without any config, so it stands in as a structural fallback: a probe
+    run against an unconfigured checkout should still reach the right feed.
+    """
+    if is_cash_index(canonical):
+        return True
+    raw = (underlying or "").strip().upper()
+    return raw.startswith("$") and raw.endswith(".X")
+
+
+def _detect_mangled_index_symbol(underlying: str) -> Optional[str]:
+    """Explain a symbol that make ate the ``$`` from, or return ``None``.
+
+    Index symbols are spelled ``$SPXW.X``, and ``make feed-probe
+    UNDERLYING='$SPXW.X'`` silently delivers ``PXW.X``: make expands ``$S``
+    as an empty variable of its own before the recipe ever runs. The result
+    is a symbol that simply does not exist, whose only previous symptom was
+    a half-minute wait and "no spot price available".
+
+    A trailing ``.X`` with no leading ``$`` is not a real ticker in any
+    convention this codebase uses, so it is safe to reject outright.
+    """
+    raw = (underlying or "").strip()
+    if not raw.upper().endswith(".X") or raw.startswith("$"):
+        return None
+    return (
+        f"{raw!r} is not a symbol. It looks like an index symbol that make "
+        f"truncated: make reads '$X' as a variable of its own and expands it "
+        f"to nothing, so '$SPXW.X' arrives here as 'PXW.X'. The original "
+        f"cannot be reconstructed from what survived, so pass it again, "
+        f"through the environment:\n"
+        f"    UNDERLYING='$SPXW.X' make feed-probe PROVIDER=<name>\n"
+        f"or double the '$' in a make assignment: UNDERLYING='$$SPXW.X'."
+    )
+
+
 def _spot_from_provider(provider: MarketDataProvider, underlying: str) -> Optional[Bar]:
     """Best available spot bar for ``underlying`` from this provider.
 
-    Briefly runs the underlying bar stream rather than assuming a quote
-    endpoint, because that is the path a migration actually depends on.
-    Returns the whole bar rather than just the close so the caller can
-    persist the tape it priced against.
+    Briefly runs a bar stream rather than assuming a quote endpoint,
+    because that is the path a migration actually depends on. Returns the
+    whole bar rather than just the close so the caller can persist the tape
+    it priced against.
+
+    Routes indices to the index feed. Sending SPX to the equity endpoint
+    returns nothing at all, which surfaces as "no spot price available" and
+    aborts the whole comparison -- for two of the four production
+    underlyings.
     """
-    if not provider.capabilities.underlying_bars:
-        return None
-    stream = provider.stream_underlying_bars(underlying, db_symbol=get_canonical_symbol(underlying))
+    canonical = get_canonical_symbol(underlying)
+    caps = provider.capabilities
+
+    if _is_index_underlying(underlying, canonical):
+        if not caps.index_bars:
+            return None
+        stream = provider.stream_index_bars(canonical, db_symbol=canonical)
+    else:
+        if not caps.underlying_bars:
+            return None
+        stream = provider.stream_underlying_bars(underlying, db_symbol=canonical)
+
     try:
         stream.start()
         deadline = time.monotonic() + 20
@@ -425,6 +485,13 @@ def _spot_from_provider(provider: MarketDataProvider, underlying: str) -> Option
             bar = stream.drain()
             if bar and bar.close:
                 return bar
+            # A poll that is failing for a structural reason -- wrong
+            # endpoint, no entitlement -- will still be failing in twenty
+            # seconds. Waiting out the deadline turns a one-line diagnosis
+            # into a half-minute of silence.
+            error = getattr(stream, "last_error", None)
+            if error:
+                raise RuntimeError(f"{underlying} spot unavailable: {error}")
             time.sleep(0.5)
     finally:
         stream.stop()
@@ -863,6 +930,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON, one object per sample")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
+
+    mangled = _detect_mangled_index_symbol(args.underlying)
+    if mangled:
+        parser.error(mangled)
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,

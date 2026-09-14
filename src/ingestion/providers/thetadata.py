@@ -41,29 +41,29 @@ sees only a fraction of consolidated volume — so this provider declares
 ``signed_underlying_volume=False`` and the caller must not treat its
 volume as a full-market figure.
 
-**Market Value, and an unresolved contradiction.**  ThetaData sells a
-"Market Value" feed that adjusts each quote's bid and ask by up to a cent,
-which they characterise as a derived product carrying no exchange fees.
-How you select it is genuinely unsettled:
+**Market Value: resolved 2026-09-14.**  ThetaData sells a "Market Value"
+feed that adjusts each quote's bid and ask by up to a cent, which they
+characterise as a derived product carrying no exchange fees.  Two
+mechanisms appeared to compete — a terminal "stage", and dedicated
+``option_snapshot_market_value`` / ``index_snapshot_market_value``
+endpoints.  ThetaData support confirmed both are real, and which one
+applies depends on how you read the data:
 
-* Their support said (2026-09-11) the toggle is *terminal-level*: run a
-  second Theta Terminal "using stage" and point a client at it.
-* But the terminal's own generated ``config.toml`` shows ``stage``
-  selecting ``mdds-stage.thetadata.us`` / ``fpss_stage_hosts``, which that
-  file documents as *"TESTING ONLY! Occasional reboots. Potential issues
-  with data and certain requests. This server is not stable."*  That is a
-  staging environment, not a fee-exempt production product.
-* Meanwhile the client exposes ``option_snapshot_market_value`` and
-  ``index_snapshot_market_value`` with signatures identical to the
-  ordinary quote endpoints.
+* **Snapshots and history (what this module uses): the endpoints.**  Call
+  ``option_snapshot_market_value`` instead of ``option_snapshot_quote``.
+  One terminal serves both, so no second process is needed.
+* **Websocket streaming (FPSS): the stage.**  A single terminal cannot
+  subscribe to Market Value and realtime simultaneously, so streaming both
+  at once needs a second terminal pointed at stage — ``fpss_region``
+  changed to ``fpss_stage_hosts``, with distinct ``port`` and ``ws_port``
+  when they share a host.
 
-The endpoint reading now looks more likely than the stage reading, so
-``market_value_endpoints`` defaults on for the MV stage.  Both mechanisms
-are supported, selected by that flag, so whichever answer ThetaData gives
-needs no rewrite.  **Confirm before trusting a Market Value measurement:**
-running the comparison against a staging server would produce a divergence
-caused by test infrastructure rather than by the penny adjustment, which is
-exactly the wrong conclusion to draw.
+Hence ``market_value_endpoints`` defaults on, and the ``*_MV_MDDS_PORT``
+second-terminal wiring is vestigial for a polling deployment — it is kept
+only for a future streaming implementation.  Note that ``config.toml``
+documents the stage hosts as *"TESTING ONLY! ... This server is not
+stable"*, which is a live concern for that streaming path and not for this
+one.
 
 They also confirmed the adjustment never *introduces* a crossed quote and
 never takes a price to zero, and that every quote is adjusted.  Nothing in
@@ -520,6 +520,11 @@ class _PollingBarStream(BarStream):
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._updates_received = 0
+        #: Last poll failure, so a caller waiting for a first bar can stop
+        #: waiting on an error that will never clear (a wrong endpoint, a
+        #: symbol with no entitlement) instead of burning its whole
+        #: deadline. Cleared by a successful poll.
+        self.last_error: Optional[str] = None
 
     def start(self) -> None:
         self._running = True
@@ -560,9 +565,11 @@ class _PollingBarStream(BarStream):
                         self._updates_received += 1
                     if self._wakeup is not None:
                         self._wakeup.set()
+                    self.last_error = None
                 failures = 0
             except Exception as e:  # noqa: BLE001
                 failures += 1
+                self.last_error = f"{type(e).__name__}: {e}"
                 logger.warning("thetadata bar poll for %s failed: %s", self._db_symbol, e)
             delay = self._poll_interval * min(2**failures, 16)
             elapsed = time.monotonic() - started
