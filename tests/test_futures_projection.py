@@ -13,8 +13,11 @@ so these tests pin the three things that make that safe:
 
 import asyncio
 from datetime import date, datetime, timedelta, timezone
+from math import exp
 
 import pytest
+
+from src.config import RISK_FREE_RATE, resolve_dividend_yield
 
 from src.jobs.futures_projection import (
     NEVER_PROJECT,
@@ -394,3 +397,51 @@ def test_active_contract_expiry_roll_days_is_overridable():
     at = datetime(2026, 9, 10, tzinfo=timezone.utc)
     assert active_contract_expiry(at, roll_days=7) == date(2026, 9, 18)
     assert active_contract_expiry(at, roll_days=8) == date(2026, 12, 18)
+
+
+def test_carry_fallback_prices_to_the_active_contract_through_the_roll():
+    """The fallback must not collapse to ~1.0 during the roll week.
+
+    Between the roll and the old contract's expiry the nearest quarterly is
+    the contract the feed has ALREADY LEFT. Pricing a full quarter of carry
+    over the few days to it makes the ratio nearly 1.0 — which publishes cash
+    levels on a futures axis, the one outcome resolve_basis refuses to reach
+    by falling back rather than defaulting to 1.0.
+
+    This is the regime the fallback is actually for: overnight the cash index
+    is frozen, so there is no concurrent pair and the measured path has
+    nothing to read.
+    """
+    in_roll_week = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    ratio = theoretical_ratio("NDX", in_roll_week)
+
+    # Sanity: the two expiries genuinely disagree on this date.
+    assert next_quarterly_expiry(in_roll_week) == date(2026, 9, 18)
+    assert active_contract_expiry(in_roll_week) == date(2026, 12, 18)
+
+    # Priced to Dec, a quarter of carry is worth ~1% -- comfortably clear of
+    # the ~0.05% that pricing to the four-day-away Sep expiry would give.
+    assert ratio > 1.005, "carry fallback collapsed toward 1.0 inside the roll week"
+
+    days_to_sep = (date(2026, 9, 18) - in_roll_week.date()).days
+    wrong = exp((RISK_FREE_RATE - resolve_dividend_yield("NDX")) * (days_to_sep / 365.0))
+    assert ratio > wrong * 1.005
+
+
+def test_carry_fallback_is_continuous_across_the_roll():
+    """No cliff in the published ratio on the day the contract switches.
+
+    Before the fix the ratio decayed toward 1.0 into expiry and then jumped
+    when next_quarterly_expiry finally moved on. Pricing to the active
+    contract throughout means the step lands on the roll -- where the feed's
+    own basis steps too -- and not a week later.
+    """
+    day_before = theoretical_ratio("NDX", datetime(2026, 9, 10, tzinfo=timezone.utc))
+    day_of = theoretical_ratio("NDX", datetime(2026, 9, 11, tzinfo=timezone.utc))
+    week_after = theoretical_ratio("NDX", datetime(2026, 9, 21, tzinfo=timezone.utc))
+
+    # The roll is the only step: Sep 10 still prices to the expiring contract.
+    assert day_before < 1.002
+    assert day_of > 1.005
+    # And it decays smoothly from there, with no second jump at Sep expiry.
+    assert day_of > week_after > 1.005

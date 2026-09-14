@@ -474,15 +474,27 @@ def next_quarterly_expiry(at: Optional[datetime] = None) -> date:
 
 
 def theoretical_ratio(index_symbol: str, at: Optional[datetime] = None) -> float:
-    """Cost-of-carry ratio ``e^((r - q) T)`` for the front quarterly future.
+    """Cost-of-carry ratio ``e^((r - q) T)`` for the ACTIVE quarterly future.
 
     The fallback when no concurrent print pair is available.  Uses the
     configured ``RISK_FREE_RATE`` and the per-symbol dividend yield, so it is
     only as good as those assumptions — which is exactly why the measured
     ratio is preferred whenever the tape offers one.
+
+    ``T`` runs to :func:`active_contract_expiry`, NOT
+    :func:`next_quarterly_expiry`.  The two differ for the week between the
+    roll and the old contract's expiry, and in that week the nearer expiry
+    belongs to the contract the feed has already left: pricing a whole
+    quarter of carry over the few days to it collapses the ratio to roughly
+    1.0.  On the Sep 2026 roll that was ~100bp low on NQ — about 290 points
+    of misplaced levels — and it lands in exactly the situation this fallback
+    exists for, because the cash index stops printing overnight and the
+    measured path has nothing to read.  ``FUTURES_BASIS_MAX_DEVIATION`` does
+    not catch it either: both the right and the wrong ratio sit well inside
+    the 3% bound.
     """
     now = at or datetime.now(timezone.utc)
-    days = max((next_quarterly_expiry(now) - now.date()).days, 0)
+    days = max((active_contract_expiry(now) - now.date()).days, 0)
     years = days / 365.0
     q = resolve_dividend_yield(index_symbol)
     return exp((RISK_FREE_RATE - q) * years)
