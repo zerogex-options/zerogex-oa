@@ -105,6 +105,20 @@ PRICE_FIELDS: frozenset[str] = frozenset(
         "put_wall",
         "max_pain",
         "pin_strike",
+        # /api/gex/pin-stability renames the pin per reading, and the renames
+        # need listing individually: the allowlist matches on KEY, so a field
+        # carrying the pin under any other name passes through unprojected.
+        # That endpoint sits under the projectable /api/gex/ prefix, so before
+        # these were listed an NQ request returned the pin as a raw NDX strike
+        # beside a correctly projected `pin_strike` in the same payload —
+        # ~400 points below the axis it is drawn on, with nothing marking it.
+        "current_pin",
+        "held_pin",
+        "session_open_pin",
+        # A DELTA between two settled pins. Projection is multiplicative, so a
+        # price difference carries across on the same ratio; leaving it raw
+        # would report an NDX-sized migration against NQ-sized levels.
+        "net_migration",
         "max_gamma_strike",
         "king_node",
         "hvl",
@@ -294,6 +308,13 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         "charm",
         "volume",
         "open_interest",
+        # pin-stability counters: minutes observed and distinct strikes
+        # occupied. Counts of samples, not prices.
+        "current_samples",
+        "held_samples",
+        "quiet_samples",
+        "total_samples",
+        "distinct_values",
     }
 )
 
