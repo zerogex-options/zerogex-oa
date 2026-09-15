@@ -204,6 +204,40 @@ _OCC_RE = re.compile(
 )
 
 
+#: One ThetaClient per terminal connection, shared by every provider that
+#: points at it.
+#:
+#: Each ThetaClient authenticates on construction and the terminal keeps ONE
+#: session: a second client invalidates the first, and every subsequent call
+#: fails with "Invalid session ID. This can occur if more than one terminal
+#: is running." Two providers on one terminal -- exactly what a realtime vs
+#: Market Value comparison is -- therefore cannot each hold their own client.
+#: Verified against a live terminal 2026-09-15, where the comparison died on
+#: its first sample.
+#:
+#: Sharing is safe because the Market Value selection for snapshots is
+#: per-CALL (the *_market_value endpoints), not per-connection, so one client
+#: serves both stages.
+_CLIENTS: Dict[Tuple[Any, ...], Any] = {}
+_CLIENTS_LOCK = threading.Lock()
+
+
+def shared_client(factory: Any, key: Tuple[Any, ...]) -> Any:
+    """The client for ``key``, constructing it once via ``factory``."""
+    with _CLIENTS_LOCK:
+        client = _CLIENTS.get(key)
+        if client is None:
+            client = factory()
+            _CLIENTS[key] = client
+        return client
+
+
+def reset_shared_clients() -> None:
+    """Drop the cache. For tests, and for a deliberate reconnect."""
+    with _CLIENTS_LOCK:
+        _CLIENTS.clear()
+
+
 def option_root_for(symbol: str) -> str:
     """ThetaData option root for a ZeroGEX/TradeStation underlying.
 
@@ -737,13 +771,21 @@ class ThetaDataProvider(MarketDataProvider):
             and os.getenv("THETADATA_MV_MDDS_PORT")
             else "THETADATA_MDDS_PORT"
         )
-        client = ThetaClient(
-            email=os.getenv("THETADATA_EMAIL") or None,
-            password=os.getenv("THETADATA_PASSWORD") or None,
-            creds_file=os.getenv("THETADATA_CREDS_FILE") or None,
-            mdds_host=os.getenv("THETADATA_MDDS_HOST") or None,
-            mdds_port=os.getenv(port_var) or None,
-            dataframe_type="pandas",
+        host = os.getenv("THETADATA_MDDS_HOST") or None
+        port = os.getenv(port_var) or None
+        # Keyed by the CONNECTION, so the realtime and Market Value stages
+        # share one client when they share a terminal -- which they do, and
+        # must, because a second authentication invalidates the first.
+        client = shared_client(
+            lambda: ThetaClient(
+                email=os.getenv("THETADATA_EMAIL") or None,
+                password=os.getenv("THETADATA_PASSWORD") or None,
+                creds_file=os.getenv("THETADATA_CREDS_FILE") or None,
+                mdds_host=host,
+                mdds_port=port,
+                dataframe_type="pandas",
+            ),
+            key=(host, port),
         )
         is_mv = resolved_stage in ("mv", "market_value", "marketvalue")
         return cls(
@@ -889,7 +931,12 @@ class ThetaDataProvider(MarketDataProvider):
         return results
 
     def close(self) -> None:
-        """Shut the shared pool down. Safe to call more than once."""
+        """Shut this provider's pool down. Safe to call more than once.
+
+        Deliberately does NOT close the client: it is shared with any other
+        provider on the same terminal, and closing it out from under a
+        still-running comparison would fail the other side.
+        """
         with self._executor_lock:
             executor, self._executor = self._executor, None
         if executor is not None:

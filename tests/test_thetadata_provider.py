@@ -888,3 +888,53 @@ def test_the_probe_reports_which_market_value_endpoints_exist():
     assert inventory["option_snapshot_market_value"] == "present"
     assert inventory["stock_snapshot_market_value"] == "ABSENT"
     assert inventory["index_snapshot_market_value"] == "ABSENT"
+
+
+def test_two_stages_on_one_terminal_share_a_client(monkeypatch):
+    """A second ThetaClient invalidates the first one's session.
+
+    The terminal keeps ONE session, so two providers each constructing their
+    own client kills the realtime vs Market Value comparison on its first
+    sample: "Invalid session ID. This can occur if more than one terminal is
+    running." Observed against a live terminal 2026-09-15.
+
+    Sharing is sound because Market Value is selected per CALL for snapshots
+    (the *_market_value endpoints), not per connection.
+    """
+    from src.ingestion.providers import thetadata as mod
+
+    mod.reset_shared_clients()
+    built = []
+
+    def _factory():
+        built.append(object())
+        return built[-1]
+
+    a = mod.shared_client(_factory, key=("host", "25503"))
+    b = mod.shared_client(_factory, key=("host", "25503"))
+    assert a is b
+    assert len(built) == 1, "a second client would invalidate the first's session"
+
+    # A genuinely different terminal still gets its own.
+    c = mod.shared_client(_factory, key=("host", "25603"))
+    assert c is not a
+    assert len(built) == 2
+    mod.reset_shared_clients()
+
+
+def test_close_does_not_shut_a_client_another_provider_is_using():
+    """Closing one stage must not break the other mid-comparison."""
+
+    class _Client:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    client = _Client()
+    a = ThetaDataProvider(client, stage="realtime")
+    b = ThetaDataProvider(client, stage="mv", market_value_endpoints=True)
+    a.close()
+    assert client.closed is False, "closed a client the other stage still needs"
+    b.close()
+    assert client.closed is False
