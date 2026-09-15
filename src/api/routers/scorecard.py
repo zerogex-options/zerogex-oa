@@ -310,3 +310,38 @@ async def get_signal_trailing_record(
         row["label"] = _humanize_signal_name(row["name"])
     payload["is_empty"] = not payload.get("signals")
     return payload
+
+
+@router.get("/sessions")
+async def list_scorecard_sessions(
+    symbol: str = Query(default="SPY", max_length=10),
+    limit: int = Query(default=60, ge=1, le=365),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Recent trading days that have a scorecard, newest first.
+
+    Backs the /scorecard landing page. Mirrors the ``/api/replay/sessions``
+    and ``/api/forecast/available-dates`` contract — ``{symbol, count,
+    sessions: []}`` with enough per-date metadata (Playbook call count and the
+    labeled closing regime) that a card renders without a fetch per day.
+
+    Empty ``sessions`` means the engine has never written for that symbol, not
+    an error.
+    """
+    sym = symbol.upper()
+    rows = await db.list_scorecard_sessions(sym, limit=limit)
+
+    def _shape(r: dict[str, Any]) -> dict[str, Any]:
+        # A row carrying neither field has no regime to label. Passing the
+        # empty dict through would read as "transition" — a real regime —
+        # rather than "unknown", so the absence is preserved explicitly.
+        has_regime = r.get("direction") is not None or r.get("composite_score") is not None
+        raw = r["date"]
+        return {
+            "date": raw.isoformat() if isinstance(raw, date) else raw,
+            "cards": r["cards"],
+            "regime": _label_regime(r if has_regime else None),
+            "composite_score": r.get("composite_score"),
+        }
+
+    return {"symbol": sym, "count": len(rows), "sessions": [_shape(r) for r in rows]}
