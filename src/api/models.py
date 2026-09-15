@@ -607,6 +607,39 @@ class GammaRegimeSeriesResponse(BaseModel):
     bars: List[GammaRegimeBar]
 
 
+class GammaWeatherResponse(BaseModel):
+    """One combined current-state read from the pieces already on the page.
+
+    A market-health classification. Not a directional signal, an entry or
+    exit, or a recommendation, and it inherits the estimated-not-observed
+    caveat from the hedging flow it reads.
+
+    ``components`` is returned alongside the verdict deliberately: a panel
+    that shows only a conclusion cannot be checked against the charts sitting
+    directly underneath it.
+    """
+
+    symbol: str
+    session: str
+    bar_start: Optional[str] = None
+    state: str
+    label: str
+    sentence: str
+    #: BUYING / SELLING / MIXED.
+    pressure: str
+    #: PINNING / ACCELERATIVE / FLAT.
+    structure: str
+    #: SUPPORTIVE / CAPPING.
+    lean_side: Optional[str] = None
+    #: TRANSITION_RISK / NARROWING / WIDENING / STEADY / NONE. A modifier on
+    #: the state, never a competing state.
+    cushion: str
+    cushion_summary: Optional[str] = None
+    components: dict = {}
+    basis: str
+    disclosure: str
+
+
 class MarketTideComponent(BaseModel):
     symbol: str
     flow_score: float

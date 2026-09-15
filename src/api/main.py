@@ -41,6 +41,7 @@ from .models import (
     FlowContractsResponse,
     HedgingFlowResponse,
     GammaRegimeSeriesResponse,
+    GammaWeatherResponse,
     MarketTideResponse,
     MarketTideHistoryResponse,
     SmartMoneyFlowPoint,
@@ -57,6 +58,7 @@ from .models import (
     OpenInterestResponse,
     StrikeProfileBucket,
 )
+from src.analytics import gamma_weather as gw
 from src.analytics.flip_cushion import DEFAULT_RATE_BARS as CUSHION_RATE_BARS
 from src.analytics.flip_cushion import build_series as build_cushion_series
 from src.analytics.flip_cushion import describe as describe_cushion
@@ -1659,6 +1661,138 @@ async def get_gamma_regime_series(
             "session": session,
             "rolling_bars": rolling_bars,
             "bars": bars,
+        }
+    )
+
+
+@app.get(
+    "/api/gex/weather",
+    response_model=GammaWeatherResponse,
+    tags=["GEX"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/gex/weather")
+async def get_gamma_weather(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+):
+    """The combined current-state read: Gamma Weather.
+
+    Consolidates what is already on the Hedging Flow page into one sentence:
+    whether estimated hedging pressure is persistently buying or selling,
+    whether near-price dealer gamma is building or thinning, which side the
+    book leans, and how much room is left before the gamma regime itself
+    changes.
+
+    Two precedence rules, both of which the spec left open:
+
+    * the **cushion is a modifier, not a state**. "Thin and closing" answers a
+      different question from "stable bid", so they compose rather than
+      compete;
+    * **stability decides the state, lean colors it.** They disagree often and
+      the panel exists to say whether a condition can persist, which is what
+      stability speaks to.
+
+    Nothing is stored. The state is derived on read from components that are,
+    so retuning a threshold reclassifies the whole archive rather than leaving
+    old sessions labelled by a rule that is no longer live.
+
+    Reads the two materialised series and classifies their latest COMMON bar,
+    so the pressure and the structure in one sentence always describe the same
+    five minutes. Returns 404 for an unknown symbol, and 409 when neither
+    series has a bar yet for the resolved session.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    flow_rows = await _db().get_hedging_flow_series(symbol=normalized, session=session)
+    regime_rows = await _db().get_gamma_regime_series(symbol=normalized, session=session)
+    if flow_rows is None and regime_rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    flow_rows = flow_rows or []
+    regime_rows = regime_rows or []
+
+    # Both series are newest-first on a shared grid. Derive the flow moving
+    # average and the cushion the same way their own endpoints do, then pair
+    # on the latest bar BOTH have: a sentence mixing this bar's pressure with
+    # last bar's structure would be quietly wrong.
+    flow_chrono = list(reversed(flow_rows))
+    ma = smooth([float(r.get("net_flow_usd") or 0.0) for r in flow_chrono], DEFAULT_SMOOTHING_BARS)
+    flow_by_bar = {
+        r["bar_start"]: (float(r.get("net_flow_usd") or 0.0), m) for r, m in zip(flow_chrono, ma)
+    }
+
+    regime_chrono = list(reversed(regime_rows))
+    cushions = build_cushion_series(
+        [(r["bar_start"], r.get("spot"), r.get("gamma_flip")) for r in regime_chrono],
+        rate_bars=CUSHION_RATE_BARS,
+    )
+
+    paired = None
+    for row, cushion in zip(reversed(regime_chrono), reversed(cushions)):
+        if row["bar_start"] in flow_by_bar:
+            paired = (row, cushion, *flow_by_bar[row["bar_start"]])
+            break
+    if paired is None:
+        raise HTTPException(
+            status_code=409,
+            detail="no bar yet carries both hedging flow and gamma structure for this session",
+        )
+
+    regime_row, cushion, pressure_bar, pressure_avg = paired
+
+    def _f(value):
+        return float(value) if value is not None else None
+
+    weather = gw.classify(
+        gw.WeatherInputs(
+            pressure_bar=pressure_bar,
+            pressure_avg=pressure_avg,
+            lean=_f(regime_row.get("rolling_lean")),
+            stability=_f(regime_row.get("rolling_stability")),
+            gamma_trend=_f(regime_row.get("anchored_stability")),
+            cushion_state=cushion.state,
+            cushion_pts=cushion.cushion_pts,
+            cushion_rate_pts=cushion.rate_pts,
+        )
+    )
+
+    bar_start = regime_row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+
+    return JSONResponse(
+        content={
+            "symbol": normalized,
+            "session": session,
+            "bar_start": bar_start.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "state": weather.state,
+            "label": weather.label,
+            "sentence": weather.sentence,
+            "pressure": weather.pressure,
+            "structure": weather.structure,
+            "lean_side": weather.lean_side,
+            "cushion": weather.cushion,
+            "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS),
+            "components": {
+                "pressure_bar_usd": pressure_bar,
+                "pressure_avg_usd": pressure_avg,
+                "lean": _f(regime_row.get("rolling_lean")),
+                "stability": _f(regime_row.get("rolling_stability")),
+                "gamma_trend": _f(regime_row.get("anchored_stability")),
+                "cushion_pts": cushion.cushion_pts,
+                "cushion_state": cushion.state,
+                "cushion_rate_pts": cushion.rate_pts,
+                "spot": _f(regime_row.get("spot")),
+                "gamma_flip": _f(regime_row.get("gamma_flip")),
+            },
+            "basis": _HEDGING_FLOW_BASIS,
+            "disclosure": _HEDGING_FLOW_DISCLOSURE,
         }
     )
 
