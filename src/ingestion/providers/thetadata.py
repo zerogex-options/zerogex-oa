@@ -638,6 +638,11 @@ class _PollingBarStream(BarStream):
 
         self._bar: Optional[Bar] = None
         self._dirty = False
+        # Sleep on an Event rather than time.sleep so stop() wakes the
+        # thread immediately. Blocking sleep meant every teardown waited out
+        # the remaining poll interval -- 5 seconds of dead time per sample,
+        # all of it after the bar had already been delivered.
+        self._wake = threading.Event()
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -657,6 +662,7 @@ class _PollingBarStream(BarStream):
 
     def stop(self) -> None:
         self._running = False
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=10)
 
@@ -695,7 +701,7 @@ class _PollingBarStream(BarStream):
                 logger.warning("thetadata bar poll for %s failed: %s", self._db_symbol, e)
             delay = self._poll_interval * min(2**failures, 16)
             elapsed = time.monotonic() - started
-            time.sleep(max(0.0, min(delay, 60.0) - elapsed))
+            self._wake.wait(max(0.0, min(delay, 60.0) - elapsed))
 
 
 # ---------------------------------------------------------------------------
