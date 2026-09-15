@@ -698,6 +698,25 @@ Server-accumulated flow series — one row per 5-minute bar (cumulative call/put
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
 
+### GET /api/gex/weather
+The combined current-state read (Gamma Weather). Consolidates what is already on the Hedging Flow page into one sentence: whether estimated hedging pressure is persistently buying or selling, whether near-price dealer gamma is building or thinning, which side the book leans, and how much room is left before the gamma regime itself changes.
+
+**Parameters:** `symbol` (required), `session` (optional, `current` | `prior`).
+
+**Two precedence rules**, both of which the feature spec left open:
+- The **cushion is a modifier, not a state**. "Thin and closing" answers a different question from "stable bid", so they compose (`Stable bid` + `TRANSITION_RISK`) rather than compete. As peers, one always has to be suppressed.
+- **Stability decides the state; lean colors it.** They disagree often, and the panel exists to say whether a condition can persist, which is what stability speaks to. This keeps every input combination covered without inventing a dozen state names, and leaves `MIXED` meaning what it should: the inputs genuinely disagree.
+
+States are `STABLE_BID`, `SUPPORTED_DIP`, `FRAGILE_RALLY`, `UNSTABLE`, `MIXED`. Cushion modifiers are `TRANSITION_RISK`, `NARROWING`, `WIDENING`, `STEADY`, `NONE`.
+
+**Nothing is stored.** The state is derived on read from components that are, so retuning a threshold reclassifies the whole archive rather than leaving old sessions labeled by a rule that is no longer live. Every tunable lives in one block in `src/analytics/gamma_weather.py`.
+
+`components` is returned alongside the verdict deliberately: a panel that shows only a conclusion cannot be checked against the charts directly underneath it.
+
+Reads the two materialized series and classifies their latest **common** bar, so the pressure and the structure in one sentence always describe the same five minutes. 404 for an unknown symbol; 409 when no bar yet carries both.
+
+This is a market-health classification, not a directional signal, entry, exit, or recommendation. It inherits the estimated-not-observed `basis` and `disclosure` from the hedging flow it reads; combining inputs does not upgrade that.
+
 ### GET /api/gex/regime-series
 The Gamma Shift read at every 5-minute bar of a session. Where `/api/gex/regime-shift` answers "how did dealer gamma change between these two moments" as a single card, this is the same maths as a line — so structure sits on the same timeline as `/api/flow/hedging` and can be read against it. Flow says how hard the tape is pushing; this says whether the book absorbs or amplifies it.
 
