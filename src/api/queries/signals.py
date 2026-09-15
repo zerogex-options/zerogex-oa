@@ -1395,6 +1395,91 @@ class SignalsQueriesMixin:
             close_t = time(16, 0)
         return datetime.combine(et_day, close_t, tzinfo=_ET).astimezone(ZoneInfo("UTC"))
 
+    async def list_scorecard_sessions(
+        self,
+        symbol: str,
+        limit: int = 60,
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Recent ET trading days that have a scorecard, newest first.
+
+        Backs the /scorecard landing page's cards, and mirrors the
+        ``/api/replay/sessions`` contract: enough per-date metadata to render a
+        card without a second fetch per day.
+
+        A day qualifies on either signal — Action Cards emitted, or a closing
+        regime written. The FULL OUTER JOIN is deliberate: a quiet session that
+        emitted no cards still has a regime and still has a scorecard worth
+        reading, and dropping it would make the list lie about which days exist.
+
+        Scanned from a date floor rather than the whole table: ``limit``
+        trading days is at most ``limit * 2`` calendar days once weekends and
+        holidays are allowed for, plus a week of slack.
+        """
+        end_et = (now or datetime.now(_ET)).astimezone(_ET)
+        floor_days = max(1, limit) * 2 + 7
+        start_utc = (
+            datetime.combine(
+                end_et.date() - timedelta(days=floor_days), time(0, 0), tzinfo=_ET
+            ).astimezone(ZoneInfo("UTC"))
+        )
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH cards AS (
+                        SELECT
+                            (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                            COUNT(*) AS total
+                        FROM signal_action_cards
+                        WHERE underlying = $1
+                          AND timestamp >= $2
+                          AND action <> 'STAND_DOWN'
+                        GROUP BY 1
+                    ),
+                    regimes AS (
+                        SELECT DISTINCT ON ((timestamp AT TIME ZONE 'America/New_York')::date)
+                            (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                            direction,
+                            composite_score
+                        FROM signal_scores
+                        WHERE underlying = $1
+                          AND timestamp >= $2
+                        ORDER BY 1, timestamp DESC
+                    )
+                    SELECT
+                        COALESCE(cards.d, regimes.d) AS d,
+                        COALESCE(cards.total, 0) AS cards,
+                        regimes.direction AS direction,
+                        regimes.composite_score AS composite_score
+                    FROM cards
+                    FULL OUTER JOIN regimes ON cards.d = regimes.d
+                    WHERE COALESCE(cards.d, regimes.d) IS NOT NULL
+                    ORDER BY d DESC
+                    LIMIT $3
+                    """,
+                    symbol,
+                    start_utc,
+                    int(max(1, limit)),
+                )
+            return [
+                {
+                    "date": r["d"],
+                    "cards": int(r["cards"] or 0),
+                    "direction": r["direction"],
+                    "composite_score": (
+                        float(r["composite_score"])
+                        if r["composite_score"] is not None
+                        else None
+                    ),
+                }
+                for r in rows
+            ]
+        except Exception as exc:
+            logger.warning("list_scorecard_sessions failed (%s): %s", symbol, exc)
+            return []
+
     async def get_signal_trailing_record(
         self,
         symbol: str,

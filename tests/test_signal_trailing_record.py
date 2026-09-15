@@ -129,3 +129,59 @@ def test_win_rate_is_null_when_nothing_was_scorable(monkeypatch: pytest.MonkeyPa
     assert row["win_rate"] is None
     assert row["avg_directional_return"] is None
     assert row["flips"] == 9
+
+
+# ── /api/scorecard/sessions — the landing page's card list ──────────────────
+
+
+def test_sessions_lists_newest_first_with_regime_and_cards(monkeypatch: pytest.MonkeyPatch):
+    from datetime import date as _date
+
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.list_scorecard_sessions = AsyncMock(
+        return_value=[
+            {"date": _date(2026, 9, 11), "cards": 55, "direction": "bullish", "composite_score": 70.0},
+            {"date": _date(2026, 9, 10), "cards": 0, "direction": "bearish", "composite_score": 20.0},
+        ]
+    )
+    with TestClient(app) as client:
+        r = client.get("/api/scorecard/sessions", params={"symbol": "QQQ", "limit": 60})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["symbol"] == "QQQ"
+    assert body["count"] == 2
+    assert [s["date"] for s in body["sessions"]] == ["2026-09-11", "2026-09-10"]
+    assert body["sessions"][0]["regime"] == "long gamma"
+    assert body["sessions"][1]["regime"] == "short gamma"
+    # A quiet session still gets a card; 0 calls is information, not absence.
+    assert body["sessions"][1]["cards"] == 0
+
+
+def test_sessions_marks_a_day_with_no_regime_unknown(monkeypatch: pytest.MonkeyPatch):
+    """A regime-less day must not borrow 'transition', which is a real regime."""
+    from datetime import date as _date
+
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.list_scorecard_sessions = AsyncMock(
+        return_value=[{"date": _date(2026, 9, 11), "cards": 3, "direction": None, "composite_score": None}]
+    )
+    with TestClient(app) as client:
+        r = client.get("/api/scorecard/sessions")
+    assert r.json()["sessions"][0]["regime"] == "unknown"
+
+
+def test_sessions_empty_is_not_an_error(monkeypatch: pytest.MonkeyPatch):
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.list_scorecard_sessions = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        r = client.get("/api/scorecard/sessions", params={"symbol": "NDX"})
+    assert r.status_code == 200
+    assert r.json() == {"symbol": "NDX", "count": 0, "sessions": []}
+
+
+def test_sessions_clamps_limit(monkeypatch: pytest.MonkeyPatch):
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.list_scorecard_sessions = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        assert client.get("/api/scorecard/sessions", params={"limit": 0}).status_code == 422
+        assert client.get("/api/scorecard/sessions", params={"limit": 400}).status_code == 422
