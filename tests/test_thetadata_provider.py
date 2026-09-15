@@ -938,3 +938,44 @@ def test_close_does_not_shut_a_client_another_provider_is_using():
     assert client.closed is False, "closed a client the other stage still needs"
     b.close()
     assert client.closed is False
+
+
+def test_the_two_stages_report_different_provider_names():
+    """A shared name makes a Market Value comparison measure nothing.
+
+    The shadow tables key on (provider, option_symbol, captured_at). With
+    both stages reporting "thetadata", the candidate's rows collided with
+    the incumbent's and were dropped by ON CONFLICT DO NOTHING -- silently,
+    since a conflict is not an error -- so the Market Value side was never
+    persisted at all. feed_comparisons recorded both sides under the same
+    name too, and the printed report labelled both columns "thetadata".
+    Observed on a live run 2026-09-15.
+    """
+
+    class _C:
+        pass
+
+    assert ThetaDataProvider(_C(), stage="realtime").name == "thetadata"
+    for mv in ("mv", "market_value", "marketvalue", "MarketValue", " MV "):
+        assert ThetaDataProvider(_C(), stage=mv).name == "thetadata_mv", mv
+
+
+def test_registry_builds_the_two_stages_under_distinct_names(monkeypatch):
+    """The names the harness persists must differ, not just the CLI labels."""
+    from src.ingestion.providers import get_provider, register_provider
+
+    built = {}
+
+    def _factory(**kw):
+        stage = kw.get("stage", "realtime")
+
+        class _C:
+            pass
+
+        p = ThetaDataProvider(_C(), stage=stage)
+        built[stage] = p
+        return p
+
+    register_provider("_t_rt", lambda **kw: _factory(stage="realtime"))
+    register_provider("_t_mv", lambda **kw: _factory(stage="mv"))
+    assert get_provider("_t_rt").name != get_provider("_t_mv").name

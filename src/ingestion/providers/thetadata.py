@@ -192,6 +192,17 @@ _FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {
 #: Override with THETADATA_MAX_CONCURRENCY; 1 restores sequential fetching.
 _DEFAULT_MAX_CONCURRENCY = 6
 
+#: Spellings that select the Market Value stage. Defined once because it is
+#: read by from_env, by the provider's own name, and by the endpoint router,
+#: and a stage that is Market Value for one and not the others produces a
+#: comparison that silently measures nothing.
+_MV_STAGES = ("mv", "market_value", "marketvalue")
+
+
+def is_market_value_stage(stage: Optional[str]) -> bool:
+    return (stage or "").strip().lower() in _MV_STAGES
+
+
 #: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
 #: diagnostic covers the index endpoints too. VIX because it is one of the
 #: symbols this deployment actually needs and is cheap to ask for.
@@ -731,6 +742,15 @@ class ThetaDataProvider(MarketDataProvider):
     ):
         self._client = client
         self.stage = stage
+        # Per-INSTANCE, not the class attribute. Both stages reporting
+        # "thetadata" made a realtime vs Market Value comparison
+        # unreadable and unpersistable: the shadow tables key on
+        # (provider, option_symbol, captured_at), so the second feed's rows
+        # collided with the first and were dropped by ON CONFLICT DO
+        # NOTHING -- the Market Value side vanished without an error -- and
+        # feed_comparisons recorded incumbent and candidate under the same
+        # name. Observed 2026-09-15.
+        self.name = "thetadata_mv" if is_market_value_stage(stage) else "thetadata"
         self._poll_interval = poll_interval
         self._oi_poll_interval = oi_poll_interval
         self._strike_range = strike_range
@@ -767,8 +787,7 @@ class ThetaDataProvider(MarketDataProvider):
         resolved_stage = (stage or os.getenv("THETADATA_STAGE", "realtime")).lower()
         port_var = (
             "THETADATA_MV_MDDS_PORT"
-            if resolved_stage in ("mv", "market_value", "marketvalue")
-            and os.getenv("THETADATA_MV_MDDS_PORT")
+            if is_market_value_stage(resolved_stage) and os.getenv("THETADATA_MV_MDDS_PORT")
             else "THETADATA_MDDS_PORT"
         )
         host = os.getenv("THETADATA_MDDS_HOST") or None
@@ -787,7 +806,7 @@ class ThetaDataProvider(MarketDataProvider):
             ),
             key=(host, port),
         )
-        is_mv = resolved_stage in ("mv", "market_value", "marketvalue")
+        is_mv = is_market_value_stage(resolved_stage)
         return cls(
             client,
             stage=resolved_stage,
