@@ -963,7 +963,15 @@ def _print_probe(result: Dict[str, Any]) -> None:
     elif result["contracts_requested"]:
         coverage = result["contracts_returned"] / result["contracts_requested"]
         print(f"  coverage           {coverage:.1%}")
-    columns = result.get("columns") or {}
+    columns = dict(result.get("columns") or {})
+    # Not a response shape: an inventory of which Market Value endpoints the
+    # installed client wraps. Printed on its own so it is not mistaken for
+    # a call that returned no rows.
+    inventory = columns.pop("market_value_endpoints", None)
+    if inventory:
+        print("\n  --- market value endpoints on this client ---")
+        for name in sorted(inventory):
+            print(f"  {name:<34} {inventory[name]}")
     if columns:
         print("\n  --- raw response columns (paste this back) ---")
         for endpoint in sorted(columns):

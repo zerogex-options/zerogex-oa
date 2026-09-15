@@ -128,6 +128,7 @@ from src.ingestion.providers.base import (
     OptionQuote,
     OptionQuoteStream,
     ProviderCapabilities,
+    ProviderCapabilityError,
 )
 from src.symbols import is_cash_index, resolve_underlying_from_option_root
 from src.utils import get_logger
@@ -894,6 +895,35 @@ class ThetaDataProvider(MarketDataProvider):
         if executor is not None:
             executor.shutdown(wait=True)
 
+    def _endpoint(self, mv_name: str, realtime_name: str) -> Callable[..., Any]:
+        """The Market Value endpoint on an MV stage, else the ordinary one.
+
+        Raises rather than falling back. A Market Value deployment that
+        quietly served realtime data for one feed would bill exchange fees
+        on exactly the thing it switched to Market Value to avoid, and
+        nothing downstream would show it -- the numbers would look right.
+        ThetaData confirmed (2026-09-14) that all three products (stock,
+        options, indices) have a Market Value feed and that the Market Value
+        product is exchange-fee exempt, so a missing endpoint here means
+        this client wraps it under some other name, not that the feed does
+        not exist. Run `make feed-probe` to see what the installed client
+        actually exposes.
+        """
+        if not self._market_value_endpoints:
+            return getattr(self._client, realtime_name)
+        fn = getattr(self._client, mv_name, None)
+        if fn is None:
+            raise ProviderCapabilityError(
+                f"stage {self.stage!r} is Market Value, but this thetadata "
+                f"client has no {mv_name!r}. Serving {realtime_name!r} "
+                "instead would silently put a realtime, exchange-fee-bearing "
+                "feed inside a Market Value deployment. Check the client "
+                "version for the endpoint's real name, or set "
+                "THETADATA_MV_VIA_ENDPOINTS=0 to select Market Value by "
+                "terminal stage instead."
+            )
+        return fn
+
     def _quote_call(self, **kwargs: Any) -> Any:
         """The quote endpoint, honouring whichever Market Value mechanism
         is configured.
@@ -903,9 +933,7 @@ class ThetaDataProvider(MarketDataProvider):
         ``option_snapshot_quote``. The two share a signature, so the swap
         is total: nothing downstream needs to know which one answered.
         """
-        if self._market_value_endpoints:
-            return self._client.option_snapshot_market_value(**kwargs)
-        return self._client.option_snapshot_quote(**kwargs)
+        return self._endpoint("option_snapshot_market_value", "option_snapshot_quote")(**kwargs)
 
     def _merge_frame(
         self,
@@ -997,9 +1025,27 @@ class ThetaDataProvider(MarketDataProvider):
         """
         out: Dict[str, Dict[str, Any]] = {}
 
+        # Which Market Value endpoints this client actually wraps. ThetaData
+        # says all three products have a Market Value feed and that the
+        # product is exchange-fee exempt; whether this Python package
+        # exposes an endpoint per family is a separate question, and a
+        # Market Value deployment missing one would silently want the
+        # realtime endpoint in its place. Settle it by looking.
+        out["market_value_endpoints"] = {
+            name: ("present" if hasattr(self._client, name) else "ABSENT")
+            for name in (
+                "option_snapshot_market_value",
+                "index_snapshot_market_value",
+                "stock_snapshot_market_value",
+            )
+        }
+
         expirations = self.get_option_expirations(underlying)
         if not expirations:
-            return {"error": {"detail": f"no expirations returned for {underlying}"}}
+            # Keep the endpoint inventory: a chain that cannot be discovered
+            # is the moment you most want to know what this client exposes.
+            out["error"] = {"detail": f"no expirations returned for {underlying}"}
+            return out
         expiration = expirations[0]
 
         # The endpoints speak ThetaData's vocabulary, not TradeStation's.
@@ -1105,8 +1151,8 @@ class ThetaDataProvider(MarketDataProvider):
         root = option_root_for(symbol)
 
         def fetch() -> Optional[Bar]:
-            frame = self._client.stock_snapshot_ohlc(symbol=root)
-            rows = _rows(frame)
+            call = self._endpoint("stock_snapshot_market_value", "stock_snapshot_ohlc")
+            rows = _rows(call(symbol=root))
             return _bar_from_row(rows[0], resolved) if rows else None
 
         return _PollingBarStream(fetch, resolved, poll_interval=self._poll_interval, wakeup=wakeup)
@@ -1128,8 +1174,13 @@ class ThetaDataProvider(MarketDataProvider):
         root = index_symbol_for(symbol)
 
         def fetch() -> Optional[Bar]:
-            frame = self._client.index_snapshot_ohlc(symbol=root)
-            rows = _rows(frame)
+            # Honours the Market Value stage like the option chain does.
+            # Index values are licensed separately from OPRA (Cboe CGIF for
+            # SPX and VIX, Nasdaq GIDS for NDX), so an MV deployment that
+            # kept calling the realtime index endpoint would carry exchange
+            # fees on half this deployment's underlyings.
+            call = self._endpoint("index_snapshot_market_value", "index_snapshot_ohlc")
+            rows = _rows(call(symbol=root))
             return _bar_from_row(rows[0], resolved) if rows else None
 
         return _PollingBarStream(fetch, resolved, poll_interval=self._poll_interval)
