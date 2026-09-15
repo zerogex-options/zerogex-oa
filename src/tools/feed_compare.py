@@ -59,7 +59,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import contextlib
 import logging
+import signal
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -233,6 +235,37 @@ def _enrich(rows: List[Dict[str, Any]], spot: float, underlying: str) -> List[Di
     return enriched
 
 
+@contextlib.contextmanager
+def _preserve_signal_handlers():
+    """Keep Ctrl-C working across an ``AnalyticsEngine`` construction.
+
+    The engine is a daemon in production and installs its own SIGINT and
+    SIGTERM handlers in ``__init__`` (main_engine.py). Those set
+    ``running = False`` on the engine instance -- correct for the daemon,
+    useless here, where the engine is built and discarded once per sample.
+    The effect is that Ctrl-C is swallowed: the handler runs, the loop never
+    sees KeyboardInterrupt, and the only way to stop a run is to kill it
+    from another shell. Observed on a live comparison 2026-09-15.
+
+    Saving and restoring around construction leaves the engine untouched
+    and gives the signal back to whoever owned it.
+    """
+    saved = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            saved[sig] = signal.getsignal(sig)
+        except (ValueError, OSError):  # pragma: no cover - platform dependent
+            pass
+    try:
+        yield
+    finally:
+        for sig, handler in saved.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):  # pragma: no cover
+                pass
+
+
 def _compute_analytics(
     rows: List[Dict[str, Any]], spot: float, underlying: str, now: datetime
 ) -> Dict[str, Optional[float]]:
@@ -244,12 +277,16 @@ def _compute_analytics(
     from src.analytics.main_engine import AnalyticsEngine
     from src.analytics.walls import compute_call_put_walls
 
+    # See _preserve_signal_handlers: constructing the engine steals SIGINT.
+
     out: Dict[str, Optional[float]] = {m: None for m in _METRICS}
     out["spot"] = spot
     if not rows:
         return out
 
-    engine = AnalyticsEngine(underlying=underlying)
+    with _preserve_signal_handlers():
+
+        engine = AnalyticsEngine(underlying=underlying)
 
     gex_by_strike = engine._calculate_gex_by_strike(rows, spot, now)
     if gex_by_strike:

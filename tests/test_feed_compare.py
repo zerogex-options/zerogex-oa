@@ -819,3 +819,28 @@ def test_summary_warns_when_the_incumbent_is_noisier_than_the_difference(capsys)
     out = capsys.readouterr().out
     assert "net_gex" in out
     assert "ITSELF" in out
+
+
+def test_ctrl_c_survives_an_analytics_engine_construction():
+    """AnalyticsEngine installs its own SIGINT handler in __init__.
+
+    That is right for the production daemon and wrong here, where the engine
+    is built and discarded once per sample: the handler sets running=False
+    on an object nobody keeps, swallows the signal, and leaves the
+    comparison loop unable to see KeyboardInterrupt. A live run could only
+    be stopped by killing it from another shell.
+    """
+    import signal as _signal
+
+    def _mine(signum, frame):  # pragma: no cover - never invoked
+        pass
+
+    original = _signal.getsignal(_signal.SIGINT)
+    _signal.signal(_signal.SIGINT, _mine)
+    try:
+        with feed_compare._preserve_signal_handlers():
+            # Stand in for the engine constructor stealing the signal.
+            _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+        assert _signal.getsignal(_signal.SIGINT) is _mine
+    finally:
+        _signal.signal(_signal.SIGINT, original)
