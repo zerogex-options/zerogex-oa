@@ -254,3 +254,22 @@ def test_components_are_returned_for_auditing():
     assert got.structure == STRUCTURE_PINNING
     assert got.lean_side == LEAN_SUPPORTIVE
     assert got.cushion == CUSHION_TRANSITION_RISK
+
+
+def test_gamma_trend_is_classified_separately_from_structure():
+    """Structure is what the book is doing now; gamma trend is where the
+    session has migrated to. They are the same measurement over two windows
+    and can legitimately disagree."""
+    got = classify(_inputs(stability=STRONG, gamma_trend=-STRONG))
+
+    assert got.structure == STRUCTURE_PINNING
+    assert got.gamma_trend == STRUCTURE_ACCELERATIVE
+
+
+def test_gamma_trend_does_not_change_the_state():
+    """Background health is context, not the verdict. The state comes from the
+    rolling view, which is the one that speaks to persistence right now."""
+    firming = classify(_inputs(stability=STRONG, gamma_trend=STRONG))
+    migrated = classify(_inputs(stability=STRONG, gamma_trend=-STRONG))
+
+    assert firming.state == migrated.state == STATE_STABLE_BID

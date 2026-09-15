@@ -618,8 +618,12 @@ class GammaWeatherResponse(BaseModel):
     sentence: str
     #: BUYING / SELLING / MIXED.
     pressure: str
-    #: PINNING / ACCELERATIVE / FLAT.
+    #: PINNING / ACCELERATIVE / FLAT, from the rolling stability.
     structure: str
+    #: The same classification applied to since-open stability. The spec calls
+    #: it background health: structure is now, this is where the session has
+    #: migrated to.
+    gamma_trend: str
     #: SUPPORTIVE / CAPPING.
     lean_side: Optional[str] = None
     #: TRANSITION_RISK / NARROWING / WIDENING / STEADY / NONE. A modifier on

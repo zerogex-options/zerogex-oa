@@ -1748,6 +1748,7 @@ async def get_gamma_weather(
             "sentence": weather.sentence,
             "pressure": weather.pressure,
             "structure": weather.structure,
+            "gamma_trend": weather.gamma_trend,
             "lean_side": weather.lean_side,
             "cushion": weather.cushion,
             "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS),
