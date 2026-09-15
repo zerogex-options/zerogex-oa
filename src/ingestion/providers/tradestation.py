@@ -620,6 +620,9 @@ class TradeStationProvider(MarketDataProvider):
         self._CAPABILITIES.require("option_open_interest")
         targets = list(option_symbols)
         out: Dict[str, OptionQuote] = {}
+        # Set when a batch call raises, so a total miss caused by errors is
+        # not reported as "the vendor has nothing for these symbols".
+        failed = False
         # The quotes endpoint embeds the symbol list in the URL PATH, so a
         # single call across a full chain exceeds the ~25KB 414 cliff.
         # Batch at OPTION_BATCH_SIZE and pace between batches, exactly as
@@ -632,6 +635,7 @@ class TradeStationProvider(MarketDataProvider):
             except Exception as e:  # noqa: BLE001 - a bad batch must not
                 # abort the whole seed; the stream backfills what is missed.
                 logger.warning("option quote snapshot batch failed: %s", e)
+                failed = True
                 continue
             quotes = raw.get("Quotes", []) if isinstance(raw, dict) else []
             for q in quotes:
@@ -642,6 +646,22 @@ class TradeStationProvider(MarketDataProvider):
                     out[symbol] = _normalise_option_quote(symbol, q)
             if DELAY_BETWEEN_BATCHES > 0:
                 time.sleep(DELAY_BETWEEN_BATCHES)
+        if targets and not out and not failed:
+            # Every call succeeded and returned nothing. That is not an
+            # outage, it is a symbol the vendor does not recognise -- and
+            # left unreported it looks identical to a market with no
+            # quotes. A live SPX comparison spent an hour reporting
+            # "contracts=0" per sample with no indication why; the symbols
+            # requested are the one thing that would have shown it.
+            logger.warning(
+                "tradestation returned no quotes for any of %d requested "
+                "symbols. First few: %s. If these look malformed for this "
+                "underlying, check OPTION_ROOT_ALIASES (an index chain is "
+                "rooted differently from its underlying, e.g. $SPXW.X -> "
+                "SPXW).",
+                len(targets),
+                targets[:3],
+            )
         return out
 
     def build_option_symbol(
