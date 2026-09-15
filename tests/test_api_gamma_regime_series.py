@@ -36,6 +36,7 @@ def _row(
     spot: Optional[float] = 700.0,
     expired: Optional[List[date]] = None,
     flip: Optional[float] = None,
+    move: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "bar_start": _bar_ts(minute),
@@ -54,6 +55,7 @@ def _row(
         "expired_expirations": expired or [],
         "rolling_bars": 6,
         "gamma_flip": flip,
+        "typical_move_30m": move,
     }
 
 
@@ -347,3 +349,59 @@ def test_http_no_flip_is_reported_not_treated_as_secure(
     assert bar["cushion_state"] == "NO_FLIP"
     assert bar["cushion_pts"] is None
     assert "no gamma flip" in bar["cushion_summary"]
+
+
+def test_http_cushion_classifies_against_the_move_scale(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Barrie's prior: measure the cushion against a typical 30-minute move,
+    not a fraction of spot. The same 10 points is an ordinary cushion on a
+    quiet tape and a live crossing risk on a fast one."""
+    app, mainmod = _build_app(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [_row(0, spot=700.0, flip=690.0, move=8.0)])
+        quiet = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+        _attach(mainmod, [_row(0, spot=700.0, flip=690.0, move=40.0)])
+        fast = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+
+    assert quiet["cushion_state"] == "NORMAL"
+    assert fast["cushion_state"] == "CROSSING"
+    assert quiet["cushion_basis"] == "move_30m"
+    assert quiet["cushion_move_ratio"] == pytest.approx(10.0 / 8.0)
+
+
+def test_http_falls_back_to_spot_when_no_move_scale_is_stored(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Bars written before the column existed must still classify, and must
+    say which yardstick they used."""
+    app, mainmod = _build_app(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [_row(0, spot=700.0, flip=690.0, move=None)])
+        bar = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+
+    assert bar["cushion_state"] == "THIN"
+    assert bar["cushion_basis"] == "spot_fraction"
+    assert bar["cushion_move_ratio"] is None
+
+
+def test_http_rate_context_separates_stable_from_collapsing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, mainmod = _build_app(monkeypatch)
+    # Cushion holds near 9 points against a 20-point typical move.
+    steady = [_row(15 - 5 * i, spot=701.0 - 0.05 * i, flip=692.0, move=20.0) for i in range(4)]
+    # Same ending cushion, 12 points given up getting there.
+    collapsing = [_row(15 - 5 * i, spot=701.0 + 4.0 * i, flip=692.0, move=20.0) for i in range(4)]
+
+    with TestClient(app) as client:
+        _attach(mainmod, steady)
+        a = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+        _attach(mainmod, collapsing)
+        b = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+
+    assert a["cushion_state"] == b["cushion_state"]
+    assert a["cushion_rate_context"] == "STABLE"
+    assert b["cushion_rate_context"] == "ACCELERATING"

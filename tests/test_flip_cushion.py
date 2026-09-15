@@ -13,20 +13,40 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.analytics.flip_cushion import (
-    CROSSING_SPAN,
+    BASIS_MOVE,
+    BASIS_SPOT,
+    CROSSING_BAND,
     DEFAULT_RATE_BARS,
+    FALLBACK_CROSSING_SPAN,
+    FALLBACK_THIN_SPAN,
+    NORMAL_BAND,
+    RATE_ACCELERATING,
+    RATE_CONTRACTING,
+    RATE_DRIFTING,
+    RATE_STABLE,
+    STATE_NORMAL,
+    THIN_BAND,
     SIDE_ABOVE,
     SIDE_BELOW,
     STATE_CROSSING,
     STATE_NO_FLIP,
     STATE_SECURE,
     STATE_THIN,
-    THIN_SPAN,
     build_series,
     classify,
+    classify_rate,
     describe,
     measure,
 )
+
+#: A typical 30-minute move, for tests that exercise the real yardstick.
+MOVE = 20.0
+
+
+def _state(frac, cushion=None, move=None):
+    """classify() returns (state, ratio, basis); most tests want the state."""
+    return classify(frac, cushion, move)[0]
+
 
 UTC = timezone.utc
 T0 = datetime(2026, 4, 24, 13, 30, tzinfo=UTC)
@@ -68,31 +88,55 @@ def test_non_positive_spot_is_refused_rather_than_divided_by():
 # --------------------------------------------------------------------------- #
 # Classification is on the fraction, not the points
 # --------------------------------------------------------------------------- #
-def test_same_points_classify_differently_across_symbols():
-    """Ten points is a live crossing risk on SPX and a comfortable cushion on
-    a low-priced underlying. A points threshold cannot express that."""
-    spx = measure(5000.0, 4990.0)[1]
-    spy = measure(700.0, 690.0)[1]
+def test_the_same_cushion_reads_differently_in_different_volatility():
+    """The reason the yardstick changed from a fraction of spot to a typical
+    30-minute move. Ten points is a live crossing risk on a quiet tape and an
+    ordinary cushion on a fast one, and only the move scale can say so."""
+    quiet = _state(10.0 / 700.0, cushion=10.0, move=8.0)
+    fast = _state(10.0 / 700.0, cushion=10.0, move=40.0)
 
-    assert classify(spx) == STATE_CROSSING
-    assert classify(spy) == STATE_THIN
+    assert quiet == STATE_NORMAL
+    assert fast == STATE_CROSSING
 
 
-def test_secure_thin_and_crossing_boundaries():
-    assert classify(THIN_SPAN * 2) == STATE_SECURE
-    assert classify(THIN_SPAN) == STATE_THIN
-    assert classify(CROSSING_SPAN) == STATE_CROSSING
+def test_the_four_bands():
+    assert _state(0.01, cushion=MOVE * 0.20, move=MOVE) == STATE_CROSSING
+    assert _state(0.01, cushion=MOVE * 0.45, move=MOVE) == STATE_THIN
+    assert _state(0.01, cushion=MOVE * 0.90, move=MOVE) == STATE_NORMAL
+    assert _state(0.01, cushion=MOVE * 2.00, move=MOVE) == STATE_SECURE
+
+
+def test_band_boundaries_are_inclusive_at_the_lower_edge():
+    assert _state(0.01, cushion=MOVE * CROSSING_BAND, move=MOVE) == STATE_CROSSING
+    assert _state(0.01, cushion=MOVE * THIN_BAND, move=MOVE) == STATE_THIN
+    assert _state(0.01, cushion=MOVE * NORMAL_BAND, move=MOVE) == STATE_NORMAL
 
 
 def test_classification_ignores_which_side_we_are_on():
-    assert classify(THIN_SPAN * 0.5) == classify(-THIN_SPAN * 0.5)
+    above = _state(0.005, cushion=10.0, move=MOVE)
+    below = _state(-0.005, cushion=10.0, move=MOVE)
+    assert above == below
+
+
+def test_basis_says_which_yardstick_was_used():
+    """The two scales are not comparable, so a reading must never leave a
+    reader guessing which produced it."""
+    assert classify(0.01, 10.0, MOVE)[2] == BASIS_MOVE
+    assert classify(0.01, 10.0, None)[2] == BASIS_SPOT
+
+
+def test_falls_back_to_the_spot_fraction_without_a_move_scale():
+    """Bars stored before the move scale existed still classify."""
+    assert _state(FALLBACK_THIN_SPAN * 2) == STATE_SECURE
+    assert _state(FALLBACK_THIN_SPAN) == STATE_THIN
+    assert _state(FALLBACK_CROSSING_SPAN) == STATE_CROSSING
 
 
 def test_no_flip_is_its_own_state_not_a_secure_cushion():
     """A profile with no crossing at all is a different statement from one
     whose crossing is far away."""
-    assert classify(None) == STATE_NO_FLIP
-    assert classify(None) != STATE_SECURE
+    assert _state(None) == STATE_NO_FLIP
+    assert _state(None) != STATE_SECURE
 
 
 # --------------------------------------------------------------------------- #
@@ -186,3 +230,59 @@ def test_describe_matches_the_spec_shape():
 def test_describe_says_so_when_there_is_no_flip():
     series = build_series(_bars([(700.0, None)]))
     assert "no gamma flip" in describe(series[0])
+
+
+# --------------------------------------------------------------------------- #
+# Rate context: thin-but-stable versus thin-and-collapsing
+# --------------------------------------------------------------------------- #
+def test_rate_context_grades_the_trailing_window():
+    assert classify_rate(-MOVE * 0.02, MOVE)[1] == RATE_STABLE
+    assert classify_rate(MOVE * 0.40, MOVE)[1] == RATE_DRIFTING
+    assert classify_rate(-MOVE * 0.25, MOVE)[1] == RATE_CONTRACTING
+    assert classify_rate(-MOVE * 0.80, MOVE)[1] == RATE_ACCELERATING
+
+
+def test_a_widening_cushion_is_never_graded_past_drifting():
+    """A cushion opening up quickly is not a risk condition, and an urgent
+    label for it would be noise dressed as a warning."""
+    assert classify_rate(MOVE * 5.0, MOVE)[1] == RATE_DRIFTING
+
+
+def test_rate_context_is_scale_free():
+    """Same fraction of a typical move, same label, whatever the instrument."""
+    small = classify_rate(-4.0, 10.0)[1]
+    large = classify_rate(-400.0, 1000.0)[1]
+    assert small == large == RATE_ACCELERATING
+
+
+def test_rate_context_is_absent_without_a_move_scale():
+    assert classify_rate(-10.0, None) == (None, None)
+    assert classify_rate(None, MOVE) == (None, None)
+
+
+def test_thin_and_stable_is_distinguishable_from_thin_and_collapsing():
+    """The distinction Barrie asked for: the cushion state is the same in both
+    and only the rate says which condition you are actually in."""
+    stable = build_series(
+        [(T0 + timedelta(minutes=5 * i), 700.0 - 0.05 * i, 692.0, MOVE) for i in range(5)]
+    )[-1]
+    # Ends at 9 points, the same THIN band as the stable case, having given up
+    # 12 points getting there. Both must land in THIN or the test is comparing
+    # states rather than rates.
+    collapsing = build_series(
+        [(T0 + timedelta(minutes=5 * i), 717.0 - 4.0 * i, 692.0, MOVE) for i in range(5)]
+    )[-1]
+
+    assert stable.state == collapsing.state == STATE_THIN
+    assert stable.rate_context == RATE_STABLE
+    assert collapsing.rate_context == RATE_ACCELERATING
+
+
+def test_the_move_scale_is_carried_on_every_bar():
+    """Stored per bar rather than recomputed, so a historical reading always
+    shows the yardstick that was actually in force at the time."""
+    bar = build_series([(T0, 700.0, 690.0, MOVE)])[0]
+
+    assert bar.move_30m == MOVE
+    assert bar.move_ratio == pytest.approx(10.0 / MOVE)
+    assert bar.basis == BASIS_MOVE

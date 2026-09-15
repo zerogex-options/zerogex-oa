@@ -1533,6 +1533,10 @@ def _format_gamma_regime_row(row: dict, cushion=None) -> dict:
         "cushion_rate_pts": cushion.rate_pts if cushion else None,
         "cushion_accelerating": cushion.accelerating if cushion else None,
         "cushion_state": cushion.state if cushion else None,
+        "cushion_move_ratio": cushion.move_ratio if cushion else None,
+        "cushion_basis": cushion.basis if cushion else None,
+        "cushion_rate_context": cushion.rate_context if cushion else None,
+        "typical_move_30m": _opt("typical_move_30m"),
         "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS) if cushion else None,
     }
 
@@ -1618,7 +1622,10 @@ async def get_gamma_regime_series(
     # endpoint uses for its moving average.
     chronological = list(reversed(rows))
     cushions = build_cushion_series(
-        [(r["bar_start"], r.get("spot"), r.get("gamma_flip")) for r in chronological],
+        [
+            (r["bar_start"], r.get("spot"), r.get("gamma_flip"), r.get("typical_move_30m"))
+            for r in chronological
+        ],
         rate_bars=CUSHION_RATE_BARS,
     )
     bars = [_format_gamma_regime_row(r, c) for r, c in zip(chronological, cushions)]
@@ -1701,7 +1708,10 @@ async def get_gamma_weather(
 
     regime_chrono = list(reversed(regime_rows))
     cushions = build_cushion_series(
-        [(r["bar_start"], r.get("spot"), r.get("gamma_flip")) for r in regime_chrono],
+        [
+            (r["bar_start"], r.get("spot"), r.get("gamma_flip"), r.get("typical_move_30m"))
+            for r in regime_chrono
+        ],
         rate_bars=CUSHION_RATE_BARS,
     )
 
@@ -1761,6 +1771,10 @@ async def get_gamma_weather(
                 "cushion_pts": cushion.cushion_pts,
                 "cushion_state": cushion.state,
                 "cushion_rate_pts": cushion.rate_pts,
+                "cushion_rate_context": cushion.rate_context,
+                "cushion_move_ratio": cushion.move_ratio,
+                "cushion_basis": cushion.basis,
+                "typical_move_30m": cushion.move_30m,
                 "spot": _f(regime_row.get("spot")),
                 "gamma_flip": _f(regime_row.get("gamma_flip")),
             },

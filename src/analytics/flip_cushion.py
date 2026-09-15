@@ -15,19 +15,24 @@ Four readings, per the Phase 1 spec:
   rolling window recomputed on every 5-minute bar;
 * a state label: secure, thin, or crossing risk.
 
-Points versus fraction
-----------------------
-Distance is carried BOTH ways and they are not interchangeable. Points are
-what a trader reads ("18 points below the flip"); the fraction is what the
-state label is computed from, because 18 points of SPX and 18 points of SPY
-are completely different conditions and a threshold in points would mean
-something different on every symbol.
+What the cushion is measured against
+------------------------------------
+Points are what a trader reads ("18 points below the flip"), but the STATE is
+never classified from points: 18 points of SPX and 18 of SPY are different
+conditions, and a threshold in points would silently mean something different
+on every symbol.
 
-The fraction is ``(spot - flip) / spot``, matching
-``src.jobs.forecast_range_model``'s ``flip_distance``, and the "near" boundary
-is that module's :data:`VOL_FLIP_PROX_SPAN` imported directly rather than
-copied. There is already a calibrated house answer to "how close is close";
-a second, independently drifting one would be worse than no answer.
+The scale is a TYPICAL 30-MINUTE REALIZED MOVE. An earlier version used a
+fraction of spot, and that was the wrong denominator: it adapts to price level
+but not to volatility, so a fixed percentage is a thin cushion on a quiet
+morning and a comfortable one on a wild afternoon, while reporting the same
+label for both. Measured against how far price actually travels in half an
+hour, "thin" means the same thing in both. Bands are in
+:data:`THIN_BAND` and friends.
+
+The spot-fraction path survives only as a FALLBACK for bars written before the
+move scale existed, and :attr:`CushionBar.basis` always says which was used so
+a reading is never silently comparing against a different yardstick.
 
 Sign conventions
 ----------------
@@ -62,19 +67,41 @@ from src.jobs.forecast_range_model import VOL_FLIP_PROX_SPAN
 #: 5-minute update rather than a slower feed.
 DEFAULT_RATE_BARS = 3
 
-#: |fraction| at or inside which the flip is close enough to be a live risk.
-THIN_SPAN = VOL_FLIP_PROX_SPAN
+# Cushion bands, as multiples of a typical 30-minute realized move. A cushion
+# smaller than a quarter of the distance price usually covers in half an hour
+# is a boundary price can reach without doing anything unusual.
+CROSSING_BAND = 0.25
+THIN_BAND = 0.60
+NORMAL_BAND = 1.25
 
-#: |fraction| at or inside which a crossing is imminent rather than merely
-#: possible. Expressed as a share of THIN_SPAN so there is ONE number to tune:
-#: move the house span and both boundaries move together.
-CROSSING_SHARE = 0.25
-CROSSING_SPAN = THIN_SPAN * CROSSING_SHARE
+#: Fallback band, as a fraction of spot, for bars stored before the move scale
+#: existed. Imported rather than copied so it cannot drift from the volatility
+#: model's own notion of "near the flip".
+FALLBACK_THIN_SPAN = VOL_FLIP_PROX_SPAN
+FALLBACK_CROSSING_SPAN = FALLBACK_THIN_SPAN * 0.25
 
 STATE_SECURE = "SECURE"
+STATE_NORMAL = "NORMAL"
 STATE_THIN = "THIN"
 STATE_CROSSING = "CROSSING"
 STATE_NO_FLIP = "NO_FLIP"
+
+BASIS_MOVE = "move_30m"
+BASIS_SPOT = "spot_fraction"
+BASIS_NONE = "none"
+
+#: Rate context over the trailing window. Separate from the cushion state
+#: because thin-but-stable and thin-and-collapsing are very different
+#: conditions and one label cannot carry both.
+RATE_STABLE = "STABLE"
+RATE_DRIFTING = "DRIFTING"
+RATE_CONTRACTING = "CONTRACTING"
+RATE_ACCELERATING = "ACCELERATING"
+
+#: Rate bands, also as multiples of the typical move: how much of a normal
+#: half-hour of travel the cushion gave up over the trailing window.
+RATE_NOISE_BAND = 0.10
+RATE_CONTRACTING_BAND = 0.35
 
 SIDE_ABOVE = "above"
 SIDE_BELOW = "below"
@@ -106,23 +133,90 @@ class CushionBar:
     rate_pts: Optional[float]
     accelerating: Optional[bool]
     state: str
+    #: Typical 30-minute realized move the cushion was measured against, and
+    #: the cushion expressed as a multiple of it. Stored per bar rather than
+    #: recomputed, so a historical reading always shows the yardstick that
+    #: was actually in force at the time.
+    move_30m: Optional[float] = None
+    move_ratio: Optional[float] = None
+    #: Which yardstick produced ``state``: the move scale, the legacy spot
+    #: fraction, or neither. Never leave a reader guessing which.
+    basis: str = BASIS_NONE
+    #: Trailing-window rate as a multiple of the typical move, and its label.
+    #: Separate from ``state`` because thin-but-stable and thin-and-collapsing
+    #: are different conditions.
+    rate_ratio: Optional[float] = None
+    rate_context: Optional[str] = None
 
 
-def classify(distance_frac: Optional[float]) -> str:
-    """State label from the signed distance fraction.
+def classify(
+    distance_frac: Optional[float],
+    cushion_pts: Optional[float] = None,
+    move_30m: Optional[float] = None,
+) -> tuple[str, Optional[float], str]:
+    """``(state, move_ratio, basis)`` for one bar.
 
-    Classified on the fraction, never on points -- see the module docstring.
-    ``None`` means there was no flip to measure against, which is
-    :data:`STATE_NO_FLIP` rather than a secure cushion.
+    Preferred yardstick is the typical 30-minute realized move: a cushion
+    smaller than a quarter of the distance price usually covers in half an
+    hour is a boundary price can reach without doing anything unusual, and
+    that statement survives a change of instrument or a change of regime.
+
+    Falls back to the spot fraction only when no move scale is available,
+    which happens for bars stored before it existed. ``basis`` reports which
+    was used, because the two are not comparable and a reader must never have
+    to guess.
+
+    No flip at all is :data:`STATE_NO_FLIP`, not a secure cushion: "there is
+    no boundary" and "the boundary is far away" are different statements.
     """
     if distance_frac is None:
-        return STATE_NO_FLIP
+        return STATE_NO_FLIP, None, BASIS_NONE
+
+    if cushion_pts is not None and move_30m is not None and move_30m > 0:
+        ratio = cushion_pts / move_30m
+        if ratio <= CROSSING_BAND:
+            state = STATE_CROSSING
+        elif ratio <= THIN_BAND:
+            state = STATE_THIN
+        elif ratio <= NORMAL_BAND:
+            state = STATE_NORMAL
+        else:
+            state = STATE_SECURE
+        return state, ratio, BASIS_MOVE
+
     magnitude = abs(distance_frac)
-    if magnitude <= CROSSING_SPAN:
-        return STATE_CROSSING
-    if magnitude <= THIN_SPAN:
-        return STATE_THIN
-    return STATE_SECURE
+    if magnitude <= FALLBACK_CROSSING_SPAN:
+        state = STATE_CROSSING
+    elif magnitude <= FALLBACK_THIN_SPAN:
+        state = STATE_THIN
+    else:
+        state = STATE_SECURE
+    return state, None, BASIS_SPOT
+
+
+def classify_rate(
+    rate_pts: Optional[float], move_30m: Optional[float]
+) -> tuple[Optional[float], Optional[str]]:
+    """``(rate_ratio, context)``: is the cushion noise, drifting, contracting,
+    or collapsing?
+
+    Scaled by the same typical move as the cushion itself, so "contracting"
+    means the same thing on every symbol. Only narrowing is graded past
+    drifting: a cushion opening up quickly is not a risk condition, and giving
+    it an urgent-sounding label would be noise dressed as a warning.
+    """
+    if rate_pts is None or move_30m is None or move_30m <= 0:
+        return None, None
+
+    ratio = rate_pts / move_30m
+    magnitude = abs(ratio)
+    if magnitude <= RATE_NOISE_BAND:
+        return ratio, RATE_STABLE
+    if ratio > 0:
+        return ratio, RATE_DRIFTING
+    if magnitude <= RATE_CONTRACTING_BAND:
+        return ratio, RATE_CONTRACTING
+    return ratio, RATE_ACCELERATING
 
 
 def measure(
@@ -143,10 +237,14 @@ def measure(
 
 
 def build_series(
-    bars: Sequence[tuple[datetime, Optional[float], Optional[float]]],
+    bars: Sequence[tuple],
     rate_bars: int = DEFAULT_RATE_BARS,
 ) -> List[CushionBar]:
-    """Build the cushion series from chronological ``(bar_start, spot, flip)``.
+    """Build the cushion series from chronological tuples.
+
+    Each entry is ``(bar_start, spot, flip)`` or ``(bar_start, spot, flip,
+    move_30m)``. The three-element form classifies on the legacy spot fraction
+    and is what bars stored before the move scale existed look like.
 
     Every derived value looks only BACKWARD, so a bar's reading is identical
     whether computed live or from a completed session. The panel is meant to
@@ -155,7 +253,9 @@ def build_series(
     out: List[CushionBar] = []
     cushions: List[Optional[float]] = []
 
-    for i, (bar_start, spot, flip) in enumerate(bars):
+    for i, entry in enumerate(bars):
+        bar_start, spot, flip = entry[0], entry[1], entry[2]
+        move_30m = entry[3] if len(entry) > 3 else None
         distance_pts, distance_frac, cushion_pts, side = measure(spot, flip)
 
         prev = cushions[-1] if cushions else None
@@ -173,6 +273,9 @@ def build_series(
                     mean_step = abs(rate_pts) / rate_bars
                     accelerating = abs(step_pts) > mean_step
 
+        state, move_ratio, basis = classify(distance_frac, cushion_pts, move_30m)
+        rate_ratio, rate_context = classify_rate(rate_pts, move_30m)
+
         cushions.append(cushion_pts)
         out.append(
             CushionBar(
@@ -186,7 +289,12 @@ def build_series(
                 step_pts=step_pts,
                 rate_pts=rate_pts,
                 accelerating=accelerating,
-                state=classify(distance_frac),
+                state=state,
+                move_30m=move_30m,
+                move_ratio=move_ratio,
+                basis=basis,
+                rate_ratio=rate_ratio,
+                rate_context=rate_context,
             )
         )
 
@@ -211,7 +319,15 @@ def describe(bar: CushionBar, rate_bars: int = DEFAULT_RATE_BARS) -> str:
     if bar.rate_pts is not None and bar.rate_pts != 0:
         word = "widening" if bar.rate_pts > 0 else "narrowing"
         window = f"{rate_bars * 5}m"
-        tail = ", accelerating" if bar.accelerating else ""
+        # Prefer the scaled context over the raw "accelerating" flag: it says
+        # how much of a normal half-hour of travel was given up, which is the
+        # difference between thin-but-stable and thin-and-collapsing.
+        if bar.rate_context and bar.rate_context != RATE_STABLE:
+            tail = f", {bar.rate_context.lower()}"
+        elif bar.rate_context == RATE_STABLE:
+            tail = ", stable"
+        else:
+            tail = ", accelerating" if bar.accelerating else ""
         parts.append(f"{window}: {word} {abs(bar.rate_pts):.0f} pts{tail}")
 
     return " | ".join(parts)

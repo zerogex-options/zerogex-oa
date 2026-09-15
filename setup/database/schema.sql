@@ -1104,6 +1104,13 @@ CREATE TABLE IF NOT EXISTS gamma_regime_5min (
     -- leaving every stored session labelled by whatever rule was live that
     -- day. NULL is meaningful -- the gamma profile had no zero crossing.
     gamma_flip             DOUBLE PRECISION,
+    -- Typical 30-minute realized move, the yardstick the cushion state is
+    -- classified against. Stored per bar rather than recomputed on read so a
+    -- historical reading always shows the scale actually in force at the time;
+    -- a fraction of spot was the earlier yardstick and adapted to price level
+    -- but not to volatility, which made the same label mean different things
+    -- on a quiet morning and a fast afternoon.
+    typical_move_30m       DOUBLE PRECISION,
     -- Expirations that left the board since the comparison point, reported so
     -- a roll-off is never read as dealers shedding gamma.
     expired_expirations    DATE[],
@@ -1115,6 +1122,7 @@ CREATE INDEX IF NOT EXISTS idx_gamma_regime_5min_symbol_bar
     ON gamma_regime_5min(symbol, bar_start DESC);
 
 ALTER TABLE gamma_regime_5min ADD COLUMN IF NOT EXISTS gamma_flip DOUBLE PRECISION;
+ALTER TABLE gamma_regime_5min ADD COLUMN IF NOT EXISTS typical_move_30m DOUBLE PRECISION;
 
 DO $$
 BEGIN
