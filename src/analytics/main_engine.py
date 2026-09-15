@@ -3905,6 +3905,39 @@ class AnalyticsEngine:
         spot = dicts[0].get("spot_price")
         return (float(spot) if spot is not None else None), dicts
 
+    #: Tri-state cache for the gamma_flip column probe: None = not yet checked,
+    #: then True/False for the life of the process. A deploy that restarts the
+    #: service re-probes, which is exactly when the answer can have changed.
+    _gamma_regime_has_flip = None
+
+    def _gamma_regime_flip_column_exists(self, cursor) -> bool:
+        """Whether gamma_regime_5min carries the gamma_flip column yet.
+
+        Exists because schema.sql is NOT re-run by a bare ``git pull`` -- only
+        ``make pull`` / ``make schema-apply`` apply it (the Makefile documents
+        a prior incident from exactly this skew). So new code can legitimately
+        reach production one deploy ahead of its column.
+
+        When that happens the cushion is simply unavailable, which is a
+        degraded reading. Without this probe it was worse than degraded: the
+        failed INSERT aborted the whole snapshot, so NO bars were written at
+        all and the entire structure series went dark over one optional
+        column. Probing costs a single catalog lookup per process.
+        """
+        if self._gamma_regime_has_flip is None:
+            cursor.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'gamma_regime_5min' AND column_name = 'gamma_flip'
+                """)
+            type(self)._gamma_regime_has_flip = cursor.fetchone() is not None
+            if not self._gamma_regime_has_flip:
+                logger.warning(
+                    "gamma_regime_5min has no gamma_flip column; writing bars without "
+                    "the flip cushion. Run `make schema-apply` (or `make pull`) to add "
+                    "it -- a bare `git pull` does not apply schema.sql."
+                )
+        return bool(self._gamma_regime_has_flip)
+
     def _gamma_flip_at_bar(self, cursor, bar_start: datetime):
         """The dealer-gamma flip level for one 5-minute bar, or None.
 
@@ -4020,6 +4053,8 @@ class AnalyticsEngine:
                         )
                     return chains[bar_ts]
 
+                has_flip = self._gamma_regime_flip_column_exists(cursor)
+
                 written_count = 0
                 for bar_ts in todo:
                     current = chain_for(bar_ts)
@@ -4029,10 +4064,17 @@ class AnalyticsEngine:
                     lookback = chain_for(lookback_ts) if lookback_ts >= session_start else None
 
                     result = build_latest_bar(anchor=anchor, lookback=lookback, current=current)
-                    gamma_flip = self._gamma_flip_at_bar(cursor, bar_ts)
+                    gamma_flip = self._gamma_flip_at_bar(cursor, bar_ts) if has_flip else None
 
+                    flip_col = ", gamma_flip" if has_flip else ""
+                    flip_val = ", %(gamma_flip)s" if has_flip else ""
+                    flip_set = (
+                        "\n                            gamma_flip = EXCLUDED.gamma_flip,"
+                        if has_flip
+                        else ""
+                    )
                     cursor.execute(
-                        """
+                        f"""
                         INSERT INTO gamma_regime_5min (
                             symbol, bar_start, spot,
                             anchored_lean, anchored_stability,
@@ -4040,7 +4082,7 @@ class AnalyticsEngine:
                             rolling_lean, rolling_stability,
                             rolling_net_shift, rolling_gross_shift,
                             sigma_price, near_spot_stock, strike_count,
-                            expired_expirations, rolling_bars, gamma_flip
+                            expired_expirations, rolling_bars{flip_col}
                         ) VALUES (
                             %(symbol)s, %(bar_start)s, %(spot)s,
                             %(anchored_lean)s, %(anchored_stability)s,
@@ -4048,7 +4090,7 @@ class AnalyticsEngine:
                             %(rolling_lean)s, %(rolling_stability)s,
                             %(rolling_net_shift)s, %(rolling_gross_shift)s,
                             %(sigma_price)s, %(near_spot_stock)s, %(strike_count)s,
-                            %(expired_expirations)s, %(rolling_bars)s, %(gamma_flip)s
+                            %(expired_expirations)s, %(rolling_bars)s{flip_val}
                         )
                         ON CONFLICT (symbol, bar_start) DO UPDATE SET
                             spot = EXCLUDED.spot,
@@ -4064,8 +4106,7 @@ class AnalyticsEngine:
                             near_spot_stock = EXCLUDED.near_spot_stock,
                             strike_count = EXCLUDED.strike_count,
                             expired_expirations = EXCLUDED.expired_expirations,
-                            rolling_bars = EXCLUDED.rolling_bars,
-                            gamma_flip = EXCLUDED.gamma_flip,
+                            rolling_bars = EXCLUDED.rolling_bars,{flip_set}
                             updated_at = NOW()
                         """,
                         {
