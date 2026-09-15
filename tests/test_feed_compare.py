@@ -7,7 +7,7 @@ that make its answer trustworthy.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -844,3 +844,106 @@ def test_ctrl_c_survives_an_analytics_engine_construction():
         assert _signal.getsignal(_signal.SIGINT) is _mine
     finally:
         _signal.signal(_signal.SIGINT, original)
+
+
+def _flip_fixture_chain(
+    spot: float, increment: float, n_strikes: int, now: datetime, *, calls: bool
+) -> list:
+    """A chain shaped in moneyness, so the ladder is the only variable.
+
+    ``calls=False`` builds the puts-only chain: dealer gamma is negative
+    everywhere, so no crossing exists at any rung and the resolver is
+    correct to return NULL.
+    """
+    import math
+
+    rows = []
+    base = round(spot / increment) * increment
+    half = n_strikes // 2
+    for dte in (0, 2, 4):
+        expiration = (now + timedelta(days=dte)).date()
+        for i in range(n_strikes):
+            strike = base + (i - half) * increment
+            moneyness = (strike - spot) / spot
+            for option_type in (("C", "P") if calls else ("P",)):
+                centre = -0.012 if option_type == "P" else 0.010
+                peak = 8000 if option_type == "P" else 6000
+                rows.append(
+                    {
+                        "option_symbol": None,
+                        "strike": float(strike),
+                        "expiration": expiration,
+                        "option_type": option_type,
+                        "open_interest": int(
+                            peak * math.exp(-((moneyness - centre) ** 2) / (2 * 0.010**2)) + 200
+                        ),
+                        "implied_volatility": 0.16 + 0.9 * abs(moneyness),
+                        "volume": 0,
+                        "bid": 1.0,
+                        "ask": 1.1,
+                        "mid": 1.05,
+                        "gamma": 0.01,
+                        "timestamp": now,
+                    }
+                )
+    return rows
+
+
+def test_an_unresolved_gamma_flip_says_why(caplog):
+    """A NULL flip prints as a bare "-" on both feeds -- same as agreement.
+
+    ``_resolve_gamma_flip`` returns None for four distinct reasons (IV
+    spike, 0DTE-dominant chain, stale IV at the 0.20 default, one-sided
+    chain), and during a migration the first question is whether the
+    candidate feed caused it. The engine already builds the diagnostic
+    that separates them; the harness has to surface it, or a whole run
+    reports a metric it cannot explain.
+    """
+    now = datetime.now(timezone.utc).replace(hour=17, minute=30, second=0, microsecond=0)
+    rows = _flip_fixture_chain(6600.0, 5.0, 40, now, calls=False)
+
+    with caplog.at_level("WARNING", logger="src.tools.feed_compare"):
+        out = feed_compare._compute_analytics(rows, 6600.0, "$SPXW.X", now, label="thetadata_mv")
+
+    assert out["gamma_flip"] is None, "fixture must leave the flip unresolved"
+    diagnostics = [
+        r.getMessage() for r in caplog.records if "gamma_flip unresolved" in r.getMessage()
+    ]
+    assert diagnostics, "an unresolved flip was reported with no explanation"
+    message = diagnostics[0]
+    assert "thetadata_mv" in message, "the diagnostic must name which feed"
+    # The one-sided cause has to be readable straight off the line.
+    assert "calls=0" in message and "puts=120" in message
+
+
+def test_a_resolved_gamma_flip_stays_quiet(caplog):
+    """The diagnostic is for the NULL path only; on a healthy chain it is noise."""
+    now = datetime.now(timezone.utc).replace(hour=17, minute=30, second=0, microsecond=0)
+    rows = _flip_fixture_chain(6600.0, 5.0, 40, now, calls=True)
+
+    with caplog.at_level("WARNING", logger="src.tools.feed_compare"):
+        out = feed_compare._compute_analytics(rows, 6600.0, "$SPXW.X", now, label="thetadata")
+
+    assert out["gamma_flip"] is not None
+    assert not [r for r in caplog.records if "gamma_flip unresolved" in r.getMessage()]
+
+
+def test_a_240_contract_spx_ladder_can_still_resolve_a_flip():
+    """The SPX comparison chain being narrower than SPY's does not, by itself,
+    cost the flip.
+
+    40 strikes at $5 on a 6600 spot spans +/-1.5%; the same 40 strikes at $1
+    on a 660 spot spans +/-3%. That asymmetry is the obvious suspect when one
+    underlying resolves a flip and the other does not, and it is wrong -- so
+    an unresolved SPX run has to be diagnosed, not explained away by the
+    ladder.
+    """
+    now = datetime.now(timezone.utc).replace(hour=17, minute=30, second=0, microsecond=0)
+    spx = feed_compare._compute_analytics(
+        _flip_fixture_chain(6600.0, 5.0, 40, now, calls=True), 6600.0, "$SPXW.X", now
+    )
+    spy = feed_compare._compute_analytics(
+        _flip_fixture_chain(660.0, 1.0, 40, now, calls=True), 660.0, "SPY", now
+    )
+    assert spx["gamma_flip"] is not None
+    assert spy["gamma_flip"] is not None
