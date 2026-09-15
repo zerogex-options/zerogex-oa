@@ -1106,6 +1106,14 @@ CREATE TABLE IF NOT EXISTS gamma_regime_5min (
     -- z-score denominator before any session history exists.
     near_spot_stock        DOUBLE PRECISION,
     strike_count           INTEGER,
+    -- Spot-to-flip cushion. Only the RAW flip level is stored; distance,
+    -- direction, rate and the secure/thin/crossing label are all derived at
+    -- read time from this plus `spot` (see src/analytics/flip_cushion.py).
+    -- Deliberate: the thresholds are the part most likely to be retuned, and
+    -- deriving them on read means a retune reclassifies history instead of
+    -- leaving every stored session labelled by whatever rule was live that
+    -- day. NULL is meaningful -- the gamma profile had no zero crossing.
+    gamma_flip             DOUBLE PRECISION,
     -- Expirations that left the board since the comparison point, reported so
     -- a roll-off is never read as dealers shedding gamma.
     expired_expirations    DATE[],
@@ -1115,6 +1123,8 @@ CREATE TABLE IF NOT EXISTS gamma_regime_5min (
 );
 CREATE INDEX IF NOT EXISTS idx_gamma_regime_5min_symbol_bar
     ON gamma_regime_5min(symbol, bar_start DESC);
+
+ALTER TABLE gamma_regime_5min ADD COLUMN IF NOT EXISTS gamma_flip DOUBLE PRECISION;
 
 DO $$
 BEGIN

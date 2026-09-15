@@ -35,6 +35,7 @@ def _row(
     rolling_lean: Optional[float] = None,
     spot: Optional[float] = 700.0,
     expired: Optional[List[date]] = None,
+    flip: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "bar_start": _bar_ts(minute),
@@ -52,6 +53,7 @@ def _row(
         "strike_count": 42,
         "expired_expirations": expired or [],
         "rolling_bars": 6,
+        "gamma_flip": flip,
     }
 
 
@@ -270,3 +272,78 @@ def test_http_rejects_bad_symbol(monkeypatch: pytest.MonkeyPatch):
     with TestClient(app) as client:
         _attach(mainmod, [])
         assert client.get("/api/gex/regime-series?symbol=SP%20Y").status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Flip cushion, derived on read
+# --------------------------------------------------------------------------- #
+def test_http_cushion_is_derived_from_the_stored_flip(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, mainmod = _build_app(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [_row(0, spot=700.0, flip=690.0)])
+        bar = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+
+    assert bar["gamma_flip"] == 690.0
+    assert bar["flip_distance_pts"] == pytest.approx(10.0)
+    assert bar["cushion_pts"] == pytest.approx(10.0)
+    assert bar["cushion_side"] == "above"
+    assert bar["cushion_state"] == "THIN"
+    assert "Flip cushion: 10 pts above" in bar["cushion_summary"]
+
+
+def test_http_cushion_label_is_scale_free(monkeypatch: pytest.MonkeyPatch):
+    """The same ten points reads THIN on a 700 underlying and CROSSING on a
+    5000 one. A points threshold could not express that, and the failure would
+    be silent."""
+    app, mainmod = _build_app(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [_row(0, spot=700.0, flip=690.0)])
+        low = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+        _attach(mainmod, [_row(0, spot=5000.0, flip=4990.0)])
+        high = client.get("/api/gex/regime-series?symbol=SPX").json()["bars"][0]
+
+    assert low["cushion_state"] == "THIN"
+    assert high["cushion_state"] == "CROSSING"
+
+
+def test_http_cushion_rate_is_measured_chronologically(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Rows arrive newest-first but a step is measured against the PREVIOUS
+    bar, so a reversal bug here would report narrowing as widening."""
+    app, mainmod = _build_app(monkeypatch)
+    # Chronologically the cushion walks 20 -> 17 -> 14 -> 11: steadily narrowing.
+    canned = [
+        _row(15, spot=701.0, flip=690.0),
+        _row(10, spot=704.0, flip=690.0),
+        _row(5, spot=707.0, flip=690.0),
+        _row(0, spot=710.0, flip=690.0),
+    ]
+
+    with TestClient(app) as client:
+        _attach(mainmod, canned)
+        bars = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"]
+
+    newest = bars[0]
+    assert newest["cushion_pts"] == pytest.approx(11.0)
+    assert newest["cushion_step_pts"] == pytest.approx(-3.0)
+    assert newest["cushion_rate_pts"] == pytest.approx(-9.0)
+    assert "narrowing" in newest["cushion_summary"]
+
+
+def test_http_no_flip_is_reported_not_treated_as_secure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, mainmod = _build_app(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [_row(0, spot=700.0, flip=None)])
+        bar = client.get("/api/gex/regime-series?symbol=SPY").json()["bars"][0]
+
+    assert bar["cushion_state"] == "NO_FLIP"
+    assert bar["cushion_pts"] is None
+    assert "no gamma flip" in bar["cushion_summary"]
