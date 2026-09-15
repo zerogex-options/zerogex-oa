@@ -692,3 +692,130 @@ def test_one_resolved_chain_metric_is_enough_to_judge():
         {"spot": 650.0, "call_wall": 700.0},
     )
     assert _verdict(diverging) == "diverge"
+
+
+# ---------------------------------------------------------------------------
+# Reading a real run (first live comparison, 2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+def test_strike_increment_is_the_modal_gap_not_the_smallest():
+    """Chains mix $1 strikes near the money with $5 in the wings.
+
+    The near-money spacing is the one walls and max pain land on, so the
+    modal gap is the right ladder; the minimum would be distorted by a
+    single tight pair and the mean by the wings.
+    """
+    wings_and_body = {}
+    strikes = (
+        [700.0, 705.0, 710.0]  # $5 wings below
+        + [754.5]  # one odd half-dollar strike
+        + [755.0 + i for i in range(20)]  # the $1 body around the money
+        + [790.0, 795.0]  # $5 wings above
+    )
+    for i, k in enumerate(sorted(strikes)):
+        wings_and_body[f"s{i}"] = {"strike": k}
+
+    gaps = sorted({round(b - a, 4) for a, b in zip(sorted(strikes), sorted(strikes)[1:])})
+    assert min(gaps) == 0.5, "fixture must contain a gap smaller than the ladder"
+    assert 5.0 in gaps, "fixture must contain wider wing gaps"
+    # Modal, so neither the lone half-dollar pair nor the $5 wings win.
+    assert feed_compare.infer_strike_increment(wings_and_body) == 1.0
+
+    assert feed_compare.infer_strike_increment({"a": {"strike": 650.0}}) is None
+    assert feed_compare.infer_strike_increment({}) is None
+
+
+def test_adjacent_strikes_are_distinguishable_from_distant_ones():
+    """A percentage tolerance cannot express a strike ladder.
+
+    SPY strikes are $1 apart near $765, so ONE strike is 0.13% and can never
+    fall inside the 0.05% price band. The first live run reported max_pain
+    "764 vs 765" as a tolerance failure indistinguishable from a wall
+    twenty-six strikes away.
+    """
+    near = {
+        c.metric: c
+        for c in compare_metrics({"max_pain": 764.0}, {"max_pain": 765.0}, strike_increment=1.0)
+    }["max_pain"]
+    far = {
+        c.metric: c
+        for c in compare_metrics({"max_pain": 764.0}, {"max_pain": 790.0}, strike_increment=1.0)
+    }["max_pain"]
+
+    assert "1 strike apart" in near.note
+    assert "26 strikes apart" in far.note
+    assert near.within_tolerance is False and far.within_tolerance is False
+
+    same = {
+        c.metric: c
+        for c in compare_metrics({"call_wall": 765.0}, {"call_wall": 765.0}, strike_increment=1.0)
+    }["call_wall"]
+    assert same.within_tolerance is True
+    assert "strike" not in same.note
+
+
+def test_summary_contrasts_self_variance_with_the_gap_between_feeds():
+    """The number that decides a migration is not how far the feeds sit
+    apart, but how that compares to how far each moves from itself.
+
+    Replays the shape of the first live run: the incumbent's net GEX spanned
+    9.3% across ten consecutive samples while the feeds never differed by
+    more than 6.1%.
+    """
+    incumbent_values = [-2_827.27e6, -2_575.92e6, -2_700.0e6]
+    candidate_values = [-2_732.48e6, -2_732.72e6, -2_732.91e6]
+    results = []
+    for a, b in zip(incumbent_values, candidate_values):
+        results.append(
+            {
+                "comparisons": [
+                    {
+                        "metric": "net_gex",
+                        "incumbent": a,
+                        "candidate": b,
+                        "pct_diff": (b - a) / abs(a) * 100,
+                    }
+                ]
+            }
+        )
+
+    summary = feed_compare.summarise_run(results)["net_gex"]
+    assert summary["samples"] == 3
+    assert summary["incumbent_self_span_pct"] > 9.0
+    assert summary["candidate_self_span_pct"] < 0.1
+    assert summary["incumbent_self_span_pct"] > summary["max_cross_feed_pct"]
+
+
+def test_summary_needs_two_samples_to_say_anything(capsys):
+    """One sample has no variance to report; saying 0% would be a lie."""
+    one = [
+        {
+            "comparisons": [
+                {"metric": "net_gex", "incumbent": 1.0, "candidate": 1.0, "pct_diff": 0.0}
+            ]
+        }
+    ]
+    feed_compare._print_summary(feed_compare.summarise_run(one), "a", "b")
+    assert capsys.readouterr().out == ""
+
+
+def test_summary_warns_when_the_incumbent_is_noisier_than_the_difference(capsys):
+    results = []
+    for a in (-2_827.0e6, -2_575.0e6):
+        results.append(
+            {
+                "comparisons": [
+                    {
+                        "metric": "net_gex",
+                        "incumbent": a,
+                        "candidate": -2_732.0e6,
+                        "pct_diff": (-2_732.0e6 - a) / abs(a) * 100,
+                    }
+                ]
+            }
+        )
+    feed_compare._print_summary(feed_compare.summarise_run(results), "tradestation", "thetadata")
+    out = capsys.readouterr().out
+    assert "net_gex" in out
+    assert "ITSELF" in out

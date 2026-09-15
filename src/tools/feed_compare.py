@@ -91,6 +91,14 @@ _METRICS = (
 _DEFAULT_PRICE_TOLERANCE_PCT = 0.05
 _DEFAULT_EXPOSURE_TOLERANCE_PCT = 2.0
 
+#: Metrics whose value is a strike, so the smallest possible non-zero
+#: difference is one strike increment. A percentage tolerance cannot express
+#: that: SPY strikes are $1 apart around $765, so ONE strike is 0.13% and no
+#: adjacent-strike disagreement can ever fall inside a 0.05% band. The
+#: percentage is still reported, but the judgement and the note are made in
+#: strikes, where "adjacent" and "nowhere near" stop looking identical.
+_STRIKE_QUANTISED = ("call_wall", "put_wall", "max_pain")
+
 
 @dataclass
 class MetricComparison:
@@ -263,14 +271,41 @@ def _compute_analytics(
     return out
 
 
+def infer_strike_increment(metadata: Dict[str, Dict[str, Any]]) -> Optional[float]:
+    """The ladder spacing for this chain, from the strikes actually sampled.
+
+    The modal gap rather than the minimum: a chain routinely mixes $1
+    strikes near the money with $5 out in the wings, and the near-money
+    spacing is the one the walls and max pain land on.
+    """
+    strikes = sorted({float(m["strike"]) for m in metadata.values() if m.get("strike")})
+    if len(strikes) < 2:
+        return None
+    gaps: Dict[float, int] = {}
+    for lo, hi in zip(strikes, strikes[1:]):
+        gap = round(hi - lo, 4)
+        if gap > 0:
+            gaps[gap] = gaps.get(gap, 0) + 1
+    if not gaps:
+        return None
+    return max(gaps.items(), key=lambda kv: kv[1])[0]
+
+
 def compare_metrics(
     incumbent: Dict[str, Optional[float]],
     candidate: Dict[str, Optional[float]],
     *,
     price_tolerance_pct: float = _DEFAULT_PRICE_TOLERANCE_PCT,
     exposure_tolerance_pct: float = _DEFAULT_EXPOSURE_TOLERANCE_PCT,
+    strike_increment: Optional[float] = None,
 ) -> List[MetricComparison]:
-    """Diff two analytics dicts into a reportable comparison."""
+    """Diff two analytics dicts into a reportable comparison.
+
+    ``strike_increment`` lets the strike-quantised metrics be described in
+    strikes. Without it they are judged on percentage, which for a $1 ladder
+    means every adjacent-strike disagreement reads as a tolerance failure
+    indistinguishable from a wall fifty strikes away.
+    """
     results: List[MetricComparison] = []
     for metric in _METRICS:
         a = incumbent.get(metric)
@@ -285,6 +320,13 @@ def compare_metrics(
             note = "candidate unresolved"
         pct = _pct_diff(a, b)
         within = None if pct is None else abs(pct) <= tolerance
+        if metric in _STRIKE_QUANTISED and strike_increment and a is not None and b is not None:
+            steps = abs(b - a) / strike_increment
+            within = steps < 0.5
+            if not within:
+                note = (note + " " if note else "") + (
+                    f"{steps:.0f} strike" + ("s" if round(steps) != 1 else "") + " apart"
+                )
         results.append(
             MetricComparison(
                 metric=metric,
@@ -800,6 +842,9 @@ def run_once(
         analytics[candidate.provider],
         price_tolerance_pct=price_tolerance_pct,
         exposure_tolerance_pct=exposure_tolerance_pct,
+        # Taken from the incumbent, which defines the contract set both
+        # feeds were asked for.
+        strike_increment=infer_strike_increment(incumbent.metadata),
     )
 
     if persist:
@@ -938,6 +983,88 @@ def _print_probe(result: Dict[str, Any]) -> None:
 #: it is read from a bar, not derived from the chain, so it agrees even when
 #: every contract failed to price.
 _CHAIN_METRICS = tuple(m for m in _METRICS if m != "spot")
+
+
+def summarise_run(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Each feed's variability against the gap between them.
+
+    A single sample cannot tell a real disagreement from ordinary jitter,
+    and a run of them is unreadable by eye. The number that decides a
+    migration is not how far the feeds sit apart -- it is how that distance
+    compares to how far each feed moves from itself minute to minute.
+
+    A feed whose own consecutive samples span 9% cannot be used to convict
+    another feed of a 6% difference. Reporting the two side by side makes
+    that visible instead of leaving it to be worked out by hand.
+    """
+    per_metric: Dict[str, Dict[str, Any]] = {}
+    for metric in _METRICS:
+        inc: List[float] = []
+        cand: List[float] = []
+        gaps: List[float] = []
+        for r in results:
+            for c in r.get("comparisons", []):
+                if c.get("metric") != metric:
+                    continue
+                a, b, pct = c.get("incumbent"), c.get("candidate"), c.get("pct_diff")
+                if a is not None:
+                    inc.append(a)
+                if b is not None:
+                    cand.append(b)
+                if pct is not None and pct not in (float("inf"), float("-inf")):
+                    gaps.append(abs(pct))
+
+        def _span_pct(values: List[float]) -> Optional[float]:
+            if len(values) < 2:
+                return None
+            mean = sum(values) / len(values)
+            if mean == 0:
+                return None
+            return (max(values) - min(values)) / abs(mean) * 100.0
+
+        per_metric[metric] = {
+            "incumbent_self_span_pct": _span_pct(inc),
+            "candidate_self_span_pct": _span_pct(cand),
+            "max_cross_feed_pct": max(gaps) if gaps else None,
+            "samples": len(results),
+        }
+    return per_metric
+
+
+def _print_summary(summary: Dict[str, Any], incumbent: str, candidate: str) -> None:
+    samples = next((v["samples"] for v in summary.values()), 0)
+    if samples < 2:
+        return
+    print(f"\n  === across {samples} samples ===")
+    print(
+        f"  {'metric':<12} {incumbent[:12] + ' self':>19} "
+        f"{candidate[:12] + ' self':>19} {'feeds apart':>13}"
+    )
+    print("  " + "-" * 66)
+    for metric, row in summary.items():
+
+        def fmt(v):
+            return "-" if v is None else f"{v:.2f}%"
+
+        print(
+            f"  {metric:<12} {fmt(row['incumbent_self_span_pct']):>19} "
+            f"{fmt(row['candidate_self_span_pct']):>19} "
+            f"{fmt(row['max_cross_feed_pct']):>13}"
+        )
+    noisy = [
+        m
+        for m, r in summary.items()
+        if r["incumbent_self_span_pct"] is not None
+        and r["max_cross_feed_pct"] is not None
+        and r["incumbent_self_span_pct"] > r["max_cross_feed_pct"]
+    ]
+    if noisy:
+        print(
+            f"\n  NOTE: on {', '.join(noisy)} the incumbent moved further from\n"
+            f"  ITSELF between samples than the two feeds ever differed. A\n"
+            f"  divergence smaller than that is not evidence about the candidate."
+        )
+    print()
 
 
 def _verdict(comparisons: Sequence[MetricComparison]) -> str:
@@ -1126,6 +1253,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     deadline = time.monotonic() + args.duration_minutes * 60
     exit_code = 0
+    collected: List[Dict[str, Any]] = []
     try:
         while True:
             result = run_once(
@@ -1140,6 +1268,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 exposure_tolerance_pct=args.exposure_tolerance_pct,
                 keep_vendor_iv=not args.solve_iv_both,
             )
+            collected.append(result)
             if args.json:
                 print(json.dumps(result, default=str))
             else:
@@ -1154,6 +1283,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         incumbent_provider.close()
         candidate_provider.close()
+    # Printed even after an interrupt: a run stopped early still carries the
+    # samples it took, and those are what the decision rests on.
+    if collected and not args.json:
+        _print_summary(summarise_run(collected), incumbent_name, candidate_name)
     return exit_code
 
 
