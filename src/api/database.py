@@ -5982,7 +5982,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             strike_count,
                             expired_expirations,
                             rolling_bars,
-                            gamma_flip
+                            gamma_flip,
+                            typical_move_30m
                         FROM gamma_regime_5min
                         WHERE symbol = $1
                           AND bar_start >= $2

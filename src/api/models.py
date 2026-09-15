@@ -589,6 +589,16 @@ class GammaRegimeBar(BaseModel):
     #: SECURE / THIN / CROSSING / NO_FLIP. Classified on the FRACTION, never
     #: on points, so the label means the same thing on SPX and SPY.
     cushion_state: Optional[str] = None
+    #: Cushion as a multiple of a typical 30-minute realized move, which is
+    #: the yardstick the state is classified against.
+    cushion_move_ratio: Optional[float] = None
+    #: Which yardstick produced the state: `move_30m`, or `spot_fraction` for
+    #: bars stored before the move scale existed. The two are not comparable.
+    cushion_basis: Optional[str] = None
+    #: STABLE / DRIFTING / CONTRACTING / ACCELERATING. Separate from the state
+    #: because thin-but-stable and thin-and-collapsing are different things.
+    cushion_rate_context: Optional[str] = None
+    typical_move_30m: Optional[float] = None
     #: The one-line read, in the shape the Phase 1 spec asks for.
     cushion_summary: Optional[str] = None
 

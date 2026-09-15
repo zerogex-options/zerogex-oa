@@ -24,8 +24,8 @@ UTC = timezone.utc
 class _Cursor:
     """Cursor that answers the writer's probes and records its statements."""
 
-    def __init__(self, has_flip: bool):
-        self._has_flip = has_flip
+    def __init__(self, columns):
+        self._columns = set(columns)
         self.statements = []
         self._last = ""
 
@@ -34,13 +34,15 @@ class _Cursor:
         self._last = sql
 
     def fetchone(self):
-        if "information_schema.columns" in self._last:
-            return (1,) if self._has_flip else None
         if "gamma_flip_point" in self._last:
             return (690.0,)
+        if "percentile_cont" in self._last:
+            return (20.0,)  # typical 30-minute move
         return None
 
     def fetchall(self):
+        if "information_schema.columns" in self._last:
+            return [(c,) for c in sorted(self._columns)]
         if "SELECT bar_start FROM gamma_regime_5min" in self._last:
             return []  # nothing written yet, so every bar is due
         # The chain read: one strike, enough to build a snapshot.
@@ -67,11 +69,14 @@ def _engine():
     return eng
 
 
-def _run(has_flip: bool):
-    """Drive one snapshot refresh against a cursor with or without the column."""
-    AnalyticsEngine._gamma_regime_has_flip = None  # re-probe per test
+ALL_COLUMNS = ("gamma_flip", "typical_move_30m")
+
+
+def _run(columns=ALL_COLUMNS):
+    """Drive one snapshot refresh against a database with these columns."""
+    AnalyticsEngine._gamma_regime_optional_cols = None  # re-probe per test
     eng = _engine()
-    cursor = _Cursor(has_flip)
+    cursor = _Cursor(columns)
     conn = MagicMock()
     conn.cursor.return_value = cursor
     cm = MagicMock()
@@ -87,42 +92,58 @@ def _inserts(cursor):
     return [sql for sql, _ in cursor.statements if "INSERT INTO gamma_regime_5min" in sql]
 
 
-def test_bars_are_still_written_when_the_column_is_missing():
+def test_bars_are_still_written_when_every_optional_column_is_missing():
     """The regression. One absent optional column used to take down every
-    bar; now it only costs the cushion."""
-    inserts = _inserts(_run(has_flip=False))
+    bar; now it only costs that field."""
+    inserts = _inserts(_run(columns=()))
 
     assert inserts, "no bars written at all — the column skew killed the snapshot"
     assert "gamma_flip" not in inserts[0]
+    assert "typical_move_30m" not in inserts[0]
 
 
-def test_the_flip_is_written_once_the_column_exists():
-    inserts = _inserts(_run(has_flip=True))
+def test_optional_columns_are_written_once_they_exist():
+    inserts = _inserts(_run())
+
+    assert inserts
+    for col in ALL_COLUMNS:
+        assert col in inserts[0]
+        assert f"{col} = EXCLUDED.{col}" in inserts[0]
+
+
+def test_a_partial_migration_writes_what_it_can():
+    """Columns arrive one deploy at a time, so the writer has to handle any
+    subset rather than only all-or-nothing."""
+    inserts = _inserts(_run(columns=("gamma_flip",)))
 
     assert inserts
     assert "gamma_flip" in inserts[0]
-    assert "gamma_flip = EXCLUDED.gamma_flip" in inserts[0]
+    assert "typical_move_30m" not in inserts[0]
 
 
-def test_column_and_value_counts_match_in_both_shapes():
+def test_column_and_value_counts_match_in_every_shape():
     """An f-string assembling SQL is exactly where a column/value mismatch
     hides, and psycopg2 would only surface it at execution time.
 
     Placeholders are counted by regex rather than by splitting on ")", since
-    ``%(symbol)s`` contains one.
+    ``%(symbol)s`` contains one. The character class must allow digits, or
+    ``%(typical_move_30m)s`` goes uncounted and the test reports a mismatch
+    that is its own.
     """
-    for has_flip in (True, False):
-        sql = _inserts(_run(has_flip))[0]
+    for columns in ((), ("gamma_flip",), ("typical_move_30m",), ALL_COLUMNS):
+        sql = _inserts(_run(columns))[0]
         col_block = sql.split("INSERT INTO gamma_regime_5min (")[1].split(") VALUES")[0]
         n_cols = len([c for c in col_block.replace("\n", " ").split(",") if c.strip()])
-        n_vals = len(re.findall(r"%\([a-z_]+\)s", sql.split("VALUES (")[1].split("ON CONFLICT")[0]))
-        assert n_cols == n_vals, f"has_flip={has_flip}: {n_cols} columns vs {n_vals} values"
+        n_vals = len(
+            re.findall(r"%\([a-z0-9_]+\)s", sql.split("VALUES (")[1].split("ON CONFLICT")[0])
+        )
+        assert n_cols == n_vals, f"{columns}: {n_cols} columns vs {n_vals} values"
 
 
 def test_the_probe_runs_once_and_is_cached():
     """A catalog lookup per bar would be waste; per process is the right
     granularity, since a restart is exactly when the answer can change."""
-    cursor = _run(has_flip=True)
+    cursor = _run()
     probes = [s for s, _ in cursor.statements if "information_schema.columns" in s]
 
     assert len(probes) == 1
@@ -130,7 +151,16 @@ def test_the_probe_runs_once_and_is_cached():
 
 def test_no_flip_lookup_when_the_column_is_absent():
     """Nowhere to put the answer, so do not pay for the query."""
-    cursor = _run(has_flip=False)
+    cursor = _run(columns=())
     lookups = [s for s, _ in cursor.statements if "gamma_flip_point" in s]
 
     assert lookups == []
+
+
+def test_the_move_scale_is_computed_once_per_cycle_not_per_bar():
+    """It is a multi-day median that barely moves intraday; recomputing it for
+    each of 78 backfilled bars would be pure waste."""
+    cursor = _run()
+    moves = [s for s, _ in cursor.statements if "percentile_cont" in s]
+
+    assert len(moves) == 1

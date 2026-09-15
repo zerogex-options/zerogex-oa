@@ -4091,38 +4091,97 @@ class AnalyticsEngine:
         spot = dicts[0].get("spot_price")
         return (float(spot) if spot is not None else None), dicts
 
-    #: Tri-state cache for the gamma_flip column probe: None = not yet checked,
-    #: then True/False for the life of the process. A deploy that restarts the
-    #: service re-probes, which is exactly when the answer can have changed.
-    _gamma_regime_has_flip = None
+    #: Optional gamma_regime_5min columns that newer engine code writes. Cached
+    #: as a set for the life of the process: None = not yet probed. A service
+    #: restart re-probes, which is exactly when the answer can have changed.
+    _gamma_regime_optional_cols = None
 
-    def _gamma_regime_flip_column_exists(self, cursor) -> bool:
-        """Whether gamma_regime_5min carries the gamma_flip column yet.
+    #: Lookback for the typical-move estimate, and the minimum minutes a
+    #: 30-minute window needs before it counts as a complete sample.
+    GAMMA_MOVE_LOOKBACK_DAYS = 5
+    GAMMA_MOVE_MIN_MINUTES = 20
+
+    def _gamma_regime_optional_columns(self, cursor) -> set:
+        """Which optional gamma_regime_5min columns this database actually has.
 
         Exists because schema.sql is NOT re-run by a bare ``git pull`` -- only
-        ``make pull`` / ``make schema-apply`` apply it (the Makefile documents
-        a prior incident from exactly this skew). So new code can legitimately
-        reach production one deploy ahead of its column.
+        ``make pull`` / ``make schema-apply`` apply it, and the Makefile
+        documents a prior incident from exactly that skew. New code can
+        legitimately reach production one deploy ahead of its columns.
 
-        When that happens the cushion is simply unavailable, which is a
-        degraded reading. Without this probe it was worse than degraded: the
-        failed INSERT aborted the whole snapshot, so NO bars were written at
-        all and the entire structure series went dark over one optional
-        column. Probing costs a single catalog lookup per process.
+        When that happens the affected reading is degraded. Without this probe
+        it was worse: a failed INSERT aborted the whole snapshot, so NO bars
+        were written and the entire structure series went dark over one
+        optional column. One catalog lookup per process buys that back.
         """
-        if self._gamma_regime_has_flip is None:
+        if self._gamma_regime_optional_cols is None:
             cursor.execute("""
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'gamma_regime_5min' AND column_name = 'gamma_flip'
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'gamma_regime_5min'
+                  AND column_name IN ('gamma_flip', 'typical_move_30m')
                 """)
-            type(self)._gamma_regime_has_flip = cursor.fetchone() is not None
-            if not self._gamma_regime_has_flip:
+            found = {row[0] for row in cursor.fetchall()}
+            type(self)._gamma_regime_optional_cols = found
+            missing = {"gamma_flip", "typical_move_30m"} - found
+            if missing:
                 logger.warning(
-                    "gamma_regime_5min has no gamma_flip column; writing bars without "
-                    "the flip cushion. Run `make schema-apply` (or `make pull`) to add "
-                    "it -- a bare `git pull` does not apply schema.sql."
+                    "gamma_regime_5min is missing %s; writing bars without those "
+                    "fields. Run `make schema-apply` (or `make pull`) to add them -- "
+                    "a bare `git pull` does not apply schema.sql.",
+                    ", ".join(sorted(missing)),
                 )
-        return bool(self._gamma_regime_has_flip)
+        return self._gamma_regime_optional_cols
+
+    def _typical_move_30m(self, cursor, until: datetime):
+        """Median 30-minute high-low range over the trailing lookback.
+
+        The yardstick the cushion is classified against. A fraction of spot
+        was the earlier choice and it adapts to price level but not to
+        volatility, so a fixed percentage reads as a thin cushion on a quiet
+        morning and a comfortable one on a fast afternoon while reporting the
+        same label for both. Distance measured in units of "how far price
+        usually travels in half an hour" means the same thing in both.
+
+        Median rather than mean: one gap or halt would otherwise redefine
+        normal for the whole lookback. Windows with too few minutes are
+        dropped rather than counted as small moves, since a partial window is
+        a data artifact and not a quiet half hour.
+
+        Computed once per cycle, not per bar. It is a multi-day median and
+        barely moves intraday, so a gap-fill stamping the current value on
+        backfilled bars is a small and bounded inaccuracy; recomputing it for
+        each of 78 bars would not be.
+        """
+        cursor.execute(
+            """
+            WITH windows AS (
+                SELECT
+                    date_trunc('hour', timestamp)
+                      + FLOOR(EXTRACT(MINUTE FROM timestamp)::int / 30)
+                        * INTERVAL '30 minutes' AS w,
+                    MAX(high) - MIN(low) AS rng,
+                    COUNT(*) AS mins
+                FROM underlying_quotes
+                WHERE symbol = %(symbol)s
+                  AND timestamp >= %(since)s
+                  AND timestamp <= %(until)s
+                GROUP BY 1
+            )
+            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY rng)
+            FROM windows
+            WHERE mins >= %(min_minutes)s
+            """,
+            {
+                "symbol": self.db_symbol,
+                "since": until - timedelta(days=self.GAMMA_MOVE_LOOKBACK_DAYS),
+                "until": until,
+                "min_minutes": self.GAMMA_MOVE_MIN_MINUTES,
+            },
+        )
+        row = cursor.fetchone()
+        value = float(row[0]) if row and row[0] is not None else None
+        # Zero would divide the cushion ratio into infinity; treat it as absent.
+        return value if value and value > 0 else None
 
     def _gamma_flip_at_bar(self, cursor, bar_start: datetime):
         """The dealer-gamma flip level for one 5-minute bar, or None.
@@ -4239,7 +4298,10 @@ class AnalyticsEngine:
                         )
                     return chains[bar_ts]
 
-                has_flip = self._gamma_regime_flip_column_exists(cursor)
+                optional = self._gamma_regime_optional_columns(cursor)
+                has_flip = "gamma_flip" in optional
+                has_move = "typical_move_30m" in optional
+                typical_move = self._typical_move_30m(cursor, session_end) if has_move else None
 
                 written_count = 0
                 for bar_ts in todo:
@@ -4254,6 +4316,13 @@ class AnalyticsEngine:
 
                     flip_col = ", gamma_flip" if has_flip else ""
                     flip_val = ", %(gamma_flip)s" if has_flip else ""
+                    move_col = ", typical_move_30m" if has_move else ""
+                    move_val = ", %(typical_move_30m)s" if has_move else ""
+                    move_set = (
+                        "\n                            typical_move_30m = EXCLUDED.typical_move_30m,"
+                        if has_move
+                        else ""
+                    )
                     flip_set = (
                         "\n                            gamma_flip = EXCLUDED.gamma_flip,"
                         if has_flip
@@ -4268,7 +4337,7 @@ class AnalyticsEngine:
                             rolling_lean, rolling_stability,
                             rolling_net_shift, rolling_gross_shift,
                             sigma_price, near_spot_stock, strike_count,
-                            expired_expirations, rolling_bars{flip_col}
+                            expired_expirations, rolling_bars{flip_col}{move_col}
                         ) VALUES (
                             %(symbol)s, %(bar_start)s, %(spot)s,
                             %(anchored_lean)s, %(anchored_stability)s,
@@ -4276,7 +4345,7 @@ class AnalyticsEngine:
                             %(rolling_lean)s, %(rolling_stability)s,
                             %(rolling_net_shift)s, %(rolling_gross_shift)s,
                             %(sigma_price)s, %(near_spot_stock)s, %(strike_count)s,
-                            %(expired_expirations)s, %(rolling_bars)s{flip_val}
+                            %(expired_expirations)s, %(rolling_bars)s{flip_val}{move_val}
                         )
                         ON CONFLICT (symbol, bar_start) DO UPDATE SET
                             spot = EXCLUDED.spot,
@@ -4292,7 +4361,7 @@ class AnalyticsEngine:
                             near_spot_stock = EXCLUDED.near_spot_stock,
                             strike_count = EXCLUDED.strike_count,
                             expired_expirations = EXCLUDED.expired_expirations,
-                            rolling_bars = EXCLUDED.rolling_bars,{flip_set}
+                            rolling_bars = EXCLUDED.rolling_bars,{flip_set}{move_set}
                             updated_at = NOW()
                         """,
                         {
@@ -4313,6 +4382,7 @@ class AnalyticsEngine:
                             "expired_expirations": list(result.expired_expirations),
                             "rolling_bars": rolling,
                             "gamma_flip": gamma_flip,
+                            "typical_move_30m": typical_move,
                         },
                     )
                     written_count += 1

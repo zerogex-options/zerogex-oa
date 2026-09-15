@@ -747,7 +747,15 @@ The Gamma Shift read at every 5-minute bar of a session. Where `/api/gex/regime-
 
 **Flip cushion.** Each bar also carries how much room price has before the gamma regime itself changes: `gamma_flip` (the stored level), `flip_distance_pts` / `flip_distance_frac` (signed, positive = spot above the flip), `cushion_pts` (unsigned room before crossing), `cushion_side`, `cushion_step_pts` (this bar) and `cushion_rate_pts` (trailing 15 minutes; negative is narrowing), `cushion_accelerating`, `cushion_state` and a one-line `cushion_summary`.
 
-Only the flip level is stored. Everything else is derived on read, so retuning a threshold reclassifies history instead of leaving old bars labeled by a rule that is no longer live. `cushion_state` is computed from the distance as a **fraction of spot**, never from points — ten points is a crossing risk on SPX and a comfortable cushion on SPY — using `VOL_FLIP_PROX_SPAN` imported from the volatility model rather than a second, independently drifting copy. States are `SECURE`, `THIN`, `CROSSING`, and `NO_FLIP`; the last means the gamma profile had no zero crossing at all, which is a different statement from a distant one. The level used is `gamma_flip_point` (structural), not `gamma_flip_raw` (nearest crossing, no significance gate).
+Only the flip level and the move scale are stored. Everything else is derived on read, so retuning a threshold reclassifies history instead of leaving old bars labeled by a rule that is no longer live.
+
+`cushion_state` is classified against a **typical 30-minute realized move** (`typical_move_30m`), never against points and no longer against a fraction of spot. A fraction of spot adapts to price level but not to volatility, so a fixed percentage reads as thin on a quiet morning and comfortable on a fast afternoon while reporting the same label for both. Bands: `CROSSING` at or under 0.25x that move, `THIN` to 0.60x, `NORMAL` to 1.25x, `SECURE` above. `SECURE` means the flip is not the immediate threat, not that a reversal is impossible. `NO_FLIP` means the profile had no zero crossing at all, which is a different statement from a distant one.
+
+`cushion_basis` says which yardstick produced the state: `move_30m`, or `spot_fraction` for bars written before the scale existed. The two are not comparable, so a reader is never left to guess.
+
+`cushion_rate_context` grades the trailing window on the same scale — `STABLE`, `DRIFTING`, `CONTRACTING`, `ACCELERATING` — and is deliberately separate from the state, because thin-but-stable and thin-and-collapsing are very different conditions and one label cannot carry both. Only narrowing is graded past `DRIFTING`: a cushion opening up quickly is not a risk condition.
+
+The level used is `gamma_flip_point` (structural), not `gamma_flip_raw` (nearest crossing, no significance gate).
 
 **Two lenses per bar.** `anchored_*` is versus the session's first bar ("changed today"), the counterpart of the Hedging Flow cumulative curve. `rolling_*` is versus `rolling_bars` bars back ("changing right now"), the counterpart of the rate line and the one to read beside a flip. **They do not sum** — both weight strikes by proximity to each bar's *own* spot, so the kernel re-centres every bar; summing bar-to-bar diffs would assert a fixed kernel and match neither lens.
 
