@@ -7,6 +7,7 @@ that make its answer trustworthy.
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -947,3 +948,109 @@ def test_a_240_contract_spx_ladder_can_still_resolve_a_flip():
     )
     assert spx["gamma_flip"] is not None
     assert spy["gamma_flip"] is not None
+
+
+def test_the_two_feeds_are_not_sampled_simultaneously_and_the_run_says_so(capsys):
+    """The feeds are polled one after the other, so a live 'feeds apart'
+    figure is the vendor's adjustment PLUS whatever the market did in
+    between.
+
+    Left unreported, the whole difference reads as the candidate's. The
+    gap has to be on the page next to the number it qualifies, or the
+    column gets quoted as a measurement of the candidate when it is an
+    upper bound.
+    """
+    result = {
+        "underlying": "SPY",
+        "captured_at": "2026-09-15T20:08:48+00:00",
+        "sampling_skew_seconds": 1.4,
+        "incumbent": {
+            "provider": "thetadata",
+            "contracts": 240,
+            "two_sided": 201,
+            "with_oi": 238,
+            "error": None,
+        },
+        "candidate": {
+            "provider": "thetadata_mv",
+            "contracts": 240,
+            "two_sided": 201,
+            "with_oi": 238,
+            "error": None,
+        },
+        "comparisons": [],
+        "verdict": "agree",
+    }
+    feed_compare._print_report(result)
+    assert "1.4s apart" in capsys.readouterr().out
+
+
+def test_the_summary_calls_feeds_apart_an_upper_bound_when_there_is_skew(capsys):
+    summary = {
+        "net_gex": {
+            "incumbent_self_span_pct": 2.45,
+            "candidate_self_span_pct": 2.53,
+            "max_cross_feed_pct": 0.08,
+            "samples": 3,
+        }
+    }
+    feed_compare._print_summary(summary, "thetadata", "thetadata_mv", max_skew_seconds=1.4)
+    out = capsys.readouterr().out
+    assert "UPPER" in out and "1.4s apart" in out
+
+    # No skew recorded (an older result, or a single failed sample): say
+    # nothing rather than print a caveat that does not apply.
+    feed_compare._print_summary(summary, "thetadata", "thetadata_mv")
+    assert "UPPER" not in capsys.readouterr().out
+
+
+class _SlowChainProvider:
+    """Instant spot and discovery; the chain snapshot is the only slow phase."""
+
+    name = "slow-chain"
+    SNAPSHOT_SECONDS = 0.15
+
+    @property
+    def capabilities(self):
+        return ProviderCapabilities(
+            underlying_bars=True, option_chain_discovery=True, option_snapshots=True
+        )
+
+    def get_option_expirations(self, underlying, strike_price=None):
+        return [date(2026, 9, 16)]
+
+    def get_option_strikes(self, underlying, expiration=None):
+        return [650.0]
+
+    def build_option_symbol(self, underlying, expiration, strike, option_type):
+        return f"{underlying}{expiration:%y%m%d}{option_type}{int(strike * 1000):08d}"
+
+    def snapshot_option_quotes(self, symbols):
+        time.sleep(self.SNAPSHOT_SECONDS)
+        return {s: OptionQuote(option_symbol=s, bid=1.0, ask=1.1) for s in symbols}
+
+
+def test_chain_at_is_stamped_after_the_snapshot_not_before():
+    """``chain_at`` is what makes the skew measurable, and it is only
+    meaningful if it marks when the quotes actually landed.
+
+    Stamped before the fetch it would read as near-simultaneous sampling
+    no matter how long the two feeds really took, which is precisely the
+    error the field exists to prevent.
+    """
+    provider = _SlowChainProvider()
+    sample = feed_compare.sample_provider(
+        provider,
+        "SPY",
+        num_expirations=1,
+        strike_count_max=1,
+        strike_pct_range=3.0,
+        spot_hint=650.0,
+    )
+    assert sample.error is None, sample.error
+    assert sample.chain_at is not None
+    elapsed = (sample.chain_at - sample.captured_at).total_seconds()
+    assert elapsed >= provider.SNAPSHOT_SECONDS, (
+        f"chain_at is only {elapsed:.3f}s after the sample started, less than the "
+        f"{provider.SNAPSHOT_SECONDS}s the snapshot took -- it was stamped before the fetch"
+    )

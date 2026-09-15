@@ -438,6 +438,12 @@ class FeedSample:
     #: first question is always whether they disagreed on spot, and that is
     #: unanswerable after the fact without the bar.
     spot_bar: Optional[Bar] = None
+    #: When this feed's chain snapshot completed. The two feeds are polled
+    #: SEQUENTIALLY, so during RTH the market moves between them and part of
+    #: any cross-feed difference is that gap rather than the vendor. Keeping
+    #: the instant lets the run report how much skew it is carrying instead
+    #: of charging all of it to the candidate.
+    chain_at: Optional[datetime] = None
     #: Seconds per phase. Discovery (expirations + strikes) runs once at
     #: startup and on strike recalibration; the chain fetch runs every poll.
     #: Reporting one total conflates a one-off cost with the recurring one,
@@ -561,6 +567,7 @@ def sample_provider(
             quotes=quotes,
             metadata=metadata,
             spot_bar=spot_bar,
+            chain_at=datetime.now(timezone.utc),
             timings={
                 "spot": round(spot_seconds, 2),
                 "discovery": round(discovery, 2),
@@ -938,9 +945,18 @@ def run_once(
             candidate=candidate,
         )
 
+    skew_seconds: Optional[float] = None
+    if incumbent.chain_at and candidate.chain_at:
+        skew_seconds = abs((candidate.chain_at - incumbent.chain_at).total_seconds())
+
     return {
         "captured_at": candidate.captured_at.isoformat(),
         "underlying": underlying,
+        # How far apart the two chain snapshots actually landed. A live
+        # cross-feed difference is the vendor's adjustment PLUS whatever the
+        # market did in this many seconds; without it the two are not
+        # separable and the difference reads as entirely the candidate's.
+        "sampling_skew_seconds": skew_seconds,
         "incumbent": {
             "provider": incumbent.provider,
             "contracts": incumbent.contract_count,
@@ -1118,7 +1134,13 @@ def summarise_run(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return per_metric
 
 
-def _print_summary(summary: Dict[str, Any], incumbent: str, candidate: str) -> None:
+def _print_summary(
+    summary: Dict[str, Any],
+    incumbent: str,
+    candidate: str,
+    *,
+    max_skew_seconds: Optional[float] = None,
+) -> None:
     samples = next((v["samples"] for v in summary.values()), 0)
     if samples < 2:
         return
@@ -1151,6 +1173,13 @@ def _print_summary(summary: Dict[str, Any], incumbent: str, candidate: str) -> N
             f"  ITSELF between samples than the two feeds ever differed. A\n"
             f"  divergence smaller than that is not evidence about the candidate."
         )
+    if max_skew_seconds:
+        print(
+            f"\n  NOTE: the two feeds were polled up to {max_skew_seconds:.1f}s apart,\n"
+            f"  not simultaneously. While the market is moving, part of every\n"
+            f"  'feeds apart' figure is that gap. Treat the column as an UPPER\n"
+            f"  BOUND on the candidate's own contribution, never a measurement."
+        )
     print()
 
 
@@ -1174,7 +1203,11 @@ def _verdict(comparisons: Sequence[MetricComparison]) -> str:
 
 def _print_report(result: Dict[str, Any]) -> None:
     inc, cand = result["incumbent"], result["candidate"]
-    print(f"\n{result['underlying']}  @  {result['captured_at']}")
+    skew = result.get("sampling_skew_seconds")
+    header = f"\n{result['underlying']}  @  {result['captured_at']}"
+    if skew is not None:
+        header += f"   (feeds sampled {skew:.1f}s apart)"
+    print(header)
     print(
         f"  incumbent {inc['provider']:<14} contracts={inc['contracts']:<6} "
         f"two-sided={inc['two_sided']:<6} with-OI={inc['with_oi']:<6}"
@@ -1373,7 +1406,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Printed even after an interrupt: a run stopped early still carries the
     # samples it took, and those are what the decision rests on.
     if collected and not args.json:
-        _print_summary(summarise_run(collected), incumbent_name, candidate_name)
+        skews = [
+            r["sampling_skew_seconds"]
+            for r in collected
+            if r.get("sampling_skew_seconds") is not None
+        ]
+        _print_summary(
+            summarise_run(collected),
+            incumbent_name,
+            candidate_name,
+            max_skew_seconds=max(skews) if skews else None,
+        )
     return exit_code
 
 
