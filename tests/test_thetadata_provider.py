@@ -781,3 +781,110 @@ def test_prior_session_is_judged_in_the_feeds_own_timezone():
     # Unknown or naive timestamps must not cause data to be discarded.
     assert is_prior_session(None) is False
     assert is_prior_session(datetime.now()) is False
+
+
+# ---------------------------------------------------------------------------
+# Market Value routing (ThetaData commercial answers, 2026-09-15)
+# ---------------------------------------------------------------------------
+
+
+class _MVClient:
+    """A client exposing both realtime and Market Value endpoints."""
+
+    def __init__(self, *, with_stock_mv=True):
+        self.called = []
+        if not with_stock_mv:
+            del self.__class__.stock_snapshot_market_value
+
+    def _bar(self, name, **kw):
+        self.called.append(name)
+        return [{"close": 100.0, "timestamp": datetime.now(timezone(timedelta(hours=-4)))}]
+
+    def index_snapshot_ohlc(self, **kw):
+        return self._bar("index_snapshot_ohlc", **kw)
+
+    def index_snapshot_market_value(self, **kw):
+        return self._bar("index_snapshot_market_value", **kw)
+
+    def stock_snapshot_ohlc(self, **kw):
+        return self._bar("stock_snapshot_ohlc", **kw)
+
+    def stock_snapshot_market_value(self, **kw):
+        return self._bar("stock_snapshot_market_value", **kw)
+
+
+def _drain(stream, timeout=3.0):
+    stream.start()
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            bar = stream.drain()
+            if bar is not None:
+                return bar
+            time.sleep(0.02)
+    finally:
+        stream.stop()
+    return None
+
+
+def test_index_bars_honour_the_market_value_stage():
+    """Index values are licensed separately from OPRA -- Cboe CGIF for SPX
+    and VIX, Nasdaq GIDS for NDX.
+
+    A Market Value deployment still calling the realtime index endpoint
+    would carry exchange fees on half this deployment's underlyings, and
+    the numbers would look entirely correct while doing it.
+    """
+    client = _MVClient()
+    mv = ThetaDataProvider(client, stage="mv", market_value_endpoints=True, poll_interval=0.05)
+    _drain(mv.stream_index_bars("$SPXW.X"))
+    assert "index_snapshot_market_value" in client.called
+    assert "index_snapshot_ohlc" not in client.called
+
+
+def test_realtime_stage_still_uses_the_realtime_endpoints():
+    client = _MVClient()
+    rt = ThetaDataProvider(
+        client, stage="realtime", market_value_endpoints=False, poll_interval=0.05
+    )
+    _drain(rt.stream_index_bars("$SPXW.X"))
+    _drain(rt.stream_underlying_bars("SPY"))
+    assert "index_snapshot_ohlc" in client.called
+    assert "stock_snapshot_ohlc" in client.called
+    assert not any(c.endswith("market_value") for c in client.called)
+
+
+def test_underlying_bars_honour_the_market_value_stage():
+    client = _MVClient()
+    mv = ThetaDataProvider(client, stage="mv", market_value_endpoints=True, poll_interval=0.05)
+    _drain(mv.stream_underlying_bars("SPY"))
+    assert "stock_snapshot_market_value" in client.called
+
+
+def test_a_missing_market_value_endpoint_raises_rather_than_falling_back():
+    """Silently serving realtime inside a Market Value deployment would bill
+    exchange fees on the feed that switched to Market Value to avoid them,
+    and nothing downstream would show it."""
+
+    class _NoStockMV:
+        def stock_snapshot_ohlc(self, **kw):
+            return []
+
+    provider = ThetaDataProvider(_NoStockMV(), stage="mv", market_value_endpoints=True)
+    with pytest.raises(ProviderCapabilityError, match="stock_snapshot_market_value"):
+        provider._endpoint("stock_snapshot_market_value", "stock_snapshot_ohlc")
+
+
+def test_the_probe_reports_which_market_value_endpoints_exist():
+    class _Partial:
+        def option_snapshot_market_value(self, **kw):
+            return []
+
+        def option_list_expirations(self, **kw):
+            return []
+
+    out = ThetaDataProvider(_Partial()).describe_columns("SPY")
+    inventory = out["market_value_endpoints"]
+    assert inventory["option_snapshot_market_value"] == "present"
+    assert inventory["stock_snapshot_market_value"] == "ABSENT"
+    assert inventory["index_snapshot_market_value"] == "ABSENT"
