@@ -5979,7 +5979,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             near_spot_stock,
                             strike_count,
                             expired_expirations,
-                            rolling_bars
+                            rolling_bars,
+                            gamma_flip
                         FROM gamma_regime_5min
                         WHERE symbol = $1
                           AND bar_start >= $2

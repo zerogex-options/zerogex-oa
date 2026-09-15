@@ -560,6 +560,29 @@ class GammaRegimeBar(BaseModel):
     expired_expirations: List[str] = []
     rolling_bars: Optional[int] = None
 
+    # Spot-to-flip cushion. Derived on read from the stored flip and spot, so
+    # a retuned threshold reclassifies history rather than leaving old bars
+    # labelled by whatever rule happened to be live that day.
+    gamma_flip: Optional[float] = None
+    #: Signed: positive means spot sits above the flip.
+    flip_distance_pts: Optional[float] = None
+    flip_distance_frac: Optional[float] = None
+    #: Unsigned room before crossing, which is what widening/narrowing track.
+    cushion_pts: Optional[float] = None
+    cushion_side: Optional[str] = None
+    #: Change in cushion: this bar, and over the rolling window. Negative is
+    #: narrowing. Null where there is no history, or either end had no flip.
+    cushion_step_pts: Optional[float] = None
+    cushion_rate_pts: Optional[float] = None
+    #: Only meaningful while narrowing; null otherwise, since "not
+    #: accelerating" and "not narrowing at all" are different statements.
+    cushion_accelerating: Optional[bool] = None
+    #: SECURE / THIN / CROSSING / NO_FLIP. Classified on the FRACTION, never
+    #: on points, so the label means the same thing on SPX and SPY.
+    cushion_state: Optional[str] = None
+    #: The one-line read, in the shape the Phase 1 spec asks for.
+    cushion_summary: Optional[str] = None
+
 
 class GammaRegimeSeriesResponse(BaseModel):
     """Intraday dealer-gamma structure across a session.

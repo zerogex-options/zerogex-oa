@@ -57,6 +57,9 @@ from .models import (
     OpenInterestResponse,
     StrikeProfileBucket,
 )
+from src.analytics.flip_cushion import DEFAULT_RATE_BARS as CUSHION_RATE_BARS
+from src.analytics.flip_cushion import build_series as build_cushion_series
+from src.analytics.flip_cushion import describe as describe_cushion
 from src.analytics.hedging_flow import (
     DEFAULT_FLAT_BAND_RATIO,
     DEFAULT_SIGNIFICANCE_RATIO,
@@ -1474,7 +1477,7 @@ async def get_hedging_flow(
     )
 
 
-def _format_gamma_regime_row(row: dict) -> dict:
+def _format_gamma_regime_row(row: dict, cushion=None) -> dict:
     """Coerce a stored gamma_regime_5min row into the JSON bar shape.
 
     Timestamps trailing-Z UTC on the same 5-minute grid as
@@ -1519,6 +1522,16 @@ def _format_gamma_regime_row(row: dict) -> dict:
             e.isoformat() if hasattr(e, "isoformat") else str(e) for e in expired
         ],
         "rolling_bars": int(row["rolling_bars"]) if row.get("rolling_bars") is not None else None,
+        "gamma_flip": _opt("gamma_flip"),
+        "flip_distance_pts": cushion.distance_pts if cushion else None,
+        "flip_distance_frac": cushion.distance_frac if cushion else None,
+        "cushion_pts": cushion.cushion_pts if cushion else None,
+        "cushion_side": cushion.side if cushion else None,
+        "cushion_step_pts": cushion.step_pts if cushion else None,
+        "cushion_rate_pts": cushion.rate_pts if cushion else None,
+        "cushion_accelerating": cushion.accelerating if cushion else None,
+        "cushion_state": cushion.state if cushion else None,
+        "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS) if cushion else None,
     }
 
 
@@ -1567,6 +1580,17 @@ async def get_gamma_regime_series(
     viewer per poll — the shape that took the strike-profile timeseries down
     in Aug 2026 — so a miss returns empty rather than falling back to compute.
 
+    Each bar also carries the spot-to-flip cushion: how much room price has
+    before the gamma regime itself changes. Only the flip level is stored;
+    distance, direction, the rolling rate and the SECURE / THIN / CROSSING
+    label are derived here, so retuning a threshold reclassifies history
+    instead of leaving old bars labelled by a rule that is no longer live.
+    The label is computed from the distance as a FRACTION of spot, never from
+    points, because ten points is a crossing risk on SPX and a comfortable
+    cushion on SPY. ``cushion_state`` of ``NO_FLIP`` means the gamma profile
+    had no zero crossing at all, which is a different statement from a distant
+    one.
+
     Same session resolution as ``/api/flow/hedging``, so the two cover
     identical bars. Rows newest → oldest. Unknown symbols 404; a session with
     nothing written yet returns an empty ``bars`` list.
@@ -1586,7 +1610,17 @@ async def get_gamma_regime_series(
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
 
-    bars = [_format_gamma_regime_row(r) for r in rows]
+    # Cushion derivations are inherently chronological (a step is measured
+    # against the previous bar), while the wire order is newest-first. Flip
+    # once, derive, pair back, and reverse -- the same shape the hedging flow
+    # endpoint uses for its moving average.
+    chronological = list(reversed(rows))
+    cushions = build_cushion_series(
+        [(r["bar_start"], r.get("spot"), r.get("gamma_flip")) for r in chronological],
+        rate_bars=CUSHION_RATE_BARS,
+    )
+    bars = [_format_gamma_regime_row(r, c) for r, c in zip(chronological, cushions)]
+    bars.reverse()
     rolling_bars = next(
         (b["rolling_bars"] for b in bars if b.get("rolling_bars") is not None), None
     )

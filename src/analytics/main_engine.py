@@ -3905,6 +3905,37 @@ class AnalyticsEngine:
         spot = dicts[0].get("spot_price")
         return (float(spot) if spot is not None else None), dicts
 
+    def _gamma_flip_at_bar(self, cursor, bar_start: datetime):
+        """The dealer-gamma flip level for one 5-minute bar, or None.
+
+        Uses ``gamma_flip_point``, the structural crossing, NOT
+        ``gamma_flip_raw``. The raw column is the nearest zero crossing with no
+        significance gate, so it can land on a near-spot noise crossing and
+        sits far from the structural level; a cushion measured against it
+        would mostly track that noise. The schema comments on both columns
+        spell the difference out.
+
+        NULL is a real answer: the profile had no crossing at all.
+        """
+        cursor.execute(
+            """
+            SELECT gamma_flip_point
+            FROM gex_summary
+            WHERE underlying = %(symbol)s
+              AND timestamp >= %(bar_start)s
+              AND timestamp <  %(bar_end)s
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            {
+                "symbol": self.db_symbol,
+                "bar_start": bar_start,
+                "bar_end": bar_start + timedelta(minutes=5),
+            },
+        )
+        row = cursor.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     def _refresh_gamma_regime_snapshot(self, timestamp: datetime):
         """Materialise gamma_regime_5min for the current session.
 
@@ -3998,6 +4029,7 @@ class AnalyticsEngine:
                     lookback = chain_for(lookback_ts) if lookback_ts >= session_start else None
 
                     result = build_latest_bar(anchor=anchor, lookback=lookback, current=current)
+                    gamma_flip = self._gamma_flip_at_bar(cursor, bar_ts)
 
                     cursor.execute(
                         """
@@ -4008,7 +4040,7 @@ class AnalyticsEngine:
                             rolling_lean, rolling_stability,
                             rolling_net_shift, rolling_gross_shift,
                             sigma_price, near_spot_stock, strike_count,
-                            expired_expirations, rolling_bars
+                            expired_expirations, rolling_bars, gamma_flip
                         ) VALUES (
                             %(symbol)s, %(bar_start)s, %(spot)s,
                             %(anchored_lean)s, %(anchored_stability)s,
@@ -4016,7 +4048,7 @@ class AnalyticsEngine:
                             %(rolling_lean)s, %(rolling_stability)s,
                             %(rolling_net_shift)s, %(rolling_gross_shift)s,
                             %(sigma_price)s, %(near_spot_stock)s, %(strike_count)s,
-                            %(expired_expirations)s, %(rolling_bars)s
+                            %(expired_expirations)s, %(rolling_bars)s, %(gamma_flip)s
                         )
                         ON CONFLICT (symbol, bar_start) DO UPDATE SET
                             spot = EXCLUDED.spot,
@@ -4033,6 +4065,7 @@ class AnalyticsEngine:
                             strike_count = EXCLUDED.strike_count,
                             expired_expirations = EXCLUDED.expired_expirations,
                             rolling_bars = EXCLUDED.rolling_bars,
+                            gamma_flip = EXCLUDED.gamma_flip,
                             updated_at = NOW()
                         """,
                         {
@@ -4052,6 +4085,7 @@ class AnalyticsEngine:
                             "strike_count": result.strike_count,
                             "expired_expirations": list(result.expired_expirations),
                             "rolling_bars": rolling,
+                            "gamma_flip": gamma_flip,
                         },
                     )
                     written_count += 1
