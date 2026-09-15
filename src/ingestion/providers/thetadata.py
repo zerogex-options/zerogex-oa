@@ -91,7 +91,11 @@ wrong:
   with the vendor's own timestamp.  A Sunday probe returned quotes stamped
   the previous Friday at 16:14, so :meth:`_merge_frame` takes that
   timestamp rather than stamping ``now()`` — the same rule the
-  TradeStation provider follows, for the same reason.
+  TradeStation provider follows, for the same reason.  The same is true of
+  ``option_snapshot_ohlc``, which serves the last available DAILY bar;
+  ThetaData confirmed (2026-09-14) that filtering on the timestamp is how
+  a caller is expected to handle it, and that no session-scoped volume
+  field exists.
 
 Also confirmed: the client reaches a local terminal with no
 ``mdds_host``/``mdds_port`` override, and ``option_list_expirations``
@@ -952,6 +956,13 @@ class ThetaDataProvider(MarketDataProvider):
                 # DAILY bar, so a contract that has not traded today comes
                 # back carrying the volume of the last day it did -- a live
                 # SPX probe returned Friday's single contract on a Monday.
+                # CONFIRMED by ThetaData support 2026-09-14: "the snapshot
+                # displays the last available result and for some contracts
+                # there isn't enough liquidity for every day", and filtering
+                # on the timestamp field is how they expect a caller to
+                # handle it. There is no session-scoped volume field to use
+                # instead, so this is the supported approach rather than a
+                # workaround for one.
                 #
                 # OptionQuote.volume is cumulative volume for THIS session,
                 # and the engine differences successive snapshots to get
