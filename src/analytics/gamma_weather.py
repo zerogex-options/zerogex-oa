@@ -143,6 +143,10 @@ class Weather:
     label: str
     pressure: str
     structure: str
+    #: Since-open stability, classified the same way as ``structure``. The
+    #: spec calls this background health: where structure says what the book
+    #: is doing right now, this says where the session has migrated to.
+    gamma_trend: str
     lean_side: Optional[str]
     cushion: str
     sentence: str
@@ -274,6 +278,7 @@ def classify(inputs: WeatherInputs) -> Weather:
         label=STATE_LABELS[state],
         pressure=pressure,
         structure=structure,
+        gamma_trend=classify_structure(inputs.gamma_trend),
         lean_side=lean_side,
         cushion=cushion,
         sentence=_sentence(state, pressure, structure, lean_side, cushion),
