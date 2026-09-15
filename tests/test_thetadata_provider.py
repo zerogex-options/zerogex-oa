@@ -1052,3 +1052,28 @@ def test_realtime_rows_still_have_no_vendor_mid():
     call = build_occ_symbol("SPY", EXP, 650.0, "C")
     state = provider.fetch_chain_state([call], include_open_interest=False)
     assert state[call].get("mid") is None
+
+
+def test_stopping_a_bar_stream_does_not_wait_out_the_poll_interval():
+    """Teardown was costing a full interval per sample.
+
+    The poll loop slept with time.sleep, so stop() had to wait for the
+    thread to wake before joining -- five seconds of dead time after the bar
+    had already been delivered. A live probe reported 5.0s for spot against
+    0.21s for the entire chain fetch.
+    """
+
+    class _C:
+        def stock_snapshot_ohlc(self, **kw):
+            return [{"close": 100.0, "timestamp": datetime.now(timezone(timedelta(hours=-4)))}]
+
+    provider = ThetaDataProvider(_C(), poll_interval=30.0)
+    stream = provider.stream_underlying_bars("SPY")
+    stream.start()
+    deadline = time.monotonic() + 3
+    while stream.drain() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    started = time.monotonic()
+    stream.stop()
+    assert time.monotonic() - started < 2.0, "stop() waited out the poll interval"
