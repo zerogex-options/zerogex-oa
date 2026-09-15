@@ -165,8 +165,16 @@ _MARKET_VALUE_ENDPOINT_NOTE = __doc__
 #: same hazard as a wrong guess. If one stops matching, the chain does not
 #: quietly empty -- :func:`report_unmapped` names the columns that arrived.
 _FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {
-    "bid": ("bid",),
-    "ask": ("ask",),
+    # The Market Value endpoints answer with their OWN column names --
+    # market_bid / market_ask / market_price, and no sizes. Verified against
+    # a live terminal 2026-09-15, where accepting only "bid"/"ask" made
+    # every Market Value quote read as absent and the comparison report
+    # two-sided=0 while looking otherwise healthy.
+    "bid": ("bid", "market_bid"),
+    "ask": ("ask", "market_ask"),
+    #: The vendor's own mark. Preferred over deriving a midpoint, and the
+    #: only price a Market Value row carries besides the two sides.
+    "mid": ("market_price",),
     "bid_size": ("bid_size",),
     "ask_size": ("ask_size",),
     # The ohlc endpoint has no "last"; its close IS the last trade.
@@ -180,7 +188,11 @@ _FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {
     "open": ("open",),
     "high": ("high",),
     "low": ("low",),
-    "close": ("close",),
+    # market_price lets a Market Value stock/index row stand in for a bar:
+    # the Market Value feed has no OHLC endpoint, so spot comes from the
+    # mark. Without this the MV stage has no spot at all and every sample
+    # aborts with "no spot price available".
+    "close": ("close", "market_price"),
     "timestamp": ("timestamp",),
 }
 
@@ -593,7 +605,9 @@ def _to_quote(symbol: str, state: Dict[str, Any]) -> OptionQuote:
         bid=state.get("bid"),
         ask=state.get("ask"),
         last=state.get("last"),
-        mid=None,  # derived on demand by OptionQuote.effective_mid()
+        # The vendor's mark when it sent one (Market Value rows carry
+        # market_price); otherwise None, and effective_mid() derives it.
+        mid=state.get("mid"),
         bid_size=state.get("bid_size"),
         ask_size=state.get("ask_size"),
         volume=state.get("volume"),
@@ -1034,6 +1048,9 @@ class ThetaDataProvider(MarketDataProvider):
                 target["ask"] = _as_float(_pick(row, "ask"))
                 target["bid_size"] = _as_int(_pick(row, "bid_size"))
                 target["ask_size"] = _as_int(_pick(row, "ask_size"))
+                # Present only on Market Value rows; None elsewhere, where
+                # OptionQuote.effective_mid() derives it from bid/ask.
+                target["mid"] = _as_float(_pick(row, "mid"))
                 # The vendor's quote time, NOT now(). These snapshots carry
                 # the last quote whether or not the market is open: a probe
                 # run on Sunday the 13th returned quotes stamped Friday the
@@ -1152,7 +1169,15 @@ class ThetaDataProvider(MarketDataProvider):
                     "right": "both",
                 },
             ),
-            ("stock_quote", self._client.stock_snapshot_quote, {"symbol": equity_root}),
+            # Routed through _endpoint so an MV stage reports the columns it
+            # will really read. Calling the client directly showed realtime
+            # column names for a Market Value provider, which is how the
+            # market_bid/market_ask mismatch stayed hidden.
+            (
+                "stock_quote",
+                self._endpoint("stock_snapshot_market_value", "stock_snapshot_quote"),
+                {"symbol": equity_root},
+            ),
             ("stock_ohlc", self._client.stock_snapshot_ohlc, {"symbol": equity_root}),
             # The index endpoints serve SPX / NDX / VIX / VXN spot, which is
             # a different licence and may well be a different row shape.
@@ -1160,7 +1185,7 @@ class ThetaDataProvider(MarketDataProvider):
             # index underlying reports on the feed it will actually use.
             (
                 "index_ohlc",
-                self._client.index_snapshot_ohlc,
+                self._endpoint("index_snapshot_market_value", "index_snapshot_ohlc"),
                 {"symbol": index_root if index_root != equity_root else _DIAGNOSTIC_INDEX},
             ),
         ]
@@ -1324,7 +1349,12 @@ def _bar_from_row(row: Dict[str, Any], db_symbol: str) -> Optional[Bar]:
         return None
     return Bar(
         symbol=db_symbol,
-        timestamp=datetime.now(timezone.utc),
+        # The vendor's time, not now(), for the same reason the option
+        # quotes use it: these snapshots serve the last available value
+        # whether or not the market is open, and now() would present a
+        # stale bar as current. Falls back to now() only when the feed
+        # sent no timestamp at all.
+        timestamp=_coerce_datetime(_pick(row, "timestamp")) or datetime.now(timezone.utc),
         open=_as_float(_pick(row, "open")),
         high=_as_float(_pick(row, "high")),
         low=_as_float(_pick(row, "low")),

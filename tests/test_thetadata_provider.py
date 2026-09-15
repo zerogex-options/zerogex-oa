@@ -979,3 +979,76 @@ def test_registry_builds_the_two_stages_under_distinct_names(monkeypatch):
     register_provider("_t_rt", lambda **kw: _factory(stage="realtime"))
     register_provider("_t_mv", lambda **kw: _factory(stage="mv"))
     assert get_provider("_t_rt").name != get_provider("_t_mv").name
+
+
+# ---------------------------------------------------------------------------
+# Market Value column names (live probe, 2026-09-15)
+# ---------------------------------------------------------------------------
+
+#: A real row from option_snapshot_market_value. The Market Value endpoints
+#: answer with their own column names and carry no sizes.
+MV_QUOTE_ROW = {
+    "expiration": "2026-09-15",
+    "market_ask": 47.19,
+    "market_bid": 46.980000000000004,
+    "market_price": 47.08,
+    "right": "CALL",
+    "strike": 710.0,
+    "symbol": "SPY",
+    "timestamp": datetime(2026, 9, 15, 13, 34, 37, tzinfo=timezone(timedelta(hours=-4))),
+}
+
+
+def test_market_value_quotes_are_read_not_dropped():
+    """Accepting only "bid"/"ask" made every Market Value quote read as
+    absent. The comparison then reported two-sided=0 while every other
+    count looked healthy -- a feed returning 240 contracts and no prices."""
+    from src.ingestion.providers.thetadata import _as_float, _pick
+
+    assert _as_float(_pick(MV_QUOTE_ROW, "bid")) == pytest.approx(46.98)
+    assert _as_float(_pick(MV_QUOTE_ROW, "ask")) == pytest.approx(47.19)
+    assert _as_float(_pick(MV_QUOTE_ROW, "mid")) == pytest.approx(47.08)
+
+
+def test_a_market_value_row_can_stand_in_for_a_spot_bar():
+    """There is no Market Value OHLC endpoint, so spot comes from the mark.
+
+    Without this the MV stage had no spot at all: every sample waited out
+    its deadline and aborted with "no spot price available"."""
+    from src.ingestion.providers.thetadata import _bar_from_row
+
+    bar = _bar_from_row(MV_QUOTE_ROW, "SPY")
+    assert bar is not None
+    assert bar.close == pytest.approx(47.08)
+
+
+def test_bars_carry_the_vendors_timestamp():
+    """Same rule as the option quotes: these snapshots serve the last
+    available value whether or not the market is open."""
+    from src.ingestion.providers.thetadata import _bar_from_row
+
+    bar = _bar_from_row(MV_QUOTE_ROW, "SPY")
+    assert bar.timestamp == MV_QUOTE_ROW["timestamp"]
+    assert bar.timestamp.utcoffset() == timedelta(0)
+
+
+def test_a_market_value_chain_joins_and_prices():
+    """End to end: the MV stage must produce two-sided quotes."""
+    client = _FakeClient(quote_rows=[MV_QUOTE_ROW], ohlc_rows=[], oi_rows=[])
+    client.option_snapshot_market_value = client.option_snapshot_quote
+
+    provider = ThetaDataProvider(client, stage="mv", market_value_endpoints=True)
+    symbol = build_occ_symbol("SPY", EXP, 710.0, "C")
+    state = provider.fetch_chain_state([symbol], include_open_interest=False)
+
+    assert state[symbol]["bid"] == pytest.approx(46.98)
+    assert state[symbol]["ask"] == pytest.approx(47.19)
+    assert state[symbol]["mid"] == pytest.approx(47.08)
+
+
+def test_realtime_rows_still_have_no_vendor_mid():
+    """Only Market Value rows carry a mark; elsewhere effective_mid() derives it."""
+    provider, _ = _chain_provider()
+    call = build_occ_symbol("SPY", EXP, 650.0, "C")
+    state = provider.fetch_chain_state([call], include_open_interest=False)
+    assert state[call].get("mid") is None
