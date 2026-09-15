@@ -267,12 +267,19 @@ def _preserve_signal_handlers():
 
 
 def _compute_analytics(
-    rows: List[Dict[str, Any]], spot: float, underlying: str, now: datetime
+    rows: List[Dict[str, Any]],
+    spot: float,
+    underlying: str,
+    now: datetime,
+    *,
+    label: str = "feed",
 ) -> Dict[str, Optional[float]]:
     """Compute the published metrics from one feed's contracts.
 
     Calls the same ``AnalyticsEngine`` and ``walls`` code the API serves
     from, so a difference here is a difference a subscriber would see.
+
+    ``label`` names the feed in the unresolved-flip diagnostic below.
     """
     from src.analytics.main_engine import AnalyticsEngine
     from src.analytics.walls import compute_call_put_walls
@@ -295,8 +302,41 @@ def _compute_analytics(
         out["call_wall"] = call_wall
         out["put_wall"] = put_wall
 
-    _profile, flip, _span = engine._resolve_gamma_flip(rows, spot, now)
+    profile, flip, span = engine._resolve_gamma_flip(rows, spot, now)
     out["gamma_flip"] = flip
+    if flip is None:
+        # A NULL flip is the engine's honest "no actionable crossing", and
+        # the comparison prints it as a bare "-" on both feeds -- which is
+        # indistinguishable from the two feeds agreeing. The engine already
+        # builds the diagnostic that separates the four documented causes
+        # (IV spike / 0DTE-dominant chain / stale IV at the 0.20 default /
+        # one-sided chain); surface it here so an unresolved run says why
+        # instead of leaving it to be re-derived from the chain by hand.
+        diag = engine._gamma_flip_unresolved_diagnostics(rows, profile, spot, now)
+        logger.warning(
+            "%s: gamma_flip unresolved through span=%.2f -- "
+            "usable=%d (calls=%d puts=%d) profile pos/neg/zero=%d/%d/%d "
+            "peak=%.3g reference=%.3g floor=%.3g "
+            "iv p50=%.3f p90=%.3f max=%.3f at_default=%.0f%% "
+            "oi_share 0dte=%.0f%% weighted 0dte=%.0f%%",
+            label,
+            span,
+            diag["usable_total"],
+            diag["usable_calls"],
+            diag["usable_puts"],
+            diag["profile_pos_pts"],
+            diag["profile_neg_pts"],
+            diag["profile_zero_pts"],
+            diag["profile_peak"],
+            diag["profile_reference"],
+            diag["structural_floor"],
+            diag["iv_p50"],
+            diag["iv_p90"],
+            diag["iv_max"],
+            100.0 * diag["iv_at_default_share"],
+            100.0 * diag["oi_share_0dte"],
+            100.0 * diag["weighted_oi_share_0dte"],
+        )
 
     # Max pain partitions by expiration internally; compare the nearest
     # expiration, which is what the headline figure tracks.
@@ -872,7 +912,9 @@ def run_once(
             analytics[sample.provider] = {m: None for m in _METRICS}
             analytics[sample.provider]["spot"] = sample.spot
             continue
-        analytics[sample.provider] = _compute_analytics(enriched, sample.spot, underlying, now)
+        analytics[sample.provider] = _compute_analytics(
+            enriched, sample.spot, underlying, now, label=sample.provider
+        )
 
     comparisons = compare_metrics(
         analytics[incumbent.provider],
