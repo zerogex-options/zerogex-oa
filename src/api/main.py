@@ -1743,34 +1743,41 @@ async def get_gamma_weather(
         rate_bars=CUSHION_RATE_BARS,
     )
 
-    paired = None
-    for row, cushion in zip(reversed(regime_chrono), reversed(cushions)):
-        if row["bar_start"] in flow_by_bar:
-            paired = (row, cushion, *flow_by_bar[row["bar_start"]])
-            break
-    if paired is None:
+    def _f(value):
+        return float(value) if value is not None else None
+
+    # Pair EVERY bar the two series share, not just the newest. Persistence
+    # needs the trailing pressure bars and state age needs the run of prior
+    # states, so a single-bar read could report neither.
+    paired = [
+        (row, cushion, *flow_by_bar[row["bar_start"]])
+        for row, cushion in zip(regime_chrono, cushions)
+        if row["bar_start"] in flow_by_bar
+    ]
+    if not paired:
         raise HTTPException(
             status_code=409,
             detail="no bar yet carries both hedging flow and gamma structure for this session",
         )
 
-    regime_row, cushion, pressure_bar, pressure_avg = paired
-
-    def _f(value):
-        return float(value) if value is not None else None
-
-    weather = gw.classify(
-        gw.WeatherInputs(
-            pressure_bar=pressure_bar,
-            pressure_avg=pressure_avg,
-            lean=_f(regime_row.get("rolling_lean")),
-            stability=_f(regime_row.get("rolling_stability")),
-            gamma_trend=_f(regime_row.get("anchored_stability")),
-            cushion_state=cushion.state,
-            cushion_pts=cushion.cushion_pts,
-            cushion_rate_pts=cushion.rate_pts,
-        )
+    series = gw.classify_series(
+        [
+            gw.WeatherInputs(
+                pressure_bar=pressure_bar,
+                pressure_avg=pressure_avg,
+                lean=_f(row.get("rolling_lean")),
+                stability=_f(row.get("rolling_stability")),
+                gamma_trend=_f(row.get("anchored_stability")),
+                cushion_state=cushion.state,
+                cushion_pts=cushion.cushion_pts,
+                cushion_rate_pts=cushion.rate_pts,
+            )
+            for row, cushion, pressure_bar, pressure_avg in paired
+        ]
     )
+
+    regime_row, cushion, pressure_bar, pressure_avg = paired[-1]
+    weather = series[-1]
 
     bar_start = regime_row["bar_start"]
     if bar_start.tzinfo is None:
@@ -1789,6 +1796,10 @@ async def get_gamma_weather(
             "gamma_trend": weather.gamma_trend,
             "lean_side": weather.lean_side,
             "cushion": weather.cushion,
+            "persistence": weather.persistence,
+            "age_bars": weather.age_bars,
+            "age_minutes": weather.age_minutes,
+            "age_label": weather.age_label,
             "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS),
             "components": {
                 "pressure_bar_usd": pressure_bar,

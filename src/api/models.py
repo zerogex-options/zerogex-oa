@@ -648,6 +648,16 @@ class GammaWeatherResponse(BaseModel):
     #: TRANSITION_RISK / NARROWING / WIDENING / STEADY / NONE. A modifier on
     #: the state, never a competing state.
     cushion: str
+    #: PULSE / DEVELOPING / ESTABLISHED. How settled the pressure direction is:
+    #: one bar is the first evidence, three is a condition.
+    persistence: str = "PULSE"
+    #: How long the current state has held. DEVELOPING / ESTABLISHED /
+    #: CONFIRMED / DURABLE, with the raw bars and minutes alongside. Duration
+    #: is the point: the question is not whether gamma calls direction, but
+    #: whether a condition that exists is healthy enough to persist.
+    age_bars: int = 0
+    age_minutes: Optional[float] = None
+    age_label: Optional[str] = None
     cushion_summary: Optional[str] = None
     components: dict = {}
     basis: str
