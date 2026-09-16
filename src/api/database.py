@@ -19,6 +19,7 @@ import json
 from src.analytics.walls import (
     DEFAULT_WALL_LADDER_DEPTH,
     align_wall_ladder,
+    compute_call_put_walls,
     compute_gamma_flip_from_strikes,
     compute_wall_ladder,
     wall_label,
@@ -141,6 +142,88 @@ def _strike_profile_bucket_cache_key(
         f"strike_profile_bucket:{symbol}:{timeframe}:"
         f"{_exp_scope(exp_filter)}:{bucket_ts.isoformat()}"
     )
+
+
+def _replay_max_pain_for_expirations(raw: Any, exp_filter: List[date]) -> Optional[float]:
+    """The stored max pain for a SINGLE-expiration replay scope, or ``None``.
+
+    ``gex_summary.max_pain`` is the front-month scalar — a whole-chain answer
+    that would quietly contradict the filtered ladder drawn beside it (on a day
+    with no same-day expiry it is next week's settlement).  The engine also
+    persists the full ``{expiration: strike}`` breakdown, so a one-date scope
+    (0DTE, or any single pick) can read its OWN settlement instead.
+
+    ``None`` for a multi-date scope — several settlements have no single max
+    pain — and for a missing, unparseable, or unlisted expiration.  The client
+    draws no line for ``None``, which is the honest answer; quoting another
+    expiration's level would not be.
+    """
+    if len(exp_filter) != 1 or raw is None:
+        return None
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get(exp_filter[0].isoformat())
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) -> Dict[str, Any]:
+    """Re-derive one replay frame's level lines from its filtered ladder.
+
+    The persisted ``call_wall`` / ``put_wall`` / ``gamma_flip`` on
+    ``gex_summary`` are whole-chain by construction, so under an expiration
+    filter they describe a book the frame's bars no longer show.  Recompute
+    them from the same rows the bars render, through the canonical helpers in
+    :mod:`src.analytics.walls` — the identical treatment
+    ``/api/gex/strike-profile-timeseries`` gives its own expiration filter, so
+    a 0DTE replay and a 0DTE rewind agree on where the walls sat.
+
+    Two things deliberately do NOT move with the filter, matching that endpoint
+    and the live surfaces (where the pin does not follow the Expiry selector):
+    ``pin_strike`` / ``pin_confidence``, which are 0DTE-by-construction and
+    whole-chain by definition, and ``max_gamma_strike`` (GEX King), which is
+    whole-chain by definition.  Both are left exactly as stored.
+
+    Scope note: the ladder is already capped to the ``strike_band_pct`` band
+    around session spot, so the walls rank over the in-band strikes — the ones
+    the chart can actually draw.  A wall outside that band would have no bar
+    beside it either way.
+
+    Returns the same dict, with its scratch keys consumed.
+    """
+    inputs = frame.pop("_gamma_inputs", None) or []
+    spot = frame.pop("_spot", None)
+    max_pain_by_exp = frame.pop("_max_pain_by_expiration", None)
+
+    try:
+        spot_f = float(spot) if spot is not None else None
+    except (TypeError, ValueError):
+        spot_f = None
+
+    if spot_f and spot_f > 0 and inputs:
+        call_wall, put_wall = compute_call_put_walls(inputs, spot_f)
+        frame["call_wall"] = call_wall
+        frame["put_wall"] = put_wall
+        frame["gamma_flip"] = compute_gamma_flip_from_strikes(inputs, spot_f)
+    else:
+        # No tape for the minute, or no in-band strikes in scope: there is
+        # nothing to rank, and the stored whole-chain levels are not an
+        # answer to the question that was asked.  Null beats wrong — the
+        # scrubber already omits a level line it has no value for.
+        frame["call_wall"] = None
+        frame["put_wall"] = None
+        frame["gamma_flip"] = None
+    frame["max_pain"] = _replay_max_pain_for_expirations(max_pain_by_exp, exp_filter)
+    return frame
 
 
 # Default history depth for component score endpoints. Sized to span the two
@@ -2980,6 +3063,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol: str,
         session_date: date,
         strike_band_pct: float = 0.04,
+        expirations: Optional[List[date]] = None,
     ) -> List[Dict[str, Any]]:
         """Every per-minute GEX frame for one cash-session date (09:30-16:00 ET).
 
@@ -3000,6 +3084,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bounded (a full session at every strike would be ~40k rows for SPX).
         call_gex/put_gex are the dollar-scaled call/put split (nullable on
         pre-gamma-column rows) that drives the scrubber's Split/Combined views.
+
+        ``expirations`` scopes the whole frame to a set of expiration dates —
+        ``[session_date]`` is the 0DTE replay.  ``None`` (the default) is the
+        whole chain and is byte-for-byte what this read has always returned.
+        Under a filter the ladder carries only those expirations AND the level
+        lines are re-derived from it (see :func:`_scope_replay_frame_levels`),
+        because the stored walls/flip/max-pain are whole-chain and would
+        otherwise describe a book the bars no longer show.  The pin strike and
+        GEX King are whole-chain by definition and stay as stored, exactly as
+        they do under ``/api/gex/strike-profile-timeseries``'s filter.
 
         Cost is flat in the size of ``gex_by_strike``: the per-minute ladder is
         a correlated LATERAL, so the read is ~390 index probes no matter how
@@ -3081,6 +3175,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                        gs.call_wall, gs.put_wall, gs.max_pain,
                        gs.pin_strike, gs.pin_confidence,
                        gs.max_gamma_strike,
+                       -- Per-expiration max-pain breakdown.  Only read under
+                       -- an expiration filter, where the scalar max_pain above
+                       -- (front month, whole chain) is the wrong settlement to
+                       -- quote beside a filtered ladder.
+                       gs.max_pain_by_expiration,
                        (SELECT uq.close::numeric
                           FROM underlying_quotes uq
                          WHERE uq.symbol = $1
@@ -3098,13 +3197,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.call_wall,
                 s.put_wall,
                 s.max_pain,
+                s.max_pain_by_expiration,
                 s.pin_strike,
                 s.pin_confidence,
                 s.max_gamma_strike,
+                -- The minute's own spot (underlying_quotes close at-or-before
+                -- the bar).  Already computed in the CTE for the dollar
+                -- scaling below; projected so an expiration-filtered read can
+                -- rank that minute's walls against the same price the bars
+                -- were scaled with.
+                s.spot,
                 ladder.strike,
                 ladder.net_gex,
                 ladder.call_gex,
-                ladder.put_gex
+                ladder.put_gex,
+                -- Raw (unscaled) OI-weighted gamma per strike.  The dollar
+                -- columns above are what the chart draws; these are what
+                -- src.analytics.walls ranks on, and the 100 x S^2 x 0.01
+                -- factor is common to every strike at one minute, so ranking
+                -- on the raw aggregate picks the same wall as ranking on the
+                -- dollar one.  Only read under an expiration filter.
+                ladder.call_gamma,
+                ladder.put_gamma
             FROM session_summary s
             -- The per-minute strike ladder is a LATERAL probe, not a join, and
             -- that is structural rather than stylistic.
@@ -3151,7 +3265,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gbs.strike,
                     AVG(gbs.net_gex) AS net_gex,
                     AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
-                    AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex
+                    AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex,
+                    AVG(gbs.call_gamma) AS call_gamma,
+                    AVG(gbs.put_gamma) AS put_gamma
                 FROM gex_by_strike gbs
                 WHERE gbs.underlying = $1
                   AND gbs.timestamp = s.timestamp
@@ -3168,6 +3284,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   -- yet) short-circuits to no-band, matching get_gex_heatmap.
                   AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
                       <= (SELECT spot_close FROM session_spot) * $4
+                  -- Expiration scope, substituted in (not a NULL-guarded OR)
+                  -- so the unfiltered read is the exact statement it has
+                  -- always been and the planner never has to reason about a
+                  -- parameter that is NULL on every whole-chain call.
+                  {exp_predicate}
                 -- One row per strike, AVG across that minute's expirations --
                 -- identical to the old GROUP BY (s.timestamp, ..., gbs.strike),
                 -- since the lateral only ever sees one timestamp.  The summary
@@ -3177,16 +3298,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ) ladder ON TRUE
             ORDER BY s.timestamp ASC, ladder.strike ASC
         """
+        # Normalised once, then used for the predicate, the bind and the
+        # level rescope below, so the three can never disagree about scope.
+        exp_filter = sorted(set(expirations)) if expirations else None
+        query = query.replace(
+            "{exp_predicate}",
+            "AND gbs.expiration = ANY($5::date[])" if exp_filter else "",
+        )
+        params: List[Any] = [symbol, start_utc, end_utc, float(strike_band_pct)]
+        if exp_filter:
+            params.append(exp_filter)
+
         started = time_module.monotonic()
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(
-                    query,
-                    symbol,
-                    start_utc,
-                    end_utc,
-                    float(strike_band_pct),
-                )
+                rows = await conn.fetch(query, *params)
         except Exception as e:
             # Elapsed separates the two ways this read blows its budget, the
             # same distinction the strike-profile timeseries logs: the pool
@@ -3194,9 +3320,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             # slow QUERY while materially more is time spent queueing for a
             # pool connection.  Both surface as an exception here.
             logger.warning(
-                "get_gex_frames_for_session(%s, %s) failed after %.1fs: %s",
+                "get_gex_frames_for_session(%s, %s, exps=%s) failed after %.1fs: %s",
                 symbol,
                 session_date,
+                _exp_scope(exp_filter),
                 time_module.monotonic() - started,
                 e,
             )
@@ -3220,6 +3347,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "max_gamma_strike": r["max_gamma_strike"],
                     "strikes": [],
                 }
+                if exp_filter:
+                    # Scratch keys, consumed by _scope_replay_frame_levels
+                    # below.  Only populated under a filter so the whole-chain
+                    # read touches neither the extra columns nor the extra
+                    # per-minute list.
+                    frames[ts]["_spot"] = r["spot"]
+                    frames[ts]["_max_pain_by_expiration"] = r["max_pain_by_expiration"]
+                    frames[ts]["_gamma_inputs"] = []
             if r["strike"] is not None:
                 frames[ts]["strikes"].append(
                     {
@@ -3229,6 +3364,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         "put_gex": r["put_gex"],
                     }
                 )
+                if exp_filter:
+                    frames[ts]["_gamma_inputs"].append(
+                        {
+                            "strike": float(r["strike"]),
+                            "call_gamma": float(r["call_gamma"] or 0.0),
+                            "put_gamma": float(r["put_gamma"] or 0.0),
+                        }
+                    )
+        if exp_filter:
+            return [_scope_replay_frame_levels(f, exp_filter) for f in frames.values()]
         return list(frames.values())
 
     async def get_intraday_level_series(

@@ -89,19 +89,63 @@ def _session_bounds(session_date: date_cls) -> tuple[datetime, datetime]:
     return start_et.astimezone(_UTC), end_et.astimezone(_UTC)
 
 
-def _bind(query: str, symbol: str, start_utc: datetime, end_utc: datetime, band: float) -> str:
-    """Substitute the $N placeholders with literals psql can run directly."""
+def _resolve_expirations(raw: str | None, session_date: date_cls) -> list[date_cls] | None:
+    """``--expirations`` → the scope the API would read, or None for All.
+
+    Mirrors ``src.api.routers.replay._parse_expiration_filter`` deliberately
+    rather than importing it: this tool is a text-processing script that must
+    run without the API package (and its FastAPI dependency) importable.  The
+    token language is the operator-facing part, so it has to match.
+    """
+    text = (raw or "all").strip()
+    if not text or text.lower() == "all":
+        return None
+    if text.lower() == "0dte":
+        return [session_date]
+    return sorted(
+        {date_cls.fromisoformat(part.strip()) for part in text.split(",") if part.strip()}
+    )
+
+
+def _bind(
+    query: str,
+    symbol: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    band: float,
+    expirations: list[date_cls] | None = None,
+) -> str:
+    """Substitute the placeholders with literals psql can run directly.
+
+    ``{exp_predicate}`` is the expiration scope the method substitutes at call
+    time (see ``get_gex_frames_for_session``).  It is resolved here the same
+    way, so the script EXPLAINs the statement the API would actually send:
+    empty for the whole-chain read, a bound ``= ANY(...)`` for a scoped one.
+    Leaving the placeholder in would emit SQL psql cannot parse.
+    """
+    if expirations:
+        dates = ", ".join(f"'{d.isoformat()}'" for d in expirations)
+        predicate = f"AND gbs.expiration = ANY(ARRAY[{dates}]::date[])"
+    else:
+        predicate = ""
     return (
-        query.replace("$1", f"'{symbol}'")
+        query.replace("{exp_predicate}", predicate)
+        .replace("$1", f"'{symbol}'")
         .replace("$2", f"'{start_utc.isoformat()}'::timestamptz")
         .replace("$3", f"'{end_utc.isoformat()}'::timestamptz")
         .replace("$4", repr(float(band)))
     )
 
 
-def build_script(symbol: str, session_date: date_cls, band: float, timeout_ms: int) -> str:
+def build_script(
+    symbol: str,
+    session_date: date_cls,
+    band: float,
+    timeout_ms: int,
+    expirations: list[date_cls] | None = None,
+) -> str:
     start_utc, end_utc = _session_bounds(session_date)
-    bound = _bind(_frames_query(), symbol, start_utc, end_utc, band)
+    bound = _bind(_frames_query(), symbol, start_utc, end_utc, band, expirations)
     # One line: psql's \echo and statement separation both get confused by a
     # query spanning many lines with embedded comments, and the comments are
     # stripped anyway because they document the shape rather than run.
@@ -113,6 +157,10 @@ def build_script(symbol: str, session_date: date_cls, band: float, timeout_ms: i
     lines = [
         _echo(f"=== replay frames read: {symbol} {session_date.isoformat()} ==="),
         _echo(f"window {start_utc.isoformat()} .. {end_utc.isoformat()} (band {band})"),
+        _echo(
+            "expiration scope: "
+            + (",".join(d.isoformat() for d in expirations) if expirations else "all")
+        ),
         f"SET statement_timeout = {timeout_ms};",
         "",
         "\\echo",
@@ -177,6 +225,16 @@ def main(argv: list[str] | None = None) -> int:
         help="strike_band_pct, matching the endpoint default (0.04)",
     )
     parser.add_argument(
+        "--expirations",
+        default="all",
+        help=(
+            "Expiration scope to EXPLAIN, in the endpoint's own token language: "
+            "all (default), 0dte, or a comma-separated list of YYYY-MM-DD. A "
+            "scoped read adds a predicate inside the lateral, so it is a "
+            "different plan and worth checking separately"
+        ),
+    )
+    parser.add_argument(
         "--timeout-ms",
         type=int,
         default=120000,
@@ -194,7 +252,16 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         parser.error(f"--date must be YYYY-MM-DD, got {args.date!r}")
 
-    sys.stdout.write(build_script(args.symbol.upper(), session_date, args.band, args.timeout_ms))
+    try:
+        expirations = _resolve_expirations(args.expirations, session_date)
+    except ValueError:
+        parser.error(
+            f"--expirations must be all, 0dte, or YYYY-MM-DD dates, got {args.expirations!r}"
+        )
+
+    sys.stdout.write(
+        build_script(args.symbol.upper(), session_date, args.band, args.timeout_ms, expirations)
+    )
     return 0
 
 

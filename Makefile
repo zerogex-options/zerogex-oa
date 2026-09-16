@@ -828,7 +828,7 @@ flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contr
 	@echo "  • $(RED)High dead_pct$(NC) in [2] AND large idx size in [4] → REINDEX CONCURRENTLY may shrink the index."
 
 .PHONY: replay-frames-explain
-replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced to the session or scaling with retention? Vars: SYMBOL=NDX DATE=YYYY-MM-DD [BAND=0.04]. Read-only.
+replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced to the session or scaling with retention? Vars: SYMBOL=NDX DATE=YYYY-MM-DD [BAND=0.04] [EXPS=all|0dte|dates]. Read-only.
 	@if [ -z "$(DATE)" ]; then \
 		echo "$(RED)DATE is required — use the session date from the warning, e.g.$(NC)"; \
 		echo "$(YELLOW)  make replay-frames-explain SYMBOL=NDX DATE=2026-07-24$(NC)"; \
@@ -841,6 +841,7 @@ replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced t
 		--symbol "$(or $(SYMBOL),NDX)" \
 		--date "$(DATE)" \
 		$(if $(BAND),--band $(BAND)) \
+		$(if $(EXPS),--expirations "$(EXPS)") \
 		| $(PSQL) -v ON_ERROR_STOP=0
 
 .PHONY: pin-strike-explain
