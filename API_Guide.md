@@ -707,6 +707,10 @@ The combined current-state read (Gamma Weather). Consolidates what is already on
 - The **cushion is a modifier, not a state**. "Thin and closing" answers a different question from "stable bid", so they compose (`Stable bid` + `TRANSITION_RISK`) rather than compete. As peers, one always has to be suppressed.
 - **Stability decides the state; lean colors it.** They disagree often, and the panel exists to say whether a condition can persist, which is what stability speaks to. This keeps every input combination covered without inventing a dozen state names, and leaves `MIXED` meaning what it should: the inputs genuinely disagree.
 
+`persistence` grades how settled the pressure direction is: `PULSE` (one aligned bar), `DEVELOPING` (two of the last three plus an aligned 3-bar average), `ESTABLISHED` (three). A pulse is the first evidence, not yet a condition. Bars inside the pressure floor do not count as aligned, but they do not count against either.
+
+`age_label` and `age_minutes` report how long the current state has held: `DEVELOPING` below 15 minutes, `ESTABLISHED` to 30, `CONFIRMED` to 60, `DURABLE` beyond. Age is counted in consecutive bars sharing the state, walking backward from each point, so a bar's age is what it would have read at the time rather than what hindsight makes of it. It is recomputed on read like the state itself, because a retuned threshold has to re-age history as well as re-label it.
+
 States are `STABLE_BID`, `SUPPORTED_DIP`, `FRAGILE_RALLY`, `UNSTABLE`, `MIXED`. Cushion modifiers are `TRANSITION_RISK`, `NARROWING`, `WIDENING`, `STEADY`, `NONE`.
 
 **Nothing is stored.** The state is derived on read from components that are, so retuning a threshold reclassifies the whole archive rather than leaving old sessions labeled by a rule that is no longer live. Every tunable lives in one block in `src/analytics/gamma_weather.py`.

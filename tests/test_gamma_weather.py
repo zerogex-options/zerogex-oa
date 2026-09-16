@@ -11,6 +11,17 @@ from __future__ import annotations
 import itertools
 
 from src.analytics.gamma_weather import (
+    AGE_CONFIRMED,
+    AGE_DEVELOPING,
+    AGE_DURABLE,
+    AGE_ESTABLISHED,
+    PERSISTENCE_DEVELOPING,
+    PERSISTENCE_ESTABLISHED,
+    PERSISTENCE_PULSE,
+    classify_age,
+    classify_persistence,
+    classify_series,
+    state_age_bars,
     CUSHION_NARROWING,
     CUSHION_NONE,
     CUSHION_STEADY,
@@ -273,3 +284,91 @@ def test_gamma_trend_does_not_change_the_state():
     migrated = classify(_inputs(stability=STRONG, gamma_trend=-STRONG))
 
     assert firming.state == migrated.state == STATE_STABLE_BID
+
+
+# --------------------------------------------------------------------------- #
+# Pressure persistence: one bar is a pulse, three is a condition
+# --------------------------------------------------------------------------- #
+def test_the_persistence_ladder():
+    assert classify_persistence([BIG, BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_ESTABLISHED
+    assert classify_persistence([BIG, -BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_DEVELOPING
+    assert classify_persistence([-BIG, -BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_PULSE
+
+
+def test_developing_requires_the_average_to_agree():
+    """Two of three bars without an aligned average is chop, not a direction
+    taking hold."""
+    assert classify_persistence([BIG, -BIG, BIG], -BIG, PRESSURE_BUYING) == PERSISTENCE_PULSE
+
+
+def test_bars_inside_the_floor_are_not_evidence_either_way():
+    """A quiet bar does not confirm a direction, but it does not argue against
+    one either; it simply does not count."""
+    tiny = PRESSURE_FLOOR_USD * 0.1
+    assert classify_persistence([BIG, tiny, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_DEVELOPING
+
+
+def test_mixed_pressure_is_always_a_pulse():
+    """There is no direction to be persistent about."""
+    assert classify_persistence([BIG, BIG, BIG], BIG, PRESSURE_MIXED) == PERSISTENCE_PULSE
+
+
+def test_only_the_trailing_window_counts():
+    """A long-dead run of aligned bars should not keep a stale direction
+    looking established."""
+    old = [BIG] * 10 + [-BIG, -BIG]
+    assert classify_persistence(old, BIG, PRESSURE_BUYING) == PERSISTENCE_PULSE
+
+
+# --------------------------------------------------------------------------- #
+# State age
+# --------------------------------------------------------------------------- #
+def test_age_bands():
+    assert classify_age(5) == AGE_DEVELOPING
+    assert classify_age(18) == AGE_ESTABLISHED
+    assert classify_age(41) == AGE_CONFIRMED
+    assert classify_age(75) == AGE_DURABLE
+
+
+def test_the_gap_between_provisional_and_established_is_not_overstated():
+    """Twelve minutes is past 'under ten' but short of the established line.
+    It reads as developing, because calling it established would claim more
+    than the clock supports."""
+    assert classify_age(12) == AGE_DEVELOPING
+
+
+def test_age_counts_backward_from_the_newest_state():
+    assert state_age_bars(["A", "A", "B", "B", "B"]) == 3
+    assert state_age_bars(["A", "B"]) == 1
+    assert state_age_bars([]) == 0
+
+
+def test_age_resets_when_the_state_changes():
+    rows = [_inputs() for _ in range(4)]
+    rows += [_inputs(pressure_bar=-BIG, pressure_avg=-BIG, stability=-STRONG)]
+    series = classify_series(rows)
+
+    assert series[3].age_minutes == 20
+    assert series[4].age_minutes == 5
+    assert series[4].state != series[3].state
+
+
+def test_age_is_what_the_bar_would_have_read_at_the_time():
+    """Counted backward at each point rather than assigned with hindsight, so
+    a completed session and a live one agree bar for bar."""
+    rows = [_inputs() for _ in range(6)]
+    full = classify_series(rows)
+    partial = classify_series(rows[:4])
+
+    assert [w.age_minutes for w in partial] == [w.age_minutes for w in full[:4]]
+
+
+def test_persistence_and_age_are_independent():
+    """Pressure can be established while the state is young, and vice versa:
+    one is about the push, the other about the condition."""
+    rows = [_inputs() for _ in range(5)]
+    rows.append(_inputs(stability=-STRONG))  # structure flips, pressure holds
+    series = classify_series(rows)
+
+    assert series[-1].persistence == PERSISTENCE_ESTABLISHED
+    assert series[-1].age_minutes == 5
