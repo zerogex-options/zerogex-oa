@@ -1105,6 +1105,7 @@ def summarise_run(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         inc: List[float] = []
         cand: List[float] = []
         gaps: List[float] = []
+        abs_gaps: List[float] = []
         for r in results:
             for c in r.get("comparisons", []):
                 if c.get("metric") != metric:
@@ -1116,6 +1117,8 @@ def summarise_run(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                     cand.append(b)
                 if pct is not None and pct not in (float("inf"), float("-inf")):
                     gaps.append(abs(pct))
+                if c.get("abs_diff") is not None:
+                    abs_gaps.append(abs(c["abs_diff"]))
 
         def _span_pct(values: List[float]) -> Optional[float]:
             if len(values) < 2:
@@ -1125,10 +1128,25 @@ def summarise_run(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 return None
             return (max(values) - min(values)) / abs(mean) * 100.0
 
+        # A metric that changes sign during the run has a mean near zero,
+        # and EVERY percentage in its row -- both self-spans and the
+        # cross-feed gap -- is then a ratio to a near-zero denominator.
+        # QQQ net_gex ran from -605M to +399M in half an hour and reported
+        # a 535% self-span and a 25% cross-feed gap; both are artefacts of
+        # the divisor, and the absolute figures say the opposite. Record
+        # enough to say so rather than printing a number that reads as a
+        # measurement.
+        crosses_zero = bool(inc) and min(inc) < 0.0 < max(inc)
+
         per_metric[metric] = {
             "incumbent_self_span_pct": _span_pct(inc),
             "candidate_self_span_pct": _span_pct(cand),
             "max_cross_feed_pct": max(gaps) if gaps else None,
+            "max_cross_feed_abs": max(abs_gaps) if abs_gaps else None,
+            "incumbent_range": (max(inc) - min(inc)) if len(inc) > 1 else None,
+            "incumbent_min": min(inc) if inc else None,
+            "incumbent_max": max(inc) if inc else None,
+            "crosses_zero": crosses_zero,
             "samples": len(results),
         }
     return per_metric
@@ -1160,6 +1178,31 @@ def _print_summary(
             f"{fmt(row['candidate_self_span_pct']):>19} "
             f"{fmt(row['max_cross_feed_pct']):>13}"
         )
+
+    def _money(v: float) -> str:
+        return f"{v / 1_000_000:,.2f}M" if abs(v) >= 1_000_000 else f"{v:,.2f}"
+
+    # Say this BEFORE the self-vs-cross note: on a metric that changed
+    # sign, that note is comparing two numbers which are both divided by
+    # something near zero, and reading either as a measurement is wrong.
+    for metric, row in summary.items():
+        if not row.get("crosses_zero") or row.get("incumbent_range") is None:
+            continue
+        print(
+            f"\n  NOTE: {metric} changed sign during the run (incumbent spanned\n"
+            f"  {_money(row['incumbent_min'])} to {_money(row['incumbent_max'])}), so every "
+            f"percentage\n  in its row divides by a mean near zero and none of them are\n"
+            f"  measurements."
+        )
+        if row.get("max_cross_feed_abs") is not None:
+            share = 100.0 * row["max_cross_feed_abs"] / row["incumbent_range"]
+            print(
+                f"  In absolute terms the feeds differed by at most\n"
+                f"  {_money(row['max_cross_feed_abs'])} against the "
+                f"{_money(row['incumbent_range'])} the metric travelled\n"
+                f"  on its own -- {share:.1f}%."
+            )
+
     noisy = [
         m
         for m, r in summary.items()
