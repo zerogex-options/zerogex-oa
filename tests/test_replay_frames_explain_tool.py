@@ -19,7 +19,7 @@ from datetime import date
 
 import pytest
 
-from src.tools.replay_frames_explain import build_script, main
+from src.tools.replay_frames_explain import _resolve_expirations, build_script, main
 
 SESSION = date(2026, 7, 24)
 
@@ -121,3 +121,45 @@ def test_echo_helper_rejects_an_apostrophe_at_the_source():
     assert _echo("no quotes here") == "\\echo no quotes here"
     with pytest.raises(ValueError, match="apostrophe"):
         _echo("the session's minute count")
+
+
+def test_the_expiration_placeholder_never_reaches_psql():
+    """The method substitutes ``{exp_predicate}`` at call time; so must this.
+
+    Emitting the raw template would hand the operator a script psql rejects as
+    a syntax error -- at the moment they are reaching for it because production
+    is timing out, which is the worst possible time to ship them a broken file.
+    """
+    script = _script()
+    assert "{exp_predicate}" not in script
+    # Whole-chain default: no expiration predicate at all, matching the
+    # statement the API sends when nothing is scoped.
+    assert "gbs.expiration" not in script
+
+
+def test_a_scoped_read_explains_the_scoped_statement():
+    """A scope adds a predicate inside the lateral -- a different plan.
+
+    The whole point of this tool is that "it was fast just now" proves nothing
+    about a plan it did not run, so the scoped read has to be EXPLAINable on
+    its own terms rather than inferred from the All one.
+    """
+    script = build_script("NDX", SESSION, 0.04, 120000, [SESSION])
+    assert "AND gbs.expiration = ANY(ARRAY['2026-07-24']::date[])" in script
+    assert "expiration scope: 2026-07-24" in script
+
+
+def test_0dte_resolves_against_the_session_being_explained():
+    """Same rule the endpoint applies: 0DTE is the replayed day's expiry."""
+    assert _resolve_expirations("0dte", SESSION) == [SESSION]
+    assert _resolve_expirations("all", SESSION) is None
+    assert _resolve_expirations(None, SESSION) is None
+    assert _resolve_expirations("2026-07-25,2026-07-24", SESSION) == [
+        date(2026, 7, 24),
+        date(2026, 7, 25),
+    ]
+
+
+def test_a_bad_expiration_scope_is_rejected_rather_than_silently_widened():
+    with pytest.raises(SystemExit):
+        main(["--date", "2026-07-24", "--expirations", "next-friday"])

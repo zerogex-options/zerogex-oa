@@ -60,6 +60,51 @@ def _et_session_window(session_date: date) -> tuple[datetime, datetime]:
     return start_et.astimezone(UTC), end_et.astimezone(UTC)
 
 
+def _parse_expiration_filter(raw: str | None, session_date: date) -> list[date] | None:
+    """``expirations`` → the dates a replay is scoped to, or ``None`` for the
+    whole chain.
+
+    Accepts ``all`` (default — today's behaviour, every expiration aggregated),
+    ``0dte``, or a comma-separated list of ``YYYY-MM-DD``.
+
+    ``0dte`` resolves against the SESSION's date, not the wall clock.  A replay
+    is a dated view: "expiring today" is a fact about the day being replayed,
+    so a link to last Tuesday still replays last Tuesday's 0DTE book rather
+    than quietly resolving to an expiration that session never had.  (The live
+    charts' rolling 0DTE token does the same thing against the live chain —
+    see ``core/expirationPersistence`` on the website.)
+
+    A session with no same-day expiry is not an error here: the filter simply
+    matches no rows, every minute keeps its frame, and the caller can say so
+    rather than falling back to the whole chain — which is the one answer a
+    0DTE request must never silently become.
+    """
+    text = (raw or "all").strip()
+    if not text or text.lower() == "all":
+        return None
+    if text.lower() == "0dte":
+        return [session_date]
+    parsed: list[date] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parsed.append(date.fromisoformat(part))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Invalid expirations '{raw}'; expected 'all', '0dte', or a "
+                    "comma-separated list of YYYY-MM-DD dates."
+                ),
+            ) from exc
+    # An all-blank list (``expirations=,``) collapses to All rather than to an
+    # empty filter that would blank every bar — same rule the strike-profile
+    # timeseries applies to its own filter.
+    return sorted(set(parsed)) or None
+
+
 def _f(value: Any) -> float | None:
     if value is None:
         return None
@@ -259,6 +304,16 @@ async def get_replay_range(
         ),
     ),
     max_expirations: int = Query(default=6, ge=1, le=12),
+    expirations: str = Query(
+        default="all",
+        description=(
+            "Expiration scope for the whole session: 'all' (default, every "
+            "expiration aggregated), '0dte' (the session's own expiry), or a "
+            "comma-separated list of YYYY-MM-DD dates. Under a scope the "
+            "ladder carries only those expirations and the walls / flip / max "
+            "pain are re-derived from it."
+        ),
+    ),
     db: DatabaseManager = Depends(get_db),
 ):
     """All replay frames for one session — bundled for the playhead buffer.
@@ -287,11 +342,31 @@ async def get_replay_range(
     it renders today. Off by default because it costs a second session-wide
     scan and grows the bundle; callers that only need the aggregate ladder
     (e.g. the pair-comparison scrubber) should leave it off.
+
+    ``expirations`` scopes the session.  ``0dte`` — the case the replay exists
+    for — is the session's own expiry: on ``/replay/SPY/2026-09-15`` that is
+    2026-09-15, resolved from the requested date rather than from today, so a
+    shared link keeps meaning what it meant.  Under a scope every per-strike
+    bar carries only those expirations, and ``call_wall`` / ``put_wall`` /
+    ``gamma_flip`` / ``max_pain`` are re-derived from that same filtered book
+    (the stored ones are whole-chain and would describe bars that aren't on
+    screen).  ``pin_strike`` / ``pin_confidence`` and ``max_gamma_strike`` do
+    NOT move with the scope — both are whole-chain by definition, exactly as
+    they behave under ``/api/gex/strike-profile-timeseries``'s filter and in
+    the live charts' Expiry selector.  The response echoes the resolved scope
+    as ``expiration_filter`` (``null`` for All) so a client never has to infer
+    what it got.
+
+    A scoped session with no matching contracts (0DTE on a day the chain had
+    no same-day expiry) returns its frames with EMPTY ladders and null levels
+    rather than silently falling back to the whole chain — "all expirations" is
+    the one answer a 0DTE request must not quietly become.
     """
     sym = symbol.upper()
     target = _parse_date(session_date)
     today_et = datetime.now(tz=ET).date()
     is_today = target == today_et
+    exp_filter = _parse_expiration_filter(expirations, target)
 
     # A failed frames read is NOT an empty session.  The read raises rather
     # than returning [] precisely so the two stay apart here: a 200 carrying
@@ -302,7 +377,7 @@ async def get_replay_range(
     # replay is blank with a screenshot that rules nothing out.
     try:
         raw_frames = await db.get_gex_frames_for_session(
-            sym, target, strike_band_pct=strike_band_pct,
+            sym, target, strike_band_pct=strike_band_pct, expirations=exp_filter
         )
     except ReplayFramesUnavailable as exc:
         raise HTTPException(
@@ -322,7 +397,13 @@ async def get_replay_range(
     # aggregate ladder above is byte-for-byte what it has always been — an
     # empty / failed shares fetch simply means the client draws plain bars.
     exp_mix: dict[str, Any] = {"expirations": [], "far_bucket": False, "rows": {}}
-    if include_expirations:
+    # Not fetched under a scope: the gradient answers "which expirations make
+    # up this bar", and under a scope the answer is the scope itself. The
+    # legend below is set from the filter instead, so a client still knows what
+    # it is looking at — and a one-date scope simply has no gradient to draw,
+    # which is what the website already falls back to for a single-expiration
+    # legend. Skipping it also spares the second session-wide scan.
+    if include_expirations and exp_filter is None:
         exp_mix = await db.get_gex_expiration_shares_for_session(
             sym,
             target,
@@ -377,19 +458,29 @@ async def get_replay_range(
         "timeframe": timeframe,
         "is_today": is_today,
         "count": len(frames),
+        # The resolved scope, so a client never has to re-derive what it asked
+        # for — null is the whole chain, a list is exactly what the bars and
+        # the re-derived levels were built from.
+        "expiration_filter": [d.isoformat() for d in exp_filter] if exp_filter else None,
         "frames": frames,
         "candles": candles,
     }
     if include_expirations:
-        # Nearest-first legend the per-strike share arrays index into. The
-        # trailing "far" label (present only when the chain runs deeper than
-        # max_expirations) is a catch-all bucket, not a date — clients rank by
-        # position, so it always sorts last, which is exactly where the faintest
-        # shade belongs.
-        legend = list(exp_mix.get("expirations") or [])
-        if exp_mix.get("far_bucket"):
-            legend.append("far")
-        payload["expirations"] = legend
+        if exp_filter is not None:
+            # The scope IS the legend. No per-strike shares ride along, so the
+            # client draws solid bars — correct, since every bar is already
+            # made of exactly these expirations.
+            payload["expirations"] = [d.isoformat() for d in exp_filter]
+        else:
+            # Nearest-first legend the per-strike share arrays index into. The
+            # trailing "far" label (present only when the chain runs deeper than
+            # max_expirations) is a catch-all bucket, not a date — clients rank by
+            # position, so it always sorts last, which is exactly where the faintest
+            # shade belongs.
+            legend = list(exp_mix.get("expirations") or [])
+            if exp_mix.get("far_bucket"):
+                legend.append("far")
+            payload["expirations"] = legend
     return payload
 
 

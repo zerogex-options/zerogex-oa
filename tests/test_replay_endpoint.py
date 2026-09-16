@@ -432,3 +432,140 @@ def test_range_survives_a_failed_shares_lookup(monkeypatch):
     assert body["expirations"] == []
     assert body["frames"][0]["strikes"][0]["net_gex"] == pytest.approx(1234.5)
     assert "call_shares" not in body["frames"][0]["strikes"][0]
+
+
+def _scoped_frames(bar: datetime) -> list[dict]:
+    """One minute's worth of already-scoped frames from the DB helper."""
+    return [
+        {"timestamp": bar, "gamma_flip": Decimal("604.6"),
+         "call_wall": Decimal("605"), "put_wall": Decimal("595"),
+         "max_pain": Decimal("601"),
+         "pin_strike": Decimal("600"), "pin_confidence": Decimal("0.4"),
+         "max_gamma_strike": Decimal("511"),
+         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5"),
+                      "call_gex": Decimal("2000.5"), "put_gex": Decimal("-766.0")}]},
+    ]
+
+
+def test_range_defaults_to_the_whole_chain(monkeypatch):
+    """No ``expirations`` param is the read this endpoint has always done."""
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(
+        return_value=_scoped_frames(bar)
+    )
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        r = client.get("/api/replay/range?symbol=SPY&date=2026-06-29")
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert body["expiration_filter"] is None
+    call = dbmod.DatabaseManager.get_gex_frames_for_session.call_args
+    assert call.kwargs["expirations"] is None
+
+
+def test_range_0dte_scopes_to_the_sessions_own_expiry(monkeypatch):
+    """``expirations=0dte`` resolves against the REPLAYED date, not today.
+
+    The whole point of a dated replay is that a link keeps meaning what it
+    meant.  Resolving the rolling token against the wall clock would make
+    yesterday's shared 0DTE link either empty or — worse — silently about a
+    different expiration than the session it claims to show.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(
+        return_value=_scoped_frames(bar)
+    )
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        r = client.get("/api/replay/range?symbol=SPY&date=2026-06-29&expirations=0dte")
+    body = r.json()
+    assert r.status_code == 200, r.text
+    call = dbmod.DatabaseManager.get_gex_frames_for_session.call_args
+    assert call.kwargs["expirations"] == [date(2026, 6, 29)]
+    # Echoed back so a client never has to re-derive the scope it got.
+    assert body["expiration_filter"] == ["2026-06-29"]
+    # The levels the helper already scoped ride through untouched.
+    assert body["frames"][0]["call_wall"] == pytest.approx(605.0)
+    assert body["frames"][0]["max_pain"] == pytest.approx(601.0)
+
+
+def test_range_accepts_an_explicit_expiration_set(monkeypatch):
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(
+        return_value=_scoped_frames(bar)
+    )
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        r = client.get(
+            "/api/replay/range?symbol=SPY&date=2026-06-29"
+            "&expirations=2026-07-17,2026-06-29"
+        )
+    body = r.json()
+    assert r.status_code == 200, r.text
+    call = dbmod.DatabaseManager.get_gex_frames_for_session.call_args
+    # Normalised (sorted, de-duped) before it reaches the read.
+    assert call.kwargs["expirations"] == [date(2026, 6, 29), date(2026, 7, 17)]
+    assert body["expiration_filter"] == ["2026-06-29", "2026-07-17"]
+
+
+def test_range_treats_a_blank_expiration_list_as_all(monkeypatch):
+    """``expirations=,`` must not blank every bar."""
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(
+        return_value=_scoped_frames(bar)
+    )
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        r = client.get("/api/replay/range?symbol=SPY&date=2026-06-29&expirations=,")
+    assert r.status_code == 200, r.text
+    assert r.json()["expiration_filter"] is None
+    assert dbmod.DatabaseManager.get_gex_frames_for_session.call_args.kwargs[
+        "expirations"
+    ] is None
+
+
+def test_range_rejects_an_unparseable_expiration_scope(monkeypatch):
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[])
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        r = client.get(
+            "/api/replay/range?symbol=SPY&date=2026-06-29&expirations=next-friday"
+        )
+    assert r.status_code == 422, r.text
+    # Nothing was read: a bad scope must not fall through to the whole chain.
+    dbmod.DatabaseManager.get_gex_frames_for_session.assert_not_called()
+
+
+def test_range_scope_is_the_legend_and_skips_the_shares_scan(monkeypatch):
+    """Under a scope the expiry gradient has nothing left to say.
+
+    Every bar is made of exactly the scoped expirations, so the per-strike mix
+    would be a constant — and computing it costs a second session-wide scan.
+    The legend still comes back (a client has to know what it is looking at),
+    it is just the scope itself.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    bar = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(
+        return_value=_scoped_frames(bar)
+    )
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
+    dbmod.DatabaseManager.get_gex_expiration_shares_for_session = AsyncMock(
+        return_value={"expirations": ["2026-06-29"], "far_bucket": False, "rows": {}}
+    )
+    with TestClient(app) as client:
+        r = client.get(
+            "/api/replay/range?symbol=SPY&date=2026-06-29"
+            "&include_expirations=true&expirations=0dte"
+        )
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert body["expirations"] == ["2026-06-29"]
+    dbmod.DatabaseManager.get_gex_expiration_shares_for_session.assert_not_called()
+    # No shares ride along — the bar is already one expiration wide.
+    assert "call_shares" not in body["frames"][0]["strikes"][0]
