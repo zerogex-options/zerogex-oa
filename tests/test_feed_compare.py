@@ -1054,3 +1054,57 @@ def test_chain_at_is_stamped_after_the_snapshot_not_before():
         f"chain_at is only {elapsed:.3f}s after the sample started, less than the "
         f"{provider.SNAPSHOT_SECONDS}s the snapshot took -- it was stamped before the fetch"
     )
+
+
+def _net_gex_run(pairs):
+    return [
+        {
+            "comparisons": [
+                {
+                    "metric": "net_gex",
+                    "incumbent": a,
+                    "candidate": b,
+                    "abs_diff": b - a,
+                    "pct_diff": (b - a) / abs(a) * 100.0,
+                }
+            ]
+        }
+        for a, b in pairs
+    ]
+
+
+def test_a_metric_that_changes_sign_has_no_meaningful_percentage(capsys):
+    """QQQ net_gex ran from -605M to +399M in half an hour.
+
+    Every percentage in that row divides by a mean sitting near zero, so
+    the run reported a 535% self-span and a 25% cross-feed gap while the
+    feeds were never more than 22M apart on a metric that travelled 1,005M
+    by itself. Printed bare, those percentages read as a measurement of the
+    candidate and convict it of nothing it did.
+    """
+    # The widest gap here is the candidate BELOW the incumbent, so a max()
+    # over signed differences would miss it and report a smaller number
+    # than the run actually saw.
+    results = _net_gex_run([(-605.86e6, -630.00e6), (-75.66e6, -56.31e6), (399.38e6, 408.40e6)])
+    summary = feed_compare.summarise_run(results)
+    row = summary["net_gex"]
+
+    assert row["crosses_zero"] is True
+    assert row["max_cross_feed_abs"] == pytest.approx(24.14e6, rel=1e-3)
+    assert row["incumbent_range"] == pytest.approx(1005.24e6, rel=1e-3)
+
+    feed_compare._print_summary(summary, "thetadata", "thetadata_mv")
+    out = capsys.readouterr().out
+    assert "changed sign" in out, "a sign change has to be called out"
+    assert "-605.86M" in out and "399.38M" in out, "show the span that broke the ratio"
+    assert "24.14M" in out, "the absolute gap is the figure that means something"
+
+
+def test_a_metric_that_keeps_its_sign_is_reported_normally(capsys):
+    """The caveat is for the degenerate case only; elsewhere it is noise."""
+    results = _net_gex_run([(-605.86e6, -607.45e6), (-400.00e6, -395.00e6), (-300.00e6, -302.00e6)])
+    summary = feed_compare.summarise_run(results)
+    assert summary["net_gex"]["crosses_zero"] is False
+
+    feed_compare._print_summary(summary, "thetadata", "thetadata_mv")
+    assert "changed sign" not in capsys.readouterr().out
