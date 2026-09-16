@@ -972,6 +972,7 @@ help: ## Show this help message
 	@echo "  make max-pain-refresh-status  - Show max-pain refresh timer status + recent log"
 	@echo "  make daily-atm-iv-backfill-install - Install pre-open daily_atm_iv backfill timer (06:00 ET)"
 	@echo "  make daily-spread-stats-backfill   - Seed the Spread Monitor's daily quoted-width history from option_chains (SPREAD_STATS_SYMBOLS=, SPREAD_STATS_DAYS=)"
+	@echo "  make spread-surface-backfill       - Seed the Spread Surface's time-of-day/strike history from option_chains (SURFACE_SYMBOLS=, SURFACE_DAYS=)"
 	@echo "  make daily-atm-iv-backfill-status  - Show daily_atm_iv backfill timer status + recent log"
 	@echo "  make system-monitor-install   - Install per-minute system-monitor timer (CPU/mem/disk/errs/cycle)"
 	@echo "  make system-monitor-show      - Print latest hourly + daily aggregates"
@@ -4760,6 +4761,22 @@ daily-spread-stats-backfill: ## Seed daily_spread_stats history from option_chai
 	@$(PY) -m src.tools.daily_spread_stats_backfill \
 		$(if $(SPREAD_STATS_SYMBOLS),--symbols $(SPREAD_STATS_SYMBOLS)) \
 		$(if $(SPREAD_STATS_DAYS),--days $(SPREAD_STATS_DAYS))
+
+# Seeds spread_surface_stats: the same reduction as above, but cut by
+# moneyness bucket and DTE bucket and stamped with a 30-minute time-of-day
+# bucket, which is what lets the Spread Surface view rank a 15:40 reading
+# against prior sessions at 15:40 rather than against their whole day.
+#
+# Far heavier than the daily backfill — one anchor per half-hour bucket per
+# session rather than one per session — so the default window is shorter.
+# Idempotent; re-running over buckets the live writer has already filled
+# corrects them in place.  Override with SURFACE_SYMBOLS / SURFACE_DAYS.
+.PHONY: spread-surface-backfill
+spread-surface-backfill: ## Seed spread_surface_stats time-of-day history from option_chains (idempotent; default 45 days)
+	@echo "$(BLUE)=== Backfilling spread_surface_stats history ===$(NC)"
+	@$(PY) -m src.tools.spread_surface_backfill \
+		$(if $(SURFACE_SYMBOLS),--symbols $(SURFACE_SYMBOLS)) \
+		$(if $(SURFACE_DAYS),--days $(SURFACE_DAYS))
 
 # Backtesting platform: archive + calibration jobs (run nightly via timers).
 # Override with ARCHIVE_DAYS / ARCHIVE_UNDERLYINGS, CALIB_DAYS / CALIB_UNDERLYINGS.

@@ -65,6 +65,7 @@ from src.analytics.walls import (
 )
 from src.analytics import pin_strike as pin_strike_mod
 from src.analytics import spread_stats as spread_stats_mod
+from src.analytics import surface_store
 from src.greeks_fd import fd_charm, fd_vanna
 from src.analytics.forced_flow import (
     ContractLeg,
@@ -3722,6 +3723,118 @@ class AnalyticsEngine:
                 exc,
             )
 
+    def _store_spread_surface(
+        self,
+        options: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+        cursor,
+    ) -> None:
+        """Upsert this cycle's cells into ``spread_surface_stats``.
+
+        The sibling of :meth:`_store_daily_spread_stats`, and deliberately a
+        separate row set rather than a widening of it.  The daily rollup keeps
+        one reading per session so "are puts wider than usual today" stays a
+        cheap scalar; this keeps the same statistic sliced by moneyness, by
+        expiry and by time of day, which is what the Spread Surface view needs
+        and what no amount of re-reading the daily row can reconstruct.
+
+        Costs no query: the snapshot is already in memory, and the widest
+        scope the page offers (+/-10%, 30DTE) is a filter over it.
+
+        Gated to 09:30-16:00 ET.  Unlike the daily writer the reason is not
+        post-close drift — a 16:30 reading would be compared only against other
+        16:30 readings, so it would be self-consistent — it is that the page
+        exists to answer "can I trade this now", and there is no now after the
+        bell.  The last bucket of the session is the one the API falls back to,
+        labelled as such.
+
+        Failures are logged and swallowed: this shares a transaction with the
+        GEX persistence, which must not fail over a liquidity rollup.
+        """
+        try:
+            spot = float(summary.get("underlying_price") or 0.0)
+            if spot <= 0:
+                return
+            underlying = summary["underlying"]
+            timestamp = summary["timestamp"]
+
+            ts_aware = (
+                timestamp if timestamp.tzinfo is not None else pytz.UTC.localize(timestamp)
+            )
+            et = ts_aware.astimezone(pytz.timezone("America/New_York"))
+            et_minute = et.hour * 60 + et.minute
+            # Half-open so the closing bucket is 15:30-16:00 rather than a
+            # one-minute 16:00-16:30 sliver.  The bounds live in
+            # surface_store because the read path clamps to the same two
+            # numbers — a writer and a reader that disagreed about where the
+            # session ends would rank a real bucket against an empty one.
+            if not (
+                surface_store.SESSION_START_MIN
+                <= et_minute
+                < surface_store.SESSION_END_MIN
+            ):
+                return
+
+            today_et = et.date()
+            widest_band = max(spread_stats_mod.MONEYNESS_BANDS)
+            widest_dte = max(spread_stats_mod.DTE_UNIVERSES)
+            low = spot * (1.0 - widest_band / 100.0)
+            high = spot * (1.0 + widest_band / 100.0)
+
+            in_scope: List[Dict[str, Any]] = []
+            dte_of: Dict[Any, int] = {}
+            for opt in options:
+                strike = opt.get("strike")
+                expiration = opt.get("expiration")
+                if strike is None or expiration is None:
+                    continue
+                try:
+                    strike_f = float(strike)
+                except (TypeError, ValueError):
+                    continue
+                if not (low <= strike_f <= high):
+                    continue
+                dte = (expiration - today_et).days
+                if dte < 0 or dte > widest_dte:
+                    continue
+                dte_of[expiration] = dte
+                in_scope.append(opt)
+
+            if not in_scope:
+                return
+
+            spreads = spread_stats_mod.contract_spreads(in_scope, spot)
+            by_type = {
+                "C": [s for s in spreads if s.option_type == "C"],
+                "P": [s for s in spreads if s.option_type == "P"],
+            }
+
+            written = surface_store.store_surface_scopes(
+                cursor,
+                underlying,
+                today_et,
+                surface_store.bucket_start_minutes(et),
+                spot,
+                # The localised value, not the raw one: a naive datetime
+                # reaching a TIMESTAMPTZ column is interpreted in the session
+                # timezone, which is not knowably UTC on every deployment.
+                ts_aware,
+                by_type,
+                dte_of,
+            )
+            logger.debug(
+                "spread_surface_stats %s @ %s: %d cells",
+                underlying,
+                surface_store.bucket_label(surface_store.bucket_start_minutes(et)),
+                written,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to upsert spread_surface_stats for %s: %s",
+                summary.get("underlying", "?"),
+                exc,
+            )
+
     def _store_calculation_results(
         self,
         gex_data: List[Dict[str, Any]],
@@ -3756,6 +3869,7 @@ class AnalyticsEngine:
                 if options is not None:
                     self._store_daily_atm_iv(options, summary, cursor)
                     self._store_daily_spread_stats(options, summary, cursor)
+                    self._store_spread_surface(options, summary, cursor)
                 # db_connection() commits on a clean __exit__; the explicit
                 # commit makes the single-transaction boundary unambiguous
                 # and is a harmless no-op when the CM commits again.

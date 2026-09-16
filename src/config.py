@@ -600,6 +600,50 @@ SPREAD_STATS_MIN_CONTRACTS = _getenv_int(
     "SPREAD_STATS_MIN_CONTRACTS", 100, min=0, max=100_000
 )
 
+# -----------------------------------------------------------------------------
+# Spread Surface vs History — the intraday surface rollup
+# -----------------------------------------------------------------------------
+# Width of the time-of-day bucket, in minutes. 0DTE quotes at 15:45 behave
+# nothing like 0DTE at 10:00, so the surface history is bucketed by clock time
+# and a reading is only ranked against prior sessions at the SAME time of day.
+# 30 minutes is a compromise: fine enough that the late-session widening does
+# not get averaged into the midday calm, coarse enough that a quarter of
+# history still leaves a dozen-plus observations in each bucket to rank against.
+SPREAD_SURFACE_BUCKET_MINUTES = _getenv_int(
+    "SPREAD_SURFACE_BUCKET_MINUTES", 30, min=5, max=390
+)
+
+# Minimum contracts before a surface cell is recorded or ranked.
+#
+# Deliberately far below SPREAD_STATS_MIN_CONTRACTS (100), and not a
+# relaxation of it: these populations are smaller BY CONSTRUCTION. The daily
+# floor guards a whole +/-5% / 7DTE chain, where 100 contracts means an
+# outage. A +/-2% 0DTE put population is about sixty contracts on SPX when
+# everything is healthy, and a single moneyness slice of it is a handful — so
+# the daily floor would reject the healthiest narrow-scope cells on the page.
+#
+# Two floors because the two are different questions: whether a whole band is
+# measurable at all, and whether one slice of it has enough contracts for a
+# median to mean anything. A slice below the floor renders as a GAP in the
+# curve; it is never interpolated across.
+SPREAD_SURFACE_MIN_CONTRACTS = _getenv_int(
+    "SPREAD_SURFACE_MIN_CONTRACTS", 20, min=1, max=100_000
+)
+SPREAD_SURFACE_MIN_BUCKET_CONTRACTS = _getenv_int(
+    "SPREAD_SURFACE_MIN_BUCKET_CONTRACTS", 5, min=1, max=100_000
+)
+
+# Trailing sessions the surface percentile ranks against, and the minimum
+# number of comparable ones before a percentile is published at all. Below the
+# minimum the UI says "insufficient history" rather than ranking a reading
+# against four days and calling the answer a percentile.
+SPREAD_SURFACE_HISTORY_DAYS = _getenv_int(
+    "SPREAD_SURFACE_HISTORY_DAYS", 60, min=5, max=365
+)
+SPREAD_SURFACE_MIN_SESSIONS = _getenv_int(
+    "SPREAD_SURFACE_MIN_SESSIONS", 8, min=2, max=200
+)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = _getenv_int("QUOTE_BATCH_SIZE", 100)  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = _getenv_int("OPTION_BATCH_SIZE", 100)

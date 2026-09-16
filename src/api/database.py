@@ -9073,3 +9073,116 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 f"Error fetching daily spread history for {symbol}: {e}", exc_info=True
             )
             raise
+
+    async def get_spread_surface_window(
+        self,
+        symbol: str,
+        option_type: str,
+        band_pct: float,
+        bucket_start_min: int,
+        days: int,
+    ) -> List[Dict[str, Any]]:
+        """Every stored surface cell for one symbol/side/band at one time bucket.
+
+        Returns the whole trailing window in a single round trip — every
+        dte_scope and every moneyness slice together — because the caller
+        needs all of them at once and the alternative is one query per cell.
+        The window is about a hundred scopes by sixty sessions, so this is a
+        few thousand narrow rows served by
+        ``idx_spread_surface_scope_window`` as a range scan.
+
+        Time-of-day matched by construction: ``bucket_start_min`` is an
+        equality, so a 15:30 reading is only ever ranked against prior
+        sessions at 15:30. Ranking it against an all-day median would report
+        the closing rotation as an anomaly on every single session.
+
+        Rows are returned oldest-first. An empty list is a normal answer on a
+        deployment where ``src.tools.spread_surface_backfill`` has not run.
+
+        The ``::real`` cast on the band is load-bearing, not decoration.
+        ``band_pct`` is REAL and part of the primary key, so the filter is a
+        float equality; casting the parameter to the column's own type puts
+        both sides through the identical float4 rounding. Without it a
+        parameter inferred as float8 would miss any band whose value is not
+        exactly representable in single precision, and the page would report
+        "no comparable sessions" for a scope with a full history behind it.
+        """
+        query = """
+            SELECT trading_date,
+                   dte_scope,
+                   money_bucket,
+                   spot_price::double precision AS spot_price,
+                   contract_count,
+                   tradable_count,
+                   two_sided_pct,
+                   zero_bid_pct,
+                   crossed_or_locked_pct,
+                   median_relative_spread_pct,
+                   p90_relative_spread_pct,
+                   median_spread
+            FROM spread_surface_stats
+            WHERE underlying = $1
+              AND option_type = $2
+              AND band_pct = $3::real
+              AND bucket_start_min = $4::smallint
+              AND trading_date >= (CURRENT_DATE - $5::int)
+            ORDER BY trading_date
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    query,
+                    symbol,
+                    option_type,
+                    float(band_pct),
+                    int(bucket_start_min),
+                    int(days),
+                )
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(
+                f"Error fetching spread surface window for {symbol}: {e}", exc_info=True
+            )
+            raise
+
+    async def get_spread_surface_latest_bucket(
+        self,
+        symbol: str,
+        option_type: str,
+    ) -> Optional[int]:
+        """The most recent time bucket this symbol has any surface history for.
+
+        Used when the live clock sits outside the cash session: rather than
+        ranking a post-close reading against an empty bucket, the caller falls
+        back to the last bucket that actually has a baseline and labels the
+        comparison as such.  Usually that is the session's closing bucket;
+        it is not on a half day, or where the writer stopped early, which is
+        why this is read rather than assumed.
+
+        Bounded to a fortnight on purpose.  ``idx_spread_surface_scope_window``
+        is keyed (underlying, option_type, dte_scope, band_pct, money_bucket,
+        bucket_start_min, trading_date DESC), so it cannot serve an ORDER BY
+        on trading_date across scopes — Postgres would sort every row this
+        symbol and side have (about a hundred scopes by thirteen buckets by
+        the whole retained history) to return a single integer, on the path
+        that runs whenever the market is shut.  Two weeks is longer than any
+        exchange holiday run and caps the scan.
+        """
+        query = """
+            SELECT bucket_start_min
+            FROM spread_surface_stats
+            WHERE underlying = $1
+              AND option_type = $2
+              AND trading_date >= (CURRENT_DATE - 14)
+            ORDER BY trading_date DESC, bucket_start_min DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, option_type)
+                return int(row["bucket_start_min"]) if row else None
+        except Exception as e:
+            logger.error(
+                f"Error fetching latest surface bucket for {symbol}: {e}", exc_info=True
+            )
+            raise

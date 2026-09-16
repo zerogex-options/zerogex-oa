@@ -98,6 +98,16 @@ __all__ = [
     "aggregate_by_expiration",
     "moneyness_bucket_label",
     "percentile_rank",
+    "DTE_UNIVERSES",
+    "DTE_BUCKETS",
+    "MONEYNESS_BANDS",
+    "BAND_WIDE",
+    "SurfaceScope",
+    "aggregate_by_dte_bucket",
+    "dte_universe_key",
+    "moneyness_bucket_key",
+    "in_band",
+    "surface_scopes",
 ]
 
 
@@ -513,4 +523,175 @@ def aggregate_by_expiration(
                 "all": split["all"].to_dict(),
             }
         )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The surface cube — history at the granularity the Spread Monitor filters ask
+# ---------------------------------------------------------------------------
+#
+# ``daily_spread_stats`` stores one row per (symbol, day, side): enough to say
+# "puts are wider than usual today", and nothing more.  The Spread Surface view
+# asks three further questions that the row cannot answer —
+#
+#   * is the deterioration AT THE MONEY or in the wings?   (per moneyness bucket)
+#   * is it only 0DTE, or the whole term structure?        (per DTE bucket)
+#   * is it unusual FOR THIS TIME OF DAY?                  (per intraday bucket)
+#
+# — so the surface rollup stores the same statistic, computed by the same
+# functions above, at the granularity those questions are asked in.  The cube
+# is enumerated HERE, once, because the live writer, the historical backfill
+# and the API's current-reading path must all produce byte-identical scope
+# keys or the percentile silently compares different populations.
+#
+# Membership follows the page: the moneyness band filters CONTRACTS first, and
+# the surviving contracts are then bucketed.  That is what ``_reduce_chain``
+# already does for the live page, so a +/-2% curve describes exactly the
+# contracts the +/-2% summary describes.
+
+#: Cumulative DTE universes — the page's "0DTE only / Through 1 / 7 / 30".
+#: Cumulative, so they overlap; each is a separate population with its own
+#: median, because medians do not combine.
+DTE_UNIVERSES: Tuple[int, ...] = (0, 1, 7, 30)
+
+#: Disjoint DTE buckets for the "where does it rank by expiry" view, as
+#: (key, low, high_inclusive). Disjoint so the reader can attribute a problem
+#: to one part of the curve instead of re-reading the same 0DTE four times.
+DTE_BUCKETS: Tuple[Tuple[str, int, int], ...] = (
+    ("b0", 0, 0),
+    ("b1", 1, 1),
+    ("b2_3", 2, 3),
+    ("b4_7", 4, 7),
+    ("b8_30", 8, 30),
+)
+
+#: Moneyness bands the page offers, as a half-width in percent of spot.
+MONEYNESS_BANDS: Tuple[float, ...] = (2.0, 5.0, 10.0)
+
+#: ``money_bucket`` value for a row covering the whole band rather than one
+#: slice of it — the summary strip and the by-expiry ranking.
+BAND_WIDE = "all"
+
+
+def dte_universe_key(dte_max: int) -> str:
+    """``7`` -> ``'u7'``. The stored key for a cumulative universe."""
+    return f"u{int(dte_max)}"
+
+
+def moneyness_bucket_key(low: float, high: float) -> str:
+    """``(-5, -3)`` -> ``'m:-5.0:-3.0'``.
+
+    Derived from the edges rather than an index, so inserting an edge cannot
+    silently re-point historical rows at a different slice of the surface.
+    """
+    return f"m:{low:.1f}:{high:.1f}"
+
+
+def in_band(spread: ContractSpread, band_pct: float) -> bool:
+    """Is this contract inside the +/-band the page is showing?"""
+    return (
+        spread.moneyness_pct is not None
+        and abs(spread.moneyness_pct) <= band_pct + 1e-9
+    )
+
+
+def aggregate_by_dte_bucket(
+    spreads: Sequence[ContractSpread],
+    dte_of: Dict[Any, int],
+    buckets: Sequence[Tuple[str, int, int]] = DTE_BUCKETS,
+) -> List[Tuple[str, SpreadAggregate]]:
+    """Group into the disjoint DTE buckets, nearest first.
+
+    Distinct from :func:`aggregate_by_expiration`, which keeps each listing
+    separate: that answers "how wide is Friday", this answers "is the problem
+    0DTE or is it everywhere". A contract whose expiration the caller could
+    not resolve joins no bucket rather than being pooled into the nearest one.
+    """
+    out: List[Tuple[str, SpreadAggregate]] = []
+    for key, low, high in buckets:
+        members = [
+            s
+            for s in spreads
+            if (dte := dte_of.get(s.expiration)) is not None and low <= dte <= high
+        ]
+        out.append((key, aggregate(members)))
+    return out
+
+
+@dataclass(frozen=True)
+class SurfaceScope:
+    """One cell of the cube: what was measured, and the reading."""
+
+    #: ``u0``/``u1``/``u7``/``u30`` (cumulative) or ``b0``..``b8_30`` (disjoint).
+    dte_scope: str
+    #: Half-width of the moneyness band the contracts were filtered to.
+    band_pct: float
+    #: :data:`BAND_WIDE`, or a :func:`moneyness_bucket_key` slice of the band.
+    money_bucket: str
+    aggregate: SpreadAggregate
+
+
+def surface_scopes(
+    spreads: Sequence[ContractSpread],
+    dte_of: Dict[Any, int],
+    edges: Sequence[float] = DEFAULT_MONEYNESS_EDGES,
+) -> List[SurfaceScope]:
+    """Every cell of the surface cube for one snapshot of one option type.
+
+    Three families, because the three views ask different questions:
+
+    * **(cumulative universe, band, bucket)** — the strike curve. One series
+      per moneyness slice, for whichever universe and band the page has
+      selected.
+    * **(cumulative universe, band, all)** — the summary strip, and the
+      population the headline percentile is ranked in.
+    * **(disjoint DTE bucket, band, all)** — the by-expiry ranking.
+
+    Empty cells are omitted rather than stored as zeroes: a bucket with no
+    contracts is "not measured here", and a zero would read as "free to
+    cross". The caller is expected to apply a minimum-contract floor before
+    persisting — see ``SPREAD_STATS_MIN_CONTRACTS``.
+    """
+    out: List[SurfaceScope] = []
+
+    for band in MONEYNESS_BANDS:
+        in_band_spreads = [s for s in spreads if in_band(s, band)]
+        if not in_band_spreads:
+            continue
+
+        for dte_max in DTE_UNIVERSES:
+            universe = [
+                s
+                for s in in_band_spreads
+                if (dte := dte_of.get(s.expiration)) is not None and dte <= dte_max
+            ]
+            if not universe:
+                continue
+            key = dte_universe_key(dte_max)
+
+            out.append(SurfaceScope(key, band, BAND_WIDE, aggregate(universe)))
+
+            for index in range(len(edges) - 1):
+                low, high = float(edges[index]), float(edges[index + 1])
+                is_last = index == len(edges) - 2
+                members = [
+                    s
+                    for s in universe
+                    if s.moneyness_pct is not None
+                    and s.moneyness_pct >= low
+                    and (s.moneyness_pct <= high if is_last else s.moneyness_pct < high)
+                ]
+                if not members:
+                    continue
+                out.append(
+                    SurfaceScope(
+                        key, band, moneyness_bucket_key(low, high), aggregate(members)
+                    )
+                )
+
+        for key, agg in aggregate_by_dte_bucket(in_band_spreads, dte_of):
+            if agg.contract_count == 0:
+                continue
+            out.append(SurfaceScope(key, band, BAND_WIDE, agg))
+
     return out

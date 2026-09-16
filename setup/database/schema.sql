@@ -2522,6 +2522,112 @@ CREATE TABLE IF NOT EXISTS daily_spread_stats (
 CREATE INDEX IF NOT EXISTS idx_daily_spread_stats_lookup
     ON daily_spread_stats(underlying, option_type, trading_date DESC);
 
+-- =============================================================================
+-- Intraday spread surface history (Spread Surface vs History)
+-- =============================================================================
+-- daily_spread_stats answers "are puts wider than usual today" and nothing
+-- more: one row per (symbol, trading_date, option_type), with dte_max and
+-- moneyness_band_pct recorded as the scope it happened to be measured under
+-- rather than as dimensions you can vary.
+--
+-- The surface view asks three questions that row cannot answer:
+--
+--   * is the deterioration AT THE MONEY or out in the wings?
+--   * is it only 0DTE, or the whole term structure?
+--   * is it unusual FOR THIS TIME OF DAY?  (0DTE at 15:45 is not 0DTE at
+--     10:00, and ranking one against the other manufactures an anomaly)
+--
+-- So this table stores the SAME statistic -- computed by the same
+-- src/analytics/spread_stats.py functions, never a second SQL
+-- reimplementation -- at the granularity those questions are asked in.
+--
+-- SCOPE COLUMNS ARE THE PRIMARY KEY, and that is the point. A percentile is
+-- only meaningful against rows measured the same way, so the filter a row was
+-- computed under travels with it and the read path matches on it exactly:
+--
+--   dte_scope     'u0'/'u1'/'u7'/'u30'  cumulative universes (the page's
+--                                        "0DTE only / Through 1 / 7 / 30")
+--                 'b0'/'b1'/'b2_3'/'b4_7'/'b8_30'  disjoint buckets, for the
+--                                        by-expiry ranking
+--   band_pct      2 / 5 / 10            half-width of the moneyness band;
+--                                        filters CONTRACTS before bucketing,
+--                                        matching what the live page does
+--   money_bucket  'all'                 the whole band (summary + ranking)
+--                 'm:<low>:<high>'      one slice of it (the strike curve)
+--   bucket_start_min  minutes past ET midnight on a 30-minute grid; the
+--                     time-of-day bucket the observation belongs to
+--
+-- Writer: src/analytics/main_engine.py writes the current bucket each cycle
+-- from the snapshot already in memory, so it costs no extra query. Backfill:
+-- src/tools/spread_surface_backfill.py seeds history from option_chains.
+--
+-- 100% derived state: safe to TRUNCATE, the backfill rebuilds it. Roughly
+-- 110 rows per (symbol, day, time bucket, option type) -- about 700k rows for
+-- four symbols over a quarter, which is small enough that the trailing-window
+-- read is an index range scan.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS spread_surface_stats (
+    underlying                 VARCHAR(10)      NOT NULL,
+    trading_date               DATE             NOT NULL,
+    bucket_start_min           SMALLINT         NOT NULL,
+    option_type                CHAR(1)          NOT NULL,
+    dte_scope                  VARCHAR(8)       NOT NULL,
+    band_pct                   REAL             NOT NULL,
+    money_bucket               VARCHAR(20)      NOT NULL,
+    spot_price                 NUMERIC(12, 4)   NOT NULL,
+    contract_count             INTEGER          NOT NULL DEFAULT 0,
+    tradable_count             INTEGER          NOT NULL DEFAULT 0,
+    two_sided_pct              DOUBLE PRECISION NOT NULL DEFAULT 0,
+    zero_bid_pct               DOUBLE PRECISION NOT NULL DEFAULT 0,
+    crossed_or_locked_pct      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    median_relative_spread_pct DOUBLE PRECISION,
+    p90_relative_spread_pct    DOUBLE PRECISION,
+    median_spread              DOUBLE PRECISION,
+    source_timestamp           TIMESTAMPTZ      NOT NULL,
+    created_at                 TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at                 TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, trading_date, bucket_start_min, option_type,
+                 dte_scope, band_pct, money_bucket)
+);
+
+-- The trailing-window read: every prior session's reading for ONE scope at
+-- ONE time-of-day bucket. Leading equality on the scope columns with
+-- trading_date trailing, so the window is a contiguous range scan rather than
+-- a filter over the whole symbol.
+CREATE INDEX IF NOT EXISTS idx_spread_surface_scope_window
+    ON spread_surface_stats(underlying, option_type, dte_scope, band_pct,
+                            money_bucket, bucket_start_min, trading_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'spread_surface_stats_option_type_check'
+    ) THEN
+        ALTER TABLE spread_surface_stats
+        ADD CONSTRAINT spread_surface_stats_option_type_check
+        CHECK (option_type IN ('C', 'P'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'spread_surface_stats_bucket_min_check'
+    ) THEN
+        ALTER TABLE spread_surface_stats
+        ADD CONSTRAINT spread_surface_stats_bucket_min_check
+        CHECK (bucket_start_min BETWEEN 0 AND 1439);
+    END IF;
+END $$;
+
+COMMENT ON TABLE spread_surface_stats IS
+    'Intraday quoted-spread history at (moneyness bucket x DTE scope x band x time-of-day). Powers "Spread Surface vs History": the historical median/band per strike slice, the percentile per expiry bucket, and time-of-day-matched comparison. Same reduction as daily_spread_stats (src/analytics/spread_stats.py), finer granularity. Derived state; safe to TRUNCATE.';
+COMMENT ON COLUMN spread_surface_stats.bucket_start_min IS
+    'Minutes past ET midnight, floored to a 30-minute grid. 0DTE spreads at 15:45 behave nothing like 0DTE at 10:00, so a percentile that ranks one against the other reports an anomaly that is really just the clock.';
+COMMENT ON COLUMN spread_surface_stats.money_bucket IS
+    'Either all (the whole band) or m:<low>:<high> for one slice of it. Keyed by the edge values rather than an index so that inserting an edge cannot silently re-point historical rows at a different part of the surface.';
+COMMENT ON COLUMN spread_surface_stats.band_pct IS
+    'Half-width of the moneyness band the contracts were filtered to BEFORE bucketing -- the same order the live page applies, so a narrow-band curve describes exactly the contracts the narrow-band summary describes.';
+
 DO $$
 BEGIN
     IF NOT EXISTS (

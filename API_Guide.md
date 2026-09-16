@@ -1028,6 +1028,67 @@ been all quarter". Rows are oldest first.
 An empty `rows` list is a normal answer where neither the analytics writer
 nor `make daily-spread-stats-backfill` has run yet — not an error.
 
+### GET /api/market/spreads/surface
+Today's quoted width across the strike surface, ranked against the same
+symbol's own history **in the same strike band at the same time of day**.
+Answers the question a width alone cannot: is this unusual, and where.
+
+One side of the book per call. Puts and calls are never blended, because the
+reading the view exists for — "the puts went wide and the calls did not" —
+is only visible against a side that has not moved.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `option_type` (optional): `C` or `P`, default `P`
+- `dte_max` (optional): one of `0`, `1`, `7`, `30`, default `0` — cumulative
+- `moneyness_band_pct` (optional): one of `2`, `5`, `10`, default `5`
+- `history_days` (optional): `5`–`365`, default from `SPREAD_SURFACE_HISTORY_DAYS` (60)
+
+`dte_max` and `moneyness_band_pct` are enumerated rather than free, and an
+off-list value is a 400 rather than a best effort. History is stored per
+scope, so a scope nobody measured has no population to rank against — and
+ranking against the nearest one that does exist is how a ±3% reading gets
+called extreme because ±5% happens to be wider.
+
+**Response:**
+
+| Field | What it carries |
+| --- | --- |
+| `summary` | The headline strip: `current_pct`, `normal_pct` (the median of the matched sessions), `vs_normal`, `percentile`, `two_sided_pct`, `contract_count`, `sessions`. |
+| `baseline` | What the comparison was actually made against: `sessions`, `earliest_date`, `latest_date`, `time_matched`, `time_bucket_label` (e.g. `15:30-16:00 ET`), `fell_back_to_last_bucket`, `min_sessions`. |
+| `curve` | One entry per moneyness slice: `current_pct`, `historical_median_pct`, `historical_p25_pct`, `historical_p75_pct`, `percentile`, `vs_normal`, `sessions`. |
+| `by_dte` | One entry per disjoint expiry bucket (`b0`, `b1`, `b2_3`, `b4_7`, `b8_30`) with its `percentile` and `insufficient_history`. |
+
+**Time-of-day matched.** Spreads have a strong intraday shape — the open and
+the close are structurally wider than midday — so a 15:40 reading ranked
+against whole prior sessions would look anomalous purely because of the
+clock. History is stored in 30-minute buckets
+(`SPREAD_SURFACE_BUCKET_MINUTES`) and matched as an equality, and
+`baseline.time_bucket_label` names the bucket used. Outside the cash session
+the comparison clamps to the session's last bucket and
+`fell_back_to_last_bucket` says so.
+
+**Every refusal is explicit.** `percentile` is `null` below
+`SPREAD_SURFACE_MIN_SESSIONS` (default 8) comparable sessions rather than
+computed from a handful of days, and `by_dte[].insufficient_history` marks
+the buckets that could not be ranked. `baseline.sessions` and the date range
+beside it describe the SAME population, so a thin scope reports `0` sessions
+and null dates rather than a months-long range the comparison never used. A
+slice with a current reading but no stored history returns its `current_pct`
+with null baseline fields — a gap, to be rendered as a gap.
+
+Today's own rollup row is excluded from its own window; otherwise the
+reading would drag its baseline toward itself on exactly the day it matters.
+
+The current half of the response is reduced from the live chain through the
+same `spread_stats` functions that wrote every stored row, so "current" here
+is the same number `/api/market/spreads` reports for the same scope. There
+is deliberately no second definition of a spread in this feature.
+
+Seed the history with `make spread-surface-backfill` (`SURFACE_SYMBOLS=`,
+`SURFACE_DAYS=`); the analytics writer extends it each cycle during the cash
+session. An all-null `baseline` on a fresh deployment is a normal answer.
+
 ---
 
 ## Max Pain
