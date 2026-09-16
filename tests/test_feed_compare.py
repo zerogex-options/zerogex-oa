@@ -1013,7 +1013,9 @@ class _SlowChainProvider:
     @property
     def capabilities(self):
         return ProviderCapabilities(
-            underlying_bars=True, option_chain_discovery=True, option_snapshots=True
+            underlying_bars=True,
+            option_chain_discovery=True,
+            option_quotes=True,
         )
 
     def get_option_expirations(self, underlying, strike_price=None):
@@ -1108,3 +1110,111 @@ def test_a_metric_that_keeps_its_sign_is_reported_normally(capsys):
 
     feed_compare._print_summary(summary, "thetadata", "thetadata_mv")
     assert "changed sign" not in capsys.readouterr().out
+
+
+class _IndexBlockedProvider:
+    """Spot is unentitled; the options chain underneath it is fine.
+
+    The exact shape ThetaData returns for $NDXP.X: the NDX index level needs
+    a Nasdaq GIDS licence, while NDX options are OPRA under the root NDXP.
+    """
+
+    name = "index-blocked"
+
+    def __init__(self):
+        self.chain_was_asked = False
+
+    @property
+    def capabilities(self):
+        return ProviderCapabilities(
+            index_bars=True,
+            option_chain_discovery=True,
+            option_quotes=True,
+            option_open_interest=True,
+        )
+
+    def stream_index_bars(self, symbol, **kw):
+        raise RuntimeError(
+            "Requesting data for NASDAQ GIDs symbols: [NDX] without proper permissions."
+        )
+
+    def stream_underlying_bars(self, symbol, **kw):
+        return self.stream_index_bars(symbol, **kw)
+
+    def get_option_expirations(self, underlying, strike_price=None):
+        return [date(2026, 9, 18)]
+
+    def get_option_strikes(self, underlying, expiration=None):
+        return [24000.0 + 25.0 * i for i in range(40)]
+
+    def build_option_symbol(self, underlying, expiration, strike, option_type):
+        return f"NDXP{expiration:%y%m%d}{option_type}{int(strike * 1000):08d}"
+
+    def snapshot_option_quotes(self, symbols):
+        self.chain_was_asked = True
+        return {
+            s: OptionQuote(option_symbol=s, bid=1.0, ask=1.2, open_interest=10) for s in symbols
+        }
+
+    def describe_columns(self, underlying):
+        return {}
+
+    def close(self):
+        pass
+
+
+def test_a_probe_reports_the_chain_even_when_spot_is_unentitled(capsys):
+    """A feed can serve a symbol's OPTIONS and not its INDEX level.
+
+    $NDXP.X failed on the Nasdaq GIDS index call and the probe gave up
+    there, reporting zero contracts for a chain it never asked for. Read
+    off the output that is indistinguishable from the whole underlying
+    being unavailable -- and the two cost very different amounts to fix.
+    """
+    provider = _IndexBlockedProvider()
+    result = feed_compare.probe(
+        provider, "$NDXP.X", num_expirations=1, strike_count_max=10, strike_pct_range=3.0
+    )
+
+    assert provider.chain_was_asked, "a failed spot call must not skip the chain"
+    assert result["contracts_returned"] == 20
+    assert result["spot"] is None
+    assert "NASDAQ GIDs" in (result["spot_error"] or "")
+
+    feed_compare._print_probe(result)
+    out = capsys.readouterr().out
+    assert "UNAVAILABLE" in out
+    assert "options reachable" in out, "the two halves must be reported separately"
+
+
+def test_a_comparison_still_refuses_to_run_without_spot():
+    """The probe's leniency must not leak into the comparison.
+
+    Every chain metric prices against spot; a sample taken without one
+    would compare two feeds on Greeks computed from nothing.
+    """
+    provider = _IndexBlockedProvider()
+    sample = feed_compare.sample_provider(
+        provider, "$NDXP.X", num_expirations=1, strike_count_max=10, strike_pct_range=3.0
+    )
+    assert sample.error is not None
+    assert not sample.quotes
+    assert not provider.chain_was_asked
+
+
+def test_a_chain_with_no_spot_centres_on_the_ladder():
+    """Without spot there is no percentage window, so take the ladder's middle."""
+    provider = _IndexBlockedProvider()
+    _symbols, metadata = feed_compare._resolve_chain(
+        provider,
+        "$NDXP.X",
+        num_expirations=1,
+        strike_count_max=4,
+        strike_pct_range=3.0,
+        spot=None,
+    )
+    strikes = sorted({m["strike"] for m in metadata.values()})
+    ladder = provider.get_option_strikes("$NDXP.X")
+    median = sorted(ladder)[len(ladder) // 2]
+    assert len(strikes) == 4
+    assert min(strikes) <= median <= max(strikes), "the picked strikes must bracket the median"
