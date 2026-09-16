@@ -433,6 +433,12 @@ class FeedSample:
     quotes: Dict[str, OptionQuote]
     metadata: Dict[str, Dict[str, Any]]
     error: Optional[str] = None
+    #: Why spot could not be read, when the caller asked to carry on without
+    #: it. A feed can be entitled for a symbol's OPTIONS and not its INDEX
+    #: level -- ThetaData serves NDX options under OPRA but the index value
+    #: under Nasdaq GIDS, a separate licence. Folding both into ``error``
+    #: reports the whole underlying as unavailable and hides which half is.
+    spot_error: Optional[str] = None
     #: The bar ``spot`` was taken from, kept so the underlying tape can be
     #: persisted alongside the chain. When two feeds disagree on GEX the
     #: first question is always whether they disagreed on spot, and that is
@@ -478,7 +484,7 @@ def _resolve_chain(
     num_expirations: int,
     strike_count_max: int,
     strike_pct_range: float,
-    spot: float,
+    spot: Optional[float],
 ) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
     """Pick the contracts to compare, and their strike/expiry metadata.
 
@@ -491,15 +497,25 @@ def _resolve_chain(
     expirations = provider.get_option_expirations(underlying)[:num_expirations]
     symbols: List[str] = []
     metadata: Dict[str, Dict[str, Any]] = {}
-    lo = spot * (1 - strike_pct_range / 100.0)
-    hi = spot * (1 + strike_pct_range / 100.0)
 
     for expiration in expirations:
         exp_str = expiration.isoformat() if isinstance(expiration, date) else str(expiration)
-        strikes = [s for s in provider.get_option_strikes(underlying, exp_str) if lo <= s <= hi]
-        # Trim from the furthest-from-spot strikes inward, as the engine does.
-        strikes.sort(key=lambda s: abs(s - spot))
-        strikes = sorted(strikes[:strike_count_max])
+        ladder = provider.get_option_strikes(underlying, exp_str)
+        if spot is None:
+            # Probe fallback: no spot, so centre on the ladder's own median.
+            # Which strikes get picked barely matters when the question is
+            # "does this feed answer for options at all" -- what matters is
+            # that the chain still gets asked for.
+            ladder = sorted(ladder)
+            centre = ladder[len(ladder) // 2] if ladder else 0.0
+            strikes = sorted(sorted(ladder, key=lambda s: abs(s - centre))[:strike_count_max])
+        else:
+            lo = spot * (1 - strike_pct_range / 100.0)
+            hi = spot * (1 + strike_pct_range / 100.0)
+            strikes = [s for s in ladder if lo <= s <= hi]
+            # Trim from the furthest-from-spot strikes inward, as the engine does.
+            strikes.sort(key=lambda s: abs(s - spot))
+            strikes = sorted(strikes[:strike_count_max])
         for strike in strikes:
             for option_type in ("C", "P"):
                 symbol = provider.build_option_symbol(underlying, expiration, strike, option_type)
@@ -520,31 +536,50 @@ def sample_provider(
     strike_count_max: int,
     strike_pct_range: float,
     spot_hint: Optional[float] = None,
+    require_spot: bool = True,
 ) -> FeedSample:
     """Take one snapshot of ``underlying``'s chain from ``provider``.
 
     Uses the snapshot path rather than the streams: a comparison wants a
     consistent instant across both feeds, and a streaming accumulator's
     contents depend on how long it has been running.
+
+    ``require_spot=False`` carries on when spot cannot be read, recording
+    the reason in ``spot_error`` and fetching the chain anyway. A comparison
+    still needs spot -- every chain metric prices against it -- but a PROBE
+    asking "what can this feed serve for this underlying" must not be
+    stopped at the first failure: spot and the chain can be separately
+    entitled, and giving up at spot reports zero coverage for a chain
+    nobody asked for.
     """
     captured_at = datetime.now(timezone.utc)
+    spot_error: Optional[str] = None
     try:
         spot_bar = None
         spot = spot_hint
         spot_started = time.monotonic()
         if spot is None:
-            spot_bar = _spot_from_provider(provider, underlying)
-            spot = float(spot_bar.close) if spot_bar and spot_bar.close else None
+            try:
+                spot_bar = _spot_from_provider(provider, underlying)
+                spot = float(spot_bar.close) if spot_bar and spot_bar.close else None
+            except Exception as e:  # noqa: BLE001 - re-raised below when required
+                if require_spot:
+                    raise
+                spot_error = f"{type(e).__name__}: {e}"
+                spot = None
         spot_seconds = time.monotonic() - spot_started
         if not spot or spot <= 0:
-            return FeedSample(
-                provider=provider.name,
-                captured_at=captured_at,
-                spot=None,
-                quotes={},
-                metadata={},
-                error="no spot price available",
-            )
+            if require_spot:
+                return FeedSample(
+                    provider=provider.name,
+                    captured_at=captured_at,
+                    spot=None,
+                    quotes={},
+                    metadata={},
+                    error="no spot price available",
+                )
+            spot_error = spot_error or "no spot price available"
+            spot = None
         discovery_started = time.monotonic()
         symbols, metadata = _resolve_chain(
             provider,
@@ -567,6 +602,7 @@ def sample_provider(
             quotes=quotes,
             metadata=metadata,
             spot_bar=spot_bar,
+            spot_error=spot_error,
             chain_at=datetime.now(timezone.utc),
             timings={
                 "spot": round(spot_seconds, 2),
@@ -585,6 +621,7 @@ def sample_provider(
             quotes={},
             metadata={},
             error=str(e),
+            spot_error=spot_error,
         )
 
 
@@ -1004,6 +1041,11 @@ def probe(
         num_expirations=num_expirations,
         strike_count_max=strike_count_max,
         strike_pct_range=strike_pct_range,
+        # A probe reports what IS reachable. Stopping at a failed spot call
+        # left "$NDXP.X" reading as a total outage when only the Nasdaq GIDS
+        # index level was unentitled and the OPRA chain underneath it was
+        # never asked for.
+        require_spot=False,
     )
     elapsed = time.monotonic() - started
 
@@ -1028,6 +1070,7 @@ def probe(
         "two_sided": sample.quoted_count,
         "with_open_interest": sample.oi_count,
         "error": sample.error,
+        "spot_error": sample.spot_error,
         "timings": sample.timings,
         "columns": columns,
     }
@@ -1036,7 +1079,10 @@ def probe(
 def _print_probe(result: Dict[str, Any]) -> None:
     print(f"\n  provider           {result['provider']}")
     print(f"  underlying         {result['underlying']}")
-    print(f"  spot               {result['spot']}")
+    if result.get("spot_error"):
+        print(f"  spot               UNAVAILABLE: {result['spot_error']}")
+    else:
+        print(f"  spot               {result['spot']}")
     timings = result.get("timings") or {}
     print(f"  wall time          {result['seconds']}s")
     if timings:
@@ -1058,6 +1104,17 @@ def _print_probe(result: Dict[str, Any]) -> None:
     elif result["contracts_requested"]:
         coverage = result["contracts_returned"] / result["contracts_requested"]
         print(f"  coverage           {coverage:.1%}")
+    # Spot and the chain are separately entitled. Say which half answered,
+    # because "add the index feed" and "this underlying is unusable" are
+    # different problems with different prices.
+    if result.get("spot_error") and result["contracts_returned"]:
+        print(
+            "\n  VERDICT            options reachable, UNDERLYING PRICE IS NOT.\n"
+            "                     The chain answered; only the spot feed is "
+            "blocked."
+        )
+    elif result.get("spot_error"):
+        print("\n  VERDICT            neither the spot feed nor the chain answered.")
     columns = dict(result.get("columns") or {})
     # Not a response shape: an inventory of which Market Value endpoints the
     # installed client wraps. Printed on its own so it is not mistaken for
