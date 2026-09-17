@@ -40,6 +40,7 @@ from .models import (
     FlowSeriesPoint,
     FlowContractsResponse,
     HedgingFlowResponse,
+    HedgingFlowSessionList,
     GammaRegimeSeriesResponse,
     GammaWeatherResponse,
     MarketTideResponse,
@@ -1099,6 +1100,34 @@ def _parse_flow_expirations(raw: Optional[str]) -> Optional[List[date_type]]:
     return parsed
 
 
+def _parse_session_date(raw: Optional[str]) -> Optional[date_type]:
+    """Parse the ?date= parameter into an ET trading date.
+
+    Strict where ``expirations`` is lenient, and for the opposite reason: a
+    malformed entry in a CSV filter can be dropped because the other entries
+    still express the caller's intent, whereas a malformed ``date`` has no
+    remaining intent to honour. Silently falling back to the current session
+    would serve today's chart under a permalink for some other day.
+
+    A well-formed date that simply has no data is NOT an error -- the series
+    endpoints answer it with an empty ``bars`` list. A dated page must not 404
+    on a day that merely turned out to be quiet, and it must not 404 because
+    the API blinked: ``notFound()`` during a crawl costs the URL its place in
+    the index.
+    """
+    if raw is None:
+        return None
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    if not _FLOW_EXPIRATION_PATTERN.match(trimmed):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    try:
+        return date_type.fromisoformat(trimmed)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be a real calendar date")
+
+
 def _format_flow_series_row(row: dict) -> dict:
     """Coerce a raw DB row into the JSON shape documented in the spec.
 
@@ -1347,6 +1376,16 @@ def _format_hedging_flip(event) -> dict:
 async def get_hedging_flow(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "Served from the retention-exempt hedging_flow_5min snapshot, so "
+            "it reaches back past the 90-day prune window that bounds the "
+            "live pipeline. A day with nothing stored returns 200 with an "
+            "empty `bars` list -- never 404."
+        ),
+    ),
     strikes: Optional[str] = Query(
         default=None,
         description="Comma-separated strikes to include. Empty/missing = all strikes.",
@@ -1439,6 +1478,7 @@ async def get_hedging_flow(
 
     strikes_list = _parse_flow_strikes(strikes)
     expirations_list = _parse_flow_expirations(expirations)
+    session_date = _parse_session_date(date)
 
     rows = await _db().get_hedging_flow_series(
         symbol=normalized,
@@ -1446,13 +1486,17 @@ async def get_hedging_flow(
         strikes=strikes_list,
         expirations=expirations_list,
         intervals=intervals,
+        session_date=session_date,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
 
     envelope = {
         "symbol": normalized,
-        "session": session,
+        # `session` has always named the day the payload describes. With an
+        # explicit date it names that date, so a dated response is
+        # self-describing and a client cannot mistake it for the live one.
+        "session": session_date.isoformat() if session_date else session,
         "basis": _HEDGING_FLOW_BASIS,
         "disclosure": _HEDGING_FLOW_DISCLOSURE,
         "smoothing_bars": smoothing,
@@ -1570,6 +1614,69 @@ def _format_gamma_regime_row(row: dict, cushion=None) -> dict:
 
 
 @app.get(
+    "/api/flow/hedging/sessions",
+    response_model=HedgingFlowSessionList,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/hedging/sessions")
+async def get_hedging_flow_sessions(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    limit: int = Query(default=60, ge=1, le=250),
+):
+    """Trading days that have a stored Hedging Flow session, newest first.
+
+    The index behind ``/api/flow/hedging?date=``. Deliberately a list of days
+    that HAVE data rather than a date picker over the calendar: a picker
+    invites a reader onto an empty session and lets them conclude the feature
+    is broken, which is why ``/api/replay/sessions`` and the scorecard's
+    equivalent are both shaped this way.
+
+    Read from ``hedging_flow_5min`` and nothing else. Listing from the live
+    tables instead would advertise exactly the 90 days the prune window keeps
+    and hide every older session that is still perfectly readable -- the list
+    and the permalinks have to agree about which days exist.
+
+    Each entry carries enough to render a card rather than a date: how many
+    bars the day has, how many of those were real rather than carried
+    forward, whether a 0DTE scope exists for it, and where the session's
+    cumulative lean finished.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    rows = await _db().get_hedging_flow_sessions(symbol=normalized, limit=limit)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    def _iso(value) -> Optional[str]:
+        if value is None:
+            return None
+        ts = value if value.tzinfo else value.replace(tzinfo=pytz.UTC)
+        return ts.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    sessions = [
+        {
+            "date": r["session_date"].isoformat(),
+            "bar_count": int(r["bar_count"] or 0),
+            "real_bar_count": int(r["real_bar_count"] or 0),
+            "had_0dte": bool(r["had_0dte"]),
+            "cum_net_usd": (float(r["cum_net_usd"]) if r.get("cum_net_usd") is not None else None),
+            "first_bar": _iso(r.get("first_bar")),
+            "last_bar": _iso(r.get("last_bar")),
+        }
+        for r in rows
+    ]
+    return JSONResponse(
+        content={"symbol": normalized, "count": len(sessions), "sessions": sessions}
+    )
+
+
+@app.get(
     "/api/gex/regime-series",
     response_model=GammaRegimeSeriesResponse,
     tags=["GEX"],
@@ -1579,6 +1686,16 @@ def _format_gamma_regime_row(row: dict, cushion=None) -> dict:
 async def get_gamma_regime_series(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "gamma_regime_5min has been written per bar since this panel "
+            "shipped and is retention-exempt, so any stored session answers. "
+            "A day with nothing written returns 200 with an empty `bars` "
+            "list -- never 404."
+        ),
+    ),
     intervals: Optional[int] = Query(
         default=None,
         ge=1,
@@ -1636,10 +1753,13 @@ async def get_gamma_regime_series(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
+    session_date = _parse_session_date(date)
+
     rows = await _db().get_gamma_regime_series(
         symbol=normalized,
         session=session,
         intervals=intervals,
+        session_date=session_date,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
@@ -1665,7 +1785,9 @@ async def get_gamma_regime_series(
     return JSONResponse(
         content={
             "symbol": normalized,
-            "session": session,
+            # Echoes the date when one was asked for, so a dated response says
+            # which day it is rather than the word "current".
+            "session": session_date.isoformat() if session_date else session,
             "rolling_bars": rolling_bars,
             "bars": bars,
         }
@@ -1682,6 +1804,15 @@ async def get_gamma_regime_series(
 async def get_gamma_weather(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`, and "
+            "is passed straight through to the two series this reads, so a "
+            "dated weather read classifies that session's last common bar. "
+            "409 when neither series has a bar for the day."
+        ),
+    ),
 ):
     """The combined current-state read: Gamma Weather.
 
@@ -1716,8 +1847,14 @@ async def get_gamma_weather(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    flow_rows = await _db().get_hedging_flow_series(symbol=normalized, session=session)
-    regime_rows = await _db().get_gamma_regime_series(symbol=normalized, session=session)
+    session_date = _parse_session_date(date)
+
+    flow_rows = await _db().get_hedging_flow_series(
+        symbol=normalized, session=session, session_date=session_date
+    )
+    regime_rows = await _db().get_gamma_regime_series(
+        symbol=normalized, session=session, session_date=session_date
+    )
     if flow_rows is None and regime_rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
 
@@ -1786,7 +1923,7 @@ async def get_gamma_weather(
     return JSONResponse(
         content={
             "symbol": normalized,
-            "session": session,
+            "session": session_date.isoformat() if session_date else session,
             "bar_start": bar_start.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "state": weather.state,
             "label": weather.label,

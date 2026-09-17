@@ -533,6 +533,39 @@ class HedgingFlowResponse(BaseModel):
     flips: List[HedgingFlowFlip]
 
 
+class HedgingFlowSession(BaseModel):
+    """One trading day that has stored hedging-flow bars.
+
+    A session CARD, not a date entry -- which is the difference between a
+    list of days that have data and a picker that invites a reader to land
+    on an empty one. ``bar_count`` grades how complete the day is (a full
+    regular session is 82 bars on the 5-minute grid) and ``real_bar_count``
+    excludes carry-forward bars, so "thin" is distinguishable from "short".
+    ``cum_net_usd`` is the session's closing lean, which is what lets a card
+    say something about the day rather than only name it.
+
+    ``had_0dte`` reports whether the 0DTE scope was materialised at all, so
+    the toggle is offered on that basis instead of being offered always and
+    resolving to nothing on a day that was not an expiry.
+    """
+
+    date: date
+    bar_count: int
+    real_bar_count: int
+    had_0dte: bool
+    cum_net_usd: Optional[float] = None
+    first_bar: Optional[datetime] = None
+    last_bar: Optional[datetime] = None
+
+
+class HedgingFlowSessionList(BaseModel):
+    """The index behind the dated Hedging Flow permalinks, newest first."""
+
+    symbol: str
+    count: int
+    sessions: List[HedgingFlowSession]
+
+
 class GammaRegimeBar(BaseModel):
     """One 5-minute bar of the intraday Gamma Shift read.
 

@@ -1143,6 +1143,88 @@ BEGIN
     END IF;
 END $$;
 
+-- Estimated hedging pressure per 5-minute bar -- the third of the three
+-- series behind the Hedging Flow page, and the last one to get a table.
+--
+-- WHY THIS IS A TABLE, AND WHY THE REASON IS NOT THE USUAL ONE. The other two
+-- snapshots on this page exist for cost: gamma_regime_5min because a bar is a
+-- diff of two per-strike chains, flow_series_5min because its CTE walks
+-- flow_by_contract with LAG-and-recumulate. Neither applies here -- the
+-- hedging pipeline reads flow_contract_facts, whose values are already
+-- per-bucket deltas, and it is the cheap one.
+--
+-- It exists for RETENTION. flow_contract_facts is in DB_MAINTAIN_TABLES, so
+-- `make db-prune` deletes it at DATA_RETENTION_DAYS (90). A past session
+-- recomputed from it therefore answers for a quarter and then comes back
+-- empty, which on a chart is indistinguishable from a genuinely quiet day --
+-- the worst available failure. Storing the finished bars lets a session
+-- outlive the trades that produced it, the same move made for gex_summary and
+-- underlying_quotes in 2026-08.
+--
+-- THEREFORE: this table is deliberately absent from DB_MAINTAIN_TABLES. Do
+-- NOT add it -- doing so deletes exactly the history the dated permalinks
+-- read. It is in DB_VACUUM_EXTRA_TABLES instead, which vacuums without
+-- pruning. The cost of keeping it forever is ~78 bars x 2 scopes per symbol
+-- per session: smaller than either table already exempted.
+--
+-- SCOPE. The live CTE accepts arbitrary strike/expiration filters, and a
+-- snapshot cannot pre-compute an arbitrary filter -- which is why
+-- flow_series_5min supersedes only the unfiltered read. The page offers
+-- exactly one filter, though (a 0DTE toggle that resolves to the session's
+-- own date), so both members of that closed set are materialised and the
+-- toggle picks a scope. A session that was not an expiry has no '0dte' rows
+-- at all, which is the same honest answer the live page gives rather than a
+-- fabricated flat line. Any other filter still falls through to the CTE and
+-- is still bounded by the prune window.
+--
+-- Column types match the CTE's emitted types so asyncpg decodes a snapshot
+-- read and a live read identically (NUMERIC -> Decimal, float8 -> float).
+CREATE TABLE IF NOT EXISTS hedging_flow_5min (
+    symbol            VARCHAR(10)  NOT NULL,
+    -- 'all' | '0dte'. See the SCOPE note above.
+    scope             VARCHAR(8)   NOT NULL,
+    bar_start         TIMESTAMPTZ  NOT NULL,
+    -- USD of stock the delta-flat hedge implies, positive for BUYING. Split
+    -- by the option type that PRODUCED the pressure, not by its direction:
+    -- customers selling puts push the net positive and land in put_flow_usd.
+    call_flow_usd     NUMERIC,
+    put_flow_usd      NUMERIC,
+    net_flow_usd      NUMERIC,
+    cum_call_usd      NUMERIC,
+    cum_put_usd       NUMERIC,
+    cum_net_usd       NUMERIC,
+    -- Share of the bar's traded volume that carried an aggressor
+    -- classification, in [0, 1]. NULL when the bar traded nothing. A low
+    -- ratio means the reading rests on a thin sample; stored rather than
+    -- derived so a historical bar keeps the coverage it actually had.
+    classified_ratio  DOUBLE PRECISION,
+    -- Mirrors underlying_quotes.close on the 5-minute grid, unfiltered, so
+    -- this series and /api/flow/series land on the same price at the same
+    -- bar. NULL-able: the carry-forward yields NULL before a session's first
+    -- quote.
+    underlying_price  NUMERIC(12, 4),
+    contract_count    INTEGER,
+    -- Carry-forward (no-flow) bar rather than a measured zero.
+    is_synthetic      BOOLEAN,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (symbol, scope, bar_start)
+);
+-- A dated read is (symbol, scope, window), which the primary key already
+-- serves. This index is for the sessions listing, which groups a symbol's
+-- whole history by ET date and never names a scope.
+CREATE INDEX IF NOT EXISTS idx_hedging_flow_5min_symbol_bar
+    ON hedging_flow_5min(symbol, bar_start DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_hedging_flow_5min_symbol') THEN
+        ALTER TABLE hedging_flow_5min
+        ADD CONSTRAINT fk_hedging_flow_5min_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
 -- Symbol FKs on the flow tables. Mirrors the pattern other tables use
 -- (option_chains, gex_summary, gex_by_strike) so deleting a symbol
 -- cascades through the flow rollups instead of leaving dangling rows.
