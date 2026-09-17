@@ -73,6 +73,11 @@ from src.analytics.forced_flow import (
     dealer_hedge_flow,
 )
 from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
+from src.hedging_flow_sql import (
+    HEDGING_FLOW_SCOPES,
+    HEDGING_FLOW_SNAPSHOT_UPSERT_PSYCOPG2,
+    SCOPE_0DTE,
+)
 from src.market_calendar import (
     calculate_time_to_expiration,
     expiration_close_time_et,
@@ -4129,6 +4134,10 @@ class AnalyticsEngine:
         # one does not block the other.
         self._refresh_flow_caches(anchor_ts, underlying_price=underlying_price)
         self._refresh_flow_series_snapshot(anchor_ts)
+        # Reads flow_contract_facts directly rather than the caches above, so
+        # its position in this sequence is not load-bearing — it sits here to
+        # keep all three snapshot writers in one place.
+        self._refresh_hedging_flow_snapshot(anchor_ts)
         self._refresh_gamma_regime_snapshot(anchor_ts)
 
     #: How many 5-minute bars back the rolling lens compares against.
@@ -4512,6 +4521,111 @@ class AnalyticsEngine:
         except Exception as e:
             logger.error(f"Error refreshing gamma regime snapshot: {e}", exc_info=True)
 
+    #: 5-minute session window helper shared by the two flow snapshot writers.
+    #: Both must resolve the window exactly as the API's
+    #: ``_resolve_flow_series_session`` does for session='current', or
+    #: engine-written rows land on a grid the API will not read back.
+    def _flow_session_window(self, timestamp: datetime):
+        """(session_start, session_end) in UTC, or None before the open.
+
+        ``session_end`` is now() floored to the 5-minute grid and capped at
+        16:15 ET, which is the same expression the API uses -- so a bar the
+        engine writes is a bar the API asks for, to the second.
+        """
+        ts_et = timestamp.astimezone(ET)
+        session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
+        session_start = session_open_et.astimezone(timezone.utc)
+        session_close = session_start + timedelta(hours=6, minutes=45)
+        now_utc = datetime.now(timezone.utc)
+        now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+        curr_bar = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+        session_end = min(curr_bar, session_close)
+        if session_end < session_start:
+            # Pre-open: the anchor's ET date has today's 09:30 in the future
+            # relative to wall-clock. Nothing to materialise yet.
+            return None
+        return session_start, session_end
+
+    def _refresh_hedging_flow_snapshot(self, timestamp: datetime):
+        """Materialise hedging_flow_5min for the current session, both scopes.
+
+        The stored rows are exactly what ``/api/flow/hedging`` computes for
+        session='current' -- same canonical CTE, rendered for psycopg2 from
+        the same template (:mod:`src.hedging_flow_sql`), so the snapshot and
+        the live read cannot drift into two different numbers for one bar.
+
+        Why a full-session UPSERT every cycle, with no incremental form
+        ----------------------------------------------------------------
+        The flow-series writer needs one because its CTE walks
+        ``flow_by_contract`` with LAG-and-recumulate over the whole session
+        (~30s/cycle measured on db.t3.small). This pipeline reads
+        ``flow_contract_facts``, whose values are already per-bucket deltas,
+        so the full-session form IS the cheap one; a second query shape would
+        be maintenance with nothing to buy.
+
+        It converges rather than churns because closed bars are
+        window-invariant -- the CTE's outer SUM is ROWS UNBOUNDED PRECEDING,
+        so once a bar's boundary passes its cumulative values are
+        mathematically fixed. The UPSERT's IS DISTINCT FROM guard then turns
+        every re-computation of a closed bar into a read with no write.
+
+        Two scopes per cycle
+        --------------------
+        ``all`` is the unfiltered series. ``0dte`` is the identical query with
+        the session's own date as the expirations filter, which is what the
+        page's toggle asks for. Writing it here rather than deriving it on
+        read is the whole point: on a historical session the trades it would
+        be derived FROM have been pruned.
+
+        The 0DTE pass writes nothing on a day that was not an expiry -- the
+        CTE's timeline is gated on its ``filtered`` CTE having rows, so a
+        filter matching nothing yields zero rows rather than a session of
+        synthetic zeros. A reader then sees no 0dte rows and says so.
+
+        Best-effort, like every other writer in this cycle: log, never raise.
+        A failure here must not cost the GEX path its cycle.
+        """
+        if not self._analytics_flow_cache_refresh_enabled:
+            return
+
+        try:
+            window = self._flow_session_window(timestamp)
+            if window is None:
+                return
+            session_start, session_end = window
+            # The 0DTE filter is the SESSION's date, not today's. They are the
+            # same thing on a live cycle and different things on a backfill,
+            # and this writer is the definition both of them follow.
+            session_date = session_start.astimezone(ET).date()
+
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                for scope in HEDGING_FLOW_SCOPES:
+                    cursor.execute(
+                        HEDGING_FLOW_SNAPSHOT_UPSERT_PSYCOPG2,
+                        {
+                            "symbol": self.db_symbol,
+                            "scope": scope,
+                            "session_start": session_start,
+                            "session_end": session_end,
+                            "strikes": None,
+                            "expirations": [session_date] if scope == SCOPE_0DTE else None,
+                        },
+                    )
+                    if cursor.rowcount:
+                        logger.info(
+                            "hedging_flow_5min upserted %d row(s) for %s scope=%s "
+                            "(window [%s, %s])",
+                            cursor.rowcount,
+                            self.db_symbol,
+                            scope,
+                            session_start.isoformat(),
+                            session_end.isoformat(),
+                        )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error refreshing hedging_flow_5min snapshot: {e}", exc_info=True)
+
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.
 
@@ -4550,16 +4664,13 @@ class AnalyticsEngine:
         try:
             # Resolve the current-session window exactly as the API's
             # _resolve_flow_series_session does for session='current', so
-            # engine-written rows match the window the API will read.
-            ts_et = timestamp.astimezone(ET)
-            session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
-            session_start = session_open_et.astimezone(timezone.utc)
-            session_close = session_start + timedelta(hours=6, minutes=45)
-            now_utc = datetime.now(timezone.utc)
-            now_floor_epoch = int(now_utc.timestamp() // 300) * 300
-            curr_bar = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
-            session_end = min(curr_bar, session_close)
-            if session_end < session_start:
+            # engine-written rows match the window the API will read. Shared
+            # with the hedging-flow writer: two copies of this arithmetic that
+            # drifted by one bar would put the two series on grids that no
+            # longer line up, which is precisely what the Hedging Flow page
+            # stacks them assuming.
+            window = self._flow_session_window(timestamp)
+            if window is None:
                 # Pre-session-open: the anchor timestamp's ET date has
                 # today's 09:30 open in the future relative to wall-clock
                 # (common pre-market for SPY/QQQ once the standalone flow
@@ -4568,6 +4679,7 @@ class AnalyticsEngine:
                 # rows on every cycle and mislabelling that as
                 # "cold-start or gap detected".
                 return
+            session_start, session_end = window
             prev_bar = max(session_start, session_end - timedelta(minutes=5))
 
             with db_connection() as conn:

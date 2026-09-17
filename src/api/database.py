@@ -29,7 +29,13 @@ from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
-from src.hedging_flow_sql import HEDGING_FLOW_CTE_ASYNCPG
+from src.hedging_flow_sql import (
+    HEDGING_FLOW_CTE_ASYNCPG,
+    HEDGING_FLOW_SESSIONS_ASYNCPG,
+    HEDGING_FLOW_SNAPSHOT_SELECT_ASYNCPG,
+    SCOPE_0DTE,
+    SCOPE_ALL,
+)
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
 from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
@@ -5771,11 +5777,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._cache_set(cache_key, result, 30.0)
         return result
 
+    @staticmethod
+    def _session_window_for_date(session_date: date) -> Tuple[datetime, datetime]:
+        """The 5-minute window for one ET trading date, in UTC.
+
+        09:30 ET through 16:15 ET, with the end capped at now() floored to the
+        grid — identical arithmetic to the ``current`` branch below, which is
+        what makes ``date=<today>`` behave exactly like ``session=current``
+        instead of reaching past the last bar that exists.
+        """
+        session_start_et = datetime(
+            session_date.year, session_date.month, session_date.day, 9, 30, tzinfo=_ET
+        )
+        session_start_utc = session_start_et.astimezone(timezone.utc)
+        session_close_utc = session_start_utc + timedelta(hours=6, minutes=45)
+        now_utc = datetime.now(timezone.utc)
+        now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+        now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+        session_end_utc = min(now_floored, session_close_utc)
+        if session_end_utc < session_start_utc:
+            # A future date, or today before the open. The window is empty
+            # rather than inverted; the read returns no rows.
+            session_end_utc = session_start_utc
+        return session_start_utc, session_end_utc
+
     async def _resolve_flow_series_session(
         self,
         conn: asyncpg.Connection,
         symbol: str,
         session: str,
+        session_date: Optional[date] = None,
     ) -> Optional[Tuple[datetime, datetime, bool]]:
         """Resolve (session_start_utc, session_end_utc, symbol_has_any_data) for
         the data-driven session model used by /api/flow/series.
@@ -5785,7 +5816,45 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol exists but the requested session has no data — the endpoint
         surfaces this as ``200 + []`` (see T4 / "session=prior but no prior
         data"). Normal resolution returns ``(start, end, True)``.
+
+        ``session_date`` names an explicit ET trading day and takes precedence
+        over ``session``. It resolves ARITHMETICALLY and reports
+        ``has_session_data=True`` without probing, which is deliberate on both
+        counts:
+
+        * the window for a named date is known by construction — the flag
+          exists for ``prior``, where the window itself has to be discovered;
+        * the probe it would otherwise do is against ``flow_by_contract``,
+          which ``make db-prune`` empties at 90 days. A dated read is served
+          from the retention-exempt snapshots precisely because its source
+          data is gone, so asking the pruned table whether the day existed
+          would report "no such session" for every session old enough to need
+          a permalink.
+
+        A date with nothing stored therefore returns an empty series rather
+        than a 404 — which is also what the dated pages need: ``notFound()``
+        on a crawl costs a permalink its place in the index, and
+        ``serverApiGet`` cannot tell an empty day from an unreachable API.
         """
+        if session_date is not None:
+            # Symbol validity is still worth a 404, but it is asked of the
+            # symbol table rather than of pruned flow rows.
+            known = await conn.fetchval(
+                "SELECT 1 FROM symbols WHERE symbol = $1 LIMIT 1",
+                symbol,
+            )
+            if not known:
+                # Fall back to the flow probe for deployments whose symbols
+                # table is not the authority it is here.
+                known = await conn.fetchval(
+                    "SELECT 1 FROM flow_by_contract WHERE symbol = $1 LIMIT 1",
+                    symbol,
+                )
+            if not known:
+                return None
+            start, end = self._session_window_for_date(session_date)
+            return start, end, True
+
         exists = await conn.fetchval(
             "SELECT 1 FROM flow_by_contract WHERE symbol = $1 LIMIT 1",
             symbol,
@@ -5981,6 +6050,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
             return []
 
+    @staticmethod
+    def _hedging_snapshot_scope(
+        session_date: date,
+        strikes: Optional[List[float]],
+        expirations: Optional[List[date]],
+    ) -> Optional[str]:
+        """Which materialised scope answers this filter, or None for neither.
+
+        ``hedging_flow_5min`` stores two series per session: the unfiltered
+        one and the session's own expiry. Those are the only two the page can
+        ask for, so anything else -- a strike list, a different expiration --
+        has to fall through to the live CTE and is bounded by the prune window
+        like every other filtered flow read.
+        """
+        if strikes:
+            return None
+        if not expirations:
+            return SCOPE_ALL
+        if len(expirations) == 1 and expirations[0] == session_date:
+            return SCOPE_0DTE
+        return None
+
     async def get_hedging_flow_series(
         self,
         symbol: str = "SPY",
@@ -5988,6 +6079,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         strikes: Optional[List[float]] = None,
         expirations: Optional[List[date]] = None,
         intervals: Optional[int] = None,
+        session_date: Optional[date] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Return 5-minute estimated hedging-pressure bars for a session.
 
@@ -5996,16 +6088,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         the same unfiltered underlying price, so the two series overlay
         exactly. Rows are newest-first; ``intervals=N`` returns the leading N.
 
-        Returns ``None`` when the symbol has never appeared in
-        flow_by_contract (caller surfaces 404), and ``[]`` when the symbol
-        exists but the resolved session has no flow.
+        Returns ``None`` when the symbol is unknown (caller surfaces 404), and
+        ``[]`` when the symbol exists but the resolved session has no flow.
 
-        There is no snapshot path here yet -- unlike flow-series this always
-        runs the CTE. It reads ``flow_contract_facts`` (already per-bucket
-        deltas, so no LAG-and-recumulate), which is a materially cheaper scan
-        than the flow-series pipeline; if it ever stops being cheap enough,
-        the query's window invariance makes it snapshot-able with the same
-        argument flow_series_5min uses.
+        Two read paths, and which one runs is decided by the QUESTION, not by
+        cost
+        -----------------------------------------------------------------
+        A live read (no ``session_date``) runs the canonical CTE, exactly as
+        before. It reads ``flow_contract_facts`` -- already per-bucket deltas,
+        so no LAG-and-recumulate -- and is the cheap one; there is nothing to
+        gain by reading a snapshot that is at most one analytics cycle behind
+        the tape the page is watching.
+
+        A DATED read serves ``hedging_flow_5min`` instead, and not for speed:
+        ``flow_contract_facts`` is pruned at ``DATA_RETENTION_DAYS`` (90), so
+        recomputing a session older than that returns an empty series that a
+        reader cannot distinguish from a quiet day. The snapshot is written
+        once per cycle from the same canonical SQL and kept forever, which is
+        the only reason a permalink from last spring still draws a chart.
+
+        A dated read whose filter neither stored scope covers falls back to
+        the CTE and inherits its 90-day horizon -- the same tradeoff
+        ``flow_series_5min`` makes for filtered reads.
         """
         symbol = symbol.upper()
 
@@ -6016,7 +6120,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if use_cache:
             strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
             exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
-            cache_key = f"hedging_flow:{symbol}:{session}:{strikes_key}:{exps_key}"
+            session_key = session_date.isoformat() if session_date else session
+            cache_key = f"hedging_flow:{symbol}:{session_key}:{strikes_key}:{exps_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached  # type: ignore[no-any-return]
@@ -6027,7 +6132,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
                 if resolved is None:
                     return None
                 session_start, session_end, has_session_data = resolved
@@ -6036,19 +6143,38 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
                     return []
 
-                rows = await asyncio.wait_for(
-                    self._fetch_timed(
-                        conn,
-                        HEDGING_FLOW_CTE_ASYNCPG,
-                        symbol,
-                        session_start,
-                        session_end,
-                        strikes_arg,
-                        expirations_arg,
-                        timeout=15.0,
-                    ),
-                    timeout=15.0,
+                scope = (
+                    self._hedging_snapshot_scope(session_date, strikes, expirations)
+                    if session_date is not None
+                    else None
                 )
+                if scope is not None:
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            HEDGING_FLOW_SNAPSHOT_SELECT_ASYNCPG,
+                            symbol,
+                            scope,
+                            session_start,
+                            session_end,
+                            timeout=10.0,
+                        ),
+                        timeout=10.0,
+                    )
+                else:
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            HEDGING_FLOW_CTE_ASYNCPG,
+                            symbol,
+                            session_start,
+                            session_end,
+                            strikes_arg,
+                            expirations_arg,
+                            timeout=15.0,
+                        ),
+                        timeout=15.0,
+                    )
                 result = [dict(row) for row in rows]
                 if intervals is not None and intervals > 0 and len(result) > intervals:
                     # Newest-first; leading N == most recent N buckets.
@@ -6060,11 +6186,69 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Hedging flow query timed out for {symbol}, returning empty")
             return []
 
+    async def get_hedging_flow_sessions(
+        self,
+        symbol: str = "SPY",
+        limit: int = 60,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Trading days that have stored hedging-flow bars, newest first.
+
+        The index behind the dated permalinks, and deliberately a list of days
+        that HAVE data rather than a date picker: a picker invites a reader to
+        land on an empty session and conclude the feature is broken, which is
+        the same reason /replay and /scorecard both ship a session list.
+
+        Read off ``hedging_flow_5min`` alone -- never the pruned source
+        tables -- so the list and the pages it links to agree about which
+        sessions exist for as long as the snapshots are kept.
+
+        Returns ``None`` for an unknown symbol (404) and ``[]`` for a known
+        symbol with nothing stored yet.
+        """
+        symbol = symbol.upper()
+        cache_key = f"hedging_flow_sessions:{symbol}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        try:
+            async with self._acquire_connection() as conn:
+                known = await conn.fetchval(
+                    "SELECT 1 FROM symbols WHERE symbol = $1 LIMIT 1", symbol
+                )
+                if not known:
+                    known = await conn.fetchval(
+                        "SELECT 1 FROM flow_by_contract WHERE symbol = $1 LIMIT 1", symbol
+                    )
+                if not known:
+                    return None
+
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(
+                        conn,
+                        HEDGING_FLOW_SESSIONS_ASYNCPG,
+                        symbol,
+                        limit,
+                        timeout=10.0,
+                    ),
+                    timeout=10.0,
+                )
+                result = [dict(row) for row in rows]
+                # The session list changes once per trading day; the endpoint
+                # TTL is the same one the series reads use so a deploy tunes
+                # both together.
+                self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Hedging flow sessions query timed out for {symbol}, returning empty")
+            return []
+
     async def get_gamma_regime_series(
         self,
         symbol: str = "SPY",
         session: str = "current",
         intervals: Optional[int] = None,
+        session_date: Optional[date] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Read the materialised intraday Gamma Regime series for a session.
 
@@ -6079,26 +6263,37 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         Session resolution is :meth:`_resolve_flow_series_session` -- the SAME
         window the flow series uses -- so the structure line and the flow line
-        cover identical bars and can be stacked without re-aligning.
+        cover identical bars and can be stacked without re-aligning. That is
+        also why ``session_date`` is threaded through here rather than handled
+        locally: a dated structure panel that resolved its own window could
+        drift a bar from the flow panel it is crosshaired to.
 
-        Returns ``None`` for a symbol with no flow history at all (404), and
-        ``[]`` when the session resolves but nothing has been written for it
-        yet (a session before the writer was deployed, or a cold engine).
-        Rows are newest-first, matching the other series endpoints.
+        This series needed nothing else to become historical.
+        ``gamma_regime_5min`` has been written per bar since the panel
+        shipped and is already absent from ``DB_MAINTAIN_TABLES``, so the rows
+        for a past session are simply there.
+
+        Returns ``None`` for an unknown symbol (404), and ``[]`` when the
+        session resolves but nothing has been written for it (a session before
+        the writer was deployed, or a cold engine). Rows are newest-first,
+        matching the other series endpoints.
         """
         symbol = symbol.upper()
 
         use_cache = intervals is None
         cache_key = None
         if use_cache:
-            cache_key = f"gamma_regime_series:{symbol}:{session}"
+            session_key = session_date.isoformat() if session_date else session
+            cache_key = f"gamma_regime_series:{symbol}:{session_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached  # type: ignore[no-any-return]
 
         try:
             async with self._acquire_connection() as conn:
-                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
                 if resolved is None:
                     return None
                 session_start, session_end, has_session_data = resolved

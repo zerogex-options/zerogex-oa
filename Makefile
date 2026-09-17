@@ -3403,6 +3403,18 @@ flow-series-backfill: ## Backfill flow_series_5min (current + prior session) bef
 	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"
 	@$(PY) -m src.tools.flow_series_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS)
 
+# Run this ONCE, SOON, after `make schema-apply` creates hedging_flow_5min.
+# Every session older than the engine's first write exists only in
+# flow_contract_facts, which db-prune deletes at DATA_RETENTION_DAYS — so the
+# reachable history shrinks by a day per day until this has run. Afterwards it
+# is only a repair tool: the engine keeps the table current by itself.
+# Idempotent; DAYS=<n> to narrow, DRY_RUN=1 to list the sessions first.
+.PHONY: hedging-flow-backfill
+hedging-flow-backfill: ## Seed hedging_flow_5min history from retained flow facts (run once, soon — the source is on a 90-day clock)
+	@echo "$(BLUE)=== Backfilling hedging_flow_5min ===$(NC)"
+	@$(PY) -m src.tools.hedging_flow_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS) \
+		$(if $(DAYS),--days $(DAYS),) $(if $(DRY_RUN),--dry-run,)
+
 # Verification gate for phase-1 -> phase-2: diff the snapshot against the
 # live CTE row-for-row. DSN is auto-derived from the same DB_* vars
 # schema-apply uses (.env), authenticating via ~/.pgpass exactly like the
@@ -3424,6 +3436,24 @@ flow-series-parity: ## Diff flow_series_5min vs the live CTE (auto-uses DB_* fro
 		FLOW_SERIES_PARITY_SYMBOL="$(FLOW_SERIES_PARITY_SYMBOL)" \
 		FLOW_SERIES_PARITY_SESSION="$(FLOW_SERIES_PARITY_SESSION)" \
 		$(PY) -m pytest tests/test_flow_series_parity.py -m integration --no-cov -q
+
+# The hedging twin. Unlike flow-series-parity this one seeds its own synthetic
+# session under a sentinel symbol, so it needs no market data and can run
+# against a scratch database — the assertions are about the SQL, not the tape.
+HEDGING_FLOW_PARITY_SYMBOL ?= ZZTEST
+
+.PHONY: hedging-flow-parity
+hedging-flow-parity: ## Diff hedging_flow_5min vs the live CTE, + the convergence and 0DTE guarantees (override HEDGING_FLOW_PARITY_DSN=...)
+	@echo "$(BLUE)=== hedging_flow_5min parity vs live CTE ===$(NC)"
+	@DSN="$(HEDGING_FLOW_PARITY_DSN)"; \
+	if [ -z "$$DSN" ]; then \
+		DSN="postgresql://$(DB_USER)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=require"; \
+		echo "$(YELLOW)Auto-derived DSN from .env DB_*: $$DSN$(NC)"; \
+	fi; \
+	PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
+		HEDGING_FLOW_PARITY_DSN="$$DSN" \
+		HEDGING_FLOW_PARITY_SYMBOL="$(HEDGING_FLOW_PARITY_SYMBOL)" \
+		$(PY) -m pytest tests/test_hedging_flow_snapshot_sql.py -m integration --no-cov -q
 
 .PHONY: ci-parity
 ci-parity: ## End-to-end flow-series parity: apply schema, seed deterministic fixture via incremental writer, run parity test against canonical CTE oracle. Defaults to localhost test DB; override CI_PARITY_DSN=postgres://...
@@ -3494,9 +3524,18 @@ DB_EXPIRY_PRUNE_TABLES = option_chains_latest
 # DATA_RETENTION_DAYS when an operator asks for it — but it takes constant
 # upsert churn and would otherwise never be vacuumed.
 #
+# hedging_flow_5min is here for a different reason: nothing else owns its
+# retention because it is meant to be kept FOREVER. It is the stored form of
+# the Hedging Flow page's dated permalinks, and its own source table
+# (flow_contract_facts) is pruned above — so putting it in DB_MAINTAIN_TABLES
+# would delete exactly the history that exists BECAUSE the source is deleted.
+# It still takes upsert churn on every analytics cycle and so still needs the
+# vacuum half. Same standing as gex_summary and underlying_quotes, which came
+# off the prune list on 2026-08-25.
+#
 # Distinct from DB_EXPIRY_PRUNE_TABLES above: these are vacuumed only, while
 # those are ALSO pruned by db-prune on their expiration column.
-DB_VACUUM_EXTRA_TABLES = futures_quotes
+DB_VACUUM_EXTRA_TABLES = futures_quotes hedging_flow_5min
 
 .PHONY: db-prune
 db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
