@@ -367,3 +367,167 @@ def test_flip_none_for_degenerate_inputs():
     assert compute_gamma_flip_from_strikes(rows, spot_price=0.0) is None
     assert compute_gamma_flip_from_strikes([], spot_price=100.0) is None
     assert compute_gamma_flip_from_strikes([_flip_row(100.0, 1.0, 2.0)], 100.0) is None
+
+
+# ---------------------------------------------------------------------------
+# compute_gamma_flip_from_strikes — the canonical gates
+#
+# The cumulative curve starts at ~0 on the lowest strike and ends at the book's
+# TOTAL net gamma.  When that total is negative — the ordinary afternoon 0DTE
+# state — the curve leaves zero through the put mass and never returns, so the
+# only sign changes left are in the deep-OTM tail where γ × OI has decayed to
+# denormal-small values.  Ungated, the nearest-crossing scan reported the top
+# edge of that noise band as the flip: a line drawn tens of dollars below the
+# whole gamma cluster (SPY, 2026-09-16, 0DTE filter — flip 739 against a
+# cluster at 750-758 and spot 753.87).
+# ---------------------------------------------------------------------------
+
+import math  # noqa: E402
+
+from src.config import (  # noqa: E402
+    GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT,
+)
+
+
+def _tail_noise_book(
+    spot: float = 753.87,
+    put_centre: float = 750.0,
+    put_peak: float = 42000.0,
+    call_centre: float = 757.5,
+    call_peak: float = 26000.0,
+    lo: float = 600.0,
+    hi: float = 900.0,
+) -> list:
+    """A 0DTE-shaped book: real gamma in a tight band around spot, and a long
+    deep-OTM tail whose γ × OI underflows towards zero.
+
+    ``put_peak > call_peak`` makes the whole book net SHORT, which is what
+    strands the cumulative curve below zero and leaves only tail crossings.
+
+    The tail's open interest is deliberately LUMPY (deterministic, no RNG —
+    round strikes carry more, and the call/put skew varies strike to strike).
+    A smooth tail pushes its crossings far enough down that the
+    actionable-distance gate would catch them on its own; real chains are
+    uneven, which walks a crossing back up to within a few percent of spot
+    where only the structural gate can reject it.  That is the case this
+    fixture has to reproduce.
+    """
+    ttm = 2.0 / (24 * 365)  # ~2h to expiry, the 2:45 PM bucket
+
+    def gamma(strike: float) -> float:
+        # Wing IV rises steeply, so tail gamma decays smoothly towards zero
+        # instead of hitting a clean 0 — exactly how a real chain looks.
+        iv = 0.13 + 2.2 * (abs(math.log(strike / spot)) ** 1.6)
+        d1 = (math.log(spot / strike) + (0.04 + 0.5 * iv * iv) * ttm) / (iv * math.sqrt(ttm))
+        return math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi) / (spot * iv * math.sqrt(ttm))
+
+    def bell(strike: float, centre: float, peak: float) -> float:
+        return peak * math.exp(-((strike - centre) ** 2) / (2 * 7.0 ** 2))
+
+    def floors(strike: float) -> tuple:
+        n = int(strike)
+        call_floor = 200.0 + 900.0 * ((n * 7919) % 17) / 16.0
+        put_floor = 200.0 + 900.0 * ((n * 6271) % 19) / 18.0
+        if n % 10 == 0:  # round strikes carry outsized OI
+            call_floor *= 3.0
+            put_floor *= 3.0
+        return call_floor, put_floor
+
+    rows = []
+    strike = lo
+    while strike <= hi:
+        g = gamma(strike)
+        call_floor, put_floor = floors(strike)
+        rows.append(
+            _flip_row(
+                strike,
+                g * (bell(strike, call_centre, call_peak) + call_floor),
+                g * (bell(strike, put_centre, put_peak) + put_floor),
+            )
+        )
+        strike += 1.0
+    return rows
+
+
+def test_flip_rejects_deep_otm_noise_crossing_on_a_net_short_book():
+    """The reported regression: a net-short 0DTE book must resolve to NULL,
+    not to the top of its noise tail."""
+    rows = _tail_noise_book()
+    spot = 753.87
+
+    total = sum(r["call_gamma"] - r["put_gamma"] for r in rows)
+    assert total < 0, "fixture must be net short for this to be the stranded case"
+
+    assert compute_gamma_flip_from_strikes(rows, spot_price=spot) is None
+
+
+def test_flip_noise_crossing_would_otherwise_pass_the_distance_gate():
+    """Guards the gate that actually does the work here.
+
+    The tail crossing sits ~4% below spot — comfortably inside
+    ``GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT``.  Distance alone never catches it;
+    it is the structural (noise-floor) gate that must.
+    """
+    rows = _tail_noise_book()
+    spot = 753.87
+
+    agg: dict = {}
+    for row in rows:
+        agg[row["strike"]] = agg.get(row["strike"], 0.0) + row["call_gamma"] - row["put_gamma"]
+    running = 0.0
+    curve = []
+    for strike in sorted(agg):
+        running += agg[strike]
+        curve.append((strike, running))
+
+    ungated = []
+    for i in range(len(curve) - 1):
+        (s1, c1), (s2, c2) = curve[i], curve[i + 1]
+        if c1 == 0.0:
+            ungated.append(s1)
+        elif c1 * c2 < 0.0:
+            ungated.append(s1 + (s2 - s1) * (-c1) / (c2 - c1))
+    assert ungated, "fixture must still contain raw tail crossings"
+
+    nearest = min(ungated, key=lambda c: abs(c - spot))
+    assert abs(nearest - spot) / spot <= GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT
+    # ...and the gamma at that level is indistinguishable from zero.
+    peak = max(abs(v) for v in agg.values())
+    local = max(abs(v) for k, v in agg.items() if abs(k - nearest) <= 0.01 * nearest)
+    assert local < 1e-20 * peak
+
+
+def test_flip_keeps_a_genuine_crossing_amid_real_gamma():
+    """The gates must not blank a real flip: put mass below, call mass above,
+    both heavy, so the cumulative genuinely dives and climbs back through
+    zero in the middle of the book."""
+    rows = _tail_noise_book(
+        put_centre=748.0, put_peak=46000.0, call_centre=760.0, call_peak=50000.0
+    )
+    spot = 753.87
+
+    flip = compute_gamma_flip_from_strikes(rows, spot_price=spot)
+    assert flip is not None, "a crossing sitting in real gamma must survive the gates"
+    assert 748.0 <= flip <= 760.0, f"flip {flip} should land between the two masses"
+
+    # And it sits ON the gamma cluster, not beside it.
+    agg: dict = {}
+    for row in rows:
+        agg[row["strike"]] = agg.get(row["strike"], 0.0) + row["call_gamma"] - row["put_gamma"]
+    peak = max(abs(v) for v in agg.values())
+    local = max(abs(v) for k, v in agg.items() if abs(k - flip) <= 2.0)
+    assert local > 0.1 * peak
+
+
+def test_flip_gates_survive_a_much_wider_chain():
+    """Widening the strike range must not dilute the reference into accepting
+    the tail — the dilution pathology the canonical resolver's anchored
+    reference exists to prevent."""
+    wide = _tail_noise_book(lo=400.0, hi=1100.0)
+    assert compute_gamma_flip_from_strikes(wide, spot_price=753.87) is None
+
+    genuine_wide = _tail_noise_book(
+        put_centre=748.0, put_peak=46000.0, call_centre=760.0, call_peak=50000.0,
+        lo=400.0, hi=1100.0,
+    )
+    assert compute_gamma_flip_from_strikes(genuine_wide, spot_price=753.87) is not None
