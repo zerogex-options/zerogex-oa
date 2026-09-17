@@ -287,9 +287,7 @@ def test_a_narrower_band_request_is_not_ranked_against_the_stored_scope(monkeypa
         return _history_rows(option_type, [1.0, 1.2, 1.1, 1.3, 1.15])
 
     client = _client(monkeypatch, history=history)
-    body = client.get(
-        "/api/market/spreads?symbol=SPX&moneyness_band_pct=2"
-    ).json()
+    body = client.get("/api/market/spreads?symbol=SPX&moneyness_band_pct=2").json()
 
     assert body["history"] is None
     assert body["puts"]["median_relative_spread_pct"] is not None
@@ -353,9 +351,7 @@ def test_the_comparison_withholds_its_percentile_off_scope(monkeypatch):
         return _history_rows(option_type, [1.0, 1.2, 1.1, 1.3, 1.15])
 
     client = _client(monkeypatch, history=history)
-    rows = client.get(
-        "/api/market/spreads/compare?symbols=SPX&dte_max=0"
-    ).json()["rows"]
+    rows = client.get("/api/market/spreads/compare?symbols=SPX&dte_max=0").json()["rows"]
 
     assert rows[0]["puts_percentile"] is None
     assert rows[0]["puts"]["median_relative_spread_pct"] is not None

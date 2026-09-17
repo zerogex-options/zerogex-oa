@@ -477,8 +477,7 @@ async def _history_context(
             if r.get("median_relative_spread_pct") is not None
             and r.get("trading_date") != session_date
             and int(r.get("dte_max") or -1) == int(dte_max)
-            and float(r.get("moneyness_band_pct") or -1.0)
-            == float(moneyness_band_pct)
+            and float(r.get("moneyness_band_pct") or -1.0) == float(moneyness_band_pct)
             # Outage-thin sessions are excluded here as well as at write
             # time, so a row seeded before the floor existed — or by an
             # operator running with a lower one — still cannot pull a

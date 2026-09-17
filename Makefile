@@ -1143,6 +1143,9 @@ help: ## Show this help message
 	@echo "  make futures-roll-check - Which contract month the feed is on; finds roll splices"
 	@echo "  make futures-carry-check- Is the ES/NQ carry fallback configured right?"
 	@echo ""
+	@echo "$(GREEN)Liquidity / Spreads:$(NC)"
+	@echo "  make spread-report      - Have index put spreads widened lately? (SYMBOLS=SPX,NDX DAYS=60 RECENT=10)"
+	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
 	@echo "  make query SQL=\"...\"  - Run custom query"
@@ -3681,6 +3684,30 @@ futures-feed-logs: ## Futures ingester journal around a reported delay (reconnec
 		--tz $(or $(TZ_LOCAL),Europe/London) \
 		--pre $(or $(PRE),45) \
 		--post $(or $(POST),120)
+
+# Default symbol set for spread-report. A literal `SPX,NDX,SPY,QQQ` inside
+# `$(or ...)` would be read as four arguments and collapse to `SPX`.
+SPREAD_REPORT_SYMBOLS := SPX,NDX,SPY,QQQ
+
+.PHONY: spread-report
+spread-report: ## Have index put spreads actually widened lately? Read-only rollup report. SYMBOLS=SPX,NDX DAYS=60 RECENT=10 BAND=5 DTE=7 SIDE=P
+	@echo "$(BLUE)=== Spread regime report ===$(NC)"
+	@echo "$(YELLOW)Reads daily_spread_stats and spread_surface_stats — the same$(NC)"
+	@echo "$(YELLOW)rollups the Spread Monitor reads, so the figures match the page.$(NC)"
+	@echo "$(YELLOW)0DTE is ranked from the surface table, against 0DTE at the same$(NC)"
+	@echo "$(YELLOW)time of day: the daily rollup stores ONE scope and cannot answer$(NC)"
+	@echo "$(YELLOW)it. Quoted NBBO widths, no sizes. Read-only.$(NC)"
+	@echo ""
+	@$(PSQL) \
+		-v symbols=$(or $(SYMBOLS),$(SPREAD_REPORT_SYMBOLS)) \
+		-v dte_max=$(or $(DTE),7) \
+		-v band=$(or $(BAND),5) \
+		-v days=$(or $(DAYS),60) \
+		-v recent=$(or $(RECENT),10) \
+		-v min_contracts=$(or $(MIN_CONTRACTS),100) \
+		-v min_sessions=$(or $(MIN_SESSIONS),8) \
+		-v option_type=$(or $(SIDE),P) \
+		-f setup/database/diagnostics/spread_regime_report.sql
 
 .PHONY: tradeworkz-check
 tradeworkz-check: ## Run TradeWorkz accounting invariants (on-demand DB audit)
