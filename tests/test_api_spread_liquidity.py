@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
+from src.config import SPREAD_STATS_DTE_MAX, SPREAD_STATS_MONEYNESS_BAND_PCT
+
 
 SESSION_DATE = date(2026, 9, 10)
 SNAPSHOT_TS = datetime(2026, 9, 10, 18, 0, tzinfo=timezone.utc)
@@ -251,6 +253,65 @@ def test_history_rows_measured_under_a_different_scope_are_excluded(monkeypatch)
     assert client.get("/api/market/spreads?symbol=SPX").json()["history"] is None
 
 
+def test_a_narrower_dte_request_is_not_ranked_against_the_stored_scope(monkeypatch):
+    """The 0DTE filter must not be scored against a through-7DTE rollup.
+
+    The regression this pins: the live reading was reduced to whatever scope
+    the caller asked for, but the window it was ranked against was pinned to
+    the rollup's own scope. Selecting "0DTE only" — the scope a trader picks
+    precisely to check the front expiry — therefore compared the structurally
+    widest book of the year against a through-7DTE distribution and reported
+    "widest 5% of sessions" every session.
+    """
+
+    def history(symbol, option_type, days):
+        return _history_rows(option_type, [1.0, 1.2, 1.1, 1.3, 1.15])
+
+    client = _client(monkeypatch, history=history)
+    body = client.get("/api/market/spreads?symbol=SPX&dte_max=0").json()
+
+    assert body["history"] is None
+    # The measurement survives; only the ranking is withheld.
+    assert body["puts"]["median_relative_spread_pct"] is not None
+
+
+def test_a_narrower_band_request_is_not_ranked_against_the_stored_scope(monkeypatch):
+    """Same rule on the other axis, where the bias runs the other way.
+
+    A +/-2% band holds the expensive near-the-money contracts, whose width is
+    a smaller share of their own premium — so ranking it against +/-5% history
+    reported "tighter than usual" on an ordinary day rather than wider.
+    """
+
+    def history(symbol, option_type, days):
+        return _history_rows(option_type, [1.0, 1.2, 1.1, 1.3, 1.15])
+
+    client = _client(monkeypatch, history=history)
+    body = client.get(
+        "/api/market/spreads?symbol=SPX&moneyness_band_pct=2"
+    ).json()
+
+    assert body["history"] is None
+    assert body["puts"]["median_relative_spread_pct"] is not None
+
+
+def test_the_default_scope_still_ranks(monkeypatch):
+    """The guard rejects a mismatch, not the comparison itself."""
+
+    def history(symbol, option_type, days):
+        return _history_rows(option_type, [1.0, 1.2, 1.1, 1.3, 1.15])
+
+    client = _client(monkeypatch, history=history)
+    body = client.get(
+        "/api/market/spreads?symbol=SPX"
+        f"&dte_max={int(SPREAD_STATS_DTE_MAX)}"
+        f"&moneyness_band_pct={float(SPREAD_STATS_MONEYNESS_BAND_PCT)}"
+    ).json()
+
+    assert body["history"]["sessions"] == 5
+    assert body["history"]["puts_percentile"] is not None
+
+
 def test_todays_own_row_is_excluded_from_its_own_window(monkeypatch):
     """Ranking a reading against itself drags it toward the middle."""
 
@@ -279,6 +340,25 @@ def test_outage_thin_sessions_are_excluded_from_the_percentile(monkeypatch):
     client = _client(monkeypatch, history=history)
     body = client.get("/api/market/spreads?symbol=SPX").json()
     assert body["history"]["sessions"] == 2
+
+
+def test_the_comparison_withholds_its_percentile_off_scope(monkeypatch):
+    """The cross-symbol table has its own expiry pills, and the same trap.
+
+    Its "vs its own history" column is the snapshot's percentile by another
+    name, so a 0DTE comparison must rank against 0DTE history or not at all.
+    """
+
+    def history(symbol, option_type, days):
+        return _history_rows(option_type, [1.0, 1.2, 1.1, 1.3, 1.15])
+
+    client = _client(monkeypatch, history=history)
+    rows = client.get(
+        "/api/market/spreads/compare?symbols=SPX&dte_max=0"
+    ).json()["rows"]
+
+    assert rows[0]["puts_percentile"] is None
+    assert rows[0]["puts"]["median_relative_spread_pct"] is not None
 
 
 def test_a_broken_rollup_does_not_take_the_page_down(monkeypatch):

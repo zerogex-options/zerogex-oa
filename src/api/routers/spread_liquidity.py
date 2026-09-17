@@ -435,6 +435,8 @@ async def _history_context(
     symbol: str,
     reduced: Dict[str, Any],
     days: int,
+    dte_max: int,
+    moneyness_band_pct: float,
 ) -> Optional[HistoryContext]:
     """Rank today's widths against the symbol's own trailing sessions.
 
@@ -443,6 +445,17 @@ async def _history_context(
     a percentile across two different populations ranks the populations.
     Sessions whose anchor snapshot was too thin to measure are excluded for
     the same reason — an ingestion outage is not a quiet market.
+
+    The scope that rows are matched against is the one the CALLER asked
+    for, not the one the rollup happens to write.  Those are the same only at
+    the default filters, and the difference is not cosmetic: ``dte_max=0``
+    reduces today's chain to the 0DTE book, which is structurally the widest
+    book of the year, while the stored rows still describe a through-7DTE
+    chain.  Ranking one against the other pinned the percentile near 100
+    every session and reported "widest 5% of sessions" on an ordinary
+    Tuesday — the page's one load-bearing verdict, wrong in the exact scope
+    a 0DTE trader selects to check it.  A scope the rollup never wrote now
+    yields no verdict, which the surfaces already render as "no baseline".
 
     Today's own rollup row is excluded from the population it is ranked
     against — including it would drag every reading toward the middle of
@@ -463,9 +476,9 @@ async def _history_context(
             for r in rows
             if r.get("median_relative_spread_pct") is not None
             and r.get("trading_date") != session_date
-            and int(r.get("dte_max") or -1) == int(SPREAD_STATS_DTE_MAX)
+            and int(r.get("dte_max") or -1) == int(dte_max)
             and float(r.get("moneyness_band_pct") or -1.0)
-            == float(SPREAD_STATS_MONEYNESS_BAND_PCT)
+            == float(moneyness_band_pct)
             # Outage-thin sessions are excluded here as well as at write
             # time, so a row seeded before the floor existed — or by an
             # operator running with a lower one — still cannot pull a
@@ -555,6 +568,14 @@ async def get_spread_snapshot(
 ):
     """Current quoted-width and liquidity across one symbol's near-dated chain.
 
+    ``history`` is null unless ``dte_max`` and ``moneyness_band_pct`` match a
+    scope the daily rollup actually stored — the writers pin one scope
+    (``SPREAD_STATS_DTE_MAX`` / ``SPREAD_STATS_MONEYNESS_BAND_PCT``), so any
+    other filter combination measures a population with no history behind it.
+    The live reading is still served; only the ranking is withheld.  Callers
+    wanting a ranked reading at another scope want ``/surface``, whose rollup
+    is stored per scope and per time of day.
+
     **Beta** — contract may change.
     """
     sym = symbol.upper()
@@ -581,7 +602,9 @@ async def get_spread_snapshot(
 
     history = None
     if history_days > 0:
-        history = await _history_context(db, sym, reduced, history_days)
+        history = await _history_context(
+            db, sym, reduced, history_days, dte_max, moneyness_band_pct
+        )
 
     response = SpreadSnapshotResponse(
         symbol=sym,
@@ -758,6 +781,12 @@ async def compare_spreads(
     ``unavailable`` set rather than being dropped — a missing row would read
     as "not compared", and a zeroed one as "perfectly tight".
 
+    ``puts_percentile`` follows the same rule as the snapshot endpoint's
+    ``history``: null unless the requested scope is one the daily rollup
+    stored.  The widths themselves are returned at whatever scope was asked
+    for — this panel carries its own expiry pills, and only the ranking is
+    scope-bound.
+
     **Beta** — contract may change.
     """
     requested = [s.strip().upper() for s in symbols.split(",") if s.strip()]
@@ -790,7 +819,9 @@ async def compare_spreads(
         by_type = reduced["by_type"]
         history = None
         if history_days > 0:
-            history = await _history_context(db, sym, reduced, history_days)
+            history = await _history_context(
+                db, sym, reduced, history_days, dte_max, moneyness_band_pct
+            )
 
         return CompareRow(
             symbol=sym,

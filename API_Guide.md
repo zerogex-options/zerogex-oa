@@ -997,6 +997,17 @@ measurement (below `SPREAD_STATS_MIN_CONTRACTS`, default 100; an ingestion
 outage is not a quiet market). "No comparison available" and "an ordinary
 day" are deliberately distinguishable.
 
+That includes the scope **you** asked for. The rollup writes one scope per
+session (`SPREAD_STATS_DTE_MAX` / `SPREAD_STATS_MONEYNESS_BAND_PCT`), so any
+other `dte_max` / `moneyness_band_pct` measures a population with no history
+behind it: the widths come back at the scope requested and the ranking is
+withheld rather than computed across two populations. `dte_max=0` is the case
+that matters — the 0DTE book is structurally the widest of the year, and
+ranking it against a through-7DTE window would report the widest 5% of
+sessions every session. For a ranked reading at another scope use
+`/api/market/spreads/surface`, whose rollup is stored per scope and per
+half-hour of the session.
+
 ### GET /api/market/spreads/series
 How today's widths moved through the session, one reading per bucket taken
 at the last chain snapshot inside it. Calls and puts are returned
@@ -1018,6 +1029,9 @@ tight").
 **Parameters:**
 - `symbols` (optional): comma-separated, max 8, default `SPX,NDX,SPY,QQQ`
 - `dte_max`, `moneyness_band_pct`, `history_days`: as above
+
+`puts_percentile` obeys the same scope rule as `history` above: null unless
+the requested scope is one the rollup stored.
 
 ### GET /api/market/spreads/history
 Trailing daily quoted-width history from the `daily_spread_stats` rollup —
