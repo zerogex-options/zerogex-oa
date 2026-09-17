@@ -51,13 +51,28 @@
 -- path: a median over 21 contracts and one over 684 are not the same
 -- measurement, and an ingestion outage is not a quiet market.
 --
+-- THE CLOCK, AND WHY §1 PRINTS IT
+-- ------------------------------
+-- Every historical row in daily_spread_stats froze at the last analytics
+-- cycle before the 16:00 ET close. TODAY's row has not frozen: it is
+-- whatever the most recent cycle wrote, which at 09:40 is a reading taken
+-- eleven minutes after the open. Spreads have a shape through the session
+-- and the open is the wide end of it, so ranking a morning reading against
+-- a window of closing readings flatters today upward.
+--
+-- So §1 and §3 print `as_of_et` beside `baseline_at_et` rather than
+-- assuming the two agree, and `skip_today = yes` drops the unfrozen
+-- session entirely — which is the honest setting for the REGIME question,
+-- where a half-formed session should not get a vote. Leave it off to see
+-- what the page is showing right now; the page has the same property.
+--
 -- Read-only. Run:
 --
 --   make spread-report
 --   make spread-report SYMBOLS=SPX,NDX DAYS=90 RECENT=5
 --
 -- Variables: symbols, dte_max, band, days, recent, min_contracts,
--- min_sessions, option_type.
+-- min_sessions, option_type, skip_today.
 
 \set ON_ERROR_STOP on
 
@@ -69,6 +84,7 @@
 \if :{?min_contracts} \else \set min_contracts 100               \endif
 \if :{?min_sessions}  \else \set min_sessions  8                 \endif
 \if :{?option_type}   \else \set option_type   'P'               \endif
+\if :{?skip_today}    \else \set skip_today    'no'              \endif
 
 \echo ''
 \echo '================================================================'
@@ -78,9 +94,15 @@
 \echo 'sentence. pctile is where the latest session ranks among the'
 \echo 'prior ones; 100 means wider than every one of them.'
 \echo ''
+\echo 'CHECK as_of_et AGAINST baseline_at_et FIRST. Historical rows froze'
+\echo 'near the 16:00 ET close; today has not frozen. A morning as_of'
+\echo 'against a 15:5x baseline ranks the time of day, not the session —'
+\echo 'run with skip_today=yes for a clean read.'
+\echo ''
 
 WITH scoped AS (
-    SELECT *
+    SELECT *,
+           MAX(trading_date) OVER (PARTITION BY underlying) AS newest_date
       FROM daily_spread_stats
      WHERE underlying = ANY (string_to_array(:'symbols', ','))
        AND dte_max = :dte_max
@@ -89,40 +111,59 @@ WITH scoped AS (
        AND median_relative_spread_pct IS NOT NULL
        AND trading_date > CURRENT_DATE - (:days || ' days')::interval
 ),
+usable AS (
+    -- The newest session is the only one that can still be unfrozen, and it
+    -- is identified by being newest rather than by the server clock: this
+    -- box runs UTC, so CURRENT_DATE rolls over at 20:00 ET and would call
+    -- the evening's live row yesterday's.
+    SELECT * FROM scoped
+     WHERE :'skip_today' <> 'yes' OR trading_date < newest_date
+),
 latest AS (
     SELECT DISTINCT ON (underlying, option_type) *
-      FROM scoped
+      FROM usable
      ORDER BY underlying, option_type, trading_date DESC
 ),
 ranked AS (
     SELECT l.underlying,
            l.option_type,
            l.trading_date,
+           l.source_timestamp,
            l.spot_price,
            l.median_relative_spread_pct                        AS today_pct,
            l.p90_relative_spread_pct                           AS today_p90,
+           l.median_spread                                     AS today_spread,
            l.median_spread_bps_underlying                      AS today_bps,
            l.zero_bid_pct + l.crossed_or_locked_pct            AS today_dead_pct,
            l.contract_count,
            percentile_cont(0.5) WITHIN GROUP (
                ORDER BY w.median_relative_spread_pct)          AS window_median,
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY EXTRACT(epoch FROM
+                   (w.source_timestamp AT TIME ZONE 'America/New_York')::time))
+                                                               AS window_clock,
            COUNT(w.*)                                          AS sessions,
            COUNT(*) FILTER (
                WHERE w.median_relative_spread_pct
                      <= l.median_relative_spread_pct)          AS at_or_below
       FROM latest l
-      LEFT JOIN scoped w
+      LEFT JOIN usable w
              ON w.underlying = l.underlying
             AND w.option_type = l.option_type
             AND w.trading_date <> l.trading_date
-     GROUP BY l.underlying, l.option_type, l.trading_date, l.spot_price,
-              l.median_relative_spread_pct, l.p90_relative_spread_pct,
+     GROUP BY l.underlying, l.option_type, l.trading_date, l.source_timestamp,
+              l.spot_price, l.median_relative_spread_pct,
+              l.p90_relative_spread_pct, l.median_spread,
               l.median_spread_bps_underlying, l.zero_bid_pct,
               l.crossed_or_locked_pct, l.contract_count
 )
 SELECT underlying                                   AS sym,
        option_type                                  AS side,
        trading_date                                 AS session,
+       TO_CHAR(source_timestamp AT TIME ZONE 'America/New_York', 'HH24:MI')
+                                                    AS as_of_et,
+       TO_CHAR(INTERVAL '1 second' * window_clock, 'HH24:MI')
+                                                    AS baseline_at_et,
        ROUND(today_pct::numeric, 2)                 AS width_pct,
        ROUND(today_p90::numeric, 2)                 AS p90_pct,
        ROUND(window_median::numeric, 2)             AS normal_pct,
@@ -133,6 +174,7 @@ SELECT underlying                                   AS sym,
             THEN ROUND(100.0 * at_or_below / sessions, 1) END
                                                     AS pctile,
        sessions,
+       ROUND(today_spread::numeric, 2)              AS width_dollars,
        ROUND(today_bps::numeric, 1)                 AS width_bps,
        ROUND(today_dead_pct::numeric, 1)            AS no_market_pct,
        contract_count                               AS contracts
@@ -217,6 +259,14 @@ WITH scoped AS (
        AND contract_count >= :min_contracts
        AND median_relative_spread_pct IS NOT NULL
        AND trading_date > CURRENT_DATE - (:days || ' days')::interval
+       -- An unfrozen session carries more weight here than anywhere else:
+       -- over a :recent of 5 it is a fifth of the "recent" side, taken at
+       -- the wide end of the session. See skip_today in the header.
+       AND (:'skip_today' <> 'yes'
+            OR trading_date < (SELECT MAX(d2.trading_date)
+                                 FROM daily_spread_stats d2
+                                WHERE d2.underlying = daily_spread_stats.underlying
+                                  AND d2.option_type = :'option_type'))
 ),
 split AS (
     SELECT underlying,
@@ -265,7 +315,9 @@ SELECT underlying                                   AS sym,
 \echo 'Each expiry bucket ranked against ITS OWN history in the same'
 \echo 'half-hour of the session — the only honest way to ask whether the'
 \echo 'front expiry is unusual, since 0DTE is the widest book of the year'
-\echo 'every day. b0 = 0DTE, b1 = 1DTE, b2_3, b4_7, b8_30. Below'
+\echo 'every day. b0 = 0DTE, b1 = 1DTE, b2_3, b4_7, b8_30. A bucket'
+\echo 'with no listed expiry today (2-3 DTE over a weekend) anchors on'
+\echo 'the last session that had one — read the session column. Below'
 \echo :min_sessions 'comparable sessions the page publishes no rank,'
 \echo 'and neither should you.'
 \echo ''
@@ -277,6 +329,13 @@ WITH scoped AS (
        AND option_type = :'option_type'
        AND band_pct = :band::real
        AND money_bucket = 'all'
+       -- The DISJOINT buckets only. surface_scopes stores two families
+       -- under money_bucket = 'all': these, and the cumulative universes
+       -- u0/u1/u7/u30 that back the summary strip. Listing both puts u0
+       -- beside b0 holding the identical number by construction, and
+       -- invites reading "0DTE is wide" off four rows that are the same
+       -- row. The cumulative view is §1's job; this is the by-expiry cut.
+       AND dte_scope IN ('b0', 'b1', 'b2_3', 'b4_7', 'b8_30')
        AND median_relative_spread_pct IS NOT NULL
        AND trading_date > CURRENT_DATE - (:days || ' days')::interval
 ),

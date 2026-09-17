@@ -1144,7 +1144,7 @@ help: ## Show this help message
 	@echo "  make futures-carry-check- Is the ES/NQ carry fallback configured right?"
 	@echo ""
 	@echo "$(GREEN)Liquidity / Spreads:$(NC)"
-	@echo "  make spread-report      - Have index put spreads widened lately? (SYMBOLS=SPX,NDX DAYS=60 RECENT=10)"
+	@echo "  make spread-report      - Have index put spreads widened lately? (SYMBOLS=SPX,NDX DAYS=60 SKIP_TODAY=yes)"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
@@ -3690,13 +3690,16 @@ futures-feed-logs: ## Futures ingester journal around a reported delay (reconnec
 SPREAD_REPORT_SYMBOLS := SPX,NDX,SPY,QQQ
 
 .PHONY: spread-report
-spread-report: ## Have index put spreads actually widened lately? Read-only rollup report. SYMBOLS=SPX,NDX DAYS=60 RECENT=10 BAND=5 DTE=7 SIDE=P
+spread-report: ## Have index put spreads actually widened lately? Read-only rollup report. SYMBOLS=SPX,NDX DAYS=60 RECENT=10 BAND=5 DTE=7 SIDE=P SKIP_TODAY=yes
 	@echo "$(BLUE)=== Spread regime report ===$(NC)"
 	@echo "$(YELLOW)Reads daily_spread_stats and spread_surface_stats — the same$(NC)"
 	@echo "$(YELLOW)rollups the Spread Monitor reads, so the figures match the page.$(NC)"
 	@echo "$(YELLOW)0DTE is ranked from the surface table, against 0DTE at the same$(NC)"
 	@echo "$(YELLOW)time of day: the daily rollup stores ONE scope and cannot answer$(NC)"
 	@echo "$(YELLOW)it. Quoted NBBO widths, no sizes. Read-only.$(NC)"
+	@echo "$(YELLOW)SKIP_TODAY=yes drops the still-unfrozen session, which is the$(NC)"
+	@echo "$(YELLOW)honest setting for 'has this changed lately' — today's row is$(NC)"
+	@echo "$(YELLOW)taken at whatever time you run this, the rest froze at 16:00.$(NC)"
 	@echo ""
 	@$(PSQL) \
 		-v symbols=$(or $(SYMBOLS),$(SPREAD_REPORT_SYMBOLS)) \
@@ -3707,6 +3710,7 @@ spread-report: ## Have index put spreads actually widened lately? Read-only roll
 		-v min_contracts=$(or $(MIN_CONTRACTS),100) \
 		-v min_sessions=$(or $(MIN_SESSIONS),8) \
 		-v option_type=$(or $(SIDE),P) \
+		-v skip_today=$(or $(SKIP_TODAY),no) \
 		-f setup/database/diagnostics/spread_regime_report.sql
 
 .PHONY: tradeworkz-check
