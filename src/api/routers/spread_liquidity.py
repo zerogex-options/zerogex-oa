@@ -1023,6 +1023,19 @@ class SurfaceSummary(BaseModel):
     vs_normal: Optional[float] = None
     percentile: Optional[float] = None
     two_sided_pct: Optional[float] = None
+    #: Coverage gets the same treatment the width gets, and for a sharper
+    #: reason: it is the number that matches the complaint. "Untradeable"
+    #: usually means a contract with NO bid rather than a wide one, and a
+    #: no-bid contract has no width to report — it is excluded from every
+    #: median above by construction. So a chain can read TIGHTER as its
+    #: wings go dead, and the width percentile will not say so.
+    #:
+    #: Read the direction the other way round from the widths: high is good
+    #: here. 51% two-sided on a 0DTE book at 15:30 sounds alarming and is
+    #: an ordinary afternoon; without a baseline there is no way to know
+    #: that from the number alone, which is why it now carries one.
+    two_sided_normal_pct: Optional[float] = None
+    two_sided_percentile: Optional[float] = None
     contract_count: int = 0
     sessions: int = 0
 
@@ -1109,7 +1122,9 @@ async def get_spread_surface(
     """The current quoted-spread surface against this symbol's own history.
 
     Answers, for one side of the book: is the market unusually wide right
-    now, and where across the strike surface is the deterioration.
+    now, where across the strike surface is the deterioration, and — the
+    question a width cannot answer — is an unusual share of the chain
+    carrying no market at all.
 
     Puts and calls are never blended. The question the view exists for is
     whether the PUTS specifically have gone wide, and that is only answerable
@@ -1196,14 +1211,32 @@ async def get_spread_surface(
             continue
         key = (row["dte_scope"], row["money_bucket"])
         history.setdefault(key, []).append(
-            (row["trading_date"], float(row["median_relative_spread_pct"]))
+            (
+                row["trading_date"],
+                float(row["median_relative_spread_pct"]),
+                row.get("two_sided_pct"),
+            )
         )
 
     def _hist(key: tuple) -> List[float]:
-        return [value for _, value in history.get(key, [])]
+        return [value for _, value, _ in history.get(key, [])]
 
     def _hist_dates(key: tuple) -> List[Any]:
-        return [day for day, _ in history.get(key, [])]
+        return [day for day, _, _ in history.get(key, [])]
+
+    def _hist_coverage(key: tuple) -> List[float]:
+        """The same window, on the share of the chain with a real market.
+
+        Filtered for nulls separately rather than alongside the widths: a
+        session can carry a width and no coverage figure, and dropping it
+        from both windows would shrink the width history to fix the other
+        one.
+        """
+        return [
+            float(coverage)
+            for _, _, coverage in history.get(key, [])
+            if coverage is not None
+        ]
 
     # --- summary -----------------------------------------------------------
     wide_key = (universe_key, spread_stats_mod.BAND_WIDE)
@@ -1213,14 +1246,19 @@ async def get_spread_surface(
         wide_cell.aggregate.median_relative_spread_pct if wide_cell else None
     )
     normal_pct = spread_stats_mod.percentile(wide_hist, 50) if wide_hist else None
+    wide_coverage = _hist_coverage(wide_key)
+    two_sided_now = wide_cell.aggregate.two_sided_pct if wide_cell else None
     summary = SurfaceSummary(
         current_pct=_round(current_pct, 3),
         normal_pct=_round(normal_pct, 3),
         vs_normal=_ratio(current_pct, normal_pct),
         percentile=_percentile_or_none(current_pct, wide_hist),
-        two_sided_pct=(
-            _round(wide_cell.aggregate.two_sided_pct, 2) if wide_cell else None
+        two_sided_pct=_round(two_sided_now, 2),
+        two_sided_normal_pct=_round(
+            spread_stats_mod.percentile(wide_coverage, 50) if wide_coverage else None,
+            2,
         ),
+        two_sided_percentile=_percentile_or_none(two_sided_now, wide_coverage),
         contract_count=wide_cell.aggregate.contract_count if wide_cell else 0,
         sessions=len(wide_hist),
     )
