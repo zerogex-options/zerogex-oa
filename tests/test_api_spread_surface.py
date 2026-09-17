@@ -123,6 +123,7 @@ def _surface_rows(
     band: float = 5.0,
     first_date: date = date(2026, 8, 1),
     scopes: Optional[List[tuple]] = None,
+    coverage: Optional[float] = 90.0,
 ) -> List[Dict[str, Any]]:
     """A stored window: one row per (session, scope), oldest first.
 
@@ -148,7 +149,11 @@ def _surface_rows(
                     "spot_price": SPOT,
                     "contract_count": 200,
                     "tradable_count": 195,
-                    "two_sided_pct": 97.5,
+                    # Wanders like the widths do, so a coverage percentile is
+                    # a real rank rather than a tie against a constant.
+                    "two_sided_pct": (
+                        None if coverage is None else coverage + ((day % 5) - 2) * 2.0
+                    ),
                     "zero_bid_pct": 2.5,
                     "crossed_or_locked_pct": 0.0,
                     "median_relative_spread_pct": median,
@@ -158,6 +163,20 @@ def _surface_rows(
                 }
             )
     return out
+
+
+def _chain_with_dead_puts(share: float = 0.5) -> Dict[str, Any]:
+    """The fixture chain with a share of its 0DTE puts quoted no-bid.
+
+    The failure a width statistic cannot express: these contracts have no
+    market, so they carry no width and are excluded from every median. The
+    chain can hold its median — or tighten — while this share climbs.
+    """
+    chain = _chain()
+    puts = [r for r in chain["rows"] if r["option_type"] == "P" and r["expiration"] == SESSION_DATE]
+    for row in puts[: int(len(puts) * share)]:
+        row["bid"] = 0.0
+    return chain
 
 
 class _StubDb:
@@ -412,3 +431,69 @@ def test_the_quoted_nbbo_disclosure_travels_with_the_surface(monkeypatch):
     body = _get(client, symbol="SPX", option_type="P", dte_max=0)
     assert body["basis"] == "quoted_nbbo"
     assert "not effective spreads" in body["disclosure"]
+
+
+# ---------------------------------------------------------------------------
+# Coverage, ranked
+# ---------------------------------------------------------------------------
+#
+# The share of the chain with a real two-sided market is the number that
+# matches the "untradeable" complaint, because "untradeable" usually means a
+# contract with NO bid rather than a wide one — and a no-bid contract has no
+# width, so it leaves every median by construction. A chain can therefore
+# read TIGHTER as its wings go dead. Until now this was the one figure on the
+# panel published without a baseline, which left "51% two-sided" unreadable:
+# alarming on its face, an ordinary afternoon in fact.
+
+
+def test_coverage_is_ranked_against_the_same_window(monkeypatch):
+    client, _ = _client(monkeypatch, window=_surface_rows(coverage=90.0))
+    summary = client.get("/api/market/spreads/surface?symbol=SPX").json()["summary"]
+
+    # Every contract in the fixture chain is two-sided, against a window
+    # that never exceeds 94 — so today is the best-covered session in it.
+    assert summary["two_sided_pct"] == 100.0
+    assert summary["two_sided_percentile"] == 100.0
+    assert summary["two_sided_normal_pct"] == 90.0
+
+
+def test_a_chain_going_no_bid_ranks_at_the_bottom(monkeypatch):
+    """The reading the width percentile cannot give you."""
+    client, _ = _client(
+        monkeypatch, chain=_chain_with_dead_puts(0.5), window=_surface_rows(coverage=90.0)
+    )
+    summary = client.get("/api/market/spreads/surface?symbol=SPX").json()["summary"]
+
+    assert summary["two_sided_pct"] < 60.0
+    assert summary["two_sided_percentile"] == 0.0
+
+
+def test_coverage_needs_the_same_session_floor_as_the_width(monkeypatch):
+    """Four days is not a distribution for coverage either."""
+    from src.config import SPREAD_SURFACE_MIN_SESSIONS
+
+    client, _ = _client(
+        monkeypatch,
+        window=_surface_rows(sessions=int(SPREAD_SURFACE_MIN_SESSIONS) - 1),
+    )
+    summary = client.get("/api/market/spreads/surface?symbol=SPX").json()["summary"]
+
+    assert summary["two_sided_percentile"] is None
+    # The measurement survives; only the rank is withheld.
+    assert summary["two_sided_pct"] is not None
+
+
+def test_missing_coverage_history_does_not_shrink_the_width_history(monkeypatch):
+    """Two windows, filtered separately.
+
+    A session can carry a width and no coverage figure. Dropping it from
+    both would fix the coverage rank by damaging the one beside it.
+    """
+    client, _ = _client(monkeypatch, window=_surface_rows(coverage=None))
+    body = client.get("/api/market/spreads/surface?symbol=SPX").json()
+
+    assert body["summary"]["two_sided_percentile"] is None
+    assert body["summary"]["two_sided_normal_pct"] is None
+    # The width ranking is untouched by the missing coverage column.
+    assert body["summary"]["percentile"] is not None
+    assert body["summary"]["sessions"] == 30

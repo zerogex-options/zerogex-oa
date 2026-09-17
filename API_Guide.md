@@ -1049,7 +1049,12 @@ nor `make daily-spread-stats-backfill` has run yet — not an error.
 ### GET /api/market/spreads/surface
 Today's quoted width across the strike surface, ranked against the same
 symbol's own history **in the same strike band at the same time of day**.
-Answers the question a width alone cannot: is this unusual, and where.
+Answers the questions a width alone cannot: is this unusual, where across
+the strikes, and how much of the chain has no market at all. That last one
+matters because "untradeable" usually means a contract with NO bid rather
+than a wide one — and a no-bid contract has no width, so it is excluded from
+every median by construction. A chain can read TIGHTER as its wings die, and
+only `two_sided_percentile` will say so.
 
 One side of the book per call. Puts and calls are never blended, because the
 reading the view exists for — "the puts went wide and the calls did not" —
@@ -1072,7 +1077,7 @@ called extreme because ±5% happens to be wider.
 
 | Field | What it carries |
 | --- | --- |
-| `summary` | The headline strip: `current_pct`, `normal_pct` (the median of the matched sessions), `vs_normal`, `percentile`, `two_sided_pct`, `contract_count`, `sessions`. |
+| `summary` | The headline strip: `current_pct`, `normal_pct` (the median of the matched sessions), `vs_normal`, `percentile`, `two_sided_pct`, `two_sided_normal_pct`, `two_sided_percentile`, `contract_count`, `sessions`. The two coverage baselines rank the same way the width does, over the same matched window and the same `SPREAD_SURFACE_MIN_SESSIONS` floor — but **high is good**: it is the share of the chain with a real two-sided market. Render it with the tone inverted, or the best-covered session of the quarter reads as an alarm. |
 | `baseline` | What the comparison was actually made against: `sessions`, `earliest_date`, `latest_date`, `time_matched`, `time_bucket_label` (e.g. `15:30-16:00 ET`), `fell_back_to_last_bucket`, `min_sessions`. |
 | `curve` | One entry per moneyness slice: `current_pct`, `historical_median_pct`, `historical_p25_pct`, `historical_p75_pct`, `percentile`, `vs_normal`, `sessions`. |
 | `by_dte` | One entry per disjoint expiry bucket (`b0`, `b1`, `b2_3`, `b4_7`, `b8_30`) with its `percentile` and `insufficient_history`. |
