@@ -51,7 +51,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.analytics.main_engine import AnalyticsEngine
 from src.database.connection import db_connection
-from src.market_calendar import ET, is_spx_am_settled_expiration
+from src.market_calendar import ET, is_am_settled_index_expiration
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -171,7 +171,7 @@ def _load_options(
             if not (
                 o["expiration"] == today_et
                 and not (o["option_symbol"] or "").upper().startswith("SPXW")
-                and is_spx_am_settled_expiration(engine.db_symbol, o["expiration"])
+                and is_am_settled_index_expiration(engine.db_symbol, o["expiration"])
             )
         ]
     return options

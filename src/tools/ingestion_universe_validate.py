@@ -50,7 +50,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from src.database.connection import db_connection
-from src.market_calendar import is_spx_am_settled_expiration
+from src.market_calendar import is_am_settled_index_expiration, pm_settled_root_for
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -91,10 +91,17 @@ def _fmt_et(ts: Optional[datetime]) -> str:
 
 
 def _is_am_settled(option_root: str, expiration) -> bool:
-    """Heuristic: AM-settled SPX monthly = root 'SPX' AND third-Friday."""
-    if option_root.upper() != "SPX":
+    """AM-settled index monthly = the AM root (SPX, NDX) AND third-Friday.
+
+    Keyed on the ROOT rather than the underlying, which is the one thing
+    this tool always has: ``SPXW`` and ``NDXP`` rows reach here as their own
+    roots and answer False on the date rule alone, without needing the
+    prefix branch the chain-reading paths do.
+    """
+    root = option_root.upper()
+    if pm_settled_root_for(root) is None:
         return False
-    return is_spx_am_settled_expiration("SPX", expiration)
+    return is_am_settled_index_expiration(root, expiration)
 
 
 def query_universe(underlying: str, max_stale_seconds: int) -> List[Dict[str, Any]]:

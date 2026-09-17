@@ -213,6 +213,79 @@ def test_empty_chain_is_404_not_a_zeroed_reading(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# AM-settled monthlies
+# ---------------------------------------------------------------------------
+
+
+def _am_settled_chain(symbol, dte_max, band):
+    """A third-Friday chain: settled monthlies beside live PM weeklies.
+
+    The monthly rows carry the marks a dead instrument accumulates after its
+    09:30 SOQ — no bid, or a width nobody would trade — which is exactly what
+    makes counting them report a liquidity event that did not happen.
+    """
+    spot = 24000.0
+    third_friday = date(2026, 9, 18)
+    rows = []
+    for strike, bid, ask, root in (
+        (spot - 100, 0.00, 180.00, "NDX"),    # settled monthly, no bid
+        (spot - 200, 5.00, 210.00, "NDX"),    # settled monthly, absurd width
+        (spot - 100, 40.00, 41.50, "NDXP"),   # live weekly, ordinary market
+        (spot - 200, 22.00, 23.00, "NDXP"),
+        (spot + 100, 38.00, 39.50, "NDXP"),
+    ):
+        rows.append(
+            {
+                "option_symbol": f"{root} 260918{'P' if strike < spot else 'C'}{int(strike)}",
+                "strike": strike,
+                "option_type": "P" if strike < spot else "C",
+                "expiration": third_friday,
+                "bid": bid,
+                "ask": ask,
+                "open_interest": 100,
+                "volume": 10,
+                "snapshot_ts": SNAPSHOT_TS,
+                "session_date": third_friday,
+            }
+        )
+    return {
+        "spot_price": spot,
+        "spot_timestamp": SNAPSHOT_TS,
+        "snapshot_ts": SNAPSHOT_TS,
+        "session_date": third_friday,
+        "rows": rows,
+    }
+
+
+def test_ndx_am_settled_monthlies_are_dropped_from_the_chain(monkeypatch):
+    """NDX settles AM on the third Friday, exactly as SPX does.
+
+    The rule existed but was spelled "SPX" in four places, so NDX carried its
+    settled monthlies through every monthly expiry — and the Spread Monitor,
+    which measures whatever the chain hands it, reported the resulting stale
+    marks as the market going untradeable.
+    """
+    client = _client(monkeypatch, chain=_am_settled_chain)
+    body = client.get("/api/market/spreads?symbol=NDX").json()
+
+    # Three NDXP contracts survive; the two settled NDX monthlies do not.
+    assert body["scope"]["contract_count"] == 3
+    assert body["all"]["zero_bid_pct"] == 0.0
+    # And the width is the live weeklies' width, not the dead monthlies'.
+    assert body["puts"]["median_relative_spread_pct"] < 10.0
+
+
+def test_the_pm_settled_weeklies_are_not_dropped_with_them(monkeypatch):
+    """The mirror-image bug: discarding live contracts on expiry day."""
+    client = _client(monkeypatch, chain=_am_settled_chain)
+    body = client.get("/api/market/spreads?symbol=NDX").json()
+
+    assert body["puts"]["contract_count"] == 2
+    assert body["calls"]["contract_count"] == 1
+    assert body["all"]["two_sided_pct"] == 100.0
+
+
+# ---------------------------------------------------------------------------
 # Historical context
 # ---------------------------------------------------------------------------
 

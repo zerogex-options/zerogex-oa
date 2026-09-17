@@ -50,7 +50,7 @@ from src.config import (
     SPREAD_STATS_MONEYNESS_BAND_PCT,
 )
 from src.database.connection import db_connection
-from src.market_calendar import is_spx_am_settled_expiration
+from src.market_calendar import is_am_settled_contract
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ _UPSERT_SQL = """
 
 
 def _keep_contract(symbol: str, option_symbol: Any, expiration: Any, day: Any) -> bool:
-    """Drop same-day SPX AM-settled contracts, as the live snapshot does.
+    """Drop same-day AM-settled index contracts, as the live snapshot does.
 
     Their SOQ happened at ~09:30 ET, so by the late-session anchor they are
     hours dead — quoted, if at all, at whatever wide marks the feed last
@@ -121,14 +121,13 @@ def _keep_contract(symbol: str, option_symbol: Any, expiration: Any, day: Any) -
     writer measures, so the backfill has to as well, or the seeded history
     would carry a monthly-expiry blowout the live series never records.
 
-    SPXW (weekly, PM-settled) shares the ``$SPX.X`` underlying and must NOT
-    be filtered, so the option-symbol prefix decides when it is available.
+    Covers SPX and NDX; the PM-settled series sharing each underlying
+    (SPXW, NDXP) is kept.  ``is_am_settled_contract`` owns that rule, so
+    this and the live path cannot drift apart.
     """
     if expiration != day:
         return True
-    if (option_symbol or "").upper().startswith("SPXW"):
-        return True
-    return not is_spx_am_settled_expiration(symbol, expiration)
+    return not is_am_settled_contract(symbol, option_symbol, expiration)
 
 
 def _backfill_symbol(

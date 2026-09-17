@@ -75,6 +75,13 @@
 -- min_sessions, option_type, skip_today.
 
 \set ON_ERROR_STOP on
+-- Never page. §1 is the widest table here (~180 columns of output) and on a
+-- narrower terminal psql hands it to $PAGER; less restores the screen when
+-- you leave it, so the table is gone from the scrollback the moment you press
+-- q. Which reads as "section 1 returned nothing" — a report whose whole job is
+-- to be read and pasted must not have a mode where its headline table
+-- disappears.
+\pset pager off
 
 \if :{?symbols}       \else \set symbols       'SPX,NDX,SPY,QQQ' \endif
 \if :{?dte_max}       \else \set dte_max       7                 \endif

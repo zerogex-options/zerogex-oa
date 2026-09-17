@@ -100,7 +100,7 @@ from src.config import (
     SPREAD_SURFACE_HISTORY_DAYS,
     SPREAD_SURFACE_MIN_SESSIONS,
 )
-from src.market_calendar import is_spx_am_settled_expiration
+from src.market_calendar import is_am_settled_contract
 from zoneinfo import ZoneInfo
 
 from ..database import DatabaseManager
@@ -337,24 +337,25 @@ def get_db() -> DatabaseManager:
 
 
 def _keep_contract(symbol: str, row: Dict[str, Any], session_date: date) -> bool:
-    """Drop same-day SPX AM-settled contracts from the measured chain.
+    """Drop same-day AM-settled index contracts from the measured chain.
 
     Their SOQ happens at ~09:30 ET, so for the rest of the session they are
     dead instruments whose rows linger with whatever marks the feed last
     carried — reliably no-bid or absurdly wide.  Counting them would report
-    a chain-wide liquidity event every third Friday.
+    a chain-wide liquidity event every third Friday, on the one day of the
+    month a reader is most likely to be checking whether the market has
+    gone untradeable.
 
-    SPXW (weekly, PM-settled) shares the ``$SPX.X`` underlying and must NOT
-    be dropped, so the option symbol decides whenever it is available.  The
-    analytics snapshot applies the same rule, which is what keeps the live
-    reading and the rollup measuring the same instruments.
+    Covers SPX and NDX; the PM-settled series that shares each underlying
+    (SPXW, NDXP) is kept.  ``is_am_settled_contract`` owns both halves of
+    that rule, and the analytics snapshot applies the same function, which
+    is what keeps the live reading and the rollup measuring the same
+    instruments.
     """
     expiration = row.get("expiration")
     if expiration != session_date:
         return True
-    if (row.get("option_symbol") or "").upper().startswith("SPXW"):
-        return True
-    return not is_spx_am_settled_expiration(symbol, expiration)
+    return not is_am_settled_contract(symbol, row.get("option_symbol"), expiration)
 
 
 def _ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:

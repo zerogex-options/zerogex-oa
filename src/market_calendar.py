@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, time, timedelta
-from typing import Optional
+from typing import Dict, Optional
 
 import pytz
 
@@ -146,46 +146,103 @@ _MIN_TTE_MINUTES = max(0.5, float(os.getenv("ANALYTICS_MIN_TTE_MINUTES", "30")))
 _MIN_YEARS_TO_EXPIRATION = _MIN_TTE_MINUTES / (60.0 * 24.0 * 365.0)
 
 
-def is_spx_am_settled_expiration(symbol: str, expiration_date: date) -> bool:
-    """True for SPX/SPXpm AM-settled monthly expirations.
+#: Cash-settled index chains whose MONTHLY series settles AM at the opening
+#: auction, mapped to the root prefix of the PM-settled series that shares
+#: the same underlying in this platform's data.
+#:
+#: Both entries have the same shape and the same trap.  SPX monthlies settle
+#: to the Special Opening Quotation at ~09:30 ET; SPXW weeklies settle at
+#: 16:00.  NDX monthlies settle to the Nasdaq-100 SOQ at the open; NDXP is
+#: the PM-settled series.  In both cases the two roots share one underlying
+#: (``$SPX.X`` / ``$NDXP.X``), so the expiration date alone cannot separate
+#: them on a third Friday and the option-symbol prefix has to decide.
+#:
+#: Add a product here and every settlement-aware path below follows: the
+#: time-to-expiration close time, the analytics snapshot's same-day drop,
+#: and the spread rollups that measure whatever the snapshot hands them.
+_AM_SETTLED_INDEX_PM_ROOTS: Dict[str, str] = {
+    "SPX": "SPXW",
+    "NDX": "NDXP",
+}
 
-    SPX monthly options expire on the third Friday of the month and
-    settle AM at the Special Opening Quotation (~09:30 ET).  The
-    weekly SPX series (SPXW) and end-of-month series settle PM at
-    16:00 ET, like SPY/QQQ/etc.
 
-    We can't always tell the series from just (underlying, expiration)
-    because TradeStation lists both SPX and SPXW under the same
-    ``$SPX.X`` underlying.  Best heuristic without an option-symbol
-    prefix is: ``$SPX.X`` (or canonical ``SPX``) on a 3rd-Friday is
-    AM-settled.  SPXW on a 3rd-Friday is rare in production data;
-    callers with ``option_symbol`` available should branch on the
-    ``SPXW`` prefix and skip this helper for those rows.
+def canonical_index_symbol(symbol: Optional[str]) -> str:
+    """``"$SPX.X"`` / ``"$SPX"`` / ``"spx"`` -> ``"SPX"``.
+
+    Use explicit prefix/suffix strips, NOT ``str.rstrip(".X")`` -- rstrip
+    treats its argument as a character set and would turn "SPX" into "SP".
     """
-    # Normalize "$SPX.X" / "SPX" / "$SPX" -> "SPX".  Use explicit
-    # prefix/suffix strips, NOT str.rstrip(".X") -- rstrip treats its
-    # argument as a character set and would turn "SPX" into "SP".
     sym = (symbol or "").upper()
     if sym.startswith("$"):
         sym = sym[1:]
     if sym.endswith(".X"):
         sym = sym[:-2]
-    if sym != "SPX":
+    return sym
+
+
+def pm_settled_root_for(symbol: Optional[str]) -> Optional[str]:
+    """The PM-settled option root that shares this underlying, if any.
+
+    ``"SPX"`` -> ``"SPXW"``, ``"NDX"`` -> ``"NDXP"``, everything else None.
+    Callers holding an ``option_symbol`` branch on this rather than
+    hard-coding a prefix, which is how NDXP came to be missed while SPXW
+    was handled in three separate places.
+    """
+    return _AM_SETTLED_INDEX_PM_ROOTS.get(canonical_index_symbol(symbol))
+
+
+def is_am_settled_index_expiration(symbol: str, expiration_date: date) -> bool:
+    """True for an index whose MONTHLY series settles AM, on a third Friday.
+
+    Covers SPX and NDX: both list AM-settled monthlies that expire on the
+    third Friday and settle at the opening auction (~09:30 ET), alongside a
+    PM-settled series that shares the same underlying.
+
+    This is the heuristic for callers who have only (underlying, expiration).
+    It cannot see which series a contract belongs to, so on a third Friday it
+    answers for the AM series and a caller holding the ``option_symbol``
+    must check :func:`pm_settled_root_for` first — or just call
+    :func:`is_am_settled_contract`, which does both.
+    """
+    if canonical_index_symbol(symbol) not in _AM_SETTLED_INDEX_PM_ROOTS:
         return False
     # Third-Friday rule: weekday() == 4 (Fri) and day-of-month in [15, 21].
     return expiration_date.weekday() == 4 and 15 <= expiration_date.day <= 21
 
 
+def is_am_settled_contract(
+    underlying_symbol: Optional[str],
+    option_symbol: Optional[str],
+    expiration: date,
+) -> bool:
+    """The whole AM-settlement rule for ONE contract, in one place.
+
+    The PM root wins when the option symbol is known: an SPXW or NDXP
+    contract on a third Friday settles at 16:00 like everything else, and
+    dropping it would discard a live weekly. Without an option symbol this
+    degrades to the date heuristic above.
+
+    Every caller that used to spell this out — the analytics snapshot's
+    same-day drop, the Spread Monitor's chain reduction, the two spread
+    backfills — now shares this one, so a new product is a single entry in
+    ``_AM_SETTLED_INDEX_PM_ROOTS`` rather than four prefix checks to find.
+    """
+    pm_root = pm_settled_root_for(underlying_symbol)
+    if pm_root and (option_symbol or "").upper().startswith(pm_root):
+        return False
+    return is_am_settled_index_expiration(underlying_symbol or "", expiration)
+
+
 def expiration_close_time_et(symbol: str, expiration_date: date) -> str:
     """Wall-clock time in ET at which the contract settles.
 
-    Returns ``"09:30:00"`` for SPX AM-settled monthlies and
+    Returns ``"09:30:00"`` for an AM-settled index monthly (SPX, NDX) and
     ``"16:00:00"`` for everything else.  Pass to
     ``calculate_time_to_expiration`` so AM-settled contracts don't
     accumulate ~6.5 hours of phantom time value on the morning of
     expiration.
     """
-    if is_spx_am_settled_expiration(symbol, expiration_date):
+    if is_am_settled_index_expiration(symbol, expiration_date):
         return "09:30:00"
     return "16:00:00"
 
@@ -197,18 +254,18 @@ def settlement_close_time_for_contract(
 ) -> str:
     """Per-contract version of ``expiration_close_time_et``.
 
-    Picks the right ET close time given an option_symbol prefix, so
-    SPXW (PM-settled) and SPX (AM-settled) contracts that share an
-    underlying AND an expiration date (e.g. a 3rd-Friday under SPX
+    Picks the right ET close time given an option_symbol prefix, so the
+    PM-settled series (SPXW, NDXP) and the AM-settled monthly (SPX, NDX)
+    that share an underlying AND an expiration date (a 3rd-Friday under
     monthly chain expansion) get distinct close times.  Falls back to
     16:00 ET when called without an underlying — the most common case
     (equity ETFs / equities).
     """
     if not underlying_symbol:
         return "16:00:00"
-    if (option_symbol or "").upper().startswith("SPXW"):
-        return "16:00:00"
-    return expiration_close_time_et(underlying_symbol, expiration)
+    if is_am_settled_contract(underlying_symbol, option_symbol, expiration):
+        return "09:30:00"
+    return "16:00:00"
 
 
 def calculate_time_to_expiration(
