@@ -1,0 +1,34 @@
+[Unit]
+Description=Periodic ZeroGEX gamma-flip carry check (hourly in-session + once after the close)
+
+[Timer]
+# Hourly through the cash session, plus one run once the session's last bar
+# (16:15 ET) has been written.
+#
+# WHY BOTH. The in-session fires are what turn a stall into an email while the
+# session is still running; the 16:30 one is the only fire that can judge a
+# COMPLETE session, since a run at 15:30 cannot see bars that have not
+# happened yet. Neither alone is enough.
+#
+# Server timezone is America/New_York (deploy/steps/010.setup), so these are
+# ET. Weekdays only: there are no bars to check at the weekend, and a check
+# that alerts on an empty Saturday is one people learn to ignore.
+#
+# The first fire is 10:30, not the open. gex_summary's first row of the day can
+# land a bar or two after 09:30, and the tool holds that warmup to the same
+# threshold as a carry -- starting an hour in means the threshold means what it
+# says rather than reporting the engine waking up.
+#
+# Cadence is hourly rather than the ingestion check's 10 minutes because the
+# thing being detected is slower and less urgent: the carry keeps the reading
+# CORRECT while the feed is out, so this is "the panel is running on a stale
+# level, go look", not "market data is being lost right now".
+OnCalendar=Mon..Fri *-*-* 10..15:30:00
+OnCalendar=Mon..Fri *-*-* 16:30:00
+RandomizedDelaySec=2m
+# A host that was down over the close still reports once it comes back. Cheap,
+# and a session nobody checked is exactly the one worth checking late.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
