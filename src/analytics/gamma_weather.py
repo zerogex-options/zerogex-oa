@@ -45,13 +45,18 @@ what makes an honest base-rate comparison possible later.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import List, Optional, Sequence
+from datetime import datetime
+from typing import Any, List, Mapping, Optional, Sequence
 
+from src.analytics.flip_cushion import DEFAULT_RATE_BARS
+from src.analytics.flip_cushion import build_series as build_cushion_series
 from src.analytics.flip_cushion import (
     STATE_CROSSING,
     STATE_NO_FLIP,
     STATE_THIN,
+    CushionBar,
 )
+from src.analytics.hedging_flow import DEFAULT_SMOOTHING_BARS, smooth
 
 # --------------------------------------------------------------------------- #
 # Tunables. Everything adjustable lives here; the logic below reads them.
@@ -429,3 +434,101 @@ def classify(inputs: WeatherInputs) -> Weather:
         cushion=cushion,
         sentence=_sentence(state, pressure, structure, lean_side, cushion),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Assembling the inputs from the two stored series.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class PairedBar:
+    """One bar that both stored series cover, with its classifier inputs.
+
+    The panel and any offline pass over history have to agree bar for bar. If
+    they assemble the inputs separately they will eventually disagree -- a
+    different smoothing window, a different cushion rate window, a paired-on
+    nothing -- and an offline base-rate number would then describe a rule no
+    user has ever seen. So this is the single assembler, and the endpoint and
+    the tooling both go through it.
+    """
+
+    bar_start: datetime
+    inputs: WeatherInputs
+    cushion: CushionBar
+    #: The source regime row, so a caller can echo the raw components it was
+    #: classified from without re-reading or re-deriving them.
+    regime: Mapping[str, Any]
+    pressure_bar: Optional[float]
+    pressure_avg: Optional[float]
+
+
+def _as_float(value: Any) -> Optional[float]:
+    return float(value) if value is not None else None
+
+
+def pair_series(
+    regime_chrono: Sequence[Mapping[str, Any]],
+    flow_chrono: Sequence[Mapping[str, Any]],
+    smoothing_bars: int = DEFAULT_SMOOTHING_BARS,
+    rate_bars: int = DEFAULT_RATE_BARS,
+) -> List[PairedBar]:
+    """Pair the hedging-flow and gamma-structure series on their shared bars.
+
+    Both arguments are CHRONOLOGICAL (oldest first), which is the opposite of
+    how both series come back from the database; reversing is the caller's job
+    because only the caller knows which way its rows arrived.
+
+    Pairs on ``bar_start`` rather than on position. The two series are written
+    by different paths on the same 5-minute grid, and a bar present in one but
+    not the other would otherwise shift every later bar by one, putting this
+    bar's pressure next to last bar's structure in a sentence that claims to
+    describe the same five minutes.
+
+    The flow moving average is computed over the FULL flow series before
+    pairing, so a bar's three-bar average is the same number the flow chart
+    draws even when the structure series starts later.
+    """
+    ma = smooth(
+        [_as_float(r.get("net_flow_usd")) or 0.0 for r in flow_chrono],
+        smoothing_bars,
+    )
+    flow_by_bar = {
+        r["bar_start"]: (_as_float(r.get("net_flow_usd")) or 0.0, m)
+        for r, m in zip(flow_chrono, ma)
+    }
+
+    cushions = build_cushion_series(
+        [
+            (r["bar_start"], r.get("spot"), r.get("gamma_flip"), r.get("typical_move_30m"))
+            for r in regime_chrono
+        ],
+        rate_bars=rate_bars,
+    )
+
+    out: List[PairedBar] = []
+    for row, cushion in zip(regime_chrono, cushions):
+        found = flow_by_bar.get(row["bar_start"])
+        if found is None:
+            continue
+        pressure_bar, pressure_avg = found
+        out.append(
+            PairedBar(
+                bar_start=row["bar_start"],
+                inputs=WeatherInputs(
+                    pressure_bar=pressure_bar,
+                    pressure_avg=pressure_avg,
+                    lean=_as_float(row.get("rolling_lean")),
+                    stability=_as_float(row.get("rolling_stability")),
+                    gamma_trend=_as_float(row.get("anchored_stability")),
+                    cushion_state=cushion.state,
+                    cushion_pts=cushion.cushion_pts,
+                    cushion_rate_pts=cushion.rate_pts,
+                ),
+                cushion=cushion,
+                regime=row,
+                pressure_bar=pressure_bar,
+                pressure_avg=pressure_avg,
+            )
+        )
+    return out

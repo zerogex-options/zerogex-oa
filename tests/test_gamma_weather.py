@@ -372,3 +372,92 @@ def test_persistence_and_age_are_independent():
 
     assert series[-1].persistence == PERSISTENCE_ESTABLISHED
     assert series[-1].age_minutes == 5
+
+
+# --------------------------------------------------------------------------- #
+# Pairing the two stored series.
+# --------------------------------------------------------------------------- #
+
+
+def _bar(i):
+    from datetime import datetime, timedelta
+
+    return datetime(2026, 9, 17, 13, 30) + timedelta(minutes=5 * i)
+
+
+def _regime(i, **over):
+    row = {
+        "bar_start": _bar(i),
+        "spot": 600.0,
+        "gamma_flip": 580.0,
+        "rolling_lean": 1.0e6,
+        "rolling_stability": STRONG,
+        "anchored_stability": STRONG,
+        "typical_move_30m": 3.0,
+    }
+    row.update(over)
+    return row
+
+
+def _flow(i, net=3.0e7):
+    return {"bar_start": _bar(i), "net_flow_usd": net}
+
+
+def test_pair_series_matches_on_bar_start_not_position():
+    """The two series are written by different paths on the same grid. Pairing
+    by position would put this bar's pressure beside last bar's structure in a
+    sentence that claims to describe the same five minutes."""
+    from src.analytics.gamma_weather import pair_series
+
+    regime = [_regime(i) for i in (0, 1, 2, 3)]
+    flow = [_flow(i) for i in (1, 3)]  # holes at 0 and 2
+
+    paired = pair_series(regime, flow)
+
+    assert [p.bar_start for p in paired] == [_bar(1), _bar(3)]
+
+
+def test_pair_series_drops_structure_bars_with_no_flow():
+    from src.analytics.gamma_weather import pair_series
+
+    assert pair_series([_regime(0)], []) == []
+
+
+def test_pair_series_drops_flow_bars_with_no_structure():
+    from src.analytics.gamma_weather import pair_series
+
+    assert pair_series([], [_flow(0)]) == []
+
+
+def test_the_moving_average_spans_the_whole_flow_series():
+    """Computed before pairing, so a bar's three-bar average is the number the
+    flow chart draws even when the structure series starts later."""
+    from src.analytics.gamma_weather import pair_series
+
+    flow = [_flow(i, net=1.0e7 * (i + 1)) for i in range(4)]
+    paired = pair_series([_regime(3)], flow)
+
+    assert paired[0].pressure_avg == (2.0e7 + 3.0e7 + 4.0e7) / 3
+
+
+def test_pair_series_carries_the_source_row_for_auditing():
+    """The panel echoes the raw components it classified from. They come off
+    the paired bar rather than a second lookup that could disagree."""
+    from src.analytics.gamma_weather import pair_series
+
+    paired = pair_series([_regime(0)], [_flow(0)])
+
+    assert paired[0].regime["gamma_flip"] == 580.0
+    assert paired[0].cushion.cushion_pts == 20.0
+
+
+def test_a_missing_flip_still_pairs_and_reports_no_cushion():
+    """NULL gamma_flip is meaningful -- the profile had no zero crossing -- and
+    must not drop the bar out of the series."""
+    from src.analytics.gamma_weather import pair_series
+    from src.analytics.flip_cushion import STATE_NO_FLIP
+
+    paired = pair_series([_regime(0, gamma_flip=None)], [_flow(0)])
+
+    assert len(paired) == 1
+    assert paired[0].cushion.state == STATE_NO_FLIP
