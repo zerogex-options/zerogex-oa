@@ -56,6 +56,7 @@ import pytz
 
 from src.analytics import base_rates as br
 from src.analytics import gamma_weather as gw
+from src.analytics.flip_cushion import BASIS_MOVE, BASIS_NONE
 from src.database.connection import db_connection
 from src.hedging_flow_sql import HEDGING_FLOW_COLUMNS, HEDGING_FLOW_CTE_PSYCOPG2
 
@@ -89,6 +90,13 @@ CHECKPOINTS = (time(10, 0), time(12, 0), time(14, 30))
 CHURN_COMPONENTS = ("pressure", "structure", "lean", "cushion", "cushion state")
 STATE_INPUTS = ("pressure", "structure")
 
+#: Components that need a stored gamma flip to mean anything. Sessions written
+#: before the gamma_flip column existed carry NULL for every bar, which the
+#: cushion correctly reads as "no flip in the profile" -- correct per bar, and
+#: badly wrong in aggregate, where a schema rollout would otherwise read as a
+#: market that never had a flip. Measured over covered sessions only.
+CUSHION_COMPONENTS = ("cushion", "cushion state")
+
 _REGIME_COLUMNS = (
     "bar_start",
     "spot",
@@ -105,6 +113,62 @@ _REGIME_OPTIONAL_COLUMNS = ("typical_move_30m",)
 
 def _minutes_to_bars(minutes: float) -> int:
     return max(1, int(round(minutes / BAR_MINUTES)))
+
+
+#: How a session's cushion readings were produced, which decides whether they
+#: can be pooled with another session's.
+CUSHION_CURRENT = "current"
+CUSHION_LEGACY = "legacy"
+CUSHION_MIXED = "mixed"
+CUSHION_ABSENT = "absent"
+
+
+def cushion_basis(session: br.Session) -> tuple:
+    """``(classification, comparable bars, usable bars)`` for one session.
+
+    Two schema rollouts landed inside the history this report reads, and each
+    left bars that look measurable and are not comparable:
+
+    * no ``gamma_flip`` means no boundary to measure against, so every bar
+      reads NO_FLIP -- correct per bar, and in aggregate a schema rollout
+      wearing the costume of a market that never had a flip;
+    * no ``typical_move_30m`` means the cushion falls back to the legacy spot
+      fraction. That one is worse, because the bars still carry ordinary
+      SECURE and THIN labels produced by a different yardstick. It is not a
+      matter of calibration either: the fallback path cannot return NORMAL at
+      all, so pooling the two changes the SHAPE of the state distribution and
+      not just its scale.
+
+    :attr:`~src.analytics.flip_cushion.CushionBar.basis` already records which
+    yardstick produced each reading, so it is the discriminator rather than
+    anything this module has to infer. It also subsumes the question of
+    whether the column was missing or merely NULL, which the writer's
+    information_schema probe cannot answer and which turns out not to matter:
+    what matters is the rule that produced the label.
+
+    Classified per SESSION rather than per bar, and mixed sessions are held
+    out whole. The transition-warning table measures a forward horizon and so
+    needs contiguous bars, and one restriction rule that both cushion tables
+    share is easier to trust than two that nearly agree.
+    """
+    anchors = br.every_bar_anchors(session)
+    if not session.components:
+        return CUSHION_ABSENT, 0, len(anchors)
+
+    bases = [session.components[i].get("cushion basis") for i in anchors]
+    measurable = [b for b in bases if b != BASIS_NONE]
+    comparable = sum(1 for b in measurable if b == BASIS_MOVE)
+
+    if not measurable:
+        label = CUSHION_ABSENT
+    elif comparable == len(measurable):
+        label = CUSHION_CURRENT
+    elif comparable == 0:
+        label = CUSHION_LEGACY
+    else:
+        label = CUSHION_MIXED
+
+    return label, comparable, len(anchors)
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +286,7 @@ def load_session(
                 "lean": str(w.lean_side),
                 "cushion": w.cushion,
                 "cushion state": bar.cushion.state,
+                "cushion basis": bar.cushion.basis,
             }
             for w, bar in zip(weather, paired)
         ],
@@ -378,6 +443,17 @@ def build_report(
     confirm_bars: int = 1,
 ) -> Dict[str, Any]:
     """Everything the printer and the JSON both read from."""
+    coverage = [cushion_basis(s) for s in sessions]
+    covered = [s for s, (label, _, _) in zip(sessions, coverage) if label == CUSHION_CURRENT]
+    basis_counts = {
+        label: sum(1 for entry in coverage if entry[0] == label)
+        for label in (CUSHION_CURRENT, CUSHION_LEGACY, CUSHION_MIXED, CUSHION_ABSENT)
+    }
+    # Only bars in the sessions the cushion tables actually use. A mixed
+    # session has comparable bars and is still held out whole, so counting its
+    # bars here would advertise evidence the tables never saw.
+    comparable_bars = sum(bars for label, bars, _ in coverage if label == CUSHION_CURRENT)
+
     ladder_bars = [
         (gw.AGE_ESTABLISHED_MIN, _minutes_to_bars(gw.AGE_ESTABLISHED_MIN)),
         (gw.AGE_CONFIRMED_MIN, _minutes_to_bars(gw.AGE_CONFIRMED_MIN)),
@@ -419,12 +495,15 @@ def build_report(
         order=[label for label, _, _ in bands],
     )
     warnings = br.lift_table(
-        br.warning_trials(sessions, horizon_bars),
+        br.warning_trials(covered, horizon_bars),
         independent=False,
         order=["WARNED", "QUIET"],
     )
 
-    churn = [br.component_churn(sessions, name) for name in CHURN_COMPONENTS]
+    churn = [
+        br.component_churn(covered if name in CUSHION_COMPONENTS else sessions, name)
+        for name in CHURN_COMPONENTS
+    ]
     attribution = br.change_attribution(sessions, STATE_INPUTS)
     confirmation = _confirmation_whatif(sessions, horizon_bars, confirm_bars)
 
@@ -449,9 +528,19 @@ def build_report(
         "age_bands": [c.as_dict() for c in age],
         "transition_warnings": [c.as_dict() for c in warnings],
         "component_churn": [c.as_dict() for c in churn],
+        "cushion_coverage": {
+            "sessions": len(sessions),
+            "sessions_on_current_basis": basis_counts[CUSHION_CURRENT],
+            "sessions_on_legacy_basis": basis_counts[CUSHION_LEGACY],
+            "sessions_mixed_basis": basis_counts[CUSHION_MIXED],
+            "sessions_without_cushion": basis_counts[CUSHION_ABSENT],
+            "comparable_bars": comparable_bars,
+            "usable_bars": sum(total for _, _, total in coverage),
+        },
         "change_attribution": attribution,
         "confirmation": confirmation["summary"] if confirmation else None,
         "_tables": {
+            "covered_sessions": len(covered),
             "churn": churn,
             "attribution": attribution,
             "confirmation": confirmation,
@@ -493,6 +582,29 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     if not report["sessions"]:
         lines.append("No classifiable sessions found. Nothing to report.")
         return "\n".join(lines)
+
+    cover = report["cushion_coverage"]
+    if cover["sessions_on_current_basis"] < cover["sessions"]:
+        lines.append(
+            f"FLIP CUSHION COVERAGE: {cover['sessions_on_current_basis']} of "
+            f"{cover['sessions']} sessions ({cover['comparable_bars']} of "
+            f"{cover['usable_bars']} bars) were classified"
+        )
+        lines.append(
+            "against the typical 30-minute move. Section 6 and the cushion rows of section 7"
+        )
+        lines.append("use only those. Of the rest:")
+        lines.append(
+            f"   {cover['sessions_on_legacy_basis']} on the legacy spot fraction,"
+            f"   {cover['sessions_mixed_basis']} mixed,"
+            f"   {cover['sessions_without_cushion']} with no flip stored."
+        )
+        lines.append("Two schema rollouts sit inside this history. A session with no stored flip")
+        lines.append("reads NO_FLIP on every bar; one with no stored typical move still reports")
+        lines.append("ordinary SECURE and THIN labels, from a different yardstick that cannot")
+        lines.append("return NORMAL at all. Pooling either with the rest would put a rollout on")
+        lines.append("the page as a finding about the market.")
+        lines.append("")
 
     lines.append("1. HOW OFTEN EACH STATE IS ON SCREEN")
     lines.append("   The reason lift matters. Read this before anything below it.")
@@ -541,6 +653,9 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     lines.append("   A hit here is the state CHANGING, the opposite of the tables above: a")
     lines.append("   warning that is never followed by a transition is the failure to catch.")
     lines.append("   Warnings repeat across consecutive bars, so these overlap heavily.")
+    lines.append(
+        f"   Measured over the {tables['covered_sessions']} session(s) on the current basis."
+    )
     lines.extend(_lift_rows(tables["warnings"], group_header="cushion", outcome_header="changed"))
     lines.append("")
 
@@ -560,7 +675,10 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
             for value, p in sorted(entry.values.items(), key=lambda kv: -kv[1].hits)
             if p.rate
         )
-        lines.append(f"   {entry.name:<16}{per_day_txt:>13}{run_txt:>10}  {spread}")
+        name = entry.name + (" *" if entry.name in CUSHION_COMPONENTS else "")
+        lines.append(f"   {name:<16}{per_day_txt:>13}{run_txt:>10}  {spread}")
+    if cover["sessions_on_current_basis"] < cover["sessions"]:
+        lines.append("   * sessions classified against the typical move only")
     lines.append("")
 
     attribution = tables["attribution"]
