@@ -24,6 +24,10 @@ from src.analytics.base_rates import (
     RunLengths,
     Session,
     age_band_trials,
+    change_attribution,
+    component_churn,
+    confirmation_lag,
+    debounce,
     checkpoint_anchors,
     compare,
     every_bar_anchors,
@@ -424,3 +428,124 @@ def test_the_graded_floor_is_the_one_the_module_publishes():
     """Pinned so the threshold cannot drift below the point where a normal
     approximation stops meaning anything."""
     assert MIN_GRADED_TRIALS >= 30
+
+
+# --------------------------------------------------------------------------- #
+# Diagnosing a restless state.
+# --------------------------------------------------------------------------- #
+
+
+def _with_components(states, components, warmup=0):
+    return Session(
+        label="d",
+        bar_starts=[OPEN + timedelta(minutes=5 * i) for i in range(len(states))],
+        states=states,
+        warmup=warmup,
+        components=components,
+    )
+
+
+def test_component_churn_counts_changes_not_bars():
+    session = _with_components(
+        ["A"] * 5,
+        [{"p": v} for v in ["X", "X", "Y", "Y", "X"]],
+    )
+
+    churn = component_churn([session], "p")
+
+    assert churn.runs == 3
+    assert churn.changes_per_session == 2.0
+    assert churn.values["X"].hits == 3
+
+
+def test_component_churn_ignores_warmup_bars():
+    session = _with_components(
+        ["A"] * 4,
+        [{"p": v} for v in ["X", "Y", "Z", "Z"]],
+        warmup=2,
+    )
+
+    churn = component_churn([session], "p")
+
+    assert churn.bars == 2
+    assert churn.runs == 1
+
+
+def test_component_churn_survives_sessions_with_no_components():
+    session = Session(label="d", bar_starts=[OPEN], states=["A"])
+
+    churn = component_churn([session], "p")
+
+    assert churn.runs == 0
+    assert churn.changes_per_session is None
+
+
+def test_change_attribution_names_the_inputs_that_moved():
+    session = _with_components(
+        ["A", "B", "C"],
+        [
+            {"p": "X", "s": "M"},
+            {"p": "Y", "s": "M"},  # pressure alone
+            {"p": "Y", "s": "N"},  # structure alone
+        ],
+    )
+
+    result = change_attribution([session], ["p", "s"])
+
+    assert result == {"p": 1, "s": 1}
+
+
+def test_a_state_change_with_no_input_change_is_flagged_not_hidden():
+    """If this bucket is ever non-empty the decomposition is missing one of
+    the classifier's inputs, and the report has to say so rather than
+    attributing the remainder to nothing."""
+    session = _with_components(["A", "B"], [{"p": "X"}, {"p": "X"}])
+
+    assert change_attribution([session], ["p"]) == {"(none)": 1}
+
+
+# --------------------------------------------------------------------------- #
+# The confirmation what-if.
+# --------------------------------------------------------------------------- #
+
+
+def test_confirming_one_bar_is_the_identity():
+    assert debounce(list("ABAB"), 1) == list("ABAB")
+    assert debounce(list("ABAB"), 0) == list("ABAB")
+
+
+def test_confirmation_filters_a_single_bar_flip():
+    assert debounce(list("AABAA"), 2) == list("AAAAA")
+
+
+def test_a_change_that_holds_arrives_late_rather_than_never():
+    assert debounce(list("AABB"), 2) == list("AAAB")
+
+
+def test_confirmation_is_causal():
+    """Each bar is decided from bars at or before it, so the debounced series
+    is one a live panel could have shown. Without this the comparison flatters
+    the confirmed track with hindsight and means nothing."""
+    raw = list("AABBABBBAAA")
+
+    full = debounce(raw, 2)
+    for cut in range(1, len(raw) + 1):
+        assert debounce(raw[:cut], 2) == full[:cut]
+
+
+def test_confirmation_lag_measures_only_changes_that_arrive():
+    """A flip filtered out never reaches the headline and has no lateness to
+    report -- that is the point of filtering it, not a gap in the accounting."""
+    raw = list("AABAABBB")
+    confirmed = debounce(raw, 2)
+
+    lags = confirmation_lag(raw, confirmed)
+
+    assert lags == [1]  # the one-bar B is filtered; the real change is 1 late
+
+
+def test_a_series_that_never_settles_confirms_nothing():
+    raw = list("ABABABAB")
+
+    assert set(debounce(raw, 2)) == {"A"}
+    assert confirmation_lag(raw, debounce(raw, 2)) == []

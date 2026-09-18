@@ -313,3 +313,69 @@ def test_skipped_sessions_are_named_rather_than_quietly_dropped():
 
     assert "Skipped 2 session(s)" in text
     assert "2026-09-01" in text
+
+
+# --------------------------------------------------------------------------- #
+# Diagnosing a restless state.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_classifier_components_are_carried_for_diagnosis():
+    """A durability table that fails every row without naming the input that
+    is moving sends the reader back to the raw charts, which is the work the
+    report exists to have already done."""
+    cursor, _ = _cursor(12)
+
+    session = tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
+
+    assert set(session.components[0]) == set(tool.CHURN_COMPONENTS)
+    assert session.components[-1]["pressure"] == gw.PRESSURE_BUYING
+    assert session.components[-1]["structure"] == gw.STRUCTURE_PINNING
+
+
+def test_the_attributed_inputs_are_the_ones_the_state_is_built_from():
+    """gamma_weather._state_for reads pressure and structure and nothing else,
+    so attribution over those two must account for every state change. If this
+    drifts, the report's "(none)" bucket fills up and says so."""
+    assert set(tool.STATE_INPUTS) == {"pressure", "structure"}
+    assert set(tool.STATE_INPUTS).issubset(set(tool.CHURN_COMPONENTS))
+
+
+def test_the_churn_section_names_every_component():
+    report = tool.build_report([_session(["A"] * 40)], horizon_bars=6)
+
+    assert [c["component"] for c in report["component_churn"]] == list(tool.CHURN_COMPONENTS)
+
+
+def test_the_what_if_section_is_absent_unless_asked_for():
+    """Default output describes the live rule and nothing else. A speculative
+    comparison printed by default would read as a claim about the product."""
+    report = tool.build_report([_session(["A"] * 40)], horizon_bars=6)
+
+    assert report["confirmation"] is None
+    assert "WHAT-IF" not in tool.format_report("SPY", report, skipped=[])
+
+
+def test_the_what_if_reports_both_sides():
+    """Churn removed AND lateness added. Reporting only the first would make
+    any confirmation window look free."""
+    from src.analytics import base_rates as br
+
+    flapping = _session(list("AB" * 20))
+    report = tool.build_report([flapping], horizon_bars=3, confirm_bars=2)
+    text = tool.format_report("SPY", report, skipped=[])
+
+    assert "WHAT-IF" in text
+    assert report["confirmation"]["raw_runs"] > report["confirmation"]["confirmed_runs"]
+    assert "median lag" in text
+    assert isinstance(br.debounce(flapping.states, 2), list)
+
+
+def test_the_what_if_never_reaches_the_live_classification():
+    """It rebuilds a separate session list; the loaded sessions keep the states
+    the panel actually showed."""
+    raw = _session(list("AABAA"))
+    report = tool.build_report([raw], horizon_bars=1, confirm_bars=2)
+
+    assert list(raw.states) == list("AABAA")
+    assert report["onset_durability"][0]["group"] in {"A", "B"}
