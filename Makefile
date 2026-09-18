@@ -3368,12 +3368,13 @@ regime-regrade-report: ## Backtest the corrected dealer-gamma regime vs stored h
 		$(if $(REGIME_JSON),--json $(REGIME_JSON))
 
 .PHONY: weather-base-rates
-weather-base-rates: ## Base-rate report for Gamma Weather states -- lift, not hit rate (read-only). Vars: WEATHER_SYMBOL, WEATHER_SESSIONS, WEATHER_HORIZON, WEATHER_JSON (all optional)
+weather-base-rates: ## Base-rate report for Gamma Weather states -- lift, not hit rate (read-only). Vars: WEATHER_SYMBOL, WEATHER_SESSIONS, WEATHER_HORIZON, WEATHER_CONFIRM, WEATHER_JSON (all optional)
 	@echo "$(BLUE)=== Gamma Weather base rates (read-only) ===$(NC)"
 	@$(PY) -m src.tools.gamma_weather_base_rates \
 		$(if $(WEATHER_SYMBOL),--symbol $(WEATHER_SYMBOL)) \
 		$(if $(WEATHER_SESSIONS),--sessions $(WEATHER_SESSIONS)) \
 		$(if $(WEATHER_HORIZON),--horizon-minutes $(WEATHER_HORIZON)) \
+		$(if $(WEATHER_CONFIRM),--confirm-bars $(WEATHER_CONFIRM)) \
 		$(if $(WEATHER_JSON),--json $(WEATHER_JSON))
 
 # Override SYMBOLS to scope; the snapshot covers current + prior session

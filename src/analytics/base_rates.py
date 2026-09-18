@@ -61,7 +61,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 # One implementation of each, not two. These live in forced_flow because that
 # is where the first track record needed them; duplicating a Wilson interval
@@ -317,6 +317,12 @@ class Session:
     warnings: Sequence[bool] = field(default_factory=tuple)
     ages: Sequence[int] = field(default_factory=tuple)
     warmup: int = 0
+    #: Per-bar component readings behind each state, keyed by component name.
+    #: Carried so a report that finds the state unstable can say WHICH input is
+    #: moving. A durability table that fails every row without naming the
+    #: driver sends the reader back to the raw charts, which is the work the
+    #: report exists to have already done.
+    components: Sequence[Mapping[str, str]] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if len(self.bar_starts) != len(self.states):
@@ -609,3 +615,161 @@ def state_share(sessions: Sequence[Session]) -> Dict[str, Proportion]:
             counts[session.states[i]] = counts.get(session.states[i], 0) + 1
             total += 1
     return {state: Proportion(n=total, hits=n) for state, n in sorted(counts.items())}
+
+
+# --------------------------------------------------------------------------- #
+# Why the state moves, and what confirmation would cost.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Churn:
+    """How restless one component is.
+
+    ``changes_per_session`` is the headline. A classifier built from components
+    that each change several times an hour cannot produce a state that lasts an
+    hour, however the combination rule is written, so this is where a flapping
+    state is diagnosed rather than in the state table itself.
+    """
+
+    name: str
+    values: Dict[str, Proportion]
+    runs: int
+    bars: int
+    sessions: int
+
+    @property
+    def changes_per_session(self) -> Optional[float]:
+        if not self.sessions:
+            return None
+        return (self.runs - self.sessions) / self.sessions
+
+    @property
+    def mean_run_bars(self) -> Optional[float]:
+        return self.bars / self.runs if self.runs else None
+
+    def as_dict(self) -> dict:
+        return {
+            "component": self.name,
+            "values": {value: p.as_dict() for value, p in self.values.items()},
+            "runs": self.runs,
+            "changes_per_session": (
+                round(self.changes_per_session, 2) if self.changes_per_session is not None else None
+            ),
+            "mean_run_bars": (
+                round(self.mean_run_bars, 2) if self.mean_run_bars is not None else None
+            ),
+        }
+
+
+def component_churn(sessions: Sequence[Session], name: str) -> Churn:
+    """Distribution and restlessness of one component, over usable bars."""
+    counts: Dict[str, int] = {}
+    total = 0
+    run_count = 0
+    seen_sessions = 0
+
+    for session in sessions:
+        if not session.components:
+            continue
+        anchors = every_bar_anchors(session)
+        if not anchors:
+            continue
+        seen_sessions += 1
+        previous: Optional[str] = None
+        for i in anchors:
+            value = str(session.components[i].get(name))
+            counts[value] = counts.get(value, 0) + 1
+            total += 1
+            if value != previous:
+                run_count += 1
+            previous = value
+
+    return Churn(
+        name=name,
+        values={v: Proportion(n=total, hits=n) for v, n in sorted(counts.items())},
+        runs=run_count,
+        bars=total,
+        sessions=seen_sessions,
+    )
+
+
+def change_attribution(sessions: Sequence[Session], names: Sequence[str]) -> Dict[str, int]:
+    """For every state change, which components moved on the same bar.
+
+    Keyed by the set of components that changed, joined with ``+``. A state
+    change with no component change is impossible if ``names`` covers the
+    classifier's inputs, so a non-zero ``(none)`` count means the decomposition
+    is incomplete and the report says so rather than quietly attributing the
+    remainder to nothing.
+    """
+    out: Dict[str, int] = {}
+    for session in sessions:
+        if not session.components:
+            continue
+        anchors = every_bar_anchors(session)
+        for previous, current in zip(anchors, anchors[1:]):
+            if session.states[current] == session.states[previous]:
+                continue
+            moved = [
+                name
+                for name in names
+                if session.components[current].get(name) != session.components[previous].get(name)
+            ]
+            key = " + ".join(moved) if moved else "(none)"
+            out[key] = out.get(key, 0) + 1
+    return out
+
+
+def debounce(states: Sequence[str], confirm_bars: int) -> List[str]:
+    """Hold the headline until a new state has repeated ``confirm_bars`` times.
+
+    A what-if, not a product change: it answers "how much of the churn would a
+    confirmation rule remove, and how late would the truth arrive". Strictly
+    causal -- each bar is decided from bars at or before it -- so the debounced
+    series is one a live panel could actually have shown, and its run lengths
+    are comparable with the raw ones rather than flattered by hindsight.
+
+    ``confirm_bars`` of 1 or less is the identity.
+    """
+    if confirm_bars <= 1 or not states:
+        return list(states)
+
+    out: List[str] = []
+    current = states[0]
+    candidate: Optional[str] = None
+    streak = 0
+
+    for state in states:
+        if state == current:
+            candidate, streak = None, 0
+        else:
+            if state == candidate:
+                streak += 1
+            else:
+                candidate, streak = state, 1
+            if streak >= confirm_bars:
+                current, candidate, streak = state, None, 0
+        out.append(current)
+
+    return out
+
+
+def confirmation_lag(raw: Sequence[str], confirmed: Sequence[str]) -> List[int]:
+    """Bars between a change in ``raw`` and the same change reaching the
+    headline. The cost side of a confirmation rule.
+
+    Only changes that survive to the headline are measured; a raw flip that is
+    filtered out never arrives and has no lag to report, which is the point of
+    filtering it.
+    """
+    lags: List[int] = []
+    pending: Optional[int] = None
+    for i in range(1, len(raw)):
+        if raw[i] != raw[i - 1]:
+            pending = i
+        if confirmed[i] != confirmed[i - 1] and pending is not None:
+            if confirmed[i] == raw[pending]:
+                lags.append(i - pending)
+            pending = None
+    return lags

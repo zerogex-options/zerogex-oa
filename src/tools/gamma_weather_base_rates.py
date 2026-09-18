@@ -82,6 +82,13 @@ DEFAULT_WARMUP_BARS = 6
 #: The spec's daily validation checkpoints.
 CHECKPOINTS = (time(10, 0), time(12, 0), time(14, 30))
 
+#: Components shown in the churn table. The first two are the only inputs
+#: :func:`gamma_weather._state_for` reads, so attribution over them must
+#: account for every state change; the rest are shown because a modifier that
+#: never fires is worth seeing too.
+CHURN_COMPONENTS = ("pressure", "structure", "lean", "cushion", "cushion state")
+STATE_INPUTS = ("pressure", "structure")
+
 _REGIME_COLUMNS = (
     "bar_start",
     "spot",
@@ -208,6 +215,16 @@ def load_session(
         warnings=[w.cushion == gw.CUSHION_TRANSITION_RISK for w in weather],
         ages=[w.age_bars for w in weather],
         warmup=warmup_bars,
+        components=[
+            {
+                "pressure": w.pressure,
+                "structure": w.structure,
+                "lean": str(w.lean_side),
+                "cushion": w.cushion,
+                "cushion state": bar.cushion.state,
+            }
+            for w, bar in zip(weather, paired)
+        ],
     )
 
 
@@ -265,6 +282,13 @@ def _label(state: str) -> str:
     return gw.STATE_LABELS.get(state, state)
 
 
+def _median_txt(lengths) -> str:
+    if lengths is None:
+        return "--"
+    median = lengths.as_dict()["median_complete_bars"]
+    return "--" if median is None else f"{median * BAR_MINUTES}m"
+
+
 def _lift_rows(
     table: Sequence[br.Comparison],
     group_header: str = "state",
@@ -292,9 +316,66 @@ def _lift_rows(
     return lines
 
 
+def _confirmation_whatif(
+    sessions: Sequence[br.Session],
+    horizon_bars: int,
+    confirm_bars: int,
+) -> Optional[Dict[str, Any]]:
+    """What a hold-before-you-change rule would buy, and what it would cost.
+
+    A measurement, not a product change: it re-derives the same run lengths
+    from a debounced copy of the state series and reports both sides -- how
+    much churn a confirmation rule removes, and how many bars later the truth
+    would have reached the panel. Nothing here is written or served.
+    """
+    if confirm_bars <= 1:
+        return None
+
+    held: List[br.Session] = []
+    lags: List[int] = []
+    for session in sessions:
+        confirmed = br.debounce(session.states, confirm_bars)
+        lags.extend(br.confirmation_lag(session.states, confirmed))
+        held.append(
+            br.Session(
+                label=session.label,
+                bar_starts=session.bar_starts,
+                states=confirmed,
+                warnings=session.warnings,
+                ages=br._ages_from_states(confirmed),
+                warmup=session.warmup,
+                components=session.components,
+            )
+        )
+
+    raw_lengths = br.run_lengths(sessions)
+    held_lengths = br.run_lengths(held)
+    ordered_lags = sorted(lags)
+
+    return {
+        "sessions": held,
+        "raw": raw_lengths,
+        "held": held_lengths,
+        "summary": {
+            "confirm_bars": confirm_bars,
+            "raw_runs": sum(v.n_runs for v in raw_lengths.values()),
+            "confirmed_runs": sum(v.n_runs for v in held_lengths.values()),
+            "confirmed_changes": len(lags),
+            "median_lag_bars": ordered_lags[len(ordered_lags) // 2] if ordered_lags else None,
+            "survival_raw": br.tally(
+                [br.held(s.states, a, horizon_bars) for s in sessions for a in br.onset_anchors(s)]
+            ).as_dict(),
+            "survival_confirmed": br.tally(
+                [br.held(s.states, a, horizon_bars) for s in held for a in br.onset_anchors(s)]
+            ).as_dict(),
+        },
+    }
+
+
 def build_report(
     sessions: Sequence[br.Session],
     horizon_bars: int,
+    confirm_bars: int = 1,
 ) -> Dict[str, Any]:
     """Everything the printer and the JSON both read from."""
     ladder_bars = [
@@ -343,6 +424,10 @@ def build_report(
         order=["WARNED", "QUIET"],
     )
 
+    churn = [br.component_churn(sessions, name) for name in CHURN_COMPONENTS]
+    attribution = br.change_attribution(sessions, STATE_INPUTS)
+    confirmation = _confirmation_whatif(sessions, horizon_bars, confirm_bars)
+
     return {
         "sessions": len(sessions),
         "bars": sum(len(s) for s in sessions),
@@ -363,7 +448,13 @@ def build_report(
         "checkpoint_durability": [c.as_dict() for c in checkpoint],
         "age_bands": [c.as_dict() for c in age],
         "transition_warnings": [c.as_dict() for c in warnings],
+        "component_churn": [c.as_dict() for c in churn],
+        "change_attribution": attribution,
+        "confirmation": confirmation["summary"] if confirmation else None,
         "_tables": {
+            "churn": churn,
+            "attribution": attribution,
+            "confirmation": confirmation,
             "onset": onset,
             "checkpoint": checkpoint,
             "age": age,
@@ -411,7 +502,8 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     lines.append("")
 
     lines.append("2. HOW LONG A STATE LASTS ONCE IT APPEARS")
-    lines.append("   Survival is the share of runs still intact after that long.")
+    lines.append("   Survival is the share of runs still intact after that long. If these")
+    lines.append("   read one bar across the board, section 7 says which input is moving.")
     ladder = tables["ladder"]
     header = "".join(f"{str(m) + 'm':>9}" for m, _ in ladder)
     lines.append(f"   {'state':<16}{'runs':>6}{'median':>8}{'censored':>10}{header}")
@@ -452,6 +544,70 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     lines.extend(_lift_rows(tables["warnings"], group_header="cushion", outcome_header="changed"))
     lines.append("")
 
+    lines.append("7. WHY THE STATE MOVES -- how restless each input is")
+    lines.append("   A state cannot outlast the inputs it is built from. If the components")
+    lines.append("   turn over several times an hour, no combination rule produces an hourly")
+    lines.append("   state, and the fix belongs upstream of the vocabulary.")
+    lines.append(f"   {'component':<16}{'changes/day':>13}{'mean run':>10}  distribution")
+    lines.append(f"   {'-' * 14:<16}{'-' * 11:>13}{'-' * 8:>10}  {'-' * 40}")
+    for entry in tables["churn"]:
+        per_day = entry.changes_per_session
+        per_day_txt = "--" if per_day is None else f"{per_day:.1f}"
+        mean_run = entry.mean_run_bars
+        run_txt = "--" if mean_run is None else f"{mean_run * BAR_MINUTES:.0f}m"
+        spread = ", ".join(
+            f"{value} {p.rate * 100:.0f}%"
+            for value, p in sorted(entry.values.items(), key=lambda kv: -kv[1].hits)
+            if p.rate
+        )
+        lines.append(f"   {entry.name:<16}{per_day_txt:>13}{run_txt:>10}  {spread}")
+    lines.append("")
+
+    attribution = tables["attribution"]
+    total_changes = sum(attribution.values())
+    if total_changes:
+        lines.append(f"   Of {total_changes} state changes, the input that moved with them:")
+        for key, count in sorted(attribution.items(), key=lambda kv: -kv[1]):
+            lines.append(f"     {key:<28}{count:>6}  {count / total_changes * 100:5.1f}%")
+        if attribution.get("(none)"):
+            lines.append("     (none) should be zero -- a state changed with no input change, so")
+            lines.append("     the decomposition above is missing one of the classifier's inputs.")
+        lines.append("")
+
+    confirmation = tables["confirmation"]
+    if confirmation:
+        summary = confirmation["summary"]
+        lines.append(
+            f"8. WHAT-IF: require {summary['confirm_bars']} bars before the headline changes"
+        )
+        lines.append("   A measurement, not a change. Strictly causal, so the confirmed series")
+        lines.append("   is one a live panel could have shown. Both sides are reported: the")
+        lines.append("   churn removed, and the bars of lateness that removal costs.")
+        lag = summary["median_lag_bars"]
+        lag_txt = "--" if lag is None else f"{lag * BAR_MINUTES}m"
+        lines.append(
+            f"   runs {summary['raw_runs']} -> {summary['confirmed_runs']}   "
+            f"changes surviving confirmation {summary['confirmed_changes']}   "
+            f"median lag {lag_txt}"
+        )
+        lines.append(
+            f"   {horizon}-minute survival from onset "
+            f"{_pct(summary['survival_raw']['rate'])} -> "
+            f"{_pct(summary['survival_confirmed']['rate'])}"
+        )
+        lines.append("")
+        lines.append(f"   {'state':<16}{'runs':>7}{'median':>9}   {'runs':>7}{'median':>9}")
+        lines.append(f"   {'':<16}{'--- raw ---':>16}   {'-- confirmed --':>16}")
+        for state in sorted(set(confirmation["raw"]) | set(confirmation["held"])):
+            raw = confirmation["raw"].get(state)
+            kept = confirmation["held"].get(state)
+            lines.append(
+                f"   {_label(state):<16}"
+                f"{(raw.n_runs if raw else 0):>7}{_median_txt(raw):>9}   "
+                f"{(kept.n_runs if kept else 0):>7}{_median_txt(kept):>9}"
+            )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -475,6 +631,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=int,
         default=DEFAULT_WARMUP_BARS,
         help="Leading bars barred from anchoring, while the rolling window fills (default: 6).",
+    )
+    parser.add_argument(
+        "--confirm-bars",
+        type=int,
+        default=1,
+        help=(
+            "What-if: how many bars a new state must repeat before the headline changes. "
+            "1 (default) reports the live rule unchanged."
+        ),
     )
     parser.add_argument("--json", dest="json_path", default=None, help="Also write JSON here.")
     parser.add_argument("--log-level", default="INFO")
@@ -502,7 +667,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # edit adds a statement.
         conn.rollback()
 
-    report = build_report(sessions, horizon_bars)
+    report = build_report(sessions, horizon_bars, confirm_bars=args.confirm_bars)
     print(format_report(symbol, report, skipped))
 
     if args.json_path:
