@@ -56,6 +56,7 @@ import pytz
 
 from src.analytics import base_rates as br
 from src.analytics import gamma_weather as gw
+from src.analytics.flip_cushion import STATE_NO_FLIP
 from src.database.connection import db_connection
 from src.hedging_flow_sql import HEDGING_FLOW_COLUMNS, HEDGING_FLOW_CTE_PSYCOPG2
 
@@ -89,6 +90,13 @@ CHECKPOINTS = (time(10, 0), time(12, 0), time(14, 30))
 CHURN_COMPONENTS = ("pressure", "structure", "lean", "cushion", "cushion state")
 STATE_INPUTS = ("pressure", "structure")
 
+#: Components that need a stored gamma flip to mean anything. Sessions written
+#: before the gamma_flip column existed carry NULL for every bar, which the
+#: cushion correctly reads as "no flip in the profile" -- correct per bar, and
+#: badly wrong in aggregate, where a schema rollout would otherwise read as a
+#: market that never had a flip. Measured over covered sessions only.
+CUSHION_COMPONENTS = ("cushion", "cushion state")
+
 _REGIME_COLUMNS = (
     "bar_start",
     "spot",
@@ -105,6 +113,22 @@ _REGIME_OPTIONAL_COLUMNS = ("typical_move_30m",)
 
 def _minutes_to_bars(minutes: float) -> int:
     return max(1, int(round(minutes / BAR_MINUTES)))
+
+
+def cushion_coverage(session: br.Session) -> tuple:
+    """``(bars with a measurable cushion, usable bars)`` for one session.
+
+    A session stored before the gamma_flip column existed has NULL for every
+    bar. Per bar that is indistinguishable from a profile with no zero
+    crossing, and the cushion is right to call it NO_FLIP. Pooled across
+    sessions it is not the same thing at all, so coverage is measured and the
+    cushion tables are restricted to sessions that have any.
+    """
+    anchors = br.every_bar_anchors(session)
+    if not session.components:
+        return 0, len(anchors)
+    covered = sum(1 for i in anchors if session.components[i].get("cushion state") != STATE_NO_FLIP)
+    return covered, len(anchors)
 
 
 # --------------------------------------------------------------------------- #
@@ -378,6 +402,9 @@ def build_report(
     confirm_bars: int = 1,
 ) -> Dict[str, Any]:
     """Everything the printer and the JSON both read from."""
+    coverage = [cushion_coverage(s) for s in sessions]
+    covered = [s for s, (bars, _) in zip(sessions, coverage) if bars > 0]
+
     ladder_bars = [
         (gw.AGE_ESTABLISHED_MIN, _minutes_to_bars(gw.AGE_ESTABLISHED_MIN)),
         (gw.AGE_CONFIRMED_MIN, _minutes_to_bars(gw.AGE_CONFIRMED_MIN)),
@@ -419,12 +446,15 @@ def build_report(
         order=[label for label, _, _ in bands],
     )
     warnings = br.lift_table(
-        br.warning_trials(sessions, horizon_bars),
+        br.warning_trials(covered, horizon_bars),
         independent=False,
         order=["WARNED", "QUIET"],
     )
 
-    churn = [br.component_churn(sessions, name) for name in CHURN_COMPONENTS]
+    churn = [
+        br.component_churn(covered if name in CUSHION_COMPONENTS else sessions, name)
+        for name in CHURN_COMPONENTS
+    ]
     attribution = br.change_attribution(sessions, STATE_INPUTS)
     confirmation = _confirmation_whatif(sessions, horizon_bars, confirm_bars)
 
@@ -449,9 +479,16 @@ def build_report(
         "age_bands": [c.as_dict() for c in age],
         "transition_warnings": [c.as_dict() for c in warnings],
         "component_churn": [c.as_dict() for c in churn],
+        "cushion_coverage": {
+            "sessions": len(sessions),
+            "sessions_with_flip": len(covered),
+            "bars_with_flip": sum(bars for bars, _ in coverage),
+            "usable_bars": sum(total for _, total in coverage),
+        },
         "change_attribution": attribution,
         "confirmation": confirmation["summary"] if confirmation else None,
         "_tables": {
+            "covered_sessions": len(covered),
             "churn": churn,
             "attribution": attribution,
             "confirmation": confirmation,
@@ -493,6 +530,22 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     if not report["sessions"]:
         lines.append("No classifiable sessions found. Nothing to report.")
         return "\n".join(lines)
+
+    cover = report["cushion_coverage"]
+    if cover["sessions_with_flip"] < cover["sessions"]:
+        lines.append(
+            f"FLIP CUSHION COVERAGE: {cover['sessions_with_flip']} of {cover['sessions']} "
+            f"sessions ({cover['bars_with_flip']} of {cover['usable_bars']} bars) carry a"
+        )
+        lines.append(
+            "stored gamma flip. Section 6 and the cushion rows of section 7 use only those."
+        )
+        lines.append(
+            "A session written before the gamma_flip column existed reads NO_FLIP on every"
+        )
+        lines.append("bar, which is right per bar and wrong pooled: it would make a schema rollout")
+        lines.append("look like a market that never had a flip.")
+        lines.append("")
 
     lines.append("1. HOW OFTEN EACH STATE IS ON SCREEN")
     lines.append("   The reason lift matters. Read this before anything below it.")
@@ -541,6 +594,9 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     lines.append("   A hit here is the state CHANGING, the opposite of the tables above: a")
     lines.append("   warning that is never followed by a transition is the failure to catch.")
     lines.append("   Warnings repeat across consecutive bars, so these overlap heavily.")
+    lines.append(
+        f"   Measured over the {tables['covered_sessions']} session(s) with a stored flip."
+    )
     lines.extend(_lift_rows(tables["warnings"], group_header="cushion", outcome_header="changed"))
     lines.append("")
 
@@ -560,7 +616,10 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
             for value, p in sorted(entry.values.items(), key=lambda kv: -kv[1].hits)
             if p.rate
         )
-        lines.append(f"   {entry.name:<16}{per_day_txt:>13}{run_txt:>10}  {spread}")
+        name = entry.name + (" *" if entry.name in CUSHION_COMPONENTS else "")
+        lines.append(f"   {name:<16}{per_day_txt:>13}{run_txt:>10}  {spread}")
+    if cover["sessions_with_flip"] < cover["sessions"]:
+        lines.append("   * sessions with a stored flip only")
     lines.append("")
 
     attribution = tables["attribution"]

@@ -379,3 +379,92 @@ def test_the_what_if_never_reaches_the_live_classification():
 
     assert list(raw.states) == list("AABAA")
     assert report["onset_durability"][0]["group"] in {"A", "B"}
+
+
+# --------------------------------------------------------------------------- #
+# Flip-cushion coverage.
+# --------------------------------------------------------------------------- #
+
+
+def _cushion_session(cushion_states, warmup=0, states=None):
+    from src.analytics import base_rates as br
+
+    n = len(cushion_states)
+    return br.Session(
+        label="2026-09-17",
+        bar_starts=_bars(n),
+        states=states or ["A"] * n,
+        warnings=[False] * n,
+        warmup=warmup,
+        components=[
+            {
+                "pressure": "BUYING",
+                "structure": "PINNING",
+                "lean": "SUPPORTIVE",
+                "cushion": "STEADY",
+                "cushion state": c,
+            }
+            for c in cushion_states
+        ],
+    )
+
+
+def test_coverage_counts_bars_that_could_carry_a_cushion():
+    session = _cushion_session(["NO_FLIP", "SECURE", "SECURE", "NO_FLIP"])
+
+    assert tool.cushion_coverage(session) == (2, 4)
+
+
+def test_coverage_respects_warmup():
+    session = _cushion_session(["SECURE", "SECURE", "NO_FLIP", "NO_FLIP"], warmup=2)
+
+    assert tool.cushion_coverage(session) == (0, 2)
+
+
+def test_a_session_stored_before_the_flip_column_is_kept_out_of_the_cushion_tables():
+    """Per bar, a NULL flip is correctly NO_FLIP. Pooled across sessions it is
+    not the same thing at all: without this, a schema rollout reads as a market
+    that never had a flip, which is the exact class of artifact-as-finding this
+    whole report exists to prevent."""
+    old = _cushion_session(["NO_FLIP"] * 40)
+    new = _cushion_session(["SECURE"] * 40)
+
+    report = tool.build_report([old, new], horizon_bars=6)
+
+    assert report["cushion_coverage"]["sessions_with_flip"] == 1
+    churn = {c["component"]: c for c in report["component_churn"]}
+    assert set(churn["cushion state"]["values"]) == {"SECURE"}
+    assert set(churn["pressure"]["values"]) == {"BUYING"}  # unrestricted
+
+
+def test_the_coverage_gap_is_stated_not_silently_applied():
+    old = _cushion_session(["NO_FLIP"] * 40)
+    new = _cushion_session(["SECURE"] * 40)
+
+    text = tool.format_report("SPY", tool.build_report([old, new], horizon_bars=6), skipped=[])
+
+    assert "FLIP CUSHION COVERAGE: 1 of 2 sessions" in text
+    assert "sessions with a stored flip only" in text
+
+
+def test_full_coverage_says_nothing_about_coverage():
+    """The banner is a warning, not furniture. A fully covered window should
+    not carry a caveat that does not apply to it."""
+    text = tool.format_report(
+        "SPY",
+        tool.build_report([_cushion_session(["SECURE"] * 40)], horizon_bars=6),
+        skipped=[],
+    )
+
+    assert "FLIP CUSHION COVERAGE" not in text
+    assert "sessions with a stored flip only" not in text
+
+
+def test_warnings_are_measured_only_where_a_cushion_could_have_fired():
+    old = _cushion_session(["NO_FLIP"] * 40)
+    new = _cushion_session(["SECURE"] * 40)
+
+    report = tool.build_report([old, new], horizon_bars=6)
+    total = sum(row["observed"]["n"] for row in report["transition_warnings"])
+
+    assert total <= 40  # the uncovered session contributes nothing
