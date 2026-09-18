@@ -7,7 +7,7 @@ make the stored history and the live reading disagree, which is the one
 failure a "vs normal" view cannot survive:
 
 * the moneyness band filters CONTRACTS before bucketing, not buckets;
-* the DTE universes are cumulative and the DTE buckets are disjoint;
+* the DTE universes are cumulative and the session buckets are disjoint;
 * a cell's population is the same whichever family you reach it through.
 """
 
@@ -16,9 +16,13 @@ from __future__ import annotations
 import datetime as dt
 
 from src.analytics import spread_stats as ss
+from src.market_calendar import trading_dte_map
 
 
 SPOT = 6000.0
+#: A Wednesday, so the fixture's expiries span a weekend — which is where
+#: calendar distance and session distance come apart.
+SESSION_DATE = dt.date(2026, 9, 16)
 
 
 def _chain(spot: float = SPOT):
@@ -26,7 +30,7 @@ def _chain(spot: float = SPOT):
     rows = []
     dte_of = {}
     for dte in (0, 1, 3, 10):
-        expiration = dt.date(2026, 9, 16) + dt.timedelta(days=dte)
+        expiration = SESSION_DATE + dt.timedelta(days=dte)
         for pct in (-9, -7, -4, -2.5, -1, 0, 1, 2.5, 4, 7, 9):
             strike = round(spot * (1 + pct / 100.0), 2)
             width = 0.10 + 0.05 * abs(pct)
@@ -45,7 +49,9 @@ def _chain(spot: float = SPOT):
         # resolves a contract's bucket through ``dte_of[s.expiration]``.
         dte_of[expiration] = dte
     spreads = ss.contract_spreads(rows, spot)
-    return spreads, dte_of
+    # Two units, as the production callers pass: calendar days scope the
+    # cumulative universes, trading sessions scope the disjoint buckets.
+    return spreads, dte_of, trading_dte_map(dte_of.keys(), SESSION_DATE)
 
 
 def test_band_filters_contracts_before_bucketing():
@@ -56,10 +62,10 @@ def test_band_filters_contracts_before_bucketing():
     -2.5% contracts, and the cell would then describe a wider population
     than the band it is labelled with.
     """
-    spreads, dte_of = _chain()
+    spreads, dte_of, tdte_of = _chain()
     cells = {
         (c.dte_scope, c.band_pct, c.money_bucket): c
-        for c in ss.surface_scopes(spreads, dte_of)
+        for c in ss.surface_scopes(spreads, dte_of, tdte_of)
     }
 
     wide = cells[("u30", 10.0, ss.BAND_WIDE)]
@@ -76,10 +82,10 @@ def test_band_filters_contracts_before_bucketing():
 
 
 def test_universes_are_cumulative_and_dte_buckets_are_disjoint():
-    spreads, dte_of = _chain()
+    spreads, dte_of, tdte_of = _chain()
     cells = {
         (c.dte_scope, c.band_pct, c.money_bucket): c
-        for c in ss.surface_scopes(spreads, dte_of)
+        for c in ss.surface_scopes(spreads, dte_of, tdte_of)
     }
 
     counts = {
@@ -90,7 +96,7 @@ def test_universes_are_cumulative_and_dte_buckets_are_disjoint():
 
     buckets = {
         key: cells[(key, 10.0, ss.BAND_WIDE)].aggregate.contract_count
-        for key, _lo, _hi in ss.DTE_BUCKETS
+        for key, _lo, _hi in ss.TRADING_DTE_BUCKETS
         if (key, 10.0, ss.BAND_WIDE) in cells
     }
     # Disjoint: the five expiry buckets partition the same population the
@@ -100,14 +106,14 @@ def test_universes_are_cumulative_and_dte_buckets_are_disjoint():
 
 
 def test_a_cell_is_the_same_population_however_it_is_reached():
-    """``u0`` and ``b0`` describe the same contracts, so the same width."""
-    spreads, dte_of = _chain()
+    """``u0`` and ``t0`` describe the same contracts, so the same width."""
+    spreads, dte_of, tdte_of = _chain()
     cells = {
         (c.dte_scope, c.band_pct, c.money_bucket): c
-        for c in ss.surface_scopes(spreads, dte_of)
+        for c in ss.surface_scopes(spreads, dte_of, tdte_of)
     }
     universe = cells[("u0", 5.0, ss.BAND_WIDE)].aggregate
-    bucket = cells[("b0", 5.0, ss.BAND_WIDE)].aggregate
+    bucket = cells[("t0", 5.0, ss.BAND_WIDE)].aggregate
     assert universe.contract_count == bucket.contract_count
     assert (
         universe.median_relative_spread_pct == bucket.median_relative_spread_pct
@@ -116,10 +122,10 @@ def test_a_cell_is_the_same_population_however_it_is_reached():
 
 def test_the_curve_reproduces_the_smile():
     """Wings wider than the money — the shape the view exists to show."""
-    spreads, dte_of = _chain()
+    spreads, dte_of, tdte_of = _chain()
     curve = {
         c.money_bucket: c.aggregate.median_relative_spread_pct
-        for c in ss.surface_scopes(spreads, dte_of)
+        for c in ss.surface_scopes(spreads, dte_of, tdte_of)
         if c.dte_scope == "u0" and c.band_pct == 10.0
         and c.money_bucket != ss.BAND_WIDE
     }
@@ -130,7 +136,7 @@ def test_the_curve_reproduces_the_smile():
 
 def test_a_contract_with_no_bid_is_counted_but_never_widens_the_median():
     """The wings failing is coverage collapse, not a bigger number."""
-    spreads, dte_of = _chain()
+    spreads, dte_of, tdte_of = _chain()
     rows = [
         {
             "option_symbol": "NOBID",
@@ -145,13 +151,13 @@ def test_a_contract_with_no_bid_is_counted_but_never_widens_the_median():
 
     cells = {
         (c.dte_scope, c.band_pct, c.money_bucket): c
-        for c in ss.surface_scopes(spreads, dte_of)
+        for c in ss.surface_scopes(spreads, dte_of, tdte_of)
     }
     cell = cells[("u0", 10.0, ss.BAND_WIDE)].aggregate
-    baseline, base_dte = _chain()
+    baseline, base_dte, base_tdte = _chain()
     clean = {
         (c.dte_scope, c.band_pct, c.money_bucket): c
-        for c in ss.surface_scopes(baseline, base_dte)
+        for c in ss.surface_scopes(baseline, base_dte, base_tdte)
     }[("u0", 10.0, ss.BAND_WIDE)].aggregate
 
     assert cell.contract_count == clean.contract_count + 1

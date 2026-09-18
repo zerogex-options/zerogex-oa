@@ -99,7 +99,7 @@ __all__ = [
     "moneyness_bucket_label",
     "percentile_rank",
     "DTE_UNIVERSES",
-    "DTE_BUCKETS",
+    "TRADING_DTE_BUCKETS",
     "MONEYNESS_BANDS",
     "BAND_WIDE",
     "SurfaceScope",
@@ -554,15 +554,34 @@ def aggregate_by_expiration(
 #: median, because medians do not combine.
 DTE_UNIVERSES: Tuple[int, ...] = (0, 1, 7, 30)
 
-#: Disjoint DTE buckets for the "where does it rank by expiry" view, as
-#: (key, low, high_inclusive). Disjoint so the reader can attribute a problem
-#: to one part of the curve instead of re-reading the same 0DTE four times.
-DTE_BUCKETS: Tuple[Tuple[str, int, int], ...] = (
-    ("b0", 0, 0),
-    ("b1", 1, 1),
-    ("b2_3", 2, 3),
-    ("b4_7", 4, 7),
-    ("b8_30", 8, 30),
+#: Disjoint expiry buckets for the "where does it rank by expiry" view, as
+#: (key, low, high_inclusive), measured in TRADING SESSIONS rather than
+#: calendar days. Disjoint so the reader can attribute a problem to one part
+#: of the curve instead of re-reading the same 0DTE four times.
+#:
+#: Sessions, not days, because the bucket has to hold the same kind of
+#: contract on every weekday or the percentile beneath it is comparing
+#: populations. Counting in calendar days, the Monday expiry is three days
+#: from a Friday and lands in "2-3 DTE" beside contracts with two or three
+#: real sessions of life left; on 2026-09-18 that reported SPX and NDX at
+#: exactly the 100th percentile of the bucket, which is the signature of a
+#: definition mismatch rather than a market event. The 4-7 bucket drifts the
+#: same way: 4-5 sessions out from a Monday, 3-5 from a Wednesday, 2-5 from
+#: a Thursday.
+#:
+#: The keys are ``t*`` and the old calendar keys were ``b*``. A rename
+#: rather than a redefinition, deliberately: rows already stored under
+#: ``b2_3`` describe a different population, and re-pointing the key at a
+#: new definition would rank today against a history that never measured
+#: the same thing. New keys start a fresh, comparable series and the old
+#: rows simply stop being read — the same reason ``moneyness_bucket_key``
+#: derives its key from the edges instead of an index.
+TRADING_DTE_BUCKETS: Tuple[Tuple[str, int, int], ...] = (
+    ("t0", 0, 0),
+    ("t1", 1, 1),
+    ("t2_3", 2, 3),
+    ("t4_7", 4, 7),
+    ("t8_30", 8, 30),
 )
 
 #: Moneyness bands the page offers, as a half-width in percent of spot.
@@ -598,9 +617,15 @@ def in_band(spread: ContractSpread, band_pct: float) -> bool:
 def aggregate_by_dte_bucket(
     spreads: Sequence[ContractSpread],
     dte_of: Dict[Any, int],
-    buckets: Sequence[Tuple[str, int, int]] = DTE_BUCKETS,
+    buckets: Sequence[Tuple[str, int, int]] = TRADING_DTE_BUCKETS,
 ) -> List[Tuple[str, SpreadAggregate]]:
-    """Group into the disjoint DTE buckets, nearest first.
+    """Group into the disjoint expiry buckets, nearest first.
+
+    ``dte_of`` must be measured in the same unit as ``buckets``. For the
+    default that is TRADING SESSIONS — see :data:`TRADING_DTE_BUCKETS` for
+    why, and :func:`src.market_calendar.trading_dte_map` for the mapping.
+    Handing it a calendar-day map silently produces the bug the trading-day
+    buckets exist to fix.
 
     Distinct from :func:`aggregate_by_expiration`, which keeps each listing
     separate: that answers "how wide is Friday", this answers "is the problem
@@ -634,9 +659,19 @@ class SurfaceScope:
 def surface_scopes(
     spreads: Sequence[ContractSpread],
     dte_of: Dict[Any, int],
+    trading_dte_of: Dict[Any, int],
     edges: Sequence[float] = DEFAULT_MONEYNESS_EDGES,
 ) -> List[SurfaceScope]:
     """Every cell of the surface cube for one snapshot of one option type.
+
+    TWO distance mappings, and they are not interchangeable. ``dte_of`` is
+    calendar days and scopes the cumulative universes, which the page offers
+    as "Through 7DTE" and which the daily rollup pins in the same unit.
+    ``trading_dte_of`` is trading sessions and scopes the disjoint buckets,
+    which are ranked against their own history and therefore have to hold
+    the same kind of contract on a Friday as on a Tuesday. Passing one where
+    the other belongs type-checks and is wrong; see
+    :data:`TRADING_DTE_BUCKETS`.
 
     Three families, because the three views ask different questions:
 
@@ -645,7 +680,7 @@ def surface_scopes(
       selected.
     * **(cumulative universe, band, all)** — the summary strip, and the
       population the headline percentile is ranked in.
-    * **(disjoint DTE bucket, band, all)** — the by-expiry ranking.
+    * **(disjoint session bucket, band, all)** — the by-expiry ranking.
 
     Empty cells are omitted rather than stored as zeroes: a bucket with no
     contracts is "not measured here", and a zero would read as "free to
@@ -689,7 +724,7 @@ def surface_scopes(
                     )
                 )
 
-        for key, agg in aggregate_by_dte_bucket(in_band_spreads, dte_of):
+        for key, agg in aggregate_by_dte_bucket(in_band_spreads, trading_dte_of):
             if agg.contract_count == 0:
                 continue
             out.append(SurfaceScope(key, band, BAND_WIDE, agg))
