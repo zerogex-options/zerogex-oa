@@ -19,6 +19,7 @@ import logging
 from typing import Any, Dict, List, Sequence, Tuple
 
 from src.analytics import spread_stats as spread_stats_mod
+from src.market_calendar import trading_dte_map
 from src.config import (
     SPREAD_SURFACE_BUCKET_MINUTES,
     SPREAD_SURFACE_MIN_BUCKET_CONTRACTS,
@@ -172,12 +173,19 @@ def store_surface_scopes(
     ``spreads_by_type`` maps ``'C'``/``'P'`` to that side's contract readings.
     Sides are kept apart all the way down: the page never blends them, because
     the question it exists for is whether the PUTS specifically have gone wide.
+
+    The trading-session distances are derived here rather than asked of the
+    caller. Every writer already hands over ``trading_date`` and the
+    expirations, so deriving it once at the funnel is the only way the live
+    engine and both backfills cannot drift into measuring different buckets
+    — which is the same reason the reduction itself lives in one module.
     """
+    trading_dte_of = trading_dte_map(dte_of.keys(), trading_date)
     written = 0
     for option_type, spreads in spreads_by_type.items():
         if not spreads:
             continue
-        scopes = spread_stats_mod.surface_scopes(spreads, dte_of)
+        scopes = spread_stats_mod.surface_scopes(spreads, dte_of, trading_dte_of)
         rows = surface_param_rows(
             underlying, trading_date, bucket_min, option_type, spot, source_ts, scopes
         )

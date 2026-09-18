@@ -100,7 +100,7 @@ from src.config import (
     SPREAD_SURFACE_HISTORY_DAYS,
     SPREAD_SURFACE_MIN_SESSIONS,
 )
-from src.market_calendar import is_am_settled_contract
+from src.market_calendar import is_am_settled_contract, trading_dte_map
 from zoneinfo import ZoneInfo
 
 from ..database import DatabaseManager
@@ -1057,13 +1057,16 @@ class SpreadSurfaceResponse(BaseModel):
     by_dte: List[DteRank]
 
 
-#: Human labels for the disjoint expiry buckets.
+#: Human labels for the disjoint expiry buckets, which are counted in
+#: TRADING SESSIONS. "1DTE" from a Friday is the Monday expiry — which is
+#: also what a trader means by it, and was not what the old calendar-day
+#: bucketing measured.
 _DTE_BUCKET_LABELS: Dict[str, str] = {
-    "b0": "0DTE",
-    "b1": "1DTE",
-    "b2_3": "2-3 DTE",
-    "b4_7": "4-7 DTE",
-    "b8_30": "8-30 DTE",
+    "t0": "0DTE",
+    "t1": "1DTE",
+    "t2_3": "2-3 DTE",
+    "t4_7": "4-7 DTE",
+    "t8_30": "8-30 DTE",
 }
 
 
@@ -1179,9 +1182,14 @@ async def get_spread_surface(
             detail=f"No {'put' if option_type == 'P' else 'call'} quotes for {sym}",
         )
 
+    # Two mappings, because the universes and the disjoint buckets measure
+    # distance in different units on purpose — see `surface_scopes`.
+    trading_dte_of = trading_dte_map(reduced["dte_of"].keys(), reduced["session_date"])
     current_cells = {
         (c.dte_scope, c.money_bucket): c
-        for c in spread_stats_mod.surface_scopes(side_spreads, reduced["dte_of"])
+        for c in spread_stats_mod.surface_scopes(
+            side_spreads, reduced["dte_of"], trading_dte_of
+        )
         if c.band_pct == band
     }
 
@@ -1304,7 +1312,7 @@ async def get_spread_surface(
 
     # --- rank by expiry ----------------------------------------------------
     by_dte: List[DteRank] = []
-    for scope_key, _low, _high in spread_stats_mod.DTE_BUCKETS:
+    for scope_key, _low, _high in spread_stats_mod.TRADING_DTE_BUCKETS:
         key = (scope_key, spread_stats_mod.BAND_WIDE)
         cell = current_cells.get(key)
         values = _hist(key)

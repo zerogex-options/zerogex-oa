@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, time, timedelta
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 import pytz
 
@@ -164,6 +164,67 @@ _AM_SETTLED_INDEX_PM_ROOTS: Dict[str, str] = {
     "SPX": "SPXW",
     "NDX": "NDXP",
 }
+
+
+def is_trading_session(day: date) -> bool:
+    """True when the US equity options market holds a session on ``day``.
+
+    Weekends and configured NYSE holidays are closed; a half day is still a
+    session. ``NYSE_HOLIDAYS`` is loaded from the environment, so a
+    deployment that has not configured it counts holidays as sessions —
+    which shifts a distance by one over a holiday week rather than
+    inventing one, and is why the loader has a strict mode.
+    """
+    return day.weekday() < 5 and day not in NYSE_HOLIDAYS
+
+
+def trading_days_until(session_date: date, expiration: date) -> int:
+    """Sessions from ``session_date`` to ``expiration``, expiry inclusive.
+
+    0 means it expires today, 1 the next session the market is open, and so
+    on. Negative for an expiration already past, mirroring what subtracting
+    two dates would give so callers filtering on ``>= 0`` keep working.
+
+    THIS IS NOT ``(expiration - session_date).days`` AND THE DIFFERENCE IS
+    THE POINT. Calendar distance makes the near buckets mean different
+    things depending on the weekday: from a Friday, the Monday expiry is
+    three calendar days out and one session out. Bucketed by calendar
+    distance it lands in "2-3 DTE" and is then ranked against a history of
+    contracts with two or three real sessions of life left — which is a
+    comparison between populations, not between days, and it reported both
+    SPX and NDX at exactly the 100th percentile of that bucket on the
+    2026-09-18 expiry.
+
+    The distortion is not confined to Fridays. Counting forward from each
+    weekday, the 4-7 calendar-day bucket holds contracts 4-5 sessions out
+    from a Monday, 3-5 from a Wednesday and 2-5 from a Thursday. Three
+    sessions in five measure something different from the other two, and the
+    baseline cannot tell which it is looking at.
+    """
+    if expiration == session_date:
+        return 0
+    step = 1 if expiration > session_date else -1
+    first, last = sorted((session_date, expiration))
+    sessions = 0
+    day = first + timedelta(days=1)
+    while day <= last:
+        if is_trading_session(day):
+            sessions += 1
+        day += timedelta(days=1)
+    return sessions * step
+
+
+def trading_dte_map(expirations: Iterable[date], session_date: date) -> Dict[date, int]:
+    """``{expiration: sessions until it}`` for a whole chain, deduplicated.
+
+    Built once per snapshot rather than per contract: a chain carries a few
+    dozen distinct expirations and several hundred thousand contracts.
+    """
+    return {
+        expiration: trading_days_until(session_date, expiration)
+        for expiration in set(expirations)
+        if expiration is not None
+    }
 
 
 def canonical_index_symbol(symbol: Optional[str]) -> str:

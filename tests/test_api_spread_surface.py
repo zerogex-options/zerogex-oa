@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 
 from src.analytics import spread_stats as ss
+from src.market_calendar import trading_dte_map
 
 
 SESSION_DATE = date(2026, 9, 10)
@@ -38,7 +39,11 @@ STRIKE_PCTS = (-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0)
 # One expiry in every disjoint DTE bucket, so the by-expiry ranking is
 # fully populated and a None there means a real refusal, not a hole in
 # the fixture.
-DTES = (0, 1, 3, 5, 10)
+#: Calendar offsets from SESSION_DATE (a Thursday) chosen so every contract
+#: lands on a real weekday AND the five session buckets are each populated
+#: exactly once: 0, 1, 3, 7 and 11 trading sessions out. Sunday expirations
+#: would collapse into the bucket of the Friday before them.
+DTES = (0, 1, 5, 11, 15)
 
 
 def _build_app(monkeypatch):
@@ -110,7 +115,9 @@ def _baseline_medians(option_type: str, band: float) -> Dict[tuple, float]:
     dte_of = {SESSION_DATE + timedelta(days=dte): dte for dte in DTES}
     return {
         (cell.dte_scope, cell.money_bucket): cell.aggregate.median_relative_spread_pct
-        for cell in ss.surface_scopes(spreads, dte_of)
+        for cell in ss.surface_scopes(
+            spreads, dte_of, trading_dte_map(dte_of.keys(), SESSION_DATE)
+        )
         if cell.band_pct == band
         and cell.aggregate.median_relative_spread_pct is not None
     }
@@ -247,8 +254,8 @@ def test_a_0dte_put_blowout_shows_up_as_0dte_and_not_as_everything(monkeypatch):
     assert body["summary"]["percentile"] == 100.0
 
     ranks = {row["dte_scope"]: row for row in body["by_dte"]}
-    assert ranks["b0"]["percentile"] == 100.0
-    for key in ("b1", "b2_3", "b4_7", "b8_30"):
+    assert ranks["t0"]["percentile"] == 100.0
+    for key in ("t1", "t2_3", "t4_7", "t8_30"):
         # Sitting in the body of its own distribution — an unmoved expiry
         # reads as ordinary, not as a milder version of the blowout.
         assert 25.0 <= ranks[key]["percentile"] <= 75.0, key
