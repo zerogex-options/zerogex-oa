@@ -74,19 +74,34 @@ PRESSURE_FLOOR_USD = 25_000_000.0
 STABILITY_FLAT_BAND_USD = 50_000_000.0
 
 #: Pressure persistence ladder, in completed 5-minute bars. One bar is a
-#: pulse; two of the last three plus an aligned average is developing; three
-#: is established enough to lean on. A pulse is not nothing -- it is the first
+#: pulse; two of the last three plus an aligned average is building; three is
+#: persistent enough to lean on. A pulse is not nothing -- it is the first
 #: evidence -- but it is not yet a condition.
 PERSISTENCE_WINDOW_BARS = 3
-PERSISTENCE_DEVELOPING_BARS = 2
-PERSISTENCE_ESTABLISHED_BARS = 3
+PERSISTENCE_BUILDING_BARS = 2
+PERSISTENCE_PERSISTENT_BARS = 3
 
 #: State-age thresholds, in minutes. Duration is the thing being studied here:
 #: not whether gamma calls direction, but whether a condition that exists is
 #: healthy enough to persist.
 AGE_ESTABLISHED_MIN = 15
 AGE_CONFIRMED_MIN = 30
-AGE_DURABLE_MIN = 60
+AGE_MATURE_MIN = 60
+
+#: Completed bars a NEW state must repeat before it takes the header.
+#:
+#: Not cosmetic. Measured over seven sessions, the unconfirmed classifier
+#: changed state roughly every 8 minutes: 347 runs with a median life of one
+#: bar, and outside a single instance no state survived 30 minutes. Requiring
+#: two bars cuts that to 94 runs, moves the median state life to 20-25
+#: minutes, and lifts 30-minute survival from 0.3% to about 30%, for a median
+#: 5 minutes of lateness. See src/tools/gamma_weather_base_rates.py, which
+#: measures both sides of that trade.
+#:
+#: Two rather than three because it is the number already agreed with Barrie
+#: for flip dots, not because seven sessions chose it. Re-run the report as
+#: history accumulates before moving it.
+CONFIRM_BARS = 2
 
 #: Share of the current cushion that the trailing window must have given up
 #: for the narrowing to count as a transition risk rather than drift. A ratio
@@ -95,14 +110,20 @@ TRANSITION_RATE_SHARE = 0.25
 
 # --------------------------------------------------------------------------- #
 
+# Two ladders that answer different questions, so they share no words. They
+# used to: both ran DEVELOPING -> ESTABLISHED, which made "established" mean
+# either a settled pressure leg or a state old enough to trust, and a reader
+# could not tell which from the value alone. Barrie caught it from the live
+# panel and picked the split below. The codes are distinct too, not just the
+# display names, because the API emits both fields side by side.
 PERSISTENCE_PULSE = "PULSE"
-PERSISTENCE_DEVELOPING = "DEVELOPING"
-PERSISTENCE_ESTABLISHED = "ESTABLISHED"
+PERSISTENCE_BUILDING = "BUILDING"
+PERSISTENCE_PERSISTENT = "PERSISTENT"
 
-AGE_DEVELOPING = "DEVELOPING"
+AGE_NEW = "NEW"
 AGE_ESTABLISHED = "ESTABLISHED"
 AGE_CONFIRMED = "CONFIRMED"
-AGE_DURABLE = "DURABLE"
+AGE_MATURE = "MATURE"
 
 PRESSURE_BUYING = "BUYING"
 PRESSURE_SELLING = "SELLING"
@@ -135,6 +156,19 @@ STATE_LABELS = {
     STATE_FRAGILE_RALLY: "Fragile rally",
     STATE_UNSTABLE: "Unstable",
     STATE_MIXED: "Mixed",
+}
+
+PERSISTENCE_LABELS = {
+    PERSISTENCE_PULSE: "Pulse",
+    PERSISTENCE_BUILDING: "Building",
+    PERSISTENCE_PERSISTENT: "Persistent",
+}
+
+AGE_LABELS = {
+    AGE_NEW: "New",
+    AGE_ESTABLISHED: "Established",
+    AGE_CONFIRMED: "Confirmed",
+    AGE_MATURE: "Mature",
 }
 
 
@@ -179,15 +213,31 @@ class Weather:
     lean_side: Optional[str]
     cushion: str
     sentence: str
-    #: How settled the pressure direction is: PULSE / DEVELOPING / ESTABLISHED.
+    #: How settled the pressure direction is: PULSE / BUILDING / PERSISTENT.
     #: A pulse is the first evidence, not yet a condition.
     persistence: str = PERSISTENCE_PULSE
-    #: How long this state has held. Bars rather than a stored timestamp,
-    #: because states are derived on read and a retuned threshold must re-age
-    #: history as well as re-label it.
+    #: How long this state has held: NEW / ESTABLISHED / CONFIRMED / MATURE.
+    #: Bars rather than a stored timestamp, because states are derived on read
+    #: and a retuned threshold must re-age history as well as re-label it.
     age_bars: int = 0
     age_minutes: Optional[float] = None
+    age: Optional[str] = None
+    #: Display wording for the two ladders, carried alongside the codes for
+    #: the same reason ``label`` sits beside ``state``: one source of truth.
+    #: The panel used to keep its own copy of both maps, which is precisely
+    #: what a rename like this one silently breaks.
+    persistence_label: str = PERSISTENCE_LABELS[PERSISTENCE_PULSE]
     age_label: Optional[str] = None
+    #: The state this bar would read without confirmation, when that differs
+    #: from the one holding the header. Carried rather than suppressed: the
+    #: whole point of confirming is to stop the header chasing noise, and the
+    #: whole point of showing the candidate anyway is that the early read is
+    #: information. Barrie's words for the same idea on flip dots -- show it
+    #: immediately as unconfirmed, upgrade it when it holds.
+    pending_state: Optional[str] = None
+    pending_label: Optional[str] = None
+    #: Completed bars the candidate has held, 1 .. CONFIRM_BARS - 1.
+    pending_bars: int = 0
 
 
 def classify_pressure(bar: Optional[float], avg: Optional[float]) -> str:
@@ -281,12 +331,12 @@ def classify_persistence(
         1 for v in window if v is not None and abs(v) > PRESSURE_FLOOR_USD and (v > 0) == (want > 0)
     )
 
-    if aligned >= PERSISTENCE_ESTABLISHED_BARS:
-        return PERSISTENCE_ESTABLISHED
+    if aligned >= PERSISTENCE_PERSISTENT_BARS:
+        return PERSISTENCE_PERSISTENT
 
     avg_aligned = avg is not None and abs(avg) > PRESSURE_FLOOR_USD and (avg > 0) == (want > 0)
-    if aligned >= PERSISTENCE_DEVELOPING_BARS and avg_aligned:
-        return PERSISTENCE_DEVELOPING
+    if aligned >= PERSISTENCE_BUILDING_BARS and avg_aligned:
+        return PERSISTENCE_BUILDING
 
     return PERSISTENCE_PULSE
 
@@ -294,20 +344,20 @@ def classify_persistence(
 def classify_age(minutes: Optional[float]) -> Optional[str]:
     """How long the current state has held, as a word.
 
-    Bands are Barrie's. Developing covers everything below the established
-    line, which absorbs the gap between his "under 10 minutes is provisional"
-    and "15 minutes is established" -- a state at 12 minutes is not yet
+    Bands are Barrie's. New covers everything below the established line,
+    which absorbs the gap between his "under 10 minutes is provisional" and
+    "15 minutes is established" -- a state at 12 minutes is not yet
     established, and calling it anything else would overstate it.
     """
     if minutes is None:
         return None
-    if minutes >= AGE_DURABLE_MIN:
-        return AGE_DURABLE
+    if minutes >= AGE_MATURE_MIN:
+        return AGE_MATURE
     if minutes >= AGE_CONFIRMED_MIN:
         return AGE_CONFIRMED
     if minutes >= AGE_ESTABLISHED_MIN:
         return AGE_ESTABLISHED
-    return AGE_DEVELOPING
+    return AGE_NEW
 
 
 def state_age_bars(states: Sequence[str]) -> int:
@@ -347,10 +397,23 @@ def _state_for(pressure: str, structure: str) -> str:
 
 
 def _sentence(
-    state: str, pressure: str, structure: str, lean_side: Optional[str], cushion: str
+    state: str,
+    pressure: str,
+    structure: str,
+    lean_side: Optional[str],
+    cushion: str,
+    pending: Optional[str] = None,
 ) -> str:
     """One plain sentence: what the tape is doing, what the book is doing, and
-    how much room is left. Conditions, never outcomes."""
+    how much room is left. Conditions, never outcomes.
+
+    ``pending`` is not decoration. Once the header is confirmed, it can name a
+    condition the components no longer support: "Stable bid" over a bar whose
+    pressure reads selling. That looks like a bug and is not one, so when a
+    different state is waiting on confirmation the sentence says so, and the
+    reader gets the reason the components and the header disagree instead of
+    being left to wonder.
+    """
     push = {
         PRESSURE_BUYING: "Hedging pressure is buying",
         PRESSURE_SELLING: "Hedging pressure is selling",
@@ -376,40 +439,124 @@ def _sentence(
         CUSHION_NONE: "there is no gamma flip in the profile",
     }[cushion]
 
-    return f"{STATE_LABELS[state]}. {push}, {book}, and {room}."
+    line = f"{STATE_LABELS[state]}. {push}, {book}, and {room}."
+    if pending and pending != state:
+        line += f" {STATE_LABELS[pending]} is forming, not yet confirmed."
+    return line
 
 
-def classify_series(inputs: Sequence[WeatherInputs], bar_minutes: float = 5.0) -> List[Weather]:
-    """Classify a chronological run of bars, with persistence and state age.
+class _Confirmation:
+    """The hold-before-you-change rule, as a state machine over one session.
 
-    The per-bar :func:`classify` cannot see history, so it reports every bar as
-    a pulse of unknown age. This is the form the panel actually wants: it walks
-    the session once and fills both.
+    Kept here, in one place, because production and the base-rate report have
+    to agree on it exactly. A report that measured a lookalike of this rule
+    would produce numbers about a panel nobody runs, which is the failure the
+    whole tool exists to prevent.
 
-    Age is measured in consecutive bars sharing the state, counted backward
-    from each point, so a bar's age is what it would have read at the time
-    rather than what hindsight makes of it.
+    Strictly causal: each bar is decided from bars at or before it, never from
+    what came next. That is what lets a completed session be replayed and give
+    the same headline the panel showed live, and what makes the report's
+    comparison of confirmed against raw legitimate rather than flattered by
+    hindsight.
+    """
+
+    def __init__(self, confirm_bars: int) -> None:
+        self.confirm_bars = confirm_bars
+        self.headline: Optional[str] = None
+        self.candidate: Optional[str] = None
+        self.streak = 0
+
+    def push(self, raw: str) -> tuple:
+        """Feed one bar's raw state; get ``(headline, pending, pending_bars)``.
+
+        The first bar of a session takes the header immediately. There is
+        nothing for it to be confirmed against, and withholding a headline for
+        the first ten minutes of every session would be a worse read than the
+        one bar of noise it avoids.
+        """
+        if self.headline is None or self.confirm_bars <= 1:
+            self.headline = raw
+            self.candidate, self.streak = None, 0
+            return self.headline, None, 0
+
+        if raw == self.headline:
+            self.candidate, self.streak = None, 0
+            return self.headline, None, 0
+
+        if raw == self.candidate:
+            self.streak += 1
+        else:
+            self.candidate, self.streak = raw, 1
+
+        if self.streak >= self.confirm_bars:
+            self.headline = raw
+            self.candidate, self.streak = None, 0
+            return self.headline, None, 0
+
+        return self.headline, self.candidate, self.streak
+
+
+def classify_series(
+    inputs: Sequence[WeatherInputs],
+    bar_minutes: float = 5.0,
+    confirm_bars: int = CONFIRM_BARS,
+) -> List[Weather]:
+    """Classify a chronological run of bars, as the panel reads them.
+
+    The per-bar :func:`classify` cannot see history, so it reports every bar
+    as an unconfirmed pulse of unknown age. This is the form the panel wants:
+    one walk of the session that fills confirmation, persistence and age.
+
+    ``state`` is the CONFIRMED headline, not this bar's raw read. A state that
+    has just appeared is carried on ``pending_state`` until it holds
+    ``confirm_bars`` bars, so the early information is visible without the
+    header chasing it. ``confirm_bars`` of 1 disables confirmation entirely,
+    which is how the base-rate report measures what confirming is worth.
+
+    Age counts consecutive bars sharing the CONFIRMED state. Measuring it on
+    the raw series would reset the clock on every one-bar flicker and make the
+    age ladder unreachable, which is exactly what it did before this rule
+    existed.
     """
     out: List[Weather] = []
     states: List[str] = []
     pressures: List[Optional[float]] = []
+    confirmation = _Confirmation(confirm_bars)
 
     for row in inputs:
         base = classify(row)
         pressures.append(row.pressure_bar)
-        states.append(base.state)
+
+        headline, pending, pending_bars = confirmation.push(base.state)
+        states.append(headline)
 
         persistence = classify_persistence(pressures, row.pressure_avg, base.pressure)
         age_bars = state_age_bars(states)
         age_minutes = age_bars * bar_minutes
+        age = classify_age(age_minutes)
 
         out.append(
             replace(
                 base,
+                state=headline,
+                label=STATE_LABELS[headline],
+                sentence=_sentence(
+                    headline,
+                    base.pressure,
+                    base.structure,
+                    base.lean_side,
+                    base.cushion,
+                    pending,
+                ),
+                pending_state=pending,
+                pending_label=STATE_LABELS[pending] if pending else None,
+                pending_bars=pending_bars,
                 persistence=persistence,
+                persistence_label=PERSISTENCE_LABELS[persistence],
                 age_bars=age_bars,
                 age_minutes=age_minutes,
-                age_label=classify_age(age_minutes),
+                age=age,
+                age_label=AGE_LABELS.get(age) if age else None,
             )
         )
 

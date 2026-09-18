@@ -721,40 +721,6 @@ def change_attribution(sessions: Sequence[Session], names: Sequence[str]) -> Dic
     return out
 
 
-def debounce(states: Sequence[str], confirm_bars: int) -> List[str]:
-    """Hold the headline until a new state has repeated ``confirm_bars`` times.
-
-    A what-if, not a product change: it answers "how much of the churn would a
-    confirmation rule remove, and how late would the truth arrive". Strictly
-    causal -- each bar is decided from bars at or before it -- so the debounced
-    series is one a live panel could actually have shown, and its run lengths
-    are comparable with the raw ones rather than flattered by hindsight.
-
-    ``confirm_bars`` of 1 or less is the identity.
-    """
-    if confirm_bars <= 1 or not states:
-        return list(states)
-
-    out: List[str] = []
-    current = states[0]
-    candidate: Optional[str] = None
-    streak = 0
-
-    for state in states:
-        if state == current:
-            candidate, streak = None, 0
-        else:
-            if state == candidate:
-                streak += 1
-            else:
-                candidate, streak = state, 1
-            if streak >= confirm_bars:
-                current, candidate, streak = state, None, 0
-        out.append(current)
-
-    return out
-
-
 def confirmation_lag(raw: Sequence[str], confirmed: Sequence[str]) -> List[int]:
     """Bars between a change in ``raw`` and the same change reaching the
     headline. The cost side of a confirmation rule.
@@ -762,6 +728,11 @@ def confirmation_lag(raw: Sequence[str], confirmed: Sequence[str]) -> List[int]:
     Only changes that survive to the headline are measured; a raw flip that is
     filtered out never arrives and has no lag to report, which is the point of
     filtering it.
+
+    Compares two already-computed series rather than applying the rule itself.
+    The rule lives in :class:`src.analytics.gamma_weather._Confirmation` and
+    has exactly one implementation, so this module cannot drift from the
+    classifier it is measuring.
     """
     lags: List[int] = []
     pending: Optional[int] = None

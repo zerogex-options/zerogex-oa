@@ -56,6 +56,17 @@ class FakeCursor:
         return False
 
 
+def _loaded(cursor, optional_columns, warmup=6, confirm_bars=1):
+    """Load a day and classify it.
+
+    ``confirm_bars=1`` by default so these tests read the classifier's raw
+    output: what is under test here is the loading, and the confirmation rule
+    has its own tests in tests/test_gamma_weather.py.
+    """
+    loaded = tool.load_session(cursor, "SPY", date(2026, 9, 17), optional_columns)
+    return None if loaded is None else loaded.classify(warmup, confirm_bars)
+
+
 def _bars(n, start=None):
     start = start or ET.localize(datetime(2026, 9, 17, 9, 30))
     return [start + timedelta(minutes=5 * i) for i in range(n)]
@@ -131,7 +142,7 @@ def test_a_sub_bar_horizon_still_measures_one_bar():
 def test_a_session_classifies_into_weather_states():
     cursor, bars = _cursor(12)
 
-    session = tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
+    session = _loaded(cursor, ["typical_move_30m"])
 
     assert len(session) == len(bars)
     assert session.warmup == 6
@@ -146,7 +157,7 @@ def test_ages_come_from_the_classifier_not_from_the_tool():
     user was looking at rather than a second count that could disagree."""
     cursor, _ = _cursor(12)
 
-    session = tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
+    session = _loaded(cursor, ["typical_move_30m"])
 
     assert session.ages[0] == 1
     assert session.ages[1] == 2
@@ -157,7 +168,7 @@ def test_ages_come_from_the_classifier_not_from_the_tool():
 def test_warnings_are_the_cushion_transition_risk_flag():
     cursor, _ = _cursor(12)
 
-    session = tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
+    session = _loaded(cursor, ["typical_move_30m"])
 
     assert list(session.warnings) == [False] * 12  # a wide, steady cushion
 
@@ -168,7 +179,7 @@ def test_the_session_window_is_the_one_the_endpoint_serves():
     against what a user saw."""
     cursor, _ = _cursor(12)
 
-    tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
+    _loaded(cursor, ["typical_move_30m"])
 
     _, params = cursor.executed[0]
     start = params["start"].astimezone(ET)
@@ -182,7 +193,7 @@ def test_the_flow_query_is_the_canonical_one_not_a_transcription():
     would show up as a base rate rather than as an error."""
     cursor, _ = _cursor(12)
 
-    tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
+    _loaded(cursor, ["typical_move_30m"])
 
     flow_sql = [sql for sql, _ in cursor.executed if "flow_contract_facts" in sql]
     assert flow_sql == [HEDGING_FLOW_CTE_PSYCOPG2]
@@ -191,7 +202,7 @@ def test_the_flow_query_is_the_canonical_one_not_a_transcription():
 def test_a_session_with_no_structure_bars_is_skipped():
     cursor = FakeCursor([], _flow_rows(_bars(12)))
 
-    assert tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6) is None
+    assert _loaded(cursor, ["typical_move_30m"]) is None
 
 
 def test_a_session_with_no_classified_flow_is_skipped():
@@ -199,7 +210,7 @@ def test_a_session_with_no_classified_flow_is_skipped():
     regime_cols = list(tool._REGIME_COLUMNS) + ["typical_move_30m"]
     cursor = FakeCursor(_regime_rows(bars, regime_cols), [])
 
-    assert tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6) is None
+    assert _loaded(cursor, ["typical_move_30m"]) is None
 
 
 def test_two_series_with_no_bar_in_common_produce_nothing():
@@ -210,7 +221,7 @@ def test_two_series_with_no_bar_in_common_produce_nothing():
     flow = _flow_rows(_bars(6, ET.localize(datetime(2026, 9, 17, 13, 0))))
     cursor = FakeCursor(regime, flow)
 
-    assert tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6) is None
+    assert _loaded(cursor, ["typical_move_30m"]) is None
 
 
 def test_a_database_without_the_newest_column_still_reports():
@@ -219,7 +230,7 @@ def test_a_database_without_the_newest_column_still_reports():
     worse than one that runs on the legacy cushion basis."""
     cursor, _ = _cursor(12, columns=())
 
-    session = tool.load_session(cursor, "SPY", date(2026, 9, 17), [], 6)
+    session = _loaded(cursor, [])
 
     assert len(session) == 12
     selected = cursor.executed[0][0]
@@ -326,7 +337,7 @@ def test_the_classifier_components_are_carried_for_diagnosis():
     report exists to have already done."""
     cursor, _ = _cursor(12)
 
-    session = tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
+    session = _loaded(cursor, ["typical_move_30m"])
 
     assert set(tool.CHURN_COMPONENTS).issubset(session.components[0])
     assert session.components[-1]["pressure"] == gw.PRESSURE_BUYING
@@ -364,16 +375,41 @@ def test_the_what_if_section_is_absent_unless_asked_for():
 def test_the_what_if_reports_both_sides():
     """Churn removed AND lateness added. Reporting only the first would make
     any confirmation window look free."""
-    from src.analytics import base_rates as br
-
-    flapping = _session(list("AB" * 20))
-    report = tool.build_report([flapping], horizon_bars=3, confirm_bars=2)
+    raw = _session(list("AB" * 20))  # a header that changes every bar
+    confirmed = _session(["A"] * 40)  # the same days, with the rule applied
+    report = tool.build_report([confirmed], horizon_bars=3, confirm_bars=2, raw_sessions=[raw])
     text = tool.format_report("SPY", report, skipped=[])
 
-    assert "WHAT-IF" in text
+    assert "WHAT CONFIRMATION BUYS" in text
     assert report["confirmation"]["raw_runs"] > report["confirmation"]["confirmed_runs"]
     assert "median lag" in text
-    assert isinstance(br.debounce(flapping.states, 2), list)
+
+
+def test_the_comparison_needs_the_unconfirmed_side_to_exist():
+    """Without it there is nothing to compare against, and a section claiming
+    to show what confirmation bought would be showing one number twice."""
+    report = tool.build_report([_session(["A"] * 40)], horizon_bars=3, confirm_bars=2)
+
+    assert report["confirmation"] is None
+    assert "WHAT CONFIRMATION BUYS" not in tool.format_report("SPY", report, skipped=[])
+
+
+def test_the_loader_can_classify_one_day_at_two_settings():
+    """One database read, two classifications, both through the real
+    classifier. The comparison used to debounce the output strings instead,
+    which measured a rule the panel does not run."""
+    cursor, _ = _cursor(12)
+    loaded = tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"])
+
+    strict = loaded.classify(0, 3)
+    raw = loaded.classify(0, 1)
+
+    assert len(strict) == len(raw) == 12
+    assert list(raw.states[:2]) == [gw.STATE_MIXED, gw.STATE_MIXED]
+    # Three bars of confirmation cannot be met by a two-bar opening run, so
+    # the header the session opened with holds longer.
+    assert strict.states[2] == gw.STATE_MIXED
+    assert raw.states[2] == gw.STATE_STABLE_BID
 
 
 def test_the_what_if_never_reaches_the_live_classification():

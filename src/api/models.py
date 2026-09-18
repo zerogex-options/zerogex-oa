@@ -681,16 +681,35 @@ class GammaWeatherResponse(BaseModel):
     #: TRANSITION_RISK / NARROWING / WIDENING / STEADY / NONE. A modifier on
     #: the state, never a competing state.
     cushion: str
-    #: PULSE / DEVELOPING / ESTABLISHED. How settled the pressure direction is:
+    #: PULSE / BUILDING / PERSISTENT. How settled the pressure direction is:
     #: one bar is the first evidence, three is a condition.
     persistence: str = "PULSE"
-    #: How long the current state has held. DEVELOPING / ESTABLISHED /
-    #: CONFIRMED / DURABLE, with the raw bars and minutes alongside. Duration
-    #: is the point: the question is not whether gamma calls direction, but
-    #: whether a condition that exists is healthy enough to persist.
+    #: How long the current state has held. NEW / ESTABLISHED / CONFIRMED /
+    #: MATURE, with the raw bars and minutes alongside. Duration is the point:
+    #: the question is not whether gamma calls direction, but whether a
+    #: condition that exists is healthy enough to persist.
+    #:
+    #: The two ladders deliberately share no words. They used to both run
+    #: DEVELOPING -> ESTABLISHED, which left "established" ambiguous in a
+    #: payload that carries both fields at once.
     age_bars: int = 0
     age_minutes: Optional[float] = None
+    age: Optional[str] = None
+    #: Display wording for both ladders, emitted beside the codes exactly as
+    #: ``label`` is emitted beside ``state``, so a client never keeps its own
+    #: copy of the mapping.
+    persistence_label: str = "Pulse"
     age_label: Optional[str] = None
+    #: The state this bar would read without confirmation, when it differs
+    #: from the one holding the header, plus how many bars it has held. The
+    #: header waits for a new state to repeat; this is the early read that
+    #: waiting would otherwise hide.
+    pending_state: Optional[str] = None
+    pending_label: Optional[str] = None
+    pending_bars: int = 0
+    #: Bars a new state must repeat before it takes the header, so a client
+    #: can render "1 of 2" without hard-coding the rule.
+    confirm_bars: int = 2
     cushion_summary: Optional[str] = None
     components: dict = {}
     basis: str

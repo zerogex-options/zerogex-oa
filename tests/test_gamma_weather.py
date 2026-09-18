@@ -12,11 +12,13 @@ import itertools
 
 from src.analytics.gamma_weather import (
     AGE_CONFIRMED,
-    AGE_DEVELOPING,
-    AGE_DURABLE,
     AGE_ESTABLISHED,
-    PERSISTENCE_DEVELOPING,
-    PERSISTENCE_ESTABLISHED,
+    AGE_LABELS,
+    AGE_MATURE,
+    AGE_NEW,
+    PERSISTENCE_BUILDING,
+    PERSISTENCE_LABELS,
+    PERSISTENCE_PERSISTENT,
     PERSISTENCE_PULSE,
     classify_age,
     classify_persistence,
@@ -290,8 +292,8 @@ def test_gamma_trend_does_not_change_the_state():
 # Pressure persistence: one bar is a pulse, three is a condition
 # --------------------------------------------------------------------------- #
 def test_the_persistence_ladder():
-    assert classify_persistence([BIG, BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_ESTABLISHED
-    assert classify_persistence([BIG, -BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_DEVELOPING
+    assert classify_persistence([BIG, BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_PERSISTENT
+    assert classify_persistence([BIG, -BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_BUILDING
     assert classify_persistence([-BIG, -BIG, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_PULSE
 
 
@@ -305,7 +307,7 @@ def test_bars_inside_the_floor_are_not_evidence_either_way():
     """A quiet bar does not confirm a direction, but it does not argue against
     one either; it simply does not count."""
     tiny = PRESSURE_FLOOR_USD * 0.1
-    assert classify_persistence([BIG, tiny, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_DEVELOPING
+    assert classify_persistence([BIG, tiny, BIG], BIG, PRESSURE_BUYING) == PERSISTENCE_BUILDING
 
 
 def test_mixed_pressure_is_always_a_pulse():
@@ -324,17 +326,17 @@ def test_only_the_trailing_window_counts():
 # State age
 # --------------------------------------------------------------------------- #
 def test_age_bands():
-    assert classify_age(5) == AGE_DEVELOPING
+    assert classify_age(5) == AGE_NEW
     assert classify_age(18) == AGE_ESTABLISHED
     assert classify_age(41) == AGE_CONFIRMED
-    assert classify_age(75) == AGE_DURABLE
+    assert classify_age(75) == AGE_MATURE
 
 
 def test_the_gap_between_provisional_and_established_is_not_overstated():
     """Twelve minutes is past 'under ten' but short of the established line.
     It reads as developing, because calling it established would claim more
     than the clock supports."""
-    assert classify_age(12) == AGE_DEVELOPING
+    assert classify_age(12) == AGE_NEW
 
 
 def test_age_counts_backward_from_the_newest_state():
@@ -344,13 +346,17 @@ def test_age_counts_backward_from_the_newest_state():
 
 
 def test_age_resets_when_the_state_changes():
+    """Once the change confirms. A single bar of a new state leaves the header
+    and its clock alone, which is the whole point of confirming."""
     rows = [_inputs() for _ in range(4)]
-    rows += [_inputs(pressure_bar=-BIG, pressure_avg=-BIG, stability=-STRONG)]
+    rows += [_inputs(pressure_bar=-BIG, pressure_avg=-BIG, stability=-STRONG)] * 2
     series = classify_series(rows)
 
     assert series[3].age_minutes == 20
-    assert series[4].age_minutes == 5
-    assert series[4].state != series[3].state
+    assert series[4].age_minutes == 25  # candidate pending, clock still running
+    assert series[4].state == series[3].state
+    assert series[5].age_minutes == 5
+    assert series[5].state != series[3].state
 
 
 def test_age_is_what_the_bar_would_have_read_at_the_time():
@@ -367,10 +373,12 @@ def test_persistence_and_age_are_independent():
     """Pressure can be established while the state is young, and vice versa:
     one is about the push, the other about the condition."""
     rows = [_inputs() for _ in range(5)]
-    rows.append(_inputs(stability=-STRONG))  # structure flips, pressure holds
+    # Structure flips and holds for two bars, so the new state confirms while
+    # the pressure leg underneath it never wavered.
+    rows += [_inputs(stability=-STRONG)] * 2
     series = classify_series(rows)
 
-    assert series[-1].persistence == PERSISTENCE_ESTABLISHED
+    assert series[-1].persistence == PERSISTENCE_PERSISTENT
     assert series[-1].age_minutes == 5
 
 
@@ -461,3 +469,157 @@ def test_a_missing_flip_still_pairs_and_reports_no_cushion():
 
     assert len(paired) == 1
     assert paired[0].cushion.state == STATE_NO_FLIP
+
+
+# --------------------------------------------------------------------------- #
+# The two ladders, kept apart.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_two_ladders_share_no_words():
+    """They answer different questions and the payload carries both at once,
+    so "established" has to mean exactly one thing. They used to both run
+    DEVELOPING -> ESTABLISHED, and a reader could not tell a settled pressure
+    leg from a state old enough to trust."""
+    assert not set(PERSISTENCE_LABELS) & set(AGE_LABELS)
+    assert not {v.lower() for v in PERSISTENCE_LABELS.values()} & {
+        v.lower() for v in AGE_LABELS.values()
+    }
+
+
+def test_every_rung_has_display_wording():
+    """A missing entry would fall through to the raw code and put PERSISTENT
+    in front of a user."""
+    for code in (PERSISTENCE_PULSE, PERSISTENCE_BUILDING, PERSISTENCE_PERSISTENT):
+        assert PERSISTENCE_LABELS[code]
+    for code in (AGE_NEW, AGE_ESTABLISHED, AGE_CONFIRMED, AGE_MATURE):
+        assert AGE_LABELS[code]
+
+
+def test_the_ladders_are_barries_wording():
+    """Pinned because these are his words, agreed in writing, and a later
+    tidy-up that renamed them would be a change to a shared vocabulary rather
+    than to an internal detail."""
+    assert list(PERSISTENCE_LABELS.values()) == ["Pulse", "Building", "Persistent"]
+    assert list(AGE_LABELS.values()) == ["New", "Established", "Confirmed", "Mature"]
+
+
+def test_code_and_label_stay_in_lockstep():
+    rows = [_inputs() for _ in range(9)]
+    series = classify_series(rows)
+
+    for w in series:
+        assert w.persistence_label == PERSISTENCE_LABELS[w.persistence]
+        assert w.age_label == AGE_LABELS[w.age]
+
+
+def test_the_age_clock_climbs_barries_rungs():
+    rows = [_inputs() for _ in range(13)]
+    series = classify_series(rows)
+
+    assert (series[1].age_minutes, series[1].age) == (10, AGE_NEW)
+    assert (series[2].age_minutes, series[2].age) == (15, AGE_ESTABLISHED)
+    assert (series[5].age_minutes, series[5].age) == (30, AGE_CONFIRMED)
+    assert (series[11].age_minutes, series[11].age) == (60, AGE_MATURE)
+
+
+# --------------------------------------------------------------------------- #
+# Confirmation: the header holds until a new state repeats.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_first_bar_of_a_session_takes_the_header_immediately():
+    """Nothing to confirm it against, and withholding a headline for the first
+    ten minutes of every session is a worse read than the one bar of noise it
+    avoids."""
+    series = classify_series([_inputs()])
+
+    assert series[0].state == STATE_STABLE_BID
+    assert series[0].pending_state is None
+
+
+def test_a_one_bar_flicker_never_reaches_the_header():
+    """The finding this rule exists for: unconfirmed, the classifier changed
+    state roughly every eight minutes and no state survived half an hour."""
+    rows = [_inputs()] * 3 + [_inputs(stability=-STRONG)] + [_inputs()] * 3
+    series = classify_series(rows)
+
+    assert {w.state for w in series} == {STATE_STABLE_BID}
+
+
+def test_the_candidate_is_shown_while_it_waits():
+    """Barrie's requirement, and the reason confirmation does not simply hide
+    the early read: show it immediately as unconfirmed, upgrade when it holds."""
+    rows = [_inputs()] * 3 + [_inputs(stability=-STRONG)]
+    series = classify_series(rows)
+
+    assert series[-1].state == STATE_STABLE_BID
+    assert series[-1].pending_state == STATE_FRAGILE_RALLY
+    assert series[-1].pending_label == "Fragile rally"
+    assert series[-1].pending_bars == 1
+
+
+def test_a_change_that_holds_takes_the_header_one_bar_late():
+    rows = [_inputs()] * 3 + [_inputs(stability=-STRONG)] * 2
+    series = classify_series(rows)
+
+    assert series[3].state == STATE_STABLE_BID
+    assert series[4].state == STATE_FRAGILE_RALLY
+    assert series[4].pending_state is None
+
+
+def test_the_sentence_explains_why_the_header_and_the_components_disagree():
+    """A confirmed header over components that have already moved reads like a
+    bug. Naming the candidate is what makes it read like a condition."""
+    rows = [_inputs()] * 3 + [_inputs(stability=-STRONG)]
+    sentence = classify_series(rows)[-1].sentence
+
+    assert sentence.startswith("Stable bid.")
+    assert "gamma near price is thinning" in sentence
+    assert "Fragile rally is forming, not yet confirmed." in sentence
+
+
+def test_two_candidates_in_a_row_confirm_neither():
+    """The streak has to be the SAME state. Alternating candidates are exactly
+    the churn the rule is there to absorb."""
+    rows = [_inputs()] * 2
+    rows += [_inputs(stability=-STRONG)]  # fragile rally
+    rows += [_inputs(pressure_bar=-BIG, pressure_avg=-BIG)]  # supported dip
+    rows += [_inputs(stability=-STRONG)]  # fragile rally again
+    series = classify_series(rows)
+
+    assert {w.state for w in series} == {STATE_STABLE_BID}
+    assert series[-1].pending_bars == 1
+
+
+def test_confirmation_is_causal():
+    """Each bar is decided from bars at or before it, so a completed session
+    replays to the headline the panel showed live. Without this the base-rate
+    report's comparison would be flattered by hindsight and mean nothing."""
+    rows = [_inputs()] * 3 + [_inputs(stability=-STRONG)] * 2 + [_inputs()] * 3
+    full = classify_series(rows)
+
+    for cut in range(1, len(rows) + 1):
+        partial = classify_series(rows[:cut])
+        assert [w.state for w in partial] == [w.state for w in full[:cut]]
+        assert [w.pending_state for w in partial] == [w.pending_state for w in full[:cut]]
+
+
+def test_confirmation_can_be_turned_off_for_measurement():
+    """How the base-rate report shows what confirming is worth: the same
+    classifier, not a debounced copy of its output."""
+    rows = [_inputs()] * 2 + [_inputs(stability=-STRONG)] + [_inputs()] * 2
+    raw = classify_series(rows, confirm_bars=1)
+
+    assert raw[2].state == STATE_FRAGILE_RALLY
+    assert raw[2].pending_state is None
+
+
+def test_age_is_measured_on_the_confirmed_state():
+    """Measuring it on the raw series resets the clock on every flicker, which
+    is what made Barrie's Confirmed and Mature rungs unreachable."""
+    rows = [_inputs()] * 6 + [_inputs(stability=-STRONG)] + [_inputs()] * 4
+    series = classify_series(rows)
+
+    assert series[-1].age_minutes == 55
+    assert series[-1].age == AGE_CONFIRMED
