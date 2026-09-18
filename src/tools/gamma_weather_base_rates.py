@@ -457,7 +457,7 @@ def build_report(
     ladder_bars = [
         (gw.AGE_ESTABLISHED_MIN, _minutes_to_bars(gw.AGE_ESTABLISHED_MIN)),
         (gw.AGE_CONFIRMED_MIN, _minutes_to_bars(gw.AGE_CONFIRMED_MIN)),
-        (gw.AGE_DURABLE_MIN, _minutes_to_bars(gw.AGE_DURABLE_MIN)),
+        (gw.AGE_MATURE_MIN, _minutes_to_bars(gw.AGE_MATURE_MIN)),
     ]
 
     lengths = br.run_lengths(sessions)
@@ -483,11 +483,11 @@ def build_report(
             _minutes_to_bars(gw.AGE_CONFIRMED_MIN),
         ),
         (
-            f"{gw.AGE_CONFIRMED_MIN}-{gw.AGE_DURABLE_MIN}m",
+            f"{gw.AGE_CONFIRMED_MIN}-{gw.AGE_MATURE_MIN}m",
             _minutes_to_bars(gw.AGE_CONFIRMED_MIN),
-            _minutes_to_bars(gw.AGE_DURABLE_MIN),
+            _minutes_to_bars(gw.AGE_MATURE_MIN),
         ),
-        (f"{gw.AGE_DURABLE_MIN}m+", _minutes_to_bars(gw.AGE_DURABLE_MIN), None),
+        (f"{gw.AGE_MATURE_MIN}m+", _minutes_to_bars(gw.AGE_MATURE_MIN), None),
     ]
     age = br.lift_table(
         br.age_band_trials(sessions, horizon_bars, bands),

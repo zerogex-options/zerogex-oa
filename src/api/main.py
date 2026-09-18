@@ -1742,8 +1742,10 @@ async def get_gamma_weather(
             "lean_side": weather.lean_side,
             "cushion": weather.cushion,
             "persistence": weather.persistence,
+            "persistence_label": weather.persistence_label,
             "age_bars": weather.age_bars,
             "age_minutes": weather.age_minutes,
+            "age": weather.age,
             "age_label": weather.age_label,
             "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS),
             "components": {

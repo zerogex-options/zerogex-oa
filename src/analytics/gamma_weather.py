@@ -74,19 +74,19 @@ PRESSURE_FLOOR_USD = 25_000_000.0
 STABILITY_FLAT_BAND_USD = 50_000_000.0
 
 #: Pressure persistence ladder, in completed 5-minute bars. One bar is a
-#: pulse; two of the last three plus an aligned average is developing; three
-#: is established enough to lean on. A pulse is not nothing -- it is the first
+#: pulse; two of the last three plus an aligned average is building; three is
+#: persistent enough to lean on. A pulse is not nothing -- it is the first
 #: evidence -- but it is not yet a condition.
 PERSISTENCE_WINDOW_BARS = 3
-PERSISTENCE_DEVELOPING_BARS = 2
-PERSISTENCE_ESTABLISHED_BARS = 3
+PERSISTENCE_BUILDING_BARS = 2
+PERSISTENCE_PERSISTENT_BARS = 3
 
 #: State-age thresholds, in minutes. Duration is the thing being studied here:
 #: not whether gamma calls direction, but whether a condition that exists is
 #: healthy enough to persist.
 AGE_ESTABLISHED_MIN = 15
 AGE_CONFIRMED_MIN = 30
-AGE_DURABLE_MIN = 60
+AGE_MATURE_MIN = 60
 
 #: Share of the current cushion that the trailing window must have given up
 #: for the narrowing to count as a transition risk rather than drift. A ratio
@@ -95,14 +95,20 @@ TRANSITION_RATE_SHARE = 0.25
 
 # --------------------------------------------------------------------------- #
 
+# Two ladders that answer different questions, so they share no words. They
+# used to: both ran DEVELOPING -> ESTABLISHED, which made "established" mean
+# either a settled pressure leg or a state old enough to trust, and a reader
+# could not tell which from the value alone. Barrie caught it from the live
+# panel and picked the split below. The codes are distinct too, not just the
+# display names, because the API emits both fields side by side.
 PERSISTENCE_PULSE = "PULSE"
-PERSISTENCE_DEVELOPING = "DEVELOPING"
-PERSISTENCE_ESTABLISHED = "ESTABLISHED"
+PERSISTENCE_BUILDING = "BUILDING"
+PERSISTENCE_PERSISTENT = "PERSISTENT"
 
-AGE_DEVELOPING = "DEVELOPING"
+AGE_NEW = "NEW"
 AGE_ESTABLISHED = "ESTABLISHED"
 AGE_CONFIRMED = "CONFIRMED"
-AGE_DURABLE = "DURABLE"
+AGE_MATURE = "MATURE"
 
 PRESSURE_BUYING = "BUYING"
 PRESSURE_SELLING = "SELLING"
@@ -135,6 +141,19 @@ STATE_LABELS = {
     STATE_FRAGILE_RALLY: "Fragile rally",
     STATE_UNSTABLE: "Unstable",
     STATE_MIXED: "Mixed",
+}
+
+PERSISTENCE_LABELS = {
+    PERSISTENCE_PULSE: "Pulse",
+    PERSISTENCE_BUILDING: "Building",
+    PERSISTENCE_PERSISTENT: "Persistent",
+}
+
+AGE_LABELS = {
+    AGE_NEW: "New",
+    AGE_ESTABLISHED: "Established",
+    AGE_CONFIRMED: "Confirmed",
+    AGE_MATURE: "Mature",
 }
 
 
@@ -179,14 +198,20 @@ class Weather:
     lean_side: Optional[str]
     cushion: str
     sentence: str
-    #: How settled the pressure direction is: PULSE / DEVELOPING / ESTABLISHED.
+    #: How settled the pressure direction is: PULSE / BUILDING / PERSISTENT.
     #: A pulse is the first evidence, not yet a condition.
     persistence: str = PERSISTENCE_PULSE
-    #: How long this state has held. Bars rather than a stored timestamp,
-    #: because states are derived on read and a retuned threshold must re-age
-    #: history as well as re-label it.
+    #: How long this state has held: NEW / ESTABLISHED / CONFIRMED / MATURE.
+    #: Bars rather than a stored timestamp, because states are derived on read
+    #: and a retuned threshold must re-age history as well as re-label it.
     age_bars: int = 0
     age_minutes: Optional[float] = None
+    age: Optional[str] = None
+    #: Display wording for the two ladders, carried alongside the codes for
+    #: the same reason ``label`` sits beside ``state``: one source of truth.
+    #: The panel used to keep its own copy of both maps, which is precisely
+    #: what a rename like this one silently breaks.
+    persistence_label: str = PERSISTENCE_LABELS[PERSISTENCE_PULSE]
     age_label: Optional[str] = None
 
 
@@ -281,12 +306,12 @@ def classify_persistence(
         1 for v in window if v is not None and abs(v) > PRESSURE_FLOOR_USD and (v > 0) == (want > 0)
     )
 
-    if aligned >= PERSISTENCE_ESTABLISHED_BARS:
-        return PERSISTENCE_ESTABLISHED
+    if aligned >= PERSISTENCE_PERSISTENT_BARS:
+        return PERSISTENCE_PERSISTENT
 
     avg_aligned = avg is not None and abs(avg) > PRESSURE_FLOOR_USD and (avg > 0) == (want > 0)
-    if aligned >= PERSISTENCE_DEVELOPING_BARS and avg_aligned:
-        return PERSISTENCE_DEVELOPING
+    if aligned >= PERSISTENCE_BUILDING_BARS and avg_aligned:
+        return PERSISTENCE_BUILDING
 
     return PERSISTENCE_PULSE
 
@@ -294,20 +319,20 @@ def classify_persistence(
 def classify_age(minutes: Optional[float]) -> Optional[str]:
     """How long the current state has held, as a word.
 
-    Bands are Barrie's. Developing covers everything below the established
-    line, which absorbs the gap between his "under 10 minutes is provisional"
-    and "15 minutes is established" -- a state at 12 minutes is not yet
+    Bands are Barrie's. New covers everything below the established line,
+    which absorbs the gap between his "under 10 minutes is provisional" and
+    "15 minutes is established" -- a state at 12 minutes is not yet
     established, and calling it anything else would overstate it.
     """
     if minutes is None:
         return None
-    if minutes >= AGE_DURABLE_MIN:
-        return AGE_DURABLE
+    if minutes >= AGE_MATURE_MIN:
+        return AGE_MATURE
     if minutes >= AGE_CONFIRMED_MIN:
         return AGE_CONFIRMED
     if minutes >= AGE_ESTABLISHED_MIN:
         return AGE_ESTABLISHED
-    return AGE_DEVELOPING
+    return AGE_NEW
 
 
 def state_age_bars(states: Sequence[str]) -> int:
@@ -403,13 +428,16 @@ def classify_series(inputs: Sequence[WeatherInputs], bar_minutes: float = 5.0) -
         age_bars = state_age_bars(states)
         age_minutes = age_bars * bar_minutes
 
+        age = classify_age(age_minutes)
         out.append(
             replace(
                 base,
                 persistence=persistence,
+                persistence_label=PERSISTENCE_LABELS[persistence],
                 age_bars=age_bars,
                 age_minutes=age_minutes,
-                age_label=classify_age(age_minutes),
+                age=age,
+                age_label=AGE_LABELS.get(age) if age else None,
             )
         )
 

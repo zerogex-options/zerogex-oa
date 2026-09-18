@@ -201,3 +201,38 @@ def test_http_missing_flip_still_classifies(monkeypatch: pytest.MonkeyPatch):
     assert payload["state"] == "STABLE_BID"
     assert payload["cushion"] == "NONE"
     assert "no gamma flip" in payload["sentence"]
+
+
+def test_http_emits_both_ladders_as_code_and_label(monkeypatch: pytest.MonkeyPatch):
+    """The panel reads the wording off the payload rather than keeping its own
+    copy of the maps. It used to keep one, and a rename of these rungs is
+    exactly what silently breaks that: an unmatched code falls through to the
+    raw value and puts PERSISTENT in front of a user."""
+    app, mainmod = _build_app(monkeypatch)
+    # 15 bars, not 12: the first two read MIXED until the three-bar average
+    # fills, so the run that reaches MATURE starts at bar 2.
+    flow, regime = _series(15, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather?symbol=SPY").json()
+
+    assert payload["persistence"] == "PERSISTENT"
+    assert payload["persistence_label"] == "Persistent"
+    assert payload["age"] == "MATURE"
+    assert payload["age_label"] == "Mature"
+
+
+def test_http_keeps_the_two_ladders_distinguishable(monkeypatch: pytest.MonkeyPatch):
+    """Both fields ride in one payload, so a value appearing in both would be
+    ambiguous to anything reading it. They used to share DEVELOPING and
+    ESTABLISHED, which is the collision Barrie caught from the live panel."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(4, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather?symbol=SPY").json()
+
+    assert payload["persistence"] != payload["age"]
+    assert payload["persistence_label"] != payload["age_label"]
