@@ -88,6 +88,21 @@ AGE_ESTABLISHED_MIN = 15
 AGE_CONFIRMED_MIN = 30
 AGE_MATURE_MIN = 60
 
+#: Completed bars a NEW state must repeat before it takes the header.
+#:
+#: Not cosmetic. Measured over seven sessions, the unconfirmed classifier
+#: changed state roughly every 8 minutes: 347 runs with a median life of one
+#: bar, and outside a single instance no state survived 30 minutes. Requiring
+#: two bars cuts that to 94 runs, moves the median state life to 20-25
+#: minutes, and lifts 30-minute survival from 0.3% to about 30%, for a median
+#: 5 minutes of lateness. See src/tools/gamma_weather_base_rates.py, which
+#: measures both sides of that trade.
+#:
+#: Two rather than three because it is the number already agreed with Barrie
+#: for flip dots, not because seven sessions chose it. Re-run the report as
+#: history accumulates before moving it.
+CONFIRM_BARS = 2
+
 #: Share of the current cushion that the trailing window must have given up
 #: for the narrowing to count as a transition risk rather than drift. A ratio
 #: of points to points, so it is scale free across symbols.
@@ -213,6 +228,16 @@ class Weather:
     #: what a rename like this one silently breaks.
     persistence_label: str = PERSISTENCE_LABELS[PERSISTENCE_PULSE]
     age_label: Optional[str] = None
+    #: The state this bar would read without confirmation, when that differs
+    #: from the one holding the header. Carried rather than suppressed: the
+    #: whole point of confirming is to stop the header chasing noise, and the
+    #: whole point of showing the candidate anyway is that the early read is
+    #: information. Barrie's words for the same idea on flip dots -- show it
+    #: immediately as unconfirmed, upgrade it when it holds.
+    pending_state: Optional[str] = None
+    pending_label: Optional[str] = None
+    #: Completed bars the candidate has held, 1 .. CONFIRM_BARS - 1.
+    pending_bars: int = 0
 
 
 def classify_pressure(bar: Optional[float], avg: Optional[float]) -> str:
@@ -372,10 +397,23 @@ def _state_for(pressure: str, structure: str) -> str:
 
 
 def _sentence(
-    state: str, pressure: str, structure: str, lean_side: Optional[str], cushion: str
+    state: str,
+    pressure: str,
+    structure: str,
+    lean_side: Optional[str],
+    cushion: str,
+    pending: Optional[str] = None,
 ) -> str:
     """One plain sentence: what the tape is doing, what the book is doing, and
-    how much room is left. Conditions, never outcomes."""
+    how much room is left. Conditions, never outcomes.
+
+    ``pending`` is not decoration. Once the header is confirmed, it can name a
+    condition the components no longer support: "Stable bid" over a bar whose
+    pressure reads selling. That looks like a bug and is not one, so when a
+    different state is waiting on confirmation the sentence says so, and the
+    reader gets the reason the components and the header disagree instead of
+    being left to wonder.
+    """
     push = {
         PRESSURE_BUYING: "Hedging pressure is buying",
         PRESSURE_SELLING: "Hedging pressure is selling",
@@ -401,37 +439,118 @@ def _sentence(
         CUSHION_NONE: "there is no gamma flip in the profile",
     }[cushion]
 
-    return f"{STATE_LABELS[state]}. {push}, {book}, and {room}."
+    line = f"{STATE_LABELS[state]}. {push}, {book}, and {room}."
+    if pending and pending != state:
+        line += f" {STATE_LABELS[pending]} is forming, not yet confirmed."
+    return line
 
 
-def classify_series(inputs: Sequence[WeatherInputs], bar_minutes: float = 5.0) -> List[Weather]:
-    """Classify a chronological run of bars, with persistence and state age.
+class _Confirmation:
+    """The hold-before-you-change rule, as a state machine over one session.
 
-    The per-bar :func:`classify` cannot see history, so it reports every bar as
-    a pulse of unknown age. This is the form the panel actually wants: it walks
-    the session once and fills both.
+    Kept here, in one place, because production and the base-rate report have
+    to agree on it exactly. A report that measured a lookalike of this rule
+    would produce numbers about a panel nobody runs, which is the failure the
+    whole tool exists to prevent.
 
-    Age is measured in consecutive bars sharing the state, counted backward
-    from each point, so a bar's age is what it would have read at the time
-    rather than what hindsight makes of it.
+    Strictly causal: each bar is decided from bars at or before it, never from
+    what came next. That is what lets a completed session be replayed and give
+    the same headline the panel showed live, and what makes the report's
+    comparison of confirmed against raw legitimate rather than flattered by
+    hindsight.
+    """
+
+    def __init__(self, confirm_bars: int) -> None:
+        self.confirm_bars = confirm_bars
+        self.headline: Optional[str] = None
+        self.candidate: Optional[str] = None
+        self.streak = 0
+
+    def push(self, raw: str) -> tuple:
+        """Feed one bar's raw state; get ``(headline, pending, pending_bars)``.
+
+        The first bar of a session takes the header immediately. There is
+        nothing for it to be confirmed against, and withholding a headline for
+        the first ten minutes of every session would be a worse read than the
+        one bar of noise it avoids.
+        """
+        if self.headline is None or self.confirm_bars <= 1:
+            self.headline = raw
+            self.candidate, self.streak = None, 0
+            return self.headline, None, 0
+
+        if raw == self.headline:
+            self.candidate, self.streak = None, 0
+            return self.headline, None, 0
+
+        if raw == self.candidate:
+            self.streak += 1
+        else:
+            self.candidate, self.streak = raw, 1
+
+        if self.streak >= self.confirm_bars:
+            self.headline = raw
+            self.candidate, self.streak = None, 0
+            return self.headline, None, 0
+
+        return self.headline, self.candidate, self.streak
+
+
+def classify_series(
+    inputs: Sequence[WeatherInputs],
+    bar_minutes: float = 5.0,
+    confirm_bars: int = CONFIRM_BARS,
+) -> List[Weather]:
+    """Classify a chronological run of bars, as the panel reads them.
+
+    The per-bar :func:`classify` cannot see history, so it reports every bar
+    as an unconfirmed pulse of unknown age. This is the form the panel wants:
+    one walk of the session that fills confirmation, persistence and age.
+
+    ``state`` is the CONFIRMED headline, not this bar's raw read. A state that
+    has just appeared is carried on ``pending_state`` until it holds
+    ``confirm_bars`` bars, so the early information is visible without the
+    header chasing it. ``confirm_bars`` of 1 disables confirmation entirely,
+    which is how the base-rate report measures what confirming is worth.
+
+    Age counts consecutive bars sharing the CONFIRMED state. Measuring it on
+    the raw series would reset the clock on every one-bar flicker and make the
+    age ladder unreachable, which is exactly what it did before this rule
+    existed.
     """
     out: List[Weather] = []
     states: List[str] = []
     pressures: List[Optional[float]] = []
+    confirmation = _Confirmation(confirm_bars)
 
     for row in inputs:
         base = classify(row)
         pressures.append(row.pressure_bar)
-        states.append(base.state)
+
+        headline, pending, pending_bars = confirmation.push(base.state)
+        states.append(headline)
 
         persistence = classify_persistence(pressures, row.pressure_avg, base.pressure)
         age_bars = state_age_bars(states)
         age_minutes = age_bars * bar_minutes
-
         age = classify_age(age_minutes)
+
         out.append(
             replace(
                 base,
+                state=headline,
+                label=STATE_LABELS[headline],
+                sentence=_sentence(
+                    headline,
+                    base.pressure,
+                    base.structure,
+                    base.lean_side,
+                    base.cushion,
+                    pending,
+                ),
+                pending_state=pending,
+                pending_label=STATE_LABELS[pending] if pending else None,
+                pending_bars=pending_bars,
                 persistence=persistence,
                 persistence_label=PERSISTENCE_LABELS[persistence],
                 age_bars=age_bars,

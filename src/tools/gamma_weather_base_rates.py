@@ -49,6 +49,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -218,13 +219,58 @@ def _window(session_date: date):
     return start, start + SESSION_LENGTH
 
 
+@dataclass(frozen=True)
+class LoadedSession:
+    """One session's classifier inputs, before any confirmation rule is applied.
+
+    Held in this form so the report can classify the same day at more than one
+    confirmation setting from a single database read, and so both settings go
+    through the real :func:`gamma_weather.classify_series` rather than a
+    lookalike. An earlier version debounced the output state strings instead,
+    which measured a rule the panel does not run.
+    """
+
+    label: str
+    bar_starts: List[Any]
+    inputs: List[gw.WeatherInputs]
+    #: Per-bar cushion state and basis. Neither depends on confirmation, so
+    #: they are resolved once at load and reused at every setting.
+    cushion_states: List[str]
+    cushion_bases: List[str]
+
+    def classify(self, warmup_bars: int, confirm_bars: int) -> br.Session:
+        weather = gw.classify_series(
+            self.inputs,
+            bar_minutes=float(BAR_MINUTES),
+            confirm_bars=confirm_bars,
+        )
+        return br.Session(
+            label=self.label,
+            bar_starts=self.bar_starts,
+            states=[w.state for w in weather],
+            warnings=[w.cushion == gw.CUSHION_TRANSITION_RISK for w in weather],
+            ages=[w.age_bars for w in weather],
+            warmup=warmup_bars,
+            components=[
+                {
+                    "pressure": w.pressure,
+                    "structure": w.structure,
+                    "lean": str(w.lean_side),
+                    "cushion": w.cushion,
+                    "cushion state": state,
+                    "cushion basis": basis,
+                }
+                for w, state, basis in zip(weather, self.cushion_states, self.cushion_bases)
+            ],
+        )
+
+
 def load_session(
     cursor,
     symbol: str,
     session_date: date,
     optional_columns: Sequence[str],
-    warmup_bars: int,
-) -> Optional[br.Session]:
+) -> Optional[LoadedSession]:
     """Rebuild one session's weather from stored components.
 
     Returns ``None`` when the day cannot be classified -- no structure bars, no
@@ -270,26 +316,12 @@ def load_session(
     if not paired:
         return None
 
-    weather = gw.classify_series([bar.inputs for bar in paired], bar_minutes=float(BAR_MINUTES))
-
-    return br.Session(
+    return LoadedSession(
         label=session_date.isoformat(),
         bar_starts=[bar.bar_start for bar in paired],
-        states=[w.state for w in weather],
-        warnings=[w.cushion == gw.CUSHION_TRANSITION_RISK for w in weather],
-        ages=[w.age_bars for w in weather],
-        warmup=warmup_bars,
-        components=[
-            {
-                "pressure": w.pressure,
-                "structure": w.structure,
-                "lean": str(w.lean_side),
-                "cushion": w.cushion,
-                "cushion state": bar.cushion.state,
-                "cushion basis": bar.cushion.basis,
-            }
-            for w, bar in zip(weather, paired)
-        ],
+        inputs=[bar.inputs for bar in paired],
+        cushion_states=[bar.cushion.state for bar in paired],
+        cushion_bases=[bar.cushion.basis for bar in paired],
     )
 
 
@@ -298,9 +330,13 @@ def load_sessions(
     symbol: str,
     limit: int,
     since: Optional[date],
-    warmup_bars: int,
 ) -> tuple:
-    """Load every classifiable session, returning ``(sessions, skipped)``."""
+    """Load every classifiable session, returning ``(loaded, skipped)``.
+
+    Classification is deliberately NOT done here. The caller decides the
+    confirmation setting, and may want the same days at more than one, which
+    would otherwise mean reading the database twice.
+    """
     with conn.cursor() as cursor:
         optional = _present_columns(cursor, "gamma_regime_5min", _REGIME_OPTIONAL_COLUMNS)
         missing = sorted(set(_REGIME_OPTIONAL_COLUMNS) - set(optional))
@@ -312,10 +348,10 @@ def load_sessions(
             )
 
         dates = session_dates(cursor, symbol, limit, since)
-        sessions: List[br.Session] = []
+        sessions: List[LoadedSession] = []
         skipped: List[str] = []
         for session_date in dates:
-            loaded = load_session(cursor, symbol, session_date, optional, warmup_bars)
+            loaded = load_session(cursor, symbol, session_date, optional)
             if loaded is None:
                 skipped.append(session_date.isoformat())
                 continue
@@ -383,42 +419,32 @@ def _lift_rows(
 
 def _confirmation_whatif(
     sessions: Sequence[br.Session],
+    raw_sessions: Optional[Sequence[br.Session]],
     horizon_bars: int,
     confirm_bars: int,
 ) -> Optional[Dict[str, Any]]:
-    """What a hold-before-you-change rule would buy, and what it would cost.
+    """What the confirmation rule buys, and what it costs.
 
-    A measurement, not a product change: it re-derives the same run lengths
-    from a debounced copy of the state series and reports both sides -- how
-    much churn a confirmation rule removes, and how many bars later the truth
-    would have reached the panel. Nothing here is written or served.
+    Both sides come from the real classifier, run twice over the same bars at
+    different ``confirm_bars`` settings. An earlier version debounced the
+    output state strings instead, which measured a rule the panel does not
+    run; the point of this report is that it cannot do that.
+
+    Reports the churn removed AND the bars of lateness added. Showing only the
+    first would make any confirmation window look free.
     """
-    if confirm_bars <= 1:
+    if raw_sessions is None or confirm_bars <= 1:
         return None
 
-    held: List[br.Session] = []
     lags: List[int] = []
-    for session in sessions:
-        confirmed = br.debounce(session.states, confirm_bars)
-        lags.extend(br.confirmation_lag(session.states, confirmed))
-        held.append(
-            br.Session(
-                label=session.label,
-                bar_starts=session.bar_starts,
-                states=confirmed,
-                warnings=session.warnings,
-                ages=br._ages_from_states(confirmed),
-                warmup=session.warmup,
-                components=session.components,
-            )
-        )
+    for raw, confirmed in zip(raw_sessions, sessions):
+        lags.extend(br.confirmation_lag(raw.states, confirmed.states))
 
-    raw_lengths = br.run_lengths(sessions)
-    held_lengths = br.run_lengths(held)
+    raw_lengths = br.run_lengths(raw_sessions)
+    held_lengths = br.run_lengths(sessions)
     ordered_lags = sorted(lags)
 
     return {
-        "sessions": held,
         "raw": raw_lengths,
         "held": held_lengths,
         "summary": {
@@ -428,10 +454,14 @@ def _confirmation_whatif(
             "confirmed_changes": len(lags),
             "median_lag_bars": ordered_lags[len(ordered_lags) // 2] if ordered_lags else None,
             "survival_raw": br.tally(
-                [br.held(s.states, a, horizon_bars) for s in sessions for a in br.onset_anchors(s)]
+                [
+                    br.held(s.states, a, horizon_bars)
+                    for s in raw_sessions
+                    for a in br.onset_anchors(s)
+                ]
             ).as_dict(),
             "survival_confirmed": br.tally(
-                [br.held(s.states, a, horizon_bars) for s in held for a in br.onset_anchors(s)]
+                [br.held(s.states, a, horizon_bars) for s in sessions for a in br.onset_anchors(s)]
             ).as_dict(),
         },
     }
@@ -441,8 +471,15 @@ def build_report(
     sessions: Sequence[br.Session],
     horizon_bars: int,
     confirm_bars: int = 1,
+    raw_sessions: Optional[Sequence[br.Session]] = None,
 ) -> Dict[str, Any]:
-    """Everything the printer and the JSON both read from."""
+    """Everything the printer and the JSON both read from.
+
+    ``sessions`` are already classified at whatever confirmation setting is
+    being reported. ``raw_sessions`` are the same days classified with
+    confirmation off, and when supplied the report adds the comparison that
+    says what confirming is worth.
+    """
     coverage = [cushion_basis(s) for s in sessions]
     covered = [s for s, (label, _, _) in zip(sessions, coverage) if label == CUSHION_CURRENT]
     basis_counts = {
@@ -505,7 +542,7 @@ def build_report(
         for name in CHURN_COMPONENTS
     ]
     attribution = br.change_attribution(sessions, STATE_INPUTS)
-    confirmation = _confirmation_whatif(sessions, horizon_bars, confirm_bars)
+    confirmation = _confirmation_whatif(sessions, raw_sessions, horizon_bars, confirm_bars)
 
     return {
         "sessions": len(sessions),
@@ -696,11 +733,11 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     if confirmation:
         summary = confirmation["summary"]
         lines.append(
-            f"8. WHAT-IF: require {summary['confirm_bars']} bars before the headline changes"
+            f"8. WHAT CONFIRMATION BUYS -- {summary['confirm_bars']} bars before the header moves"
         )
-        lines.append("   A measurement, not a change. Strictly causal, so the confirmed series")
-        lines.append("   is one a live panel could have shown. Both sides are reported: the")
-        lines.append("   churn removed, and the bars of lateness that removal costs.")
+        lines.append("   Everything above already reflects this rule, because the panel runs it.")
+        lines.append("   This is the same days classified with confirmation off, for comparison.")
+        lines.append("   Both sides are reported: the churn removed, and the lateness it costs.")
         lag = summary["median_lag_bars"]
         lag_txt = "--" if lag is None else f"{lag * BAR_MINUTES}m"
         lines.append(
@@ -715,7 +752,7 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
         )
         lines.append("")
         lines.append(f"   {'state':<16}{'runs':>7}{'median':>9}   {'runs':>7}{'median':>9}")
-        lines.append(f"   {'':<16}{'--- raw ---':>16}   {'-- confirmed --':>16}")
+        lines.append(f"   {'':<16}{'-- unconfirmed -':>16}   {'--- as shipped -':>16}")
         for state in sorted(set(confirmation["raw"]) | set(confirmation["held"])):
             raw = confirmation["raw"].get(state)
             kept = confirmation["held"].get(state)
@@ -753,10 +790,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--confirm-bars",
         type=int,
-        default=1,
+        default=gw.CONFIRM_BARS,
         help=(
-            "What-if: how many bars a new state must repeat before the headline changes. "
-            "1 (default) reports the live rule unchanged."
+            "Bars a new state must repeat before it takes the header. Defaults to the "
+            "value the panel runs; pass 1 to see the classifier without confirmation."
         ),
     )
     parser.add_argument("--json", dest="json_path", default=None, help="Also write JSON here.")
@@ -780,12 +817,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     with db_connection() as conn:
-        sessions, skipped = load_sessions(conn, symbol, args.sessions, since, args.warmup_bars)
+        loaded, skipped = load_sessions(conn, symbol, args.sessions, since)
         # This tool never writes. Make the contract explicit even if a future
         # edit adds a statement.
         conn.rollback()
 
-    report = build_report(sessions, horizon_bars, confirm_bars=args.confirm_bars)
+    # One database read, classified twice: once at the setting being reported
+    # and once with confirmation off, so the comparison in section 8 costs
+    # nothing extra and both sides come from the same bars.
+    sessions = [s.classify(args.warmup_bars, args.confirm_bars) for s in loaded]
+    raw_sessions = (
+        [s.classify(args.warmup_bars, 1) for s in loaded] if args.confirm_bars > 1 else None
+    )
+
+    report = build_report(
+        sessions,
+        horizon_bars,
+        confirm_bars=args.confirm_bars,
+        raw_sessions=raw_sessions,
+    )
     print(format_report(symbol, report, skipped))
 
     if args.json_path:

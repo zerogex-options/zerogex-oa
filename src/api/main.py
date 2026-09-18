@@ -1747,6 +1747,10 @@ async def get_gamma_weather(
             "age_minutes": weather.age_minutes,
             "age": weather.age,
             "age_label": weather.age_label,
+            "pending_state": weather.pending_state,
+            "pending_label": weather.pending_label,
+            "pending_bars": weather.pending_bars,
+            "confirm_bars": gw.CONFIRM_BARS,
             "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS),
             "components": {
                 "pressure_bar_usd": pressure_bar,

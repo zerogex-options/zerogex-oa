@@ -658,6 +658,16 @@ class GammaWeatherResponse(BaseModel):
     #: copy of the mapping.
     persistence_label: str = "Pulse"
     age_label: Optional[str] = None
+    #: The state this bar would read without confirmation, when it differs
+    #: from the one holding the header, plus how many bars it has held. The
+    #: header waits for a new state to repeat; this is the early read that
+    #: waiting would otherwise hide.
+    pending_state: Optional[str] = None
+    pending_label: Optional[str] = None
+    pending_bars: int = 0
+    #: Bars a new state must repeat before it takes the header, so a client
+    #: can render "1 of 2" without hard-coding the rule.
+    confirm_bars: int = 2
     cushion_summary: Optional[str] = None
     components: dict = {}
     basis: str

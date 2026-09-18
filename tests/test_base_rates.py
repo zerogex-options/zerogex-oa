@@ -27,7 +27,6 @@ from src.analytics.base_rates import (
     change_attribution,
     component_churn,
     confirmation_lag,
-    debounce,
     checkpoint_anchors,
     compare,
     every_bar_anchors,
@@ -509,43 +508,21 @@ def test_a_state_change_with_no_input_change_is_flagged_not_hidden():
 # --------------------------------------------------------------------------- #
 
 
-def test_confirming_one_bar_is_the_identity():
-    assert debounce(list("ABAB"), 1) == list("ABAB")
-    assert debounce(list("ABAB"), 0) == list("ABAB")
-
-
-def test_confirmation_filters_a_single_bar_flip():
-    assert debounce(list("AABAA"), 2) == list("AAAAA")
-
-
-def test_a_change_that_holds_arrives_late_rather_than_never():
-    assert debounce(list("AABB"), 2) == list("AAAB")
-
-
-def test_confirmation_is_causal():
-    """Each bar is decided from bars at or before it, so the debounced series
-    is one a live panel could have shown. Without this the comparison flatters
-    the confirmed track with hindsight and means nothing."""
-    raw = list("AABBABBBAAA")
-
-    full = debounce(raw, 2)
-    for cut in range(1, len(raw) + 1):
-        assert debounce(raw[:cut], 2) == full[:cut]
-
-
 def test_confirmation_lag_measures_only_changes_that_arrive():
     """A flip filtered out never reaches the headline and has no lateness to
-    report -- that is the point of filtering it, not a gap in the accounting."""
+    report -- that is the point of filtering it, not a gap in the accounting.
+
+    The confirmed series is written out literally rather than produced by a
+    debouncer living here: the rule has one implementation, in the classifier,
+    and this module only compares what it was handed."""
     raw = list("AABAABBB")
-    confirmed = debounce(raw, 2)
+    confirmed = list("AAAAAABB")  # the lone B filtered; the real change 1 late
 
-    lags = confirmation_lag(raw, confirmed)
-
-    assert lags == [1]  # the one-bar B is filtered; the real change is 1 late
+    assert confirmation_lag(raw, confirmed) == [1]
 
 
-def test_a_series_that_never_settles_confirms_nothing():
+def test_a_series_that_never_settles_reports_no_lag():
     raw = list("ABABABAB")
+    confirmed = ["A"] * len(raw)
 
-    assert set(debounce(raw, 2)) == {"A"}
-    assert confirmation_lag(raw, debounce(raw, 2)) == []
+    assert confirmation_lag(raw, confirmed) == []
