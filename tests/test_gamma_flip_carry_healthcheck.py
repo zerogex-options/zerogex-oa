@@ -145,7 +145,7 @@ def test_the_exit_code_fails_only_on_a_carry_past_the_threshold(monkeypatch):
         cursor = FakeCursor({b: 690.0 for b in BARS}, observations)
         conn = _FakeConn(cursor)
         monkeypatch.setattr(tool, "db_connection", lambda: conn)
-        return tool.main(["--symbol", "SPY", "--sessions", "1"])
+        return tool.main(["--symbols", "SPY", "--sessions", "1"])
 
     shallow = {b: 690.0 for b in BARS}
     del shallow[BARS[5]]
@@ -157,13 +157,42 @@ def test_the_exit_code_fails_only_on_a_carry_past_the_threshold(monkeypatch):
     assert run(deep) == 1
 
 
+def test_a_session_with_no_readings_at_all_fails_rather_than_passing(monkeypatch):
+    """The worst case in the file, and the one a carry-depth-only gate would
+    wave through: gex_summary wrote NOTHING, so every bar is unresolved and
+    ZERO are carried -- there was never a reading to carry. Every consumer
+    reads the stored NULLs as "no gamma flip in the profile"."""
+    cursor = FakeCursor({b: None for b in BARS}, {})
+    conn = _FakeConn(cursor)
+    monkeypatch.setattr(tool, "db_connection", lambda: conn)
+
+    report = _check({b: None for b in BARS}, {})
+    assert (report["carried"], report["deepest_carry_bars"]) == (0, 0)
+    assert report["unresolved"] == len(BARS)
+
+    assert tool.main(["--symbols", "SPY", "--sessions", "1"]) == 1
+
+
+def test_a_session_that_starts_slowly_is_not_failed_for_its_warmup(monkeypatch):
+    """gex_summary's first row of the day can land a bar or two after 09:30.
+    That is a warmup, and it is held to the same depth as a carry rather than
+    alerting on the open of every session."""
+    observations = {b: 690.0 for b in BARS[2:]}
+    cursor = FakeCursor({b: 690.0 for b in BARS}, observations)
+    conn = _FakeConn(cursor)
+    monkeypatch.setattr(tool, "db_connection", lambda: conn)
+
+    assert _check({b: 690.0 for b in BARS}, observations)["unresolved"] == 2
+    assert tool.main(["--symbols", "SPY", "--sessions", "1"]) == 0
+
+
 def test_the_check_writes_nothing(monkeypatch):
     """Read-only: it is meant to be safe to run mid-session against prod."""
     cursor = FakeCursor({b: 690.0 for b in BARS}, {BARS[0]: 690.0})
     conn = _FakeConn(cursor)
     monkeypatch.setattr(tool, "db_connection", lambda: conn)
 
-    tool.main(["--symbol", "SPY", "--sessions", "1"])
+    tool.main(["--symbols", "SPY", "--sessions", "1"])
 
     assert conn.rolled_back and not conn.committed
     for sql, _ in cursor.executed:
@@ -201,3 +230,33 @@ class _CursorCM:
 
     def __exit__(self, *exc):
         return False
+
+
+def test_the_universe_defaults_to_the_engine_that_writes_both_tables(monkeypatch):
+    """The analytics engine writes gamma_regime_5min AND gex_summary, one
+    worker per symbol. A monitor pinned to SPY would pass a session in which
+    every other underlying's flip went dark, so the default follows the engine
+    rather than a constant."""
+    monkeypatch.setenv("ANALYTICS_UNDERLYINGS", "SPY,QQQ")
+    assert tool.configured_symbols() == ["SPY", "QQQ"]
+
+    monkeypatch.delenv("ANALYTICS_UNDERLYINGS")
+    monkeypatch.setenv("ANALYTICS_UNDERLYING", "SPX")
+    assert tool.configured_symbols() == ["SPX"]
+
+    monkeypatch.delenv("ANALYTICS_UNDERLYING")
+    assert tool.configured_symbols() == ["SPY"]
+
+
+def test_every_configured_symbol_is_checked_and_named_in_its_own_report(monkeypatch):
+    """A failure has to say WHICH underlying went dark; one pooled count would
+    send an operator to the wrong engine worker."""
+    monkeypatch.setenv("ANALYTICS_UNDERLYINGS", "SPY,QQQ")
+    cursor = FakeCursor({b: 690.0 for b in BARS}, {BARS[0]: 690.0})
+    conn = _FakeConn(cursor)
+    monkeypatch.setattr(tool, "db_connection", lambda: conn)
+
+    assert tool.main(["--sessions", "1"]) == 1
+
+    checked = [params["symbol"] for sql, params in cursor.executed if "SELECT DISTINCT" in sql]
+    assert checked == ["SPY", "QQQ"]

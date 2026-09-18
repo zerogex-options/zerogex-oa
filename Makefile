@@ -978,6 +978,9 @@ help: ## Show this help message
 	@echo "  make system-monitor-install   - Install per-minute system-monitor timer (CPU/mem/disk/errs/cycle)"
 	@echo "  make system-monitor-show      - Print latest hourly + daily aggregates"
 	@echo "  make system-monitor-status    - Show system-monitor timer status + recent log"
+	@echo "  make gamma-flip-carry-install - Install gamma-flip carry timer (hourly in-session + post-close)"
+	@echo "  make gamma-flip-carry-status  - Show gamma-flip carry timer status + recent log"
+	@echo "  make gamma-flip-carry-healthcheck - Flag sessions whose gamma flip was carried over missing rows"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
 	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
@@ -4355,9 +4358,45 @@ GAMMA_FLIP_MAX_CARRY_BARS ?= 3
 gamma-flip-carry-healthcheck: ## Alert if gamma_regime_5min.gamma_flip was carried over missing gex_summary rows. 0=ok 1=carried 2=db error
 	@$(PY) -m src.tools.gamma_flip_carry_healthcheck \
 		--max-carry-bars $(GAMMA_FLIP_MAX_CARRY_BARS) \
-		$(if $(FLOW_SYMBOL),--symbol $(FLOW_SYMBOL)) \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
 		$(if $(SESSIONS),--sessions $(SESSIONS)) \
 		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-carry-install
+gamma-flip-carry-install: ## Install the gamma-flip carry timer (hourly 10:30-15:30 ET + 16:30 ET post-close)
+	@echo "$(BLUE)=== Installing Gamma-Flip Carry Check Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-carry.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-carry.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-gamma-flip-carry.timer
+	@echo "$(GREEN)✅ Gamma-flip carry timer installed and started$(NC)"
+	@if [ ! -f /etc/systemd/system/zerogex-alert@.service ]; then \
+		echo "$(YELLOW)⚠  zerogex-alert@.service is NOT installed, so a failure will be"; \
+		echo "   logged but will not leave the box. Install it with:"; \
+		echo "     make alert-template-install$(NC)"; \
+	elif ! sudo grep -qs '^ALERT_BACKEND=resend' /etc/zerogex/alert.env; then \
+		echo "$(YELLOW)⚠  /etc/zerogex/alert.env is not set to the email backend, so a"; \
+		echo "   failure alerts to the journal only. For email, set in that file:"; \
+		echo "     ALERT_BACKEND=resend"; \
+		echo "     ALERT_EMAIL_TO=you@example.com"; \
+		echo "   then: make alert-template-test$(NC)"; \
+	else \
+		echo "$(GREEN)✅ Email alerting is configured (ALERT_BACKEND=resend)$(NC)"; \
+	fi
+	@echo "$(YELLOW)Status:      make gamma-flip-carry-status$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-gamma-flip-carry$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-gamma-flip-carry.service$(NC)"
+
+.PHONY: gamma-flip-carry-status
+gamma-flip-carry-status: ## Show the gamma-flip carry timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Gamma-Flip Carry Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-gamma-flip-carry.timer' || true
+	@echo ""
+	@echo "$(BLUE)Service — last run:$(NC)"
+	@systemctl status zerogex-oa-gamma-flip-carry.service --no-pager -l || true
+	@echo ""
+	@echo "$(BLUE)Recent log lines:$(NC)"
+	@sudo journalctl -u zerogex-oa-gamma-flip-carry -n 30 --no-pager || true
 
 .PHONY: freshness-replay
 freshness-replay: ## Replay the freshness check over a session from the DB (DATE=YYYY-MM-DD)
