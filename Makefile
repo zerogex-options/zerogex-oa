@@ -3477,6 +3477,28 @@ hedging-flow-parity: ## Diff hedging_flow_5min vs the live CTE, + the convergenc
 		HEDGING_FLOW_PARITY_SYMBOL="$(HEDGING_FLOW_PARITY_SYMBOL)" \
 		$(PY) -m pytest tests/test_hedging_flow_snapshot_sql.py -m integration --no-cov -q
 
+# The carry harness. Same posture as hedging-flow-parity and for the same
+# reason: it SEEDS a synthetic session (under its own sentinel symbol, which it
+# also removes), so it must never silently inherit the .env database.
+GAMMA_FLIP_CARRY_SYMBOL ?= ZZFLIP
+
+.PHONY: gamma-flip-carry-sql
+gamma-flip-carry-sql: ## Run the gamma-flip observation query against real rows (missing window vs measured NULL). SEEDS DATA — requires an explicit GAMMA_FLIP_CARRY_DSN=... (use a scratch DB)
+	@echo "$(BLUE)=== gamma_flip observation query vs real rows ===$(NC)"
+	@if [ -z "$(GAMMA_FLIP_CARRY_DSN)" ]; then \
+		echo "$(RED)Refusing to run: GAMMA_FLIP_CARRY_DSN is not set.$(NC)"; \
+		echo "$(YELLOW)This harness SEEDS gex_summary rows, so it must name the"; \
+		echo "database it means rather than inheriting the .env one."; \
+		echo ""; \
+		echo "Point it at a scratch database with schema.sql applied:"; \
+		echo "  make gamma-flip-carry-sql GAMMA_FLIP_CARRY_DSN=postgresql://user@host:5432/scratch$(NC)"; \
+		exit 1; \
+	fi
+	@PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
+		GAMMA_FLIP_CARRY_DSN="$(GAMMA_FLIP_CARRY_DSN)" \
+		GAMMA_FLIP_CARRY_SYMBOL="$(GAMMA_FLIP_CARRY_SYMBOL)" \
+		$(PY) -m pytest tests/test_gamma_flip_carry_sql.py -m integration --no-cov -q
+
 .PHONY: ci-parity
 ci-parity: ## End-to-end flow-series parity: apply schema, seed deterministic fixture via incremental writer, run parity test against canonical CTE oracle. Defaults to localhost test DB; override CI_PARITY_DSN=postgres://...
 	@DSN="$${CI_PARITY_DSN:-postgresql://zerogex_test:test@localhost:5432/zerogex_test}"; \
@@ -4321,6 +4343,20 @@ INGEST_FRESHNESS_MAX_STALE_MINUTES ?= 15
 ingestion-freshness-healthcheck: ## Alert if ANY TradeStation stream stopped writing (bars, chains, VIX/VXN, ES/NQ). 0=ok 1=stale 2=db error
 	@$(PY) -m src.tools.ingestion_freshness_healthcheck \
 		--max-stale-minutes $(INGEST_FRESHNESS_MAX_STALE_MINUTES) \
+		$(if $(JSON),--json)
+
+# How deep a gamma-flip carry has to go before the check fails, in 5-minute
+# bars. The newest bar is legitimately one carry deep on the cycle after it
+# opens; three bars is fifteen minutes with no gex_summary row at all, which is
+# a stall rather than a late write.
+GAMMA_FLIP_MAX_CARRY_BARS ?= 3
+
+.PHONY: gamma-flip-carry-healthcheck
+gamma-flip-carry-healthcheck: ## Alert if gamma_regime_5min.gamma_flip was carried over missing gex_summary rows. 0=ok 1=carried 2=db error
+	@$(PY) -m src.tools.gamma_flip_carry_healthcheck \
+		--max-carry-bars $(GAMMA_FLIP_MAX_CARRY_BARS) \
+		$(if $(FLOW_SYMBOL),--symbol $(FLOW_SYMBOL)) \
+		$(if $(SESSIONS),--sessions $(SESSIONS)) \
 		$(if $(JSON),--json)
 
 .PHONY: freshness-replay

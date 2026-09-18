@@ -1113,6 +1113,18 @@ CREATE TABLE IF NOT EXISTS gamma_regime_5min (
     -- deriving them on read means a retune reclassifies history instead of
     -- leaving every stored session labelled by whatever rule was live that
     -- day. NULL is meaningful -- the gamma profile had no zero crossing.
+    --
+    -- That last sentence is load-bearing, and until 2026-09 it was not quite
+    -- true. The level came from whichever gex_summary row landed inside the
+    -- bar's own five minutes, so a window that received NO row stored NULL
+    -- too, and every consumer read it as "one-signed profile, no boundary".
+    -- The writer now carries the last level measured EARLIER IN THE SAME
+    -- SESSION across a window with no row, and writes NULL only where a row
+    -- exists and reported no crossing (src/analytics/gamma_flip_carry.py).
+    -- Whether a bar was measured or carried is NOT stored: gex_summary is
+    -- retention-exempt, so the join answers it for as long as the bar exists,
+    -- and retroactively -- which is what
+    -- src/tools/gamma_flip_carry_healthcheck.py reports.
     gamma_flip             DOUBLE PRECISION,
     -- Typical 30-minute realized move, the yardstick the cushion state is
     -- classified against. Stored per bar rather than recomputed on read so a

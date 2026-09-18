@@ -63,6 +63,7 @@ from src.analytics.walls import (
     compute_call_put_walls,
     compute_call_put_walls_with_strength,
 )
+from src.analytics import gamma_flip_carry
 from src.analytics import pin_strike as pin_strike_mod
 from src.analytics import spread_stats as spread_stats_mod
 from src.analytics import surface_store
@@ -4306,8 +4307,8 @@ class AnalyticsEngine:
         # Zero would divide the cushion ratio into infinity; treat it as absent.
         return value if value and value > 0 else None
 
-    def _gamma_flip_at_bar(self, cursor, bar_start: datetime):
-        """The dealer-gamma flip level for one 5-minute bar, or None.
+    def _gamma_flips_for_session(self, cursor, session_bars, session_start, session_end):
+        """Every bar's dealer-gamma flip level for one session, in one query.
 
         Uses ``gamma_flip_point``, the structural crossing, NOT
         ``gamma_flip_raw``. The raw column is the nearest zero crossing with no
@@ -4316,26 +4317,26 @@ class AnalyticsEngine:
         would mostly track that noise. The schema comments on both columns
         spell the difference out.
 
-        NULL is a real answer: the profile had no crossing at all.
+        NULL is still a real answer -- the profile had no crossing at all --
+        but ONLY where a ``gex_summary`` row exists to have said so. A bar
+        whose five minutes hold no row measured nothing, and takes the last
+        level measured earlier in the SAME session rather than a NULL that
+        every consumer reads as "there is no boundary". The asymmetry is the
+        whole point; :mod:`src.analytics.gamma_flip_carry` argues it.
+
+        One query per cycle, not one per bar. The resolution needs the earlier
+        bars anyway, and a cold start walking a session used to issue a round
+        trip per bar to learn what a single grouped scan already says.
         """
         cursor.execute(
-            """
-            SELECT gamma_flip_point
-            FROM gex_summary
-            WHERE underlying = %(symbol)s
-              AND timestamp >= %(bar_start)s
-              AND timestamp <  %(bar_end)s
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
+            gamma_flip_carry.GAMMA_FLIP_OBSERVATIONS_SQL,
             {
                 "symbol": self.db_symbol,
-                "bar_start": bar_start,
-                "bar_end": bar_start + timedelta(minutes=5),
+                "session_start": session_start,
+                "session_end": session_end,
             },
         )
-        row = cursor.fetchone()
-        return float(row[0]) if row and row[0] is not None else None
+        return gamma_flip_carry.resolve_session_flips(session_bars, cursor.fetchall())
 
     def _refresh_gamma_regime_snapshot(self, timestamp: datetime):
         """Materialise gamma_regime_5min for the current session.
@@ -4391,8 +4392,10 @@ class AnalyticsEngine:
                 written = {r[0] for r in cursor.fetchall()}
 
                 bar = session_start
+                session_bars = []
                 todo = []
                 while bar <= session_end:
+                    session_bars.append(bar)
                     # Always rewrite the newest bar: it is still filling.
                     if bar not in written or bar == session_end:
                         todo.append(bar)
@@ -4425,8 +4428,19 @@ class AnalyticsEngine:
                 has_flip = "gamma_flip" in optional
                 has_move = "typical_move_30m" in optional
                 typical_move = self._typical_move_30m(cursor, session_end) if has_move else None
+                # Resolved over the WHOLE grid, not just the bars being
+                # written: a bar with no gex_summary row of its own carries the
+                # last level measured before it, which can sit in a bar written
+                # cycles ago. Bounded by the session either way, so the carry
+                # can never reach back past 09:30 ET into yesterday.
+                flips = (
+                    self._gamma_flips_for_session(cursor, session_bars, session_start, session_end)
+                    if has_flip
+                    else {}
+                )
 
                 written_count = 0
+                written_flips = []
                 for bar_ts in todo:
                     current = chain_for(bar_ts)
                     if current is None:
@@ -4435,7 +4449,10 @@ class AnalyticsEngine:
                     lookback = chain_for(lookback_ts) if lookback_ts >= session_start else None
 
                     result = build_latest_bar(anchor=anchor, lookback=lookback, current=current)
-                    gamma_flip = self._gamma_flip_at_bar(cursor, bar_ts) if has_flip else None
+                    flip_at = flips.get(bar_ts)
+                    gamma_flip = flip_at.flip if flip_at is not None else None
+                    if flip_at is not None:
+                        written_flips.append(flip_at)
 
                     flip_col = ", gamma_flip" if has_flip else ""
                     flip_val = ", %(gamma_flip)s" if has_flip else ""
@@ -4517,6 +4534,24 @@ class AnalyticsEngine:
                         written_count,
                         self.db_symbol,
                         session_end.isoformat(),
+                    )
+
+                # A carried level is a correct reading of a degraded feed, and
+                # without this line it is indistinguishable from a measured one
+                # -- which is the failure this whole path exists to remove. The
+                # newest bar is legitimately one carry deep on the first cycle
+                # after it opens, so only deeper than that is worth saying.
+                carry = gamma_flip_carry.summarize(written_flips)
+                if carry.notable:
+                    logger.log(
+                        logging.WARNING if carry.sustained else logging.INFO,
+                        "gamma_regime_5min gamma_flip for %s: %s. No gex_summary row landed "
+                        "in those 5-minute windows, so the level is standing in from an "
+                        "earlier bar of this session rather than measured (a profile that "
+                        "genuinely has no crossing is still stored NULL). Per-session "
+                        "history: python -m src.tools.gamma_flip_carry_healthcheck",
+                        self.db_symbol,
+                        gamma_flip_carry.describe(carry),
                     )
         except Exception as e:
             logger.error(f"Error refreshing gamma regime snapshot: {e}", exc_info=True)
