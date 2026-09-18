@@ -328,9 +328,14 @@ def test_the_classifier_components_are_carried_for_diagnosis():
 
     session = tool.load_session(cursor, "SPY", date(2026, 9, 17), ["typical_move_30m"], 6)
 
-    assert set(session.components[0]) == set(tool.CHURN_COMPONENTS)
+    assert set(tool.CHURN_COMPONENTS).issubset(session.components[0])
     assert session.components[-1]["pressure"] == gw.PRESSURE_BUYING
     assert session.components[-1]["structure"] == gw.STRUCTURE_PINNING
+    # Carried but deliberately not a churn row: the basis is the discriminator
+    # that decides which sessions the cushion rows may pool, so it belongs in
+    # the coverage banner rather than in a table it would restrict to itself.
+    assert "cushion basis" in session.components[0]
+    assert "cushion basis" not in tool.CHURN_COMPONENTS
 
 
 def test_the_attributed_inputs_are_the_ones_the_state_is_built_from():
@@ -386,10 +391,12 @@ def test_the_what_if_never_reaches_the_live_classification():
 # --------------------------------------------------------------------------- #
 
 
-def _cushion_session(cushion_states, warmup=0, states=None):
+def _cushion_session(bases, warmup=0, states=None):
+    """A session whose cushion readings were produced by the given bases."""
     from src.analytics import base_rates as br
+    from src.analytics.flip_cushion import BASIS_NONE
 
-    n = len(cushion_states)
+    n = len(bases)
     return br.Session(
         label="2026-09-17",
         bar_starts=_bars(n),
@@ -402,69 +409,120 @@ def _cushion_session(cushion_states, warmup=0, states=None):
                 "structure": "PINNING",
                 "lean": "SUPPORTIVE",
                 "cushion": "STEADY",
-                "cushion state": c,
+                "cushion state": "NO_FLIP" if b == BASIS_NONE else "SECURE",
+                "cushion basis": b,
             }
-            for c in cushion_states
+            for b in bases
         ],
     )
 
 
-def test_coverage_counts_bars_that_could_carry_a_cushion():
-    session = _cushion_session(["NO_FLIP", "SECURE", "SECURE", "NO_FLIP"])
+def _basis(kind):
+    from src.analytics.flip_cushion import BASIS_MOVE, BASIS_NONE, BASIS_SPOT
 
-    assert tool.cushion_coverage(session) == (2, 4)
-
-
-def test_coverage_respects_warmup():
-    session = _cushion_session(["SECURE", "SECURE", "NO_FLIP", "NO_FLIP"], warmup=2)
-
-    assert tool.cushion_coverage(session) == (0, 2)
+    return {"move": BASIS_MOVE, "spot": BASIS_SPOT, "none": BASIS_NONE}[kind]
 
 
-def test_a_session_stored_before_the_flip_column_is_kept_out_of_the_cushion_tables():
-    """Per bar, a NULL flip is correctly NO_FLIP. Pooled across sessions it is
-    not the same thing at all: without this, a schema rollout reads as a market
-    that never had a flip, which is the exact class of artifact-as-finding this
-    whole report exists to prevent."""
-    old = _cushion_session(["NO_FLIP"] * 40)
-    new = _cushion_session(["SECURE"] * 40)
+def test_a_session_measured_entirely_against_the_typical_move_is_current():
+    session = _cushion_session([_basis("move")] * 4)
 
-    report = tool.build_report([old, new], horizon_bars=6)
+    assert tool.cushion_basis(session) == (tool.CUSHION_CURRENT, 4, 4)
 
-    assert report["cushion_coverage"]["sessions_with_flip"] == 1
+
+def test_bars_with_no_flip_do_not_make_a_session_mixed():
+    """A profile with no zero crossing is an absence of measurement, not a
+    second yardstick. It cannot make the readings around it incomparable."""
+    session = _cushion_session([_basis("none"), _basis("move"), _basis("none")])
+
+    assert tool.cushion_basis(session)[0] == tool.CUSHION_CURRENT
+
+
+def test_a_session_predating_the_typical_move_column_is_legacy():
+    session = _cushion_session([_basis("spot")] * 4)
+
+    assert tool.cushion_basis(session) == (tool.CUSHION_LEGACY, 0, 4)
+
+
+def test_a_column_applied_mid_session_reads_mixed():
+    """Which is what actually happened: the ALTER landed during a session and
+    the writer carried on. Both halves look measurable and are not comparable."""
+    session = _cushion_session([_basis("spot"), _basis("spot"), _basis("move")])
+
+    assert tool.cushion_basis(session)[0] == tool.CUSHION_MIXED
+
+
+def test_a_session_with_no_cushion_at_all_is_absent():
+    session = _cushion_session([_basis("none")] * 4)
+
+    assert tool.cushion_basis(session) == (tool.CUSHION_ABSENT, 0, 4)
+
+
+def test_basis_classification_respects_warmup():
+    session = _cushion_session([_basis("spot"), _basis("spot"), _basis("move")], warmup=2)
+
+    assert tool.cushion_basis(session) == (tool.CUSHION_CURRENT, 1, 1)
+
+
+def test_the_legacy_yardstick_is_kept_out_of_the_cushion_tables():
+    """Worse than a missing flip, because the bars carry ordinary SECURE and
+    THIN labels from a rule that cannot return NORMAL at all: pooling changes
+    the shape of the distribution, not just its scale."""
+    legacy = _cushion_session([_basis("spot")] * 40)
+    current = _cushion_session([_basis("move")] * 40)
+
+    report = tool.build_report([legacy, current], horizon_bars=6)
+
+    assert report["cushion_coverage"]["sessions_on_current_basis"] == 1
+    assert report["cushion_coverage"]["sessions_on_legacy_basis"] == 1
     churn = {c["component"]: c for c in report["component_churn"]}
-    assert set(churn["cushion state"]["values"]) == {"SECURE"}
-    assert set(churn["pressure"]["values"]) == {"BUYING"}  # unrestricted
+    assert churn["cushion state"]["values"]["SECURE"]["n"] == 40  # the legacy day is out
+    assert churn["pressure"]["values"]["BUYING"]["n"] == 80  # unrestricted
 
 
-def test_the_coverage_gap_is_stated_not_silently_applied():
-    old = _cushion_session(["NO_FLIP"] * 40)
-    new = _cushion_session(["SECURE"] * 40)
+def test_a_mixed_session_is_held_out_whole():
+    """The transition-warning table measures a forward horizon, so it needs
+    contiguous bars; taking half a session would leave gaps the horizon would
+    silently step over."""
+    mixed = _cushion_session([_basis("spot")] * 20 + [_basis("move")] * 20)
+    current = _cushion_session([_basis("move")] * 40)
 
-    text = tool.format_report("SPY", tool.build_report([old, new], horizon_bars=6), skipped=[])
+    report = tool.build_report([mixed, current], horizon_bars=6)
+
+    assert report["cushion_coverage"]["sessions_mixed_basis"] == 1
+    assert report["cushion_coverage"]["comparable_bars"] == 40  # not 60
+
+
+def test_the_basis_split_is_stated_not_silently_applied():
+    legacy = _cushion_session([_basis("spot")] * 40)
+    current = _cushion_session([_basis("move")] * 40)
+
+    text = tool.format_report(
+        "SPY", tool.build_report([legacy, current], horizon_bars=6), skipped=[]
+    )
 
     assert "FLIP CUSHION COVERAGE: 1 of 2 sessions" in text
-    assert "sessions with a stored flip only" in text
+    assert "1 on the legacy spot fraction" in text
+    assert "sessions classified against the typical move only" in text
 
 
-def test_full_coverage_says_nothing_about_coverage():
-    """The banner is a warning, not furniture. A fully covered window should
-    not carry a caveat that does not apply to it."""
+def test_a_fully_current_window_says_nothing_about_coverage():
+    """The banner is a warning, not furniture. Once both rollouts have aged
+    out of the window it has to disappear on its own."""
     text = tool.format_report(
         "SPY",
-        tool.build_report([_cushion_session(["SECURE"] * 40)], horizon_bars=6),
+        tool.build_report([_cushion_session([_basis("move")] * 40)], horizon_bars=6),
         skipped=[],
     )
 
     assert "FLIP CUSHION COVERAGE" not in text
-    assert "sessions with a stored flip only" not in text
+    assert "typical move only" not in text
 
 
-def test_warnings_are_measured_only_where_a_cushion_could_have_fired():
-    old = _cushion_session(["NO_FLIP"] * 40)
-    new = _cushion_session(["SECURE"] * 40)
+def test_warnings_are_measured_only_where_the_yardstick_is_comparable():
+    legacy = _cushion_session([_basis("spot")] * 40)
+    current = _cushion_session([_basis("move")] * 40)
 
-    report = tool.build_report([old, new], horizon_bars=6)
+    report = tool.build_report([legacy, current], horizon_bars=6)
     total = sum(row["observed"]["n"] for row in report["transition_warnings"])
 
-    assert total <= 40  # the uncovered session contributes nothing
+    assert total <= 40
