@@ -3434,21 +3434,33 @@ flow-series-parity: ## Diff flow_series_5min vs the live CTE (auto-uses DB_* fro
 		FLOW_SERIES_PARITY_SESSION="$(FLOW_SERIES_PARITY_SESSION)" \
 		$(PY) -m pytest tests/test_flow_series_parity.py -m integration --no-cov -q
 
-# The hedging twin. Unlike flow-series-parity this one seeds its own synthetic
-# session under a sentinel symbol, so it needs no market data and can run
-# against a scratch database — the assertions are about the SQL, not the tape.
+# The hedging twin. Unlike flow-series-parity this one SEEDS its own synthetic
+# session under a sentinel symbol — which is what lets it run against a scratch
+# database with no market data, and also why it does NOT auto-derive the DSN
+# from .env the way its sibling does.
+#
+# That difference is the whole point of the guard below. flow-series-parity
+# only reads, so defaulting to the configured database is harmless
+# convenience. This one writes, and the first time it was run it inherited the
+# sibling's auto-derive, pointed at production, and left a sentinel row in
+# `symbols` behind (the fixture cleans up fully now, but the target should not
+# have aimed there in the first place). Name the database you mean.
 HEDGING_FLOW_PARITY_SYMBOL ?= ZZTEST
 
 .PHONY: hedging-flow-parity
-hedging-flow-parity: ## Diff hedging_flow_5min vs the live CTE, + the convergence and 0DTE guarantees (override HEDGING_FLOW_PARITY_DSN=...)
+hedging-flow-parity: ## Diff hedging_flow_5min vs the live CTE, + the convergence and 0DTE guarantees. SEEDS DATA — requires an explicit HEDGING_FLOW_PARITY_DSN=... (use a scratch DB)
 	@echo "$(BLUE)=== hedging_flow_5min parity vs live CTE ===$(NC)"
-	@DSN="$(HEDGING_FLOW_PARITY_DSN)"; \
-	if [ -z "$$DSN" ]; then \
-		DSN="postgresql://$(DB_USER)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=require"; \
-		echo "$(YELLOW)Auto-derived DSN from .env DB_*: $$DSN$(NC)"; \
-	fi; \
-	PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
-		HEDGING_FLOW_PARITY_DSN="$$DSN" \
+	@if [ -z "$(HEDGING_FLOW_PARITY_DSN)" ]; then \
+		echo "$(RED)Refusing to run: HEDGING_FLOW_PARITY_DSN is not set.$(NC)"; \
+		echo "$(YELLOW)This harness SEEDS a synthetic session, so it must never"; \
+		echo "silently inherit the .env database the way flow-series-parity does."; \
+		echo ""; \
+		echo "Point it at a scratch database with schema.sql applied:"; \
+		echo "  make hedging-flow-parity HEDGING_FLOW_PARITY_DSN=postgresql://user@host:5432/scratch$(NC)"; \
+		exit 1; \
+	fi
+	@PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
+		HEDGING_FLOW_PARITY_DSN="$(HEDGING_FLOW_PARITY_DSN)" \
 		HEDGING_FLOW_PARITY_SYMBOL="$(HEDGING_FLOW_PARITY_SYMBOL)" \
 		$(PY) -m pytest tests/test_hedging_flow_snapshot_sql.py -m integration --no-cov -q
 

@@ -21,13 +21,22 @@ against real rows rather than argued from the query text:
    rows at all, rather than a day of synthetic zeros that a chart would draw
    as a flat line through the middle of the panel.
 
-Run it against a scratch database:
+Run it against a SCRATCH database:
 
     make hedging-flow-parity HEDGING_FLOW_PARITY_DSN=postgres://...
 
 The DSN's database must already have ``setup/database/schema.sql`` applied.
-The harness seeds its own synthetic session, so it needs no market data and
-leaves nothing behind but rows for the sentinel symbol it creates.
+The DSN is deliberately NOT auto-derived from ``.env`` the way
+``flow-series-parity`` derives it: that harness only reads, while this one
+WRITES a synthetic session, and a target that silently defaults to production
+is one `make` away from seeding rows into it.
+
+The harness cleans up after itself completely — including the ``symbols`` row,
+which an earlier version created and left behind. A stray symbol is close to
+harmless (the Market Tide universe requires option_chains and gex_summary rows
+the sentinel never has) but it does satisfy the existence probe behind
+``/api/flow/hedging?symbol=…``, so the endpoint would answer 200 + empty for a
+symbol that does not exist instead of 404.
 """
 
 from __future__ import annotations
@@ -159,17 +168,27 @@ def cursor():
     conn = psycopg2.connect(_DSN)
     conn.autocommit = True
     cur = conn.cursor()
-    cur.execute("DELETE FROM hedging_flow_5min WHERE symbol = %s", (_SYMBOL,))
-    cur.execute("DELETE FROM flow_contract_facts WHERE symbol = %s", (_SYMBOL,))
-    cur.execute("DELETE FROM underlying_quotes WHERE symbol = %s", (_SYMBOL,))
+    _purge(cur)
     try:
         yield cur
     finally:
-        cur.execute("DELETE FROM hedging_flow_5min WHERE symbol = %s", (_SYMBOL,))
-        cur.execute("DELETE FROM flow_contract_facts WHERE symbol = %s", (_SYMBOL,))
-        cur.execute("DELETE FROM underlying_quotes WHERE symbol = %s", (_SYMBOL,))
+        _purge(cur)
         cur.close()
         conn.close()
+
+
+def _purge(cur) -> None:
+    """Remove every row the harness creates, in FK-safe order.
+
+    ``symbols`` is last and is easy to forget — the three data tables all
+    reference it. Forgetting it leaves a sentinel underlying in the database
+    that outlives the test run, which is exactly what happened the first time
+    this was run against a real deployment.
+    """
+    cur.execute("DELETE FROM hedging_flow_5min WHERE symbol = %s", (_SYMBOL,))
+    cur.execute("DELETE FROM flow_contract_facts WHERE symbol = %s", (_SYMBOL,))
+    cur.execute("DELETE FROM underlying_quotes WHERE symbol = %s", (_SYMBOL,))
+    cur.execute("DELETE FROM symbols WHERE symbol = %s", (_SYMBOL,))
 
 
 @pytest.mark.skipif(_DSN is None, reason=_SKIP_REASON)
