@@ -1696,59 +1696,32 @@ async def get_gamma_weather(
     flow_rows = flow_rows or []
     regime_rows = regime_rows or []
 
-    # Both series are newest-first on a shared grid. Derive the flow moving
-    # average and the cushion the same way their own endpoints do, then pair
-    # on the latest bar BOTH have: a sentence mixing this bar's pressure with
-    # last bar's structure would be quietly wrong.
-    flow_chrono = list(reversed(flow_rows))
-    ma = smooth([float(r.get("net_flow_usd") or 0.0) for r in flow_chrono], DEFAULT_SMOOTHING_BARS)
-    flow_by_bar = {
-        r["bar_start"]: (float(r.get("net_flow_usd") or 0.0), m) for r, m in zip(flow_chrono, ma)
-    }
-
-    regime_chrono = list(reversed(regime_rows))
-    cushions = build_cushion_series(
-        [
-            (r["bar_start"], r.get("spot"), r.get("gamma_flip"), r.get("typical_move_30m"))
-            for r in regime_chrono
-        ],
-        rate_bars=CUSHION_RATE_BARS,
-    )
-
     def _f(value):
         return float(value) if value is not None else None
 
-    # Pair EVERY bar the two series share, not just the newest. Persistence
-    # needs the trailing pressure bars and state age needs the run of prior
-    # states, so a single-bar read could report neither.
-    paired = [
-        (row, cushion, *flow_by_bar[row["bar_start"]])
-        for row, cushion in zip(regime_chrono, cushions)
-        if row["bar_start"] in flow_by_bar
-    ]
+    # Both series are newest-first on a shared grid. Pair EVERY bar the two
+    # share, not just the newest: persistence needs the trailing pressure bars
+    # and state age needs the run of prior states, so a single-bar read could
+    # report neither. The assembly lives in gamma_weather so that the offline
+    # base-rate pass (src.tools.gamma_weather_base_rates) classifies through
+    # the identical path -- a second copy here would eventually measure a rule
+    # the panel does not run.
+    paired = gw.pair_series(
+        list(reversed(regime_rows)),
+        list(reversed(flow_rows)),
+        rate_bars=CUSHION_RATE_BARS,
+    )
     if not paired:
         raise HTTPException(
             status_code=409,
             detail="no bar yet carries both hedging flow and gamma structure for this session",
         )
 
-    series = gw.classify_series(
-        [
-            gw.WeatherInputs(
-                pressure_bar=pressure_bar,
-                pressure_avg=pressure_avg,
-                lean=_f(row.get("rolling_lean")),
-                stability=_f(row.get("rolling_stability")),
-                gamma_trend=_f(row.get("anchored_stability")),
-                cushion_state=cushion.state,
-                cushion_pts=cushion.cushion_pts,
-                cushion_rate_pts=cushion.rate_pts,
-            )
-            for row, cushion, pressure_bar, pressure_avg in paired
-        ]
-    )
+    series = gw.classify_series([bar.inputs for bar in paired])
 
-    regime_row, cushion, pressure_bar, pressure_avg = paired[-1]
+    latest = paired[-1]
+    regime_row, cushion = latest.regime, latest.cushion
+    pressure_bar, pressure_avg = latest.pressure_bar, latest.pressure_avg
     weather = series[-1]
 
     bar_start = regime_row["bar_start"]
