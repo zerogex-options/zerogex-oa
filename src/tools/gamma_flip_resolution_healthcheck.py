@@ -242,8 +242,21 @@ def configured_symbols() -> List[str]:
     return [get_canonical_symbol(symbol) for symbol in parse_underlyings(raw)]
 
 
-def format_report(results: Sequence[SessionResolution], max_blank_minutes: float) -> List[str]:
-    """Human-readable lines, worst blackout first."""
+def format_report(
+    results: Sequence[SessionResolution],
+    max_blank_minutes: float,
+    by_date: bool = False,
+) -> List[str]:
+    """Human-readable lines, worst blackout first, or chronological.
+
+    Worst-first is the monitor's order: it puts the thing that tripped the
+    exit code at the top.  It is the wrong order for the question this tool
+    was actually built to answer.  The first production run returned thirty
+    NDX sessions in which the blackout ran from 100% of the session to none
+    of it, and the break between the two regimes fell on a single day --
+    which was invisible until the rows were re-sorted by date, because
+    severity order interleaves the months.  ``--by-date`` is that view.
+    """
     if not results:
         return ["no gex_summary rows in the requested window"]
 
@@ -251,7 +264,12 @@ def format_report(results: Sequence[SessionResolution], max_blank_minutes: float
         f"{'symbol':<8} {'session':<12} {'rows':>6} {'blank':>7} {'blank%':>7} "
         f"{'longest':>9}  window",
     ]
-    for r in sorted(results, key=lambda r: r.longest_blank_minutes, reverse=True):
+    ordered = (
+        sorted(results, key=lambda r: (r.symbol, r.session_date))
+        if by_date
+        else sorted(results, key=lambda r: r.longest_blank_minutes, reverse=True)
+    )
+    for r in ordered:
         window = ""
         if r.longest is not None and r.longest.minutes > 0:
             window = (
@@ -287,6 +305,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help=(
             "Fail when one unbroken blank stretch exceeds this many minutes "
             f"(default: {DEFAULT_MAX_BLANK_MINUTES:g})."
+        ),
+    )
+    parser.add_argument(
+        "--by-date",
+        action="store_true",
+        help=(
+            "Order the report chronologically per symbol instead of worst-first. "
+            "Use this to see WHEN the flip started or stopped resolving; severity "
+            "order hides a regime change by interleaving the dates."
         ),
     )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
@@ -333,7 +360,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         )
     else:
-        for line in format_report(results, args.max_blank_minutes):
+        for line in format_report(results, args.max_blank_minutes, by_date=args.by_date):
             print(line)
         if breaches:
             print(

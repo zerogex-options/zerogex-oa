@@ -180,3 +180,35 @@ def test_session_dates_come_back_oldest_first():
     days = (date(2026, 9, 16), date(2026, 9, 14), date(2026, 9, 15))
     cursor = FakeCursor([], dates=days)
     assert tool.session_dates(cursor, "NDX", 10, None) == sorted(days)
+
+
+def test_by_date_orders_chronologically_so_a_regime_change_is_visible():
+    """The first production run had NDX blank for essentially every session
+    through one date and essentially none after it. Severity order interleaved
+    the months and hid the break; this is the view that shows it."""
+    early = tool.summarize_session("NDX", date(2026, 8, 7), _rows("B" * 21))
+    late = tool.summarize_session("NDX", date(2026, 9, 18), _rows("R" * 21))
+    middling = tool.summarize_session("NDX", date(2026, 9, 11), _rows("R" + "B" * 10 + "R"))
+    results = [late, middling, early]
+
+    by_severity = tool.format_report(results, 30.0)[1:]
+    assert by_severity[0].split()[1] == "2026-08-07"  # worst first
+
+    chronological = tool.format_report(results, 30.0, by_date=True)[1:]
+    assert [ln.split()[1] for ln in chronological] == [
+        "2026-08-07",
+        "2026-09-11",
+        "2026-09-18",
+    ]
+
+
+def test_by_date_groups_by_symbol_before_date():
+    a = tool.summarize_session("NDX", date(2026, 9, 18), _rows("RR"))
+    b = tool.summarize_session("SPX", date(2026, 9, 11), _rows("RR"))
+    c = tool.summarize_session("NDX", date(2026, 9, 11), _rows("RR"))
+    lines = tool.format_report([a, b, c], 30.0, by_date=True)[1:]
+    assert [(ln.split()[0], ln.split()[1]) for ln in lines] == [
+        ("NDX", "2026-09-11"),
+        ("NDX", "2026-09-18"),
+        ("SPX", "2026-09-11"),
+    ]
