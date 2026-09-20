@@ -4389,12 +4389,13 @@ gamma-flip-blackout-forensics: ## Say WHY the gamma flip was left unpublished, f
 		$(if $(JSON),--json)
 
 .PHONY: gamma-flip-gate-replay
-gamma-flip-gate-replay: ## Replay a blank flip cycle and name the gate that rejected it. SYMBOL=NDX SESSION=YYYY-MM-DD [AT="YYYY-MM-DD HH:MM"] [SAMPLES=n]
+gamma-flip-gate-replay: ## Replay a blank flip cycle and name the gate that rejected it. SYMBOL=NDX SESSION=YYYY-MM-DD [AT="..."] [SAMPLES=n] [DTE_REFS=0.5,1,2,3,5]
 	@$(PY) -m src.tools.gamma_flip_gate_replay \
 		--symbol $(or $(SYMBOL),SPX) \
 		$(if $(SESSION),--session $(SESSION)) \
 		$(if $(AT),--at "$(AT)") \
 		$(if $(SAMPLES),--samples $(SAMPLES)) \
+		$(if $(DTE_REFS),--dte-ref-days $(DTE_REFS)) \
 		$(if $(JSON),--json)
 
 .PHONY: gamma-flip-resolution-install
