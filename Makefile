@@ -981,6 +981,7 @@ help: ## Show this help message
 	@echo "  make gamma-flip-carry-install - Install gamma-flip carry timer (hourly in-session + post-close)"
 	@echo "  make gamma-flip-carry-status  - Show gamma-flip carry timer status + recent log"
 	@echo "  make gamma-flip-carry-healthcheck - Flag sessions whose gamma flip was carried over missing rows"
+	@echo "  make gamma-flip-resolution-healthcheck - Report how long the gamma flip was left unpublished"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
 	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
@@ -4360,6 +4361,17 @@ gamma-flip-carry-healthcheck: ## Alert if gamma_regime_5min.gamma_flip was carri
 		--max-carry-bars $(GAMMA_FLIP_MAX_CARRY_BARS) \
 		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
 		$(if $(SESSIONS),--sessions $(SESSIONS)) \
+		$(if $(JSON),--json)
+
+GAMMA_FLIP_MAX_BLANK_MINUTES ?= 30
+
+.PHONY: gamma-flip-resolution-healthcheck
+gamma-flip-resolution-healthcheck: ## Report how long the gamma flip was left UNPUBLISHED (row present, value NULL). 0=ok 1=blank too long 2=db error
+	@$(PY) -m src.tools.gamma_flip_resolution_healthcheck \
+		--max-blank-minutes $(GAMMA_FLIP_MAX_BLANK_MINUTES) \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(SESSIONS),--sessions $(SESSIONS)) \
+		$(if $(SINCE),--since $(SINCE)) \
 		$(if $(JSON),--json)
 
 .PHONY: gamma-flip-carry-install
