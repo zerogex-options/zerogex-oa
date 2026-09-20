@@ -120,6 +120,88 @@ FLIP_REASON_BEYOND_MAX_DISTANCE = "BEYOND_MAX_DISTANCE"
 #: structure.
 FLIP_REASON_BELOW_STRUCTURAL_FLOOR = "BELOW_STRUCTURAL_FLOOR"
 
+# gex_summary's upsert is assembled rather than written out, because the engine
+# can legitimately run one deploy ahead of its own columns: schema.sql is NOT
+# re-run by a bare `git pull` (only `make pull` / `make schema-apply` apply it),
+# and the Makefile documents a prior incident from exactly that skew. A hard
+# -coded column list turns that skew into a failed INSERT, and this write shares
+# a transaction with the by-strike, profile and rollup writes -- so ONE missing
+# optional column would roll back the entire snapshot and the whole cycle would
+# land nothing. 2635cb3 hardened the gamma_regime_5min writer against this after
+# it happened there; this is the same guard on the larger table.
+
+#: Every gex_summary column the writer binds a value for, in INSERT order.
+#: ``computed_at`` is deliberately absent: it is NOW() rather than a bound
+#: parameter, so it is appended to the statement separately.
+_GEX_SUMMARY_COLUMNS = (
+    "underlying",
+    "timestamp",
+    "max_gamma_strike",
+    "max_gamma_value",
+    "gamma_flip_point",
+    "put_call_ratio",
+    "max_pain",
+    "total_call_volume",
+    "total_put_volume",
+    "total_call_oi",
+    "total_put_oi",
+    "total_net_gex",
+    "net_gex_at_spot",
+    "flip_distance",
+    "local_gex",
+    "convexity_risk",
+    "call_wall",
+    "put_wall",
+    "call_wall_strength",
+    "put_wall_strength",
+    "max_pain_by_expiration",
+    "gamma_flip_span_used",
+    "gamma_flip_raw",
+    "pin_strike",
+    "pin_score",
+    "pin_confidence",
+    "pin_strike_reason",
+    "gamma_flip_reason",
+    "data_as_of",
+)
+
+#: The conflict key. Never assigned in DO UPDATE SET, never in its guard.
+_GEX_SUMMARY_KEY_COLUMNS = frozenset({"underlying", "timestamp"})
+
+#: The columns schema.sql adds by ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``
+#: rather than in the base CREATE TABLE -- everything bolted onto gex_summary
+#: after it first shipped, and so exactly the set a database can still lack
+#: while the code that writes it is already deployed.
+#:
+#: The split is the schema's own, not a judgement call re-made here: identity
+#: and the core GEX metrics are all in the original CREATE TABLE, so a database
+#: missing one of THOSE is broken rather than merely behind, and the writer
+#: should still fail loudly on it instead of quietly filing a gutted row.
+#: Keep this in step with schema.sql when a column is added -- the writer is
+#: only as skew-proof as this set is current.
+_GEX_SUMMARY_OPTIONAL_COLUMNS = frozenset(
+    {
+        "flip_distance",
+        "local_gex",
+        "convexity_risk",
+        "call_wall",
+        "put_wall",
+        "call_wall_strength",
+        "put_wall_strength",
+        "max_pain_by_expiration",
+        "net_gex_at_spot",
+        "gamma_flip_span_used",
+        "gamma_flip_raw",
+        "pin_strike",
+        "pin_score",
+        "pin_confidence",
+        "pin_strike_reason",
+        "computed_at",
+        "data_as_of",
+        "gamma_flip_reason",
+    }
+)
+
 # Underlyings whose AnalyticsEngine startup banner has already been logged at
 # INFO in this process. Per-process, per-symbol: the daemon's one engine per
 # symbol still announces itself, the API's per-request constructions do not.
@@ -3279,6 +3361,85 @@ class AnalyticsEngine:
 
         logger.info(f"✅ Stored {len(gex_data)} GEX by strike records")
 
+    #: Which of gex_summary's optional columns this database actually has, and
+    #: the upsert assembled for them. Cached for the life of the process: None
+    #: = not yet probed. A service restart re-probes, which is exactly when the
+    #: answer can have changed. Per process rather than per write because a
+    #: per-row catalog lookup would be a query on every cycle to answer a
+    #: question that only a deploy can change.
+    _gex_summary_optional_cols = None
+    _gex_summary_sql = None
+
+    def _gex_summary_optional_columns(self, cursor) -> frozenset:
+        """Which of :data:`_GEX_SUMMARY_OPTIONAL_COLUMNS` this database has."""
+        if self._gex_summary_optional_cols is None:
+            wanted = sorted(_GEX_SUMMARY_OPTIONAL_COLUMNS)
+            # Interpolated, not bound: these are module constants naming the
+            # writer's own columns, never anything reaching this process from
+            # outside it.
+            in_list = ", ".join(f"'{c}'" for c in wanted)
+            cursor.execute(
+                f"""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'gex_summary'
+                  AND column_name IN ({in_list})
+                """
+            )
+            found = frozenset(row[0] for row in cursor.fetchall())
+            type(self)._gex_summary_optional_cols = found
+            missing = _GEX_SUMMARY_OPTIONAL_COLUMNS - found
+            if missing:
+                logger.warning(
+                    "gex_summary is missing %s; writing summary rows without "
+                    "those fields. Run `make schema-apply` (or `make pull`) to "
+                    "add them -- a bare `git pull` does not apply schema.sql.",
+                    ", ".join(sorted(missing)),
+                )
+        return self._gex_summary_optional_cols
+
+    def _gex_summary_upsert(self, cursor) -> str:
+        """The gex_summary upsert, assembled for the columns that exist.
+
+        One statement built from :data:`_GEX_SUMMARY_COLUMNS`, so the column
+        list, the VALUES list, the DO UPDATE SET and the IS DISTINCT FROM guard
+        are all generated from a single ordering and cannot fall out of step
+        with each other -- the mismatch an f-string splicing fragments into
+        four hand-maintained lists invites, and which psycopg2 would only
+        surface at execution time.
+        """
+        if self._gex_summary_sql is None:
+            present = self._gex_summary_optional_columns(cursor)
+            cols = [
+                c
+                for c in _GEX_SUMMARY_COLUMNS
+                if c not in _GEX_SUMMARY_OPTIONAL_COLUMNS or c in present
+            ]
+            updatable = [c for c in cols if c not in _GEX_SUMMARY_KEY_COLUMNS]
+            # computed_at is NOW() rather than a bound value, so it rides
+            # outside the parameter list -- and stays out of the guard below:
+            # it differs on every cycle, so including it there would make every
+            # row differ from itself and the upsert would rewrite the whole
+            # table forever.
+            stamped = "computed_at" in present
+            insert_cols = cols + (["computed_at"] if stamped else [])
+            insert_vals = [f"%({c})s" for c in cols] + (["NOW()"] if stamped else [])
+            sets = [f"{c} = EXCLUDED.{c}" for c in updatable] + (
+                ["computed_at = NOW()"] if stamped else []
+            )
+            guard = [f"EXCLUDED.{c} IS DISTINCT FROM gex_summary.{c}" for c in updatable]
+            type(self)._gex_summary_sql = (
+                f"INSERT INTO gex_summary\n"
+                f"    ({', '.join(insert_cols)})\n"
+                f"VALUES\n"
+                f"    ({', '.join(insert_vals)})\n"
+                f"ON CONFLICT (underlying, timestamp) DO UPDATE SET\n"
+                + ",\n".join(f"    {s}" for s in sets)
+                + "\nWHERE\n    "
+                + "\n    OR ".join(guard)
+                + "\n"
+            )
+        return self._gex_summary_sql
+
     def _store_gex_summary(self, summary: Dict[str, Any], cursor) -> None:
         """Write the GEX summary row on ``cursor``.
 
@@ -3360,108 +3521,59 @@ class AnalyticsEngine:
         # one, since the carry means a level WAS served and there is nothing
         # to explain. Only the rows that render as an em dash carry a code.
         gamma_flip_reason_val = summary.get("gamma_flip_reason")
-        cursor.execute(
-            """
-            INSERT INTO gex_summary
-            (underlying, timestamp, max_gamma_strike, max_gamma_value,
-             gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
-             total_put_volume, total_call_oi, total_put_oi, total_net_gex,
-             net_gex_at_spot, flip_distance, local_gex, convexity_risk,
-             call_wall, put_wall, call_wall_strength, put_wall_strength,
-             max_pain_by_expiration, gamma_flip_span_used,
-             gamma_flip_raw, pin_strike, pin_score, pin_confidence,
-             pin_strike_reason, gamma_flip_reason, computed_at, data_as_of)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
-            ON CONFLICT (underlying, timestamp) DO UPDATE SET
-                max_gamma_strike = EXCLUDED.max_gamma_strike,
-                max_gamma_value = EXCLUDED.max_gamma_value,
-                gamma_flip_point = EXCLUDED.gamma_flip_point,
-                gamma_flip_raw = EXCLUDED.gamma_flip_raw,
-                put_call_ratio = EXCLUDED.put_call_ratio,
-                max_pain = EXCLUDED.max_pain,
-                total_call_volume = EXCLUDED.total_call_volume,
-                total_put_volume = EXCLUDED.total_put_volume,
-                total_call_oi = EXCLUDED.total_call_oi,
-                total_put_oi = EXCLUDED.total_put_oi,
-                total_net_gex = EXCLUDED.total_net_gex,
-                net_gex_at_spot = EXCLUDED.net_gex_at_spot,
-                flip_distance = EXCLUDED.flip_distance,
-                local_gex = EXCLUDED.local_gex,
-                convexity_risk = EXCLUDED.convexity_risk,
-                call_wall = EXCLUDED.call_wall,
-                put_wall = EXCLUDED.put_wall,
-                call_wall_strength = EXCLUDED.call_wall_strength,
-                put_wall_strength = EXCLUDED.put_wall_strength,
-                max_pain_by_expiration = EXCLUDED.max_pain_by_expiration,
-                gamma_flip_span_used = EXCLUDED.gamma_flip_span_used,
-                pin_strike = EXCLUDED.pin_strike,
-                pin_score = EXCLUDED.pin_score,
-                pin_confidence = EXCLUDED.pin_confidence,
-                pin_strike_reason = EXCLUDED.pin_strike_reason,
-                gamma_flip_reason = EXCLUDED.gamma_flip_reason,
-                computed_at = NOW(),
-                data_as_of = EXCLUDED.data_as_of
-            WHERE
-                EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
-                OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
-                OR EXCLUDED.gamma_flip_point IS DISTINCT FROM gex_summary.gamma_flip_point
-                OR EXCLUDED.put_call_ratio IS DISTINCT FROM gex_summary.put_call_ratio
-                OR EXCLUDED.max_pain IS DISTINCT FROM gex_summary.max_pain
-                OR EXCLUDED.total_call_volume IS DISTINCT FROM gex_summary.total_call_volume
-                OR EXCLUDED.total_put_volume IS DISTINCT FROM gex_summary.total_put_volume
-                OR EXCLUDED.total_call_oi IS DISTINCT FROM gex_summary.total_call_oi
-                OR EXCLUDED.total_put_oi IS DISTINCT FROM gex_summary.total_put_oi
-                OR EXCLUDED.total_net_gex IS DISTINCT FROM gex_summary.total_net_gex
-                OR EXCLUDED.net_gex_at_spot IS DISTINCT FROM gex_summary.net_gex_at_spot
-                OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
-                OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
-                OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
-                OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
-                OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
-                OR EXCLUDED.call_wall_strength IS DISTINCT FROM gex_summary.call_wall_strength
-                OR EXCLUDED.put_wall_strength IS DISTINCT FROM gex_summary.put_wall_strength
-                OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
-                OR EXCLUDED.gamma_flip_span_used IS DISTINCT FROM gex_summary.gamma_flip_span_used
-                OR EXCLUDED.gamma_flip_raw IS DISTINCT FROM gex_summary.gamma_flip_raw
-                OR EXCLUDED.pin_strike IS DISTINCT FROM gex_summary.pin_strike
-                OR EXCLUDED.pin_score IS DISTINCT FROM gex_summary.pin_score
-                OR EXCLUDED.pin_confidence IS DISTINCT FROM gex_summary.pin_confidence
-                OR EXCLUDED.pin_strike_reason IS DISTINCT FROM gex_summary.pin_strike_reason
-                OR EXCLUDED.gamma_flip_reason IS DISTINCT FROM gex_summary.gamma_flip_reason
-                OR EXCLUDED.data_as_of IS DISTINCT FROM gex_summary.data_as_of
-        """,
-            (
-                summary["underlying"],
-                summary["timestamp"],
-                float(summary["max_gamma_strike"]),
-                float(summary["max_gamma_value"]),
-                gamma_flip_point,
-                float(summary["put_call_ratio"]),
-                (float(summary["max_pain"]) if summary.get("max_pain") is not None else None),
-                int(summary["total_call_volume"]),
-                int(summary["total_put_volume"]),
-                int(summary["total_call_oi"]),
-                int(summary["total_put_oi"]),
-                float(summary["total_net_gex"]),
-                (float(net_gex_at_spot) if net_gex_at_spot is not None else None),
-                float(flip_distance) if flip_distance is not None else None,
-                float(summary.get("local_gex", 0.0)),
-                float(convexity_risk) if convexity_risk is not None else None,
-                float(call_wall_val) if call_wall_val is not None else None,
-                float(put_wall_val) if put_wall_val is not None else None,
-                (float(call_wall_strength_val) if call_wall_strength_val is not None else None),
-                (float(put_wall_strength_val) if put_wall_strength_val is not None else None),
-                mp_by_exp_json,
-                (float(gamma_flip_span_used) if gamma_flip_span_used is not None else None),
-                (float(gamma_flip_raw) if gamma_flip_raw is not None else None),
-                (float(pin_strike_val) if pin_strike_val is not None else None),
-                (float(pin_score_val) if pin_score_val is not None else None),
-                (float(pin_confidence_val) if pin_confidence_val is not None else None),
-                (str(pin_strike_reason_val) if pin_strike_reason_val is not None else None),
-                (str(gamma_flip_reason_val) if gamma_flip_reason_val is not None else None),
-                summary.get("data_as_of"),
+        # Values for every column the writer can fill, keyed by column name.
+        # Bound by NAME rather than position: a column the database does not
+        # have simply leaves an unused key here, where a positional %s tuple
+        # would shift every parameter after the gap one place left and file a
+        # row of silently wrong values under the right column names.
+        values = {
+            "underlying": summary["underlying"],
+            "timestamp": summary["timestamp"],
+            "max_gamma_strike": float(summary["max_gamma_strike"]),
+            "max_gamma_value": float(summary["max_gamma_value"]),
+            "gamma_flip_point": gamma_flip_point,
+            "put_call_ratio": float(summary["put_call_ratio"]),
+            "max_pain": (
+                float(summary["max_pain"]) if summary.get("max_pain") is not None else None
             ),
-        )
+            "total_call_volume": int(summary["total_call_volume"]),
+            "total_put_volume": int(summary["total_put_volume"]),
+            "total_call_oi": int(summary["total_call_oi"]),
+            "total_put_oi": int(summary["total_put_oi"]),
+            "total_net_gex": float(summary["total_net_gex"]),
+            "net_gex_at_spot": (
+                float(net_gex_at_spot) if net_gex_at_spot is not None else None
+            ),
+            "flip_distance": (float(flip_distance) if flip_distance is not None else None),
+            "local_gex": float(summary.get("local_gex", 0.0)),
+            "convexity_risk": (float(convexity_risk) if convexity_risk is not None else None),
+            "call_wall": (float(call_wall_val) if call_wall_val is not None else None),
+            "put_wall": (float(put_wall_val) if put_wall_val is not None else None),
+            "call_wall_strength": (
+                float(call_wall_strength_val) if call_wall_strength_val is not None else None
+            ),
+            "put_wall_strength": (
+                float(put_wall_strength_val) if put_wall_strength_val is not None else None
+            ),
+            "max_pain_by_expiration": mp_by_exp_json,
+            "gamma_flip_span_used": (
+                float(gamma_flip_span_used) if gamma_flip_span_used is not None else None
+            ),
+            "gamma_flip_raw": (float(gamma_flip_raw) if gamma_flip_raw is not None else None),
+            "pin_strike": (float(pin_strike_val) if pin_strike_val is not None else None),
+            "pin_score": (float(pin_score_val) if pin_score_val is not None else None),
+            "pin_confidence": (
+                float(pin_confidence_val) if pin_confidence_val is not None else None
+            ),
+            "pin_strike_reason": (
+                str(pin_strike_reason_val) if pin_strike_reason_val is not None else None
+            ),
+            "gamma_flip_reason": (
+                str(gamma_flip_reason_val) if gamma_flip_reason_val is not None else None
+            ),
+            "data_as_of": summary.get("data_as_of"),
+        }
+        cursor.execute(self._gex_summary_upsert(cursor), values)
         logger.debug("✅ Stored GEX summary")
 
     def _store_gex_profile(self, summary: Dict[str, Any], cursor) -> None:
