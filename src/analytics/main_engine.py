@@ -1097,16 +1097,45 @@ class AnalyticsEngine:
                 # timestamp alone cannot say whether anything changed since
                 # the last cycle; the latest table's write clock can. One
                 # indexed aggregate over this underlying's contracts.
-                cursor.execute(
-                    """
-                    SELECT MAX(updated_at)
-                    FROM option_chains_latest
-                    WHERE underlying = %s
-                    """,
-                    (self.db_symbol,),
-                )
-                updated_row = cursor.fetchone()
-                data_updated_at = updated_row[0] if updated_row else None
+                #
+                # ISOLATED. This reads option_chains_latest whether or not the
+                # cache flag is on, because it is a write clock rather than a
+                # data source. That makes it the one statement in _get_snapshot
+                # that can fail on an environment where the cache table has not
+                # been created yet -- and without this try, that failure is
+                # caught by the broad except below, which returns None and
+                # turns EVERY analytics cycle into a no-op. A missing write
+                # clock must cost the sub-minute skip guard (it falls back to
+                # the bucket timestamp) and nothing else.
+                data_updated_at = None
+                try:
+                    cursor.execute(
+                        """
+                        SELECT MAX(updated_at)
+                        FROM option_chains_latest
+                        WHERE underlying = %s
+                        """,
+                        (self.db_symbol,),
+                    )
+                    updated_row = cursor.fetchone()
+                    data_updated_at = updated_row[0] if updated_row else None
+                except Exception:
+                    # A failed statement aborts the transaction, so roll back
+                    # before returning or the context manager's commit raises
+                    # on the way out and takes the snapshot with it.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        logger.warning(
+                            "Rollback after data_as_of probe failure also failed",
+                            exc_info=True,
+                        )
+                    logger.warning(
+                        "option_chains_latest write-clock probe failed; this "
+                        "cycle's data_as_of is unset and the sub-minute skip "
+                        "guard falls back to the bucket timestamp",
+                        exc_info=True,
+                    )
 
                 return {
                     "timestamp": timestamp,

@@ -22,6 +22,7 @@ These tests pin down:
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import psycopg2
 import pytz
 
 from src.analytics import main_engine
@@ -62,6 +63,13 @@ def _mock_db_connection(latest_ts, underlying_price, snapshot_rows):
     cursor.fetchone.side_effect = [
         (latest_ts,),  # query 1: latest option_chains timestamp
         (underlying_price, latest_ts),  # query 2: underlying close + ts
+        # _get_snapshot's last query: option_chains_latest MAX(updated_at),
+        # the sub-minute change signal behind gex_summary.data_as_of. These
+        # mocks are positional, so a query added to _get_snapshot without a
+        # matching entry here raises StopIteration -- which the engine's broad
+        # except swallows into a silent None, and the test fails somewhere
+        # else entirely. That is exactly how this went unnoticed for 11 days.
+        (latest_ts,),
     ]
     cursor.fetchall.return_value = snapshot_rows
 
@@ -105,9 +113,21 @@ def test_default_off_flag_skips_cache_query_entirely():
         result = engine._get_snapshot()
 
     sqls = _execute_sqls(cursor)
+    # The cache SNAPSHOT query must not run. Note the narrowing: this used to
+    # assert that option_chains_latest was not named at all, which stopped
+    # being the right test when the data_as_of write clock started reading
+    # MAX(updated_at) off that table on every cycle regardless of the flag.
+    # The flag governs where the CONTRACTS come from, and that is what is
+    # asserted here -- naming the table is not the same as sourcing from it.
     assert not any(
-        "option_chains_latest" in s for s in sqls
-    ), "cache query must NOT run when flag is off"
+        "option_chains_latest" in s and "gamma IS NOT NULL" in s for s in sqls
+    ), "cache snapshot query must NOT run when flag is off"
+    # ...and the write clock DOES run, unconditionally. Asserted rather than
+    # merely permitted, so the sub-minute skip guard losing its input is a
+    # test failure and not a silent regression.
+    assert any(
+        "MAX(updated_at)" in s for s in sqls
+    ), "the data_as_of write clock runs whether or not the cache flag is on"
     # Legacy history query still ran.
     assert any("DISTINCT ON" in s for s in sqls)
     assert result is not None and len(result["options"]) == 1
@@ -163,6 +183,7 @@ def test_cache_empty_falls_back_to_history(caplog):
     cursor.fetchone.side_effect = [
         (snapshot_ts,),
         (500.0, snapshot_ts),
+        (snapshot_ts,),  # option_chains_latest MAX(updated_at)
     ]
     cursor.fetchall.side_effect = [[], history_rows]
     conn = MagicMock()
@@ -225,6 +246,7 @@ def test_cache_empty_AND_history_empty_does_not_warn(caplog):
     cursor.fetchone.side_effect = [
         (snapshot_ts,),
         (500.0, snapshot_ts),
+        (snapshot_ts,),  # option_chains_latest MAX(updated_at)
     ]
     # Both cache and history return 0 rows -- genuine no-data state.
     cursor.fetchall.side_effect = [[], []]
@@ -270,6 +292,7 @@ def test_cache_read_error_falls_back_to_history(caplog):
     cursor.fetchone.side_effect = [
         (snapshot_ts,),
         (500.0, snapshot_ts),
+        (snapshot_ts,),  # option_chains_latest MAX(updated_at)
     ]
     # First fetchall() raises (cache); second fetchall() returns history.
     cursor.fetchall.side_effect = [RuntimeError("simulated cache outage"), history_rows]
@@ -367,3 +390,43 @@ def test_first_cycle_latch_flips_even_when_cache_returns_rows():
     assert (
         engine._snapshot_cold_start_consumed is True
     ), "first cycle must consume the cold-start latch on the cache path too"
+
+
+# ---------------------------------------------------------------------------
+# The write clock is isolated from the snapshot.
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_write_clock_costs_data_as_of_and_nothing_else():
+    """A missing option_chains_latest must not cost the whole cycle.
+
+    The MAX(updated_at) probe is the one statement in _get_snapshot that reads
+    the cache table regardless of the flag, so it is the one that fails on an
+    environment where that table has not been created. Caught by the method's
+    broad except, that failure returns None -- which is not a degraded
+    snapshot, it is NO snapshot, on every cycle, for as long as the table is
+    missing. The probe therefore carries its own try, and this is the test
+    that says so.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    engine.use_latest_cache = False
+
+    snapshot_ts = _snapshot_ts()
+    expiration = snapshot_ts.astimezone(ET).date() + timedelta(days=7)
+    rows = [_row("SPY260520C00500000", 500.0, expiration, "C", snapshot_ts)]
+    cm, cursor = _mock_db_connection(snapshot_ts, 500.0, rows)
+
+    def execute_side_effect(sql, params=None):
+        if "MAX(updated_at)" in sql:
+            raise psycopg2.errors.UndefinedTable("relation option_chains_latest does not exist")
+        return None
+
+    cursor.execute.side_effect = execute_side_effect
+
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+
+    assert result is not None, "a missing write clock must not blank the snapshot"
+    assert len(result["options"]) == 1
+    assert result["data_updated_at"] is None
+    cm.__enter__.return_value.rollback.assert_called()
