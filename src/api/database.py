@@ -1980,6 +1980,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.data_as_of,
                     gs.gamma_flip_point,
                     gs.gamma_flip_raw,
+                    gs.gamma_flip_reason,
                     gs.flip_distance,
                     gs.local_gex,
                     gs.convexity_risk,
