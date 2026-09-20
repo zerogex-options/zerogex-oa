@@ -278,20 +278,29 @@ class AnalyticsEngine:
         # Horizon-occupancy reference for the DTE ramp, PER SYMBOL.
         #
         # The ramp exists to stop a same-day 0DTE wall pinning a multi-day
-        # regime level, and five days is the right horizon for a book whose
-        # weight genuinely lives in the multi-day tenors -- SPX runs ~12% of
-        # its open interest in 0DTE, so the ramp barely touches its structure.
+        # regime level, and ONE horizon serves every underlying: the module
+        # default is 5 days and production overrides it to 2 through the
+        # environment for all symbols at once.  Two days is a fine horizon for
+        # a book whose weight genuinely lives in the multi-day tenors -- SPX
+        # runs ~12% of its open interest in 0DTE, so the ramp barely touches
+        # its structure.
         #
         # It is the wrong horizon for a book that IS same-day.  NDX carries
-        # ~76% of its open interest in 0DTE, and against a five-day reference
-        # the ramp does not down-weight an anomaly, it down-weights the
-        # market: what survives is too thin to place a crossing anywhere near
-        # spot, so the resolver walks the whole ladder and persists NULL.
+        # ~76% of its open interest in 0DTE, and at a two-day reference the
+        # ramp does not down-weight an anomaly, it down-weights the market:
+        # what survives is too thin to place a crossing anywhere near spot, so
+        # the resolver walks the whole ladder and persists NULL.
         # That is the 2026-07..09 NDX blackout, confirmed by replaying stored
         # chains (src/tools/gamma_flip_gate_replay.py): on the cycles that
         # reproduce blank, turning the ramp off is the ONLY relaxation that
         # publishes, and it publishes a flip ~2% below spot while every gate
-        # stays exactly where it is.
+        # stays exactly where it is.  Sweeping the horizon on the same cycles
+        # puts a number on it: at ref=2 NDX sits ON the boundary -- some
+        # cycles publish, some do not, which is what a session that is 31%
+        # blank looks like from the inside -- and at ref=1 every cycle
+        # publishes, within half a percent of the level ref=2 produced on the
+        # cycles where it managed to produce one.  The level was never wrong.
+        # It was intermittently invisible.
         #
         # So the reference becomes per-symbol, and DEFAULTS TO THE GLOBAL --
         # setting nothing changes nothing.  Override one underlying with
