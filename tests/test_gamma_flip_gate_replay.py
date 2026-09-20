@@ -46,6 +46,8 @@ def _result(**overrides):
             ("DTE ramp off", None),
             ("all gates off (control)", 22_750.0),
         ),
+        dte_sweep=(),
+        production_dte_ref=5.0,
         diagnostics={},
     )
     base.update(overrides)
@@ -184,3 +186,53 @@ def test_diagnostics_render_when_fields_are_missing_or_none():
     body = "\n".join(tool.format_report([result]))
     assert "usable=12" in body
     assert "peak=-" in body
+
+
+# --- the DTE sweep picks a number the chain supports -----------------------
+
+
+def test_the_largest_reference_that_publishes_everywhere_is_the_recommendation():
+    """Largest, not smallest: a shorter horizon weakens the ramp for no gain."""
+    a = _result(dte_sweep=((0.5, 28_800.0), (1.0, 28_790.0), (2.0, 28_780.0), (5.0, None)))
+    b = _result(dte_sweep=((0.5, 28_700.0), (1.0, 28_690.0), (2.0, None), (5.0, None)))
+    assert tool.recommended_dte_ref([a, b]) == 1.0
+
+
+def test_no_shared_reference_recommends_nothing():
+    a = _result(dte_sweep=((0.5, 28_800.0), (1.0, None)))
+    b = _result(dte_sweep=((0.5, None), (1.0, 28_690.0)))
+    assert tool.recommended_dte_ref([a, b]) is None
+
+
+def test_an_unswept_cycle_blocks_the_recommendation():
+    """A value that publishes in the cycles we swept says nothing about the rest."""
+    swept = _result(dte_sweep=((1.0, 28_790.0),))
+    unswept = _result(dte_sweep=())
+    assert tool.recommended_dte_ref([swept, unswept]) is None
+    assert tool.recommended_dte_ref([]) is None
+
+
+def test_the_recommendation_is_printed_with_what_production_runs_today():
+    swept = _result(dte_sweep=((1.0, 28_790.0), (5.0, None)), production_dte_ref=5.0)
+    body = "\n".join(tool.format_report([swept, swept]))
+    assert "1 days" in body
+    assert "production runs 5" in body
+
+
+def test_the_sweep_is_rendered_per_cycle():
+    body = "\n".join(tool.format_report([_result(dte_sweep=((1.0, 28_790.0), (5.0, None)))]))
+    assert "DTE reference sweep" in body
+    assert "ref=1" in body
+    assert "ref=5" in body
+
+
+def test_the_engine_reads_a_per_symbol_dte_reference(monkeypatch):
+    """The knob the sweep exists to set has to actually reach the weight."""
+    from src.analytics.main_engine import AnalyticsEngine
+
+    engine = AnalyticsEngine.__new__(AnalyticsEngine)
+    engine.dte_ref_days = 1.0
+    full = engine._dte_profile_weight(1.0 / 365.0)
+    engine.dte_ref_days = 5.0
+    ramped = engine._dte_profile_weight(1.0 / 365.0)
+    assert full > ramped
