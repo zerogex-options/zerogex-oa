@@ -116,6 +116,8 @@ class ReplayResult:
     stored_flip: Optional[float]
     stored_raw: Optional[float]
     relaxed: Sequence[Tuple[str, Optional[float]]]
+    dte_sweep: Sequence[Tuple[float, Optional[float]]]
+    production_dte_ref: float
     diagnostics: Dict[str, Any]
 
     @property
@@ -138,6 +140,8 @@ class ReplayResult:
             "stored_flip": self.stored_flip,
             "stored_raw": self.stored_raw,
             "relaxed": {label: flip for label, flip in self.relaxed},
+            "dte_sweep": {str(ref): flip for ref, flip in self.dte_sweep},
+            "production_dte_ref": self.production_dte_ref,
             "culprits": self.culprits,
             "diagnostics": self.diagnostics,
         }
@@ -305,6 +309,7 @@ def replay_cycle(
     options: List[Dict[str, Any]],
     spot: float,
     stored: Tuple[Optional[float], Optional[float]],
+    dte_refs: Sequence[float] = (),
 ) -> ReplayResult:
     """Resolve once as production would, then once per relaxed gate."""
     profile, flip, span = engine._resolve_gamma_flip(options, spot, timestamp)
@@ -314,6 +319,16 @@ def replay_cycle(
         with _patched(module, overrides):
             _p, relaxed_flip, _s = engine._resolve_gamma_flip(options, spot, timestamp)
         relaxed.append((label, relaxed_flip))
+
+    # The DTE reference is per-ENGINE, not a module constant, so the sweep
+    # patches the instance.  Sweeping it is not the same as the "DTE ramp off"
+    # relaxation: off answers "is the ramp responsible", the sweep answers
+    # "what horizon would publish", which is the number that goes in .env.
+    dte_sweep: List[Tuple[float, Optional[float]]] = []
+    for ref in dte_refs:
+        with _patched(engine, {"dte_ref_days": float(ref)}):
+            _p, swept, _s = engine._resolve_gamma_flip(options, spot, timestamp)
+        dte_sweep.append((float(ref), swept))
 
     diagnostics: Dict[str, Any] = {}
     if flip is None:
@@ -329,8 +344,29 @@ def replay_cycle(
         stored_flip=stored[0],
         stored_raw=stored[1],
         relaxed=tuple(relaxed),
+        dte_sweep=tuple(dte_sweep),
+        production_dte_ref=float(engine.dte_ref_days),
         diagnostics=diagnostics,
     )
+
+
+def recommended_dte_ref(blank: Sequence[ReplayResult]) -> Optional[float]:
+    """The largest swept DTE reference that publishes in EVERY blank cycle.
+
+    Largest, not smallest.  A shorter reference weakens the ramp, and the ramp
+    is there to stop a same-day wall pinning a multi-day regime level; the
+    value worth deploying is the longest horizon that still resolves the chain
+    in front of it, not the one that flattens the ramp hardest.
+
+    ``None`` when the cycles were not swept, or when no single value publishes
+    in all of them -- in which case the chain needs more than a new constant.
+    """
+    swept = [r for r in blank if r.dte_sweep]
+    if not swept or len(swept) != len(blank):
+        return None
+    publishing = [{ref for ref, flip in r.dte_sweep if flip is not None} for r in swept]
+    common = set.intersection(*publishing) if publishing else set()
+    return max(common) if common else None
 
 
 def _fmt(value: Optional[float]) -> str:
@@ -378,6 +414,11 @@ def format_report(results: Sequence[ReplayResult]) -> List[str]:
         for label, flip in r.relaxed:
             mark = "PUBLISHES" if flip is not None else "still blank"
             lines.append(f"    {label:<32} {mark:<12} {_fmt(flip)}")
+        if r.dte_sweep:
+            lines.append("    DTE reference sweep (days -> published flip):")
+            for ref, flip in r.dte_sweep:
+                mark = "PUBLISHES" if flip is not None else "still blank"
+                lines.append(f"      ref={ref:<5g} {mark:<12} {_fmt(flip)}")
         if r.diagnostics:
             d = r.diagnostics
             lines.append(
@@ -417,6 +458,16 @@ def format_report(results: Sequence[ReplayResult]) -> List[str]:
             f"Relaxing {' or '.join(sorted(shared))} publishes a flip in every "
             "one of them."
         )
+        recommended = recommended_dte_ref(blank)
+        if recommended is not None:
+            lines.append(
+                f"The LARGEST DTE reference that publishes in all of them is "
+                f"{recommended:g} days (production runs "
+                f"{blank[0].production_dte_ref:g}). Largest rather than "
+                "smallest: the ramp exists to hold near-dated out of a "
+                "multi-day level, so take the longest horizon that still "
+                "resolves rather than the one that weakens it most."
+            )
     else:
         lines.append(
             f"{len(blank)} of {len(results)} replayed cycles reproduce blank, but "
@@ -437,6 +488,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=3,
         help="Blank cycles to replay from --session, spread across it (default 3).",
     )
+    parser.add_argument(
+        "--dte-ref-days",
+        default=None,
+        help=(
+            "Comma-separated horizon-occupancy references to sweep, in days "
+            "(e.g. 0.5,1,2,3,5). Answers what GAMMA_PROFILE_DTE_REF_DAYS_<SYMBOL> "
+            "would have to be for this chain to publish."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     parser.add_argument("--log-level", default="WARNING")
     args = parser.parse_args(argv)
@@ -450,6 +510,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("one of --session or --at is required")
 
     symbol = get_canonical_symbol(args.symbol)
+    dte_refs = (
+        [float(v) for v in str(args.dte_ref_days).split(",") if v.strip()]
+        if args.dte_ref_days
+        else []
+    )
 
     from src.analytics import main_engine as module
     from src.analytics.main_engine import AnalyticsEngine
@@ -489,6 +554,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         options,
                         spot,
                         stored_row(cursor, symbol, timestamp),
+                        dte_refs,
                     )
                 )
             conn.rollback()

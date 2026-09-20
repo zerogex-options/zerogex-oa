@@ -111,6 +111,11 @@ class AnalyticsEngine:
     Decoupled from ingestion - runs on its own schedule against database data.
     """
 
+    #: Class-level default for the per-symbol DTE ramp reference, so an engine
+    #: built without ``__init__`` (the pattern several tests use to exercise a
+    #: single method) still resolves it.  ``__init__`` overrides it per symbol.
+    dte_ref_days: float = GAMMA_PROFILE_DTE_REF_DAYS
+
     def __init__(
         self,
         underlying: str = "SPY",
@@ -270,6 +275,37 @@ class AnalyticsEngine:
         # underlying chain stats (IV, OI by DTE, peak/floor) instead of
         # the log going silent for hours.  An info line is emitted on
         # the unresolved→resolved transition so the recovery is visible.
+        # Horizon-occupancy reference for the DTE ramp, PER SYMBOL.
+        #
+        # The ramp exists to stop a same-day 0DTE wall pinning a multi-day
+        # regime level, and five days is the right horizon for a book whose
+        # weight genuinely lives in the multi-day tenors -- SPX runs ~12% of
+        # its open interest in 0DTE, so the ramp barely touches its structure.
+        #
+        # It is the wrong horizon for a book that IS same-day.  NDX carries
+        # ~76% of its open interest in 0DTE, and against a five-day reference
+        # the ramp does not down-weight an anomaly, it down-weights the
+        # market: what survives is too thin to place a crossing anywhere near
+        # spot, so the resolver walks the whole ladder and persists NULL.
+        # That is the 2026-07..09 NDX blackout, confirmed by replaying stored
+        # chains (src/tools/gamma_flip_gate_replay.py): on the cycles that
+        # reproduce blank, turning the ramp off is the ONLY relaxation that
+        # publishes, and it publishes a flip ~2% below spot while every gate
+        # stays exactly where it is.
+        #
+        # So the reference becomes per-symbol, and DEFAULTS TO THE GLOBAL --
+        # setting nothing changes nothing.  Override one underlying with
+        # GAMMA_PROFILE_DTE_REF_DAYS_<SYMBOL> (e.g.
+        # GAMMA_PROFILE_DTE_REF_DAYS_NDX=1) once the replay sweep has shown
+        # which value publishes a sane flip for that chain.  Per-call
+        # overrides (compute_flip_term_structure's horizons) still win over
+        # this, so the term structure is untouched.
+        self.dte_ref_days: float = _getenv_float(
+            f"GAMMA_PROFILE_DTE_REF_DAYS_{self.db_symbol}",
+            GAMMA_PROFILE_DTE_REF_DAYS,
+            min=0.5,
+            max=60.0,
+        )
         self._gamma_flip_unresolved_state: bool = False
         self._gamma_flip_unresolved_last_warn_mono: float = 0.0
         self._gamma_flip_unresolved_warn_throttle_seconds: float = _getenv_float(
@@ -1238,7 +1274,7 @@ class AnalyticsEngine:
         """
         if not GAMMA_PROFILE_DTE_WEIGHTING:
             return 1.0
-        ref_days = GAMMA_PROFILE_DTE_REF_DAYS if dte_ref_days is None else float(dte_ref_days)
+        ref_days = self.dte_ref_days if dte_ref_days is None else float(dte_ref_days)
         if T <= 0.0 or ref_days <= 0.0:
             return 0.0
         chosen_shape = GAMMA_PROFILE_DTE_WEIGHT_SHAPE if shape is None else shape.strip().lower()
