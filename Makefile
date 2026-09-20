@@ -982,6 +982,9 @@ help: ## Show this help message
 	@echo "  make gamma-flip-carry-status  - Show gamma-flip carry timer status + recent log"
 	@echo "  make gamma-flip-carry-healthcheck - Flag sessions whose gamma flip was carried over missing rows"
 	@echo "  make gamma-flip-resolution-healthcheck - Report how long the gamma flip was left unpublished"
+	@echo "  make gamma-flip-blackout-forensics - Say WHY the gamma flip was left unpublished (retention-exempt rows)"
+	@echo "  make gamma-flip-resolution-install - Install gamma-flip resolution timer (hourly in-session + post-close)"
+	@echo "  make gamma-flip-resolution-status - Show gamma-flip resolution timer status + recent log"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
 	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
@@ -4374,6 +4377,51 @@ gamma-flip-resolution-healthcheck: ## Report how long the gamma flip was left UN
 		$(if $(FLIP_SINCE),--since $(FLIP_SINCE)) \
 		$(if $(BY_DATE),--by-date) \
 		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-blackout-forensics
+gamma-flip-blackout-forensics: ## Say WHY the gamma flip was left unpublished, from retention-exempt rows. FLIP_SINCE=YYYY-MM-DD BLANK_ONLY=1
+	@$(PY) -m src.tools.gamma_flip_blackout_forensics \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(SESSIONS),--sessions $(SESSIONS)) \
+		$(if $(FLIP_SINCE),--since $(FLIP_SINCE)) \
+		$(if $(BLANK_ONLY),--blank-only) \
+		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-resolution-install
+gamma-flip-resolution-install: ## Install the gamma-flip resolution timer (hourly 10:30-15:30 ET + 16:05 ET post-close)
+	@echo "$(BLUE)=== Installing Gamma-Flip Resolution Check Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-resolution.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-resolution.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-gamma-flip-resolution.timer
+	@echo "$(GREEN)✅ Gamma-flip resolution timer installed and started$(NC)"
+	@if [ ! -f /etc/systemd/system/zerogex-alert@.service ]; then \
+		echo "$(YELLOW)⚠  zerogex-alert@.service is NOT installed, so a blackout will be"; \
+		echo "   logged but will not leave the box. Install it with:"; \
+		echo "     make alert-template-install$(NC)"; \
+	elif ! sudo grep -qs '^ALERT_BACKEND=resend' /etc/zerogex/alert.env; then \
+		echo "$(YELLOW)⚠  /etc/zerogex/alert.env is not set to the email backend, so a"; \
+		echo "   blackout alerts to the journal only. For email, set in that file:"; \
+		echo "     ALERT_BACKEND=resend"; \
+		echo "     ALERT_EMAIL_TO=you@example.com"; \
+		echo "   then: make alert-template-test$(NC)"; \
+	else \
+		echo "$(GREEN)✅ Email alerting is configured (ALERT_BACKEND=resend)$(NC)"; \
+	fi
+	@echo "$(YELLOW)Status:      make gamma-flip-resolution-status$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-gamma-flip-resolution$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-gamma-flip-resolution.service$(NC)"
+
+.PHONY: gamma-flip-resolution-status
+gamma-flip-resolution-status: ## Show the gamma-flip resolution timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Gamma-Flip Resolution Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-gamma-flip-resolution.timer' || true
+	@echo ""
+	@echo "$(BLUE)Service — last run:$(NC)"
+	@systemctl status zerogex-oa-gamma-flip-resolution.service --no-pager -l || true
+	@echo ""
+	@echo "$(BLUE)Recent log lines:$(NC)"
+	@sudo journalctl -u zerogex-oa-gamma-flip-resolution -n 30 --no-pager || true
 
 .PHONY: gamma-flip-carry-install
 gamma-flip-carry-install: ## Install the gamma-flip carry timer (hourly 10:30-15:30 ET + 16:30 ET post-close)

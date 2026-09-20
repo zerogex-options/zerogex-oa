@@ -326,9 +326,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     symbols = (
-        [get_canonical_symbol(s) for s in args.symbols]
-        if args.symbols
-        else configured_symbols()
+        [get_canonical_symbol(s) for s in args.symbols] if args.symbols else configured_symbols()
     )
     since = date.fromisoformat(args.since) if args.since else None
 
@@ -365,10 +363,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if breaches:
             print(
                 f"\n{len(breaches)} session(s) left the flip blank for more than "
-                f"{args.max_blank_minutes:g} minutes. The engine logs why on the "
-                "unresolved transition: grep the analytics journal for "
-                '"Gamma flip UNRESOLVED" over those dates, if it still reaches '
-                "back that far."
+                f"{args.max_blank_minutes:g} minutes. For WHY, run "
+                "`make gamma-flip-blackout-forensics` over the same dates: it "
+                "separates a declined publish gate from a degraded chain using "
+                "fields in these same retention-exempt rows. The engine's full "
+                'diagnostic is richer -- grep the analytics journal for "Gamma '
+                'flip UNRESOLVED" -- but journald is capped, so that only '
+                "answers for recent dates."
             )
 
     return 1 if breaches else 0
