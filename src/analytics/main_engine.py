@@ -91,6 +91,35 @@ from src.market_calendar import (
 
 logger = get_logger(__name__)
 
+# Why a cycle published no gamma flip.  NULL in gex_summary.gamma_flip_reason
+# when a flip WAS published, a code below when it was not -- the same shape as
+# pin_strike_reason in the same table.
+#
+# The point of these is that a blank Flip line stops being one event.  Three of
+# the four codes below describe a chain the resolver read correctly and
+# declined honestly ("the flip is 10% away", "there is no crossing in the
+# searched band"), and one describes a chain it could not read at all.  Until
+# this column existed they all rendered as the same em dash, and a five-week
+# NDX blackout sat behind an appearance identical to a quiet Tuesday.
+#: The chain produced no usable spot-shift profile at all -- no contracts with
+#: IV, OI and a strike survived.  A data problem, not a market one.
+FLIP_REASON_NO_PROFILE = "NO_PROFILE"
+#: The profile never changes sign across the whole span ladder.  Dealer gamma
+#: is one-signed everywhere within +/-max span, so there is no flip to find in
+#: the searched band.  A real (and extreme) market state.
+FLIP_REASON_ONE_SIDED = "ONE_SIDED"
+#: Crossings exist but every one sits within GAMMA_PROFILE_INTERIOR_MARGIN of a
+#: grid edge, so none is bracketed well enough to trust.
+FLIP_REASON_EDGE_ONLY = "EDGE_ONLY"
+#: A well-bracketed crossing exists but sits further from spot than
+#: GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT.  The flip is real and not actionable --
+#: the SPX 2026-08 blackout, where it sat 9-10% below spot for two weeks.
+FLIP_REASON_BEYOND_MAX_DISTANCE = "BEYOND_MAX_DISTANCE"
+#: A well-bracketed, near-enough crossing exists but the profile around it is
+#: below the structural floor -- a noise-floor sign change rather than
+#: structure.
+FLIP_REASON_BELOW_STRUCTURAL_FLOOR = "BELOW_STRUCTURAL_FLOOR"
+
 # Underlyings whose AnalyticsEngine startup banner has already been logged at
 # INFO in this process. Per-process, per-symbol: the daemon's one engine per
 # symbol still announces itself, the API's per-request constructions do not.
@@ -2081,6 +2110,93 @@ class AnalyticsEngine:
                 best_flip = candidate
         return best_flip
 
+    def _classify_unresolved_flip(
+        self,
+        options: List[Dict[str, Any]],
+        profile: List[Tuple[float, float]],
+        underlying_price: float,
+    ) -> str:
+        """Which gate left this cycle without a flip.
+
+        Re-walks the last ladder rung's profile applying the SAME gates in the
+        SAME order as :meth:`_find_structural_interior_crossing` -- interior
+        margin, then actionable distance, then structural floor -- and reports
+        the furthest one any candidate reached.  Furthest rather than first
+        because that is the most specific true statement about the chain: a
+        crossing rejected by the floor got past the interior and distance
+        tests, so saying "edge only" about it would be wrong.
+
+        This deliberately does NOT change the resolver.  It is called only on
+        the unresolved path, once per cycle, and it exists so the NULL that
+        the resolver honestly persists stops being indistinguishable from a
+        broken feed.  If it ever disagrees with the resolver about whether a
+        crossing qualifies, the resolver is right and this is the bug -- hence
+        the shared structural reference rather than a second opinion about it.
+
+        Returns one of the ``FLIP_REASON_*`` codes.
+        """
+        if not profile or len(profile) < 2:
+            return FLIP_REASON_NO_PROFILE
+
+        s_lo = profile[0][0]
+        s_hi = profile[-1][0]
+        width = s_hi - s_lo
+        if width <= 0:
+            return FLIP_REASON_NO_PROFILE
+
+        margin_abs = GAMMA_PROFILE_INTERIOR_MARGIN * width
+        interior_lo = s_lo + margin_abs
+        interior_hi = s_hi - margin_abs
+
+        # The same anchored reference the resolver gated on.  Slicing the last
+        # rung gives the identical value as slicing the first, because the
+        # canonical band is inside both and the grid step does not change with
+        # the rung.
+        reference = self._structural_reference_from_profile(
+            options, underlying_price, profile, GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT
+        )
+        floor_abs = GAMMA_PROFILE_STRUCTURAL_MIN_FRAC * reference if reference > 0 else None
+
+        saw_crossing = False
+        saw_interior = False
+        saw_near_enough = False
+
+        for i in range(len(profile) - 1):
+            s1, c1 = profile[i]
+            s2, c2 = profile[i + 1]
+            if c1 * c2 < 0.0:
+                candidate = s1 + (s2 - s1) * (-c1) / (c2 - c1)
+            elif c1 == 0.0:
+                candidate = s1
+            else:
+                continue
+            saw_crossing = True
+
+            if candidate < interior_lo or candidate > interior_hi:
+                continue
+            saw_interior = True
+
+            if (
+                underlying_price > 0
+                and abs(candidate - underlying_price) / underlying_price
+                > GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT
+            ):
+                continue
+            saw_near_enough = True
+
+        if not saw_crossing:
+            return FLIP_REASON_ONE_SIDED
+        if not saw_interior:
+            return FLIP_REASON_EDGE_ONLY
+        if not saw_near_enough:
+            return FLIP_REASON_BEYOND_MAX_DISTANCE
+        # Interior and near enough, so the floor is what rejected it -- either
+        # the window peak fell short, or there was no usable reference to
+        # measure against, which the resolver treats the same way.
+        if floor_abs is None:
+            return FLIP_REASON_NO_PROFILE
+        return FLIP_REASON_BELOW_STRUCTURAL_FLOOR
+
     def _resolve_gamma_flip(
         self,
         options: List[Dict[str, Any]],
@@ -2833,6 +2949,17 @@ class AnalyticsEngine:
         gamma_flip_raw = self._calculate_gamma_flip_point(raw_profile, underlying_price)
 
         gamma_flip_unresolved = gamma_flip_point is None
+        # Persisted on EVERY unresolved cycle, not only the ones that warn.
+        # The warning is throttled so a morning-long blackout does not spam
+        # the journal, but a reason that only lands on the transition would
+        # leave most blank rows unexplained -- which is the exact gap that
+        # made this investigation necessary. One extra pass over an
+        # already-built profile, once per unresolved cycle.
+        gamma_flip_reason = (
+            self._classify_unresolved_flip(options, gamma_profile, underlying_price)
+            if gamma_flip_unresolved
+            else None
+        )
         if gamma_flip_unresolved:
             # Throttle the verbose diagnostic so a persistent unresolved
             # regime (e.g. SPX with the actionable flip beyond
@@ -3035,6 +3162,7 @@ class AnalyticsEngine:
             "gamma_flip_point": gamma_flip_point,
             "gamma_flip_raw": gamma_flip_raw,
             "gamma_flip_unresolved": gamma_flip_unresolved,
+            "gamma_flip_reason": gamma_flip_reason,
             "gamma_flip_span_used": gamma_flip_span_used if gamma_flip_point is not None else None,
             "flip_distance": flip_distance,
             "local_gex": local_gex,
@@ -3228,6 +3356,10 @@ class AnalyticsEngine:
         pin_score_val = summary.get("pin_score")
         pin_confidence_val = summary.get("pin_confidence")
         pin_strike_reason_val = summary.get("pin_strike_reason")
+        # NULL whenever a flip was published -- including a carried-forward
+        # one, since the carry means a level WAS served and there is nothing
+        # to explain. Only the rows that render as an em dash carry a code.
+        gamma_flip_reason_val = summary.get("gamma_flip_reason")
         cursor.execute(
             """
             INSERT INTO gex_summary
@@ -3238,8 +3370,8 @@ class AnalyticsEngine:
              call_wall, put_wall, call_wall_strength, put_wall_strength,
              max_pain_by_expiration, gamma_flip_span_used,
              gamma_flip_raw, pin_strike, pin_score, pin_confidence,
-             pin_strike_reason, computed_at, data_as_of)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+             pin_strike_reason, gamma_flip_reason, computed_at, data_as_of)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -3266,6 +3398,7 @@ class AnalyticsEngine:
                 pin_score = EXCLUDED.pin_score,
                 pin_confidence = EXCLUDED.pin_confidence,
                 pin_strike_reason = EXCLUDED.pin_strike_reason,
+                gamma_flip_reason = EXCLUDED.gamma_flip_reason,
                 computed_at = NOW(),
                 data_as_of = EXCLUDED.data_as_of
             WHERE
@@ -3294,6 +3427,7 @@ class AnalyticsEngine:
                 OR EXCLUDED.pin_score IS DISTINCT FROM gex_summary.pin_score
                 OR EXCLUDED.pin_confidence IS DISTINCT FROM gex_summary.pin_confidence
                 OR EXCLUDED.pin_strike_reason IS DISTINCT FROM gex_summary.pin_strike_reason
+                OR EXCLUDED.gamma_flip_reason IS DISTINCT FROM gex_summary.gamma_flip_reason
                 OR EXCLUDED.data_as_of IS DISTINCT FROM gex_summary.data_as_of
         """,
             (
@@ -3324,6 +3458,7 @@ class AnalyticsEngine:
                 (float(pin_score_val) if pin_score_val is not None else None),
                 (float(pin_confidence_val) if pin_confidence_val is not None else None),
                 (str(pin_strike_reason_val) if pin_strike_reason_val is not None else None),
+                (str(gamma_flip_reason_val) if gamma_flip_reason_val is not None else None),
                 summary.get("data_as_of"),
             ),
         )

@@ -85,6 +85,13 @@ class DealerLevels(BaseModel):
     """
 
     gamma_flip: Optional[float] = None
+    #: Why ``gamma_flip`` is absent, when it is: NULL whenever a flip was
+    #: published, otherwise one of NO_PROFILE / ONE_SIDED / EDGE_ONLY /
+    #: BEYOND_MAX_DISTANCE / BELOW_STRUCTURAL_FLOOR. A client that draws
+    #: nothing for a null flip can now say WHY it is drawing nothing --
+    #: three of those codes mean the chain was read correctly and the
+    #: level is simply not where a chart can show it.
+    gamma_flip_reason: Optional[str] = None
     call_wall: Optional[float] = None
     put_wall: Optional[float] = None
     max_pain: Optional[float] = None
@@ -213,6 +220,7 @@ async def get_levels(
         net_gex_at_spot=_maybe_float(summary.get("net_gex_at_spot")),
         levels=DealerLevels(
             gamma_flip=_maybe_float(summary.get("gamma_flip")),
+            gamma_flip_reason=summary.get("gamma_flip_reason"),
             call_wall=_maybe_float(summary.get("call_wall")),
             put_wall=_maybe_float(summary.get("put_wall")),
             max_pain=_maybe_float(summary.get("max_pain")),

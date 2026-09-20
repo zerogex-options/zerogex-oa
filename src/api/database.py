@@ -2107,6 +2107,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.gamma_flip_point AS gamma_flip,
                 ls.gamma_flip_raw,
                 ls.gamma_flip_span_used,
+                -- Why the flip is absent, when it is. NULL whenever a flip was
+                -- published, a FLIP_REASON_* code otherwise. Same contract as
+                -- pin_strike_reason below, and the reason a client can now
+                -- tell "the flip is 10% away" from "the feed is broken"
+                -- instead of rendering both as the same em dash.
+                ls.gamma_flip_reason,
                 ls.flip_distance,
                 ls.local_gex,
                 ls.convexity_risk,

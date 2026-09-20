@@ -167,6 +167,11 @@ def test_endpoint_returns_consolidated_contract(monkeypatch: pytest.MonkeyPatch)
     assert body["net_gex_at_spot"] == -1.2e9
     assert body["levels"] == {
         "gamma_flip": 675.0,
+        # Null because a flip WAS published. It carries a FLIP_REASON_* code
+        # only on the cycles that publish none, which is what lets a client
+        # distinguish "the flip is 10% from spot" from "the feed is down"
+        # instead of drawing the same em dash for both.
+        "gamma_flip_reason": None,
         "call_wall": 680.0,
         "put_wall": 670.0,
         "max_pain": 676.0,

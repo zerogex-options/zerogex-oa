@@ -577,6 +577,21 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS computed_at TIMESTAMPTZ;
 -- age_seconds and the v2 freshness grade are measured from this. NULL on
 -- rows older than the column.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS data_as_of TIMESTAMPTZ;
+
+-- Why a cycle published no gamma flip.  NULL when one WAS published (including
+-- a carried-forward value -- a level was served, so there is nothing to
+-- explain); a FLIP_REASON_* code from src/analytics/main_engine.py when the
+-- resolver declined: NO_PROFILE / ONE_SIDED / EDGE_ONLY /
+-- BEYOND_MAX_DISTANCE / BELOW_STRUCTURAL_FLOOR.  Same shape as
+-- pin_strike_reason above, for the same reason.
+--
+-- A NULL gamma_flip_point is the resolver being honest, and three of those
+-- codes describe a chain it read correctly and declined to fabricate a level
+-- from.  Without this column all of them render as one em dash, which is also
+-- what a broken feed renders as -- so an NDX blackout ran from 2026-07 to
+-- 2026-09 looking exactly like a quiet session, and the only way to tell the
+-- difference afterwards was to replay the stored chains one cycle at a time.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_reason TEXT;
 COMMENT ON COLUMN gex_summary.data_as_of IS
     'Newest option_chains_latest.updated_at the snapshot read; what the row is as of. timestamp is the minute bucket.';
 
