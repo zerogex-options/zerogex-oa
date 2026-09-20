@@ -981,12 +981,27 @@ async def get_gamma_vwap_confluence_signal(
     bounce level.
 
     **Logic highlights** (`src/signals/advanced/gamma_vwap_confluence.py`):
-    - Requires flip + VWAP within 0.15% of midpoint; adds max_pain / max_gamma /
-      call_wall if also within 0.15%.
-    - `cluster_quality = max(0, 1 − cluster_gap_pct / 0.5%)`;
-      multi-member bonus `1.0 + 0.15 × extra_members`.
-    - `net_gex < 0` → continuation (bullish if price above, bearish below);
-      long gamma → mean reversion (`−0.7 × directional`).
+    - The gamma flip and VWAP are **always** members — neither is admission-tested,
+      so `cluster_members` never holds fewer than two entries and `Members: 2` is
+      the floor rather than a reading. `max_pain` / `max_gamma` / `call_wall` each
+      join only when they sit within 0.15% of the flip/VWAP **midpoint**:
+      `abs(level − mid) / close <= 0.0015`, where `mid = (flip + vwap) / 2`.
+    - `confluence_level` = arithmetic mean of whichever members qualified.
+    - `cluster_gap_pct = abs(flip − vwap) / close` — the two core members only. An
+      optional level sitting far from the cluster does **not** widen the gap.
+    - `cluster_quality = clamp(1 − cluster_gap_pct / CONFLUENCE_MAX_GAP_PCT, 0.05, 1.00)`,
+      the divisor defaulting to **1.0%** (`SIGNAL_CONFLUENCE_MAX_GAP_PCT`). The floor is
+      **0.05, not 0** — a wide-gap card still prints a small non-zero score, so a ±5
+      reports *no cluster* rather than weak direction.
+    - `multi_mult = 1.0 + 0.15 × (len(cluster_members) − 2)` — 1.30× at four members.
+    - `distance = (close − confluence_level) / close`, divided by `0.003` and clamped
+      to ±1, so **|distance| ≥ 0.30% saturates** the reading.
+    - `net_gex < 0` → continuation, regime factor `+1` (bullish above the cluster,
+      bearish below); `net_gex >= 0` → mean reversion, regime factor `−0.7` — the sign
+      **inverts** and the magnitude is damped.
+    - Composition is a plain product, clipped once at the end:
+      `clamped_score = clip(quality × multi_mult × scaled_distance × regime, −1, 1)`,
+      and `score = clamped_score × 100`.
     - **Triggered when `|score| ≥ 20` (clamped 0.20).**
 
     **Params:** `symbol` (default `SPY`). Returns 404 when no data exists.
@@ -1010,12 +1025,22 @@ async def get_gamma_vwap_confluence_signal(
     - `score` — [-100, +100].
     - `signal` — `"bullish_confluence"` | `"bearish_confluence"` | `"neutral"`.
     - `triggered` — `true` when `|score| ≥ 20`.
-    - `confluence_level` — price of the cluster midpoint.
-    - `cluster_gap_pct` — |flip − vwap| / close; [0, ~0.005].
+    - `confluence_level` — mean of the qualifying `cluster_members`; a midpoint only
+      in the two-member case. `null` in the same `missing_levels` case as
+      `cluster_gap_pct` below.
+    - `cluster_gap_pct` — `|flip − vwap| / close`; ≥ 0 and **not bounded above** (it is
+      `cluster_quality` that floors, at 0.05, not the gap). `null` when flip or vwap
+      is unavailable or close <= 0 — the `missing_levels` short-circuit, which also
+      omits `confluence_level`, `cluster_quality` and `cluster_members` and scores 0.
+      Clients should render the absence rather than back-computing a gap: in that
+      state no cluster was built.
     - `gamma_flip`, `vwap`, `max_pain`, `max_gamma`, `call_wall` — raw input
       levels used in the computation; `null` when unavailable. Always present
       regardless of whether the level ended up in `cluster_members`.
-    - `expected_target` — reversion target (mean-reversion) or extrapolated (continuation).
+    - `expected_target` — `confluence_level` itself under mean reversion; under
+      continuation `close + 2 × (close − confluence_level)`, i.e. projected past spot
+      by twice the distance already travelled from the cluster, on the side price
+      has already left. Geometric: it does not scale with the score.
     - `regime_direction` (in `context_values`) — `"mean_reversion"` | `"continuation"`.
 
     **Trader interpretation:**
