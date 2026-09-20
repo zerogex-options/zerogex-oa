@@ -983,6 +983,7 @@ help: ## Show this help message
 	@echo "  make gamma-flip-carry-healthcheck - Flag sessions whose gamma flip was carried over missing rows"
 	@echo "  make gamma-flip-resolution-healthcheck - Report how long the gamma flip was left unpublished"
 	@echo "  make gamma-flip-blackout-forensics - Say WHY the gamma flip was left unpublished (retention-exempt rows)"
+	@echo "  make gamma-flip-gate-replay - Replay a blank flip cycle and name the gate that rejected it"
 	@echo "  make gamma-flip-resolution-install - Install gamma-flip resolution timer (hourly in-session + post-close)"
 	@echo "  make gamma-flip-resolution-status - Show gamma-flip resolution timer status + recent log"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
@@ -4385,6 +4386,15 @@ gamma-flip-blackout-forensics: ## Say WHY the gamma flip was left unpublished, f
 		$(if $(SESSIONS),--sessions $(SESSIONS)) \
 		$(if $(FLIP_SINCE),--since $(FLIP_SINCE)) \
 		$(if $(BLANK_ONLY),--blank-only) \
+		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-gate-replay
+gamma-flip-gate-replay: ## Replay a blank flip cycle and name the gate that rejected it. SYMBOL=NDX SESSION=YYYY-MM-DD [AT="YYYY-MM-DD HH:MM"] [SAMPLES=n]
+	@$(PY) -m src.tools.gamma_flip_gate_replay \
+		--symbol $(or $(SYMBOL),SPX) \
+		$(if $(SESSION),--session $(SESSION)) \
+		$(if $(AT),--at "$(AT)") \
+		$(if $(SAMPLES),--samples $(SAMPLES)) \
 		$(if $(JSON),--json)
 
 .PHONY: gamma-flip-resolution-install
