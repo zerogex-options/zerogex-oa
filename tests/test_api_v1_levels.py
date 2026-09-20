@@ -172,6 +172,8 @@ def test_endpoint_returns_consolidated_contract(monkeypatch: pytest.MonkeyPatch)
         # distinguish "the flip is 10% from spot" from "the feed is down"
         # instead of drawing the same em dash for both.
         "gamma_flip_reason": None,
+        # ...and no label to draw, for the same reason.
+        "gamma_flip_label": None,
         "call_wall": 680.0,
         "put_wall": 670.0,
         "max_pain": 676.0,
