@@ -1,0 +1,31 @@
+[Unit]
+Description=Intraday trigger for the ZeroGEX re-anchored cone (every 15m, 09:45-15:30 ET Mon-Fri)
+
+[Timer]
+# Every 15 minutes across the cash session.  The window is bounded at both
+# ends by what can actually be graded: nothing before 09:45 because the
+# realized-vol blend needs some tape to read, and nothing after 15:30 because
+# that is the last anchor whose shortest horizon (+30m) still completes
+# before the 16:00 bell.  The job re-checks the same window itself, so a
+# mistimed fire no-ops rather than committing a claim that can never mature.
+OnCalendar=Mon..Fri *-*-* 09:45:00
+OnCalendar=Mon..Fri *-*-* 10..14:00,15,30,45:00
+OnCalendar=Mon..Fri *-*-* 15:00,15,30:00
+#
+# NOTE: these bare times are interpreted in the SYSTEM timezone, which the
+# deploy pins to America/New_York (deploy/steps/010.setup: `timedatectl
+# set-timezone America/New_York`).  That host-TZ pin is what makes them ET.
+# Same constraint as the morning writer: a per-timer `OnCalendar ...
+# America/New_York` token needs systemd >= 252 and Ubuntu 22.04 ships 249.
+#
+# Small jitter only.  The anchors want to sit near the :00/:15/:30/:45 grid
+# so a session's cones read as an even cadence on the chart; correctness does
+# not depend on it, since every cone is anchored on its actual fire time.
+RandomizedDelaySec=20s
+# Deliberately NOT Persistent.  A missed 11:15 fire is a gap in the record.
+# Catching it up at 14:00 would not recreate the 11:15 claim — it would
+# manufacture a brand-new one and file it as though the gap never happened.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

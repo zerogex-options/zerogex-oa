@@ -4714,6 +4714,49 @@ forecast-receipt: ## Write today's receipt against the immutable morning commitm
 		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
 		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
 
+.PHONY: cone-writer-dry-run
+cone-writer-dry-run: ## Dry-run one intraday cone fire (always logs, never writes). Vars: CONE_AT=YYYY-MM-DDTHH:MM
+	@echo "$(BLUE)=== Dry-run intraday cone writer ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_writer --dry-run \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(CONE_AT),--at $(CONE_AT) --allow-off-window) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: cone-writer
+cone-writer: ## Commit one intraday cone fire (idempotent; immutable after first write)
+	@echo "$(BLUE)=== Committing intraday cone ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_writer \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(CONE_AT),--at $(CONE_AT) --allow-off-window) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: cone-receipt-dry-run
+cone-receipt-dry-run: ## Dry-run grading of every matured cone horizon (never writes)
+	@echo "$(BLUE)=== Dry-run intraday cone grading ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_receipt --dry-run \
+		$(if $(CONE_AT),--at $(CONE_AT))
+
+.PHONY: cone-receipt
+cone-receipt: ## Grade every matured cone horizon (write-once per claim)
+	@echo "$(BLUE)=== Grading matured cone horizons ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_receipt \
+		$(if $(CONE_AT),--at $(CONE_AT))
+
+.PHONY: cone-backfill
+cone-backfill: ## Replay a whole session's cone fires at 15m spacing. Vars: FORECAST_DATE=YYYY-MM-DD (required)
+	@echo "$(BLUE)=== Backfilling intraday cones for $(FORECAST_DATE) ===$(NC)"
+	@if [ -z "$(FORECAST_DATE)" ]; then \
+		echo "$(RED)FORECAST_DATE=YYYY-MM-DD is required$(NC)"; exit 1; \
+	fi
+	@for t in 09:45 10:00 10:15 10:30 10:45 11:00 11:15 11:30 11:45 \
+			  12:00 12:15 12:30 12:45 13:00 13:15 13:30 13:45 \
+			  14:00 14:15 14:30 14:45 15:00 15:15 15:30; do \
+		$(PY) -m src.jobs.intraday_cone_writer \
+			--date $(FORECAST_DATE) --at "$(FORECAST_DATE)T$$t" \
+			$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS)) || true; \
+	done
+	@echo "$(YELLOW)Now grade them:  make cone-receipt$(NC)"
+
 .PHONY: forecast-prune
 forecast-prune: ## Delete daily_forecast rows before a cutoff. Vars: BEFORE=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Forecast Prune (daily_forecast) ===$(NC)"
@@ -4808,11 +4851,17 @@ forecast-install: ## Install all forecast timers (08:30 writer, 16:05 receipt, 2
 	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.timer /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.timer /etc/systemd/system/
 	@sudo systemctl daemon-reload
 	@sudo systemctl enable --now zerogex-oa-forecast-writer.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-receipt.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-calibrate.timer
-	@echo "$(GREEN)✅ Forecast timers installed (08:30 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)$(NC)"
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-writer.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-receipt.timer
+	@echo "$(GREEN)✅ Forecast timers installed (08:30 writer, 16:05 receipt, 20:00 calibrate, 15m cone writer + grader; Mon-Fri)$(NC)"
 	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-forecast-*'$(NC)"
 	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -u zerogex-oa-forecast-calibrate$(NC)"
 
