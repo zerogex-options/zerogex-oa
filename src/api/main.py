@@ -42,6 +42,7 @@ from .models import (
     HedgingFlowResponse,
     GammaRegimeSeriesResponse,
     GammaWeatherResponse,
+    GammaWeatherSeriesResponse,
     MarketTideResponse,
     MarketTideHistoryResponse,
     SmartMoneyFlowPoint,
@@ -1644,6 +1645,48 @@ async def get_gamma_regime_series(
     )
 
 
+async def _classify_weather_session(symbol: str, session: str) -> tuple:
+    """Load, pair and classify one session's Gamma Weather.
+
+    Returns ``(normalized_symbol, paired_bars, classified_series)``. Shared by
+    the current-state endpoint and the series endpoint so the panel and its own
+    history cannot disagree about a bar. Raises the HTTP errors both share: 400
+    for a malformed symbol, 404 for one with no flow history at all, 409 when
+    the session has no bar carrying both series yet.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    flow_rows = await _db().get_hedging_flow_series(symbol=normalized, session=session)
+    regime_rows = await _db().get_gamma_regime_series(symbol=normalized, session=session)
+    if flow_rows is None and regime_rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    # Both series are newest-first on a shared grid. Pair EVERY bar the two
+    # share, not just the newest: persistence needs the trailing pressure bars
+    # and state age needs the run of prior states, so a single-bar read could
+    # report neither. The assembly lives in gamma_weather so that the offline
+    # base-rate pass (src.tools.gamma_weather_base_rates) classifies through
+    # the identical path -- a second copy here would eventually measure a rule
+    # the panel does not run.
+    paired = gw.pair_series(
+        list(reversed(regime_rows or [])),
+        list(reversed(flow_rows or [])),
+        rate_bars=CUSHION_RATE_BARS,
+    )
+    if not paired:
+        raise HTTPException(
+            status_code=409,
+            detail="no bar yet carries both hedging flow and gamma structure for this session",
+        )
+
+    return normalized, paired, gw.classify_series([bar.inputs for bar in paired])
+
+
 @app.get(
     "/api/gex/weather",
     response_model=GammaWeatherResponse,
@@ -1681,43 +1724,10 @@ async def get_gamma_weather(
     five minutes. Returns 404 for an unknown symbol, and 409 when neither
     series has a bar yet for the resolved session.
     """
-    normalized = symbol.strip().upper()
-    if not _FLOW_SYMBOL_PATTERN.match(normalized):
-        raise HTTPException(
-            status_code=400,
-            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
-        )
-
-    flow_rows = await _db().get_hedging_flow_series(symbol=normalized, session=session)
-    regime_rows = await _db().get_gamma_regime_series(symbol=normalized, session=session)
-    if flow_rows is None and regime_rows is None:
-        raise HTTPException(status_code=404, detail="symbol not found")
-
-    flow_rows = flow_rows or []
-    regime_rows = regime_rows or []
+    normalized, paired, series = await _classify_weather_session(symbol, session)
 
     def _f(value):
         return float(value) if value is not None else None
-
-    # Both series are newest-first on a shared grid. Pair EVERY bar the two
-    # share, not just the newest: persistence needs the trailing pressure bars
-    # and state age needs the run of prior states, so a single-bar read could
-    # report neither. The assembly lives in gamma_weather so that the offline
-    # base-rate pass (src.tools.gamma_weather_base_rates) classifies through
-    # the identical path -- a second copy here would eventually measure a rule
-    # the panel does not run.
-    paired = gw.pair_series(
-        list(reversed(regime_rows)),
-        list(reversed(flow_rows)),
-        rate_bars=CUSHION_RATE_BARS,
-    )
-    if not paired:
-        raise HTTPException(
-            status_code=409,
-            detail="no bar yet carries both hedging flow and gamma structure for this session",
-        )
-
-    series = gw.classify_series([bar.inputs for bar in paired])
 
     latest = paired[-1]
     regime_row, cushion = latest.regime, latest.cushion
@@ -1768,6 +1778,89 @@ async def get_gamma_weather(
                 "spot": _f(regime_row.get("spot")),
                 "gamma_flip": _f(regime_row.get("gamma_flip")),
             },
+            "basis": _HEDGING_FLOW_BASIS,
+            "disclosure": _HEDGING_FLOW_DISCLOSURE,
+        }
+    )
+
+
+@app.get(
+    "/api/gex/weather-series",
+    response_model=GammaWeatherSeriesResponse,
+    tags=["GEX"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/gex/weather-series")
+async def get_gamma_weather_series(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+):
+    """The session's Gamma Weather history, and the moments it said something new.
+
+    ``/api/gex/weather`` answers what the panel reads right now. This answers
+    what happened while nobody was looking, which the header cannot: a word on
+    a chip captures one slice of time, and someone returning to the page after
+    two hours is asking about a pattern.
+
+    Both endpoints go through the same loader and the same classifier, so a bar
+    described here and the same bar described there cannot disagree.
+
+    ``changes`` is not one entry per bar. An entry exists only where a label
+    actually moved, so a quiet afternoon in one state produces a single line
+    instead of fifty identical ones, and the trail stays readable at a glance.
+    Every label was computed causally when the bar printed, so what is rendered
+    now is what the panel showed at the time rather than a hindsight summary.
+
+    Same 400 / 404 / 409 semantics as the current-state endpoint.
+    """
+    normalized, paired, series = await _classify_weather_session(symbol, session)
+
+    def _stamp(value):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=pytz.UTC)
+        return value.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    bar_starts = [bar.bar_start for bar in paired]
+
+    return JSONResponse(
+        content={
+            "symbol": normalized,
+            "session": session,
+            "confirm_bars": gw.CONFIRM_BARS,
+            "bars": [
+                {
+                    "bar_start": _stamp(bar_start),
+                    "state": weather.state,
+                    "label": weather.label,
+                    "sentence": weather.sentence,
+                    "pressure": weather.pressure,
+                    "structure": weather.structure,
+                    "gamma_trend": weather.gamma_trend,
+                    "lean_side": weather.lean_side,
+                    "cushion": weather.cushion,
+                    "cushion_band": weather.cushion_band,
+                    "persistence": weather.persistence,
+                    "persistence_label": weather.persistence_label,
+                    "age_bars": weather.age_bars,
+                    "age_minutes": weather.age_minutes,
+                    "age": weather.age,
+                    "age_label": weather.age_label,
+                    "pending_state": weather.pending_state,
+                    "pending_label": weather.pending_label,
+                    "pending_bars": weather.pending_bars,
+                }
+                for bar_start, weather in zip(bar_starts, series)
+            ],
+            "changes": [
+                {
+                    "bar_start": _stamp(change.bar_start),
+                    "field": change.field,
+                    "kind": change.kind,
+                    "text": change.text,
+                    "opening": change.opening,
+                }
+                for change in gw.changes(series, bar_starts)
+            ],
             "basis": _HEDGING_FLOW_BASIS,
             "disclosure": _HEDGING_FLOW_DISCLOSURE,
         }
