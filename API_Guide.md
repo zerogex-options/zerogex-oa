@@ -360,7 +360,8 @@ upstream can change.
 | `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
 | `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
-| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
+| `cone_cycle` | `/api/cone/session/*`, `/api/cone/latest` | 15 min (09:45–15:30 ET only) | — | — |
+| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/cone/reliability`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
 
 A dash means no update is expected, which surfaces as
