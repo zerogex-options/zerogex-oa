@@ -2570,6 +2570,35 @@ class SignalsQueriesMixin:
             )
             return None
 
+    async def get_graded_cone_claims_for_tuning(
+        self, sessions: int = 60
+    ) -> List[Dict[str, Any]]:
+        """Graded claims with everything needed to rebuild them offline.
+
+        window_low/window_high are the point: they are what the tape actually
+        reached, so they decide whether any candidate band would have held —
+        which makes parameter changes testable without re-running a backfill.
+        """
+        query = """
+            SELECT symbol, session_date, forecast_ts, horizon_min,
+                   anchor_spot, daily_sigma, elapsed_min, gamma_mult,
+                   call_wall, put_wall, band_low, band_high, sigma,
+                   hold_prob, window_low, window_high, held
+            FROM intraday_forecast
+            WHERE held IS NOT NULL
+              AND window_low IS NOT NULL
+              AND daily_sigma IS NOT NULL
+              AND session_date >= (CURRENT_DATE - ($1 * 2))
+            ORDER BY session_date ASC, forecast_ts ASC, horizon_min ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, sessions)
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_graded_cone_claims_for_tuning failed: %s", exc)
+            return []
+
     async def get_trailing_realized_vol_ratios(
         self, symbol: str, before_date: date, limit: int = 10
     ) -> List[float]:

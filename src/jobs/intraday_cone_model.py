@@ -237,6 +237,28 @@ HOLD_PROB_MAX = 0.98
 MIN_HALF_FRACTION = 0.0004
 MAX_HALF_FRACTION = 0.0250
 
+#: How the volatility used for the PROBABILITY scales with the horizon.
+#:
+#: Sigma over a window is ``daily_sigma * variance_fraction ** exponent``.
+#: 0.5 is Brownian motion — variance linear in time — and was the model's
+#: implicit assumption from the start.
+#:
+#: Mind the direction, because it is the opposite of what the phrase
+#: "more contained" suggests. The variance fraction is BELOW 1, so a LARGER
+#: exponent yields a SMALLER sub-daily sigma against the same daily figure.
+#: Raising it above 0.5 therefore says: for the range this day actually
+#: delivered, the path spent less of it wandering inside short windows — which
+#: is what nine graded sessions show, and what dealer hedging around a pin
+#: should do to a tape. Dropping it below 0.5 says the reverse and makes the
+#: cone far more pessimistic.
+#:
+#: This is deliberately a separate knob from CONE_TERM_DECAY, which shapes the
+#: BAND. Conflating them is what made the v1_4 fit miss: widening the band
+#: raises the realized hold rate too, because the band is the thing being
+#: graded, so band geometry can never close a gap that lives in the process
+#: assumption. Held at 0.5 until a holdout says otherwise — see cone_tune.
+CONE_PATH_EXPONENT = 0.5
+
 #: Terms kept on each side of the image series in ``hold_probability``.  The
 #: reflections decay super-exponentially; 6 is far past the point where any
 #: term moves the fourth decimal.
@@ -706,7 +728,9 @@ def _lean_to_wall(
     return min(pulled, ceiling), True
 
 
-def compute_cone(inp: ConeInputs) -> ConeResult:
+def compute_cone(
+    inp: ConeInputs, *, path_exponent: float = CONE_PATH_EXPONENT
+) -> ConeResult:
     """Build the full set of horizon claims for one fire.
 
     Order matters and mirrors the daily model's pipeline: establish the vol
@@ -780,8 +804,10 @@ def compute_cone(inp: ConeInputs) -> ConeResult:
         base_sigma = daily_sigma * math.sqrt(vf) if vf > 0 else 0.0
         if base_sigma <= 0:
             continue
-        # The volatility the cone assumes for this window, after gamma.
-        sigma_h = base_sigma * vol_mult
+        # The volatility the cone assumes for this window, after gamma. The
+        # path exponent scales the PROBABILITY's sigma only; the band keeps
+        # ordinary sqrt-variance growth (see CONE_PATH_EXPONENT).
+        sigma_h = daily_sigma * (vf ** path_exponent) * vol_mult
 
         # Sub-proportional widening (see CONE_TERM_DECAY).  Without this the
         # band is a fixed multiple of sigma and the hold probability is the
