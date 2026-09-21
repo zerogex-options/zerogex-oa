@@ -2425,22 +2425,28 @@ class SignalsQueriesMixin:
 
     async def insert_intraday_cone(
         self, rows: List[Dict[str, Any]]
-    ) -> int:
+    ) -> Optional[int]:
         """Commit one fire's horizon claims.
 
         Idempotent per the same contract as the morning writer: the
         (symbol, forecast_ts, horizon_min) primary key plus the immutability
         trigger mean a re-run cannot restate a claim already on the record.
-        Returns the number of rows actually inserted — a re-run of an
-        already-committed fire returns 0, which is the caller's signal to log
-        "already committed" rather than to retry.
+        Returns the number of rows actually inserted, or None if the write
+        FAILED.
+
+        Those are different answers and conflating them is not cosmetic. This
+        used to return 0 on an exception as well as on a clean conflict, so a
+        writer whose every insert was rejected — by a missing column, say —
+        reported "already committed" and exited 0. A whole session went missing
+        that way and the log read like a healthy idempotent re-run. A job that
+        announces success when it failed is worse than one that crashes.
 
         The whole fire goes in one transaction.  A half-written cone would
         leave some horizons of one anchor committed and others not, and the
         reliability table would then be sampling horizons rather than fires.
         """
         if not rows:
-            return 0
+            return 0        # nothing asked for is a real zero, not a failure
         try:
             async with self._acquire_connection() as conn:
                 async with conn.transaction():
@@ -2486,7 +2492,7 @@ class SignalsQueriesMixin:
                 "insert_intraday_cone failed (%s, %s): %s",
                 rows[0].get("symbol"), rows[0].get("forecast_ts"), exc,
             )
-            return 0
+            return None
 
     async def get_quote_as_of(
         self, symbol: str, as_of: datetime, not_before: datetime

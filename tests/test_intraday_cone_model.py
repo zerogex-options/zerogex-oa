@@ -29,6 +29,8 @@ from src.jobs.intraday_cone_model import (
     CONE_HORIZONS_MIN,
     CONE_VOL_RATIO_MAX,
     CONE_VOL_RATIO_MIN,
+    VOL_BASIS_MULT_MAX,
+    VOL_BASIS_MULT_MIN,
     GAMMA_MULT_MAX,
     GAMMA_MULT_MIN,
     HOLD_PROB_MAX,
@@ -529,6 +531,47 @@ def test_realized_now_dominates_by_the_end_of_the_session():
     # At the last fire the realized read must be the majority of the blend.
     assert late < 0.5 * (10.0 + 2.0), f"realized should dominate by 15:30, got {late}"
     assert late == pytest.approx(10.0 - 0.80 * 8.0, abs=0.15)
+
+
+def test_the_committed_vol_basis_recentres_the_implied_leg():
+    """The variance-risk premium, absorbed rather than rediscovered.
+
+    The daily model learns a per-symbol vol_range_basis_mult nightly, for the
+    stated purpose of absorbing the structural fact that realized vol runs
+    below implied. The cone ignored it for three rounds and kept measuring
+    the same shortfall by hand. Without it the cone's 'normal day' is the
+    daily model's normal day divided by this scalar, so two surfaces grading
+    the same tape disagree about what average means.
+    """
+    plain = compute_cone(_inputs(vol_basis_mult=None))
+    recentred = compute_cone(_inputs(vol_basis_mult=0.65))
+    assert recentred.daily_sigma == pytest.approx(plain.daily_sigma * 0.65, rel=0.35)
+    assert recentred.daily_sigma < plain.daily_sigma
+    assert "committed vol basis" in " ".join(recentred.rationale)
+
+
+def test_the_basis_and_the_anchor_compose():
+    """They answer different questions and both apply: the basis re-centres
+    what 'normal' means for this symbol, the anchor says how much of normal
+    today should deliver."""
+    trailing = [0.8, 0.82, 0.78, 0.81, 0.8, 0.79]
+    neither = compute_cone(_inputs())
+    basis_only = compute_cone(_inputs(vol_basis_mult=0.65))
+    both = compute_cone(_inputs(vol_basis_mult=0.65, trailing_vol_ratios=trailing))
+    assert both.daily_sigma < basis_only.daily_sigma < neither.daily_sigma
+    assert both.vol_ratio_source == "measured"
+
+
+def test_the_basis_is_clamped_to_the_calibrators_own_range():
+    floored = compute_cone(_inputs(vol_basis_mult=0.001))
+    at_floor = compute_cone(_inputs(vol_basis_mult=VOL_BASIS_MULT_MIN))
+    assert floored.daily_sigma == pytest.approx(at_floor.daily_sigma, rel=1e-9)
+
+    capped = compute_cone(_inputs(vol_basis_mult=99.0))
+    at_cap = compute_cone(_inputs(vol_basis_mult=VOL_BASIS_MULT_MAX))
+    assert capped.daily_sigma == pytest.approx(at_cap.daily_sigma, rel=1e-9)
+
+    assert compute_cone(_inputs(vol_basis_mult="nonsense")).horizons
 
 
 def test_cone_degrades_rather_than_raises_on_a_thin_surface():

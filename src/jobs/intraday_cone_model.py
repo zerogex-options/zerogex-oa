@@ -184,6 +184,11 @@ WALL_LEAN_MIN_FRACTION = 0.45  # never pull an edge inside this × raw half-widt
 #: only input that knows about a scheduled event later in the day.
 REALIZED_BLEND_MAX = 0.85
 
+#: Bounds on the committed per-symbol vol-basis multiplier, matching the
+#: range ``forecast_calibrate`` already constrains it to.
+VOL_BASIS_MULT_MIN = 0.45
+VOL_BASIS_MULT_MAX = 1.40
+
 #: Bounds on the morning's committed expected-vol ratio when the cone adopts
 #: it.  A ratio is a published claim, not a measurement, so a bad one is
 #: clamped rather than allowed to collapse or explode the whole session's
@@ -383,6 +388,7 @@ def blended_daily_sigma(
     elapsed_min: float,
     session_minutes: int = SESSION_MINUTES,
     expected_vol_ratio: Optional[float] = None,
+    vol_basis_mult: Optional[float] = None,
 ) -> tuple[float, list[str]]:
     """Blend the implied and realized full-day sigmas, weighting realized by
     how much of the day it has actually seen.
@@ -417,6 +423,14 @@ def blended_daily_sigma(
     together, so improving the vol call improves both at once.
     """
     notes: list[str] = []
+    if implied_sigma is not None and implied_sigma > 0 and vol_basis_mult is not None:
+        try:
+            mult = _clamp(float(vol_basis_mult), VOL_BASIS_MULT_MIN, VOL_BASIS_MULT_MAX)
+        except (TypeError, ValueError):
+            mult = None
+        if mult is not None:
+            implied_sigma = implied_sigma * mult
+            notes.append(f"implied re-centred on the committed vol basis ({mult:.2f})")
     if implied_sigma is not None and implied_sigma > 0 and expected_vol_ratio is not None:
         try:
             ratio = _clamp(
@@ -530,6 +544,15 @@ class ConeInputs:
     #: GRADED realized vol ratios from prior sessions, oldest-first.  Their
     #: median is the preferred anchor: a measurement rather than a forecast.
     trailing_vol_ratios: Sequence[float] = ()
+    #: The per-symbol ``vol_range_basis_mult`` the morning forecast committed.
+    #:
+    #: This is the daily model's nightly-learned correction for the
+    #: variance-risk premium — the structural fact that realized vol runs
+    #: below implied — and the cone spent three rounds rediscovering its
+    #: absence.  Without it the cone's "normal day" is the daily model's
+    #: normal day divided by this scalar, so the two surfaces disagree about
+    #: what an average session looks like while grading against the same tape.
+    vol_basis_mult: Optional[float] = None
     session_high: Optional[float] = None
     session_low: Optional[float] = None
 
@@ -664,6 +687,7 @@ def compute_cone(inp: ConeInputs) -> ConeResult:
         elapsed_min=inp.elapsed_min,
         session_minutes=inp.session_minutes,
         expected_vol_ratio=vol_anchor,
+        vol_basis_mult=inp.vol_basis_mult,
     )
     if vol_anchor is not None:
         result.rationale.append(f"vol anchor {vol_anchor:.2f}x ({vol_source})")

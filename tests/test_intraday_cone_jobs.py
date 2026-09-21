@@ -84,7 +84,10 @@ def _fake_writer_db(
     db.get_quote_as_of = AsyncMock(side_effect=_quote_as_of)
     db.get_gex_summary_as_of = AsyncMock(return_value=gex)
     db.get_daily_forecast = AsyncMock(
-        return_value=morning if morning is not None else {"implied_move": Decimal("4.50")}
+        return_value=morning if morning is not None else {
+            "implied_move": Decimal("4.50"),
+            "forecast_inputs": {"calibration_applied": {"vol_range_basis_mult": 0.65}},
+        }
     )
     db.get_bar_extremes_between = AsyncMock(
         return_value=extremes
@@ -444,6 +447,81 @@ async def test_a_failing_trailing_read_does_not_stop_the_fire(monkeypatch, caplo
     assert await mod._run(_writer_args(mod)) == 0
     fake.insert_intraday_cone.assert_awaited_once()
     assert "trailing vol ratios failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_is_never_reported_as_already_committed(monkeypatch, caplog):
+    """The bug that hid a whole missing session.
+
+    insert_intraday_cone used to return 0 on an exception as well as on a
+    clean conflict, so a writer whose every insert was rejected by a missing
+    column logged "already committed" and exited 0. The backfill looked like a
+    healthy idempotent re-run and the session simply was not there. A job that
+    announces success when it failed is worse than one that crashes.
+    """
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db(inserted=None)     # None == the write failed
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_writer_args(mod)) == 0
+
+    assert "FAILED to commit" in caplog.text
+    assert "claims lost" in caplog.text
+    assert "already committed" not in caplog.text
+    assert "failed to commit at" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_clean_conflict_is_still_a_quiet_noop(monkeypatch, caplog):
+    """The other half: a genuine re-run must stay boring."""
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db(inserted=0)
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_writer_args(mod)) == 0
+    assert "already committed" in caplog.text
+    assert "FAILED" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_vol_basis_comes_from_the_committed_snapshot(monkeypatch):
+    """Read from the morning row's immutable forecast_inputs, not from live
+    calibration state — the live scalar is relearned nightly, so a backfill
+    reading it would use a number derived from sessions after the one being
+    rebuilt."""
+    mod = _reload("intraday_cone_writer")
+    wide = _fake_writer_db(morning={
+        "implied_move": Decimal("4.50"),
+        "forecast_inputs": {"calibration_applied": {"vol_range_basis_mult": 1.30}},
+    })
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: wide)
+    await mod._run(_writer_args(mod))
+    wide_row = wide.insert_intraday_cone.await_args.args[0][0]
+
+    tight = _fake_writer_db(morning={
+        "implied_move": Decimal("4.50"),
+        "forecast_inputs": {"calibration_applied": {"vol_range_basis_mult": 0.55}},
+    })
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: tight)
+    await mod._run(_writer_args(mod))
+    tight_row = tight.insert_intraday_cone.await_args.args[0][0]
+
+    assert float(tight_row["daily_sigma"]) < float(wide_row["daily_sigma"])
+
+
+def test_the_committed_basis_survives_json_and_missing_shapes():
+    """forecast_inputs is JSONB and may arrive as a string; anything else
+    widens the cone rather than breaking the fire."""
+    mod = _reload("intraday_cone_writer")
+    assert mod._committed_vol_basis(
+        {"forecast_inputs": '{"calibration_applied": {"vol_range_basis_mult": 0.7}}'}
+    ) == pytest.approx(0.7)
+    assert mod._committed_vol_basis(
+        {"forecast_inputs": {"calibration_applied": {"vol_range_basis_mult": 0.7}}}
+    ) == pytest.approx(0.7)
+    for bad in ({}, {"forecast_inputs": None}, {"forecast_inputs": "not json"},
+                {"forecast_inputs": {"calibration_applied": None}},
+                {"forecast_inputs": {"calibration_applied": {}}},
+                {"forecast_inputs": []}):
+        assert mod._committed_vol_basis(bad) is None
 
 
 # ---------------------------------------------------------------------------

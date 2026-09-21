@@ -109,6 +109,28 @@ async def _fetch_optional(db: DatabaseManager, method: str, symbol: str, *args) 
         return None
 
 
+def _committed_vol_basis(morning: dict[str, Any]) -> Optional[float]:
+    """Pull ``vol_range_basis_mult`` out of the morning row's committed inputs.
+
+    ``forecast_inputs`` is JSONB and immutable, so this is the value that was
+    actually applied that morning — the point-in-time answer a backfill needs.
+    Returns None on any shape the column does not have, since a missing
+    scalar should widen the cone rather than break the fire.
+    """
+    raw = morning.get("forecast_inputs")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    applied = raw.get("calibration_applied")
+    if not isinstance(applied, dict):
+        return None
+    return _f(applied.get("vol_range_basis_mult"))
+
+
 def _gex_is_fresh(ts: Any, now: datetime) -> bool:
     """Whether a GEX snapshot is a live read as of ``now``.
 
@@ -162,6 +184,7 @@ async def _build_inputs(
     # not a fresh VIX read).
     implied_move: Optional[float] = None
     expected_vol_ratio: Optional[float] = None
+    vol_basis_mult: Optional[float] = None
     try:
         morning = await db.get_daily_forecast(symbol, day)
         if morning:
@@ -170,6 +193,12 @@ async def _build_inputs(
             # today should deliver. Without it the cone treats every session as
             # average, which three backfills showed it is not.
             expected_vol_ratio = _f(morning.get("expected_vol_ratio"))
+            # The per-symbol vol basis this symbol's forecast was committed
+            # against. Read from the morning row's immutable snapshot rather
+            # than from live calibration state, because the live scalar is
+            # learned nightly and a backfill reading it would be using a
+            # number derived from sessions after the one being rebuilt.
+            vol_basis_mult = _committed_vol_basis(morning)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "intraday_cone_writer: morning forecast lookup failed for %s: %s", symbol, exc
@@ -219,6 +248,7 @@ async def _build_inputs(
         implied_move=implied_move,
         expected_vol_ratio=expected_vol_ratio,
         trailing_vol_ratios=trailing_ratios,
+        vol_basis_mult=vol_basis_mult,
         session_high=_f(session_extremes.get("window_high")) if session_extremes else None,
         session_low=_f(session_extremes.get("window_low")) if session_extremes else None,
         call_wall=_f(gex.get("call_wall")) if (gex and fresh) else None,
@@ -234,6 +264,7 @@ async def _build_inputs(
         "implied_move": implied_move,
         "expected_vol_ratio": expected_vol_ratio,
         "n_trailing_ratios": len(trailing_ratios),
+        "vol_basis_mult": vol_basis_mult,
         "gex_fresh": fresh,
         "model_version": MODEL_VERSION,
     }
@@ -319,6 +350,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     try:
         symbols = [s.strip().upper() for s in args.symbol.split(",") if s.strip()]
+        failures = 0
         for sym in symbols:
             built = await _build_inputs(db, sym, day, now)
             if built is None:
@@ -348,7 +380,16 @@ async def _run(args: argparse.Namespace) -> int:
                 continue
 
             inserted = await db.insert_intraday_cone(rows)
-            if inserted == 0:
+            if inserted is None:
+                # A failed write is NOT an idempotent no-op. Saying so loudly
+                # is the difference between noticing a missing session and
+                # discovering it three reports later.
+                logger.error(
+                    "intraday_cone_writer: %s %s FAILED to commit — %d claims lost",
+                    sym, now.strftime("%H:%M"), len(rows),
+                )
+                failures += 1
+            elif inserted == 0:
                 logger.info(
                     "intraday_cone_writer: %s %s already committed — leaving as-is",
                     sym, now.strftime("%H:%M"),
@@ -358,6 +399,13 @@ async def _run(args: argparse.Namespace) -> int:
                     "intraday_cone_writer: committed %s %s spot=%.2f (%d horizons) %s",
                     sym, now.strftime("%H:%M"), inputs.spot, inserted, summary,
                 )
+        if failures:
+            # Still exit 0 — one bad fire must not wedge the timer — but the
+            # count goes in the log so a backfill loop's tail shows it.
+            logger.error(
+                "intraday_cone_writer: %d of %d symbols failed to commit at %s",
+                failures, len(symbols), now.strftime("%H:%M"),
+            )
         return 0
     finally:
         try:
