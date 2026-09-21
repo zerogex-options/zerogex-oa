@@ -49,6 +49,27 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 # GAMMA_FLIP_MAX_BLANK_MINUTES, 1 when one did, 2 on DB error. A nonzero exit
 # marks the unit failed, surfaces in `systemctl --failed`, logs the offending
 # symbol and session, and fires the OnFailure hook above.
+# NOTHING IS IGNORED HERE, DELIBERATELY.
+#
+# The check now reports gamma_flip_reason, and IGNORE_REASONS="CODE ..." would
+# stop a named cause from breaching. It is tempting to put
+# BEYOND_MAX_DISTANCE in it: on 2026-09-21 NDX was blank for all 390 rows with
+# 375 of them under that code, and the resolver was RIGHT -- Friday's monthly
+# opex left a book at 3.16 calls per put, long gamma everywhere, with the
+# crossing 12% to 37% below spot. This unit emailed about it seven times.
+#
+# Do not. The NDX blackout of 2026-07..09, which was a real bug in our own DTE
+# weighting and took five weeks and a customer to find, ALSO reported
+# BEYOND_MAX_DISTANCE. The code does not separate "the market moved the flip
+# away" from "our math did", so silencing it would have silenced the one
+# failure this unit exists for.
+#
+# What separates them is how far gamma_flip_raw (ungated, unweighted) sits
+# from spot: ~3% on 2026-09-17 when the ramp was hiding a near-spot crossing,
+# 12-37% on 2026-09-21 when no near-spot crossing existed. That is the rule
+# worth encoding, and it needs a spot price this check does not yet read.
+# Until then the reason is printed in the alert so triage is one glance
+# instead of one investigation.
 ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-resolution-healthcheck SESSIONS=1
 
 # One indexed range scan and a rollback per symbol-session.

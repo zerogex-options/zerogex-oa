@@ -4370,13 +4370,14 @@ gamma-flip-carry-healthcheck: ## Alert if gamma_regime_5min.gamma_flip was carri
 GAMMA_FLIP_MAX_BLANK_MINUTES ?= 30
 
 .PHONY: gamma-flip-resolution-healthcheck
-gamma-flip-resolution-healthcheck: ## Report how long the gamma flip was left UNPUBLISHED (row present, value NULL). FLIP_SINCE=YYYY-MM-DD BY_DATE=1. 0=ok 1=blank too long 2=db error
+gamma-flip-resolution-healthcheck: ## Report how long the gamma flip was left UNPUBLISHED (row present, value NULL). FLIP_SINCE=YYYY-MM-DD BY_DATE=1 IGNORE_REASONS="CODE ...". 0=ok 1=blank too long 2=db error
 	@$(PY) -m src.tools.gamma_flip_resolution_healthcheck \
 		--max-blank-minutes $(GAMMA_FLIP_MAX_BLANK_MINUTES) \
 		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
 		$(if $(SESSIONS),--sessions $(SESSIONS)) \
 		$(if $(FLIP_SINCE),--since $(FLIP_SINCE)) \
 		$(if $(BY_DATE),--by-date) \
+		$(if $(IGNORE_REASONS),--ignore-reasons $(IGNORE_REASONS)) \
 		$(if $(JSON),--json)
 
 .PHONY: gamma-flip-blackout-forensics

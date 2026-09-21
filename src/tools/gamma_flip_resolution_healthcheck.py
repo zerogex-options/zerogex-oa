@@ -61,9 +61,10 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import pytz
 
@@ -113,6 +114,10 @@ class SessionResolution:
     resolved: int
     unresolved: int
     longest: Optional[BlankRun]
+    #: ``{reason: rows}`` over the blank rows, commonest first.  Empty for a
+    #: session written before gamma_flip_reason existed, which is why the
+    #: report prints "-" rather than inventing a cause.
+    reasons: Sequence[Tuple[str, int]] = ()
 
     @property
     def unresolved_pct(self) -> float:
@@ -121,6 +126,22 @@ class SessionResolution:
     @property
     def longest_blank_minutes(self) -> float:
         return self.longest.minutes if self.longest else 0.0
+
+    @property
+    def dominant_reason(self) -> Optional[str]:
+        """The reason behind most of this session's blank rows."""
+        return self.reasons[0][0] if self.reasons else None
+
+    def is_ignored(self, ignore: Sequence[str]) -> bool:
+        """Is every blank row in this session one the operator asked to ignore?
+
+        EVERY row, not the dominant one.  A session that is 99% "the flip is
+        further from spot than anything actionable" and 1% "there was no usable
+        chain" is not a quiet session, and a majority rule would silence it.
+        """
+        if not ignore or not self.reasons:
+            return False
+        return all(reason in ignore for reason, _rows in self.reasons)
 
     def as_dict(self) -> dict:
         out = {
@@ -131,6 +152,8 @@ class SessionResolution:
             "unresolved": self.unresolved,
             "unresolved_pct": round(self.unresolved_pct, 1),
             "longest_blank_minutes": round(self.longest_blank_minutes, 1),
+            "reasons": {reason: rows for reason, rows in self.reasons},
+            "dominant_reason": self.dominant_reason,
         }
         if self.longest is not None:
             out["longest_blank_start"] = self.longest.start.astimezone(ET).isoformat()
@@ -179,13 +202,19 @@ def blank_runs(rows: Sequence[Tuple[datetime, Optional[float]]]) -> List[BlankRu
 def summarize_session(
     symbol: str,
     session_date: date,
-    rows: Sequence[Tuple[datetime, Optional[float]]],
+    rows: Sequence[Sequence[Any]],
 ) -> Optional[SessionResolution]:
-    """Classify one session's rows.  ``None`` when the session stored none."""
+    """Classify one session's rows.  ``None`` when the session stored none.
+
+    ``rows`` is chronological ``(timestamp, gamma_flip_point, gamma_flip_reason)``.
+    The reason is tolerated as absent so a caller holding two-column rows (and
+    every session written before that column existed) still summarizes.
+    """
     if not rows:
         return None
-    unresolved = sum(1 for _ts, flip in rows if flip is None)
-    runs = blank_runs(rows)
+    unresolved = sum(1 for row in rows if row[1] is None)
+    tally: Counter = Counter(row[2] for row in rows if row[1] is None and len(row) > 2 and row[2])
+    runs = blank_runs([(row[0], row[1]) for row in rows])
     longest = max(runs, key=lambda r: r.minutes) if runs else None
     return SessionResolution(
         symbol=symbol,
@@ -194,6 +223,7 @@ def summarize_session(
         resolved=len(rows) - unresolved,
         unresolved=unresolved,
         longest=longest,
+        reasons=tuple(tally.most_common()),
     )
 
 
@@ -219,7 +249,7 @@ def check_session(cursor, symbol: str, session_date: date) -> Optional[SessionRe
     start, end = session_window(session_date)
     cursor.execute(
         """
-        SELECT timestamp, gamma_flip_point
+        SELECT timestamp, gamma_flip_point, gamma_flip_reason
         FROM gex_summary
         WHERE underlying = %(symbol)s
           AND timestamp >= %(start)s
@@ -262,7 +292,7 @@ def format_report(
 
     lines = [
         f"{'symbol':<8} {'session':<12} {'rows':>6} {'blank':>7} {'blank%':>7} "
-        f"{'longest':>9}  window",
+        f"{'longest':>9}  {'reason':<21} window",
     ]
     ordered = (
         sorted(results, key=lambda r: (r.symbol, r.session_date))
@@ -278,10 +308,16 @@ def format_report(
                 + (" (open at close)" if r.longest.open_at_session_end else "")
             )
         flag = "  <-- over threshold" if r.longest_blank_minutes > max_blank_minutes else ""
+        # Mixed causes get the commonest plus a count, because the tail is the
+        # part worth looking at: "BEYOND_MAX_DISTANCE +1" is a session that was
+        # correct all day except for the rows that were not.
+        reason = r.dominant_reason or "-"
+        if len(r.reasons) > 1:
+            reason += f" +{len(r.reasons) - 1}"
         lines.append(
             f"{r.symbol:<8} {r.session_date.isoformat():<12} {r.rows:>6} "
             f"{r.unresolved:>7} {r.unresolved_pct:>6.1f}% "
-            f"{r.longest_blank_minutes:>8.1f}m  {window}{flag}"
+            f"{r.longest_blank_minutes:>8.1f}m  {reason:<21} {window}{flag}"
         )
     return lines
 
@@ -316,6 +352,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "order hides a regime change by interleaving the dates."
         ),
     )
+    parser.add_argument(
+        "--ignore-reasons",
+        nargs="*",
+        default=None,
+        help=(
+            "gamma_flip_reason codes that do NOT count as a breach, e.g. "
+            "BEYOND_MAX_DISTANCE ONE_SIDED. A session is excused only when "
+            "EVERY blank row carries an ignored code. Use this on the timer so "
+            "a correct reading of a deep long-gamma regime does not page "
+            "anyone hourly for days; leave it unset when reading history."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -344,15 +392,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("gamma flip resolution check failed: %s", exc, exc_info=True)
         return 2
 
-    breaches = [r for r in results if r.longest_blank_minutes > args.max_blank_minutes]
+    ignore = [str(code).strip().upper() for code in (args.ignore_reasons or [])]
+    over = [r for r in results if r.longest_blank_minutes > args.max_blank_minutes]
+    excused = [r for r in over if r.is_ignored(ignore)]
+    breaches = [r for r in over if r not in excused]
 
     if args.json:
         print(
             json.dumps(
                 {
                     "max_blank_minutes": args.max_blank_minutes,
+                    "ignore_reasons": ignore,
                     "sessions": [r.as_dict() for r in results],
                     "breaches": [r.as_dict() for r in breaches],
+                    "excused": [r.as_dict() for r in excused],
                 },
                 indent=2,
             )
@@ -360,6 +413,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         for line in format_report(results, args.max_blank_minutes, by_date=args.by_date):
             print(line)
+        if excused:
+            # Printed, never silent. An excused session is still a session
+            # nobody saw a flip in, and the operator decides whether the
+            # excuse was the right call -- the tool only declines to page.
+            print(
+                f"\n{len(excused)} session(s) over threshold but excused by "
+                f"--ignore-reasons {' '.join(ignore)}: "
+                + ", ".join(f"{r.symbol} {r.session_date}" for r in excused)
+            )
         if breaches:
             print(
                 f"\n{len(breaches)} session(s) left the flip blank for more than "

@@ -212,3 +212,82 @@ def test_by_date_groups_by_symbol_before_date():
         ("NDX", "2026-09-18"),
         ("SPX", "2026-09-11"),
     ]
+
+
+# --- the reason, and the excuse -------------------------------------------
+#
+# The timer installed on 2026-09-20 fires hourly through the session. On
+# 2026-09-21 NDX was blank for all 390 rows and the resolver was RIGHT: the
+# flip sat 12% to 37% below spot in a deep long-gamma book, and 375 of those
+# rows say BEYOND_MAX_DISTANCE. Left alone, that unit would have emailed seven
+# times that day and again the next, about a correct reading. A monitor people
+# learn to ignore is the state this whole investigation started in, so the
+# check has to be able to tell a fault from a market.
+
+
+def _reason_rows(pattern, reasons, cadence_seconds=30):
+    """``pattern`` of R/B, plus a reason per blank row in order."""
+    out = []
+    pending = list(reasons)
+    for i, ch in enumerate(pattern):
+        ts = OPEN + timedelta(seconds=cadence_seconds * i)
+        if ch == "B":
+            out.append((ts, None, pending.pop(0) if pending else None))
+        else:
+            out.append((ts, 29000.0 + i, None))
+    return out
+
+
+def test_reasons_are_tallied_over_the_blank_rows_only():
+    rows = _reason_rows("BBBRB", ["BEYOND_MAX_DISTANCE"] * 3 + ["EDGE_ONLY"])
+    result = tool.summarize_session("NDX", SESSION, rows)
+    assert result.reasons == (("BEYOND_MAX_DISTANCE", 3), ("EDGE_ONLY", 1))
+    assert result.dominant_reason == "BEYOND_MAX_DISTANCE"
+
+
+def test_a_session_predating_the_column_reports_no_reason_rather_than_a_guess():
+    rows = [(ts, flip) for ts, flip in _rows("BBRB")]
+    result = tool.summarize_session("NDX", SESSION, rows)
+    assert result.reasons == ()
+    assert result.dominant_reason is None
+
+
+def test_a_session_is_excused_only_when_every_blank_row_is_excusable():
+    """99% correct plus 1% broken is not a quiet session."""
+    mixed = tool.summarize_session(
+        "NDX", SESSION, _reason_rows("BBB", ["BEYOND_MAX_DISTANCE"] * 2 + ["NO_PROFILE"])
+    )
+    assert not mixed.is_ignored(["BEYOND_MAX_DISTANCE"])
+    assert mixed.is_ignored(["BEYOND_MAX_DISTANCE", "NO_PROFILE"])
+
+    clean = tool.summarize_session("NDX", SESSION, _reason_rows("BBB", ["BEYOND_MAX_DISTANCE"] * 3))
+    assert clean.is_ignored(["BEYOND_MAX_DISTANCE"])
+
+
+def test_nothing_is_excused_when_the_operator_asked_for_nothing():
+    result = tool.summarize_session("NDX", SESSION, _reason_rows("BBB", ["ONE_SIDED"] * 3))
+    assert not result.is_ignored([])
+
+
+def test_a_session_with_no_recorded_reason_is_never_excused():
+    """Absence is not a cause, so it cannot be the grounds for staying quiet."""
+    rows = [(ts, flip) for ts, flip in _rows("BBB")]
+    result = tool.summarize_session("NDX", SESSION, rows)
+    assert not result.is_ignored(["BEYOND_MAX_DISTANCE", "NO_PROFILE", "ONE_SIDED"])
+
+
+def test_the_report_names_the_reason_and_flags_a_mixed_session():
+    single = tool.summarize_session("NDX", SESSION, _reason_rows("BB", ["ONE_SIDED"] * 2))
+    mixed = tool.summarize_session(
+        "SPX", SESSION, _reason_rows("BB", ["BEYOND_MAX_DISTANCE", "NO_PROFILE"])
+    )
+    body = "\n".join(tool.format_report([single, mixed], max_blank_minutes=0.0))
+    assert "ONE_SIDED" in body
+    assert "+1" in body, "a second cause has to be visible, it is the part worth reading"
+
+
+def test_the_json_payload_carries_the_reasons():
+    result = tool.summarize_session("NDX", SESSION, _reason_rows("BB", ["EDGE_ONLY"] * 2))
+    payload = result.as_dict()
+    assert payload["reasons"] == {"EDGE_ONLY": 2}
+    assert payload["dominant_reason"] == "EDGE_ONLY"
