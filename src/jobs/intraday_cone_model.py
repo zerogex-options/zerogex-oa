@@ -98,6 +98,30 @@ DIURNAL_CLOSE_DECAY = 0.09   # ≈35 min e-folding
 # Cone construction
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# On the residual conservatism, and why it is not tuned away
+# ---------------------------------------------------------------------------
+# Across 9 graded sessions the cone runs about 10 points UNDERCONFIDENT at
+# every horizon: bands hold more often than the published probability says.
+# A single multiplier on the sigma used in hold_probability would close that
+# gap on this sample in one line. It is deliberately not applied.
+#
+# The sample is 7 quiet sessions against 2 active ones, and the two regimes
+# lean opposite ways. On the quiet days the cone is conservative by 30-40
+# points; on 2026-09-16, the one genuinely volatile session (2.0-2.75x the
+# expected range), it was already slightly OVERconfident. A level correction
+# fitted to the majority would improve the average and make the days that
+# actually matter worse — the classic fit to the common case.
+#
+# There is also a product reason. This model exists to publish a reliability
+# table, and a known bias that the table displays honestly is worth more than
+# a number tuned until it looks calibrated on a sample that is mostly calm.
+# Tuning to the sample is what a scoreboard is supposed to catch.
+#
+# Revisit when the graded history holds a materially larger share of active
+# sessions, and fit the level then — from the reliability table, per regime,
+# not globally.
+
 #: Half-width of the raw cone in horizon sigmas before gamma conditioning.
 #:
 #: Calibrated against the model's own output rather than assumed.  Note that
@@ -128,7 +152,14 @@ CONE_SIGMA_MULT = 1.50
 #: modest default and is exactly what the reliability table is for — if the
 #: +2h bucket comes in persistently under its predicted hold, δ is too small
 #: and the receipt will say so in public before anyone has to argue about it.
-CONE_TERM_DECAY = 0.12
+#: Fitted against 3,024 graded claims over 9 sessions (v1_3), where realized
+#: hold decayed 6.8 points across the horizon ladder while the published
+#: probability decayed 15.9 — 2.3x too steep. 0.07 reproduces the observed
+#: decay. The reference horizon is untouched by construction (its decay
+#: factor is 1.0), so this flattens the term structure without shifting the
+#: level, which matters because the level should NOT be fitted here — see
+#: the note on residual conservatism below.
+CONE_TERM_DECAY = 0.07
 
 #: Gamma conditioning bounds.  Long dealer gamma damps realized movement
 #: (hedging leans against the tape); short gamma amplifies it.  The multiplier
@@ -230,7 +261,8 @@ _IMAGE_TERMS = 6
 #:         this changed almost nothing in practice)
 #:   v1_2  measured anchor: median of prior GRADED realized ratios
 #:   v1_3  per-symbol vol_range_basis_mult applied; realized blend to 0.85
-MODEL_VERSION = "cone_v1_3"
+#:   v1_4  term decay fitted to 9 graded sessions (0.12 -> 0.07)
+MODEL_VERSION = "cone_v1_4"
 
 
 # ---------------------------------------------------------------------------

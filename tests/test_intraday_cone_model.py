@@ -600,7 +600,7 @@ def test_the_model_version_tracks_the_math_it_stamps():
         m.REALIZED_BLEND_MAX, m.WALL_LEAN, m.CONE_VOL_RATIO_MIN,
         m.CONE_VOL_RATIO_MAX, m.VOL_BASIS_MULT_MIN, m.VOL_BASIS_MULT_MAX,
     )
-    assert fingerprint == (1.50, 0.12, 0.22, 0.50, 0.85, 0.35, 0.45, 1.90, 0.45, 1.40), (
+    assert fingerprint == (1.50, 0.07, 0.22, 0.50, 0.85, 0.35, 0.45, 1.90, 0.45, 1.40), (
         "a band-defining constant moved — bump MODEL_VERSION and update this "
         "fingerprint, so committed claims stay attributable to the math that "
         "produced them"
