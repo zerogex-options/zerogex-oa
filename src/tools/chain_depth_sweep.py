@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from src.ingestion.providers import get_provider
+from src.market_calendar import calculate_time_to_expiration, settlement_close_time_for_contract
 from src.tools.feed_compare import (
     _compute_analytics,
     _detect_mangled_index_symbol,
@@ -92,10 +93,23 @@ def sweep_once(
     rows = _quotes_to_option_rows(sample.quotes, sample.metadata, now)
     enriched = _enrich(rows, sample.spot, underlying)
 
+    # Run this after the close and the front expiration has already settled:
+    # its contracts price at T=0, so the IV solver cannot touch them and the
+    # profile drops every one. That reads in the diagnostics as a chain
+    # missing a quarter of itself, which looks like a data fault and is
+    # merely the clock. Two six-minute runs were spent on it before the tool
+    # said so.
+    expirations = sorted({r["expiration"] for r in enriched})
+    front_settled = False
+    if expirations:
+        close_t = settlement_close_time_for_contract(underlying, None, expirations[0])
+        front_settled = calculate_time_to_expiration(now, expirations[0], close_t) <= 0
+
     out: Dict[str, Any] = {
         "captured_at": sample.captured_at,
         "spot": sample.spot,
         "error": None,
+        "front_expiration_settled": front_settled,
         "depths": {},
     }
     for depth in depths:
@@ -156,8 +170,21 @@ def summarise(rounds: Sequence[Dict[str, Any]], depths: Sequence[int]) -> Dict[i
     return per_depth
 
 
-def _print_summary(summary: Dict[int, Dict[str, Any]], underlying: str, rounds: int) -> None:
+def _print_summary(
+    summary: Dict[int, Dict[str, Any]],
+    underlying: str,
+    rounds: int,
+    *,
+    front_expiration_settled: bool = False,
+) -> None:
     print(f"\n  === {underlying}: chain depth sweep, {rounds} round(s) ===\n")
+    if front_expiration_settled:
+        print(
+            "  AFTER THE CLOSE: the front expiration has already settled. Its\n"
+            "  contracts price at T=0, so the IV solver cannot reach them and the\n"
+            "  profile drops all of them -- the chain will look a quarter empty\n"
+            "  for reasons that are the clock, not the feed. Re-run during RTH.\n"
+        )
     print(
         f"  {'depth':<7}{'contracts':<11}{'resolved':<11}{'mean flip':>12}"
         f"{'vs spot':>10}{'step':>10}{'net_gex':>14}"
@@ -266,7 +293,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not collected:
         print("\n  no usable rounds\n")
         return 1
-    _print_summary(summarise(collected, depths), args.underlying, len(collected))
+    _print_summary(
+        summarise(collected, depths),
+        args.underlying,
+        len(collected),
+        front_expiration_settled=any(r.get("front_expiration_settled") for r in collected),
+    )
     return 0
 
 

@@ -20,10 +20,14 @@ class _CountingProvider:
 
     name = "counting-probe"
 
-    def __init__(self):
+    def __init__(self, first_expiration_days=1):
         self.snapshot_calls = 0
         self.expiration_calls = 0
         self.symbols_requested = 0
+        #: Offset of the FRONT expiration in days. Negative puts it in the
+        #: past -- already settled -- while the rest of the chain stays live,
+        #: which is the only shape that tells "front" from "last" apart.
+        self.first_expiration_days = first_expiration_days
 
     @property
     def capabilities(self):
@@ -54,7 +58,8 @@ class _CountingProvider:
     def get_option_expirations(self, underlying, strike_price=None):
         self.expiration_calls += 1
         today = datetime.now(timezone.utc).date()
-        return [today + timedelta(days=d) for d in range(1, 13)]
+        start = self.first_expiration_days
+        return [today + timedelta(days=d) for d in range(start, start + 12)]
 
     def get_option_strikes(self, underlying, expiration=None):
         return [640.0 + i for i in range(41)]
@@ -216,3 +221,53 @@ def test_a_real_index_symbol_is_not_rejected():
     assert _detect_mangled_index_symbol("$SPXW.X") is None
     assert _detect_mangled_index_symbol("QQQ") is None
     assert _detect_mangled_index_symbol("PXW.X") is not None
+
+
+def test_a_post_close_sweep_says_the_front_expiration_is_dead(capsys):
+    """Two six-minute runs were spent before the tool admitted this.
+
+    Past the settlement instant the front expiration prices at T=0, so the
+    IV solver cannot reach it and the profile drops every one of its
+    contracts. A QQQ sweep at 16:18 ET dropped exactly 64 contracts for
+    want of a solved IV at every depth -- one expiration's worth, constant,
+    because it was 19 minutes after the close. Read cold that is a feed
+    fault; it is the clock.
+    """
+    summary = chain_depth_sweep.summarise([_round({3: None, 12: None})], (3, 12))
+    chain_depth_sweep._print_summary(summary, "QQQ", 1, front_expiration_settled=True)
+    out = capsys.readouterr().out
+    assert "AFTER THE CLOSE" in out
+    assert "RTH" in out, "the message must say what to do instead"
+
+
+def test_an_intraday_sweep_stays_quiet_about_the_clock(capsys):
+    summary = chain_depth_sweep.summarise([_round({3: 700.0, 12: 730.0})], (3, 12))
+    chain_depth_sweep._print_summary(summary, "QQQ", 1)
+    assert "AFTER THE CLOSE" not in capsys.readouterr().out
+
+
+def test_the_settled_flag_reads_the_front_expiration_not_the_last():
+    """A chain whose FRONT expiration has settled is flagged even though
+    every later one is still live -- which is exactly the post-close shape,
+    and the only case that distinguishes the two ends of the ladder."""
+    live = chain_depth_sweep.sweep_once(
+        _CountingProvider(first_expiration_days=1),
+        "SPY",
+        depths=(3,),
+        strike_count_max=6,
+        strike_pct_range=3.0,
+    )
+    assert live["front_expiration_settled"] is False
+
+    # Offset -1 at depth 3 gives [yesterday, today, tomorrow]: the front is
+    # definitively settled and the LAST is definitively live, whatever hour
+    # the suite runs at. A deeper offset settles the whole slice and the two
+    # ends of the ladder stop disagreeing.
+    settled_front = chain_depth_sweep.sweep_once(
+        _CountingProvider(first_expiration_days=-1),
+        "SPY",
+        depths=(3,),
+        strike_count_max=6,
+        strike_pct_range=3.0,
+    )
+    assert settled_front["front_expiration_settled"] is True
