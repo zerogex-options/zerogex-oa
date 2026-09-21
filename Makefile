@@ -4768,6 +4768,12 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)drawn for more movement than happened, so they hold more often than$(NC)"; \
 	echo "$(YELLOW)predicted -- underconfident. Well ABOVE 1 is the reverse.$(NC)"; \
 	echo "$(YELLOW)gap = realized hold rate minus mean predicted. Near 0 is calibrated.$(NC)"; \
+	echo "$(YELLOW)vol_anchor is what the cone assumed today would deliver against a$(NC)"; \
+	echo "$(YELLOW)normal day, and anchor_src says where it came from: 'measured' is$(NC)"; \
+	echo "$(YELLOW)the median of prior GRADED sessions, 'committed' is the morning$(NC)"; \
+	echo "$(YELLOW)forecast's prediction (which itself falls back to a neutral 1.0 on$(NC)"; \
+	echo "$(YELLOW)a cold start), 'none' is no claim at all. If vol_anchor sits near$(NC)"; \
+	echo "$(YELLOW)1.00 while vol_ratio sits near 0.5, the anchor is the problem.$(NC)"; \
 	echo "$(YELLOW)realized_range_pct is the FULL 09:30-16:00 cash session from$(NC)"; \
 	echo "$(YELLOW)underlying_quotes. It deliberately does not reuse the graded$(NC)"; \
 	echo "$(YELLOW)windows: those start at 10:15 and so miss the opening 45 minutes,$(NC)"; \
@@ -4781,6 +4787,8 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       COUNT(*) FILTER (WHERE held) AS held_n, \
 		       AVG(hold_prob) AS mean_pred, \
 		       AVG(daily_sigma / NULLIF(anchor_spot,0)) AS sigma_frac, \
+		       AVG(vol_ratio_applied) AS vol_anchor, \
+		       MIN(vol_ratio_source) AS anchor_src, \
 		       AVG(anchor_spot) AS spot \
 		FROM intraday_forecast \
 		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
@@ -4803,6 +4811,8 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       ROUND(100.0 * held_n / claims, 1) AS hold_pct, \
 		       ROUND(100.0 * mean_pred, 1)       AS pred_pct, \
 		       ROUND(100.0 * (held_n::numeric / claims - mean_pred), 1) AS gap_pts, \
+		       ROUND(vol_anchor::numeric, 2)     AS vol_anchor, \
+		       anchor_src, \
 		       ROUND(100.0 * sigma_frac, 3)      AS model_sigma_pct, \
 		       ROUND(100.0 * realized_frac, 3)   AS realized_range_pct, \
 		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio \

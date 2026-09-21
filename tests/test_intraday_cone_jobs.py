@@ -46,6 +46,7 @@ def _fake_writer_db(
     inserted=4,
     gex_ts=None,
     walk=None,
+    trailing=None,
 ):
     """A stubbed DB whose reads are POINT-IN-TIME, like the real ones.
 
@@ -89,6 +90,9 @@ def _fake_writer_db(
         return_value=extremes
         if extremes is not None
         else {"window_low": Decimal("598.50"), "window_high": Decimal("602.00"), "bars": 90}
+    )
+    db.get_trailing_realized_vol_ratios = AsyncMock(
+        return_value=list(trailing) if trailing is not None else []
     )
     db.insert_intraday_cone = AsyncMock(return_value=inserted)
     return db
@@ -347,6 +351,99 @@ async def test_a_session_with_no_bars_commits_nothing(monkeypatch, caplog):
     assert await mod._run(_writer_args(mod)) == 0
     fake.insert_intraday_cone.assert_not_awaited()
     assert "no SPY bar at or before" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_trailing_vol_read_cannot_see_its_own_future(monkeypatch):
+    """The lookahead trap, arriving by a different door.
+
+    The obvious way to get trailing realized ratios is
+    get_daily_forecast_history, which takes no date bound and returns the
+    newest rows in the table. During a backfill those are sessions AFTER the
+    one being reconstructed. The date bound is the whole point, so it is
+    asserted on the call itself rather than inferred from the output.
+    """
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db(trailing=[0.5, 0.6, 0.55, 0.48, 0.52, 0.6])
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_writer_args(mod)) == 0
+
+    symbol, before, limit = fake.get_trailing_realized_vol_ratios.await_args.args
+    assert symbol == "SPY"
+    assert before == date(2026, 9, 21), "the bound must be the session being written"
+    assert limit == 10
+
+
+@pytest.mark.asyncio
+async def test_a_measured_anchor_is_preferred_over_a_predicted_one(monkeypatch):
+    """Graded outcomes beat a forecast of them — especially this forecast,
+    which degrades to a neutral 1.0 on a cold start and so silently reasserts
+    'today is average', the error the anchor exists to correct."""
+    mod = _reload("intraday_cone_writer")
+    measured = _fake_writer_db(
+        trailing=[0.5, 0.52, 0.48, 0.55, 0.5, 0.51],
+        morning={"implied_move": Decimal("4.50"), "expected_vol_ratio": Decimal("1.00")},
+    )
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: measured)
+    await mod._run(_writer_args(mod))
+    rows = measured.insert_intraday_cone.await_args.args[0]
+    assert rows[0]["vol_ratio_source"] == "measured"
+    assert rows[0]["vol_ratio_applied"] == pytest.approx(0.505, abs=0.02)
+
+    # Cold start: fewer than the minimum observations, so the prediction is
+    # all that is left.
+    cold = _fake_writer_db(
+        trailing=[0.5, 0.52],
+        morning={"implied_move": Decimal("4.50"), "expected_vol_ratio": Decimal("0.80")},
+    )
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: cold)
+    await mod._run(_writer_args(mod))
+    cold_rows = cold.insert_intraday_cone.await_args.args[0]
+    assert cold_rows[0]["vol_ratio_source"] == "committed"
+    assert cold_rows[0]["vol_ratio_applied"] == pytest.approx(0.80, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_with_neither_anchor_the_cone_makes_no_vol_claim(monkeypatch):
+    """Honestly wide beats confidently wrong."""
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db(trailing=[], morning={"implied_move": Decimal("4.50")})
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    await mod._run(_writer_args(mod))
+    rows = fake.insert_intraday_cone.await_args.args[0]
+    assert rows[0]["vol_ratio_source"] == "none"
+    assert rows[0]["vol_ratio_applied"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_measured_anchor_actually_narrows_the_bands(monkeypatch):
+    """The effect that was missing the first time round: adopting a vol call
+    of ~0.5 has to move the basis by about 40%, not 12%."""
+    mod = _reload("intraday_cone_writer")
+    flat = _fake_writer_db(trailing=[])
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: flat)
+    await mod._run(_writer_args(mod))
+    wide = flat.insert_intraday_cone.await_args.args[0][0]
+
+    quiet = _fake_writer_db(trailing=[0.5, 0.52, 0.48, 0.55, 0.5, 0.51])
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: quiet)
+    await mod._run(_writer_args(mod))
+    tight = quiet.insert_intraday_cone.await_args.args[0][0]
+
+    assert float(tight["daily_sigma"]) < float(wide["daily_sigma"])
+    shrink = 1 - float(tight["daily_sigma"]) / float(wide["daily_sigma"])
+    assert shrink > 0.20, f"the anchor must move the basis materially, got {shrink:.0%}"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_trailing_read_does_not_stop_the_fire(monkeypatch, caplog):
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db()
+    fake.get_trailing_realized_vol_ratios = AsyncMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_writer_args(mod)) == 0
+    fake.insert_intraday_cone.assert_awaited_once()
+    assert "trailing vol ratios failed" in caplog.text
 
 
 # ---------------------------------------------------------------------------

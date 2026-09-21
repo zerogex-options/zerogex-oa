@@ -46,6 +46,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
+from src.jobs.forecast_range_model import robust_persistence_anchor
+
 # ---------------------------------------------------------------------------
 # Session geometry
 # ---------------------------------------------------------------------------
@@ -334,6 +336,46 @@ def realized_daily_sigma(
     return sigma_so_far / math.sqrt(frac)
 
 
+def resolve_vol_anchor(
+    *,
+    trailing_ratios: Sequence[float],
+    committed_ratio: Optional[float],
+) -> tuple[Optional[float], str]:
+    """How much of a normal day's range today should deliver, and where that
+    number came from.
+
+    Order matters, and the first version got it wrong by skipping straight to
+    the last resort:
+
+    1. **measured** — the median of prior sessions' GRADED realized ratios.
+       Vol clusters, so what the tape has actually been delivering is the
+       best available statement about what it will deliver next.
+    2. **committed** — the morning forecast's prediction. A real fallback,
+       but a weak one: ``predict_expected_vol`` itself degrades to a neutral
+       1.0 without enough history, so adopting it on a cold start silently
+       reasserts "today is average" — the exact error this is meant to fix.
+       That is what happened on the first attempt, and why the sigma moved
+       12% when it needed to move about 40%.
+    3. **none** — no claim. The caller uses the raw implied move and the
+       cone is honestly wide rather than confidently wrong.
+
+    Returning the source alongside the value is not bookkeeping. Twice now the
+    only way to tell what this model actually did was to invert the published
+    bands by hand; a claim should say what it was built from.
+    """
+    measured = robust_persistence_anchor(list(trailing_ratios or ()))
+    if measured is not None and measured > 0:
+        return _clamp(measured, CONE_VOL_RATIO_MIN, CONE_VOL_RATIO_MAX), "measured"
+    if committed_ratio is not None:
+        try:
+            value = float(committed_ratio)
+        except (TypeError, ValueError):
+            return None, "none"
+        if value > 0:
+            return _clamp(value, CONE_VOL_RATIO_MIN, CONE_VOL_RATIO_MAX), "committed"
+    return None, "none"
+
+
 def blended_daily_sigma(
     *,
     implied_sigma: Optional[float],
@@ -481,11 +523,13 @@ class ConeInputs:
     # Vol basis.  ``implied_move`` is the committed full-day 1-σ dollar move
     # from the morning forecast; session high/low drive the realized estimate.
     implied_move: Optional[float] = None
-    #: The morning forecast's committed expected_vol_ratio — predicted realized
-    #: range as a multiple of a normal day's.  None means no call was
-    #: committed, and the cone falls back to treating today as average, which
-    #: is what it used to do unconditionally and got wrong.
+    #: The morning forecast's committed expected_vol_ratio — the PREDICTED
+    #: realized range as a multiple of a normal day's.  Used only as a
+    #: fallback; see ``resolve_vol_anchor``.
     expected_vol_ratio: Optional[float] = None
+    #: GRADED realized vol ratios from prior sessions, oldest-first.  Their
+    #: median is the preferred anchor: a measurement rather than a forecast.
+    trailing_vol_ratios: Sequence[float] = ()
     session_high: Optional[float] = None
     session_low: Optional[float] = None
 
@@ -516,6 +560,11 @@ class ConeResult:
     horizons: list[ConeHorizon] = field(default_factory=list)
     daily_sigma: float = 0.0
     gamma_mult: float = 1.0
+    #: The vol anchor actually applied, and where it came from
+    #: ("measured" | "committed" | "none"). Published so a reader never has to
+    #: invert the bands to find out what the cone assumed.
+    vol_ratio_applied: Optional[float] = None
+    vol_ratio_source: str = "none"
     model_version: str = MODEL_VERSION
     rationale: list[str] = field(default_factory=list)
 
@@ -603,13 +652,21 @@ def compute_cone(inp: ConeInputs) -> ConeResult:
         elapsed_min=inp.elapsed_min,
         session_minutes=inp.session_minutes,
     )
+    vol_anchor, vol_source = resolve_vol_anchor(
+        trailing_ratios=inp.trailing_vol_ratios,
+        committed_ratio=inp.expected_vol_ratio,
+    )
+    result.vol_ratio_applied = vol_anchor
+    result.vol_ratio_source = vol_source
     daily_sigma, sigma_notes = blended_daily_sigma(
         implied_sigma=inp.implied_move,
         realized_sigma=realized,
         elapsed_min=inp.elapsed_min,
         session_minutes=inp.session_minutes,
-        expected_vol_ratio=inp.expected_vol_ratio,
+        expected_vol_ratio=vol_anchor,
     )
+    if vol_anchor is not None:
+        result.rationale.append(f"vol anchor {vol_anchor:.2f}x ({vol_source})")
     result.daily_sigma = daily_sigma
     result.rationale.extend(sigma_notes)
     if daily_sigma <= 0:

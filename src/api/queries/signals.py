@@ -2454,7 +2454,7 @@ class SignalsQueriesMixin:
                                 hold_prob, sigma, call_wall, put_wall,
                                 gamma_flip, net_gex_at_spot, daily_sigma,
                                 gamma_mult, elapsed_min, model_version,
-                                content_hash
+                                content_hash, vol_ratio_applied, vol_ratio_source
                             )
                             VALUES (
                                 $1, $2, $3, $4,
@@ -2462,7 +2462,7 @@ class SignalsQueriesMixin:
                                 $9, $10, $11, $12,
                                 $13, $14, $15,
                                 $16, $17, $18,
-                                $19
+                                $19, $20, $21
                             )
                             ON CONFLICT (symbol, forecast_ts, horizon_min)
                             DO NOTHING
@@ -2476,6 +2476,7 @@ class SignalsQueriesMixin:
                             r.get("daily_sigma"), r.get("gamma_mult"),
                             r.get("elapsed_min"), r["model_version"],
                             r["content_hash"],
+                            r.get("vol_ratio_applied"), r.get("vol_ratio_source"),
                         )
                         if got is not None:
                             inserted += 1
@@ -2562,6 +2563,56 @@ class SignalsQueriesMixin:
                 "get_gex_summary_as_of(%s, %s) failed: %s", symbol, as_of, exc,
             )
             return None
+
+    async def get_trailing_realized_vol_ratios(
+        self, symbol: str, before_date: date, limit: int = 10
+    ) -> List[float]:
+        """GRADED realized vol ratios from sessions strictly before ``before_date``.
+
+        Each value is one past session's actual high-low range as a multiple
+        of a normal day's range, written by the 16:05 receipt. Their median is
+        the vol-persistence anchor the daily model calls "the dominant driver"
+        — where realized vol has actually been sitting, rather than where a
+        model predicted it would sit.
+
+        Note ``before_date`` is EXCLUSIVE and not optional. The obvious
+        alternative, reusing ``get_daily_forecast_history``, takes no date
+        bound and returns the newest rows in the table — which during a
+        backfill are sessions AFTER the one being reconstructed. That is the
+        same lookahead that made the first backfill worthless, arriving by a
+        different door.
+
+        Returned oldest-first so the caller can hand them straight to
+        ``robust_persistence_anchor``, which reads the tail as most recent.
+        """
+        query = """
+            SELECT date, realized_vol_ratio
+            FROM daily_forecast
+            WHERE symbol = $1
+              AND date < $2
+              AND realized_vol_ratio IS NOT NULL
+              AND receipt_ts IS NOT NULL
+            ORDER BY date DESC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, before_date, limit)
+        except Exception as exc:
+            logger.warning(
+                "get_trailing_realized_vol_ratios(%s, before %s) failed: %s",
+                symbol, before_date, exc,
+            )
+            return []
+        out: List[float] = []
+        for r in reversed(rows):          # DESC -> oldest-first
+            try:
+                v = float(r["realized_vol_ratio"])
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                out.append(v)
+        return out
 
     async def get_matured_ungraded_cones(
         self, now: datetime, limit: int = 500
@@ -2695,6 +2746,7 @@ class SignalsQueriesMixin:
                            target_ts, anchor_spot, band_low, band_high,
                            hold_prob, sigma, call_wall, put_wall, gamma_flip,
                            net_gex_at_spot, gamma_mult, elapsed_min,
+                           vol_ratio_applied, vol_ratio_source,
                            model_version, graded_at, window_low, window_high,
                            held, brier
                     FROM intraday_forecast

@@ -3457,6 +3457,13 @@ CREATE TABLE IF NOT EXISTS intraday_forecast (
     daily_sigma     NUMERIC(12,4),
     gamma_mult      NUMERIC(6,4),
     elapsed_min     SMALLINT,
+    -- What the cone assumed about today's volatility, and where that came
+    -- from ('measured' = median of prior graded sessions, 'committed' = the
+    -- morning forecast's prediction, 'none' = no claim). Stored because
+    -- twice the only way to establish what this model actually did was to
+    -- invert the published bands by hand.
+    vol_ratio_applied NUMERIC(6,4),
+    vol_ratio_source  VARCHAR(16),
 
     model_version   VARCHAR(32) NOT NULL,
     content_hash    TEXT        NOT NULL,
@@ -3477,6 +3484,9 @@ CREATE TABLE IF NOT EXISTS intraday_forecast (
 );
 
 -- The grader's working set: claims that have matured but carry no verdict.
+ALTER TABLE intraday_forecast ADD COLUMN IF NOT EXISTS vol_ratio_applied NUMERIC(6,4);
+ALTER TABLE intraday_forecast ADD COLUMN IF NOT EXISTS vol_ratio_source  VARCHAR(16);
+
 CREATE INDEX IF NOT EXISTS idx_intraday_forecast_ungraded
     ON intraday_forecast(target_ts)
     WHERE graded_at IS NULL;

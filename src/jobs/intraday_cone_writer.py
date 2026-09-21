@@ -184,6 +184,16 @@ async def _build_inputs(
             symbol,
         )
 
+    # Prior sessions' GRADED ratios, bounded strictly before this session so a
+    # backfill cannot read its own future.
+    trailing_ratios: list[float] = []
+    try:
+        trailing_ratios = await db.get_trailing_realized_vol_ratios(symbol, day, 10)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "intraday_cone_writer: trailing vol ratios failed for %s: %s", symbol, exc
+        )
+
     session_extremes = None
     try:
         session_extremes = await db.get_bar_extremes_between(
@@ -208,6 +218,7 @@ async def _build_inputs(
         elapsed_min=_elapsed_minutes(now, day),
         implied_move=implied_move,
         expected_vol_ratio=expected_vol_ratio,
+        trailing_vol_ratios=trailing_ratios,
         session_high=_f(session_extremes.get("window_high")) if session_extremes else None,
         session_low=_f(session_extremes.get("window_low")) if session_extremes else None,
         call_wall=_f(gex.get("call_wall")) if (gex and fresh) else None,
@@ -222,6 +233,7 @@ async def _build_inputs(
         "spot": spot,
         "implied_move": implied_move,
         "expected_vol_ratio": expected_vol_ratio,
+        "n_trailing_ratios": len(trailing_ratios),
         "gex_fresh": fresh,
         "model_version": MODEL_VERSION,
     }
@@ -264,6 +276,11 @@ def _rows_for_fire(
                 "net_gex_at_spot": inputs.net_gex_at_spot,
                 "daily_sigma": round(result.daily_sigma, 4),
                 "gamma_mult": round(result.gamma_mult, 4),
+                "vol_ratio_applied": (
+                    round(result.vol_ratio_applied, 4)
+                    if result.vol_ratio_applied is not None else None
+                ),
+                "vol_ratio_source": result.vol_ratio_source,
                 "elapsed_min": int(inputs.elapsed_min),
                 "model_version": result.model_version,
                 "content_hash": _content_hash(claim),
