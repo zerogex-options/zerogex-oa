@@ -86,6 +86,7 @@ from .routers.gamma_shift import router as gamma_shift_router
 from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
 from .routers.forecast import router as forecast_router
+from .routers.cone import router as cone_router
 from .routers.replay import router as replay_router
 from .routers.forced_flow import router as forced_flow_router
 from .routers.levels import router as levels_router
@@ -592,6 +593,11 @@ app.include_router(scorecard_router, dependencies=[_scope_signals])
 # public /forecast/{date} page. Read-only here; the writer cron jobs live
 # in src.jobs.forecast_writer and src.jobs.forecast_receipt.
 app.include_router(forecast_router, dependencies=[_scope_signals])
+# Intraday re-anchored cone — the 15-minute counterpart to the daily band,
+# plus the reliability receipt that says whether its published hold
+# probabilities mean what they say. Read-only; the writer and grader crons
+# live in src.jobs.intraday_cone_writer and src.jobs.intraday_cone_receipt.
+app.include_router(cone_router, dependencies=[_scope_signals])
 # GEX Replay — scrubbable per-minute frames over historical gex_summary +
 # gex_by_strike data. Read-only; no new ingestion. Scope matches the rest
 # of the GEX surface (basic + pro tiers).
