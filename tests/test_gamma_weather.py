@@ -623,3 +623,163 @@ def test_age_is_measured_on_the_confirmed_state():
 
     assert series[-1].age_minutes == 55
     assert series[-1].age == AGE_CONFIRMED
+
+
+# --------------------------------------------------------------------------- #
+# The change trail.
+# --------------------------------------------------------------------------- #
+
+
+def _stamps(n):
+    from datetime import datetime, timedelta
+
+    base = datetime(2026, 9, 21, 13, 30)
+    return [base + timedelta(minutes=5 * i) for i in range(n)]
+
+
+def _trail(rows, field=None):
+    from src.analytics.gamma_weather import changes
+
+    series = classify_series(rows)
+    out = changes(series, _stamps(len(rows)))
+    return [c for c in out if field is None or c.field == field]
+
+
+def test_a_quiet_session_goes_silent_once_it_settles():
+    """The reason this exists. A state that holds all afternoon should produce
+    a handful of lines, not one per bar, or the trail is as unreadable as the
+    bars it was meant to replace.
+
+    Pressure still climbs its ladder over the first bars, which is a real
+    change and prints. After that, forty identical bars say nothing at all."""
+    trail = _trail([_inputs() for _ in range(40)])
+    settled = [c for c in trail if c.bar_start > _stamps(4)[-1]]
+
+    assert settled == []
+    assert len(trail) < 10
+
+
+def test_the_open_is_reported_so_every_field_starts_somewhere():
+    trail = _trail([_inputs() for _ in range(6)])
+    fields = {c.field for c in trail if c.opening}
+
+    assert "state" in fields
+    assert "pressure" in fields
+    assert "stability" in fields
+
+
+def test_the_open_is_worded_as_a_reading_not_a_transition():
+    """ "Pressure back to a pulse" at the open describes a return from nothing."""
+    trail = _trail([_inputs() for _ in range(3)], field="pressure")
+
+    assert [c.text for c in trail if c.opening] == ["Opened buying"]
+
+
+def test_persistence_says_nothing_at_the_open():
+    """The first bar of a session has no history behind it, so it is always a
+    pulse. A line saying so on every session is the noise this leaves out."""
+    trail = _trail([_inputs() for _ in range(1)], field="pressure")
+
+    assert [c.kind for c in trail] == ["PRESSURE"]
+
+
+def test_a_pressure_flip_is_reported_against_its_field():
+    rows = [_inputs() for _ in range(4)]
+    rows += [_inputs(pressure_bar=-BIG, pressure_avg=-BIG) for _ in range(3)]
+
+    trail = _trail(rows, field="pressure")
+
+    assert "Flipped to selling" in [c.text for c in trail]
+
+
+def test_the_persistence_ladder_is_reported_step_by_step():
+    trail = _trail([_inputs() for _ in range(6)], field="pressure")
+    steps = [c.text for c in trail if c.kind == "PERSISTENCE"]
+
+    assert steps == ["Pressure building", "Pressure persistent"]
+
+
+def test_a_forming_candidate_and_its_confirmation_both_print():
+    """Barrie's requirement: the early read is visible, and so is the moment it
+    became the header."""
+    rows = [_inputs() for _ in range(3)] + [_inputs(stability=-STRONG) for _ in range(2)]
+
+    trail = _trail(rows, field="state")
+    texts = [c.text for c in trail if not c.opening]
+
+    assert texts == ["Fragile rally forming", "Fragile rally"]
+
+
+def test_a_candidate_that_fades_does_not_announce_its_own_disappearance():
+    """It never reached the header, so there is nothing to retract. Reporting
+    it would be reporting the noise confirmation exists to absorb."""
+    rows = [_inputs() for _ in range(3)] + [_inputs(stability=-STRONG)] + [_inputs()]
+
+    trail = _trail(rows, field="state")
+
+    assert [c.text for c in trail if not c.opening] == ["Fragile rally forming"]
+
+
+def test_the_cushion_reports_where_it_is_and_where_it_is_going_separately():
+    """A band change and a rate change are different facts: thin-and-stable is
+    not thin-and-collapsing, which is the distinction Barrie asked for."""
+    rows = [_inputs(cushion_state="SECURE", cushion_pts=40.0, cushion_rate_pts=2.0)] * 3
+    rows += [_inputs(cushion_state="THIN", cushion_pts=6.0, cushion_rate_pts=-4.0)] * 2
+
+    kinds = {c.kind for c in _trail(rows, field="cushion") if not c.opening}
+
+    assert kinds == {"CUSHION_BAND", "CUSHION_RATE"}
+
+
+def test_no_flip_reports_the_band_but_not_a_direction():
+    """There is no boundary, so "steady" would describe a cushion that does
+    not exist."""
+    rows = [_inputs(cushion_state="NO_FLIP") for _ in range(3)]
+
+    trail = _trail(rows, field="cushion")
+
+    assert [c.kind for c in trail] == ["CUSHION_BAND"]
+    assert trail[0].text == "No gamma flip in the profile"
+
+
+def test_the_trail_is_ordered_by_time():
+    rows = [_inputs() for _ in range(4)]
+    rows += [_inputs(pressure_bar=-BIG, pressure_avg=-BIG, stability=-STRONG) for _ in range(3)]
+
+    stamps = [c.bar_start for c in _trail(rows)]
+
+    assert stamps == sorted(stamps)
+
+
+def test_an_empty_session_has_no_trail():
+    from src.analytics.gamma_weather import changes
+
+    assert changes([], []) == []
+
+
+def test_a_mismatched_trail_is_refused_rather_than_zipped_short():
+    """Silently truncating would date every later comment wrongly, which is
+    worse than failing, because nothing downstream could tell."""
+    import pytest
+
+    from src.analytics.gamma_weather import changes
+
+    series = classify_series([_inputs() for _ in range(3)])
+    with pytest.raises(ValueError):
+        changes(series, _stamps(2))
+
+
+def test_a_cause_is_reported_before_its_consequence():
+    """Sorting the trail alphabetically put "Pressure persistent" above the
+    "Flipped to buying" that produced it, which reads backwards to anyone
+    scanning a session."""
+    rows = [_inputs(pressure_bar=-BIG, pressure_avg=-BIG) for _ in range(4)]
+    rows += [_inputs() for _ in range(3)]
+
+    trail = [c for c in _trail(rows, field="pressure") if not c.opening]
+    flip = next(c for c in trail if c.kind == "PRESSURE")
+    # Only within the bar they share: a ladder step on an earlier bar is a
+    # different event, not this one out of order.
+    same_bar = [c.kind for c in trail if c.bar_start == flip.bar_start]
+
+    assert same_bar.index("PRESSURE") < same_bar.index("PERSISTENCE")

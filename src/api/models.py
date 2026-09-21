@@ -716,6 +716,66 @@ class GammaWeatherResponse(BaseModel):
     disclosure: str
 
 
+class GammaWeatherBar(BaseModel):
+    """One bar of the session's Gamma Weather, as the panel read it at the time."""
+
+    bar_start: str
+    state: str
+    label: str
+    sentence: str
+    pressure: str
+    structure: str
+    gamma_trend: str
+    lean_side: Optional[str] = None
+    cushion: str
+    cushion_band: Optional[str] = None
+    persistence: str
+    persistence_label: str
+    age_bars: int
+    age_minutes: Optional[float] = None
+    age: Optional[str] = None
+    age_label: Optional[str] = None
+    pending_state: Optional[str] = None
+    pending_label: Optional[str] = None
+    pending_bars: int = 0
+
+
+class GammaWeatherChange(BaseModel):
+    """A moment the panel said something new.
+
+    ``field`` is which header field the line belongs under, so an open drawer
+    shows only its own story. ``opening`` marks the session's first read of a
+    field rather than a change to it.
+    """
+
+    bar_start: str
+    field: str
+    kind: str
+    text: str
+    opening: bool = False
+
+
+class GammaWeatherSeriesResponse(BaseModel):
+    """The session's Weather history, plus only the moments worth commenting on.
+
+    The current-state endpoint answers "what is it now". This answers "what
+    happened while I was away", which a header cannot: words capture one slice
+    of time and the question is about a pattern.
+
+    ``changes`` is deliberately not one entry per bar. A quiet stretch produces
+    nothing, so a session that sits in one state all afternoon yields one line
+    rather than fifty identical ones.
+    """
+
+    symbol: str
+    session: str
+    bars: List[GammaWeatherBar]
+    changes: List[GammaWeatherChange]
+    confirm_bars: int
+    basis: str
+    disclosure: str
+
+
 class MarketTideComponent(BaseModel):
     symbol: str
     flow_score: float

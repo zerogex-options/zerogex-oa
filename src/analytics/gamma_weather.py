@@ -238,6 +238,12 @@ class Weather:
     pending_label: Optional[str] = None
     #: Completed bars the candidate has held, 1 .. CONFIRM_BARS - 1.
     pending_bars: int = 0
+    #: SECURE / NORMAL / THIN / CROSSING / NO_FLIP, echoed from the inputs.
+    #: ``cushion`` above is the direction of travel; this is where the cushion
+    #: actually is, and the two change independently. Carried so a change
+    #: trail can be built from the series alone rather than from the series
+    #: plus the cushion objects that produced it.
+    cushion_band: Optional[str] = None
 
 
 def classify_pressure(bar: Optional[float], avg: Optional[float]) -> str:
@@ -574,6 +580,7 @@ def classify(inputs: WeatherInputs) -> Weather:
     return Weather(
         state=state,
         label=STATE_LABELS[state],
+        cushion_band=inputs.cushion_state,
         pressure=pressure,
         structure=structure,
         gamma_trend=classify_structure(inputs.gamma_trend),
@@ -679,3 +686,237 @@ def pair_series(
             )
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# The change trail: what actually happened, and when.
+# --------------------------------------------------------------------------- #
+#
+# A panel read at 15:40 answers "what is it now". Someone who looked away at
+# 11:00 needs "what happened while I was gone", and re-reading 78 sentences is
+# not an answer either. So this reduces a classified session to the moments a
+# label actually changed.
+#
+# "Quiet bars stay quiet" is structural rather than a filter applied at the
+# end: an event exists only where a tracked label differs from the bar before,
+# so a session that sits in one state all afternoon produces one line, not 50
+# identical ones. Nothing here re-derives anything. Every label was already
+# computed by classify_series, causally, which is what lets a trail rendered
+# now match what the panel showed at the time.
+
+CHANGE_STATE = "state"
+CHANGE_PRESSURE = "pressure"
+CHANGE_LEAN = "lean"
+CHANGE_STABILITY = "stability"
+CHANGE_GAMMA_TREND = "gamma_trend"
+CHANGE_CUSHION = "cushion"
+
+
+@dataclass(frozen=True)
+class WeatherChange:
+    """One moment worth commenting on.
+
+    ``field`` is which panel field the line belongs under, so an open drawer
+    can show only its own story. ``opening`` marks the session's first read of
+    a field rather than a change to it, which is worth distinguishing: a
+    session that never moves should still start its trail somewhere.
+    """
+
+    bar_start: Any
+    field: str
+    kind: str
+    text: str
+    opening: bool = False
+
+
+def _state_text(value: Optional[str]) -> Optional[str]:
+    return STATE_LABELS[value] if value else None
+
+
+def _pending_text(value: Optional[str]) -> Optional[str]:
+    # Only the appearance of a candidate is worth a line. Its disappearance is
+    # either a confirmation, which the state change already reports, or a
+    # candidate that faded, which is the noise confirmation exists to absorb.
+    return f"{STATE_LABELS[value]} forming" if value else None
+
+
+_PRESSURE_TEXT = {
+    PRESSURE_BUYING: "Flipped to buying",
+    PRESSURE_SELLING: "Flipped to selling",
+    PRESSURE_MIXED: "Pressure went mixed",
+}
+
+_PERSISTENCE_TEXT = {
+    PERSISTENCE_PULSE: "Pressure back to a pulse",
+    PERSISTENCE_BUILDING: "Pressure building",
+    PERSISTENCE_PERSISTENT: "Pressure persistent",
+}
+
+_LEAN_TEXT = {
+    LEAN_SUPPORTIVE: "Lean turned supportive",
+    LEAN_CAPPING: "Lean turned capping",
+}
+
+_STRUCTURE_TEXT = {
+    STRUCTURE_PINNING: "Gamma near price building",
+    STRUCTURE_ACCELERATIVE: "Gamma near price thinning",
+    STRUCTURE_FLAT: "Gamma near price flat",
+}
+
+_TREND_TEXT = {
+    STRUCTURE_PINNING: "Session gamma building",
+    STRUCTURE_ACCELERATIVE: "Session gamma thinning",
+    STRUCTURE_FLAT: "Session gamma flat",
+}
+
+_CUSHION_BAND_TEXT = {
+    "SECURE": "Cushion secure",
+    "NORMAL": "Cushion normal",
+    "THIN": "Cushion thin",
+    "CROSSING": "Cushion at crossing risk",
+    "NO_FLIP": "No gamma flip in the profile",
+}
+
+_CUSHION_RATE_TEXT = {
+    CUSHION_TRANSITION_RISK: "Cushion thin and closing quickly",
+    CUSHION_NARROWING: "Cushion narrowing",
+    CUSHION_WIDENING: "Cushion widening",
+    CUSHION_STEADY: "Cushion steady",
+    CUSHION_NONE: None,
+}
+
+
+def _mapped(table):
+    return lambda value: table.get(value) if value else None
+
+
+# The session's first bar is a reading, not a transition, so the fields whose
+# change wording assumes movement get a descriptive opening instead. "Pressure
+# back to a pulse" at 09:30 describes a return from nothing.
+_PRESSURE_OPEN_TEXT = {
+    PRESSURE_BUYING: "Opened buying",
+    PRESSURE_SELLING: "Opened selling",
+    PRESSURE_MIXED: "Opened mixed",
+}
+
+_LEAN_OPEN_TEXT = {
+    LEAN_SUPPORTIVE: "Lean supportive",
+    LEAN_CAPPING: "Lean capping",
+}
+
+
+def _no_opening(_value: Optional[str]) -> Optional[str]:
+    """Nothing to say at the open.
+
+    Persistence is the only one so far: the first bar of a session has no
+    history behind it, so it is always a pulse, and a line saying so on every
+    session is the sort of noise this trail exists to leave out.
+    """
+    return None
+
+
+#: (field, attribute, kind, change text, opening text) for every label a
+#: change can be reported on. Declarative on purpose: adding a field to the
+#: trail is a row here, and nothing else in this module needs to know.
+_TRACKED = (
+    (CHANGE_STATE, "state", "STATE", _state_text, _state_text),
+    (CHANGE_STATE, "pending_state", "FORMING", _pending_text, _pending_text),
+    (
+        CHANGE_PRESSURE,
+        "pressure",
+        "PRESSURE",
+        _mapped(_PRESSURE_TEXT),
+        _mapped(_PRESSURE_OPEN_TEXT),
+    ),
+    (
+        CHANGE_PRESSURE,
+        "persistence",
+        "PERSISTENCE",
+        _mapped(_PERSISTENCE_TEXT),
+        _no_opening,
+    ),
+    (CHANGE_LEAN, "lean_side", "LEAN", _mapped(_LEAN_TEXT), _mapped(_LEAN_OPEN_TEXT)),
+    (
+        CHANGE_STABILITY,
+        "structure",
+        "STABILITY",
+        _mapped(_STRUCTURE_TEXT),
+        _mapped(_STRUCTURE_TEXT),
+    ),
+    (
+        CHANGE_GAMMA_TREND,
+        "gamma_trend",
+        "GAMMA_TREND",
+        _mapped(_TREND_TEXT),
+        _mapped(_TREND_TEXT),
+    ),
+    (
+        CHANGE_CUSHION,
+        "cushion_band",
+        "CUSHION_BAND",
+        _mapped(_CUSHION_BAND_TEXT),
+        _mapped(_CUSHION_BAND_TEXT),
+    ),
+    (
+        CHANGE_CUSHION,
+        "cushion",
+        "CUSHION_RATE",
+        _mapped(_CUSHION_RATE_TEXT),
+        _mapped(_CUSHION_RATE_TEXT),
+    ),
+)
+
+
+def changes(
+    series: Sequence[Weather],
+    bar_starts: Sequence[Any],
+) -> List[WeatherChange]:
+    """Reduce a classified session to the moments something changed.
+
+    ``series`` and ``bar_starts`` are chronological and the same length. The
+    first bar contributes an opening line per field so every field's trail
+    starts somewhere, including on a session that then never moves.
+
+    A field whose text mapping returns ``None`` contributes nothing, which is
+    how "no flip in the profile" avoids announcing a cushion direction that
+    does not exist.
+    """
+    if not series:
+        return []
+    if len(series) != len(bar_starts):
+        raise ValueError("series and bar_starts must be the same length")
+
+    # Collected per field then ordered by bar index rather than by timestamp:
+    # two bars can carry the same bar_start on a malformed series, and an
+    # index cannot tie or go missing the way a looked-up timestamp can.
+    collected: List[tuple] = []
+    for order, (field, attr, kind, render, render_open) in enumerate(_TRACKED):
+        previous = None
+        for i, bar in enumerate(series):
+            value = getattr(bar, attr)
+            if i > 0 and value == previous:
+                continue
+            previous = value
+            text = (render_open if i == 0 else render)(value)
+            if text is None:
+                continue
+            collected.append(
+                (
+                    i,
+                    order,
+                    WeatherChange(
+                        bar_start=bar_starts[i],
+                        field=field,
+                        kind=kind,
+                        text=text,
+                        opening=(i == 0),
+                    ),
+                )
+            )
+
+    # Within a bar, declaration order rather than alphabetical: sorting by
+    # kind put "Pressure persistent" above the "Flipped to buying" that caused
+    # it, which reads backwards. _TRACKED is ordered so a cause precedes its
+    # consequence.
+    collected.sort(key=lambda row: (row[0], row[1]))
+    return [change for _, _, change in collected]

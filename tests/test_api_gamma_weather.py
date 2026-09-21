@@ -236,3 +236,176 @@ def test_http_keeps_the_two_ladders_distinguishable(monkeypatch: pytest.MonkeyPa
 
     assert payload["persistence"] != payload["age"]
     assert payload["persistence_label"] != payload["age_label"]
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/gex/weather-series
+# --------------------------------------------------------------------------- #
+
+
+def test_http_series_returns_every_paired_bar(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(12, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    assert len(payload["bars"]) == 12
+    assert payload["bars"][0]["bar_start"] < payload["bars"][-1]["bar_start"]
+
+
+def test_http_series_and_current_state_describe_the_same_bar(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Both go through one loader and one classifier. If they ever disagreed,
+    a comment in the drawer would contradict the header above it and there
+    would be no way to tell which was right."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(14, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        now = client.get("/api/gex/weather?symbol=SPY").json()
+        _attach(mainmod, flow, regime)
+        series = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    newest = series["bars"][-1]
+    for field in ("bar_start", "state", "sentence", "persistence", "age_minutes"):
+        assert newest[field] == now[field]
+
+
+def test_http_series_reports_only_real_changes(monkeypatch: pytest.MonkeyPatch):
+    """A quiet session must not produce one comment per bar. That is the whole
+    point: the trail exists so someone returning to the page does not have to
+    read 78 sentences."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(40, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    assert len(payload["changes"]) < len(payload["bars"])
+
+
+def test_http_series_changes_carry_a_field_to_file_them_under(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An open drawer shows one field's story, so every line has to say which
+    field it belongs to."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(12, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    fields = {c["field"] for c in payload["changes"]}
+    assert fields <= {"state", "pressure", "lean", "stability", "gamma_trend", "cushion"}
+    assert "state" in fields
+    assert all(c["text"] for c in payload["changes"])
+
+
+def test_http_series_carries_the_confirmation_window(monkeypatch: pytest.MonkeyPatch):
+    """So a client can render "1 of 2" without hard-coding the rule."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(12, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    assert payload["confirm_bars"] >= 2
+
+
+def test_http_series_keeps_the_estimated_flow_caveat(monkeypatch: pytest.MonkeyPatch):
+    """It inherits the aggressor-inferred basis like every other flow read, and
+    a history view is exactly where that caveat could get quietly dropped."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(12, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    assert payload["basis"] == "aggressor_inferred"
+    assert "Not observed dealer flow" in payload["disclosure"]
+
+
+def test_http_series_unknown_symbol_is_404(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, None, None)
+        assert client.get("/api/gex/weather-series?symbol=NOPE").status_code == 404
+
+
+def test_http_series_rejects_a_bad_symbol(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app(monkeypatch)
+
+    with TestClient(app) as client:
+        assert client.get("/api/gex/weather-series?symbol=SP%20Y").status_code == 400
+
+
+def test_http_series_with_no_shared_bar_is_409(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app(monkeypatch)
+    flow, _ = _series(6, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, [])
+        assert client.get("/api/gex/weather-series?symbol=SPY").status_code == 409
+
+
+# --------------------------------------------------------------------------- #
+# The dated read, through the shared loader.
+# --------------------------------------------------------------------------- #
+
+
+def test_http_a_dated_read_reaches_both_series(monkeypatch: pytest.MonkeyPatch):
+    """The ?date= selector was written straight into the current-state
+    endpoint and now runs through the shared loader instead. If it stopped
+    reaching the accessors, a dated permalink would quietly serve today."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(8, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather?symbol=SPY&date=2026-04-24").json()
+        flow_call = mainmod.db_manager.get_hedging_flow_series.await_args
+        regime_call = mainmod.db_manager.get_gamma_regime_series.await_args
+
+    assert flow_call.kwargs["session_date"].isoformat() == "2026-04-24"
+    assert regime_call.kwargs["session_date"].isoformat() == "2026-04-24"
+    assert payload["session"] == "2026-04-24"
+
+
+def test_http_a_dated_series_read_resolves_the_same_day(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A dated drawer and a dated header must describe one session. They share
+    the loader precisely so this cannot drift."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(8, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY&date=2026-04-24").json()
+        regime_call = mainmod.db_manager.get_gamma_regime_series.await_args
+
+    assert regime_call.kwargs["session_date"].isoformat() == "2026-04-24"
+    assert payload["session"] == "2026-04-24"
+
+
+def test_http_a_malformed_date_is_refused_on_both_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Falling back to the current session would serve today's read under
+    someone else's permalink."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(8, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        assert client.get("/api/gex/weather?symbol=SPY&date=nonsense").status_code == 400
+        assert client.get("/api/gex/weather-series?symbol=SPY&date=nonsense").status_code == 400
