@@ -253,9 +253,21 @@ async def _run(args: argparse.Namespace) -> int:
                   f"real {r['real']*100:5.1f}%  gap {r['gap']*100:+6.1f}")
         print(f"   tuned    mean |gap| {t_gap*100:.1f} pts   brier {t_brier:.4f}")
         print(f"   current  mean |gap| {base_t[0]*100:.1f} pts   brier {base_t[1]:.4f}")
-        if t_gap >= base_t[0]:
+        # Three outcomes, not two. The sweep can land ON the committed
+        # configuration, which is a pass rather than a failure — reporting
+        # that as "do not ship this fit" reads as a problem when it is the
+        # strongest result available: nothing in the grid beats what is live.
+        same = (abs(t_gap - base_t[0]) < 1e-9 and abs(t_brier - base_t[1]) < 1e-9)
+        if same:
+            print("   -> the sweep found nothing better than what is already "
+                  "committed. No change indicated.")
+        elif t_gap >= base_t[0]:
             print("   -> does NOT beat the committed parameters out of sample. "
                   "Do not ship this fit.")
+        else:
+            print(f"   -> beats the committed parameters out of sample "
+                  f"({base_t[0] * 100:.1f} -> {t_gap * 100:.1f} pts). "
+                  f"Check the ablation before shipping it.")
 
         # Ablation, LEAVE-ONE-OUT from the committed config.
         #
