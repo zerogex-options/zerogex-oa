@@ -315,13 +315,18 @@ def _compute_analytics(
         diag = engine._gamma_flip_unresolved_diagnostics(rows, profile, spot, now)
         logger.warning(
             "%s: gamma_flip unresolved through span=%.2f -- "
-            "usable=%d (calls=%d puts=%d) profile pos/neg/zero=%d/%d/%d "
+            "usable=%d/%d (%.0f%%; dropped %d no-IV, %d no-OI) "
+            "calls=%d puts=%d profile pos/neg/zero=%d/%d/%d "
             "peak=%.3g reference=%.3g floor=%.3g "
             "iv p50=%.3f p90=%.3f max=%.3f at_default=%.0f%% "
             "oi_share 0dte=%.0f%% weighted 0dte=%.0f%%",
             label,
             span,
             diag["usable_total"],
+            diag["considered"],
+            100.0 * diag["usable_share"],
+            diag["excluded_no_iv"],
+            diag["excluded_no_oi"],
             diag["usable_calls"],
             diag["usable_puts"],
             diag["profile_pos_pts"],

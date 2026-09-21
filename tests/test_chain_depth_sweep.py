@@ -191,3 +191,28 @@ def test_a_partially_resolved_sweep_still_counts_what_resolved():
     assert summary[3]["resolved"] == 0 and summary[3]["attempted"] == 2
     assert summary[12]["resolved"] == 2
     assert summary[12]["mean_flip"] == 732.0
+
+
+def test_a_make_truncated_symbol_is_rejected_before_the_first_round(capsys):
+    """`make sweep UNDERLYING='$SPXW.X'` delivers 'PXW.X'.
+
+    Make expands $S as a variable of its own before exporting, and the
+    symbol that arrives cannot exist. Six rounds at a minute apiece is six
+    minutes to learn that, which is exactly what happened on 2026-09-21.
+    """
+    import pytest
+
+    with pytest.raises(SystemExit):
+        chain_depth_sweep.main(["--underlying", "PXW.X"])
+    err = capsys.readouterr().err
+    assert "is not a symbol" in err
+    assert "UNDERLYING='$SPXW.X' make" in err, "the message must carry the fix"
+
+
+def test_a_real_index_symbol_is_not_rejected():
+    """The guard keys on a trailing .X with no leading $ -- '$SPXW.X' passes."""
+    from src.tools.feed_compare import _detect_mangled_index_symbol
+
+    assert _detect_mangled_index_symbol("$SPXW.X") is None
+    assert _detect_mangled_index_symbol("QQQ") is None
+    assert _detect_mangled_index_symbol("PXW.X") is not None
