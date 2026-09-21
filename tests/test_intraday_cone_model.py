@@ -27,6 +27,8 @@ import pytest
 
 from src.jobs.intraday_cone_model import (
     CONE_HORIZONS_MIN,
+    CONE_VOL_RATIO_MAX,
+    CONE_VOL_RATIO_MIN,
     GAMMA_MULT_MAX,
     GAMMA_MULT_MIN,
     HOLD_PROB_MAX,
@@ -443,6 +445,90 @@ def test_hold_probability_describes_the_band_actually_drawn():
             spot=600.0, band_low=h.band_low, band_high=h.band_high, sigma=h.sigma
         )
         assert h.hold_prob == pytest.approx(expected, abs=1e-9)
+
+
+def test_the_committed_vol_call_scales_the_implied_leg():
+    """The correction for this model's largest early error.
+
+    The first version used the raw implied move, which is arithmetically
+    identical to asserting that every session delivers a normal day's range.
+    Three backfilled sessions came back at roughly half that, so the bands
+    were sized for movement that never arrived and nearly everything held.
+    """
+    normal = compute_cone(_inputs(expected_vol_ratio=None))
+    quiet = compute_cone(_inputs(expected_vol_ratio=0.60))
+    assert quiet.daily_sigma < normal.daily_sigma
+    assert quiet.daily_sigma == pytest.approx(normal.daily_sigma * 0.60, rel=0.35), (
+        "the ratio scales only the implied leg, not the realized one"
+    )
+    q_width = quiet.horizons[0].band_high - quiet.horizons[0].band_low
+    n_width = normal.horizons[0].band_high - normal.horizons[0].band_low
+    assert q_width < n_width
+    assert "morning vol call" in " ".join(quiet.rationale)
+
+
+def test_the_vol_call_raises_hold_only_through_the_structural_clamp():
+    """WHY the fix works, pinned so a later change cannot break the channel.
+
+    Barrier survival is scale-free, so shrinking the band and the walk
+    together cannot move the probability — and with no wall in range, it
+    doesn't. The gain comes entirely from a correctly-sized band overshooting
+    the walls less and therefore being clamped less. Losing that distinction
+    is how someone later "simplifies" the ratio onto the band alone and
+    silently reintroduces the inverted-gamma bug from the first draft.
+    """
+    bare = dict(call_wall=None, put_wall=None, gamma_flip=None)
+    open_normal = compute_cone(_inputs(expected_vol_ratio=None, **bare))
+    open_quiet = compute_cone(_inputs(expected_vol_ratio=0.60, **bare))
+    # Not bit-exact: band edges and sigma are rounded to the precision they are
+    # published at before the probability is derived from them, so the two
+    # differ in the fifth decimal. A tenth of a point is far below anything a
+    # reader could act on, and far below the gain the clamped case must show.
+    for a, b in zip(open_normal.horizons, open_quiet.horizons):
+        assert a.hold_prob == pytest.approx(b.hold_prob, abs=0.001), (
+            "with no wall in range the ratio must not move the odds"
+        )
+
+    # Put a wall where a normal-sized band overshoots it and a quiet one does not.
+    walled = dict(call_wall=601.2, put_wall=598.8, gamma_flip=None)
+    clamped_normal = compute_cone(_inputs(expected_vol_ratio=None, **walled))
+    clamped_quiet = compute_cone(_inputs(expected_vol_ratio=0.60, **walled))
+    gain = clamped_quiet.horizons[-1].hold_prob - clamped_normal.horizons[-1].hold_prob
+    assert gain > 0.02, (
+        f"the structural channel must carry a real gain, got {gain:.4f}"
+    )
+
+
+def test_a_nonsense_vol_call_cannot_wreck_the_session():
+    """A ratio is a published claim, not a measurement."""
+    floored = compute_cone(_inputs(expected_vol_ratio=0.001))
+    at_floor = compute_cone(_inputs(expected_vol_ratio=CONE_VOL_RATIO_MIN))
+    assert floored.daily_sigma == pytest.approx(at_floor.daily_sigma, rel=1e-9)
+
+    capped = compute_cone(_inputs(expected_vol_ratio=999.0))
+    at_cap = compute_cone(_inputs(expected_vol_ratio=CONE_VOL_RATIO_MAX))
+    assert capped.daily_sigma == pytest.approx(at_cap.daily_sigma, rel=1e-9)
+
+    # Garbage that is not a number degrades to "no call", not to a crash.
+    assert compute_cone(_inputs(expected_vol_ratio="nonsense")).horizons
+
+
+def test_no_committed_call_behaves_as_it_did_before():
+    """A session with no morning forecast must still produce an honest cone."""
+    none_given = compute_cone(_inputs(expected_vol_ratio=None))
+    assert len(none_given.horizons) == len(CONE_HORIZONS_MIN)
+    assert "morning vol call" not in " ".join(none_given.rationale)
+
+
+def test_realized_now_dominates_by_the_end_of_the_session():
+    """The old 0.55 cap left a stale morning number carrying 49% of the weight
+    at 15:30, when the realized read had already seen ~88% of the day."""
+    early, _ = blended_daily_sigma(implied_sigma=10.0, realized_sigma=2.0, elapsed_min=15)
+    late, _ = blended_daily_sigma(implied_sigma=10.0, realized_sigma=2.0, elapsed_min=360)
+    assert early > late, "realized should pull harder as the session accumulates"
+    # At the last fire the realized read must be the majority of the blend.
+    assert late < 0.5 * (10.0 + 2.0), f"realized should dominate by 15:30, got {late}"
+    assert late == pytest.approx(10.0 - 0.80 * 8.0, abs=0.15)
 
 
 def test_cone_degrades_rather_than_raises_on_a_thin_surface():

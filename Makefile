@@ -4768,19 +4768,37 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)drawn for more movement than happened, so they hold more often than$(NC)"; \
 	echo "$(YELLOW)predicted -- underconfident. Well ABOVE 1 is the reverse.$(NC)"; \
 	echo "$(YELLOW)gap = realized hold rate minus mean predicted. Near 0 is calibrated.$(NC)"; \
+	echo "$(YELLOW)realized_range_pct is the FULL 09:30-16:00 cash session from$(NC)"; \
+	echo "$(YELLOW)underlying_quotes. It deliberately does not reuse the graded$(NC)"; \
+	echo "$(YELLOW)windows: those start at 10:15 and so miss the opening 45 minutes,$(NC)"; \
+	echo "$(YELLOW)which carry 23%% of the day's variance -- measuring there understated$(NC)"; \
+	echo "$(YELLOW)the range by ~12%% and biased vol_ratio low.$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per session x symbol ---$(NC)"; \
-	$(PSQL) -c "WITH s AS ( \
+	$(PSQL) -c "WITH c AS ( \
 		SELECT session_date, symbol, \
 		       COUNT(*) AS claims, \
 		       COUNT(*) FILTER (WHERE held) AS held_n, \
 		       AVG(hold_prob) AS mean_pred, \
 		       AVG(daily_sigma / NULLIF(anchor_spot,0)) AS sigma_frac, \
-		       (MAX(window_high) - MIN(window_low)) / NULLIF(AVG(anchor_spot),0) AS realized_frac \
+		       AVG(anchor_spot) AS spot \
 		FROM intraday_forecast \
 		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
 		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
-		GROUP BY session_date, symbol) \
+		GROUP BY session_date, symbol), \
+		tape AS ( \
+		SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d, symbol, \
+		       MAX(high) - MIN(low) AS rng \
+		FROM underlying_quotes \
+		WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		      BETWEEN TIME '09:30' AND TIME '16:00' \
+		  AND (timestamp AT TIME ZONE 'America/New_York')::date \
+		      >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY 1, 2), \
+		s AS ( \
+		SELECT c.*, t.rng / NULLIF(c.spot,0) AS realized_frac \
+		FROM c LEFT JOIN tape t \
+		  ON t.d = c.session_date AND t.symbol = c.symbol) \
 		SELECT session_date, symbol, claims, \
 		       ROUND(100.0 * held_n / claims, 1) AS hold_pct, \
 		       ROUND(100.0 * mean_pred, 1)       AS pred_pct, \

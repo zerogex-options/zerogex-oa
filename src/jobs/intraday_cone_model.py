@@ -171,7 +171,23 @@ WALL_LEAN_MIN_FRACTION = 0.45  # never pull an edge inside this × raw half-widt
 #: Blend weight on the realized-so-far sigma against the implied sigma.  Early
 #: in the session realized is a thin sample, so the weight ramps in with the
 #: square root of elapsed variance rather than being applied flat from 09:45.
-REALIZED_BLEND_MAX = 0.55
+#:
+#: Raised from 0.55 after three backfilled sessions came back with realized
+#: range running about half the vol basis at every horizon.  The old cap was
+#: indefensible at the tail of the session: by 15:30 the realized read has
+#: seen ~88% of the day's variance and the implied number is a stale morning
+#: guess, yet implied still carried 49% of the weight.  At 0.85 the weight
+#: runs ~0.26 at 09:45 and ~0.80 at 15:30 — realized dominates once it has
+#: earned the right to, and implied never vanishes entirely because it is the
+#: only input that knows about a scheduled event later in the day.
+REALIZED_BLEND_MAX = 0.85
+
+#: Bounds on the morning's committed expected-vol ratio when the cone adopts
+#: it.  A ratio is a published claim, not a measurement, so a bad one is
+#: clamped rather than allowed to collapse or explode the whole session's
+#: bands.  The range matches the daily model's own VOL_RATIO_MIN/MAX.
+CONE_VOL_RATIO_MIN = 0.45
+CONE_VOL_RATIO_MAX = 1.90
 
 #: Published hold probabilities are clamped so a degenerate band never reads
 #: as a certainty in either direction.
@@ -324,16 +340,51 @@ def blended_daily_sigma(
     realized_sigma: Optional[float],
     elapsed_min: float,
     session_minutes: int = SESSION_MINUTES,
+    expected_vol_ratio: Optional[float] = None,
 ) -> tuple[float, list[str]]:
     """Blend the implied and realized full-day sigmas, weighting realized by
     how much of the day it has actually seen.
 
     At 09:45 the realized estimate rests on 15 minutes and gets little weight;
-    by 14:00 it rests on most of the session's variance and gets most of
+    by 15:30 it rests on ~88% of the session's variance and gets most of
     ``REALIZED_BLEND_MAX``.  Returns ``(sigma, rationale)`` and falls back to
     whichever input exists when the other is missing.
+
+    ``expected_vol_ratio`` is the morning forecast's committed call on how
+    much of a NORMAL day's range today should deliver, and it scales the
+    implied leg before the blend.
+
+    That scaling is not a refinement, it is the correction for this model's
+    largest early error.  The first version used the raw implied move, which
+    is arithmetically identical to asserting a ratio of 1.0 — every day is an
+    average day — and three backfilled sessions came back at roughly 0.5.
+    The bands were sized for movement that did not arrive, so nearly
+    everything held and the published probabilities meant nothing.
+
+    The daily model had already learned this and said so in its own
+    docstrings: vol clusters, so how the tape has actually been trading beats
+    structure alone, and anchoring on that is what stops the prediction
+    defaulting to "normal".  The cone now inherits that call instead of
+    re-deciding it worse.
+
+    Worth stating plainly: the daily model publishes expected_vol_ratio
+    UNGRADED, because it does not beat a majority-bucket baseline.  Adopting
+    it inherits a claim its own authors will not score.  It is still the
+    better of the two available options — a mediocre estimator beats a
+    constant that is wrong by a factor of two — and it ties the two surfaces
+    together, so improving the vol call improves both at once.
     """
     notes: list[str] = []
+    if implied_sigma is not None and implied_sigma > 0 and expected_vol_ratio is not None:
+        try:
+            ratio = _clamp(
+                float(expected_vol_ratio), CONE_VOL_RATIO_MIN, CONE_VOL_RATIO_MAX
+            )
+        except (TypeError, ValueError):
+            ratio = None
+        if ratio is not None:
+            implied_sigma = implied_sigma * ratio
+            notes.append(f"implied scaled to the morning vol call ({ratio:.2f}x a normal day)")
     have_implied = implied_sigma is not None and implied_sigma > 0
     have_realized = realized_sigma is not None and realized_sigma > 0
     if have_implied and have_realized:
@@ -430,6 +481,11 @@ class ConeInputs:
     # Vol basis.  ``implied_move`` is the committed full-day 1-σ dollar move
     # from the morning forecast; session high/low drive the realized estimate.
     implied_move: Optional[float] = None
+    #: The morning forecast's committed expected_vol_ratio — predicted realized
+    #: range as a multiple of a normal day's.  None means no call was
+    #: committed, and the cone falls back to treating today as average, which
+    #: is what it used to do unconditionally and got wrong.
+    expected_vol_ratio: Optional[float] = None
     session_high: Optional[float] = None
     session_low: Optional[float] = None
 
@@ -552,6 +608,7 @@ def compute_cone(inp: ConeInputs) -> ConeResult:
         realized_sigma=realized,
         elapsed_min=inp.elapsed_min,
         session_minutes=inp.session_minutes,
+        expected_vol_ratio=inp.expected_vol_ratio,
     )
     result.daily_sigma = daily_sigma
     result.rationale.extend(sigma_notes)

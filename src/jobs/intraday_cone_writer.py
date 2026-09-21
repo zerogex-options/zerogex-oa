@@ -161,10 +161,15 @@ async def _build_inputs(
     # The committed morning vol basis (see the module docstring on why this is
     # not a fresh VIX read).
     implied_move: Optional[float] = None
+    expected_vol_ratio: Optional[float] = None
     try:
         morning = await db.get_daily_forecast(symbol, day)
         if morning:
             implied_move = _f(morning.get("implied_move"))
+            # The morning's committed call on how much of a normal day's range
+            # today should deliver. Without it the cone treats every session as
+            # average, which three backfills showed it is not.
+            expected_vol_ratio = _f(morning.get("expected_vol_ratio"))
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "intraday_cone_writer: morning forecast lookup failed for %s: %s", symbol, exc
@@ -202,6 +207,7 @@ async def _build_inputs(
         spot=spot,
         elapsed_min=_elapsed_minutes(now, day),
         implied_move=implied_move,
+        expected_vol_ratio=expected_vol_ratio,
         session_high=_f(session_extremes.get("window_high")) if session_extremes else None,
         session_low=_f(session_extremes.get("window_low")) if session_extremes else None,
         call_wall=_f(gex.get("call_wall")) if (gex and fresh) else None,
@@ -215,6 +221,7 @@ async def _build_inputs(
         "session_date": day.isoformat(),
         "spot": spot,
         "implied_move": implied_move,
+        "expected_vol_ratio": expected_vol_ratio,
         "gex_fresh": fresh,
         "model_version": MODEL_VERSION,
     }
