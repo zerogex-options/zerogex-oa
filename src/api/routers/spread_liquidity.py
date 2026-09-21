@@ -1,0 +1,1365 @@
+"""Spread Monitor — quoted bid/ask width and liquidity across an option chain.
+
+    GET /api/market/spreads          — the current chain, reduced
+    GET /api/market/spreads/series   — how today's widths moved, per bucket
+    GET /api/market/spreads/compare  — the same reading across symbols
+    GET /api/market/spreads/history  — the trailing daily rollup
+
+Every other analytics surface here reads the book to say what it *means*.
+This one reads the same rows to say whether you can get filled in it: a
+gamma wall three points away is worth nothing to a trader whose put is
+quoted 12.40 x 15.80.  The inputs are the ``bid`` / ``ask`` columns already
+ingested on every ``option_chains`` row — no new data, just the summary
+nobody had computed.
+
+The arithmetic lives in :mod:`src.analytics.spread_stats`, which is also
+what the analytics writer and the historical backfill call.  That is not
+tidiness: the headline number here is scored against the daily rollup, and
+a comparison computed by two implementations of the same statistic is a
+comparison of the implementations.
+
+--------------------------------------------------------------------------
+Three numbers, because one cannot do the job
+--------------------------------------------------------------------------
+
+``median_relative_spread_pct``
+    Width as a share of the option's own mid.  The headline: it is what
+    makes a cheap option untradeable, since a put quoted 0.05 x 0.35 costs
+    150% of its premium to cross.
+
+``median_spread_bps_underlying``
+    Width in basis points of the index level.  The only measure here that
+    is comparable ACROSS symbols — SPX near 6,800 and NDX near 25,000 are
+    not on one dollar scale and never will be.
+
+``zero_bid_pct``
+    The failure that has no width at all.  A contract quoted 0.00 x 2.40
+    has no market; it is excluded from every median (there is nothing to
+    take a median of) and counted here instead.  Without this number a
+    chain would appear to TIGHTEN as its wings went no-bid, because only
+    the still-quoted contracts would remain in the sample.
+
+--------------------------------------------------------------------------
+What these endpoints do not claim
+--------------------------------------------------------------------------
+
+* **Quoted, not effective.**  Effective spread measures fills against the
+  midpoint at the time of the fill.  That needs per-trade prints and an
+  NBBO to compare them to; neither is stored.  Every response carries a
+  ``disclosure`` saying so, and surfaces must render it.
+* **No depth.**  The feed carries no bid/ask sizes, so a tight quote for
+  one contract and a tight quote for a thousand are indistinguishable here.
+* **Futures are refused, not projected.**  ES / NQ carry no option chain of
+  their own — their surfaces are SPX / NDX levels carried onto the futures
+  price axis — so there is no futures quote to measure a width from.  The
+  futures middleware answers 400 (see ``_UNSUPPORTED_PREFIXES`` in
+  ``src/api/futures_middleware.py``); inventing a width by scaling an SPX
+  quote would be a fabricated answer to the one question this page exists
+  to answer honestly.
+
+--------------------------------------------------------------------------
+Why this rides MARKET_RAW despite publishing only aggregates
+--------------------------------------------------------------------------
+
+Nothing below is per-contract — every figure is a median or a p90 over a
+population, and a median does not invert to the values behind it.  But the
+CALLER picks the population: ``moneyness_band_pct`` goes to 0.25,
+``dte_max`` to 0, and each bucket reports its own ``tradable_count``.  Narrow
+one to a single contract and the quote falls out by arithmetic, since
+``median_spread`` is then ``ask - bid`` and ``median_relative_spread_pct`` is
+``200 * (ask - bid) / (ask + bid)`` for that one contract — two equations,
+two unknowns, and the response names the expiration, strike band and option
+type it belongs to.
+
+Which is the premium surface's failure mode wearing an aggregate's clothes,
+so it gets the premium surface's answer: gate the route, because there is no
+field to redact that closes it, and suppressing thin buckets would not either
+(a caller can vary the band and difference the results).  See the
+``src/api/scopes.py`` docstring for where that line is drawn, and
+``tests/test_market_data_scope_boundary.py`` for its enforcement.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import OrderedDict
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+
+from src.analytics import spread_stats as spread_stats_mod
+from src.analytics import surface_store
+from src.config import (
+    SPREAD_STATS_DTE_MAX,
+    SPREAD_STATS_MIN_CONTRACTS,
+    SPREAD_STATS_MONEYNESS_BAND_PCT,
+    SPREAD_SURFACE_BUCKET_MINUTES,
+    SPREAD_SURFACE_HISTORY_DAYS,
+    SPREAD_SURFACE_MIN_SESSIONS,
+)
+from src.market_calendar import is_am_settled_contract, trading_dte_map
+from zoneinfo import ZoneInfo
+
+from ..database import DatabaseManager
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/market/spreads", tags=["Market Data", "Beta"])
+
+#: The exchange clock every time-of-day comparison is made in.
+_SURFACE_ET = ZoneInfo("America/New_York")
+
+
+#: Rendered on every response.  The distinction between quoted and effective
+#: spread is the one a reader is most likely to get wrong, and getting it
+#: wrong turns a real observation into an overstated one.
+DISCLOSURE = (
+    "Quoted (NBBO) spreads, not effective spreads: this measures the width "
+    "market makers are showing, not what trades actually filled at. Sizes "
+    "are not carried by the feed, so a tight quote for one contract and a "
+    "tight quote for a thousand look identical here."
+)
+
+#: The symbols with an option chain of their own.  ES / NQ are absent
+#: because they have none here — see the module docstring.
+COMPARABLE_SYMBOLS = ("SPX", "NDX", "SPY", "QQQ")
+
+#: Trailing sessions used for the "is this unusual?" percentile.  A quarter
+#: of sessions is long enough to span a vol regime and short enough that a
+#: structural change (a new listing schedule, a fee change) doesn't sit in
+#: the window forever.
+DEFAULT_HISTORY_DAYS = 60
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
+
+class SpreadAggregateModel(BaseModel):
+    """One population's quote quality. Widths are null when nothing is quoted."""
+
+    contract_count: int
+    tradable_count: int
+    two_sided_pct: float
+    zero_bid_pct: float
+    crossed_or_locked_pct: float
+    no_quote_pct: float
+    median_spread: Optional[float] = None
+    median_relative_spread_pct: Optional[float] = None
+    p90_relative_spread_pct: Optional[float] = None
+    median_spread_bps_underlying: Optional[float] = None
+    p90_spread_bps_underlying: Optional[float] = None
+    total_open_interest: int = 0
+    total_volume: int = 0
+
+
+class SpreadScope(BaseModel):
+    """The population measured. Two readings are only comparable if these match."""
+
+    dte_max: int
+    moneyness_band_pct: float
+    strike_low: float
+    strike_high: float
+    contract_count: int
+
+
+class MoneynessBucket(SpreadAggregateModel):
+    moneyness_low_pct: float
+    moneyness_high_pct: float
+    label: str
+
+
+class ExpirationSlice(BaseModel):
+    expiration: date
+    dte: int
+    calls: SpreadAggregateModel
+    puts: SpreadAggregateModel
+    all: SpreadAggregateModel
+
+
+class HistoryContext(BaseModel):
+    """Where today's reading sits in the symbol's own trailing history.
+
+    Percentiles are null — not 50, not 0 — when the rollup has too little
+    history to rank against. "No comparison available" and "an ordinary
+    day" must never render identically.
+    """
+
+    sessions: int
+    calls_percentile: Optional[float] = None
+    puts_percentile: Optional[float] = None
+    all_percentile: Optional[float] = None
+    puts_median_over_window: Optional[float] = None
+    calls_median_over_window: Optional[float] = None
+    #: Today's put width divided by its median over the window. 2.0 means
+    #: puts are quoted twice as wide as a typical session in the window.
+    puts_vs_window_ratio: Optional[float] = None
+
+
+class SpreadSnapshotResponse(BaseModel):
+    symbol: str
+    spot_price: float
+    timestamp: datetime
+    session_date: date
+    basis: str = "quoted_nbbo"
+    disclosure: str = DISCLOSURE
+    scope: SpreadScope
+    calls: SpreadAggregateModel
+    puts: SpreadAggregateModel
+    all: SpreadAggregateModel
+    #: Put median width / call median width. Above 1 means puts are the
+    #: expensive side to trade — the shape the "index puts have gone
+    #: bonkers" complaint describes. Null when either side has no market.
+    put_call_width_ratio: Optional[float] = None
+    history: Optional[HistoryContext] = None
+    calls_by_moneyness: List[MoneynessBucket]
+    puts_by_moneyness: List[MoneynessBucket]
+    by_expiration: List[ExpirationSlice]
+
+
+class SeriesBucket(BaseModel):
+    bucket_start: datetime
+    #: The chain snapshot the bucket was read at — the LAST one inside it.
+    anchor_ts: datetime
+    spot: float
+    calls: Optional[SpreadAggregateModel] = None
+    puts: Optional[SpreadAggregateModel] = None
+
+
+class SpreadSeriesResponse(BaseModel):
+    symbol: str
+    session: str
+    bucket_minutes: int
+    dte_max: int
+    moneyness_band_pct: float
+    basis: str = "quoted_nbbo"
+    disclosure: str = DISCLOSURE
+    bars: List[SeriesBucket]
+
+
+class CompareRow(BaseModel):
+    symbol: str
+    spot_price: Optional[float] = None
+    timestamp: Optional[datetime] = None
+    #: Null with a populated `unavailable` when the chain could not be read.
+    calls: Optional[SpreadAggregateModel] = None
+    puts: Optional[SpreadAggregateModel] = None
+    put_call_width_ratio: Optional[float] = None
+    puts_percentile: Optional[float] = None
+    unavailable: Optional[str] = None
+
+
+class SpreadCompareResponse(BaseModel):
+    symbols: List[str]
+    dte_max: int
+    moneyness_band_pct: float
+    basis: str = "quoted_nbbo"
+    disclosure: str = DISCLOSURE
+    rows: List[CompareRow]
+
+
+class HistoryRow(BaseModel):
+    trading_date: date
+    option_type: str
+    spot_price: float
+    contract_count: int
+    tradable_count: int
+    two_sided_pct: float
+    zero_bid_pct: float
+    crossed_or_locked_pct: float
+    median_spread: Optional[float] = None
+    median_relative_spread_pct: Optional[float] = None
+    p90_relative_spread_pct: Optional[float] = None
+    median_spread_bps_underlying: Optional[float] = None
+    p90_spread_bps_underlying: Optional[float] = None
+
+
+class SpreadHistoryResponse(BaseModel):
+    symbol: str
+    option_type: str
+    dte_max: int
+    moneyness_band_pct: float
+    basis: str = "quoted_nbbo"
+    disclosure: str = DISCLOSURE
+    #: Sessions in the window whose anchor snapshot was too thin to be a
+    #: measurement, and which are therefore absent from `rows`. Reported
+    #: rather than dropped silently: a gap in the chart should be
+    #: explicable, and a rising count here is an ingestion problem.
+    excluded_thin_sessions: int = 0
+    #: Oldest first, so a chart can render it without reversing.
+    rows: List[HistoryRow]
+
+
+# ---------------------------------------------------------------------------
+# Cache — mirrors premium_surface / vol_surface
+# ---------------------------------------------------------------------------
+
+_cache: "OrderedDict[tuple, Dict[str, Any]]" = OrderedDict()
+_cache_lock = asyncio.Lock()
+_CACHE_TTL = 30  # seconds
+_CACHE_MAX_SIZE = 64
+
+
+async def _get_cached(key: tuple) -> Optional[Any]:
+    async with _cache_lock:
+        entry = _cache.get(key)
+        if entry and (
+            datetime.now(timezone.utc) - entry["ts"]
+        ).total_seconds() < _CACHE_TTL:
+            return entry["data"]
+        if entry is not None:
+            del _cache[key]
+    return None
+
+
+async def _set_cached(key: tuple, data: Any) -> None:
+    async with _cache_lock:
+        if key in _cache:
+            del _cache[key]
+        _cache[key] = {"data": data, "ts": datetime.now(timezone.utc)}
+        while len(_cache) > _CACHE_MAX_SIZE:
+            _cache.popitem(last=False)
+
+
+def get_db() -> DatabaseManager:
+    from ..main import db_manager
+
+    assert db_manager is not None, "db_manager not initialized"
+    return db_manager
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _keep_contract(symbol: str, row: Dict[str, Any], session_date: date) -> bool:
+    """Drop same-day AM-settled index contracts from the measured chain.
+
+    Their SOQ happens at ~09:30 ET, so for the rest of the session they are
+    dead instruments whose rows linger with whatever marks the feed last
+    carried — reliably no-bid or absurdly wide.  Counting them would report
+    a chain-wide liquidity event every third Friday, on the one day of the
+    month a reader is most likely to be checking whether the market has
+    gone untradeable.
+
+    Covers SPX and NDX; the PM-settled series that shares each underlying
+    (SPXW, NDXP) is kept.  ``is_am_settled_contract`` owns both halves of
+    that rule, and the analytics snapshot applies the same function, which
+    is what keeps the live reading and the rollup measuring the same
+    instruments.
+    """
+    expiration = row.get("expiration")
+    if expiration != session_date:
+        return True
+    return not is_am_settled_contract(symbol, row.get("option_symbol"), expiration)
+
+
+def _ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    """Guarded ratio: null unless both sides are real, positive numbers."""
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return round(numerator / denominator, 3)
+
+
+def _round(value: Any, places: int) -> Optional[float]:
+    """Round a DB numeric to ``places``, preserving null as null."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), places)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bps(median_spread: Any, spot: Any) -> Optional[float]:
+    """Convert a bucket's median dollar width to basis points of the underlying.
+
+    Exact rather than approximate: spot is constant within a bucket, so
+    ``median(10000 * w / S)`` and ``10000 * median(w) / S`` are the same
+    number.  Deriving it here saves a second percentile pass in SQL over the
+    identical ordering.
+    """
+    width = _round(median_spread, 8)
+    price = _round(spot, 8)
+    if width is None or price is None or price <= 0:
+        return None
+    return round(10_000.0 * width / price, 3)
+
+
+async def _reduce_chain(
+    db: DatabaseManager, symbol: str, dte_max: int, band_pct: float
+) -> Optional[Dict[str, Any]]:
+    """Fetch the latest stable chain for ``symbol`` and reduce it.
+
+    Returns None when the symbol has no readable chain — no spot, no
+    snapshot, or nothing left in scope after the AM-settled filter.  The
+    callers turn that into a 404 (single symbol) or an ``unavailable`` row
+    (the comparison), never into zeros.
+    """
+    data = await db.get_spread_snapshot_chain(symbol, dte_max, band_pct)
+    if not data or not data.get("rows"):
+        return None
+
+    session_date = data["session_date"]
+    rows = [r for r in data["rows"] if _keep_contract(symbol, r, session_date)]
+    if not rows:
+        return None
+
+    spot = float(data["spot_price"])
+    spreads = spread_stats_mod.contract_spreads(rows, spot)
+    if not spreads:
+        return None
+
+    dte_of = {
+        r["expiration"]: (r["expiration"] - session_date).days
+        for r in rows
+        if r.get("expiration") is not None
+    }
+
+    return {
+        "spot": spot,
+        "snapshot_ts": data["snapshot_ts"],
+        "session_date": session_date,
+        "rows": rows,
+        "spreads": spreads,
+        "by_type": spread_stats_mod.aggregate_by_option_type(spreads),
+        "dte_of": dte_of,
+    }
+
+
+async def _history_context(
+    db: DatabaseManager,
+    symbol: str,
+    reduced: Dict[str, Any],
+    days: int,
+    dte_max: int,
+    moneyness_band_pct: float,
+) -> Optional[HistoryContext]:
+    """Rank today's widths against the symbol's own trailing sessions.
+
+    Compares like with like or not at all: rows measured under a different
+    ``dte_max`` / moneyness band are excluded rather than blended in, since
+    a percentile across two different populations ranks the populations.
+    Sessions whose anchor snapshot was too thin to measure are excluded for
+    the same reason — an ingestion outage is not a quiet market.
+
+    The scope that rows are matched against is the one the CALLER asked
+    for, not the one the rollup happens to write.  Those are the same only at
+    the default filters, and the difference is not cosmetic: ``dte_max=0``
+    reduces today's chain to the 0DTE book, which is structurally the widest
+    book of the year, while the stored rows still describe a through-7DTE
+    chain.  Ranking one against the other pinned the percentile near 100
+    every session and reported "widest 5% of sessions" on an ordinary
+    Tuesday — the page's one load-bearing verdict, wrong in the exact scope
+    a 0DTE trader selects to check it.  A scope the rollup never wrote now
+    yields no verdict, which the surfaces already render as "no baseline".
+
+    Today's own rollup row is excluded from the population it is ranked
+    against — including it would drag every reading toward the middle of
+    its own window, most visibly on the day it matters, when today is the
+    outlier.
+
+    Returns None when nothing comparable survives.  The page then shows the
+    live reading with no verdict attached, which is the honest state on a
+    fresh deployment.
+    """
+    by_type = reduced["by_type"]
+    session_date = reduced["session_date"]
+
+    async def _window(option_type: str) -> List[float]:
+        rows = await db.get_daily_spread_history(symbol, option_type, days)
+        return [
+            float(r["median_relative_spread_pct"])
+            for r in rows
+            if r.get("median_relative_spread_pct") is not None
+            and r.get("trading_date") != session_date
+            and int(r.get("dte_max") or -1) == int(dte_max)
+            and float(r.get("moneyness_band_pct") or -1.0) == float(moneyness_band_pct)
+            # Outage-thin sessions are excluded here as well as at write
+            # time, so a row seeded before the floor existed — or by an
+            # operator running with a lower one — still cannot pull a
+            # percentile toward a reading its own chain could not support.
+            and int(r.get("contract_count") or 0) >= int(SPREAD_STATS_MIN_CONTRACTS)
+        ]
+
+    try:
+        calls_window, puts_window, all_window = await asyncio.gather(
+            _window("C"), _window("P"), _window("A")
+        )
+    except Exception as exc:
+        # The rollup is a convenience, not the reading. A missing table on a
+        # partially-migrated deployment must not take the whole page down.
+        logger.warning("Spread history unavailable for %s: %s", symbol, exc)
+        return None
+
+    sessions = max(len(calls_window), len(puts_window), len(all_window))
+    if sessions == 0:
+        return None
+
+    puts_now = by_type["puts"].median_relative_spread_pct
+    calls_now = by_type["calls"].median_relative_spread_pct
+    all_now = by_type["all"].median_relative_spread_pct
+
+    puts_median = spread_stats_mod.percentile(puts_window, 50)
+    calls_median = spread_stats_mod.percentile(calls_window, 50)
+
+    return HistoryContext(
+        sessions=sessions,
+        calls_percentile=(
+            spread_stats_mod.percentile_rank(calls_now, calls_window)
+            if calls_now is not None
+            else None
+        ),
+        puts_percentile=(
+            spread_stats_mod.percentile_rank(puts_now, puts_window)
+            if puts_now is not None
+            else None
+        ),
+        all_percentile=(
+            spread_stats_mod.percentile_rank(all_now, all_window)
+            if all_now is not None
+            else None
+        ),
+        puts_median_over_window=(
+            None if puts_median is None else round(puts_median, 3)
+        ),
+        calls_median_over_window=(
+            None if calls_median is None else round(calls_median, 3)
+        ),
+        puts_vs_window_ratio=_ratio(puts_now, puts_median),
+    )
+
+
+def _agg_model(agg: spread_stats_mod.SpreadAggregate) -> SpreadAggregateModel:
+    return SpreadAggregateModel(**agg.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("", response_model=SpreadSnapshotResponse)
+async def get_spread_snapshot(
+    symbol: str = Query(default="SPX", description="Underlying symbol"),
+    dte_max: int = Query(
+        default=SPREAD_STATS_DTE_MAX,
+        ge=0,
+        le=90,
+        description="Max days to expiration to include",
+    ),
+    moneyness_band_pct: float = Query(
+        default=SPREAD_STATS_MONEYNESS_BAND_PCT,
+        ge=0.25,
+        le=25.0,
+        description="Half-width of the strike band around spot, in percent",
+    ),
+    history_days: int = Query(
+        default=DEFAULT_HISTORY_DAYS,
+        ge=0,
+        le=180,
+        description="Trailing sessions to rank today's reading against (0 to skip)",
+    ),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Current quoted-width and liquidity across one symbol's near-dated chain.
+
+    ``history`` is null unless ``dte_max`` and ``moneyness_band_pct`` match a
+    scope the daily rollup actually stored — the writers pin one scope
+    (``SPREAD_STATS_DTE_MAX`` / ``SPREAD_STATS_MONEYNESS_BAND_PCT``), so any
+    other filter combination measures a population with no history behind it.
+    The live reading is still served; only the ranking is withheld.  Callers
+    wanting a ranked reading at another scope want ``/surface``, whose rollup
+    is stored per scope and per time of day.
+
+    **Beta** — contract may change.
+    """
+    sym = symbol.upper()
+    cache_key = ("snapshot", sym, dte_max, moneyness_band_pct, history_days)
+    cached = await _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        reduced = await _reduce_chain(db, sym, dte_max, moneyness_band_pct)
+    except Exception as e:
+        logger.error(f"Error fetching spread snapshot for {sym}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    if reduced is None:
+        raise HTTPException(
+            status_code=404, detail=f"No quoted option chain available for {sym}"
+        )
+
+    spot = reduced["spot"]
+    by_type = reduced["by_type"]
+    spreads = reduced["spreads"]
+    band = float(moneyness_band_pct) / 100.0
+
+    history = None
+    if history_days > 0:
+        history = await _history_context(
+            db, sym, reduced, history_days, dte_max, moneyness_band_pct
+        )
+
+    response = SpreadSnapshotResponse(
+        symbol=sym,
+        spot_price=round(spot, 4),
+        timestamp=reduced["snapshot_ts"],
+        session_date=reduced["session_date"],
+        scope=SpreadScope(
+            dte_max=dte_max,
+            moneyness_band_pct=moneyness_band_pct,
+            strike_low=round(spot * (1.0 - band), 4),
+            strike_high=round(spot * (1.0 + band), 4),
+            contract_count=len(spreads),
+        ),
+        calls=_agg_model(by_type["calls"]),
+        puts=_agg_model(by_type["puts"]),
+        all=_agg_model(by_type["all"]),
+        put_call_width_ratio=_ratio(
+            by_type["puts"].median_relative_spread_pct,
+            by_type["calls"].median_relative_spread_pct,
+        ),
+        history=history,
+        calls_by_moneyness=[
+            MoneynessBucket(**b)
+            for b in spread_stats_mod.aggregate_by_moneyness(spreads, option_type="C")
+        ],
+        puts_by_moneyness=[
+            MoneynessBucket(**b)
+            for b in spread_stats_mod.aggregate_by_moneyness(spreads, option_type="P")
+        ],
+        by_expiration=[
+            ExpirationSlice(
+                expiration=slice_["expiration"],
+                dte=slice_["dte"],
+                calls=SpreadAggregateModel(**slice_["calls"]),
+                puts=SpreadAggregateModel(**slice_["puts"]),
+                all=SpreadAggregateModel(**slice_["all"]),
+            )
+            for slice_ in spread_stats_mod.aggregate_by_expiration(
+                spreads, reduced["dte_of"]
+            )
+        ],
+    )
+
+    await _set_cached(cache_key, response)
+    return response
+
+
+@router.get("/series", response_model=SpreadSeriesResponse)
+async def get_spread_series(
+    symbol: str = Query(default="SPX", description="Underlying symbol"),
+    session: str = Query(
+        default="current", pattern="^(current|prior)$", description="Trading session"
+    ),
+    bucket_minutes: int = Query(
+        default=15, ge=1, le=60, description="Bucket size in minutes"
+    ),
+    dte_max: int = Query(default=SPREAD_STATS_DTE_MAX, ge=0, le=90),
+    moneyness_band_pct: float = Query(
+        default=SPREAD_STATS_MONEYNESS_BAND_PCT, ge=0.25, le=25.0
+    ),
+    db: DatabaseManager = Depends(get_db),
+):
+    """How today's quoted widths moved through the session, puts against calls.
+
+    One reading per bucket, taken at the last chain snapshot inside it.
+    Calls and puts are returned separately and no blended row is computed:
+    the whole point of the series is the divergence between the two, and a
+    combined median reports roughly half of it.
+
+    **Beta** — contract may change.
+    """
+    sym = symbol.upper()
+    cache_key = (
+        "series",
+        sym,
+        session,
+        bucket_minutes,
+        dte_max,
+        moneyness_band_pct,
+    )
+    cached = await _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        rows = await db.get_spread_intraday_series(
+            sym, dte_max, moneyness_band_pct, bucket_minutes, session
+        )
+    except Exception as e:
+        logger.error(f"Error fetching spread series for {sym}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    # The query groups by (bucket, option_type); fold the two rows of each
+    # bucket back into one bar.
+    buckets: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
+    for row in rows:
+        key = row["bucket_start"]
+        bar = buckets.setdefault(
+            key,
+            {
+                "bucket_start": row["bucket_start"],
+                "anchor_ts": row["anchor_ts"],
+                "spot": float(row["spot"]),
+                "calls": None,
+                "puts": None,
+            },
+        )
+        total = int(row["contract_count"] or 0)
+        if total == 0:
+            continue
+
+        def _pct(count: Any) -> float:
+            return round(100.0 * int(count or 0) / total, 2)
+
+        agg = SpreadAggregateModel(
+            contract_count=total,
+            tradable_count=int(row["tradable_count"] or 0),
+            two_sided_pct=_pct(row["tradable_count"]),
+            zero_bid_pct=_pct(row["zero_bid_count"]),
+            crossed_or_locked_pct=_pct(row["crossed_or_locked_count"]),
+            no_quote_pct=round(
+                max(
+                    0.0,
+                    100.0
+                    - _pct(row["tradable_count"])
+                    - _pct(row["zero_bid_count"])
+                    - _pct(row["crossed_or_locked_count"]),
+                ),
+                2,
+            ),
+            median_spread=_round(row["median_spread"], 4),
+            median_relative_spread_pct=_round(row["median_relative_spread_pct"], 3),
+            p90_relative_spread_pct=_round(row["p90_relative_spread_pct"], 3),
+            median_spread_bps_underlying=_bps(row["median_spread"], row["spot"]),
+            p90_spread_bps_underlying=None,
+            total_open_interest=int(row["total_open_interest"] or 0),
+            total_volume=int(row["total_volume"] or 0),
+        )
+        bar["calls" if row["option_type"] == "C" else "puts"] = agg
+
+    response = SpreadSeriesResponse(
+        symbol=sym,
+        session=session,
+        bucket_minutes=bucket_minutes,
+        dte_max=dte_max,
+        moneyness_band_pct=moneyness_band_pct,
+        bars=[SeriesBucket(**b) for b in buckets.values()],
+    )
+
+    await _set_cached(cache_key, response)
+    return response
+
+
+@router.get("/compare", response_model=SpreadCompareResponse)
+async def compare_spreads(
+    symbols: str = Query(
+        default=",".join(COMPARABLE_SYMBOLS),
+        description="Comma-separated underlyings to compare",
+    ),
+    dte_max: int = Query(default=SPREAD_STATS_DTE_MAX, ge=0, le=90),
+    moneyness_band_pct: float = Query(
+        default=SPREAD_STATS_MONEYNESS_BAND_PCT, ge=0.25, le=25.0
+    ),
+    history_days: int = Query(default=DEFAULT_HISTORY_DAYS, ge=0, le=180),
+    db: DatabaseManager = Depends(get_db),
+):
+    """The same reading side by side across symbols.
+
+    Read ``median_spread_bps_underlying`` for the cross-symbol comparison,
+    not ``median_spread``: index levels differ by 4x between SPX and NDX, so
+    their dollar widths are not on one scale.
+
+    A symbol whose chain cannot be read comes back as a row with
+    ``unavailable`` set rather than being dropped — a missing row would read
+    as "not compared", and a zeroed one as "perfectly tight".
+
+    ``puts_percentile`` follows the same rule as the snapshot endpoint's
+    ``history``: null unless the requested scope is one the daily rollup
+    stored.  The widths themselves are returned at whatever scope was asked
+    for — this panel carries its own expiry pills, and only the ranking is
+    scope-bound.
+
+    **Beta** — contract may change.
+    """
+    requested = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not requested:
+        raise HTTPException(status_code=400, detail="No symbols requested")
+    if len(requested) > 8:
+        raise HTTPException(status_code=400, detail="At most 8 symbols per request")
+
+    cache_key = (
+        "compare",
+        tuple(requested),
+        dte_max,
+        moneyness_band_pct,
+        history_days,
+    )
+    cached = await _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    async def _row(sym: str) -> CompareRow:
+        try:
+            reduced = await _reduce_chain(db, sym, dte_max, moneyness_band_pct)
+        except Exception as exc:
+            logger.warning("Spread comparison failed for %s: %s", sym, exc)
+            return CompareRow(symbol=sym, unavailable="lookup failed")
+
+        if reduced is None:
+            return CompareRow(symbol=sym, unavailable="no quoted chain")
+
+        by_type = reduced["by_type"]
+        history = None
+        if history_days > 0:
+            history = await _history_context(
+                db, sym, reduced, history_days, dte_max, moneyness_band_pct
+            )
+
+        return CompareRow(
+            symbol=sym,
+            spot_price=round(reduced["spot"], 4),
+            timestamp=reduced["snapshot_ts"],
+            calls=_agg_model(by_type["calls"]),
+            puts=_agg_model(by_type["puts"]),
+            put_call_width_ratio=_ratio(
+                by_type["puts"].median_relative_spread_pct,
+                by_type["calls"].median_relative_spread_pct,
+            ),
+            puts_percentile=history.puts_percentile if history else None,
+        )
+
+    rows = await asyncio.gather(*(_row(sym) for sym in requested))
+
+    response = SpreadCompareResponse(
+        symbols=requested,
+        dte_max=dte_max,
+        moneyness_band_pct=moneyness_band_pct,
+        rows=list(rows),
+    )
+
+    await _set_cached(cache_key, response)
+    return response
+
+
+@router.get("/history", response_model=SpreadHistoryResponse)
+async def get_spread_history(
+    symbol: str = Query(default="SPX", description="Underlying symbol"),
+    option_type: str = Query(
+        default="P",
+        pattern="^[CPA]$",
+        description="C (calls), P (puts) or A (blended chain)",
+    ),
+    days: int = Query(default=DEFAULT_HISTORY_DAYS, ge=1, le=180),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Trailing daily quoted-width history from the ``daily_spread_stats`` rollup.
+
+    This is what turns "spreads are 6.2% wide" into "spreads are wider than
+    they have been all quarter".  Rows are oldest first.
+
+    Sessions whose anchor snapshot was too thin to be a measurement are
+    omitted and counted in ``excluded_thin_sessions``; a chart should show
+    the gap rather than a point, because an ingestion outage is not a
+    session anyone traded.
+
+    An empty ``rows`` list is a normal answer on a deployment where neither
+    the analytics writer nor ``src.tools.daily_spread_stats_backfill`` has
+    run yet — not an error, and the caller should render the live reading
+    without a historical verdict rather than an error state.
+
+    **Beta** — contract may change.
+    """
+    sym = symbol.upper()
+    cache_key = ("history", sym, option_type, days)
+    cached = await _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        all_rows = await db.get_daily_spread_history(sym, option_type, days)
+    except Exception as e:
+        logger.error(f"Error fetching spread history for {sym}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    # Same floor the percentile applies, for the same reason. The writers
+    # reject these now, but rows seeded before the floor existed are still
+    # in the table — and a row we have decided is not a measurement must
+    # not be handed to a chart as one.
+    #
+    # Filtered rather than deleted from the rollup: the live writer may hold
+    # a BETTER row for the same day, taken at its own cycle when the chain
+    # was still full, and a blind delete would destroy that instead of the
+    # bad reading. Dropping at read time costs nothing and cannot lose data.
+    rows = [
+        r
+        for r in all_rows
+        if int(r.get("contract_count") or 0) >= int(SPREAD_STATS_MIN_CONTRACTS)
+    ]
+    excluded = len(all_rows) - len(rows)
+    if excluded:
+        logger.info(
+            "Spread history %s/%s: %d of %d sessions excluded as too thin "
+            "to measure (floor %d)",
+            sym,
+            option_type,
+            excluded,
+            len(all_rows),
+            SPREAD_STATS_MIN_CONTRACTS,
+        )
+
+    response = SpreadHistoryResponse(
+        symbol=sym,
+        option_type=option_type,
+        dte_max=int(SPREAD_STATS_DTE_MAX),
+        moneyness_band_pct=float(SPREAD_STATS_MONEYNESS_BAND_PCT),
+        excluded_thin_sessions=excluded,
+        rows=[
+            HistoryRow(
+                trading_date=r["trading_date"],
+                option_type=r["option_type"],
+                spot_price=float(r["spot_price"]),
+                contract_count=int(r["contract_count"] or 0),
+                tradable_count=int(r["tradable_count"] or 0),
+                two_sided_pct=float(r["two_sided_pct"] or 0.0),
+                zero_bid_pct=float(r["zero_bid_pct"] or 0.0),
+                crossed_or_locked_pct=float(r["crossed_or_locked_pct"] or 0.0),
+                median_spread=_round(r["median_spread"], 4),
+                median_relative_spread_pct=_round(
+                    r["median_relative_spread_pct"], 3
+                ),
+                p90_relative_spread_pct=_round(r["p90_relative_spread_pct"], 3),
+                median_spread_bps_underlying=_round(
+                    r["median_spread_bps_underlying"], 3
+                ),
+                p90_spread_bps_underlying=_round(r["p90_spread_bps_underlying"], 3),
+            )
+            for r in rows
+        ],
+    )
+
+    await _set_cached(cache_key, response)
+    return response
+
+# ---------------------------------------------------------------------------
+# Spread Surface vs History
+# ---------------------------------------------------------------------------
+#
+# The rest of this router answers "how wide is it now". This section answers
+# "is that unusual, and WHERE" — the two questions a width alone cannot settle.
+#
+# Everything current is read through :func:`_reduce_chain` and
+# :func:`spread_stats.surface_scopes`, the same path the live page and the
+# rollup writers use, so the number this endpoint calls "current" is the same
+# number Spread Monitor shows for the same filters. Everything historical is
+# read from ``spread_surface_stats``, whose rows were produced by those same
+# functions. There is deliberately no second definition of a spread anywhere
+# in this feature.
+
+
+class SurfacePoint(BaseModel):
+    """One moneyness slice of the strike curve."""
+
+    money_bucket: str
+    label: str
+    moneyness_low_pct: float
+    moneyness_high_pct: float
+    #: Bucket midpoint — the curve's x position.
+    center_pct: float
+    current_pct: Optional[float] = None
+    historical_median_pct: Optional[float] = None
+    historical_p25_pct: Optional[float] = None
+    historical_p75_pct: Optional[float] = None
+    #: Where the current reading sits in this slice's own history, 0-100.
+    percentile: Optional[float] = None
+    vs_normal: Optional[float] = None
+    contract_count: int = 0
+    two_sided_pct: Optional[float] = None
+    #: Comparable prior sessions behind this slice. Below the minimum the
+    #: percentile is withheld rather than computed from a handful of days.
+    sessions: int = 0
+
+
+class DteRank(BaseModel):
+    """One expiry bucket in the "where does it rank" view."""
+
+    dte_scope: str
+    label: str
+    percentile: Optional[float] = None
+    current_pct: Optional[float] = None
+    historical_median_pct: Optional[float] = None
+    sessions: int = 0
+    #: True when there is not enough comparable history to rank this bucket.
+    #: The UI must say so rather than draw a bar at some default height.
+    insufficient_history: bool = True
+
+
+class SurfaceBaseline(BaseModel):
+    """Exactly what the comparison was made against. Rendered, not buried."""
+
+    sessions: int
+    earliest_date: Optional[date] = None
+    latest_date: Optional[date] = None
+    #: True when history was matched to the current time of day.
+    time_matched: bool
+    #: e.g. "15:30-16:00 ET".
+    time_bucket_label: str
+    #: True when the live clock sits outside the cash session and the
+    #: comparison fell back to the last bucket with a baseline.
+    fell_back_to_last_bucket: bool = False
+    min_sessions: int
+
+
+class SurfaceSummary(BaseModel):
+    current_pct: Optional[float] = None
+    normal_pct: Optional[float] = None
+    vs_normal: Optional[float] = None
+    percentile: Optional[float] = None
+    two_sided_pct: Optional[float] = None
+    #: Coverage gets the same treatment the width gets, and for a sharper
+    #: reason: it is the number that matches the complaint. "Untradeable"
+    #: usually means a contract with NO bid rather than a wide one, and a
+    #: no-bid contract has no width to report — it is excluded from every
+    #: median above by construction. So a chain can read TIGHTER as its
+    #: wings go dead, and the width percentile will not say so.
+    #:
+    #: Read the direction the other way round from the widths: high is good
+    #: here. 51% two-sided on a 0DTE book at 15:30 sounds alarming and is
+    #: an ordinary afternoon; without a baseline there is no way to know
+    #: that from the number alone, which is why it now carries one.
+    two_sided_normal_pct: Optional[float] = None
+    two_sided_percentile: Optional[float] = None
+    contract_count: int = 0
+    sessions: int = 0
+
+
+class SpreadSurfaceResponse(BaseModel):
+    symbol: str
+    option_type: str
+    spot_price: float
+    timestamp: datetime
+    session_date: date
+    dte_max: int
+    dte_scope: str
+    moneyness_band_pct: float
+    basis: str = "quoted_nbbo"
+    disclosure: str = DISCLOSURE
+    baseline: SurfaceBaseline
+    summary: SurfaceSummary
+    curve: List[SurfacePoint]
+    by_dte: List[DteRank]
+
+
+#: Human labels for the disjoint expiry buckets, which are counted in
+#: TRADING SESSIONS. "1DTE" from a Friday is the Monday expiry — which is
+#: also what a trader means by it, and was not what the old calendar-day
+#: bucketing measured.
+_DTE_BUCKET_LABELS: Dict[str, str] = {
+    "t0": "0DTE",
+    "t1": "1DTE",
+    "t2_3": "2-3 DTE",
+    "t4_7": "4-7 DTE",
+    "t8_30": "8-30 DTE",
+}
+
+
+def _resolve_bucket(session_ts: datetime) -> tuple[int, bool]:
+    """The time-of-day bucket to compare in, and whether we had to fall back.
+
+    Inside the cash session the current reading is ranked against prior
+    sessions at the same clock time. Outside it — pre-open, after the bell,
+    a weekend — there is no matching bucket, so the comparison clamps to the
+    session's last bucket and the response says it did. Silently ranking a
+    Saturday reading against Friday's 15:30 would be the same answer without
+    the disclosure.
+    """
+    et = session_ts.astimezone(_SURFACE_ET)
+    minute = et.hour * 60 + et.minute
+    if minute < surface_store.SESSION_START_MIN:
+        return surface_store.SESSION_START_MIN, True
+    if minute >= surface_store.SESSION_END_MIN:
+        width = max(1, int(SPREAD_SURFACE_BUCKET_MINUTES))
+        return (surface_store.SESSION_END_MIN - width), True
+    return surface_store.bucket_start_minutes(et), False
+
+
+def _percentile_or_none(
+    current: Optional[float], population: List[float]
+) -> Optional[float]:
+    """Rank, but only once there is enough history for a rank to mean anything.
+
+    Below ``SPREAD_SURFACE_MIN_SESSIONS`` the answer is None, not a number:
+    "the widest of the four days we have" is not a 100th percentile, and
+    rendering it as one would be the most misleading thing on the page.
+    """
+    if current is None or len(population) < SPREAD_SURFACE_MIN_SESSIONS:
+        return None
+    return spread_stats_mod.percentile_rank(current, population)
+
+
+@router.get("/surface", response_model=SpreadSurfaceResponse)
+async def get_spread_surface(
+    symbol: str = Query(default="SPX", description="Underlying symbol"),
+    option_type: str = Query(
+        default="P", pattern="^[CP]$", description="C (calls) or P (puts)"
+    ),
+    dte_max: int = Query(
+        default=0,
+        description="Cumulative DTE universe: 0, 1, 7 or 30",
+    ),
+    moneyness_band_pct: float = Query(
+        default=5.0, description="Half-width of the strike band: 2, 5 or 10"
+    ),
+    history_days: int = Query(
+        default=SPREAD_SURFACE_HISTORY_DAYS, ge=5, le=365
+    ),
+    db: DatabaseManager = Depends(get_db),
+):
+    """The current quoted-spread surface against this symbol's own history.
+
+    Answers, for one side of the book: is the market unusually wide right
+    now, where across the strike surface is the deterioration, and — the
+    question a width cannot answer — is an unusual share of the chain
+    carrying no market at all.
+
+    Puts and calls are never blended. The question the view exists for is
+    whether the PUTS specifically have gone wide, and that is only answerable
+    against a side that has not.
+
+    **Beta** — contract may change.
+    """
+    sym = symbol.upper()
+    if int(dte_max) not in spread_stats_mod.DTE_UNIVERSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"dte_max must be one of {list(spread_stats_mod.DTE_UNIVERSES)}",
+        )
+    if float(moneyness_band_pct) not in spread_stats_mod.MONEYNESS_BANDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "moneyness_band_pct must be one of "
+                f"{list(spread_stats_mod.MONEYNESS_BANDS)} — history is stored "
+                "per band, so an arbitrary value has nothing to rank against"
+            ),
+        )
+
+    band = float(moneyness_band_pct)
+    universe_key = spread_stats_mod.dte_universe_key(int(dte_max))
+    cache_key = ("surface", sym, option_type, int(dte_max), band, history_days)
+    cached = await _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    # The live reading, fetched at the WIDEST scope the page offers so one
+    # chain read serves every filter, then narrowed by the same cube the
+    # writers use. Narrowing here rather than in the query is what makes the
+    # current number identical to the stored one for the same scope.
+    widest_band = max(spread_stats_mod.MONEYNESS_BANDS)
+    widest_dte = max(spread_stats_mod.DTE_UNIVERSES)
+    try:
+        reduced = await _reduce_chain(db, sym, widest_dte, widest_band)
+    except Exception as e:
+        logger.error(f"Error fetching spread surface for {sym}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    if reduced is None:
+        raise HTTPException(
+            status_code=404, detail=f"No quoted option chain available for {sym}"
+        )
+
+    side_spreads = [s for s in reduced["spreads"] if s.option_type == option_type]
+    if not side_spreads:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {'put' if option_type == 'P' else 'call'} quotes for {sym}",
+        )
+
+    # Two mappings, because the universes and the disjoint buckets measure
+    # distance in different units on purpose — see `surface_scopes`.
+    trading_dte_of = trading_dte_map(reduced["dte_of"].keys(), reduced["session_date"])
+    current_cells = {
+        (c.dte_scope, c.money_bucket): c
+        for c in spread_stats_mod.surface_scopes(
+            side_spreads, reduced["dte_of"], trading_dte_of
+        )
+        if c.band_pct == band
+    }
+
+    bucket_min, fell_back = _resolve_bucket(reduced["snapshot_ts"])
+    if fell_back:
+        stored = await db.get_spread_surface_latest_bucket(sym, option_type)
+        if stored is not None:
+            bucket_min = stored
+
+    try:
+        window = await db.get_spread_surface_window(
+            sym, option_type, band, bucket_min, history_days
+        )
+    except Exception as exc:
+        # A partially-migrated deployment must still render today's surface.
+        logger.warning("Spread surface history unavailable for %s: %s", sym, exc)
+        window = []
+
+    session_date = reduced["session_date"]
+    history: Dict[tuple, List[tuple]] = {}
+    for row in window:
+        if row.get("median_relative_spread_pct") is None:
+            continue
+        if row.get("trading_date") == session_date:
+            # Today's own row never ranks today — it would drag every reading
+            # toward the middle of its own window, worst on the day it matters.
+            continue
+        key = (row["dte_scope"], row["money_bucket"])
+        history.setdefault(key, []).append(
+            (
+                row["trading_date"],
+                float(row["median_relative_spread_pct"]),
+                row.get("two_sided_pct"),
+            )
+        )
+
+    def _hist(key: tuple) -> List[float]:
+        return [value for _, value, _ in history.get(key, [])]
+
+    def _hist_dates(key: tuple) -> List[Any]:
+        return [day for day, _, _ in history.get(key, [])]
+
+    def _hist_coverage(key: tuple) -> List[float]:
+        """The same window, on the share of the chain with a real market.
+
+        Filtered for nulls separately rather than alongside the widths: a
+        session can carry a width and no coverage figure, and dropping it
+        from both windows would shrink the width history to fix the other
+        one.
+        """
+        return [
+            float(coverage)
+            for _, _, coverage in history.get(key, [])
+            if coverage is not None
+        ]
+
+    # --- summary -----------------------------------------------------------
+    wide_key = (universe_key, spread_stats_mod.BAND_WIDE)
+    wide_cell = current_cells.get(wide_key)
+    wide_hist = _hist(wide_key)
+    current_pct = (
+        wide_cell.aggregate.median_relative_spread_pct if wide_cell else None
+    )
+    normal_pct = spread_stats_mod.percentile(wide_hist, 50) if wide_hist else None
+    wide_coverage = _hist_coverage(wide_key)
+    two_sided_now = wide_cell.aggregate.two_sided_pct if wide_cell else None
+    summary = SurfaceSummary(
+        current_pct=_round(current_pct, 3),
+        normal_pct=_round(normal_pct, 3),
+        vs_normal=_ratio(current_pct, normal_pct),
+        percentile=_percentile_or_none(current_pct, wide_hist),
+        two_sided_pct=_round(two_sided_now, 2),
+        two_sided_normal_pct=_round(
+            spread_stats_mod.percentile(wide_coverage, 50) if wide_coverage else None,
+            2,
+        ),
+        two_sided_percentile=_percentile_or_none(two_sided_now, wide_coverage),
+        contract_count=wide_cell.aggregate.contract_count if wide_cell else 0,
+        sessions=len(wide_hist),
+    )
+
+    # --- strike curve ------------------------------------------------------
+    edges = spread_stats_mod.DEFAULT_MONEYNESS_EDGES
+    curve: List[SurfacePoint] = []
+    for index in range(len(edges) - 1):
+        low, high = float(edges[index]), float(edges[index + 1])
+        key_money = spread_stats_mod.moneyness_bucket_key(low, high)
+        key = (universe_key, key_money)
+        cell = current_cells.get(key)
+        values = _hist(key)
+        if cell is None and not values:
+            # Outside the selected band, or never quoted here. A gap, not a
+            # zero: the curve must not be interpolated across it.
+            continue
+        agg = cell.aggregate if cell else None
+        cur = agg.median_relative_spread_pct if agg else None
+        med = spread_stats_mod.percentile(values, 50) if values else None
+        curve.append(
+            SurfacePoint(
+                money_bucket=key_money,
+                label=spread_stats_mod.moneyness_bucket_label(low, high),
+                moneyness_low_pct=low,
+                moneyness_high_pct=high,
+                center_pct=round((low + high) / 2.0, 3),
+                current_pct=_round(cur, 3),
+                historical_median_pct=_round(med, 3),
+                historical_p25_pct=_round(
+                    spread_stats_mod.percentile(values, 25) if values else None, 3
+                ),
+                historical_p75_pct=_round(
+                    spread_stats_mod.percentile(values, 75) if values else None, 3
+                ),
+                percentile=_percentile_or_none(cur, values),
+                vs_normal=_ratio(cur, med),
+                contract_count=agg.contract_count if agg else 0,
+                two_sided_pct=_round(agg.two_sided_pct, 2) if agg else None,
+                sessions=len(values),
+            )
+        )
+
+    # --- rank by expiry ----------------------------------------------------
+    by_dte: List[DteRank] = []
+    for scope_key, _low, _high in spread_stats_mod.TRADING_DTE_BUCKETS:
+        key = (scope_key, spread_stats_mod.BAND_WIDE)
+        cell = current_cells.get(key)
+        values = _hist(key)
+        cur = cell.aggregate.median_relative_spread_pct if cell else None
+        pct = _percentile_or_none(cur, values)
+        by_dte.append(
+            DteRank(
+                dte_scope=scope_key,
+                label=_DTE_BUCKET_LABELS.get(scope_key, scope_key),
+                percentile=pct,
+                current_pct=_round(cur, 3),
+                historical_median_pct=_round(
+                    spread_stats_mod.percentile(values, 50) if values else None, 3
+                ),
+                sessions=len(values),
+                insufficient_history=pct is None,
+            )
+        )
+
+    # The date range must describe the SAME population as ``sessions``.
+    # Spanning every scope in the window would print a months-long range
+    # beside a zero count whenever the selected scope is too thin to
+    # publish — the exact "implies 60 sessions when there are 36" failure
+    # the baseline line exists to prevent.
+    baseline_dates = _hist_dates(wide_key)
+    response = SpreadSurfaceResponse(
+        symbol=sym,
+        option_type=option_type,
+        spot_price=round(reduced["spot"], 4),
+        timestamp=reduced["snapshot_ts"],
+        session_date=session_date,
+        dte_max=int(dte_max),
+        dte_scope=universe_key,
+        moneyness_band_pct=band,
+        baseline=SurfaceBaseline(
+            sessions=len(wide_hist),
+            earliest_date=min(baseline_dates) if baseline_dates else None,
+            latest_date=max(baseline_dates) if baseline_dates else None,
+            time_matched=bool(baseline_dates),
+            time_bucket_label=surface_store.bucket_label(bucket_min),
+            fell_back_to_last_bucket=fell_back,
+            min_sessions=int(SPREAD_SURFACE_MIN_SESSIONS),
+        ),
+        summary=summary,
+        curve=curve,
+        by_dte=by_dte,
+    )
+
+    await _set_cached(cache_key, response)
+    return response

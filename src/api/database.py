@@ -19,6 +19,7 @@ import json
 from src.analytics.walls import (
     DEFAULT_WALL_LADDER_DEPTH,
     align_wall_ladder,
+    compute_call_put_walls,
     compute_gamma_flip_from_strikes,
     compute_wall_ladder,
     wall_label,
@@ -28,7 +29,13 @@ from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
-from src.hedging_flow_sql import HEDGING_FLOW_CTE_ASYNCPG
+from src.hedging_flow_sql import (
+    HEDGING_FLOW_CTE_ASYNCPG,
+    HEDGING_FLOW_SESSIONS_ASYNCPG,
+    HEDGING_FLOW_SNAPSHOT_SELECT_ASYNCPG,
+    SCOPE_0DTE,
+    SCOPE_ALL,
+)
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
 from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
@@ -141,6 +148,88 @@ def _strike_profile_bucket_cache_key(
         f"strike_profile_bucket:{symbol}:{timeframe}:"
         f"{_exp_scope(exp_filter)}:{bucket_ts.isoformat()}"
     )
+
+
+def _replay_max_pain_for_expirations(raw: Any, exp_filter: List[date]) -> Optional[float]:
+    """The stored max pain for a SINGLE-expiration replay scope, or ``None``.
+
+    ``gex_summary.max_pain`` is the front-month scalar — a whole-chain answer
+    that would quietly contradict the filtered ladder drawn beside it (on a day
+    with no same-day expiry it is next week's settlement).  The engine also
+    persists the full ``{expiration: strike}`` breakdown, so a one-date scope
+    (0DTE, or any single pick) can read its OWN settlement instead.
+
+    ``None`` for a multi-date scope — several settlements have no single max
+    pain — and for a missing, unparseable, or unlisted expiration.  The client
+    draws no line for ``None``, which is the honest answer; quoting another
+    expiration's level would not be.
+    """
+    if len(exp_filter) != 1 or raw is None:
+        return None
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get(exp_filter[0].isoformat())
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) -> Dict[str, Any]:
+    """Re-derive one replay frame's level lines from its filtered ladder.
+
+    The persisted ``call_wall`` / ``put_wall`` / ``gamma_flip`` on
+    ``gex_summary`` are whole-chain by construction, so under an expiration
+    filter they describe a book the frame's bars no longer show.  Recompute
+    them from the same rows the bars render, through the canonical helpers in
+    :mod:`src.analytics.walls` — the identical treatment
+    ``/api/gex/strike-profile-timeseries`` gives its own expiration filter, so
+    a 0DTE replay and a 0DTE rewind agree on where the walls sat.
+
+    Two things deliberately do NOT move with the filter, matching that endpoint
+    and the live surfaces (where the pin does not follow the Expiry selector):
+    ``pin_strike`` / ``pin_confidence``, which are 0DTE-by-construction and
+    whole-chain by definition, and ``max_gamma_strike`` (GEX King), which is
+    whole-chain by definition.  Both are left exactly as stored.
+
+    Scope note: the ladder is already capped to the ``strike_band_pct`` band
+    around session spot, so the walls rank over the in-band strikes — the ones
+    the chart can actually draw.  A wall outside that band would have no bar
+    beside it either way.
+
+    Returns the same dict, with its scratch keys consumed.
+    """
+    inputs = frame.pop("_gamma_inputs", None) or []
+    spot = frame.pop("_spot", None)
+    max_pain_by_exp = frame.pop("_max_pain_by_expiration", None)
+
+    try:
+        spot_f = float(spot) if spot is not None else None
+    except (TypeError, ValueError):
+        spot_f = None
+
+    if spot_f and spot_f > 0 and inputs:
+        call_wall, put_wall = compute_call_put_walls(inputs, spot_f)
+        frame["call_wall"] = call_wall
+        frame["put_wall"] = put_wall
+        frame["gamma_flip"] = compute_gamma_flip_from_strikes(inputs, spot_f)
+    else:
+        # No tape for the minute, or no in-band strikes in scope: there is
+        # nothing to rank, and the stored whole-chain levels are not an
+        # answer to the question that was asked.  Null beats wrong — the
+        # scrubber already omits a level line it has no value for.
+        frame["call_wall"] = None
+        frame["put_wall"] = None
+        frame["gamma_flip"] = None
+    frame["max_pain"] = _replay_max_pain_for_expirations(max_pain_by_exp, exp_filter)
+    return frame
 
 
 # Default history depth for component score endpoints. Sized to span the two
@@ -1888,8 +1977,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.timestamp,
                     gs.underlying,
                     gs.computed_at,
+                    gs.data_as_of,
                     gs.gamma_flip_point,
                     gs.gamma_flip_raw,
+                    gs.gamma_flip_reason,
                     gs.flip_distance,
                     gs.local_gex,
                     gs.convexity_risk,
@@ -2004,6 +2095,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.timestamp,
                 ls.underlying AS symbol,
                 ls.computed_at,
+                ls.data_as_of,
                 lq.spot_price,
                 st.total_call_gex,
                 st.total_put_gex,
@@ -2016,6 +2108,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.gamma_flip_point AS gamma_flip,
                 ls.gamma_flip_raw,
                 ls.gamma_flip_span_used,
+                -- Why the flip is absent, when it is. NULL whenever a flip was
+                -- published, a FLIP_REASON_* code otherwise. Same contract as
+                -- pin_strike_reason below, and the reason a client can now
+                -- tell "the flip is 10% away" from "the feed is broken"
+                -- instead of rendering both as the same em dash.
+                ls.gamma_flip_reason,
                 ls.flip_distance,
                 ls.local_gex,
                 ls.convexity_risk,
@@ -2978,6 +3076,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol: str,
         session_date: date,
         strike_band_pct: float = 0.04,
+        expirations: Optional[List[date]] = None,
     ) -> List[Dict[str, Any]]:
         """Every per-minute GEX frame for one cash-session date (09:30-16:00 ET).
 
@@ -2998,6 +3097,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bounded (a full session at every strike would be ~40k rows for SPX).
         call_gex/put_gex are the dollar-scaled call/put split (nullable on
         pre-gamma-column rows) that drives the scrubber's Split/Combined views.
+
+        ``expirations`` scopes the whole frame to a set of expiration dates —
+        ``[session_date]`` is the 0DTE replay.  ``None`` (the default) is the
+        whole chain and is byte-for-byte what this read has always returned.
+        Under a filter the ladder carries only those expirations AND the level
+        lines are re-derived from it (see :func:`_scope_replay_frame_levels`),
+        because the stored walls/flip/max-pain are whole-chain and would
+        otherwise describe a book the bars no longer show.  The pin strike and
+        GEX King are whole-chain by definition and stay as stored, exactly as
+        they do under ``/api/gex/strike-profile-timeseries``'s filter.
 
         Cost is flat in the size of ``gex_by_strike``: the per-minute ladder is
         a correlated LATERAL, so the read is ~390 index probes no matter how
@@ -3079,6 +3188,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                        gs.call_wall, gs.put_wall, gs.max_pain,
                        gs.pin_strike, gs.pin_confidence,
                        gs.max_gamma_strike,
+                       -- Per-expiration max-pain breakdown.  Only read under
+                       -- an expiration filter, where the scalar max_pain above
+                       -- (front month, whole chain) is the wrong settlement to
+                       -- quote beside a filtered ladder.
+                       gs.max_pain_by_expiration,
                        (SELECT uq.close::numeric
                           FROM underlying_quotes uq
                          WHERE uq.symbol = $1
@@ -3096,13 +3210,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.call_wall,
                 s.put_wall,
                 s.max_pain,
+                s.max_pain_by_expiration,
                 s.pin_strike,
                 s.pin_confidence,
                 s.max_gamma_strike,
+                -- The minute's own spot (underlying_quotes close at-or-before
+                -- the bar).  Already computed in the CTE for the dollar
+                -- scaling below; projected so an expiration-filtered read can
+                -- rank that minute's walls against the same price the bars
+                -- were scaled with.
+                s.spot,
                 ladder.strike,
                 ladder.net_gex,
                 ladder.call_gex,
-                ladder.put_gex
+                ladder.put_gex,
+                -- Raw (unscaled) OI-weighted gamma per strike.  The dollar
+                -- columns above are what the chart draws; these are what
+                -- src.analytics.walls ranks on, and the 100 x S^2 x 0.01
+                -- factor is common to every strike at one minute, so ranking
+                -- on the raw aggregate picks the same wall as ranking on the
+                -- dollar one.  Only read under an expiration filter.
+                ladder.call_gamma,
+                ladder.put_gamma
             FROM session_summary s
             -- The per-minute strike ladder is a LATERAL probe, not a join, and
             -- that is structural rather than stylistic.
@@ -3149,7 +3278,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gbs.strike,
                     AVG(gbs.net_gex) AS net_gex,
                     AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
-                    AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex
+                    AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex,
+                    AVG(gbs.call_gamma) AS call_gamma,
+                    AVG(gbs.put_gamma) AS put_gamma
                 FROM gex_by_strike gbs
                 WHERE gbs.underlying = $1
                   AND gbs.timestamp = s.timestamp
@@ -3166,6 +3297,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   -- yet) short-circuits to no-band, matching get_gex_heatmap.
                   AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
                       <= (SELECT spot_close FROM session_spot) * $4
+                  -- Expiration scope, substituted in (not a NULL-guarded OR)
+                  -- so the unfiltered read is the exact statement it has
+                  -- always been and the planner never has to reason about a
+                  -- parameter that is NULL on every whole-chain call.
+                  {exp_predicate}
                 -- One row per strike, AVG across that minute's expirations --
                 -- identical to the old GROUP BY (s.timestamp, ..., gbs.strike),
                 -- since the lateral only ever sees one timestamp.  The summary
@@ -3175,16 +3311,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ) ladder ON TRUE
             ORDER BY s.timestamp ASC, ladder.strike ASC
         """
+        # Normalised once, then used for the predicate, the bind and the
+        # level rescope below, so the three can never disagree about scope.
+        exp_filter = sorted(set(expirations)) if expirations else None
+        query = query.replace(
+            "{exp_predicate}",
+            "AND gbs.expiration = ANY($5::date[])" if exp_filter else "",
+        )
+        params: List[Any] = [symbol, start_utc, end_utc, float(strike_band_pct)]
+        if exp_filter:
+            params.append(exp_filter)
+
         started = time_module.monotonic()
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(
-                    query,
-                    symbol,
-                    start_utc,
-                    end_utc,
-                    float(strike_band_pct),
-                )
+                rows = await conn.fetch(query, *params)
         except Exception as e:
             # Elapsed separates the two ways this read blows its budget, the
             # same distinction the strike-profile timeseries logs: the pool
@@ -3192,9 +3333,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             # slow QUERY while materially more is time spent queueing for a
             # pool connection.  Both surface as an exception here.
             logger.warning(
-                "get_gex_frames_for_session(%s, %s) failed after %.1fs: %s",
+                "get_gex_frames_for_session(%s, %s, exps=%s) failed after %.1fs: %s",
                 symbol,
                 session_date,
+                _exp_scope(exp_filter),
                 time_module.monotonic() - started,
                 e,
             )
@@ -3218,6 +3360,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "max_gamma_strike": r["max_gamma_strike"],
                     "strikes": [],
                 }
+                if exp_filter:
+                    # Scratch keys, consumed by _scope_replay_frame_levels
+                    # below.  Only populated under a filter so the whole-chain
+                    # read touches neither the extra columns nor the extra
+                    # per-minute list.
+                    frames[ts]["_spot"] = r["spot"]
+                    frames[ts]["_max_pain_by_expiration"] = r["max_pain_by_expiration"]
+                    frames[ts]["_gamma_inputs"] = []
             if r["strike"] is not None:
                 frames[ts]["strikes"].append(
                     {
@@ -3227,6 +3377,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         "put_gex": r["put_gex"],
                     }
                 )
+                if exp_filter:
+                    frames[ts]["_gamma_inputs"].append(
+                        {
+                            "strike": float(r["strike"]),
+                            "call_gamma": float(r["call_gamma"] or 0.0),
+                            "put_gamma": float(r["put_gamma"] or 0.0),
+                        }
+                    )
+        if exp_filter:
+            return [_scope_replay_frame_levels(f, exp_filter) for f in frames.values()]
         return list(frames.values())
 
     async def get_intraday_level_series(
@@ -5624,11 +5784,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._cache_set(cache_key, result, 30.0)
         return result
 
+    @staticmethod
+    def _session_window_for_date(session_date: date) -> Tuple[datetime, datetime]:
+        """The 5-minute window for one ET trading date, in UTC.
+
+        09:30 ET through 16:15 ET, with the end capped at now() floored to the
+        grid — identical arithmetic to the ``current`` branch below, which is
+        what makes ``date=<today>`` behave exactly like ``session=current``
+        instead of reaching past the last bar that exists.
+        """
+        session_start_et = datetime(
+            session_date.year, session_date.month, session_date.day, 9, 30, tzinfo=_ET
+        )
+        session_start_utc = session_start_et.astimezone(timezone.utc)
+        session_close_utc = session_start_utc + timedelta(hours=6, minutes=45)
+        now_utc = datetime.now(timezone.utc)
+        now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+        now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+        session_end_utc = min(now_floored, session_close_utc)
+        if session_end_utc < session_start_utc:
+            # A future date, or today before the open. The window is empty
+            # rather than inverted; the read returns no rows.
+            session_end_utc = session_start_utc
+        return session_start_utc, session_end_utc
+
     async def _resolve_flow_series_session(
         self,
         conn: asyncpg.Connection,
         symbol: str,
         session: str,
+        session_date: Optional[date] = None,
     ) -> Optional[Tuple[datetime, datetime, bool]]:
         """Resolve (session_start_utc, session_end_utc, symbol_has_any_data) for
         the data-driven session model used by /api/flow/series.
@@ -5638,7 +5823,45 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol exists but the requested session has no data — the endpoint
         surfaces this as ``200 + []`` (see T4 / "session=prior but no prior
         data"). Normal resolution returns ``(start, end, True)``.
+
+        ``session_date`` names an explicit ET trading day and takes precedence
+        over ``session``. It resolves ARITHMETICALLY and reports
+        ``has_session_data=True`` without probing, which is deliberate on both
+        counts:
+
+        * the window for a named date is known by construction — the flag
+          exists for ``prior``, where the window itself has to be discovered;
+        * the probe it would otherwise do is against ``flow_by_contract``,
+          which ``make db-prune`` empties at 90 days. A dated read is served
+          from the retention-exempt snapshots precisely because its source
+          data is gone, so asking the pruned table whether the day existed
+          would report "no such session" for every session old enough to need
+          a permalink.
+
+        A date with nothing stored therefore returns an empty series rather
+        than a 404 — which is also what the dated pages need: ``notFound()``
+        on a crawl costs a permalink its place in the index, and
+        ``serverApiGet`` cannot tell an empty day from an unreachable API.
         """
+        if session_date is not None:
+            # Symbol validity is still worth a 404, but it is asked of the
+            # symbol table rather than of pruned flow rows.
+            known = await conn.fetchval(
+                "SELECT 1 FROM symbols WHERE symbol = $1 LIMIT 1",
+                symbol,
+            )
+            if not known:
+                # Fall back to the flow probe for deployments whose symbols
+                # table is not the authority it is here.
+                known = await conn.fetchval(
+                    "SELECT 1 FROM flow_by_contract WHERE symbol = $1 LIMIT 1",
+                    symbol,
+                )
+            if not known:
+                return None
+            start, end = self._session_window_for_date(session_date)
+            return start, end, True
+
         exists = await conn.fetchval(
             "SELECT 1 FROM flow_by_contract WHERE symbol = $1 LIMIT 1",
             symbol,
@@ -5834,6 +6057,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
             return []
 
+    @staticmethod
+    def _hedging_snapshot_scope(
+        session_date: date,
+        strikes: Optional[List[float]],
+        expirations: Optional[List[date]],
+    ) -> Optional[str]:
+        """Which materialised scope answers this filter, or None for neither.
+
+        ``hedging_flow_5min`` stores two series per session: the unfiltered
+        one and the session's own expiry. Those are the only two the page can
+        ask for, so anything else -- a strike list, a different expiration --
+        has to fall through to the live CTE and is bounded by the prune window
+        like every other filtered flow read.
+        """
+        if strikes:
+            return None
+        if not expirations:
+            return SCOPE_ALL
+        if len(expirations) == 1 and expirations[0] == session_date:
+            return SCOPE_0DTE
+        return None
+
     async def get_hedging_flow_series(
         self,
         symbol: str = "SPY",
@@ -5841,6 +6086,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         strikes: Optional[List[float]] = None,
         expirations: Optional[List[date]] = None,
         intervals: Optional[int] = None,
+        session_date: Optional[date] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Return 5-minute estimated hedging-pressure bars for a session.
 
@@ -5849,16 +6095,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         the same unfiltered underlying price, so the two series overlay
         exactly. Rows are newest-first; ``intervals=N`` returns the leading N.
 
-        Returns ``None`` when the symbol has never appeared in
-        flow_by_contract (caller surfaces 404), and ``[]`` when the symbol
-        exists but the resolved session has no flow.
+        Returns ``None`` when the symbol is unknown (caller surfaces 404), and
+        ``[]`` when the symbol exists but the resolved session has no flow.
 
-        There is no snapshot path here yet -- unlike flow-series this always
-        runs the CTE. It reads ``flow_contract_facts`` (already per-bucket
-        deltas, so no LAG-and-recumulate), which is a materially cheaper scan
-        than the flow-series pipeline; if it ever stops being cheap enough,
-        the query's window invariance makes it snapshot-able with the same
-        argument flow_series_5min uses.
+        Two read paths, and which one runs is decided by the QUESTION, not by
+        cost
+        -----------------------------------------------------------------
+        A live read (no ``session_date``) runs the canonical CTE, exactly as
+        before. It reads ``flow_contract_facts`` -- already per-bucket deltas,
+        so no LAG-and-recumulate -- and is the cheap one; there is nothing to
+        gain by reading a snapshot that is at most one analytics cycle behind
+        the tape the page is watching.
+
+        A DATED read serves ``hedging_flow_5min`` instead, and not for speed:
+        ``flow_contract_facts`` is pruned at ``DATA_RETENTION_DAYS`` (90), so
+        recomputing a session older than that returns an empty series that a
+        reader cannot distinguish from a quiet day. The snapshot is written
+        once per cycle from the same canonical SQL and kept forever, which is
+        the only reason a permalink from last spring still draws a chart.
+
+        A dated read whose filter neither stored scope covers falls back to
+        the CTE and inherits its 90-day horizon -- the same tradeoff
+        ``flow_series_5min`` makes for filtered reads.
         """
         symbol = symbol.upper()
 
@@ -5869,7 +6127,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if use_cache:
             strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
             exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
-            cache_key = f"hedging_flow:{symbol}:{session}:{strikes_key}:{exps_key}"
+            session_key = session_date.isoformat() if session_date else session
+            cache_key = f"hedging_flow:{symbol}:{session_key}:{strikes_key}:{exps_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached  # type: ignore[no-any-return]
@@ -5880,7 +6139,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
                 if resolved is None:
                     return None
                 session_start, session_end, has_session_data = resolved
@@ -5889,19 +6150,38 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
                     return []
 
-                rows = await asyncio.wait_for(
-                    self._fetch_timed(
-                        conn,
-                        HEDGING_FLOW_CTE_ASYNCPG,
-                        symbol,
-                        session_start,
-                        session_end,
-                        strikes_arg,
-                        expirations_arg,
-                        timeout=15.0,
-                    ),
-                    timeout=15.0,
+                scope = (
+                    self._hedging_snapshot_scope(session_date, strikes, expirations)
+                    if session_date is not None
+                    else None
                 )
+                if scope is not None:
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            HEDGING_FLOW_SNAPSHOT_SELECT_ASYNCPG,
+                            symbol,
+                            scope,
+                            session_start,
+                            session_end,
+                            timeout=10.0,
+                        ),
+                        timeout=10.0,
+                    )
+                else:
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            HEDGING_FLOW_CTE_ASYNCPG,
+                            symbol,
+                            session_start,
+                            session_end,
+                            strikes_arg,
+                            expirations_arg,
+                            timeout=15.0,
+                        ),
+                        timeout=15.0,
+                    )
                 result = [dict(row) for row in rows]
                 if intervals is not None and intervals > 0 and len(result) > intervals:
                     # Newest-first; leading N == most recent N buckets.
@@ -5913,11 +6193,69 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Hedging flow query timed out for {symbol}, returning empty")
             return []
 
+    async def get_hedging_flow_sessions(
+        self,
+        symbol: str = "SPY",
+        limit: int = 60,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Trading days that have stored hedging-flow bars, newest first.
+
+        The index behind the dated permalinks, and deliberately a list of days
+        that HAVE data rather than a date picker: a picker invites a reader to
+        land on an empty session and conclude the feature is broken, which is
+        the same reason /replay and /scorecard both ship a session list.
+
+        Read off ``hedging_flow_5min`` alone -- never the pruned source
+        tables -- so the list and the pages it links to agree about which
+        sessions exist for as long as the snapshots are kept.
+
+        Returns ``None`` for an unknown symbol (404) and ``[]`` for a known
+        symbol with nothing stored yet.
+        """
+        symbol = symbol.upper()
+        cache_key = f"hedging_flow_sessions:{symbol}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        try:
+            async with self._acquire_connection() as conn:
+                known = await conn.fetchval(
+                    "SELECT 1 FROM symbols WHERE symbol = $1 LIMIT 1", symbol
+                )
+                if not known:
+                    known = await conn.fetchval(
+                        "SELECT 1 FROM flow_by_contract WHERE symbol = $1 LIMIT 1", symbol
+                    )
+                if not known:
+                    return None
+
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(
+                        conn,
+                        HEDGING_FLOW_SESSIONS_ASYNCPG,
+                        symbol,
+                        limit,
+                        timeout=10.0,
+                    ),
+                    timeout=10.0,
+                )
+                result = [dict(row) for row in rows]
+                # The session list changes once per trading day; the endpoint
+                # TTL is the same one the series reads use so a deploy tunes
+                # both together.
+                self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Hedging flow sessions query timed out for {symbol}, returning empty")
+            return []
+
     async def get_gamma_regime_series(
         self,
         symbol: str = "SPY",
         session: str = "current",
         intervals: Optional[int] = None,
+        session_date: Optional[date] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Read the materialised intraday Gamma Regime series for a session.
 
@@ -5932,26 +6270,37 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         Session resolution is :meth:`_resolve_flow_series_session` -- the SAME
         window the flow series uses -- so the structure line and the flow line
-        cover identical bars and can be stacked without re-aligning.
+        cover identical bars and can be stacked without re-aligning. That is
+        also why ``session_date`` is threaded through here rather than handled
+        locally: a dated structure panel that resolved its own window could
+        drift a bar from the flow panel it is crosshaired to.
 
-        Returns ``None`` for a symbol with no flow history at all (404), and
-        ``[]`` when the session resolves but nothing has been written for it
-        yet (a session before the writer was deployed, or a cold engine).
-        Rows are newest-first, matching the other series endpoints.
+        This series needed nothing else to become historical.
+        ``gamma_regime_5min`` has been written per bar since the panel
+        shipped and is already absent from ``DB_MAINTAIN_TABLES``, so the rows
+        for a past session are simply there.
+
+        Returns ``None`` for an unknown symbol (404), and ``[]`` when the
+        session resolves but nothing has been written for it (a session before
+        the writer was deployed, or a cold engine). Rows are newest-first,
+        matching the other series endpoints.
         """
         symbol = symbol.upper()
 
         use_cache = intervals is None
         cache_key = None
         if use_cache:
-            cache_key = f"gamma_regime_series:{symbol}:{session}"
+            session_key = session_date.isoformat() if session_date else session
+            cache_key = f"gamma_regime_series:{symbol}:{session_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached  # type: ignore[no-any-return]
 
         try:
             async with self._acquire_connection() as conn:
-                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
                 if resolved is None:
                     return None
                 session_start, session_end, has_session_data = resolved
@@ -8769,4 +9118,418 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 }
         except Exception as e:
             logger.error(f"Error fetching premium surface data: {e}", exc_info=True)
+            raise
+
+    # -----------------------------------------------------------------
+    # Spread Monitor — quoted-width / liquidity reads
+    # -----------------------------------------------------------------
+    #
+    # Two read shapes, and the split is deliberate:
+    #
+    #   * :meth:`get_spread_snapshot_chain` returns RAW contract rows at one
+    #     timestamp and lets ``src.analytics.spread_stats`` reduce them in
+    #     Python.  It is the same module the analytics writer and the
+    #     backfill use, so "today's reading" and the daily history it is
+    #     scored against are produced by one implementation.  That matters
+    #     more than it might look: a percentile is a comparison, and a
+    #     comparison across two implementations of the same statistic is a
+    #     comparison of the implementations.
+    #
+    #   * :meth:`get_spread_intraday_series` aggregates in SQL, because a
+    #     full session for SPX is a few hundred thousand contract-rows and
+    #     shipping them to Python per request is not a trade worth making.
+    #     Nothing in the response is compared against the daily history —
+    #     it is a within-session shape — so the second definition here is
+    #     confined to a place where drift cannot corrupt a comparison.
+    #
+    # The SQL predicates below mirror ``spread_stats.classify_quote``
+    # exactly.  Keep them in step:
+    #     TWO_SIDED  ->  bid > 0 AND ask > bid          (the only state with a width)
+    #     ZERO_BID   ->  ask > 0 AND (bid IS NULL OR bid <= 0)
+    #     LOCKED     ->  ask = bid  (folded into crossed_or_locked below)
+    #     CROSSED    ->  ask < bid  AND bid > 0
+    #     NO_QUOTE   ->  ask IS NULL OR ask <= 0
+
+    _SPREAD_TWO_SIDED_SQL = (
+        "oc.bid IS NOT NULL AND oc.ask IS NOT NULL AND oc.bid > 0 AND oc.ask > oc.bid"
+    )
+    _SPREAD_ZERO_BID_SQL = (
+        "oc.ask IS NOT NULL AND oc.ask > 0 AND (oc.bid IS NULL OR oc.bid <= 0)"
+    )
+    _SPREAD_CROSSED_LOCKED_SQL = (
+        "oc.ask IS NOT NULL AND oc.bid IS NOT NULL AND oc.ask > 0 "
+        "AND oc.bid > 0 AND oc.ask <= oc.bid"
+    )
+    # relative width = 100 * (ask - bid) / mid, and mid = (ask + bid) / 2,
+    # so the ratio simplifies to 200 * (ask - bid) / (ask + bid).  Guarded by
+    # the two-sided FILTER, under which (ask + bid) > 0 always holds.
+    _SPREAD_RELATIVE_SQL = "200.0 * (oc.ask - oc.bid) / (oc.ask + oc.bid)"
+
+    async def get_spread_snapshot_chain(
+        self,
+        symbol: str,
+        dte_max: int,
+        moneyness_band_pct: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Latest stable chain snapshot, as raw rows for the spread reducer.
+
+        Returns spot, the snapshot timestamp, its ET session date, and one
+        row per contract inside the ±``moneyness_band_pct`` strike band with
+        ``0 <= dte <= dte_max``.
+
+        Rows are returned RAW — quotes are not filtered, scored or dropped
+        here.  A contract with no bid is exactly the observation the caller
+        is looking for, and a read path that quietly discarded it would make
+        a chain look tighter the worse its wings got.
+
+        Anchors on ``_STABLE_SNAPSHOT_CTE`` (as the premium surface does) so
+        a quiescing post-close feed doesn't hand back a half-written
+        terminal bucket, which would read as a chain-wide liquidity event.
+        """
+        spot_query = """
+            SELECT close, timestamp
+            FROM underlying_quotes
+            WHERE symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+
+        chain_query = f"""
+            WITH {_STABLE_SNAPSHOT_CTE}
+            SELECT
+                oc.option_symbol,
+                oc.strike,
+                oc.option_type,
+                oc.expiration,
+                oc.bid,
+                oc.ask,
+                oc.open_interest,
+                oc.volume,
+                latest_ts.ts AS snapshot_ts,
+                (latest_ts.ts AT TIME ZONE 'America/New_York')::date AS session_date
+            FROM option_chains oc
+            CROSS JOIN latest_ts
+            WHERE oc.underlying = $1
+              AND oc.timestamp = latest_ts.ts
+              AND oc.strike BETWEEN $2::numeric AND $3::numeric
+              AND oc.expiration >= (latest_ts.ts AT TIME ZONE 'America/New_York')::date
+              AND oc.expiration <= (latest_ts.ts AT TIME ZONE 'America/New_York')::date
+                                   + $4::int
+            ORDER BY oc.expiration, oc.strike, oc.option_type
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                spot_row = await conn.fetchrow(spot_query, symbol)
+                if not spot_row or not spot_row["close"]:
+                    return None
+
+                spot_price = float(spot_row["close"])
+                if spot_price <= 0:
+                    return None
+
+                band = float(moneyness_band_pct) / 100.0
+                rows = await conn.fetch(
+                    chain_query,
+                    symbol,
+                    spot_price * (1.0 - band),
+                    spot_price * (1.0 + band),
+                    int(dte_max),
+                )
+                if not rows:
+                    return None
+
+                return {
+                    "spot_price": spot_price,
+                    "spot_timestamp": spot_row["timestamp"],
+                    "snapshot_ts": rows[0]["snapshot_ts"],
+                    "session_date": rows[0]["session_date"],
+                    "rows": [dict(r) for r in rows],
+                }
+        except Exception as e:
+            logger.error(
+                f"Error fetching spread snapshot chain for {symbol}: {e}", exc_info=True
+            )
+            raise
+
+    async def get_spread_intraday_series(
+        self,
+        symbol: str,
+        dte_max: int,
+        moneyness_band_pct: float,
+        bucket_minutes: int,
+        session: str = "current",
+    ) -> List[Dict[str, Any]]:
+        """Per-bucket quoted-width series for one session, split by option type.
+
+        One reading per bucket, taken at the LAST chain snapshot inside it
+        rather than averaged over the minutes within.  Two reasons, and both
+        are load-bearing:
+
+        * ``option_chains`` is written every minute, so a 15-minute average
+          would re-measure the same contracts fifteen times and scan fifteen
+          times the rows to say the same thing.
+        * A bucket average smears a genuine step change — the exact event
+          the page exists to show — across the bucket that contains it.
+
+        The moneyness band is re-centred on the spot AT EACH BUCKET, not on
+        the current spot.  A band pinned to the close would sit off the money
+        for the morning of a trending day and would report the resulting
+        change in which contracts were sampled as a change in how wide they
+        were quoted.
+        """
+        session_start, session_end = _get_flow_session_bounds(session)
+        bucket_seconds = max(60, int(bucket_minutes) * 60)
+        band = float(moneyness_band_pct) / 100.0
+
+        query = f"""
+            WITH bucket_anchor AS (
+                SELECT
+                    to_timestamp(
+                        floor(extract(epoch FROM oc.timestamp) / $4::int) * $4::int
+                    ) AS bucket_start,
+                    MAX(oc.timestamp) AS anchor_ts
+                FROM option_chains oc
+                WHERE oc.underlying = $1
+                  AND oc.timestamp >= $2
+                  AND oc.timestamp <= $3
+                GROUP BY 1
+            ),
+            spot_at AS (
+                SELECT
+                    ba.bucket_start,
+                    ba.anchor_ts,
+                    (
+                        SELECT uq.close
+                        FROM underlying_quotes uq
+                        WHERE uq.symbol = $1
+                          AND uq.timestamp <= ba.anchor_ts
+                        ORDER BY uq.timestamp DESC
+                        LIMIT 1
+                    ) AS spot
+                FROM bucket_anchor ba
+            )
+            SELECT
+                sa.bucket_start,
+                sa.anchor_ts,
+                sa.spot::double precision AS spot,
+                oc.option_type,
+                COUNT(*)::int AS contract_count,
+                COUNT(*) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::int
+                    AS tradable_count,
+                COUNT(*) FILTER (WHERE {self._SPREAD_ZERO_BID_SQL})::int
+                    AS zero_bid_count,
+                COUNT(*) FILTER (WHERE {self._SPREAD_CROSSED_LOCKED_SQL})::int
+                    AS crossed_or_locked_count,
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY (oc.ask - oc.bid)
+                ) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::double precision
+                    AS median_spread,
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY {self._SPREAD_RELATIVE_SQL}
+                ) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::double precision
+                    AS median_relative_spread_pct,
+                percentile_cont(0.9) WITHIN GROUP (
+                    ORDER BY {self._SPREAD_RELATIVE_SQL}
+                ) FILTER (WHERE {self._SPREAD_TWO_SIDED_SQL})::double precision
+                    AS p90_relative_spread_pct,
+                COALESCE(SUM(oc.open_interest), 0)::bigint AS total_open_interest,
+                COALESCE(SUM(oc.volume), 0)::bigint AS total_volume
+            FROM spot_at sa
+            JOIN option_chains oc
+              ON oc.underlying = $1
+             AND oc.timestamp = sa.anchor_ts
+            WHERE sa.spot IS NOT NULL
+              AND sa.spot > 0
+              AND oc.strike BETWEEN sa.spot * (1 - $5::numeric)
+                                AND sa.spot * (1 + $5::numeric)
+              AND oc.expiration >= (sa.anchor_ts AT TIME ZONE 'America/New_York')::date
+              AND oc.expiration <= (sa.anchor_ts AT TIME ZONE 'America/New_York')::date
+                                   + $6::int
+            GROUP BY sa.bucket_start, sa.anchor_ts, sa.spot, oc.option_type
+            ORDER BY sa.bucket_start, oc.option_type
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    query,
+                    symbol,
+                    session_start,
+                    session_end,
+                    bucket_seconds,
+                    band,
+                    int(dte_max),
+                )
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(
+                f"Error fetching spread intraday series for {symbol}: {e}",
+                exc_info=True,
+            )
+            raise
+
+    async def get_daily_spread_history(
+        self,
+        symbol: str,
+        option_type: str,
+        days: int,
+    ) -> List[Dict[str, Any]]:
+        """Trailing daily quoted-width history from the ``daily_spread_stats`` rollup.
+
+        Returned OLDEST-FIRST so the caller can chart it without reversing.
+        ``option_type`` is 'C', 'P' or 'A' (blended).
+
+        An empty list is a normal answer, not an error: the rollup is written
+        by the analytics engine and seeded by
+        ``src.tools.daily_spread_stats_backfill``, so a fresh deployment has
+        no history until one of the two has run.  The caller renders the
+        live reading without a percentile rather than failing.
+        """
+        query = """
+            SELECT trading_date,
+                   option_type,
+                   spot_price::double precision AS spot_price,
+                   dte_max,
+                   moneyness_band_pct,
+                   contract_count,
+                   tradable_count,
+                   two_sided_pct,
+                   zero_bid_pct,
+                   crossed_or_locked_pct,
+                   median_spread,
+                   median_relative_spread_pct,
+                   p90_relative_spread_pct,
+                   median_spread_bps_underlying,
+                   p90_spread_bps_underlying,
+                   total_open_interest,
+                   total_volume,
+                   source_timestamp
+            FROM daily_spread_stats
+            WHERE underlying = $1
+              AND option_type = $2
+            ORDER BY trading_date DESC
+            LIMIT $3::int
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, option_type, int(days))
+                return [dict(r) for r in reversed(rows)]
+        except Exception as e:
+            logger.error(
+                f"Error fetching daily spread history for {symbol}: {e}", exc_info=True
+            )
+            raise
+
+    async def get_spread_surface_window(
+        self,
+        symbol: str,
+        option_type: str,
+        band_pct: float,
+        bucket_start_min: int,
+        days: int,
+    ) -> List[Dict[str, Any]]:
+        """Every stored surface cell for one symbol/side/band at one time bucket.
+
+        Returns the whole trailing window in a single round trip — every
+        dte_scope and every moneyness slice together — because the caller
+        needs all of them at once and the alternative is one query per cell.
+        The window is about a hundred scopes by sixty sessions, so this is a
+        few thousand narrow rows served by
+        ``idx_spread_surface_scope_window`` as a range scan.
+
+        Time-of-day matched by construction: ``bucket_start_min`` is an
+        equality, so a 15:30 reading is only ever ranked against prior
+        sessions at 15:30. Ranking it against an all-day median would report
+        the closing rotation as an anomaly on every single session.
+
+        Rows are returned oldest-first. An empty list is a normal answer on a
+        deployment where ``src.tools.spread_surface_backfill`` has not run.
+
+        The ``::real`` cast on the band is load-bearing, not decoration.
+        ``band_pct`` is REAL and part of the primary key, so the filter is a
+        float equality; casting the parameter to the column's own type puts
+        both sides through the identical float4 rounding. Without it a
+        parameter inferred as float8 would miss any band whose value is not
+        exactly representable in single precision, and the page would report
+        "no comparable sessions" for a scope with a full history behind it.
+        """
+        query = """
+            SELECT trading_date,
+                   dte_scope,
+                   money_bucket,
+                   spot_price::double precision AS spot_price,
+                   contract_count,
+                   tradable_count,
+                   two_sided_pct,
+                   zero_bid_pct,
+                   crossed_or_locked_pct,
+                   median_relative_spread_pct,
+                   p90_relative_spread_pct,
+                   median_spread
+            FROM spread_surface_stats
+            WHERE underlying = $1
+              AND option_type = $2
+              AND band_pct = $3::real
+              AND bucket_start_min = $4::smallint
+              AND trading_date >= (CURRENT_DATE - $5::int)
+            ORDER BY trading_date
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    query,
+                    symbol,
+                    option_type,
+                    float(band_pct),
+                    int(bucket_start_min),
+                    int(days),
+                )
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(
+                f"Error fetching spread surface window for {symbol}: {e}", exc_info=True
+            )
+            raise
+
+    async def get_spread_surface_latest_bucket(
+        self,
+        symbol: str,
+        option_type: str,
+    ) -> Optional[int]:
+        """The most recent time bucket this symbol has any surface history for.
+
+        Used when the live clock sits outside the cash session: rather than
+        ranking a post-close reading against an empty bucket, the caller falls
+        back to the last bucket that actually has a baseline and labels the
+        comparison as such.  Usually that is the session's closing bucket;
+        it is not on a half day, or where the writer stopped early, which is
+        why this is read rather than assumed.
+
+        Bounded to a fortnight on purpose.  ``idx_spread_surface_scope_window``
+        is keyed (underlying, option_type, dte_scope, band_pct, money_bucket,
+        bucket_start_min, trading_date DESC), so it cannot serve an ORDER BY
+        on trading_date across scopes — Postgres would sort every row this
+        symbol and side have (about a hundred scopes by thirteen buckets by
+        the whole retained history) to return a single integer, on the path
+        that runs whenever the market is shut.  Two weeks is longer than any
+        exchange holiday run and caps the scan.
+        """
+        query = """
+            SELECT bucket_start_min
+            FROM spread_surface_stats
+            WHERE underlying = $1
+              AND option_type = $2
+              AND trading_date >= (CURRENT_DATE - 14)
+            ORDER BY trading_date DESC, bucket_start_min DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, option_type)
+                return int(row["bucket_start_min"]) if row else None
+        except Exception as e:
+            logger.error(
+                f"Error fetching latest surface bucket for {symbol}: {e}", exc_info=True
+            )
             raise

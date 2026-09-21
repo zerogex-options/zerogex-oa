@@ -60,6 +60,7 @@ def _row(
     gamma_flip=Decimal("505.5"),
     pin_strike=None,
     pin_confidence=None,
+    max_gamma_strike=None,
     call_gex=None,
     put_gex=None,
     net_gex=None,
@@ -77,6 +78,10 @@ def _row(
         "gamma_flip": gamma_flip,
         "pin_strike": pin_strike,
         "pin_confidence": pin_confidence,
+        # GEX King rides through per bucket alongside the pin. Absent from
+        # this fixture, the row assembly raises KeyError and every test in
+        # the module fails on a missing key rather than on what it asserts.
+        "max_gamma_strike": max_gamma_strike,
         "strike": None if strike is None else Decimal(str(strike)),
         "call_gamma_raw": Decimal(str(call_raw)),
         "put_gamma_raw": Decimal(str(put_raw)),

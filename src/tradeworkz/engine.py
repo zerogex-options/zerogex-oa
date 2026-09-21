@@ -30,7 +30,7 @@ from src.tradeworkz import ml as ml_mod
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.context import MarketSnapshot, build_snapshot
 from src.tradeworkz.models import BotSpec, OpenPosition
-from src.tradeworkz.registry import get_bot_class, DEFAULT_ROSTER, RETIRED_BOT_IDS
+from src.tradeworkz.registry import get_bot_class, DEFAULT_ROSTER, DISABLED_BOT_IDS
 from src.tradeworkz.reconciler import (
     _earliest_leg_expiration,
     close_position,
@@ -255,7 +255,9 @@ def _run_bot(
                     # tick when a quote may return. See _force_settle_due.
                     if _force_settle_due(pos, now_utc):
                         settled = close_position(
-                            conn, pos, reason="time_stop_settle",
+                            conn,
+                            pos,
+                            reason="time_stop_settle",
                             fallback_fill=pos.current_price,
                         )
                         if settled is not None:
@@ -265,7 +267,8 @@ def _run_bot(
                                 "TradeWorkz: %s position %s is past time_stop but "
                                 "unsettleable (no live mark, no last price); left "
                                 "open for manual review",
-                                bot_id, pos.id,
+                                bot_id,
+                                pos.id,
                             )
                     continue
                 stats["marked"] += 1
@@ -273,9 +276,10 @@ def _run_bot(
                 if decision.should_close:
                     close_position(conn, pos, reason=decision.reason or "signal")
                     stats["closed"] += 1
-                elif getattr(decision, "should_cut", False) and (
-                    getattr(decision, "cut_fraction", 0.0) or 0.0
-                ) > 0:
+                elif (
+                    getattr(decision, "should_cut", False)
+                    and (getattr(decision, "cut_fraction", 0.0) or 0.0) > 0
+                ):
                     # Scale-out tranche: books realized onto the position and
                     # keeps a runner open. No tw_trades row / capital move until
                     # the final close consolidates. See
@@ -479,9 +483,11 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
       deliberately NOT re-synced, so a runtime auto-disable (the
       governance circuit breaker) or a manual disable survives a
       redeploy; re-enable a bot explicitly to bring it back.
-    * Bot ids listed in :data:`RETIRED_BOT_IDS` are flipped to
+    * Bot ids listed in :data:`DISABLED_BOT_IDS` are flipped to
       ``enabled=false`` and their sleeve is zeroed so the freed capital
-      shows up in the next admin-triggered rebalance.
+      shows up in the next admin-triggered rebalance. That list is every
+      bot whose catalog entry is not yet VALIDATED — a provisioning
+      state, not the catalog's terminal RETIRED stage.
     * ``starting_capital`` is re-synced to ``FLEET_CAPITAL / N`` for
       every active roster bot so shrinking or growing the roster keeps
       the total sleeve pot at ``FLEET_CAPITAL``. ``current_capital`` /
@@ -490,11 +496,12 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
       fresh baseline.
     """
     fleet = tw_config.FLEET_CAPITAL if fleet_capital is None else float(fleet_capital)
-    # DEFAULT_ROSTER is empty when the whole fleet is shelved (see
-    # registry.SHELVED_SPECS): the seed / re-sync loop below then no-ops (an
-    # empty active_ids matches no rows) and only the RETIRED_BOT_IDS retire step
-    # runs — so a fully-shelved fleet still gets disabled + zeroed on the next
-    # provision instead of being skipped by an early return.
+    # DEFAULT_ROSTER is empty while no catalog strategy is both VALIDATED
+    # and bot-bound (src/strategies): the seed / re-sync loop below then
+    # no-ops (an empty active_ids matches no rows) and only the
+    # DISABLED_BOT_IDS step runs — so an unfunded fleet still gets disabled +
+    # zeroed on the next provision instead of being skipped by an early
+    # return.
     roster = list(DEFAULT_ROSTER)
     slice_amount = round(fleet / len(roster), 2) if roster else 0.0
     now = datetime.now(timezone.utc)
@@ -578,14 +585,14 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
     # Retire bots that used to be in the roster but no longer belong.
     # Flip enabled=false + zero the sleeve so their capital is no longer
     # counted against the fleet total. Historical rows stay put.
-    if RETIRED_BOT_IDS:
+    if DISABLED_BOT_IDS:
         cur.execute(
             """
             UPDATE tw_bots
                SET enabled = FALSE, updated_at = %s
              WHERE id = ANY(%s) AND enabled IS TRUE
             """,
-            (now, list(RETIRED_BOT_IDS)),
+            (now, list(DISABLED_BOT_IDS)),
         )
         cur.execute(
             """
@@ -595,6 +602,6 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
              WHERE bot_id = ANY(%s)
                AND (starting_capital <> 0 OR current_capital <> 0)
             """,
-            (now, list(RETIRED_BOT_IDS)),
+            (now, list(DISABLED_BOT_IDS)),
         )
     return inserted

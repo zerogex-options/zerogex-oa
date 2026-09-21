@@ -60,6 +60,13 @@ def _mock_db_connection(latest_ts, underlying_price, option_rows):
     cursor.fetchone.side_effect = [
         (latest_ts,),  # query 1: latest option_chains timestamp
         (underlying_price, latest_ts),  # query 2: underlying close + ts
+        # _get_snapshot's last query: option_chains_latest MAX(updated_at),
+        # the sub-minute change signal behind gex_summary.data_as_of. These
+        # mocks are positional, so a query added to _get_snapshot without a
+        # matching entry here raises StopIteration -- which the engine's broad
+        # except swallows into a silent None, and the test fails somewhere
+        # else entirely. That is exactly how this went unnoticed for 11 days.
+        (latest_ts,),
     ]
     cursor.fetchall.return_value = option_rows  # query 3: option rows
 
@@ -219,6 +226,7 @@ def _mock_db_connection_with_stale_underlying(
         (option_chain_ts,),
         (underlying_price, underlying_ts),
         forward_row,
+        (option_chain_ts,),  # option_chains_latest MAX(updated_at)
     ]
     cursor.fetchall.return_value = option_rows
     conn = MagicMock()

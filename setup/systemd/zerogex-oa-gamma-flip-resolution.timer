@@ -1,0 +1,29 @@
+[Unit]
+Description=Periodic ZeroGEX gamma-flip resolution check (hourly in-session + once after the close)
+
+[Timer]
+# Deliberately the same shape as the carry timer: hourly through the cash
+# session, plus one run after the close that can judge a COMPLETE session. The
+# in-session fires turn a blackout into an email while it is still happening,
+# which is the whole point -- a blank Flip line is worth knowing about at
+# 10:30, not in a screenshot six weeks later.
+#
+# Server timezone is America/New_York (deploy/steps/010.setup), so these are
+# ET. Weekdays only: there are no cycles to judge at the weekend.
+#
+# First fire at 10:30 rather than the open. The tool measures a blank run to
+# the row that ends it, and the session's first rows can legitimately be blank
+# for a cycle or two while the chain fills; starting an hour in means the
+# threshold reports blackouts rather than the engine waking up.
+#
+# The last in-session fire is 15:30 and the final one is 16:05, not the carry
+# check's 16:30: this tool's session window closes at 16:00 ET, so there is
+# nothing after the close for it to wait for.
+OnCalendar=Mon..Fri *-*-* 10..15:30:00
+OnCalendar=Mon..Fri *-*-* 16:05:00
+RandomizedDelaySec=2m
+# A host that was down over the close still reports once it comes back.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

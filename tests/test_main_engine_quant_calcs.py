@@ -7,7 +7,10 @@ import pytest
 from scipy import stats
 
 from src.analytics import main_engine
-from src.analytics.main_engine import AnalyticsEngine
+from src.analytics.main_engine import (
+    _GEX_SUMMARY_OPTIONAL_COLUMNS,
+    AnalyticsEngine,
+)
 
 
 def _opt(strike, otype, *, oi=1000, iv=0.20, exp=None, gamma=0.0, volume=0):
@@ -975,9 +978,30 @@ def test_resolve_gamma_flip_keeps_sign_consistency_invariant_at_every_rung(monke
     assert (n_b < 0) == (spot < flip_b)
 
 
+def _migrated_cursor():
+    """Cursor whose gex_summary column probe reports a fully-migrated table.
+
+    ``_store_gex_summary`` assembles its upsert from the columns the database
+    actually has (see tests/test_gex_summary_schema_skew.py). A bare MagicMock
+    iterates empty, which the writer correctly reads as "every optional column
+    is missing" -- so these tests would assert against the DEGRADED statement
+    and a column dropped from the real one would still look persisted.
+    """
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [(c,) for c in sorted(_GEX_SUMMARY_OPTIONAL_COLUMNS)]
+    return cursor
+
+
+def _upsert(cursor):
+    """The (sql, params) of the gex_summary upsert the writer issued."""
+    sql, params = cursor.execute.call_args_list[-1][0]
+    assert "INSERT INTO gex_summary" in sql
+    return sql, params
+
+
 def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
     engine = AnalyticsEngine(underlying="SPY")
-    cursor = MagicMock()
+    cursor = _migrated_cursor()
     cursor.fetchone.return_value = (501.25,)
 
     summary = {
@@ -999,13 +1023,13 @@ def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
 
     # First execute fetches prior non-null gamma flip.
     assert cursor.execute.call_count >= 2
-    insert_args = cursor.execute.call_args_list[-1][0][1]
-    assert insert_args[4] == 501.25
+    _, insert_args = _upsert(cursor)
+    assert insert_args["gamma_flip_point"] == 501.25
 
 
 def test_store_gex_summary_keeps_current_gamma_flip_when_present():
     engine = AnalyticsEngine(underlying="SPY")
-    cursor = MagicMock()
+    cursor = _migrated_cursor()
 
     summary = {
         "underlying": "SPY",
@@ -1025,8 +1049,8 @@ def test_store_gex_summary_keeps_current_gamma_flip_when_present():
     engine._store_gex_summary(summary, cursor)
 
     # No carry-forward SELECT when current gamma flip exists.
-    insert_args = cursor.execute.call_args_list[-1][0][1]
-    assert insert_args[4] == 499.75
+    _, insert_args = _upsert(cursor)
+    assert insert_args["gamma_flip_point"] == 499.75
 
 
 def test_store_gex_summary_persists_null_when_flip_unresolved():
@@ -1034,7 +1058,7 @@ def test_store_gex_summary_persists_null_when_flip_unresolved():
     carry-forward is SKIPPED and NULL is persisted (a visible gap),
     instead of silently re-freezing the last level (the original bug)."""
     engine = AnalyticsEngine(underlying="SPY")
-    cursor = MagicMock()
+    cursor = _migrated_cursor()
     cursor.fetchone.return_value = (501.25,)  # a prior exists; must NOT be used
 
     summary = {
@@ -1055,10 +1079,12 @@ def test_store_gex_summary_persists_null_when_flip_unresolved():
 
     engine._store_gex_summary(summary, cursor)
 
-    # No carry-forward SELECT — only the INSERT — and flip persists NULL.
-    assert cursor.execute.call_count == 1
-    insert_args = cursor.execute.call_args_list[-1][0][1]
-    assert insert_args[4] is None
+    # No carry-forward SELECT — only the INSERT (the column probe aside) —
+    # and flip persists NULL.
+    assert len([c for c in cursor.execute.call_args_list if "SELECT" in c[0][0]
+                and "information_schema" not in c[0][0]]) == 0
+    _, insert_args = _upsert(cursor)
+    assert insert_args["gamma_flip_point"] is None
 
 
 def test_store_gex_summary_persists_net_gex_at_spot():
@@ -1066,7 +1092,7 @@ def test_store_gex_summary_persists_net_gex_at_spot():
     params (regression: it was dropped between compute and persist, so the
     column was always written NULL)."""
     engine = AnalyticsEngine(underlying="SPY")
-    cursor = MagicMock()
+    cursor = _migrated_cursor()
 
     summary = {
         "underlying": "SPY",
@@ -1086,11 +1112,13 @@ def test_store_gex_summary_persists_net_gex_at_spot():
 
     engine._store_gex_summary(summary, cursor)
 
-    insert_args = cursor.execute.call_args_list[-1][0][1]
-    # Param order: ... total_net_gex (11), net_gex_at_spot (12), flip_distance (13) ...
-    assert insert_args[4] == 499.75  # gamma_flip_point index unchanged
-    assert insert_args[11] == 555.0
-    assert insert_args[12] == -1_234_567.0
+    sql, insert_args = _upsert(cursor)
+    assert insert_args["gamma_flip_point"] == 499.75
+    assert insert_args["total_net_gex"] == 555.0
+    assert insert_args["net_gex_at_spot"] == -1_234_567.0
+    # Bound is not enough: the value must also be in the statement, or the
+    # column this test exists to defend goes back to being written NULL.
+    assert "net_gex_at_spot" in sql and "%(net_gex_at_spot)s" in sql
 
 
 def test_gex_summary_includes_flip_distance_local_gex_and_convexity():

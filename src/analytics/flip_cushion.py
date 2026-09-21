@@ -45,10 +45,17 @@ is converging on the boundary.
 No flip, no cushion
 -------------------
 ``gamma_flip_point`` is NULL when the dealer-gamma profile is one-signed (no
-crossing at all) or degraded. That is not a missing value to paper over: it
-means there is no nearby regime boundary, which is its own state
-(:data:`STATE_NO_FLIP`) and reads very differently from "the boundary is far
-away". The two are kept distinct.
+crossing at all). That is not a missing value to paper over: it means there is
+no nearby regime boundary, which is its own state (:data:`STATE_NO_FLIP`) and
+reads very differently from "the boundary is far away". The two are kept
+distinct.
+
+Which is why a NULL arriving here has to be a MEASUREMENT and not a gap. A bar
+whose five minutes received no ``gex_summary`` row at all measured nothing, and
+the writer resolves it from the last level measured earlier in the same session
+rather than passing a NULL down (:mod:`src.analytics.gamma_flip_carry`). This
+module cannot make that distinction itself -- by the time a bar is read, the
+two look identical -- so it is made once, where the bar is written.
 """
 
 from __future__ import annotations

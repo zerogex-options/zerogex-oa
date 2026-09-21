@@ -303,7 +303,12 @@ def build_opening_range(
     if not window:
         return None, "no_bars_in_or_window"
     if len(window) < cfg.min_or_bars:
-        return None, f"or_bars_{len(window)}_below_min_{cfg.min_or_bars}"
+        # The MEASURED count stays out of the key. Skip reasons are aggregated
+        # by exact string into the run's .meta.json, so embedding a per-session
+        # value gave every skipped session its own key with a count of one, and
+        # "38 sessions lost to a thin window" never appeared anywhere. The
+        # threshold is config, so it is constant for the run and belongs here.
+        return None, f"or_bars_below_min_{cfg.min_or_bars}"
 
     high = max(b.high for b in window)
     low = min(b.low for b in window)
@@ -325,7 +330,12 @@ def build_opening_range(
         open_bar_repaired=repaired,
     )
     if orange.width_bp < cfg.min_or_width_bp:
-        return None, f"or_width_{orange.width_bp:.2f}bp_below_min_{cfg.min_or_width_bp}bp"
+        # Aggregatable key, per the note above. This one matters most: on a
+        # 1-minute opening range a real share of quiet sessions fall under the
+        # floor, and dropping them selects for volatile opens. That is a
+        # sample-selection effect the report has to be able to state, which it
+        # cannot do from a pile of unique keys.
+        return None, f"or_width_below_min_{cfg.min_or_width_bp}bp"
     return orange, None
 
 

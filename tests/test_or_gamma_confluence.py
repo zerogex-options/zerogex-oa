@@ -1106,3 +1106,147 @@ def test_gamma_lead_is_a_rebuild_axis_not_a_recohort_axis():
     ]
     grid = _distance_grid(rows, (2.0, 20.0))
     assert grid[0]["n_with"] == 0 and grid[1]["n_with"] == 1
+
+
+# ── The measurement artefact the sweep exposed ────────────────────────
+
+
+def test_touch_offset_records_how_far_the_bar_closed_back_inside():
+    """The event fires on the bar's extreme; the forward scan starts from its
+    close. That displacement is the whole baseline, so it has to be on the row."""
+    cfg = _cfg()
+    # Up rung at 29650; bar wicks to it and closes 10 points back below.
+    bars = _or_bars() + [_bar(5, 29550, 29650, 29550, 29640)]
+    orange, _ = build_opening_range(bars, SESSION, "NQ", cfg)
+    ladder = build_ladder(orange, cfg)
+    events = extract_touch_events("NQ", orange, ladder, bars, cfg, tick=0.25)
+    feats = build_features(events[0], SessionContext.build("NQ", bars, cfg), orange, ladder, cfg)
+    assert feats["touch_offset_r"] == pytest.approx(10.0 / orange.width)
+
+    # Down side mirrors: closing back ABOVE the level is the same displacement.
+    bars_dn = _or_bars() + [_bar(5, 29550, 29550, 29450, 29460)]
+    orange_dn, _ = build_opening_range(bars_dn, SESSION, "NQ", cfg)
+    ladder_dn = build_ladder(orange_dn, cfg)
+    ev_dn = extract_touch_events("NQ", orange_dn, ladder_dn, bars_dn, cfg, tick=0.25)
+    f_dn = build_features(
+        ev_dn[0], SessionContext.build("NQ", bars_dn, cfg), orange_dn, ladder_dn, cfg
+    )
+    assert f_dn["touch_offset_r"] == pytest.approx(10.0 / orange_dn.width)
+
+
+def test_mechanical_null_reproduces_the_observed_step_column():
+    """The sweep showed reversal falling as the step widens on ONE tape:
+    55.1% / 52.6% / 49.4% at 0.25R / 0.5R / 1R. Gambler's ruin says that is
+    the close-offset, not the market. A single offset must reproduce it."""
+    from research.or_gamma_confluence.report import _mechanical_null
+
+    rng = random.Random(4)
+    predicted = {}
+    for step in (0.25, 0.5, 1.0):
+        rows = [
+            {
+                "next_exists": True,
+                "touch_offset_r": abs(rng.gauss(0, 0.033)),
+                "outcome": OUTCOME_REVERSAL if rng.random() < 0.5 else OUTCOME_CONTINUATION,
+            }
+            for _ in range(4000)
+        ]
+        predicted[step] = _mechanical_null(rows, ResearchConfig(extension_step=step))[
+            "expected_reversal_rate"
+        ]
+    # Falls monotonically with the step, as observed.
+    assert predicted[0.25] > predicted[0.5] > predicted[1.0]
+    # And lands on the two best-powered observed cells.
+    assert predicted[0.25] == pytest.approx(0.551, abs=0.01)
+    assert predicted[0.5] == pytest.approx(0.526, abs=0.01)
+
+
+def test_mechanical_null_excludes_the_outermost_rung():
+    """Gambler's ruin needs two barriers; the outermost rung has no `next`."""
+    from research.or_gamma_confluence.report import _mechanical_null
+
+    rows = [{"next_exists": False, "touch_offset_r": 0.05, "outcome": OUTCOME_REVERSAL}]
+    assert _mechanical_null(rows, ResearchConfig())["available"] is False
+
+
+def test_report_states_the_baseline_is_not_fifty_percent():
+    from research.or_gamma_confluence.report import build_summary, render_markdown
+
+    rng = random.Random(9)
+    rows = [
+        {
+            "symbol": "NQ",
+            "gamma_symbol": "NDX",
+            "session": f"2026-07-{d % 28 + 1:02d}",
+            "outcome": OUTCOME_REVERSAL if rng.random() < 0.526 else OUTCOME_CONTINUATION,
+            "extension_k": 2.0,
+            "next_exists": True,
+            "touch_offset_r": abs(rng.gauss(0, 0.033)),
+            "gamma_available": True,
+            "gamma_levels_total": 13,
+            "nearest_gamma_distance": 5.0,
+        }
+        for d in range(49)
+        for _ in range(30)
+    ]
+    summary = build_summary(rows, ResearchConfig())
+    mech = summary["mechanical_null"]
+    assert mech["available"]
+    # The generator has NO mean reversion beyond the displacement itself, so
+    # the null must land on the observed rate rather than on 50%.
+    assert mech["expected_reversal_rate"] == pytest.approx(
+        summary["overall"]["reversal_rate"], abs=0.02
+    )
+    assert mech["expected_reversal_rate"] > 0.51
+
+    md = render_markdown(summary)
+    assert "The baseline is not 50%" in md
+    assert "mechanical null" in md
+    assert "excess:" in md
+
+
+def test_kinds_agreeing_counts_distinct_metrics_not_levels():
+    """Four adjacent ranked GEX strikes are ONE kind of evidence; a wall, max
+    pain, a pin and GEX 1 together are four. The product's claim is about the
+    second, so the cohort has to read the kinds column, not the count."""
+    from research.or_gamma_confluence.cohorts import kinds_agreeing
+
+    row = {"gamma_confluence_count_10": 6, "gamma_confluence_kinds_10": 2}
+    assert kinds_agreeing(row, 10.0) == 2
+    cs = {
+        c.key: c for c in build_cohorts(confluence_distance=10.0, min_extension=2.0, min_broken=2)
+    }
+    assert cs["kinds_2"].predicate(row) is True
+    assert cs["kinds_4"].predicate(row) is False
+    # A row with no gamma frame has no agreement, and must not vanish.
+    assert kinds_agreeing({}, 10.0) == 0
+    assert cs["kinds_2"].predicate({}) is False
+
+
+def test_report_shows_the_base_rate_of_multi_metric_agreement():
+    """'Four metrics agree' is only selective if it is rare. The report has to
+    print how often it happens before any cohort built on it can be read."""
+    from research.or_gamma_confluence.report import build_summary, render_markdown
+
+    rows = [
+        {
+            "symbol": "NQ",
+            "gamma_symbol": "NDX",
+            "session": f"2026-07-{d % 28 + 1:02d}",
+            "outcome": OUTCOME_REVERSAL if d % 2 else OUTCOME_CONTINUATION,
+            "extension_k": 2.0,
+            "gamma_available": True,
+            "gamma_levels_total": 13,
+            "nearest_gamma_distance": 1.0,
+            "gamma_confluence_count_10": 5,
+            "gamma_confluence_kinds_10": 4,
+        }
+        for d in range(50)
+    ]
+    summary = build_summary(rows, ResearchConfig())
+    agree = summary["discrimination"]["agreement"]
+    at10 = next(a for a in agree if a["distance"] == 10.0)
+    assert at10["kinds_4_share"] == pytest.approx(1.0)
+    md = render_markdown(summary)
+    assert ">=4 metrics" in md
+    assert "only selective if the base rate is low" in md

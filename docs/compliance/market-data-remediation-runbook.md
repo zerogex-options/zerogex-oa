@@ -191,11 +191,33 @@ account. **This is what buys the ability to have the conversation calmly.**
 Both running, separate tables or a source column. **Don't switch over yet.** The ingestion layer
 already separates the data client from everything else — this is the payoff for that.
 
+> **Tooling shipped 2026-09-10.** The provider seam now exists:
+> `src/ingestion/providers/` with `MARKET_DATA_PROVIDER` selecting the vendor (default
+> `tradestation`, so nothing changes until you flip it). A new vendor is one module copied from
+> `providers/stub.py` plus two lines in the registry. Design notes:
+> `docs/design/market-data-provider-abstraction.md`.
+>
+> Use **separate shadow tables, not a source column** — `setup/database/shadow_tables.sql`, or
+> `make feed-compare-schema`. The live tables feed the analytics engine, every API route and every
+> signal; a candidate under evaluation must have no path into any of that, and a shared table with a
+> discriminator is one forgotten `WHERE` clause away from serving a subscriber an unvetted number.
+
 **Done when:** both feeds have written a full trading day with no gaps.
 
 ### 14. Check the numbers actually match · 1 week
 Compare GEX summary, walls, flip, max pain and greeks from each feed. They **won't match exactly** —
 providers time and batch ticks differently — and we need to know how far apart before subscribers do.
+
+> **Run:** `make feed-compare CANDIDATE=<vendor> MINUTES=390 PERSIST=1`
+>
+> It samples both feeds over the same contracts at the same instant, pushes both through the *same*
+> IV, Greeks and analytics code, and diffs spot, net GEX, call wall, put wall, gamma flip and max
+> pain. Every run lands in `feed_comparisons`, so "the differences are written down and explained"
+> can be answered from SQL weeks later instead of from scrollback.
+>
+> Watch the **with-OI contract count**, not just the metrics. GEX is open-interest weighted, so a
+> candidate that quotes the whole chain but seeds no OI produces a plausible-looking empty gamma
+> profile that a spot-price check would never catch.
 
 At least five days, including one OPEX Friday and one volatile day. Extend the existing
 freshness/validation harness rather than writing a one-off.

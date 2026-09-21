@@ -1,0 +1,58 @@
+[Unit]
+Description=ZeroGEX gamma-flip carry check (alerts when gex_summary stops feeding the 5-minute flip)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# Wired to the shared dispatcher, and ENABLED rather than left commented the
+# way the normalizer healthcheck's is. The condition this catches is silent by
+# construction: the writer carries the last measured flip across a window with
+# no gex_summary row, which is the right answer and therefore looks like a
+# normal reading everywhere it is consumed. It logs a WARNING per cycle, but a
+# journal nobody reads is where this failure already lives -- the point of the
+# unit is to make it leave the box.
+#
+# Requires `make alert-template-install` and a backend in /etc/zerogex/alert.env
+# (ALERT_BACKEND=resend + ALERT_EMAIL_TO for email). Without them the
+# dispatcher falls back to ALERT_BACKEND=stderr and the alert lands in
+# `journalctl -u zerogex-alert@*` -- degraded, but never a failed install.
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment. ANALYTICS_UNDERLYINGS comes from here, so the check covers
+# exactly the symbols the analytics engine writes -- add an underlying to the
+# engine and it is covered on the next fire, with no unit to edit.
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# SESSIONS=1 so a firing judges the session in front of it. The default of 5
+# is for reading history by hand; on a timer it would re-alert on a session
+# already dealt with every hour for a week.
+#
+# Exits 0 when every symbol got a flip reading of its own at least every
+# GAMMA_FLIP_MAX_CARRY_BARS bars, 1 when one went longer than that (carried,
+# or with nothing to carry at all), 2 on DB error. A nonzero exit marks the
+# unit failed, which surfaces in `systemctl --failed`, logs the offending
+# symbol and session, and fires the OnFailure hook above.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-carry-healthcheck SESSIONS=1
+
+# Two indexed range scans and a rollback per symbol-session. No excuse for it
+# to run long.
+TimeoutStartSec=120
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-gamma-flip-carry

@@ -74,6 +74,7 @@ from typing import Any, Deque, Generic, Iterable, Optional, Tuple, TypeVar
 import pytz
 from pydantic import BaseModel, Field
 
+from src.jobs.intraday_cone_model import FIRE_INTERVAL_MIN
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     ANALYTICS_INTERVAL,
@@ -375,6 +376,27 @@ SIGNALS_CYCLE = CadenceProfile(
     stale_floor_seconds=60.0,
 )
 
+CONE_CYCLE = CadenceProfile(
+    name="cone_cycle",
+    description=(
+        "Intraday re-anchored cone. The writer fires every "
+        f"{FIRE_INTERVAL_MIN} minutes between 09:45 and 15:30 ET and commits "
+        "one immutable claim per horizon; nothing is written outside that "
+        "window, so the extended and closed cadences are unset rather than "
+        "advertising a cadence no job is running."
+    ),
+    regular_seconds=float(FIRE_INTERVAL_MIN * 60),
+    # No cones pre-market or after the bell. Claiming a cadence here would
+    # make a healthy feed read `stale` every evening — the same false page
+    # ANALYTICS_CYCLE's closed_seconds=None exists to prevent.
+    extended_seconds=None,
+    closed_seconds=None,
+    # Two missed fires before it is called late, matching FLOW_AGGREGATE's
+    # shape for the other interval-bucketed feed.
+    stale_grace=2.0,
+    stale_floor_seconds=float(2 * FIRE_INTERVAL_MIN * 60),
+)
+
 DAILY_CYCLE = CadenceProfile(
     name="daily_cycle",
     description=(
@@ -478,6 +500,10 @@ ENDPOINT_CADENCE: Tuple[Tuple[str, CadenceProfile], ...] = (
     ("/api/market/*", REALTIME_QUOTE),
     ("/api/signals/*", SIGNALS_CYCLE),
     ("/api/forecast*", DAILY_CYCLE),
+    # Aggregated over graded, immutable claims — age is expected, not a fault.
+    # Must precede the general cone glob: first match wins.
+    ("/api/cone/reliability*", HISTORICAL),
+    ("/api/cone/*", CONE_CYCLE),
     ("/api/scorecard*", DAILY_CYCLE),
     ("/api/news*", DAILY_CYCLE),
     ("/api/replay/*", HISTORICAL),
@@ -747,6 +773,12 @@ _GENERATED_KEYS = ("generated_at", "evaluated_at", "as_of", "snapshot_time", "co
 # the only keys freshness is graded against when any of them is present.
 _SOURCE_KEYS = (
     "source_timestamp",
+    # A cycle-backed snapshot's own statement of what its data are as of: the
+    # newest quote write it read. Distinct from as_of, the minute bucket it is
+    # filed under, which the levels body also carries and which runs up to a
+    # minute behind the quotes. Under the max() below this outranks as_of
+    # whenever both are present, which is what makes age_seconds honest.
+    "data_as_of",
     # Ranked/top-N responses expose this so freshness is graded on the feed's
     # recency rather than on which selected row happens to be newest. It is
     # always >= any row timestamp, so the max() below picks it up naturally.

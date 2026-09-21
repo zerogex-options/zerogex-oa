@@ -71,7 +71,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -111,6 +111,8 @@ class Sample:
     advanced: bool  # as_of moved since the previous sample
     regressed: bool = False  # ...and moved BACKWARDS: an older snapshot served after a newer
     computed_at: Optional[datetime] = None  # when the engine wrote it, if the API says
+    data_as_of: Optional[datetime] = None  # newest quote write the snapshot read
+    data_age_seconds: Optional[float] = None  # evaluated_at - data_as_of
     recomputed: bool = False  # same as_of, newer computed_at: the minute row was rewritten
     session: Optional[str] = None  # v2 market_session_status
     freshness: Optional[str] = None  # v2 freshness_status
@@ -125,6 +127,7 @@ class Summary:
     publish_age_seconds: List[float]  # age on first sight of each new as_of
     ages: List[float]  # age_seconds of every sample
     regressions: int = 0  # samples where as_of went backwards
+    data_ages: List[float] = field(default_factory=list)  # quote age, when the API states it
 
 
 def parse_iso(value: str) -> datetime:
@@ -229,6 +232,7 @@ def take_sample(
         evaluated_at = parse_iso(evaluated_raw) if evaluated_raw else sample_at
         as_of_raw = data.get("as_of") or envelope.get("source_timestamp")
         computed_raw = data.get("computed_at")
+        data_as_of_raw = data.get("data_as_of")
         age = envelope.get("age_seconds")
         if age is None:
             age = data.get("age_seconds")
@@ -238,10 +242,13 @@ def take_sample(
         evaluated_at = sample_at
         as_of_raw = body.get("as_of")
         computed_raw = body.get("computed_at")
+        data_as_of_raw = body.get("data_as_of")
         age = body.get("age_seconds")
 
     as_of = parse_iso(as_of_raw) if as_of_raw else None
     computed_at = parse_iso(computed_raw) if computed_raw else None
+    data_as_of = parse_iso(data_as_of_raw) if data_as_of_raw else None
+    data_age = (evaluated_at - data_as_of).total_seconds() if data_as_of else None
     if age is None and as_of is not None:
         age = (evaluated_at - as_of).total_seconds()
 
@@ -265,6 +272,8 @@ def take_sample(
         freshness=freshness,
         cache_status=cache_status,
         computed_at=computed_at,
+        data_as_of=data_as_of,
+        data_age_seconds=data_age,
         recomputed=recomputed,
     )
 
@@ -313,9 +322,12 @@ def summarize(samples: Sequence[Sample]) -> Summary:
     snapshots = 0
     regressions = 0
 
+    data_ages: List[float] = []
     for sample in samples:
         if sample.age_seconds is not None:
             ages.append(sample.age_seconds)
+        if sample.data_age_seconds is not None:
+            data_ages.append(sample.data_age_seconds)
         if sample.as_of is None:
             continue
         if newest is not None and sample.as_of < newest:
@@ -336,6 +348,7 @@ def summarize(samples: Sequence[Sample]) -> Summary:
         publish_age_seconds=publish_ages,
         ages=ages,
         regressions=regressions,
+        data_ages=data_ages,
     )
 
 
@@ -369,6 +382,11 @@ def format_report(summary: Summary, interval: float) -> str:
         f"   [resolution {interval:.0f}s plus the 5s edge cache: true value is lower]",
         f"age seen by a random poll:       {_stats(summary.ages)}",
     ]
+    if summary.data_ages:
+        lines.append(
+            f"quote age seen by a random poll: {_stats(summary.data_ages)}"
+            "   [from data_as_of: what the numbers are actually as of]"
+        )
     if summary.regressions:
         lines.append(
             f"as_of went BACKWARDS in {summary.regressions} sample(s): an older snapshot "
@@ -409,6 +427,7 @@ def summary_json(summary: Summary, interval: float) -> Dict[str, object]:
         "cycle_period_seconds": block(summary.period_seconds),
         "age_at_publish_seconds": block(summary.publish_age_seconds),
         "age_seen_by_random_poll_seconds": block(summary.ages),
+        "quote_age_seen_by_random_poll_seconds": block(summary.data_ages),
     }
 
 
@@ -515,9 +534,12 @@ def format_sample(sample: Sample) -> str:
     if sample.session or sample.freshness:
         status = f"  [{sample.session or '?'}/{sample.freshness or '?'}]"
     cache = f"  {sample.cache_status}" if sample.cache_status else ""
+    quotes = ""
+    if sample.data_age_seconds is not None:
+        quotes = f"  quotes {fmt_age(sample.data_age_seconds)}"
     return (
         f"{sample.sample_at.strftime('%H:%M:%S')}  eval {sample.evaluated_at.strftime('%H:%M:%S')}"
-        f"  as_of {as_of}  age {fmt_age(sample.age_seconds):>10}  "
+        f"  as_of {as_of}  age {fmt_age(sample.age_seconds):>10}{quotes}  "
         f"v{sample.api_version}{status}{cache}{marker}"
     )
 
@@ -538,6 +560,8 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                 "freshness",
                 "cache_status",
                 "computed_at",
+                "data_as_of",
+                "data_age_seconds",
             ]
         )
         for s in samples:
@@ -554,6 +578,8 @@ def _write_csv(path: str, samples: Sequence[Sample]) -> None:
                     s.freshness or "",
                     s.cache_status or "",
                     s.computed_at.isoformat() if s.computed_at else "",
+                    s.data_as_of.isoformat() if s.data_as_of else "",
+                    "" if s.data_age_seconds is None else f"{s.data_age_seconds:.3f}",
                 ]
             )
 

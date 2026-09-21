@@ -90,13 +90,17 @@ def _snap_to_bar(snap: MarketSnapshot) -> dict:
         bar["put_call_ratio"] = snap.put_call_ratio
     if snap.max_pain is not None:
         bar["max_pain"] = snap.max_pain
-    # MSI rides the snapshot's `extra` escape hatch when the live context
-    # attaches it (from signal_scores); absent otherwise.
+    # MSI now comes off first-class snapshot fields (build_snapshot reads
+    # signal_scores as-of); the `extra` escape hatch is still honoured so a
+    # caller that hand-builds a snapshot keeps working. Absent from both
+    # leaves the field out, and a condition on a missing field fails closed.
     extra = snap.extra or {}
-    if extra.get("msi") is not None:
-        bar["msi"] = extra["msi"]
-    if extra.get("msi_regime") is not None:
-        bar["msi_regime"] = extra["msi_regime"]
+    msi = snap.msi_score if snap.msi_score is not None else extra.get("msi")
+    if msi is not None:
+        bar["msi"] = msi
+    regime = snap.msi_regime if snap.msi_regime is not None else extra.get("msi_regime")
+    if regime is not None:
+        bar["msi_regime"] = regime
     return bar
 
 

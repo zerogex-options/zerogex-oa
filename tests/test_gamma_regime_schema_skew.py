@@ -34,8 +34,6 @@ class _Cursor:
         self._last = sql
 
     def fetchone(self):
-        if "gamma_flip_point" in self._last:
-            return (690.0,)
         if "percentile_cont" in self._last:
             return (20.0,)  # typical 30-minute move
         return None
@@ -45,6 +43,11 @@ class _Cursor:
             return [(c,) for c in sorted(self._columns)]
         if "SELECT bar_start FROM gamma_regime_5min" in self._last:
             return []  # nothing written yet, so every bar is due
+        if "gamma_flip_point" in self._last:
+            # Flip observations for the session, one row per 5-minute bar that
+            # had a gex_summary row -- the writer resolves the rest by carrying
+            # forward (tests/test_gamma_flip_carry_forward.py owns that).
+            return [(datetime(2026, 4, 24, 13, 30, tzinfo=UTC), 690.0)]
         # The chain read: one strike, enough to build a snapshot.
         return [(700.0, 700.0, datetime(2026, 4, 24).date(), 1.0e6, 1.0e6, 0.0, 10, 10)]
 

@@ -70,6 +70,44 @@ def _resolve_user(request: Request) -> Optional[str]:
     return None
 
 
+def _catalog_fields(bot_id: str, strategy_class: str) -> Dict[str, Any]:
+    """Strategy-catalog identity for a ``tw_bots`` row.
+
+    The roster is stored under legacy bot ids, so a row is folded back onto its
+    canonical catalog entry here. That is what lets a bot card show the same
+    name, thesis family and research stage that Backtesting and Pattern
+    Insights show for the same strategy — the three surfaces read one catalog.
+
+    Returns empty-ish fields for a row with no catalog entry (the two legacy
+    symbol-specific variants, or a user-deployed ``spec_strategy`` bot whose
+    behavior comes from a saved backtest rather than a catalog thesis).
+    """
+    from src.strategies import FAMILY_LABELS, find
+
+    entry = find(bot_id)
+    if entry is None:
+        return {
+            "strategy_id": None,
+            "stage": None,
+            "family": None,
+            "family_label": None,
+            "backtestable": False,
+            "provisionable": False,
+            "in_catalog": False,
+            "is_user_deployed": strategy_class == "spec_strategy",
+        }
+    return {
+        "strategy_id": entry.id,
+        "stage": entry.stage.value,
+        "family": entry.family.value,
+        "family_label": FAMILY_LABELS[entry.family],
+        "backtestable": entry.backtestable,
+        "provisionable": entry.is_provisionable,
+        "in_catalog": True,
+        "is_user_deployed": False,
+    }
+
+
 def _rows_affected(command_tag: Any) -> int:
     """Parse the ``N`` out of an asyncpg command tag like ``"UPDATE 3"``.
 
@@ -105,7 +143,9 @@ async def _cancel_queued_for_disabled_channels(
         WHERE end_user = $1 AND bot_id = $2 AND status = 'queued'
           AND COALESCE(($3::jsonb ->> channel)::boolean, false) = false
         """,
-        user, bot_id, json.dumps(channels),
+        user,
+        bot_id,
+        json.dumps(channels),
     )
     return _rows_affected(result)
 
@@ -123,8 +163,7 @@ async def fleet_summary(db: DatabaseManager = Depends(get_db)) -> Dict[str, Any]
     positions, best-performing bot 24h, and total number of bots.
     """
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
+        row = await conn.fetchrow("""
             WITH cap AS (
                 SELECT SUM(starting_capital) AS start, SUM(current_capital) AS cur,
                        SUM(peak_capital) AS peak
@@ -176,8 +215,7 @@ async def fleet_summary(db: DatabaseManager = Depends(get_db)) -> Dict[str, Any]
                 (SELECT pnl FROM best) AS best_bot_pnl,
                 (SELECT bot_id FROM worst) AS worst_bot_id,
                 (SELECT pnl FROM worst) AS worst_bot_pnl
-            """
-        )
+            """)
     starting = float(row["starting_capital"] or 0.0)
     current = float(row["current_capital"] or 0.0)
     return {
@@ -192,9 +230,13 @@ async def fleet_summary(db: DatabaseManager = Depends(get_db)) -> Dict[str, Any]
         "wins_today": int(row["wins_today"] or 0),
         "n_bots": int(row["n_bots"] or 0),
         "best_bot_id": row["best_bot_id"],
-        "best_bot_pnl": float(row["best_bot_pnl"] or 0.0) if row["best_bot_pnl"] is not None else None,
+        "best_bot_pnl": (
+            float(row["best_bot_pnl"] or 0.0) if row["best_bot_pnl"] is not None else None
+        ),
         "worst_bot_id": row["worst_bot_id"],
-        "worst_bot_pnl": float(row["worst_bot_pnl"] or 0.0) if row["worst_bot_pnl"] is not None else None,
+        "worst_bot_pnl": (
+            float(row["worst_bot_pnl"] or 0.0) if row["worst_bot_pnl"] is not None else None
+        ),
         "fleet_capital_config": tw_config.FLEET_CAPITAL,
     }
 
@@ -265,6 +307,7 @@ async def list_bots(
         win_rate = wins / trades if trades else None
         bots.append(
             {
+                **_catalog_fields(r["id"], r["strategy_class"]),
                 "id": r["id"],
                 "display_name": r["display_name"],
                 "strategy_class": r["strategy_class"],
@@ -384,9 +427,7 @@ async def bot_detail(bot_id: str, db: DatabaseManager = Depends(get_db)) -> Dict
         )
         if not b:
             raise HTTPException(status_code=404, detail="Bot not found")
-        ml = await conn.fetchrow(
-            "SELECT * FROM tw_ml_state WHERE bot_id = $1", bot_id
-        )
+        ml = await conn.fetchrow("SELECT * FROM tw_ml_state WHERE bot_id = $1", bot_id)
         positions = await conn.fetch(
             """
             SELECT id, underlying, opened_at, direction, strategy_type,
@@ -400,7 +441,14 @@ async def bot_detail(bot_id: str, db: DatabaseManager = Depends(get_db)) -> Dict
     params = b["params"] or {}
     if isinstance(params, str):
         params = json.loads(params)
+    catalog = _catalog_fields(b["id"], b["strategy_class"])
+    entry = None
+    if catalog["strategy_id"]:
+        from src.strategies import can_promote, can_retire, find
+
+        entry = find(catalog["strategy_id"])
     return {
+        **catalog,
         "id": b["id"],
         "display_name": b["display_name"],
         "strategy_class": b["strategy_class"],
@@ -412,6 +460,40 @@ async def bot_detail(bot_id: str, db: DatabaseManager = Depends(get_db)) -> Dict
         "enabled": b["enabled"],
         "is_public": b["is_public"],
         "params": params,
+        # The catalog's research ledger for this strategy, so a bot card can
+        # explain WHY it is unfunded instead of just showing a zeroed sleeve.
+        "research": (
+            None
+            if entry is None
+            else {
+                "thesis": entry.thesis,
+                "runs": [
+                    {
+                        "ran_on": r.ran_on.isoformat(),
+                        "window_days": r.window_days,
+                        "trades": r.trades,
+                        "verdict": r.verdict.value,
+                        "profit_factor": r.profit_factor,
+                        "expectancy": r.expectancy,
+                        "win_rate": r.win_rate,
+                        "harness": r.harness,
+                        "tuning_generation": r.tuning_generation,
+                        "notes": r.notes,
+                    }
+                    for r in sorted(entry.research, key=lambda x: x.ran_on, reverse=True)
+                ],
+                "promotion": {
+                    "eligible": can_promote(entry).allowed,
+                    "blockers": list(can_promote(entry).blockers),
+                },
+                "retirement": {
+                    "eligible": can_retire(entry).allowed,
+                    "blockers": list(can_retire(entry).blockers),
+                },
+                "supersedes": list(entry.supersedes),
+                "superseded_by": entry.superseded_by,
+            }
+        ),
         "capital": {
             "starting": float(b["starting_capital"] or 0.0),
             "current": float(b["current_capital"] or 0.0),
@@ -441,7 +523,8 @@ async def bot_trades(
             FROM tw_trades WHERE bot_id = $1
             ORDER BY closed_at DESC LIMIT $2
             """,
-            bot_id, limit,
+            bot_id,
+            limit,
         )
     return {"bot_id": bot_id, "trades": [dict(r) for r in rows]}
 
@@ -461,7 +544,8 @@ async def bot_equity_curve(
             WHERE bot_id = $1 AND session_date >= CURRENT_DATE - ($2 || ' days')::interval
             ORDER BY session_date
             """,
-            bot_id, str(days),
+            bot_id,
+            str(days),
         )
     return {"bot_id": bot_id, "points": [dict(r) for r in rows]}
 
@@ -594,9 +678,7 @@ async def performance_trend(
         for r in rows
     ]
     spy_closes = {
-        r["session_date"].isoformat(): float(r["close"])
-        for r in spy
-        if r["close"] is not None
+        r["session_date"].isoformat(): float(r["close"]) for r in spy if r["close"] is not None
     }
     # Denominator for the historical fleet-return %. Normally the live sum of
     # sleeve starting_capital. But once the fleet is retired the sleeves are
@@ -637,7 +719,8 @@ async def bot_metrics(
             WHERE bot_id = $1 AND session_date >= CURRENT_DATE - ($2 || ' days')::interval
             ORDER BY session_date
             """,
-            bot_id, str(days),
+            bot_id,
+            str(days),
         )
     return {"bot_id": bot_id, "metrics": [dict(r) for r in rows]}
 
@@ -691,7 +774,10 @@ async def follow_bot(
               SET channels = EXCLUDED.channels,
                   min_confidence = EXCLUDED.min_confidence
             """,
-            user, bot_id, json.dumps(channels), min_confidence,
+            user,
+            bot_id,
+            json.dumps(channels),
+            min_confidence,
         )
         # Turning a channel OFF must take effect immediately — including for
         # events that already fanned out to a queued (not-yet-delivered) row.
@@ -718,7 +804,8 @@ async def unfollow_bot(
     async with db.pool.acquire() as conn:
         await conn.execute(
             "DELETE FROM tw_bot_followers WHERE end_user = $1 AND bot_id = $2",
-            user, bot_id,
+            user,
+            bot_id,
         )
         # Unfollowing means "stop notifying me about this bot" — including
         # events that already fanned out to a queued (email / webhook) row
@@ -731,7 +818,8 @@ async def unfollow_bot(
             SET status = 'cancelled', error = 'follower unfollowed'
             WHERE end_user = $1 AND bot_id = $2 AND status = 'queued'
             """,
-            user, bot_id,
+            user,
+            bot_id,
         )
     return {
         "status": "ok",
@@ -791,7 +879,8 @@ async def my_feed(
             WHERE n.end_user = $1 AND n.channel = 'in_app'
             ORDER BY n.sent_at DESC LIMIT $2
             """,
-            user, limit,
+            user,
+            limit,
         )
     feed = []
     for r in rows:
@@ -862,7 +951,8 @@ async def admin_update_bot(
     async with db.pool.acquire() as conn:
         result = await conn.execute(
             f"UPDATE tw_bots SET {sets}, updated_at = NOW() WHERE id = $1",
-            bot_id, *fields.values(),
+            bot_id,
+            *fields.values(),
         )
     return {"status": "ok", "bot_id": bot_id, "updated": fields, "result": result}
 
@@ -886,7 +976,8 @@ async def admin_update_capital(
     async with db.pool.acquire() as conn:
         await conn.execute(
             f"UPDATE tw_bot_capital SET {sets}, updated_at = NOW() WHERE bot_id = $1",
-            bot_id, *fields.values(),
+            bot_id,
+            *fields.values(),
         )
     return {"status": "ok", "bot_id": bot_id, "updated": fields}
 
@@ -927,7 +1018,11 @@ async def admin_simulate(
 
     with db_connection() as conn:
         summary = simulate(
-            conn, days=days, master_seed=master_seed, scale=scale, bot_ids=bot_ids,
+            conn,
+            days=days,
+            master_seed=master_seed,
+            scale=scale,
+            bot_ids=bot_ids,
         )
     return summary
 
@@ -1004,8 +1099,7 @@ async def admin_positions(
     practice, so paging isn't needed.
     """
     async with db.pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
+        rows = await conn.fetch("""
             SELECT p.id, p.bot_id, b.display_name AS bot_display_name,
                    p.underlying, p.opened_at, p.updated_at, p.direction,
                    p.strategy_type, p.legs, p.entry_price, p.current_price,
@@ -1017,8 +1111,7 @@ async def admin_positions(
             FROM tw_positions p
             LEFT JOIN tw_bots b ON b.id = p.bot_id
             ORDER BY p.opened_at DESC
-            """
-        )
+            """)
 
     def _parse_json(v: Any) -> Any:
         if v is None:
@@ -1053,15 +1146,11 @@ async def admin_positions(
                 "unrealized_pnl": (
                     float(r["unrealized_pnl"]) if r["unrealized_pnl"] is not None else None
                 ),
-                "stop_price": (
-                    float(r["stop_price"]) if r["stop_price"] is not None else None
-                ),
+                "stop_price": (float(r["stop_price"]) if r["stop_price"] is not None else None),
                 "target_price": (
                     float(r["target_price"]) if r["target_price"] is not None else None
                 ),
-                "time_stop_at": (
-                    r["time_stop_at"].isoformat() if r["time_stop_at"] else None
-                ),
+                "time_stop_at": (r["time_stop_at"].isoformat() if r["time_stop_at"] else None),
                 "min_hold_until": (
                     r["min_hold_until"].isoformat() if r["min_hold_until"] else None
                 ),
@@ -1070,16 +1159,13 @@ async def admin_positions(
                 ),
                 "wall_ref_side": r["wall_ref_side"],
                 "entry_conviction": (
-                    float(r["entry_conviction"])
-                    if r["entry_conviction"] is not None else None
+                    float(r["entry_conviction"]) if r["entry_conviction"] is not None else None
                 ),
                 "origin": r["origin"],
                 "components_at_entry": _parse_json(r["components_at_entry"]),
             }
         )
-    total_unrealized = sum(
-        (e["unrealized_pnl"] or 0.0) for e in entries
-    )
+    total_unrealized = sum((e["unrealized_pnl"] or 0.0) for e in entries)
     return {
         "entries": entries,
         "summary": {
@@ -1134,9 +1220,7 @@ async def admin_trades(
     params: List[Any] = []
 
     if origin == "live":
-        where.append(
-            "(components_at_entry ->> 'origin') IS DISTINCT FROM 'simulate'"
-        )
+        where.append("(components_at_entry ->> 'origin') IS DISTINCT FROM 'simulate'")
     elif origin == "simulate":
         where.append("(components_at_entry ->> 'origin') = 'simulate'")
 
@@ -1222,8 +1306,7 @@ async def admin_trades(
                 "outcome": r["outcome"],
                 "close_reason": r["close_reason"],
                 "entry_conviction": (
-                    float(r["entry_conviction"])
-                    if r["entry_conviction"] is not None else None
+                    float(r["entry_conviction"]) if r["entry_conviction"] is not None else None
                 ),
                 "origin": r["origin"],
                 "legs": _parse_json(r["legs"]),
@@ -1248,12 +1331,26 @@ async def admin_trades(
         w = csv.writer(buf)
         w.writerow(
             [
-                "id", "bot_id", "bot_display_name", "underlying", "origin",
-                "opened_at", "closed_at", "direction", "strategy_type",
-                "contract", "entry_price", "exit_price", "quantity",
-                "cost_basis", "proceeds",
-                "realized_pnl", "pnl_percent", "outcome",
-                "close_reason", "entry_conviction",
+                "id",
+                "bot_id",
+                "bot_display_name",
+                "underlying",
+                "origin",
+                "opened_at",
+                "closed_at",
+                "direction",
+                "strategy_type",
+                "contract",
+                "entry_price",
+                "exit_price",
+                "quantity",
+                "cost_basis",
+                "proceeds",
+                "realized_pnl",
+                "pnl_percent",
+                "outcome",
+                "close_reason",
+                "entry_conviction",
             ]
         )
         for e in entries:
@@ -1276,14 +1373,26 @@ async def admin_trades(
             proceeds = round(exit_px * qty * 100, 2) if qty else None
             w.writerow(
                 [
-                    e["id"], e["bot_id"], e["bot_display_name"],
-                    e["underlying"], e["origin"],
-                    e["opened_at"], e["closed_at"], e["direction"],
-                    e["strategy_type"], contract,
-                    e["entry_price"], e["exit_price"], e["quantity"],
-                    cost_basis, proceeds,
-                    e["realized_pnl"], e["pnl_percent"],
-                    e["outcome"], e["close_reason"], e["entry_conviction"],
+                    e["id"],
+                    e["bot_id"],
+                    e["bot_display_name"],
+                    e["underlying"],
+                    e["origin"],
+                    e["opened_at"],
+                    e["closed_at"],
+                    e["direction"],
+                    e["strategy_type"],
+                    contract,
+                    e["entry_price"],
+                    e["exit_price"],
+                    e["quantity"],
+                    cost_basis,
+                    proceeds,
+                    e["realized_pnl"],
+                    e["pnl_percent"],
+                    e["outcome"],
+                    e["close_reason"],
+                    e["entry_conviction"],
                 ]
             )
         return PlainTextResponse(
@@ -1291,8 +1400,7 @@ async def admin_trades(
             media_type="text/csv; charset=utf-8",
             headers={
                 "Content-Disposition": (
-                    f'attachment; filename="tradeworkz-audit-'
-                    f'{origin}.csv"'
+                    f'attachment; filename="tradeworkz-audit-' f'{origin}.csv"'
                 ),
             },
         )
@@ -1468,17 +1576,16 @@ async def admin_diagnose() -> Dict[str, Any]:
 
     with db_connection() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
+        cur.execute("""
             SELECT id, display_name, strategy_class, tier, direction_mode,
                    universe, tagline, description, is_public, enabled, params
             FROM tw_bots WHERE enabled = TRUE
             ORDER BY id
-            """
-        )
+            """)
         bots = cur.fetchall()
 
         from src.tradeworkz.engine import _bot_underlyings
+
         fleet = tw_config.fleet_universes()
         underlyings_needed: set[str] = set()
         for row in bots:
@@ -1493,8 +1600,17 @@ async def admin_diagnose() -> Dict[str, Any]:
         bot_reports: List[Dict[str, Any]] = []
         for row in bots:
             (
-                bot_id, display_name, strategy_class, tier, direction_mode,
-                universe, tagline, description, is_public, enabled, params,
+                bot_id,
+                display_name,
+                strategy_class,
+                tier,
+                direction_mode,
+                universe,
+                tagline,
+                description,
+                is_public,
+                enabled,
+                params,
             ) = row
             if isinstance(params, str):
                 try:
@@ -1519,12 +1635,17 @@ async def admin_diagnose() -> Dict[str, Any]:
                     continue
 
                 spec = BotSpec(
-                    id=bot_id, display_name=display_name,
-                    strategy_class=strategy_class, tier=tier,
-                    direction_mode=direction_mode, universe=u,
-                    tagline=tagline or "", description=description or "",
+                    id=bot_id,
+                    display_name=display_name,
+                    strategy_class=strategy_class,
+                    tier=tier,
+                    direction_mode=direction_mode,
+                    universe=u,
+                    tagline=tagline or "",
+                    description=description or "",
                     params=dict(params or {}),
-                    is_public=bool(is_public), enabled=bool(enabled),
+                    is_public=bool(is_public),
+                    enabled=bool(enabled),
                 )
                 ml_state = ml_mod.load_state(conn, bot_id)
                 capital = load_capital(conn, bot_id)
@@ -1539,9 +1660,7 @@ async def admin_diagnose() -> Dict[str, Any]:
                 row_ct = cur.fetchone()
                 open_pos_count = int(row_ct[0]) if row_ct else 0
                 report["open_positions"] = open_pos_count
-                report["current_capital"] = (
-                    capital.current_capital if capital else None
-                )
+                report["current_capital"] = capital.current_capital if capital else None
                 report["confidence_base"] = bot.confidence_base()
                 report["confidence_threshold"] = bot.confidence_threshold()
                 report["size_multiplier"] = bot.size_multiplier()
@@ -1700,14 +1819,10 @@ def _explain_no_signal(bot: "BaseBot", snap: "MarketSnapshot") -> str:  # noqa: 
         call_d = snap.distance_to_call_wall_pct()
         put_d = snap.distance_to_put_wall_pct()
         call_touch = (
-            call_d is not None
-            and abs(call_d) <= prox_pct
-            and snap.spot <= (snap.call_wall or 0)
+            call_d is not None and abs(call_d) <= prox_pct and snap.spot <= (snap.call_wall or 0)
         )
         put_touch = (
-            put_d is not None
-            and abs(put_d) <= prox_pct
-            and snap.spot >= (snap.put_wall or 0)
+            put_d is not None and abs(put_d) <= prox_pct and snap.spot >= (snap.put_wall or 0)
         )
         if not (call_touch or put_touch):
             return (
@@ -1774,7 +1889,8 @@ async def internal_queued_notifications(
             ORDER BY n.sent_at ASC
             LIMIT $2
             """,
-            channel, limit,
+            channel,
+            limit,
         )
     entries = []
     for r in rows:
@@ -1840,6 +1956,8 @@ async def internal_mark_notification(
                 sent_at = CASE WHEN $1::text = 'sent' THEN NOW() ELSE sent_at END
             WHERE id = $3
             """,
-            status, error, row_id,
+            status,
+            error,
+            row_id,
         )
     return {"status": "ok", "id": row_id, "new_status": status, "result": result}

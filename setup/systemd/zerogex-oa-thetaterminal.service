@@ -1,0 +1,64 @@
+[Unit]
+Description=Theta Terminal (ThetaData market data gateway)
+Documentation=https://http-docs.thetadata.us/
+After=network-online.target
+Wants=network-online.target
+
+# The ingestion and analytics units depend on this being up when
+# MARKET_DATA_PROVIDER=thetadata. It is deliberately NOT declared as a
+# dependency of theirs: during the evaluation this runs alongside the
+# TradeStation path, and a terminal outage must not take production down.
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/thetaterminal
+
+# Credentials come from creds.txt in WorkingDirectory (chmod 600). Kept out
+# of .env and out of this unit so they never reach the journal or a git
+# diff; the terminal reads the file itself and prompts if it is missing,
+# which under systemd would hang rather than fail, hence the startup timeout
+# below.
+Environment="PATH=/usr/bin:/usr/local/bin:/bin"
+
+# --max-terminal-heap bounds the TERMINAL's heap. Note that a bare -Xmx
+# would bound the bootstrap launcher instead and leave the terminal itself
+# unbounded, which is the wrong knob.
+ExecStart=/usr/bin/java -jar /home/ubuntu/thetaterminal/ThetaTerminalv3.jar --max-terminal-heap 512m
+
+Restart=always
+RestartSec=15
+StartLimitBurst=5
+StartLimitInterval=300
+
+# A missing or rejected credentials file leaves the terminal waiting on a
+# prompt that will never come. Fail instead of hanging forever.
+TimeoutStartSec=120
+
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+SendSIGKILL=yes
+
+# 512m of terminal heap plus JVM overhead. The box has 7.6G and runs the
+# ingestion, analytics and API units alongside this.
+MemoryMax=1G
+CPUQuota=100%
+CPUWeight=70
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# The terminal rewrites config.toml on startup, so its own directory has to
+# stay writable even though the rest of home does not.
+ReadWritePaths=/home/ubuntu/thetaterminal
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=thetaterminal
+
+[Install]
+WantedBy=multi-user.target

@@ -828,7 +828,7 @@ flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contr
 	@echo "  • $(RED)High dead_pct$(NC) in [2] AND large idx size in [4] → REINDEX CONCURRENTLY may shrink the index."
 
 .PHONY: replay-frames-explain
-replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced to the session or scaling with retention? Vars: SYMBOL=NDX DATE=YYYY-MM-DD [BAND=0.04]. Read-only.
+replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced to the session or scaling with retention? Vars: SYMBOL=NDX DATE=YYYY-MM-DD [BAND=0.04] [EXPS=all|0dte|dates]. Read-only.
 	@if [ -z "$(DATE)" ]; then \
 		echo "$(RED)DATE is required — use the session date from the warning, e.g.$(NC)"; \
 		echo "$(YELLOW)  make replay-frames-explain SYMBOL=NDX DATE=2026-07-24$(NC)"; \
@@ -841,7 +841,27 @@ replay-frames-explain: ## Diagnose /api/replay/range frames read: is it fenced t
 		--symbol "$(or $(SYMBOL),NDX)" \
 		--date "$(DATE)" \
 		$(if $(BAND),--band $(BAND)) \
+		$(if $(EXPS),--expirations "$(EXPS)") \
 		| $(PSQL) -v ON_ERROR_STOP=0
+
+.PHONY: pin-strike-explain
+pin-strike-explain: ## Explain one historical Pin Strike: the per-candidate table gex_summary does not persist. Vars: SYMBOL=NDX AT="YYYY-MM-DD HH:MM" (ET) [TOP=25] [NEAR=29500]. Read-only.
+	@if [ -z "$(AT)" ]; then \
+		echo "$(RED)AT is required — the minute to explain, in ET, e.g.$(NC)"; \
+		echo "$(YELLOW)  make pin-strike-explain SYMBOL=NDX AT=\"2026-09-03 14:30\"$(NC)"; \
+		exit 2; \
+	fi
+	@echo "$(BLUE)=== Pin Strike: per-candidate breakdown ===$(NC)"
+	@echo "$(YELLOW)Confidence is a SHARE of the candidate field, not a measure of size —$(NC)"
+	@echo "$(YELLOW)the share column is what explains a 'Weak' label on a heavy strike.$(NC)"
+	@echo "$(YELLOW)Needs open interest, so only sessions inside DATA_RETENTION_DAYS (~90d)$(NC)"
+	@echo "$(YELLOW)can be explained; the archive keeps no OI. A DRIFT warning means the$(NC)"
+	@echo "$(YELLOW)recompute no longer reproduces what shipped — do not quote it.$(NC)"
+	@$(PY) -m src.tools.pin_strike_explain \
+		--underlying "$(or $(SYMBOL),NDX)" \
+		--at "$(AT)" \
+		$(if $(TOP),--top $(TOP)) \
+		$(if $(NEAR),--near $(NEAR))
 
 .PHONY: flow-index-prune
 flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner doesn't use it). Pass CONFIRM=yes to execute.
@@ -895,6 +915,12 @@ help: ## Show this help message
 	@echo "  make ingestion-disable  - Disable ingestion service from starting on boot"
 	@echo "  make ingestion-health   - Show ingestion service health and recent errors"
 	@echo ""
+	@echo "$(GREEN)Market Data Provider Migration:$(NC)"
+	@echo "  make feed-probe         - Size ONE fetch before a real run (PROVIDER=<name>)"
+	@echo "                            index symbols: UNDERLYING='\$$SPXW.X' make feed-probe ..."
+	@echo "  make feed-compare       - Diff a candidate feed vs the incumbent (CANDIDATE=<name>)"
+	@echo "  make feed-compare-schema - Create the shadow tables the harness writes to"
+	@echo ""
 	@echo "$(GREEN)Analytics Service Management:$(NC)"
 	@echo "  make analytics-start    - Start the analytics service"
 	@echo "  make analytics-stop     - Stop the analytics service"
@@ -946,10 +972,20 @@ help: ## Show this help message
 	@echo "  make max-pain-refresh-install - Install daily max-pain snapshot refresh timer (05:00 ET)"
 	@echo "  make max-pain-refresh-status  - Show max-pain refresh timer status + recent log"
 	@echo "  make daily-atm-iv-backfill-install - Install pre-open daily_atm_iv backfill timer (06:00 ET)"
+	@echo "  make daily-spread-stats-backfill   - Seed the Spread Monitor's daily quoted-width history from option_chains (SPREAD_STATS_SYMBOLS=, SPREAD_STATS_DAYS=)"
+	@echo "  make spread-surface-backfill       - Seed the Spread Surface's time-of-day/strike history from option_chains (SURFACE_SYMBOLS=, SURFACE_DAYS=)"
 	@echo "  make daily-atm-iv-backfill-status  - Show daily_atm_iv backfill timer status + recent log"
 	@echo "  make system-monitor-install   - Install per-minute system-monitor timer (CPU/mem/disk/errs/cycle)"
 	@echo "  make system-monitor-show      - Print latest hourly + daily aggregates"
 	@echo "  make system-monitor-status    - Show system-monitor timer status + recent log"
+	@echo "  make gamma-flip-carry-install - Install gamma-flip carry timer (hourly in-session + post-close)"
+	@echo "  make gamma-flip-carry-status  - Show gamma-flip carry timer status + recent log"
+	@echo "  make gamma-flip-carry-healthcheck - Flag sessions whose gamma flip was carried over missing rows"
+	@echo "  make gamma-flip-resolution-healthcheck - Report how long the gamma flip was left unpublished"
+	@echo "  make gamma-flip-blackout-forensics - Say WHY the gamma flip was left unpublished (retention-exempt rows)"
+	@echo "  make gamma-flip-gate-replay - Replay a blank flip cycle and name the gate that rejected it"
+	@echo "  make gamma-flip-resolution-install - Install gamma-flip resolution timer (hourly in-session + post-close)"
+	@echo "  make gamma-flip-resolution-status - Show gamma-flip resolution timer status + recent log"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
 	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
@@ -1095,6 +1131,7 @@ help: ## Show this help message
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
 	@echo "  make replay-frames-explain        - EXPLAIN ANALYZE the /api/replay/range frames read (SYMBOL=NDX DATE=YYYY-MM-DD)"
+	@echo "  make pin-strike-explain           - Why a Pin Strike scored as it did: full candidate table (SYMBOL=NDX AT=\"YYYY-MM-DD HH:MM\")"
 	@echo "  make flow-index-prune             - Drop idx_flow_by_contract_symbol_ts_strike (CONFIRM=yes)"
 	@echo "  make flow-series-drop-covering-index - DISABLED (index retained; see target)"
 	@echo ""
@@ -1107,6 +1144,15 @@ help: ## Show this help message
 	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
 	@echo "  make db-symbols-audit   - Read-only audit of malformed symbols rows (cascade preview)"
 	@echo "  make db-symbols-cleanup - Delete malformed symbols rows (CONFIRM=yes; INCLUDE_DATA=yes to cascade)"
+	@echo ""
+	@echo "$(GREEN)Feed Diagnostics:$(NC)"
+	@echo "  make futures-forensics  - Was the ES/NQ chart actually late? (SYMBOL=NDX DATE=... OPEN=08:00)"
+	@echo "  make futures-feed-logs  - Futures ingester journal around that window (same args)"
+	@echo "  make futures-roll-check - Which contract month the feed is on; finds roll splices"
+	@echo "  make futures-carry-check- Is the ES/NQ carry fallback configured right?"
+	@echo ""
+	@echo "$(GREEN)Liquidity / Spreads:$(NC)"
+	@echo "  make spread-report      - Have index put spreads widened lately? (SYMBOLS=SPX,NDX DAYS=60 SKIP_TODAY=yes)"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
@@ -1856,6 +1902,55 @@ disk-clean-noconfirm: ## Non-interactive disk/cache cleanup (driven by zerogex-o
 run-auth: ## Test TradeStation authentication
 	@echo "$(BLUE)=== Testing TradeStation Authentication ===$(NC)"
 	@$(VENV_PYTHON) -m src.ingestion.tradestation_auth
+
+# UNDERLYING is read by the SHELL ("$${UNDERLYING:-SPY}"), not expanded by
+# make, because index symbols start with "$" and make eats it. Passed as
+# $(or $(UNDERLYING),SPY), '$SPXW.X' silently becomes 'PXW.X' -- make reads
+# $S as an (empty) variable -- and the probe then queries a symbol that does
+# not exist. Both of these work; the first is the one to prefer:
+#
+#   UNDERLYING='$$SPXW.X' make feed-probe PROVIDER=thetadata
+#   make feed-probe PROVIDER=thetadata UNDERLYING='$$$$SPXW.X'
+#
+# (In a shell, that second one is typed UNDERLYING='$$SPXW.X'.)
+.PHONY: feed-compare
+feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDIDATE, MINUTES, PERSIST, JSON)
+	@echo "$(BLUE)=== Feed comparison (runbook step 14) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.feed_compare \
+		--underlying "$${UNDERLYING:-SPY}" \
+		$(if $(INCUMBENT),--incumbent '$(INCUMBENT)') \
+		$(if $(CANDIDATE),--candidate '$(CANDIDATE)') \
+		$(if $(MINUTES),--duration-minutes '$(MINUTES)') \
+		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)') \
+		$(if $(PERSIST),--persist) \
+		$(if $(SOLVE_IV_BOTH),--solve-iv-both) \
+		$(if $(JSON),--json) \
+		$(if $(DEBUG),--debug)
+
+.PHONY: feed-probe
+feed-probe: ## Measure ONE fetch from a provider before a real run (PROVIDER, UNDERLYING)
+	@echo "$(BLUE)=== Feed probe (sizing, no DB writes) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.feed_compare --probe \
+		--underlying "$${UNDERLYING:-SPY}" \
+		--incumbent '$(or $(PROVIDER),$(INCUMBENT),tradestation)' \
+		$(if $(EXPIRATIONS),--expirations '$(EXPIRATIONS)') \
+		$(if $(STRIKE_COUNT_MAX),--strike-count-max '$(STRIKE_COUNT_MAX)') \
+		$(if $(JSON),--json)
+
+.PHONY: chain-depth-sweep
+chain-depth-sweep: ## Does the gamma flip converge as the chain deepens? (UNDERLYING, PROVIDER, DEPTHS, ROUNDS)
+	@echo "$(BLUE)=== Chain depth sweep (read-only; no DB writes) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.chain_depth_sweep \
+		--underlying "$${UNDERLYING:-SPY}" \
+		$(if $(PROVIDER),--provider '$(PROVIDER)') \
+		$(if $(DEPTHS),--depths '$(DEPTHS)') \
+		$(if $(ROUNDS),--rounds '$(ROUNDS)') \
+		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)')
+
+.PHONY: feed-compare-schema
+feed-compare-schema: ## Create the shadow tables the comparison harness writes to
+	@echo "$(BLUE)=== Applying shadow tables ===$(NC)"
+	@$(PSQL) -f setup/database/shadow_tables.sql
 
 .PHONY: run-client
 run-client: ## Test TradeStation API client (TEST, SYMBOL, BARS_BACK, INTERVAL, UNIT, QUERY, DEBUG, TEST_HISTORICAL)
@@ -3336,6 +3431,18 @@ flow-series-backfill: ## Backfill flow_series_5min (current + prior session) bef
 	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"
 	@$(PY) -m src.tools.flow_series_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS)
 
+# Run this ONCE, SOON, after `make schema-apply` creates hedging_flow_5min.
+# Every session older than the engine's first write exists only in
+# flow_contract_facts, which db-prune deletes at DATA_RETENTION_DAYS — so the
+# reachable history shrinks by a day per day until this has run. Afterwards it
+# is only a repair tool: the engine keeps the table current by itself.
+# Idempotent; DAYS=<n> to narrow, DRY_RUN=1 to list the sessions first.
+.PHONY: hedging-flow-backfill
+hedging-flow-backfill: ## Seed hedging_flow_5min history from retained flow facts (run once, soon — the source is on a 90-day clock)
+	@echo "$(BLUE)=== Backfilling hedging_flow_5min ===$(NC)"
+	@$(PY) -m src.tools.hedging_flow_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS) \
+		$(if $(DAYS),--days $(DAYS),) $(if $(DRY_RUN),--dry-run,)
+
 # Verification gate for phase-1 -> phase-2: diff the snapshot against the
 # live CTE row-for-row. DSN is auto-derived from the same DB_* vars
 # schema-apply uses (.env), authenticating via ~/.pgpass exactly like the
@@ -3357,6 +3464,58 @@ flow-series-parity: ## Diff flow_series_5min vs the live CTE (auto-uses DB_* fro
 		FLOW_SERIES_PARITY_SYMBOL="$(FLOW_SERIES_PARITY_SYMBOL)" \
 		FLOW_SERIES_PARITY_SESSION="$(FLOW_SERIES_PARITY_SESSION)" \
 		$(PY) -m pytest tests/test_flow_series_parity.py -m integration --no-cov -q
+
+# The hedging twin. Unlike flow-series-parity this one SEEDS its own synthetic
+# session under a sentinel symbol — which is what lets it run against a scratch
+# database with no market data, and also why it does NOT auto-derive the DSN
+# from .env the way its sibling does.
+#
+# That difference is the whole point of the guard below. flow-series-parity
+# only reads, so defaulting to the configured database is harmless
+# convenience. This one writes, and the first time it was run it inherited the
+# sibling's auto-derive, pointed at production, and left a sentinel row in
+# `symbols` behind (the fixture cleans up fully now, but the target should not
+# have aimed there in the first place). Name the database you mean.
+HEDGING_FLOW_PARITY_SYMBOL ?= ZZTEST
+
+.PHONY: hedging-flow-parity
+hedging-flow-parity: ## Diff hedging_flow_5min vs the live CTE, + the convergence and 0DTE guarantees. SEEDS DATA — requires an explicit HEDGING_FLOW_PARITY_DSN=... (use a scratch DB)
+	@echo "$(BLUE)=== hedging_flow_5min parity vs live CTE ===$(NC)"
+	@if [ -z "$(HEDGING_FLOW_PARITY_DSN)" ]; then \
+		echo "$(RED)Refusing to run: HEDGING_FLOW_PARITY_DSN is not set.$(NC)"; \
+		echo "$(YELLOW)This harness SEEDS a synthetic session, so it must never"; \
+		echo "silently inherit the .env database the way flow-series-parity does."; \
+		echo ""; \
+		echo "Point it at a scratch database with schema.sql applied:"; \
+		echo "  make hedging-flow-parity HEDGING_FLOW_PARITY_DSN=postgresql://user@host:5432/scratch$(NC)"; \
+		exit 1; \
+	fi
+	@PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
+		HEDGING_FLOW_PARITY_DSN="$(HEDGING_FLOW_PARITY_DSN)" \
+		HEDGING_FLOW_PARITY_SYMBOL="$(HEDGING_FLOW_PARITY_SYMBOL)" \
+		$(PY) -m pytest tests/test_hedging_flow_snapshot_sql.py -m integration --no-cov -q
+
+# The carry harness. Same posture as hedging-flow-parity and for the same
+# reason: it SEEDS a synthetic session (under its own sentinel symbol, which it
+# also removes), so it must never silently inherit the .env database.
+GAMMA_FLIP_CARRY_SYMBOL ?= ZZFLIP
+
+.PHONY: gamma-flip-carry-sql
+gamma-flip-carry-sql: ## Run the gamma-flip observation query against real rows (missing window vs measured NULL). SEEDS DATA — requires an explicit GAMMA_FLIP_CARRY_DSN=... (use a scratch DB)
+	@echo "$(BLUE)=== gamma_flip observation query vs real rows ===$(NC)"
+	@if [ -z "$(GAMMA_FLIP_CARRY_DSN)" ]; then \
+		echo "$(RED)Refusing to run: GAMMA_FLIP_CARRY_DSN is not set.$(NC)"; \
+		echo "$(YELLOW)This harness SEEDS gex_summary rows, so it must name the"; \
+		echo "database it means rather than inheriting the .env one."; \
+		echo ""; \
+		echo "Point it at a scratch database with schema.sql applied:"; \
+		echo "  make gamma-flip-carry-sql GAMMA_FLIP_CARRY_DSN=postgresql://user@host:5432/scratch$(NC)"; \
+		exit 1; \
+	fi
+	@PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
+		GAMMA_FLIP_CARRY_DSN="$(GAMMA_FLIP_CARRY_DSN)" \
+		GAMMA_FLIP_CARRY_SYMBOL="$(GAMMA_FLIP_CARRY_SYMBOL)" \
+		$(PY) -m pytest tests/test_gamma_flip_carry_sql.py -m integration --no-cov -q
 
 .PHONY: ci-parity
 ci-parity: ## End-to-end flow-series parity: apply schema, seed deterministic fixture via incremental writer, run parity test against canonical CTE oracle. Defaults to localhost test DB; override CI_PARITY_DSN=postgres://...
@@ -3427,9 +3586,18 @@ DB_EXPIRY_PRUNE_TABLES = option_chains_latest
 # DATA_RETENTION_DAYS when an operator asks for it — but it takes constant
 # upsert churn and would otherwise never be vacuumed.
 #
+# hedging_flow_5min is here for a different reason: nothing else owns its
+# retention because it is meant to be kept FOREVER. It is the stored form of
+# the Hedging Flow page's dated permalinks, and its own source table
+# (flow_contract_facts) is pruned above — so putting it in DB_MAINTAIN_TABLES
+# would delete exactly the history that exists BECAUSE the source is deleted.
+# It still takes upsert churn on every analytics cycle and so still needs the
+# vacuum half. Same standing as gex_summary and underlying_quotes, which came
+# off the prune list on 2026-08-25.
+#
 # Distinct from DB_EXPIRY_PRUNE_TABLES above: these are vacuumed only, while
 # those are ALSO pruned by db-prune on their expiration column.
-DB_VACUUM_EXTRA_TABLES = futures_quotes
+DB_VACUUM_EXTRA_TABLES = futures_quotes hedging_flow_5min
 
 .PHONY: db-prune
 db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
@@ -3556,6 +3724,96 @@ db-symbols-cleanup: ## Delete malformed symbols rows. Dry-run unless CONFIRM=yes
 psql: ## Open PostgreSQL shell
 	@$(PSQL)
 
+# =============================================================================
+# Futures feed forensics — answering "the NQ/ES chart was delayed" after the fact
+# =============================================================================
+
+.PHONY: futures-forensics
+futures-forensics: ## Was the ES/NQ chart actually late? Read-only DB forensics. SYMBOL=NDX DATE=2026-09-14 OPEN=08:00 TZ_LOCAL=Europe/London PRE=45 POST=120 LAG_WARN=90 DAYS=7
+	@echo "$(BLUE)=== Futures feed forensics ===$(NC)"
+	@echo "$(YELLOW)Reads futures_quotes.updated_at, which records when each bar$(NC)"
+	@echo "$(YELLOW)LANDED. A reconnect replays barsback and heals its own gap, so$(NC)"
+	@echo "$(YELLOW)the series looks whole afterwards — this is what still shows the$(NC)"
+	@echo "$(YELLOW)delay. Read-only.$(NC)"
+	@echo ""
+	@$(PSQL) \
+		-v index_symbol=$(or $(SYMBOL),NDX) \
+		-v peer_symbol=$(or $(PEER),SPX) \
+		-v incident_date=$(or $(DATE),today) \
+		-v open_local=$(or $(OPEN),08:00) \
+		-v local_tz=$(or $(TZ_LOCAL),Europe/London) \
+		-v pre_min=$(or $(PRE),45) \
+		-v post_min=$(or $(POST),120) \
+		-v lag_warn_sec=$(or $(LAG_WARN),90) \
+		-v history_days=$(or $(DAYS),7) \
+		-f setup/database/diagnostics/futures_feed_forensics.sql
+
+.PHONY: futures-carry-check
+futures-carry-check: ## Is the ES/NQ carry fallback configured right? Compares RISK_FREE_RATE/DIVIDEND_YIELD_BY_SYMBOL against the basis measured from the tape
+	@echo "$(BLUE)=== Futures carry configuration check ===$(NC)"
+	@echo "$(YELLOW)theoretical_ratio is the basis used whenever no concurrent$(NC)"
+	@echo "$(YELLOW)index/futures pair exists — most of the overnight session.$(NC)"
+	@echo "$(YELLOW)This prints what the config implies beside what the tape says.$(NC)"
+	@echo ""
+	@$(VENV_PYTHON) -m src.tools.futures_carry_check
+
+.PHONY: futures-roll-check
+futures-roll-check: ## Which contract month is the ES/NQ feed on, and did it splice at a roll? SYMBOL=NDX DAYS=75 JUMP_BPS=25
+	@echo "$(BLUE)=== Futures contract / roll check ===$(NC)"
+	@echo "$(YELLOW)Answers \"why is our quote different from another platform\":$(NC)"
+	@echo "$(YELLOW)a continuous contract rolls to the next quarter and jumps by$(NC)"
+	@echo "$(YELLOW)one quarter of carry. Uses the cash index as the control.$(NC)"
+	@echo "$(YELLOW)Read-only.$(NC)"
+	@echo ""
+	@$(PSQL) \
+		-v index_symbol=$(or $(SYMBOL),NDX) \
+		-v history_days=$(or $(DAYS),75) \
+		-v local_tz=$(or $(TZ_LOCAL),America/New_York) \
+		-v jump_bps=$(or $(JUMP_BPS),25) \
+		-f setup/database/diagnostics/futures_contract_roll.sql
+
+.PHONY: futures-feed-logs
+futures-feed-logs: ## Futures ingester journal around a reported delay (reconnects, auth, respawns). SYMBOL=NDX DATE=2026-09-14 OPEN=08:00 TZ_LOCAL=Europe/London PRE=45 POST=120
+	@echo "$(BLUE)=== Futures ingester logs ===$(NC)"
+	@echo "$(YELLOW)Run futures-forensics FIRST: the journal is capped and often holds$(NC)"
+	@echo "$(YELLOW)only hours, while futures_quotes keeps days. See journal-volume.$(NC)"
+	@echo ""
+	@bin/futures-feed-logs.sh \
+		--symbol $(or $(SYMBOL),all) \
+		--date $(or $(DATE),today) \
+		--open $(or $(OPEN),08:00) \
+		--tz $(or $(TZ_LOCAL),Europe/London) \
+		--pre $(or $(PRE),45) \
+		--post $(or $(POST),120)
+
+# Default symbol set for spread-report. A literal `SPX,NDX,SPY,QQQ` inside
+# `$(or ...)` would be read as four arguments and collapse to `SPX`.
+SPREAD_REPORT_SYMBOLS := SPX,NDX,SPY,QQQ
+
+.PHONY: spread-report
+spread-report: ## Have index put spreads actually widened lately? Read-only rollup report. SYMBOLS=SPX,NDX DAYS=60 RECENT=10 BAND=5 DTE=7 SIDE=P SKIP_TODAY=yes
+	@echo "$(BLUE)=== Spread regime report ===$(NC)"
+	@echo "$(YELLOW)Reads daily_spread_stats and spread_surface_stats — the same$(NC)"
+	@echo "$(YELLOW)rollups the Spread Monitor reads, so the figures match the page.$(NC)"
+	@echo "$(YELLOW)0DTE is ranked from the surface table, against 0DTE at the same$(NC)"
+	@echo "$(YELLOW)time of day: the daily rollup stores ONE scope and cannot answer$(NC)"
+	@echo "$(YELLOW)it. Quoted NBBO widths, no sizes. Read-only.$(NC)"
+	@echo "$(YELLOW)SKIP_TODAY=yes drops the still-unfrozen session, which is the$(NC)"
+	@echo "$(YELLOW)honest setting for 'has this changed lately' — today's row is$(NC)"
+	@echo "$(YELLOW)taken at whatever time you run this, the rest froze at 16:00.$(NC)"
+	@echo ""
+	@$(PSQL) \
+		-v symbols=$(or $(SYMBOLS),$(SPREAD_REPORT_SYMBOLS)) \
+		-v dte_max=$(or $(DTE),7) \
+		-v band=$(or $(BAND),5) \
+		-v days=$(or $(DAYS),60) \
+		-v recent=$(or $(RECENT),10) \
+		-v min_contracts=$(or $(MIN_CONTRACTS),100) \
+		-v min_sessions=$(or $(MIN_SESSIONS),8) \
+		-v option_type=$(or $(SIDE),P) \
+		-v skip_today=$(or $(SKIP_TODAY),no) \
+		-f setup/database/diagnostics/spread_regime_report.sql
+
 .PHONY: tradeworkz-check
 tradeworkz-check: ## Run TradeWorkz accounting invariants (on-demand DB audit)
 	@echo "$(BLUE)=== TradeWorkz invariants ===$(NC)"
@@ -3573,6 +3831,15 @@ tradeworkz-review: ## Show scale-out ladder activity for the latest session (arm
 tradeworkz-backtest: ## Replay bots over history to screen for entry edge (args: ARGS="--days 5 --interval-min 5 --bots id1,id2 --json")
 	@echo "$(BLUE)=== TradeWorkz backtest (research screen: 1 contract, scaling OFF, ML neutral) ===$(NC)"
 	@$(VENV_PYTHON) -m src.tradeworkz.backtest $(ARGS)
+
+.PHONY: strategy-catalog-audit
+strategy-catalog-audit: ## Audit the strategy catalog: bindings, stages, evidence depth, retirement eligibility (args: ARGS="--json --family wall")
+	@echo "$(BLUE)=== Strategy catalog audit (source of truth for all three surfaces) ===$(NC)"
+	@$(VENV_PYTHON) -m src.strategies.audit $(ARGS)
+
+.PHONY: strategy-catalog-check
+strategy-catalog-check: ## Fail if the catalog has integrity problems (for CI / pre-deploy)
+	@$(VENV_PYTHON) -m src.strategies.audit --strict >/dev/null && 		echo "$(GREEN)strategy catalog OK$(NC)" || 		{ $(VENV_PYTHON) -m src.strategies.audit | tail -20; exit 1; }
 
 .PHONY: query
 query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
@@ -4096,6 +4363,123 @@ ingestion-freshness-healthcheck: ## Alert if ANY TradeStation stream stopped wri
 		--max-stale-minutes $(INGEST_FRESHNESS_MAX_STALE_MINUTES) \
 		$(if $(JSON),--json)
 
+# How deep a gamma-flip carry has to go before the check fails, in 5-minute
+# bars. The newest bar is legitimately one carry deep on the cycle after it
+# opens; three bars is fifteen minutes with no gex_summary row at all, which is
+# a stall rather than a late write.
+GAMMA_FLIP_MAX_CARRY_BARS ?= 3
+
+.PHONY: gamma-flip-carry-healthcheck
+gamma-flip-carry-healthcheck: ## Alert if gamma_regime_5min.gamma_flip was carried over missing gex_summary rows. 0=ok 1=carried 2=db error
+	@$(PY) -m src.tools.gamma_flip_carry_healthcheck \
+		--max-carry-bars $(GAMMA_FLIP_MAX_CARRY_BARS) \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(SESSIONS),--sessions $(SESSIONS)) \
+		$(if $(JSON),--json)
+
+GAMMA_FLIP_MAX_BLANK_MINUTES ?= 30
+
+.PHONY: gamma-flip-resolution-healthcheck
+gamma-flip-resolution-healthcheck: ## Report how long the gamma flip was left UNPUBLISHED (row present, value NULL). FLIP_SINCE=YYYY-MM-DD BY_DATE=1. 0=ok 1=blank too long 2=db error
+	@$(PY) -m src.tools.gamma_flip_resolution_healthcheck \
+		--max-blank-minutes $(GAMMA_FLIP_MAX_BLANK_MINUTES) \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(SESSIONS),--sessions $(SESSIONS)) \
+		$(if $(FLIP_SINCE),--since $(FLIP_SINCE)) \
+		$(if $(BY_DATE),--by-date) \
+		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-blackout-forensics
+gamma-flip-blackout-forensics: ## Say WHY the gamma flip was left unpublished, from retention-exempt rows. FLIP_SINCE=YYYY-MM-DD BLANK_ONLY=1
+	@$(PY) -m src.tools.gamma_flip_blackout_forensics \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(SESSIONS),--sessions $(SESSIONS)) \
+		$(if $(FLIP_SINCE),--since $(FLIP_SINCE)) \
+		$(if $(BLANK_ONLY),--blank-only) \
+		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-gate-replay
+gamma-flip-gate-replay: ## Replay a blank flip cycle and name the gate that rejected it. SYMBOL=NDX SESSION=YYYY-MM-DD [AT="..."] [SAMPLES=n] [DTE_REFS=0.5,1,2,3,5]
+	@$(PY) -m src.tools.gamma_flip_gate_replay \
+		--symbol $(or $(SYMBOL),SPX) \
+		$(if $(SESSION),--session $(SESSION)) \
+		$(if $(AT),--at "$(AT)") \
+		$(if $(SAMPLES),--samples $(SAMPLES)) \
+		$(if $(DTE_REFS),--dte-ref-days $(DTE_REFS)) \
+		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-resolution-install
+gamma-flip-resolution-install: ## Install the gamma-flip resolution timer (hourly 10:30-15:30 ET + 16:05 ET post-close)
+	@echo "$(BLUE)=== Installing Gamma-Flip Resolution Check Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-resolution.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-resolution.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-gamma-flip-resolution.timer
+	@echo "$(GREEN)✅ Gamma-flip resolution timer installed and started$(NC)"
+	@if [ ! -f /etc/systemd/system/zerogex-alert@.service ]; then \
+		echo "$(YELLOW)⚠  zerogex-alert@.service is NOT installed, so a blackout will be"; \
+		echo "   logged but will not leave the box. Install it with:"; \
+		echo "     make alert-template-install$(NC)"; \
+	elif ! sudo grep -qs '^ALERT_BACKEND=resend' /etc/zerogex/alert.env; then \
+		echo "$(YELLOW)⚠  /etc/zerogex/alert.env is not set to the email backend, so a"; \
+		echo "   blackout alerts to the journal only. For email, set in that file:"; \
+		echo "     ALERT_BACKEND=resend"; \
+		echo "     ALERT_EMAIL_TO=you@example.com"; \
+		echo "   then: make alert-template-test$(NC)"; \
+	else \
+		echo "$(GREEN)✅ Email alerting is configured (ALERT_BACKEND=resend)$(NC)"; \
+	fi
+	@echo "$(YELLOW)Status:      make gamma-flip-resolution-status$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-gamma-flip-resolution$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-gamma-flip-resolution.service$(NC)"
+
+.PHONY: gamma-flip-resolution-status
+gamma-flip-resolution-status: ## Show the gamma-flip resolution timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Gamma-Flip Resolution Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-gamma-flip-resolution.timer' || true
+	@echo ""
+	@echo "$(BLUE)Service — last run:$(NC)"
+	@systemctl status zerogex-oa-gamma-flip-resolution.service --no-pager -l || true
+	@echo ""
+	@echo "$(BLUE)Recent log lines:$(NC)"
+	@sudo journalctl -u zerogex-oa-gamma-flip-resolution -n 30 --no-pager || true
+
+.PHONY: gamma-flip-carry-install
+gamma-flip-carry-install: ## Install the gamma-flip carry timer (hourly 10:30-15:30 ET + 16:30 ET post-close)
+	@echo "$(BLUE)=== Installing Gamma-Flip Carry Check Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-carry.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-carry.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-gamma-flip-carry.timer
+	@echo "$(GREEN)✅ Gamma-flip carry timer installed and started$(NC)"
+	@if [ ! -f /etc/systemd/system/zerogex-alert@.service ]; then \
+		echo "$(YELLOW)⚠  zerogex-alert@.service is NOT installed, so a failure will be"; \
+		echo "   logged but will not leave the box. Install it with:"; \
+		echo "     make alert-template-install$(NC)"; \
+	elif ! sudo grep -qs '^ALERT_BACKEND=resend' /etc/zerogex/alert.env; then \
+		echo "$(YELLOW)⚠  /etc/zerogex/alert.env is not set to the email backend, so a"; \
+		echo "   failure alerts to the journal only. For email, set in that file:"; \
+		echo "     ALERT_BACKEND=resend"; \
+		echo "     ALERT_EMAIL_TO=you@example.com"; \
+		echo "   then: make alert-template-test$(NC)"; \
+	else \
+		echo "$(GREEN)✅ Email alerting is configured (ALERT_BACKEND=resend)$(NC)"; \
+	fi
+	@echo "$(YELLOW)Status:      make gamma-flip-carry-status$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-gamma-flip-carry$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-gamma-flip-carry.service$(NC)"
+
+.PHONY: gamma-flip-carry-status
+gamma-flip-carry-status: ## Show the gamma-flip carry timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Gamma-Flip Carry Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-gamma-flip-carry.timer' || true
+	@echo ""
+	@echo "$(BLUE)Service — last run:$(NC)"
+	@systemctl status zerogex-oa-gamma-flip-carry.service --no-pager -l || true
+	@echo ""
+	@echo "$(BLUE)Recent log lines:$(NC)"
+	@sudo journalctl -u zerogex-oa-gamma-flip-carry -n 30 --no-pager || true
+
 .PHONY: freshness-replay
 freshness-replay: ## Replay the freshness check over a session from the DB (DATE=YYYY-MM-DD)
 	@$(PY) -m src.tools.freshness_replay \
@@ -4340,6 +4724,253 @@ forecast-receipt: ## Write today's receipt against the immutable morning commitm
 		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
 		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
 
+.PHONY: cone-writer-dry-run
+cone-writer-dry-run: ## Dry-run one intraday cone fire (always logs, never writes). Vars: CONE_AT=YYYY-MM-DDTHH:MM
+	@echo "$(BLUE)=== Dry-run intraday cone writer ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_writer --dry-run \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(CONE_AT),--at $(CONE_AT) --allow-off-window) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: cone-writer
+cone-writer: ## Commit one intraday cone fire (idempotent; immutable after first write)
+	@echo "$(BLUE)=== Committing intraday cone ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_writer \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(CONE_AT),--at $(CONE_AT) --allow-off-window) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: cone-receipt-dry-run
+cone-receipt-dry-run: ## Dry-run grading of every matured cone horizon (never writes)
+	@echo "$(BLUE)=== Dry-run intraday cone grading ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_receipt --dry-run \
+		$(if $(CONE_AT),--at $(CONE_AT))
+
+.PHONY: cone-receipt
+cone-receipt: ## Grade every matured cone horizon (write-once per claim)
+	@echo "$(BLUE)=== Grading matured cone horizons ===$(NC)"
+	@$(PY) -m src.jobs.intraday_cone_receipt \
+		$(if $(CONE_AT),--at $(CONE_AT))
+
+.PHONY: cone-backfill
+cone-backfill: ## Replay a whole session's cone fires at 15m spacing. Vars: FORECAST_DATE=YYYY-MM-DD (required)
+	@echo "$(BLUE)=== Backfilling intraday cones for $(FORECAST_DATE) ===$(NC)"
+	@if [ -z "$(FORECAST_DATE)" ]; then \
+		echo "$(RED)FORECAST_DATE=YYYY-MM-DD is required$(NC)"; exit 1; \
+	fi
+	@for t in 09:45 10:00 10:15 10:30 10:45 11:00 11:15 11:30 11:45 \
+			  12:00 12:15 12:30 12:45 13:00 13:15 13:30 13:45 \
+			  14:00 14:15 14:30 14:45 15:00 15:15 15:30; do \
+		$(PY) -m src.jobs.intraday_cone_writer \
+			--date $(FORECAST_DATE) --at "$(FORECAST_DATE)T$$t" \
+			$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS)) || true; \
+	done
+	@echo "$(YELLOW)Now grade them:  make cone-receipt$(NC)"
+
+.PHONY: cone-calibration
+cone-calibration: ## Per-session cone report: predicted vs realized hold, and model vol basis vs what the tape did. Vars: SESSIONS=20 (default), SYMBOL=SPY (optional scope).
+	@echo "$(BLUE)=== Cone Calibration Report ===$(NC)"
+	@SESSIONS="$${SESSIONS:-20}"; \
+	SYMBOL_FILTER=""; \
+	if [ -n "$${SYMBOL}" ]; then SYMBOL_FILTER="AND symbol = '$${SYMBOL}'"; fi; \
+	echo "$(YELLOW)vol_ratio = what the tape actually did, over what the model's vol basis$(NC)"; \
+	echo "$(YELLOW)expected. 1.00 is an ordinary day. Well BELOW 1 means the bands were$(NC)"; \
+	echo "$(YELLOW)drawn for more movement than happened, so they hold more often than$(NC)"; \
+	echo "$(YELLOW)predicted -- underconfident. Well ABOVE 1 is the reverse.$(NC)"; \
+	echo "$(YELLOW)gap = realized hold rate minus mean predicted. Near 0 is calibrated.$(NC)"; \
+	echo "$(YELLOW)vol_anchor is what the cone assumed today would deliver against a$(NC)"; \
+	echo "$(YELLOW)normal day, and anchor_src says where it came from: 'measured' is$(NC)"; \
+	echo "$(YELLOW)the median of prior GRADED sessions, 'committed' is the morning$(NC)"; \
+	echo "$(YELLOW)forecast's prediction (which itself falls back to a neutral 1.0 on$(NC)"; \
+	echo "$(YELLOW)a cold start), 'none' is no claim at all. If vol_anchor sits near$(NC)"; \
+	echo "$(YELLOW)1.00 while vol_ratio sits near 0.5, the anchor is the problem.$(NC)"; \
+	echo "$(YELLOW)realized_range_pct is the FULL 09:30-16:00 cash session from$(NC)"; \
+	echo "$(YELLOW)underlying_quotes. It deliberately does not reuse the graded$(NC)"; \
+	echo "$(YELLOW)windows: those start at 10:15 and so miss the opening 45 minutes,$(NC)"; \
+	echo "$(YELLOW)which carry 23%% of the day's variance -- measuring there understated$(NC)"; \
+	echo "$(YELLOW)the range by ~12%% and biased vol_ratio low.$(NC)"; \
+	echo ""; \
+	echo "$(BLUE)--- Per session x symbol ---$(NC)"; \
+	$(PSQL) -c "WITH c AS ( \
+		SELECT session_date, symbol, \
+		       COUNT(*) AS claims, \
+		       COUNT(*) FILTER (WHERE held) AS held_n, \
+		       AVG(hold_prob) AS mean_pred, \
+		       AVG(daily_sigma / NULLIF(anchor_spot,0)) AS sigma_frac, \
+		       AVG(vol_ratio_applied) AS vol_anchor, \
+		       MIN(vol_ratio_source) AS anchor_src, \
+		       MIN(model_version) AS model_ver, \
+		       AVG(anchor_spot) AS spot \
+		FROM intraday_forecast \
+		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
+		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY session_date, symbol), \
+		tape AS ( \
+		SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d, symbol, \
+		       MAX(high) - MIN(low) AS rng \
+		FROM underlying_quotes \
+		WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		      BETWEEN TIME '09:30' AND TIME '16:00' \
+		  AND (timestamp AT TIME ZONE 'America/New_York')::date \
+		      >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY 1, 2), \
+		s AS ( \
+		SELECT c.*, t.rng / NULLIF(c.spot,0) AS realized_frac \
+		FROM c LEFT JOIN tape t \
+		  ON t.d = c.session_date AND t.symbol = c.symbol) \
+		SELECT session_date, symbol, claims, \
+		       ROUND(100.0 * held_n / claims, 1) AS hold_pct, \
+		       ROUND(100.0 * mean_pred, 1)       AS pred_pct, \
+		       ROUND(100.0 * (held_n::numeric / claims - mean_pred), 1) AS gap_pts, \
+		       ROUND(vol_anchor::numeric, 2)     AS vol_anchor, \
+		       anchor_src, \
+		       model_ver, \
+		       ROUND(100.0 * sigma_frac, 3)      AS model_sigma_pct, \
+		       ROUND(100.0 * realized_frac, 3)   AS realized_range_pct, \
+		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio \
+		FROM s ORDER BY session_date DESC, symbol;"; \
+	echo ""; \
+	echo "$(BLUE)--- Per SYMBOL (current cohort only) ---$(NC)"; \
+	echo "$(YELLOW)Read this before the per-horizon table. An aggregate gap near zero$(NC)"; \
+	echo "$(YELLOW)can be every symbol calibrated, or two large biases cancelling -- and$(NC)"; \
+	echo "$(YELLOW)those call for opposite actions. The published page filters by symbol,$(NC)"; \
+	echo "$(YELLOW)so a reader on one symbol sees ITS numbers, not this average.$(NC)"; \
+	$(PSQL) -c "SELECT symbol, COUNT(*) AS claims, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE held) / COUNT(*), 1) AS hold_pct, \
+		       ROUND(100.0 * AVG(hold_prob), 1) AS pred_pct, \
+		       ROUND(100.0 * (COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) \
+		                      - AVG(hold_prob)), 1) AS gap_pts, \
+		       ROUND(AVG(brier)::numeric, 4) AS brier \
+		FROM intraday_forecast \
+		WHERE held IS NOT NULL AND vol_ratio_source IS NOT NULL $${SYMBOL_FILTER} \
+		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY symbol ORDER BY gap_pts;"; \
+	echo ""; \
+	echo "$(BLUE)--- Per horizon, SPLIT BY MODEL ---$(NC)"; \
+	echo "$(YELLOW)Never read across rows here. A session backfilled under an older$(NC)"; \
+	echo "$(YELLOW)model is not evidence about the current one, and averaging the two$(NC)"; \
+	echo "$(YELLOW)makes a stale cohort look like a regression. 'pre-anchor' marks rows$(NC)"; \
+	echo "$(YELLOW)written before the vol anchor existed -- re-backfill those sessions$(NC)"; \
+	echo "$(YELLOW)before drawing any conclusion from them.$(NC)"; \
+	$(PSQL) -c "SELECT model_version, \
+		       CASE WHEN vol_ratio_source IS NULL THEN 'pre-anchor' ELSE 'current' END AS cohort, \
+		       horizon_min, COUNT(*) AS claims, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE held) / COUNT(*), 1) AS hold_pct, \
+		       ROUND(100.0 * AVG(hold_prob), 1) AS pred_pct, \
+		       ROUND(100.0 * (COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) - AVG(hold_prob)), 1) AS gap_pts, \
+		       ROUND(AVG(brier)::numeric, 4) AS brier \
+		FROM intraday_forecast \
+		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
+		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY model_version, cohort, horizon_min \
+		ORDER BY model_version, cohort, horizon_min;"; \
+	echo ""; \
+	echo "$(YELLOW)One session decides nothing -- a quiet day and a wrong vol basis look$(NC)"; \
+	echo "$(YELLOW)identical in a single row. Backfill several sessions, including a$(NC)"; \
+	echo "$(YELLOW)volatile one, before changing any constant. If vol_ratio sits near 1$(NC)"; \
+	echo "$(YELLOW)while gap_pts stays large, the vol basis is fine and the cone geometry$(NC)"; \
+	echo "$(YELLOW)is what needs tuning. If vol_ratio is persistently far from 1, the$(NC)"; \
+	echo "$(YELLOW)basis is the problem and tuning the geometry would just paper over it.$(NC)"
+
+.PHONY: cone-install
+cone-install: ## Install + enable ONLY the two intraday cone timers (writer 15m 09:45-15:30, grader 10:05-16:50).
+	@echo "$(BLUE)=== Installing Intraday Cone Timers ===$(NC)"
+	@echo "$(YELLOW)Deliberately narrower than forecast-install, which also re-copies and$(NC)"
+	@echo "$(YELLOW)re-enables the four daily-forecast units. Those are already running in$(NC)"
+	@echo "$(YELLOW)production, and there is no reason to touch a working cron to start a$(NC)"
+	@echo "$(YELLOW)new one.$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-writer.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-receipt.timer
+	@echo "$(GREEN)✅ Cone timers installed$(NC)"
+	@echo ""
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-cone-*' || true
+	@echo ""
+	@echo "$(YELLOW)The writer only fires 09:45-15:30 ET Mon-Fri, so NEXT will read$(NC)"
+	@echo "$(YELLOW)tomorrow morning outside those hours -- that is the window, not a fault.$(NC)"
+	@echo "$(YELLOW)Symbols come from FORECAST_SYMBOLS in .env (systemd reads that file, NOT$(NC)"
+	@echo "$(YELLOW)your shell); unset there, the writer silently does SPY alone.$(NC)"
+	@echo "$(YELLOW)Logs:  journalctl -u zerogex-oa-forecast-cone-writer -f$(NC)"
+
+.PHONY: cone-status
+cone-status: ## Cone timers, last/next fire, recent logs, and today's committed claims.
+	@echo "$(BLUE)=== Cone Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-cone-*' || true
+	@echo ""
+	@echo "$(BLUE)=== Today's committed claims ===$(NC)"
+	@$(PSQL) -c "SELECT symbol, COUNT(*) AS claims, COUNT(DISTINCT forecast_ts) AS fires, \
+		MIN(forecast_ts) AS first_fire, MAX(forecast_ts) AS last_fire, \
+		MIN(model_version) AS model_ver \
+		FROM intraday_forecast WHERE session_date = CURRENT_DATE \
+		GROUP BY symbol ORDER BY symbol;"
+	@echo ""
+	@echo "$(BLUE)=== Recent writer log ===$(NC)"
+	@sudo journalctl -u zerogex-oa-forecast-cone-writer -n 20 --no-pager || true
+
+.PHONY: cone-tune
+cone-tune: ## Sweep cone parameters against GRADED claims offline -- no re-backfill. Vars: SESSIONS=60, HOLDOUT=0.33, OBJECTIVE=brier|gap, SYMBOL=NDX
+	@echo "$(BLUE)=== Cone Parameter Sweep (offline, against stored claims) ===$(NC)"
+	@echo "$(YELLOW)Every graded claim stores the window extremes the tape reached, which$(NC)"
+	@echo "$(YELLOW)decide whether ANY band would have held -- so candidates are scored$(NC)"
+	@echo "$(YELLOW)against real outcomes without re-running a backfill.$(NC)"
+	@echo "$(YELLOW)HOLDOUT splits by SESSION, not by claim: claims within a session are$(NC)"
+	@echo "$(YELLOW)nowhere near independent, so a per-claim split would leak and report a$(NC)"
+	@echo "$(YELLOW)fit far better than it is. Ship nothing that fails out of sample.$(NC)"
+	@$(PY) -m src.jobs.cone_tune \
+		$(if $(SESSIONS),--sessions $(SESSIONS)) \
+		$(if $(HOLDOUT),--holdout $(HOLDOUT)) \
+		$(if $(OBJECTIVE),--objective $(OBJECTIVE)) \
+		$(if $(SYMBOL),--symbol $(SYMBOL))
+
+.PHONY: cone-prune
+cone-prune: ## Delete intraday_forecast rows for a session. Vars: SESSION=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Cone Prune (intraday_forecast) ===$(NC)"
+	@if [ -z "$${SESSION}" ]; then \
+		echo "$(RED)SESSION=YYYY-MM-DD is required -- refusing to run without an explicit session.$(NC)"; \
+		echo "$(YELLOW)Deletes every cone committed for that ONE session.$(NC)"; \
+		echo "$(YELLOW)  make cone-prune SESSION=2026-09-18                 # all symbols$(NC)"; \
+		echo "$(YELLOW)  make cone-prune SESSION=2026-09-18 SYMBOL=SPY      # scope to one symbol$(NC)"; \
+		echo "$(YELLOW)  make cone-prune SESSION=2026-09-18 CONFIRM=yes     # actually delete$(NC)"; \
+		exit 1; \
+	fi; \
+	if ! echo "$${SESSION}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$$'; then \
+		echo "$(RED)SESSION='$${SESSION}' is not a YYYY-MM-DD date.$(NC)"; \
+		exit 1; \
+	fi; \
+	SYMBOL_FILTER=""; \
+	if [ -n "$${SYMBOL}" ]; then \
+		echo "$(YELLOW)Scoping to SYMBOL='$${SYMBOL}'.$(NC)"; \
+		SYMBOL_FILTER="AND symbol = '$${SYMBOL}'"; \
+	else \
+		echo "$(YELLOW)No SYMBOL set -> ALL symbols.$(NC)"; \
+	fi; \
+	echo "$(YELLOW)Target: intraday_forecast rows with session_date = '$${SESSION}' (permanent DELETE).$(NC)"; \
+	echo "$(YELLOW)Cones are immutable once written, so a backfill produced from bad inputs$(NC)"; \
+	echo "$(YELLOW)cannot be corrected in place -- it has to be deleted and re-run. That is$(NC)"; \
+	echo "$(YELLOW)the ONLY reason this target exists. Deleting a session that was committed$(NC)"; \
+	echo "$(YELLOW)live erases a public claim and the verdict it earned; do not.$(NC)"; \
+	echo "$(BLUE)--- Rows to delete (grouped by symbol) ---$(NC)"; \
+	$(PSQL) -c "SELECT symbol, COUNT(*) AS n_claims, COUNT(DISTINCT forecast_ts) AS n_fires, \
+		COUNT(*) FILTER (WHERE graded_at IS NOT NULL) AS graded, \
+		COUNT(*) FILTER (WHERE held) AS held, \
+		MIN(anchor_spot) AS min_anchor, MAX(anchor_spot) AS max_anchor \
+		FROM intraday_forecast WHERE session_date = '$${SESSION}' $${SYMBOL_FILTER} \
+		GROUP BY symbol ORDER BY symbol;"; \
+	echo "$(YELLOW)min_anchor = max_anchor means the writer never re-anchored -- the symptom$(NC)"; \
+	echo "$(YELLOW)of a backfill run before the point-in-time read fix.$(NC)"; \
+	if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to DELETE the rows above.$(NC)"; \
+	else \
+		echo "$(BLUE)--- Deleting ---$(NC)"; \
+		ROWS=$$($(PSQL) -t -A -c "WITH deleted AS (DELETE FROM intraday_forecast WHERE session_date = '$${SESSION}' $${SYMBOL_FILTER} RETURNING 1) SELECT COUNT(*) FROM deleted;"); \
+		echo "$(GREEN)✓ Deleted $${ROWS} intraday_forecast row(s) for $${SESSION}.$(NC)"; \
+		echo "$(YELLOW)Re-run:  make cone-backfill FORECAST_DATE=$${SESSION} && make cone-receipt$(NC)"; \
+	fi
+
 .PHONY: forecast-prune
 forecast-prune: ## Delete daily_forecast rows before a cutoff. Vars: BEFORE=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Forecast Prune (daily_forecast) ===$(NC)"
@@ -4434,11 +5065,17 @@ forecast-install: ## Install all forecast timers (08:30 writer, 16:05 receipt, 2
 	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.timer /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.timer /etc/systemd/system/
 	@sudo systemctl daemon-reload
 	@sudo systemctl enable --now zerogex-oa-forecast-writer.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-receipt.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-calibrate.timer
-	@echo "$(GREEN)✅ Forecast timers installed (08:30 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)$(NC)"
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-writer.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-receipt.timer
+	@echo "$(GREEN)✅ Forecast timers installed (08:30 writer, 16:05 receipt, 20:00 calibrate, 15m cone writer + grader; Mon-Fri)$(NC)"
 	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-forecast-*'$(NC)"
 	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -u zerogex-oa-forecast-calibrate$(NC)"
 
@@ -4615,6 +5252,34 @@ daily-atm-iv-backfill: ## Re-seed daily_atm_iv 30-day history (idempotent, runs 
 	@$(PY) -m src.tools.daily_atm_iv_backfill \
 		$(if $(DAILY_ATM_IV_SYMBOLS),--symbols $(DAILY_ATM_IV_SYMBOLS)) \
 		$(if $(DAILY_ATM_IV_DAYS),--days $(DAILY_ATM_IV_DAYS))
+
+# Spread Monitor history.  The analytics writer UPSERTs today's three rows
+# (calls / puts / blended) each cash-session cycle; this seeds the trailing
+# window the page compares today against, and is the safety net for gaps a
+# missed EOD cycle would leave.  Idempotent — safe to re-run.
+# Override with SPREAD_STATS_SYMBOLS / SPREAD_STATS_DAYS.
+.PHONY: daily-spread-stats-backfill
+daily-spread-stats-backfill: ## Seed daily_spread_stats history from option_chains (idempotent; default 90 days)
+	@echo "$(BLUE)=== Backfilling daily_spread_stats history ===$(NC)"
+	@$(PY) -m src.tools.daily_spread_stats_backfill \
+		$(if $(SPREAD_STATS_SYMBOLS),--symbols $(SPREAD_STATS_SYMBOLS)) \
+		$(if $(SPREAD_STATS_DAYS),--days $(SPREAD_STATS_DAYS))
+
+# Seeds spread_surface_stats: the same reduction as above, but cut by
+# moneyness bucket and DTE bucket and stamped with a 30-minute time-of-day
+# bucket, which is what lets the Spread Surface view rank a 15:40 reading
+# against prior sessions at 15:40 rather than against their whole day.
+#
+# Far heavier than the daily backfill — one anchor per half-hour bucket per
+# session rather than one per session — so the default window is shorter.
+# Idempotent; re-running over buckets the live writer has already filled
+# corrects them in place.  Override with SURFACE_SYMBOLS / SURFACE_DAYS.
+.PHONY: spread-surface-backfill
+spread-surface-backfill: ## Seed spread_surface_stats time-of-day history from option_chains (idempotent; default 45 days)
+	@echo "$(BLUE)=== Backfilling spread_surface_stats history ===$(NC)"
+	@$(PY) -m src.tools.spread_surface_backfill \
+		$(if $(SURFACE_SYMBOLS),--symbols $(SURFACE_SYMBOLS)) \
+		$(if $(SURFACE_DAYS),--days $(SURFACE_DAYS))
 
 # Backtesting platform: archive + calibration jobs (run nightly via timers).
 # Override with ARCHIVE_DAYS / ARCHIVE_UNDERLYINGS, CALIB_DAYS / CALIB_UNDERLYINGS.

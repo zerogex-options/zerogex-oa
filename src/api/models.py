@@ -333,6 +333,13 @@ class UnderlyingQuote(BaseModel):
     # card, and the candlestick chart read the futures fields.
     #   display_source: 'futures' when the future should be shown, else None.
     #   data_symbol:    the future's UI ticker (e.g. 'ES'), else None.
+    #   data_contract:  the CME contract that ticker resolves to right now
+    #       (e.g. 'ESZ26'), else None. The ticker alone is ambiguous across a
+    #       quarterly roll — two platforms showing "ES" can be on different
+    #       contracts, a quarter of carry apart — so this names the one being
+    #       shown. DISPLAY-only, derived from the roll calendar
+    #       (futures_projection.active_contract_code); never a data key.
+    #   data_contract_expiry: that contract's expiry, for the same reason.
     #   futures_close:  the future's last price (the number those surfaces show).
     #   futures_reference_close: the future's price at the 16:00 ET cash close
     #       — the baseline for the overnight change, measured futures-vs-futures
@@ -340,6 +347,8 @@ class UnderlyingQuote(BaseModel):
     #       basis.
     display_source: Optional[str] = None
     data_symbol: Optional[str] = None
+    data_contract: Optional[str] = None
+    data_contract_expiry: Optional[date] = None
     futures_close: Optional[Decimal] = None
     futures_reference_close: Optional[Decimal] = None
     # FEED freshness, for the natively-served futures quote (ES / NQ).
@@ -522,6 +531,39 @@ class HedgingFlowResponse(BaseModel):
     smoothing_bars: int
     bars: List[HedgingFlowBar]
     flips: List[HedgingFlowFlip]
+
+
+class HedgingFlowSession(BaseModel):
+    """One trading day that has stored hedging-flow bars.
+
+    A session CARD, not a date entry -- which is the difference between a
+    list of days that have data and a picker that invites a reader to land
+    on an empty one. ``bar_count`` grades how complete the day is (a full
+    regular session is 82 bars on the 5-minute grid) and ``real_bar_count``
+    excludes carry-forward bars, so "thin" is distinguishable from "short".
+    ``cum_net_usd`` is the session's closing lean, which is what lets a card
+    say something about the day rather than only name it.
+
+    ``had_0dte`` reports whether the 0DTE scope was materialised at all, so
+    the toggle is offered on that basis instead of being offered always and
+    resolving to nothing on a day that was not an expiry.
+    """
+
+    date: date
+    bar_count: int
+    real_bar_count: int
+    had_0dte: bool
+    cum_net_usd: Optional[float] = None
+    first_bar: Optional[datetime] = None
+    last_bar: Optional[datetime] = None
+
+
+class HedgingFlowSessionList(BaseModel):
+    """The index behind the dated Hedging Flow permalinks, newest first."""
+
+    symbol: str
+    count: int
+    sessions: List[HedgingFlowSession]
 
 
 class GammaRegimeBar(BaseModel):

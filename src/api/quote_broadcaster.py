@@ -136,6 +136,11 @@ class QuoteBroadcaster:
         # Last snapshot per symbol — the "hello" payload sent to a new
         # subscriber on subscribe(). Prevents the two-frame flicker where
         # a new consumer would mount empty and wait for the next tick.
+        #
+        # Its OHLC/timestamp are the genuine last print and stay frozen, but
+        # its ``session`` must NOT: that label is wall-clock state, and it is
+        # re-derived on every replay (see subscribe()) so a snapshot cached
+        # hours or days ago cannot answer with the session it was born in.
         self._latest: Dict[str, Dict[str, Any]] = {}
 
         # asset_type cache keyed by symbol; used when computing the
@@ -340,6 +345,40 @@ class QuoteBroadcaster:
         self._fanout_tasks.add(task)
         task.add_done_callback(self._fanout_tasks.discard)
 
+    async def _session_label(self, symbol: str, asset_type: Optional[str]) -> Optional[str]:
+        """The session label for ``symbol`` as of NOW.
+
+        Computed in the API process rather than on the ingestion side because
+        the wall-clock-driven state machine belongs here, and computing it in
+        one place means every worker's answer — over the socket and over
+        ``GET /api/market/quote`` — comes from the same helper and agrees.
+
+        ``close_data_available`` comes from the same signal the HTTP handler
+        uses (1s-cached in DatabaseManager) so the two paths agree at the
+        16:00 ET boundary. On failure, or when no check is wired, we degrade
+        to True — matching the pre-fix behavior so a broken DB never strands
+        the WS in perpetual "open".
+
+        Called on every fan-out AND on every snapshot replay, so the answer is
+        always the session the clock is in when the frame leaves the server.
+        """
+        prices = self._soft_close.get(symbol) or []
+        stable = len(prices) >= 3 and len(set(prices)) == 1
+        close_avail = True
+        if self._close_data_check is not None:
+            try:
+                close_avail = bool(await self._close_data_check(symbol, asset_type))
+            except Exception:
+                close_avail = True
+        try:
+            # Annotated local rather than a bare return: ``_compute_session`` is
+            # an untyped callable, so returning its result directly is an
+            # implicit Any escape (mypy no-any-return).
+            session: Optional[str] = self._compute_session(asset_type, stable, close_avail)
+        except Exception:
+            return None
+        return session
+
     async def _fanout(self, raw: Dict[str, Any]) -> None:
         """Enrich the raw ingestion payload and send to all subscribers."""
         symbol = raw.get("symbol")
@@ -353,32 +392,17 @@ class QuoteBroadcaster:
         else:
             asset_type = self._asset_type.get(symbol)
 
-        # Compute session at broadcast time (not on the ingestion side)
-        # because the wall-clock-driven state machine belongs to the API
-        # process, and doing it here means every worker's answer stays
-        # consistent with GET /api/market/quote — which uses the same
-        # helper.
+        # Feed the soft-close tracker before labelling: 3 consecutive
+        # identical closes are what let the INDEX 16:00:00-16:00:29 window
+        # settle to "closed" (mirrors main.py's _SoftCloseTracker). Only a
+        # real incoming tick advances it — a replay must not.
         prices = self._soft_close.setdefault(symbol, [])
         close_val = raw.get("close")
         if close_val is not None:
             prices.append(close_val)
             del prices[:-3]
-        stable = len(prices) >= 3 and len(set(prices)) == 1
-        # Query ``close_data_available`` from the same signal the HTTP
-        # handler uses (1s-cached in DatabaseManager) so the two paths
-        # agree at the 16:00 ET boundary. On failure or when no check
-        # is wired we degrade to True — matches the pre-fix behavior
-        # so a broken DB never strands the WS in perpetual "open".
-        close_avail = True
-        if self._close_data_check is not None:
-            try:
-                close_avail = bool(await self._close_data_check(symbol, asset_type))
-            except Exception:
-                close_avail = True
-        try:
-            session = self._compute_session(asset_type, stable, close_avail)
-        except Exception:
-            session = None
+
+        session = await self._session_label(symbol, asset_type)
 
         message = {
             "type": "quote",
@@ -498,13 +522,40 @@ class QuoteBroadcaster:
                 self._per_user_count[owner] = user_count
 
     async def subscribe(self, ws: WebSocket, symbol: str) -> Optional[Dict[str, Any]]:
-        """Add ``ws`` to the ``symbol`` subscriber set; return snapshot if any."""
+        """Add ``ws`` to the ``symbol`` subscriber set; return snapshot if any.
+
+        The replayed snapshot keeps the cached tick's prices and timestamp —
+        that IS the last print, and saying so is the point of the hello frame
+        — but its ``session`` is re-derived for right now. The cached label
+        was computed when the tick arrived, and a snapshot outlives its
+        session: ``_latest`` is in-process memory with no expiry, so a quiet
+        market serves the same tick for as long as the worker lives.
+
+        Replaying the frozen label made the socket contradict
+        ``GET /api/market/quote``, which always answers from the clock. Over a
+        weekend that showed: SPY's last tick lands Friday ~19:59 ET labelled
+        ``after-hours``, and every Saturday (re)subscribe replayed that label,
+        so the header flipped into its extended-hours rendering — the
+        after-hours row, and row 1 re-anchored onto Friday's extended print —
+        until the next HTTP poll answered ``closed`` and put it back. With the
+        client's stall watchdog reconnecting roughly once a minute all
+        weekend, the quote visibly switched back and forth.
+
+        Re-labelling costs one ``close_data_available`` lookup per subscribe,
+        which is the same 1s-cached signal the fan-out path already reads.
+        """
         symbol = symbol.strip().upper()
         if not symbol:
             return None
         async with self._lock:
             self._subscribers.setdefault(symbol, set()).add(ws)
-        return self._latest.get(symbol)
+        snapshot = self._latest.get(symbol)
+        if snapshot is None:
+            return None
+        # Do NOT mutate the cached entry: it is shared by every subscriber and
+        # re-labelled per replay.
+        session = await self._session_label(symbol, self._asset_type.get(symbol))
+        return {**snapshot, "session": session}
 
     async def unsubscribe(self, ws: WebSocket, symbol: str) -> None:
         symbol = symbol.strip().upper()

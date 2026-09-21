@@ -16,7 +16,7 @@ from enum import IntEnum
 import os
 from src.config import _getenv_str
 import re
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 import pytz
 
 from .database import DatabaseManager
@@ -40,6 +40,7 @@ from .models import (
     FlowSeriesPoint,
     FlowContractsResponse,
     HedgingFlowResponse,
+    HedgingFlowSessionList,
     GammaRegimeSeriesResponse,
     GammaWeatherResponse,
     GammaWeatherSeriesResponse,
@@ -80,11 +81,13 @@ from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
+from .routers.spread_liquidity import router as spread_liquidity_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.gamma_shift import router as gamma_shift_router
 from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
 from .routers.forecast import router as forecast_router
+from .routers.cone import router as cone_router
 from .routers.replay import router as replay_router
 from .routers.forced_flow import router as forced_flow_router
 from .routers.levels import router as levels_router
@@ -543,6 +546,33 @@ app.include_router(vol_surface_router, dependencies=[_scope_gex])
 # volatilities only, and an IV is not invertible to a price without the rate,
 # dividend and time conventions that produced it.
 app.include_router(premium_surface_router, dependencies=[_scope_market_raw])
+# Spread Monitor — quoted bid/ask width and liquidity across the chain (Beta).
+# MARKET_RAW for the same reason as the premium surface above, and it is worth
+# writing down why an AGGREGATE lands on the raw side of the line.
+#
+# Nothing here is per-contract: every figure is a median or a p90 over a
+# population, and a median does not invert to the values behind it. But the
+# CALLER chooses the population. `moneyness_band_pct` goes down to 0.25 and
+# `dte_max` to 0, and the response reports `tradable_count` per bucket — so a
+# caller can narrow a bucket until exactly one contract is left, and read it:
+#
+#     median_spread                 = ask - bid
+#     median_relative_spread_pct    = 200 * (ask - bid) / (ask + bid)
+#     => ask + bid = 200 * median_spread / median_relative_spread_pct
+#     => bid, ask   recovered exactly, for a contract the same response
+#                   identifies by expiration, strike band and option type.
+#
+# That is the premium surface's failure mode wearing an aggregate's clothes,
+# and the same conclusion follows: the gate belongs on the route, because
+# there is no field to redact that closes it. Suppressing thin buckets would
+# not close it either — a caller can vary the band and difference the results.
+# tests/test_market_data_scope_boundary.py pins this against the mounted route
+# table so the reasoning does not have to survive in a comment alone.
+#
+# No product cost: the website BFF holds TIER_FULL, so /spread-monitor is
+# unaffected. It is withheld from the external analytics tier, which is the
+# correct answer for a surface whose entire subject is the vendor's quotes.
+app.include_router(spread_liquidity_router, dependencies=[_scope_market_raw])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # Gamma Regime Shift — the derivative of the dealer-gamma surface (what
 # CHANGED between two snapshots, what expires next, and the classified read
@@ -564,6 +594,11 @@ app.include_router(scorecard_router, dependencies=[_scope_signals])
 # public /forecast/{date} page. Read-only here; the writer cron jobs live
 # in src.jobs.forecast_writer and src.jobs.forecast_receipt.
 app.include_router(forecast_router, dependencies=[_scope_signals])
+# Intraday re-anchored cone — the 15-minute counterpart to the daily band,
+# plus the reliability receipt that says whether its published hold
+# probabilities mean what they say. Read-only; the writer and grader crons
+# live in src.jobs.intraday_cone_writer and src.jobs.intraday_cone_receipt.
+app.include_router(cone_router, dependencies=[_scope_signals])
 # GEX Replay — scrubbable per-minute frames over historical gex_summary +
 # gex_by_strike data. Read-only; no new ingestion. Scope matches the rest
 # of the GEX surface (basic + pro tiers).
@@ -1072,6 +1107,34 @@ def _parse_flow_expirations(raw: Optional[str]) -> Optional[List[date_type]]:
     return parsed
 
 
+def _parse_session_date(raw: Optional[str]) -> Optional[date_type]:
+    """Parse the ?date= parameter into an ET trading date.
+
+    Strict where ``expirations`` is lenient, and for the opposite reason: a
+    malformed entry in a CSV filter can be dropped because the other entries
+    still express the caller's intent, whereas a malformed ``date`` has no
+    remaining intent to honour. Silently falling back to the current session
+    would serve today's chart under a permalink for some other day.
+
+    A well-formed date that simply has no data is NOT an error -- the series
+    endpoints answer it with an empty ``bars`` list. A dated page must not 404
+    on a day that merely turned out to be quiet, and it must not 404 because
+    the API blinked: ``notFound()`` during a crawl costs the URL its place in
+    the index.
+    """
+    if raw is None:
+        return None
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    if not _FLOW_EXPIRATION_PATTERN.match(trimmed):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    try:
+        return date_type.fromisoformat(trimmed)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be a real calendar date")
+
+
 def _format_flow_series_row(row: dict) -> dict:
     """Coerce a raw DB row into the JSON shape documented in the spec.
 
@@ -1320,6 +1383,16 @@ def _format_hedging_flip(event) -> dict:
 async def get_hedging_flow(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "Served from the retention-exempt hedging_flow_5min snapshot, so "
+            "it reaches back past the 90-day prune window that bounds the "
+            "live pipeline. A day with nothing stored returns 200 with an "
+            "empty `bars` list -- never 404."
+        ),
+    ),
     strikes: Optional[str] = Query(
         default=None,
         description="Comma-separated strikes to include. Empty/missing = all strikes.",
@@ -1412,6 +1485,7 @@ async def get_hedging_flow(
 
     strikes_list = _parse_flow_strikes(strikes)
     expirations_list = _parse_flow_expirations(expirations)
+    session_date = _parse_session_date(date)
 
     rows = await _db().get_hedging_flow_series(
         symbol=normalized,
@@ -1419,13 +1493,17 @@ async def get_hedging_flow(
         strikes=strikes_list,
         expirations=expirations_list,
         intervals=intervals,
+        session_date=session_date,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
 
     envelope = {
         "symbol": normalized,
-        "session": session,
+        # `session` has always named the day the payload describes. With an
+        # explicit date it names that date, so a dated response is
+        # self-describing and a client cannot mistake it for the live one.
+        "session": session_date.isoformat() if session_date else session,
         "basis": _HEDGING_FLOW_BASIS,
         "disclosure": _HEDGING_FLOW_DISCLOSURE,
         "smoothing_bars": smoothing,
@@ -1543,6 +1621,69 @@ def _format_gamma_regime_row(row: dict, cushion=None) -> dict:
 
 
 @app.get(
+    "/api/flow/hedging/sessions",
+    response_model=HedgingFlowSessionList,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/hedging/sessions")
+async def get_hedging_flow_sessions(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    limit: int = Query(default=60, ge=1, le=250),
+):
+    """Trading days that have a stored Hedging Flow session, newest first.
+
+    The index behind ``/api/flow/hedging?date=``. Deliberately a list of days
+    that HAVE data rather than a date picker over the calendar: a picker
+    invites a reader onto an empty session and lets them conclude the feature
+    is broken, which is why ``/api/replay/sessions`` and the scorecard's
+    equivalent are both shaped this way.
+
+    Read from ``hedging_flow_5min`` and nothing else. Listing from the live
+    tables instead would advertise exactly the 90 days the prune window keeps
+    and hide every older session that is still perfectly readable -- the list
+    and the permalinks have to agree about which days exist.
+
+    Each entry carries enough to render a card rather than a date: how many
+    bars the day has, how many of those were real rather than carried
+    forward, whether a 0DTE scope exists for it, and where the session's
+    cumulative lean finished.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    rows = await _db().get_hedging_flow_sessions(symbol=normalized, limit=limit)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+
+    def _iso(value) -> Optional[str]:
+        if value is None:
+            return None
+        ts = value if value.tzinfo else value.replace(tzinfo=pytz.UTC)
+        return ts.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    sessions = [
+        {
+            "date": r["session_date"].isoformat(),
+            "bar_count": int(r["bar_count"] or 0),
+            "real_bar_count": int(r["real_bar_count"] or 0),
+            "had_0dte": bool(r["had_0dte"]),
+            "cum_net_usd": (float(r["cum_net_usd"]) if r.get("cum_net_usd") is not None else None),
+            "first_bar": _iso(r.get("first_bar")),
+            "last_bar": _iso(r.get("last_bar")),
+        }
+        for r in rows
+    ]
+    return JSONResponse(
+        content={"symbol": normalized, "count": len(sessions), "sessions": sessions}
+    )
+
+
+@app.get(
     "/api/gex/regime-series",
     response_model=GammaRegimeSeriesResponse,
     tags=["GEX"],
@@ -1552,6 +1693,16 @@ def _format_gamma_regime_row(row: dict, cushion=None) -> dict:
 async def get_gamma_regime_series(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "gamma_regime_5min has been written per bar since this panel "
+            "shipped and is retention-exempt, so any stored session answers. "
+            "A day with nothing written returns 200 with an empty `bars` "
+            "list -- never 404."
+        ),
+    ),
     intervals: Optional[int] = Query(
         default=None,
         ge=1,
@@ -1609,10 +1760,13 @@ async def get_gamma_regime_series(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
+    session_date = _parse_session_date(date)
+
     rows = await _db().get_gamma_regime_series(
         symbol=normalized,
         session=session,
         intervals=intervals,
+        session_date=session_date,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
@@ -1638,21 +1792,33 @@ async def get_gamma_regime_series(
     return JSONResponse(
         content={
             "symbol": normalized,
-            "session": session,
+            # Echoes the date when one was asked for, so a dated response says
+            # which day it is rather than the word "current".
+            "session": session_date.isoformat() if session_date else session,
             "rolling_bars": rolling_bars,
             "bars": bars,
         }
     )
 
 
-async def _classify_weather_session(symbol: str, session: str) -> tuple:
+async def _classify_weather_session(
+    symbol: str,
+    session: str,
+    date: Optional[str] = None,
+) -> tuple:
     """Load, pair and classify one session's Gamma Weather.
 
-    Returns ``(normalized_symbol, paired_bars, classified_series)``. Shared by
+    Returns ``(normalized_symbol, session_date, paired_bars, classified_series)``.
+    Shared by
     the current-state endpoint and the series endpoint so the panel and its own
     history cannot disagree about a bar. Raises the HTTP errors both share: 400
     for a malformed symbol, 404 for one with no flow history at all, 409 when
     the session has no bar carrying both series yet.
+
+    ``date`` is the explicit ET trading day, passed straight through to both
+    series exactly as the dated read does elsewhere. It lives here rather than
+    in each endpoint so a dated history and a dated current-state read resolve
+    the same day by construction.
     """
     normalized = symbol.strip().upper()
     if not _FLOW_SYMBOL_PATTERN.match(normalized):
@@ -1661,8 +1827,14 @@ async def _classify_weather_session(symbol: str, session: str) -> tuple:
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    flow_rows = await _db().get_hedging_flow_series(symbol=normalized, session=session)
-    regime_rows = await _db().get_gamma_regime_series(symbol=normalized, session=session)
+    session_date = _parse_session_date(date)
+
+    flow_rows = await _db().get_hedging_flow_series(
+        symbol=normalized, session=session, session_date=session_date
+    )
+    regime_rows = await _db().get_gamma_regime_series(
+        symbol=normalized, session=session, session_date=session_date
+    )
     if flow_rows is None and regime_rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
 
@@ -1684,7 +1856,7 @@ async def _classify_weather_session(symbol: str, session: str) -> tuple:
             detail="no bar yet carries both hedging flow and gamma structure for this session",
         )
 
-    return normalized, paired, gw.classify_series([bar.inputs for bar in paired])
+    return normalized, session_date, paired, gw.classify_series([bar.inputs for bar in paired])
 
 
 @app.get(
@@ -1697,6 +1869,15 @@ async def _classify_weather_session(symbol: str, session: str) -> tuple:
 async def get_gamma_weather(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`, and "
+            "is passed straight through to the two series this reads, so a "
+            "dated weather read classifies that session's last common bar. "
+            "409 when neither series has a bar for the day."
+        ),
+    ),
 ):
     """The combined current-state read: Gamma Weather.
 
@@ -1724,7 +1905,9 @@ async def get_gamma_weather(
     five minutes. Returns 404 for an unknown symbol, and 409 when neither
     series has a bar yet for the resolved session.
     """
-    normalized, paired, series = await _classify_weather_session(symbol, session)
+    normalized, session_date, paired, series = await _classify_weather_session(
+        symbol, session, date
+    )
 
     def _f(value):
         return float(value) if value is not None else None
@@ -1741,7 +1924,7 @@ async def get_gamma_weather(
     return JSONResponse(
         content={
             "symbol": normalized,
-            "session": session,
+            "session": session_date.isoformat() if session_date else session,
             "bar_start": bar_start.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "state": weather.state,
             "label": weather.label,
@@ -1794,6 +1977,14 @@ async def get_gamma_weather(
 async def get_gamma_weather_series(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`, and "
+            "resolves through the same loader the current-state read uses, so a "
+            "dated history and a dated header describe the same session."
+        ),
+    ),
 ):
     """The session's Gamma Weather history, and the moments it said something new.
 
@@ -1813,7 +2004,9 @@ async def get_gamma_weather_series(
 
     Same 400 / 404 / 409 semantics as the current-state endpoint.
     """
-    normalized, paired, series = await _classify_weather_session(symbol, session)
+    normalized, session_date, paired, series = await _classify_weather_session(
+        symbol, session, date
+    )
 
     def _stamp(value):
         if value.tzinfo is None:
@@ -1825,7 +2018,7 @@ async def get_gamma_weather_series(
     return JSONResponse(
         content={
             "symbol": normalized,
-            "session": session,
+            "session": session_date.isoformat() if session_date else session,
             "confirm_bars": gw.CONFIRM_BARS,
             "bars": [
                 {
@@ -2003,6 +2196,7 @@ async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> Under
         in ("timestamp", "open", "high", "low", "close", "up_volume", "down_volume", "volume")
     }
     payload["symbol"] = futures_symbol
+    payload.update(_future_contract_fields(fut.get("future_symbol")))
 
     # ``session`` describes the MARKET, not the feed.
     #
@@ -2035,6 +2229,32 @@ def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
     if not future_symbol:
         return None
     return future_symbol.lstrip("@").upper() or None
+
+
+def _future_contract_fields(
+    future_symbol: Optional[str], at: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """``data_contract`` / ``data_contract_expiry`` for a continuous future.
+
+    The badge ticker is ambiguous by itself: ``@NQ`` is whichever contract the
+    continuous series has rolled to, and for the week between the roll and the
+    old contract's expiry two platforms both labelled "NQ" sit a quarter of
+    carry apart — on the Sep 2026 roll that was ~300 NQ points, which reads as
+    a broken feed rather than as two different contracts. Naming the contract
+    is what makes the number checkable.
+
+    ``at`` matters for a historical series: one spanning a roll genuinely
+    contains two contracts, so each row is labelled with the one in force at
+    its own timestamp rather than with today's.
+    """
+    from src.jobs.futures_projection import active_contract_code, active_contract_expiry
+
+    if not future_symbol:
+        return {}
+    return {
+        "data_contract": active_contract_code(future_symbol, at),
+        "data_contract_expiry": active_contract_expiry(at),
+    }
 
 
 if not _NYSE_HOLIDAYS:
@@ -2234,6 +2454,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
             if fut and fut.get("close") is not None:
                 data["display_source"] = "futures"
                 data["data_symbol"] = _future_display_label(fut.get("future_symbol"))
+                data.update(_future_contract_fields(fut.get("future_symbol")))
                 data["futures_close"] = fut.get("close")
                 data["futures_reference_close"] = fut.get("reference_close")
 
@@ -2350,7 +2571,17 @@ async def get_historical_quotes(
             fut_rows = await _db().get_historical_futures(
                 futures_index, start_dt, end_dt, window_units, timeframe
             )
-            return [UnderlyingQuote(**{**row, "symbol": label}) for row in fut_rows]
+            native_future = resolve_index_future(futures_index)
+            return [
+                UnderlyingQuote(
+                    **{
+                        **row,
+                        "symbol": label,
+                        **_future_contract_fields(native_future, row.get("timestamp")),
+                    }
+                )
+                for row in fut_rows
+            ]
 
         # Index→future DISPLAY swap for the candlestick series — ONLY when the
         # caller opts in via allow_futures (the candle chart). Read-only from
@@ -2361,9 +2592,17 @@ async def get_historical_quotes(
                 symbol, start_dt, end_dt, window_units, timeframe
             )
             if fut_rows:
-                label = _future_display_label(resolve_index_future(symbol))
+                swap_future = resolve_index_future(symbol)
+                label = _future_display_label(swap_future)
                 return [
-                    UnderlyingQuote(**{**row, "display_source": "futures", "data_symbol": label})
+                    UnderlyingQuote(
+                        **{
+                            **row,
+                            "display_source": "futures",
+                            "data_symbol": label,
+                            **_future_contract_fields(swap_future, row.get("timestamp")),
+                        }
+                    )
                     for row in fut_rows
                 ]
 

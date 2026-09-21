@@ -79,8 +79,27 @@ def _et_day_to_utc_bounds(day: date) -> tuple[datetime, datetime]:
     return start_et.astimezone(ZoneInfo("UTC")), end_et.astimezone(ZoneInfo("UTC"))
 
 
+# Words `.title()` gets wrong. These labels are read by subscribers on the
+# public scorecard AND posted verbatim in the 4:15 PM ET recap, where "Eod
+# Pressure" and "Zero Dte Position Imbalance" read as a typo in our own
+# product's vocabulary.
+_LABEL_OVERRIDES = {
+    "eod": "EOD",
+    "dte": "DTE",
+    "gex": "GEX",
+    "vwap": "VWAP",
+    "msi": "MSI",
+    "zero": "0",
+}
+
+
 def _humanize_signal_name(name: str) -> str:
-    return name.replace("_", " ").title()
+    """``zero_dte_position_imbalance`` -> ``0DTE Position Imbalance``."""
+    words = [_LABEL_OVERRIDES.get(w, w.title()) for w in name.split("_")]
+    # "0" + "DTE" is one token, not two.
+    if len(words) >= 2 and words[0] == "0" and words[1] == "DTE":
+        words[:2] = ["0DTE"]
+    return " ".join(words)
 
 
 def _label_regime(reg: dict[str, Any] | None) -> str:
@@ -128,6 +147,12 @@ async def get_daily_scorecard(
     - ``date`` — YYYY-MM-DD; defaults to today in America/New_York.
     - ``symbol`` — underlying (default ``SPY``).
     - ``horizon_minutes`` — forward window for ``realized_return`` (5–240, default 60).
+      The forward price is bounded to the same regular session: a flip within
+      this many minutes of the close counts in ``flips`` but not in ``scored``,
+      and contributes nothing to ``avg_directional_return``. Grading it against
+      an after-hours print (or, on a Friday, the next Monday's open) is what
+      made ``eod_pressure`` — which can only fire in the last 90 minutes —
+      report a meaningless number for every session.
 
     **Returns:**
     ```json
@@ -234,3 +259,89 @@ async def get_daily_scorecard(
         "tweet_text": tweet_text,
         "is_empty": is_empty,
     }
+
+
+@router.get("/signal-record")
+async def get_signal_trailing_record(
+    symbol: str = Query(default="SPY", max_length=10),
+    sessions: int = Query(default=30, ge=2, le=120),
+    horizon_minutes: int = Query(default=60, ge=5, le=240),
+    signal: str | None = Query(
+        default=None,
+        description="Single signal name; omit for every Basic + Advanced signal.",
+    ),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Per-signal flip record over the last ``sessions`` trading days.
+
+    The daily scorecard is one calendar day, which cannot answer "is this
+    signal any good" — the question a subscriber actually asks after a signal
+    calls one session correctly. This is the same flip definition and the same
+    session-bounded forward return, aggregated over a window.
+
+    **Params:**
+    - ``symbol`` — underlying (default ``SPY``).
+    - ``sessions`` — trailing weekdays to cover (2–120, default 30).
+    - ``horizon_minutes`` — forward window (5–240, default 60).
+    - ``signal`` — one signal name; omit for all of them.
+
+    **Returns:** ``signals[]`` with ``flips``, ``scored``, ``wins``,
+    ``losses``, ``win_rate`` and ``avg_directional_return`` per name.
+
+    ``scored`` can be lower than ``flips``, and ``win_rate`` is ``null`` when
+    nothing was scorable. A signal that only fires near the close
+    (``eod_pressure``) can have many flips and few scorable ones; that is the
+    honest shape of the measurement, not a defect to paper over.
+    """
+    sym = symbol.upper()
+    if signal is not None and signal not in ALL_SIGNAL_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown signal '{signal}'.",
+        )
+    names = [signal] if signal else list(ALL_SIGNAL_NAMES)
+    payload = await db.get_signal_trailing_record(
+        symbol=sym,
+        signal_names=names,
+        sessions=sessions,
+        horizon_minutes=horizon_minutes,
+    )
+    for row in payload.get("signals", []):
+        row["label"] = _humanize_signal_name(row["name"])
+    payload["is_empty"] = not payload.get("signals")
+    return payload
+
+
+@router.get("/sessions")
+async def list_scorecard_sessions(
+    symbol: str = Query(default="SPY", max_length=10),
+    limit: int = Query(default=60, ge=1, le=365),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Recent trading days that have a scorecard, newest first.
+
+    Backs the /scorecard landing page. Mirrors the ``/api/replay/sessions``
+    and ``/api/forecast/available-dates`` contract — ``{symbol, count,
+    sessions: []}`` with enough per-date metadata (Playbook call count and the
+    labeled closing regime) that a card renders without a fetch per day.
+
+    Empty ``sessions`` means the engine has never written for that symbol, not
+    an error.
+    """
+    sym = symbol.upper()
+    rows = await db.list_scorecard_sessions(sym, limit=limit)
+
+    def _shape(r: dict[str, Any]) -> dict[str, Any]:
+        # A row carrying neither field has no regime to label. Passing the
+        # empty dict through would read as "transition" — a real regime —
+        # rather than "unknown", so the absence is preserved explicitly.
+        has_regime = r.get("direction") is not None or r.get("composite_score") is not None
+        raw = r["date"]
+        return {
+            "date": raw.isoformat() if isinstance(raw, date) else raw,
+            "cards": r["cards"],
+            "regime": _label_regime(r if has_regime else None),
+            "composite_score": r.get("composite_score"),
+        }
+
+    return {"symbol": sym, "count": len(rows), "sessions": [_shape(r) for r in rows]}

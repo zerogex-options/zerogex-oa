@@ -360,7 +360,8 @@ upstream can change.
 | `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
 | `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
-| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
+| `cone_cycle` | `/api/cone/session/*`, `/api/cone/latest` | 15 min (09:45–15:30 ET only) | — | — |
+| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/cone/reliability`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
 
 A dash means no update is expected, which surfaces as
@@ -583,6 +584,8 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   "as_of": "2026-07-06T19:30:00Z",
   "age_seconds": 42,
   "computed_at": "2026-07-06T19:30:45Z",
+  "data_as_of": "2026-07-06T19:30:41Z",
+  "computed_at": "2026-07-06T19:30:45Z",
   "net_gex_at_spot": -1200000000.0,
   "levels": {
     "gamma_flip": 675.0,
@@ -617,18 +620,36 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
 - `pin_score` (raw max pin score = restoring gamma × reachability) and
   `pin_confidence` (its dominance over all viable pins, `0..1`) are top-level
   scalar metadata a client can use to classify pin strength; both `null` when
-  there is no active pin.
+  there is no active pin. `pin_confidence` is
+  `winning_score / Σ(all positive candidate scores)` over every listed strike
+  within ±2.5 expected moves of spot, same-day expiration only — the buckets
+  the ZeroGEX UI renders are `>= 0.50` Strong, `>= 0.33` Moderate, else Weak.
+  **It measures dominance, not magnitude**, so a strike carrying several times
+  its neighbors' gamma can still score low: the kernel spreads that gamma
+  across the neighboring strikes, and each of those is itself a candidate in
+  the denominator. Two consequences worth handling if you classify your own:
+  the value is per-snapshot with no time smoothing (it can flicker on a
+  near-tie), and the candidate band narrows as `τ → 0`, so the same book reads
+  more confident late in the session than early. See the
+  [Pin Strike](https://zerogex.io/help/platform/pin-strike) methodology page.
 - `profile` is ascending by strike (histogram order). `net_gex` is dollar
   gamma per 1% move, calls positive / puts negative, and
   `net_gex == call_gex + put_gex` by construction.
 - `computed_at` is when the analytics engine last wrote the snapshot (server
-  clock; `null` on rows that predate the column). `as_of` is the chain bucket
-  the numbers were computed *from*; `computed_at` is when they were
-  *produced*. They differ by the engine cycle's phase within the minute plus
-  its own duration (26–59s measured in production), and a sub-minute cadence
-  rewrites the same minute row, so `computed_at` is the one field that
-  changes on a rewrite. Freshness (`age_seconds`, v2 `source_timestamp`)
-  stays measured from `as_of`; v2 `generated_at` reports `computed_at`.
+  clock; null on rows that predate the column). `as_of` is the minute bucket
+  the numbers are filed under; `computed_at` is when they were *produced*.
+  A sub-minute cadence rewrites the same minute row, so `computed_at` is the
+  one field that changes on a rewrite. v2 `generated_at` reports it.
+- `data_as_of` is what the numbers are actually *as of*: the newest quote
+  write the engine read for this snapshot (null on rows that predate the
+  column). A minute bucket is already up to a minute old when the cycle reads
+  it, so measuring staleness from `as_of` overstated every snapshot's age by
+  the cycle's phase in the minute — 26–59s measured in production while the
+  quotes inside were under 5s old. **`age_seconds` and the v2
+  `source_timestamp` / `freshness_status` are measured from `data_as_of`
+  when present**, and from `as_of` only on rows that predate it. Consumers
+  that display `age_seconds` (the NinjaTrader and Sierra Chart studies)
+  therefore read lower, and truer, with no change on their side.
 - `as_of` / `age_seconds` describe snapshot freshness — see *Data
   freshness & update cadence* above.
 
@@ -914,6 +935,183 @@ when no option is trading, so the last snapshot before the close is the
 correct answer all evening. `/api/market/quote` sits beside them on the wider
 04:00–20:00 tape window and will still be updating; that difference is real,
 not an inconsistency.
+
+---
+
+## Spread Monitor (quoted spreads & liquidity) — Beta
+
+Scope: `market_raw` — **internal BFF only, not redistributable.** Excluded
+from the `analytics` tier issued to external customers, for the same reason
+`/api/gex/premium_surface` is.
+
+Nothing here is per-contract: every figure is a median or a p90 over a
+population of contracts, and a median does not invert to the values behind
+it. But the *caller* chooses the population — `moneyness_band_pct` goes down
+to `0.25`, `dte_max` to `0`, and each bucket reports its own
+`tradable_count`. Narrow a bucket to a single contract and the quote falls
+out by arithmetic:
+
+```
+median_spread              = ask - bid
+median_relative_spread_pct = 200 * (ask - bid) / (ask + bid)
+=> ask + bid = 200 * median_spread / median_relative_spread_pct
+=> bid and ask, for a contract the same response identifies by expiration,
+   strike band and option type.
+```
+
+There is no field to redact that closes that, so the gate is on the route.
+See the `scopes.py` docstring for where the MARKET_RAW line is drawn and why.
+
+Three measures, each answering a different question:
+
+| Field | Question it answers |
+| --- | --- |
+| `median_relative_spread_pct` | How much of the premium does crossing cost? `100 * (ask - bid) / mid`. The headline. |
+| `median_spread_bps_underlying` | Is this symbol worse than that one? `10000 * (ask - bid) / spot` — the only cross-symbol comparable measure, since SPX near 6,800 and NDX near 25,000 are not on one dollar scale. |
+| `zero_bid_pct` | What share of the chain has no market at all? Contracts quoted with an offer and no bid have no width by construction; they are excluded from every median and counted here instead. |
+
+**Quoted, not effective.** Every response carries a `disclosure` saying so.
+This measures the width market makers are showing, not what trades filled
+at, and the feed carries no sizes — a tight quote for one contract and a
+tight quote for a thousand are indistinguishable here.
+
+**Futures are refused, not projected.** ES / NQ carry no option chain of
+their own (their surfaces are SPX / NDX levels carried onto the futures
+price axis), so `symbol=ES` answers 400. Scaling an SPX quote by the futures
+basis would invent a width nobody published.
+
+### GET /api/market/spreads
+Current quoted width and liquidity across one symbol's near-dated chain,
+split into calls, puts and the blended chain, plus the curve across strike
+distance and a per-expiration breakdown.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `dte_max` (optional): `0`–`90`, default from `SPREAD_STATS_DTE_MAX` (7)
+- `moneyness_band_pct` (optional): `0.25`–`25`, default from `SPREAD_STATS_MONEYNESS_BAND_PCT` (5) — half-width of the strike band around spot
+- `history_days` (optional): `0`–`180`, default `60`; trailing sessions to rank today's reading against, `0` to skip
+
+`history` is null when the `daily_spread_stats` rollup has nothing
+comparable to rank against — a fresh deployment, rows measured under a
+different scope, or sessions whose anchor snapshot was too thin to be a
+measurement (below `SPREAD_STATS_MIN_CONTRACTS`, default 100; an ingestion
+outage is not a quiet market). "No comparison available" and "an ordinary
+day" are deliberately distinguishable.
+
+That includes the scope **you** asked for. The rollup writes one scope per
+session (`SPREAD_STATS_DTE_MAX` / `SPREAD_STATS_MONEYNESS_BAND_PCT`), so any
+other `dte_max` / `moneyness_band_pct` measures a population with no history
+behind it: the widths come back at the scope requested and the ranking is
+withheld rather than computed across two populations. `dte_max=0` is the case
+that matters — the 0DTE book is structurally the widest of the year, and
+ranking it against a through-7DTE window would report the widest 5% of
+sessions every session. For a ranked reading at another scope use
+`/api/market/spreads/surface`, whose rollup is stored per scope and per
+half-hour of the session.
+
+### GET /api/market/spreads/series
+How today's widths moved through the session, one reading per bucket taken
+at the last chain snapshot inside it. Calls and puts are returned
+separately; no blended row is computed, because the divergence between the
+two is the point.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `session` (optional): `current` or `prior`, default `current`
+- `bucket_minutes` (optional): `1`–`60`, default `15`
+- `dte_max`, `moneyness_band_pct`: as above
+
+### GET /api/market/spreads/compare
+The same reading side by side across symbols. A symbol whose chain cannot be
+read comes back with `unavailable` set rather than being dropped (which
+would read as "not compared") or zeroed (which would read as "perfectly
+tight").
+
+**Parameters:**
+- `symbols` (optional): comma-separated, max 8, default `SPX,NDX,SPY,QQQ`
+- `dte_max`, `moneyness_band_pct`, `history_days`: as above
+
+`puts_percentile` obeys the same scope rule as `history` above: null unless
+the requested scope is one the rollup stored.
+
+### GET /api/market/spreads/history
+Trailing daily quoted-width history from the `daily_spread_stats` rollup —
+what turns "spreads are 6.2% wide" into "spreads are wider than they have
+been all quarter". Rows are oldest first.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `option_type` (optional): `C`, `P` or `A` (blended), default `P`
+- `days` (optional): `1`–`180`, default `60`
+
+An empty `rows` list is a normal answer where neither the analytics writer
+nor `make daily-spread-stats-backfill` has run yet — not an error.
+
+### GET /api/market/spreads/surface
+Today's quoted width across the strike surface, ranked against the same
+symbol's own history **in the same strike band at the same time of day**.
+Answers the questions a width alone cannot: is this unusual, where across
+the strikes, and how much of the chain has no market at all. That last one
+matters because "untradeable" usually means a contract with NO bid rather
+than a wide one — and a no-bid contract has no width, so it is excluded from
+every median by construction. A chain can read TIGHTER as its wings die, and
+only `two_sided_percentile` will say so.
+
+One side of the book per call. Puts and calls are never blended, because the
+reading the view exists for — "the puts went wide and the calls did not" —
+is only visible against a side that has not moved.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `option_type` (optional): `C` or `P`, default `P`
+- `dte_max` (optional): one of `0`, `1`, `7`, `30`, default `0` — cumulative
+- `moneyness_band_pct` (optional): one of `2`, `5`, `10`, default `5`
+- `history_days` (optional): `5`–`365`, default from `SPREAD_SURFACE_HISTORY_DAYS` (60)
+
+`dte_max` and `moneyness_band_pct` are enumerated rather than free, and an
+off-list value is a 400 rather than a best effort. History is stored per
+scope, so a scope nobody measured has no population to rank against — and
+ranking against the nearest one that does exist is how a ±3% reading gets
+called extreme because ±5% happens to be wider.
+
+**Response:**
+
+| Field | What it carries |
+| --- | --- |
+| `summary` | The headline strip: `current_pct`, `normal_pct` (the median of the matched sessions), `vs_normal`, `percentile`, `two_sided_pct`, `two_sided_normal_pct`, `two_sided_percentile`, `contract_count`, `sessions`. The two coverage baselines rank the same way the width does, over the same matched window and the same `SPREAD_SURFACE_MIN_SESSIONS` floor — but **high is good**: it is the share of the chain with a real two-sided market. Render it with the tone inverted, or the best-covered session of the quarter reads as an alarm. |
+| `baseline` | What the comparison was actually made against: `sessions`, `earliest_date`, `latest_date`, `time_matched`, `time_bucket_label` (e.g. `15:30-16:00 ET`), `fell_back_to_last_bucket`, `min_sessions`. |
+| `curve` | One entry per moneyness slice: `current_pct`, `historical_median_pct`, `historical_p25_pct`, `historical_p75_pct`, `percentile`, `vs_normal`, `sessions`. |
+| `by_dte` | One entry per disjoint expiry bucket (`t0`, `t1`, `t2_3`, `t4_7`, `t8_30`) with its `percentile` and `insufficient_history`. Buckets are measured in **trading sessions**, not calendar days — from a Friday, `t1` is the Monday expiry. The cumulative `dte_max` universes above stay in calendar days, which is why the two are not the same axis. The keys were `b*` on calendar days before 2026-09-18; the stored rows under those keys describe a different population and are no longer read, so a deployment needs `make spread-surface-backfill` to seed the new series. |
+
+**Time-of-day matched.** Spreads have a strong intraday shape — the open and
+the close are structurally wider than midday — so a 15:40 reading ranked
+against whole prior sessions would look anomalous purely because of the
+clock. History is stored in 30-minute buckets
+(`SPREAD_SURFACE_BUCKET_MINUTES`) and matched as an equality, and
+`baseline.time_bucket_label` names the bucket used. Outside the cash session
+the comparison clamps to the session's last bucket and
+`fell_back_to_last_bucket` says so.
+
+**Every refusal is explicit.** `percentile` is `null` below
+`SPREAD_SURFACE_MIN_SESSIONS` (default 8) comparable sessions rather than
+computed from a handful of days, and `by_dte[].insufficient_history` marks
+the buckets that could not be ranked. `baseline.sessions` and the date range
+beside it describe the SAME population, so a thin scope reports `0` sessions
+and null dates rather than a months-long range the comparison never used. A
+slice with a current reading but no stored history returns its `current_pct`
+with null baseline fields — a gap, to be rendered as a gap.
+
+Today's own rollup row is excluded from its own window; otherwise the
+reading would drag its baseline toward itself on exactly the day it matters.
+
+The current half of the response is reduced from the live chain through the
+same `spread_stats` functions that wrote every stored row, so "current" here
+is the same number `/api/market/spreads` reports for the same scope. There
+is deliberately no second definition of a spread in this feature.
+
+Seed the history with `make spread-surface-backfill` (`SURFACE_SYMBOLS=`,
+`SURFACE_DAYS=`); the analytics writer extends it each cycle during the cash
+session. An all-null `baseline` on a fresh deployment is a normal answer.
 
 ---
 

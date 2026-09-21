@@ -355,3 +355,57 @@ def test_http_series_with_no_shared_bar_is_409(monkeypatch: pytest.MonkeyPatch):
     with TestClient(app) as client:
         _attach(mainmod, flow, [])
         assert client.get("/api/gex/weather-series?symbol=SPY").status_code == 409
+
+
+# --------------------------------------------------------------------------- #
+# The dated read, through the shared loader.
+# --------------------------------------------------------------------------- #
+
+
+def test_http_a_dated_read_reaches_both_series(monkeypatch: pytest.MonkeyPatch):
+    """The ?date= selector was written straight into the current-state
+    endpoint and now runs through the shared loader instead. If it stopped
+    reaching the accessors, a dated permalink would quietly serve today."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(8, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather?symbol=SPY&date=2026-04-24").json()
+        flow_call = mainmod.db_manager.get_hedging_flow_series.await_args
+        regime_call = mainmod.db_manager.get_gamma_regime_series.await_args
+
+    assert flow_call.kwargs["session_date"].isoformat() == "2026-04-24"
+    assert regime_call.kwargs["session_date"].isoformat() == "2026-04-24"
+    assert payload["session"] == "2026-04-24"
+
+
+def test_http_a_dated_series_read_resolves_the_same_day(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A dated drawer and a dated header must describe one session. They share
+    the loader precisely so this cannot drift."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(8, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY&date=2026-04-24").json()
+        regime_call = mainmod.db_manager.get_gamma_regime_series.await_args
+
+    assert regime_call.kwargs["session_date"].isoformat() == "2026-04-24"
+    assert payload["session"] == "2026-04-24"
+
+
+def test_http_a_malformed_date_is_refused_on_both_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Falling back to the current session would serve today's read under
+    someone else's permalink."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(8, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        assert client.get("/api/gex/weather?symbol=SPY&date=nonsense").status_code == 400
+        assert client.get("/api/gex/weather-series?symbol=SPY&date=nonsense").status_code == 400

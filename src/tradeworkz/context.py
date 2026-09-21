@@ -13,6 +13,7 @@ must handle it — a snapshot is best-effort, never partial-crash.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
@@ -233,6 +234,27 @@ class MarketSnapshot:
     put_panic_dominance: Optional[float] = None
     put_panic_baseline: Optional[float] = None
 
+    # ===================================================================
+    # Signals-engine reads (see _fetch_signal_state). These make the same
+    # inputs the playbook patterns gate on available to a bot, so a bot can
+    # implement a validated pattern's thesis by reading the SAME measured
+    # signal rather than re-deriving an approximation of it. Best-effort:
+    # empty when the signals engine has not written for this symbol, and a
+    # bot that needs one must fail closed rather than assume a default.
+    # ===================================================================
+
+    #: MSI composite (0-100) and regime label from ``signal_scores``.
+    msi_score: Optional[float] = None
+    msi_regime: Optional[str] = None
+    #: The MSI component payloads from ``signal_scores.components`` — each a
+    #: dict carrying at least ``score`` (a clamped [-1, +1] reading).
+    msi_components: Dict[str, Any] = field(default_factory=dict)
+    #: Basic + advanced component scores from ``signal_component_scores``,
+    #: keyed by component name. Each value carries ``clamped_score``
+    #: ([-1, +1]), ``score`` (the x100 form the playbook patterns compare
+    #: against) and ``context_values``.
+    signal_components: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # ---- Convenience derivations ---------------------------------------
 
     @property
@@ -391,6 +413,151 @@ class MarketSnapshot:
         ``round(price)``; on SPX's 5-point grid it snaps to a real strike.
         """
         return nearest_strike(price, self.effective_strike_increment())
+
+    # ---- Signals-engine accessors --------------------------------------
+
+    def component_score(self, name: str) -> Optional[float]:
+        """Signed component score on the playbook's 0-100 scale.
+
+        ``signal_component_scores`` persists ``clamped_score`` in [-1, +1];
+        the playbook's ``SignalSnapshot.score`` is that value x100, and the
+        patterns' thresholds (e.g. ``|score| >= 40``) are written against the
+        x100 form. Returning the same scale is what lets a bot use a
+        pattern's own calibrated threshold verbatim instead of a re-derived
+        one that would drift from it.
+        """
+        row = self.signal_components.get(name)
+        if not row:
+            return None
+        score = row.get("score")
+        if isinstance(score, (int, float)):
+            return float(score)
+        clamped = row.get("clamped_score")
+        return float(clamped) * 100.0 if isinstance(clamped, (int, float)) else None
+
+    def component_context(self, name: str) -> Dict[str, Any]:
+        """A component's ``context_values``, or an empty dict."""
+        row = self.signal_components.get(name) or {}
+        ctx = row.get("context_values")
+        return ctx if isinstance(ctx, dict) else {}
+
+    def component_triggered(self, name: str) -> bool:
+        """Whether a component reported itself triggered this tick."""
+        return bool(self.component_context(name).get("triggered", False))
+
+    def msi_component_score(self, name: str) -> Optional[float]:
+        """One MSI component's clamped [-1, +1] score, or None.
+
+        Kept on the clamped scale because that is what the patterns compare
+        against for MSI components (unlike ``component_score`` above, which
+        the patterns read x100) — the two scales are a property of the
+        playbook's own snapshot construction, and reproducing them exactly is
+        what keeps a bot's gate identical to the pattern's.
+        """
+        comp = self.msi_components.get(name) if self.msi_components else None
+        if not isinstance(comp, dict):
+            return None
+        score = comp.get("score")
+        return float(score) if isinstance(score, (int, float)) else None
+
+
+def _fetch_signal_state(
+    conn: Any, underlying: str, as_of: Optional[datetime] = None
+) -> tuple[Optional[float], Optional[str], Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Latest MSI + per-component signal state for ``underlying`` — best-effort.
+
+    Returns ``(msi_score, msi_regime, msi_components, signal_components)``.
+
+    Two reads, both bounded by ``as_of`` so a replayed instant sees only what
+    the signals engine had written by then:
+
+    * ``signal_scores`` — the MSI composite, its regime label, and the
+      component payloads the playbook's MSI gates read.
+    * ``signal_component_scores`` — one row per basic/advanced component,
+      ``DISTINCT ON`` the freshest per name.
+
+    This is the bridge that lets a bot implement a *validated pattern's*
+    thesis honestly: the pattern gates on measured signal scores, so the bot
+    reads the same persisted numbers rather than re-deriving an approximation
+    that would drift from the thing that was actually validated.
+
+    Each read is isolated in its own SAVEPOINT, so a missing table or a
+    hiccup nulls these fields and never aborts the snapshot. Degrading to
+    empty is safe because every consumer must fail closed on a missing
+    component — see ``GexGradientDrift.open_criteria``.
+    """
+    msi_score: Optional[float] = None
+    msi_regime: Optional[str] = None
+    msi_components: Dict[str, Any] = {}
+    components: Dict[str, Dict[str, Any]] = {}
+
+    cur = conn.cursor()
+    try:
+        cur.execute("SAVEPOINT tw_msi")
+        cur.execute(
+            """
+            SELECT composite_score, direction, components
+            FROM signal_scores
+            WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (underlying, as_of),
+        )
+        row = cur.fetchone()
+        cur.execute("RELEASE SAVEPOINT tw_msi")
+        if row:
+            msi_score = _maybe_float(row[0])
+            msi_regime = row[1]
+            raw = row[2]
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    raw = {}
+            if isinstance(raw, dict):
+                msi_components = raw
+    except Exception:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT tw_msi")
+        except Exception:
+            pass
+
+    try:
+        cur.execute("SAVEPOINT tw_components")
+        cur.execute(
+            """
+            SELECT DISTINCT ON (component_name)
+                   component_name, clamped_score, context_values
+            FROM signal_component_scores
+            WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
+            ORDER BY component_name, timestamp DESC
+            """,
+            (underlying, as_of),
+        )
+        rows = cur.fetchall()
+        cur.execute("RELEASE SAVEPOINT tw_components")
+        for name, clamped, ctx_vals in rows or []:
+            if isinstance(ctx_vals, str):
+                try:
+                    ctx_vals = json.loads(ctx_vals)
+                except json.JSONDecodeError:
+                    ctx_vals = {}
+            clamped_f = _maybe_float(clamped)
+            components[name] = {
+                "clamped_score": clamped_f,
+                # The x100 form the playbook's SignalSnapshot.score carries,
+                # so a bot can reuse a pattern's threshold verbatim.
+                "score": None if clamped_f is None else clamped_f * 100.0,
+                "context_values": ctx_vals if isinstance(ctx_vals, dict) else {},
+            }
+    except Exception:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT tw_components")
+        except Exception:
+            pass
+
+    return msi_score, msi_regime, msi_components, components
 
 
 def _fetch_trade_bias(
@@ -632,6 +799,9 @@ def build_snapshot(
     # Fused directional trade-bias (best-effort; isolated so a missing/empty
     # trade_bias_scores never aborts the snapshot build).
     bias_code, bias_trend, bias_conf = _fetch_trade_bias(conn, underlying, as_of)
+    msi_score, msi_regime, msi_components, signal_components = _fetch_signal_state(
+        conn, underlying, as_of
+    )
 
     # ---- Edge metrics (best-effort; each isolated in its own SAVEPOINT, so
     # a missing table or thin history nulls only its own fields). These are
@@ -705,6 +875,11 @@ def build_snapshot(
         trade_bias_code=bias_code,
         trade_bias_trend=bias_trend,
         trade_bias_confidence=bias_conf,
+        # -- Signals-engine state --
+        msi_score=msi_score,
+        msi_regime=msi_regime,
+        msi_components=msi_components,
+        signal_components=signal_components,
         # -- Edge metrics --
         pin_strike=_maybe_float(gx[10]),
         pin_score=_maybe_float(gx[11]),

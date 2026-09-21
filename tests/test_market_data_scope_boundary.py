@@ -49,7 +49,22 @@ RAW_QUOTE_FIELDS = frozenset({"bid", "ask", "last", "mid", "bid_price", "ask_pri
 # reaching the caller, not the label on it.
 DERIVED_QUOTE_FIELDS = frozenset({"premium"})
 
-QUOTE_FIELDS = RAW_QUOTE_FIELDS | DERIVED_QUOTE_FIELDS
+# Quote WIDTHS. These are aggregates — a median over a population of
+# contracts — and a median does not invert to the values behind it. They are
+# listed anyway, because the caller chooses the population: /api/market/spreads
+# takes moneyness_band_pct down to 0.25 and dte_max to 0, and reports
+# tradable_count per bucket. Narrowed to a single contract,
+# ``median_spread`` is ask-bid and ``median_relative_spread_pct`` is
+# 200*(ask-bid)/(ask+bid) — two equations, two unknowns, and the response
+# names the expiration, strike band and option type they belong to.
+#
+# So "it is only an aggregate" is not on its own a reason to sit outside
+# MARKET_RAW, and this set is where that gets enforced rather than argued.
+AGGREGATE_QUOTE_FIELDS = frozenset(
+    {"median_spread", "median_relative_spread_pct", "p90_relative_spread_pct"}
+)
+
+QUOTE_FIELDS = RAW_QUOTE_FIELDS | DERIVED_QUOTE_FIELDS | AGGREGATE_QUOTE_FIELDS
 
 
 class _Endpoint(typing.NamedTuple):

@@ -562,6 +562,88 @@ PIN_STRIKE_MIN_SCORE = _getenv_float("PIN_STRIKE_MIN_SCORE", 0.0, min=0.0)
 # ±1% band the daily_atm_iv anchor already uses.
 PIN_STRIKE_ATM_IV_BAND_PCT = _getenv_float("PIN_STRIKE_ATM_IV_BAND_PCT", 0.01, min=0.001, max=0.1)
 
+# =============================================================================
+# Spread Monitor — quoted-spread / liquidity rollup scope
+# =============================================================================
+# The daily_spread_stats rollup exists to answer a COMPARATIVE question ("are
+# spreads wider than usual?"), so the population it measures has to be the
+# same population every day.  These two constants pin that scope, and the
+# values are written into every row (daily_spread_stats.dte_max /
+# .moneyness_band_pct) so a later change starts a fresh comparable series
+# rather than silently poisoning the trailing percentile.
+#
+# The defaults deliberately match where the complaint lives: near-dated
+# contracts within a few percent of spot, which is what a 0DTE/1DTE index
+# trader is actually quoted in.  Widening the band would pull in far wings
+# whose quotes are structurally wide on the calmest day and would drown out
+# the change the page is built to show.
+SPREAD_STATS_DTE_MAX = _getenv_int("SPREAD_STATS_DTE_MAX", 7, min=0, max=365)
+SPREAD_STATS_MONEYNESS_BAND_PCT = _getenv_float(
+    "SPREAD_STATS_MONEYNESS_BAND_PCT", 5.0, min=0.25, max=50.0
+)
+
+# Minimum contracts in scope before a session is recorded at all.
+#
+# A median over 21 contracts and a median over 684 are not the same
+# measurement, but stored side by side in daily_spread_stats they become
+# equal peers in the distribution every percentile is ranked against.
+# Observed in production: QQQ 2026-08-25 produced a 21-contract anchor
+# snapshot against a 570-700 norm — an ingestion outage, not a thin market.
+#
+# The floor is deliberately far below any legitimate session (the thinnest
+# real days here run 400+) rather than tuned close to the norm. Its job is
+# to reject outages, not to second-guess quiet days, and a threshold that
+# starts discarding real sessions would do more damage than the outage.
+# The same floor gates the read path, so rows written before it existed
+# cannot leak into a percentile either.
+SPREAD_STATS_MIN_CONTRACTS = _getenv_int(
+    "SPREAD_STATS_MIN_CONTRACTS", 100, min=0, max=100_000
+)
+
+# -----------------------------------------------------------------------------
+# Spread Surface vs History — the intraday surface rollup
+# -----------------------------------------------------------------------------
+# Width of the time-of-day bucket, in minutes. 0DTE quotes at 15:45 behave
+# nothing like 0DTE at 10:00, so the surface history is bucketed by clock time
+# and a reading is only ranked against prior sessions at the SAME time of day.
+# 30 minutes is a compromise: fine enough that the late-session widening does
+# not get averaged into the midday calm, coarse enough that a quarter of
+# history still leaves a dozen-plus observations in each bucket to rank against.
+SPREAD_SURFACE_BUCKET_MINUTES = _getenv_int(
+    "SPREAD_SURFACE_BUCKET_MINUTES", 30, min=5, max=390
+)
+
+# Minimum contracts before a surface cell is recorded or ranked.
+#
+# Deliberately far below SPREAD_STATS_MIN_CONTRACTS (100), and not a
+# relaxation of it: these populations are smaller BY CONSTRUCTION. The daily
+# floor guards a whole +/-5% / 7DTE chain, where 100 contracts means an
+# outage. A +/-2% 0DTE put population is about sixty contracts on SPX when
+# everything is healthy, and a single moneyness slice of it is a handful — so
+# the daily floor would reject the healthiest narrow-scope cells on the page.
+#
+# Two floors because the two are different questions: whether a whole band is
+# measurable at all, and whether one slice of it has enough contracts for a
+# median to mean anything. A slice below the floor renders as a GAP in the
+# curve; it is never interpolated across.
+SPREAD_SURFACE_MIN_CONTRACTS = _getenv_int(
+    "SPREAD_SURFACE_MIN_CONTRACTS", 20, min=1, max=100_000
+)
+SPREAD_SURFACE_MIN_BUCKET_CONTRACTS = _getenv_int(
+    "SPREAD_SURFACE_MIN_BUCKET_CONTRACTS", 5, min=1, max=100_000
+)
+
+# Trailing sessions the surface percentile ranks against, and the minimum
+# number of comparable ones before a percentile is published at all. Below the
+# minimum the UI says "insufficient history" rather than ranking a reading
+# against four days and calling the answer a percentile.
+SPREAD_SURFACE_HISTORY_DAYS = _getenv_int(
+    "SPREAD_SURFACE_HISTORY_DAYS", 60, min=5, max=365
+)
+SPREAD_SURFACE_MIN_SESSIONS = _getenv_int(
+    "SPREAD_SURFACE_MIN_SESSIONS", 8, min=2, max=200
+)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = _getenv_int("QUOTE_BATCH_SIZE", 100)  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = _getenv_int("OPTION_BATCH_SIZE", 100)
@@ -1809,6 +1891,29 @@ ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS = max(
     30, _getenv_int("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", 180)
 )
 ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35)
+
+# ---------------------------------------------------------------------------
+# Market data provider selection
+# ---------------------------------------------------------------------------
+# Which upstream vendor the ingestion layer reads from. Resolved by
+# ``src.ingestion.providers.get_provider``; see that package for the
+# interface a new vendor implements.
+#
+# Defaults to "tradestation" so an unset environment behaves exactly as it
+# did before the provider abstraction existed. Changing this is a
+# production cutover: stand the new feed up in parallel and diff its
+# analytics against the incumbent (``make feed-compare``) before flipping
+# it, per step 14 of docs/compliance/market-data-remediation-runbook.md.
+#
+# An unrecognised value is FATAL rather than a silent fallback -- a typo
+# that quietly kept reading the old feed would look like a successful
+# cutover.
+MARKET_DATA_PROVIDER = _getenv_str("MARKET_DATA_PROVIDER", "tradestation")
+
+# Provider used by the comparison harness as the CANDIDATE feed, run
+# alongside MARKET_DATA_PROVIDER (the incumbent). Empty disables the
+# harness. Never read by the live ingestion path.
+MARKET_DATA_COMPARE_PROVIDER = _getenv_str("MARKET_DATA_COMPARE_PROVIDER", "")
 
 # TradeStation credential variables (used by service startup and helper scripts).
 TRADESTATION_CLIENT_ID = os.getenv("TRADESTATION_CLIENT_ID")

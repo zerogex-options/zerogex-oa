@@ -35,6 +35,13 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel
 
+from src.analytics.main_engine import (
+    FLIP_REASON_BEYOND_MAX_DISTANCE,
+    FLIP_REASON_NO_PROFILE,
+    FLIP_REASON_ONE_SIDED,
+)
+from src.config import GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT
+
 from ..database import DatabaseManager
 from ..errors import handle_api_errors
 
@@ -85,6 +92,25 @@ class DealerLevels(BaseModel):
     """
 
     gamma_flip: Optional[float] = None
+    #: Why ``gamma_flip`` is absent, when it is: NULL whenever a flip was
+    #: published, otherwise one of NO_PROFILE / ONE_SIDED / EDGE_ONLY /
+    #: BEYOND_MAX_DISTANCE / BELOW_STRUCTURAL_FLOOR. A client that draws
+    #: nothing for a null flip can now say WHY it is drawing nothing --
+    #: three of those codes mean the chain was read correctly and the
+    #: level is simply not where a chart can show it.
+    gamma_flip_reason: Optional[str] = None
+    #: A short, ready-to-draw label for a client that has no room to
+    #: interpret ``gamma_flip_reason`` itself, e.g. ``Flip >8%\u2193``.
+    #: NULL whenever a flip was published.
+    #:
+    #: Derived HERE rather than in the client on purpose. The
+    #: NinjaTrader indicator is the hardest artifact in this system to
+    #: update -- it is compiled by hand on a tester's own machine from a
+    #: file sent by email -- so anything that can change (the 8%, which
+    #: is GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT, or the wording) has to
+    #: ship from the server or it ships never. The client draws the
+    #: string and makes no decisions about it.
+    gamma_flip_label: Optional[str] = None
     call_wall: Optional[float] = None
     put_wall: Optional[float] = None
     max_pain: Optional[float] = None
@@ -110,6 +136,14 @@ class LevelsResponse(BaseModel):
     # one field that changes on a rewrite. Freshness stays measured from
     # ``as_of`` (see src/api/freshness.py); this is additive.
     computed_at: Optional[datetime] = None
+    # What the numbers are actually as of: the newest quote write the engine
+    # read for this snapshot. ``as_of`` is the minute bucket the snapshot is
+    # filed under, and a bucket is already up to a minute old when the cycle
+    # reads it, so measuring staleness from it overstated every snapshot's age
+    # by the cycle's phase in the minute (26-59s measured) while the quotes
+    # inside were under 5s old. ``age_seconds`` is measured from this when
+    # present, and from ``as_of`` on rows that predate the column.
+    data_as_of: Optional[datetime] = None
     net_gex_at_spot: Optional[float] = None
     levels: DealerLevels
     # Pin Strike metadata (scalars, not drawable lines): the raw maximum pin
@@ -119,6 +153,39 @@ class LevelsResponse(BaseModel):
     pin_confidence: Optional[float] = None
     pin_strike_reason: Optional[str] = None
     profile: List[StrikeGamma]
+
+
+def _flip_label(
+    reason: Optional[str],
+    raw: Optional[float],
+    spot: Optional[float],
+) -> Optional[str]:
+    """One short line for a client whose only alternative is an em dash.
+
+    ``reason`` is the stable enum; this is the disposable presentation of it.
+    Keeping them separate means the codes stay aggregatable in SQL while the
+    wording can be changed without a migration or a client rebuild.
+
+    Direction for the far-flip case comes from ``gamma_flip_raw``, the
+    un-gated nearest crossing on the same cycle: it sits on the same side of
+    spot as the crossing the distance gate rejected. When it is absent the
+    label drops the arrow rather than guessing a direction.
+    """
+    if not reason:
+        return None
+    if reason == FLIP_REASON_BEYOND_MAX_DISTANCE:
+        pct = f"{GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT * 100:g}"
+        if raw is not None and spot is not None and spot > 0:
+            return f"Flip >{pct}%" + ("\u2193" if raw < spot else "\u2191")
+        return f"Flip >{pct}% away"
+    if reason == FLIP_REASON_ONE_SIDED:
+        return "Flip out of range"
+    if reason == FLIP_REASON_NO_PROFILE:
+        return "Flip no data"
+    # EDGE_ONLY / BELOW_STRUCTURAL_FLOOR: a crossing exists but the engine will
+    # not stand behind it. "Unresolved" is the honest word and deliberately
+    # does not imply a fault, because there is not one.
+    return "Flip unresolved"
 
 
 def _maybe_float(value: object) -> Optional[float]:
@@ -187,7 +254,13 @@ async def get_levels(
     as_of = summary["timestamp"]
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
-    age_seconds = max(0, int((datetime.now(timezone.utc) - as_of).total_seconds()))
+    data_as_of = summary.get("data_as_of")
+    if data_as_of is not None and data_as_of.tzinfo is None:
+        data_as_of = data_as_of.replace(tzinfo=timezone.utc)
+    # Staleness is measured from the quotes, not from the bucket they are
+    # filed under (see LevelsResponse.data_as_of).
+    freshness_anchor = data_as_of if data_as_of is not None else as_of
+    age_seconds = max(0, int((datetime.now(timezone.utc) - freshness_anchor).total_seconds()))
 
     return LevelsResponse(
         symbol=sym,
@@ -195,9 +268,16 @@ async def get_levels(
         as_of=as_of,
         age_seconds=age_seconds,
         computed_at=summary.get("computed_at"),
+        data_as_of=data_as_of,
         net_gex_at_spot=_maybe_float(summary.get("net_gex_at_spot")),
         levels=DealerLevels(
             gamma_flip=_maybe_float(summary.get("gamma_flip")),
+            gamma_flip_reason=summary.get("gamma_flip_reason"),
+            gamma_flip_label=_flip_label(
+                summary.get("gamma_flip_reason"),
+                _maybe_float(summary.get("gamma_flip_raw")),
+                _maybe_float(summary.get("spot_price")),
+            ),
             call_wall=_maybe_float(summary.get("call_wall")),
             put_wall=_maybe_float(summary.get("put_wall")),
             max_pain=_maybe_float(summary.get("max_pain")),

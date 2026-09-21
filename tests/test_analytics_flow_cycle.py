@@ -34,6 +34,7 @@ def _bare_engine() -> AnalyticsEngine:
     eng.db_symbol = "SPY"
     eng._refresh_flow_caches = MagicMock()
     eng._refresh_flow_series_snapshot = MagicMock()
+    eng._refresh_hedging_flow_snapshot = MagicMock()
     eng._refresh_gamma_regime_snapshot = MagicMock()
     return eng
 
@@ -283,9 +284,13 @@ def test_run_flow_cycle_anchor_uses_max_option_chains_timestamp():
 def test_run_flow_cycle_uses_dedicated_db_connection():
     """``_run_flow_cycle`` opens its own short-lived connection for the
     anchor lookup, then ``_refresh_flow_caches`` /
-    ``_refresh_flow_series_snapshot`` / ``_refresh_gamma_regime_snapshot``
-    each open their own. We don't hand a long-held connection across
-    stages — keeps pool pressure bounded if any stage stalls."""
+    ``_refresh_flow_series_snapshot`` / ``_refresh_hedging_flow_snapshot`` /
+    ``_refresh_gamma_regime_snapshot`` each open their own. We don't hand a
+    long-held connection across stages — keeps pool pressure bounded if any
+    stage stalls.
+
+    A new refresh stage that forgets to be mocked in ``_bare_engine`` shows
+    up here as an extra open, which is the point: this count is the contract."""
     eng = _bare_engine()
     anchor = datetime(2026, 6, 15, 19, 55, tzinfo=timezone.utc)
 
