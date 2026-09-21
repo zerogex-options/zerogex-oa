@@ -546,18 +546,40 @@ def _claim(**overrides):
 
 
 def _fake_grader_db(*, due=None, extremes=None, wrote=True):
+    """A STATEFUL stand-in: graded claims leave the pending queue.
+
+    The previous fixture returned a fixed page from every fetch, which is not
+    how the real query behaves and is why a truncating grader looked healthy
+    in tests while dropping a whole session in production.
+    """
+    pending = list(due if due is not None else [_claim()])
+
+    def _key(r):
+        return (r["symbol"], r["forecast_ts"], r["horizon_min"])
+
+    async def _fetch(now, limit=2000):
+        return [r for r in pending if r["target_ts"] <= now][:limit]
+
+    async def _write(**kw):
+        if not wrote:
+            return False
+        want = (kw["symbol"], kw["forecast_ts"], kw["horizon_min"])
+        for r in list(pending):
+            if _key(r) == want:
+                pending.remove(r)
+        return True
+
     db = type("FakeDB", (), {})()
     db.connect = AsyncMock(return_value=None)
     db.disconnect = AsyncMock(return_value=None)
-    db.get_matured_ungraded_cones = AsyncMock(
-        return_value=due if due is not None else [_claim()]
-    )
+    db.get_matured_ungraded_cones = AsyncMock(side_effect=_fetch)
     db.get_bar_extremes_between = AsyncMock(
         return_value=extremes
         if extremes is not None
         else {"window_low": Decimal("598.80"), "window_high": Decimal("601.40"), "bars": 30}
     )
-    db.update_intraday_cone_receipt = AsyncMock(return_value=wrote)
+    db.update_intraday_cone_receipt = AsyncMock(side_effect=_write)
+    db._pending = pending
     return db
 
 
@@ -674,6 +696,58 @@ async def test_one_bad_claim_does_not_abort_the_run(monkeypatch, caplog):
     # The healthy claim still got graded.
     assert fake.update_intraday_cone_receipt.await_count == 1
     assert "failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_grader_drains_a_backlog_larger_than_one_page(monkeypatch, caplog):
+    """The truncation that lost a whole session, three reports running.
+
+    The fetch orders oldest-first and caps at --limit, and the first version
+    graded exactly one page. A backlog above the cap therefore left the NEWEST
+    session ungraded — and since the calibration report requires a verdict,
+    that session vanished from the report entirely rather than showing up
+    short. The tell was a run logging "500 matured" against a limit of 500.
+    """
+    mod = _reload("intraday_cone_receipt")
+    backlog = [
+        _claim(minute=m % 60, horizon=h)
+        for m in range(0, 30)
+        for h in (30, 60, 90, 120)
+    ]
+    # Distinct keys so the stateful fixture can remove them independently.
+    for i, r in enumerate(backlog):
+        r["forecast_ts"] = datetime(2026, 9, 21, 9, 45, tzinfo=ET) + timedelta(minutes=i)
+        r["target_ts"] = r["forecast_ts"] + timedelta(minutes=r["horizon_min"])
+
+    fake = _fake_grader_db(due=backlog)
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_grader_args(mod, at="2026-09-22T12:00")) == 0
+
+    assert fake._pending == [], "every matured claim must be graded"
+    assert fake.get_matured_ungraded_cones.await_count > 1, "it must page"
+    assert "page(s)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_page_that_cannot_progress_stops_instead_of_spinning(monkeypatch):
+    """Rows waiting on bars come back on every fetch. Counting them as
+    progress would turn the cron into an infinite loop."""
+    mod = _reload("intraday_cone_receipt")
+    fake = _fake_grader_db()
+    fake.get_bar_extremes_between = AsyncMock(return_value=None)   # always pending
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_grader_args(mod)) == 0
+    assert fake.get_matured_ungraded_cones.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_always_errors_does_not_spin_the_loop(monkeypatch):
+    """An error is not a departure either — the row is still in the queue."""
+    mod = _reload("intraday_cone_receipt")
+    fake = _fake_grader_db(due=[_claim(band_low=None)])
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_grader_args(mod)) == 0
+    assert fake.get_matured_ungraded_cones.await_count == 1
 
 
 @pytest.mark.asyncio

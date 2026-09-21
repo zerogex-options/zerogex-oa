@@ -49,6 +49,11 @@ ET = ZoneInfo("America/New_York")
 #: the scoreboard without being deleted or, worse, silently counted as a win.
 ABANDON_AFTER = timedelta(days=3)
 
+#: Safety bound on the paging loop. At the default limit this covers ~1M
+#: claims, far past any real backlog, and exists only so a bug cannot turn a
+#: cron into an infinite loop.
+MAX_BATCHES = 500
+
 
 async def _grade_one(
     db: DatabaseManager, row: dict, now: datetime, dry_run: bool
@@ -131,32 +136,75 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        try:
-            due = await db.get_matured_ungraded_cones(now, limit=args.limit)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("intraday_cone_receipt: fetch failed (%s) — exiting 0", exc)
-            return 0
+        tally: dict[str, int] = {}
+        total = 0
+        batches = 0
 
-        if not due:
+        # Drain the backlog in pages rather than grading one page and stopping.
+        #
+        # The single-query version silently truncated. The fetch orders
+        # oldest-first and caps at --limit, so a backlog larger than the cap
+        # left the NEWEST session ungraded — and because the calibration report
+        # requires a verdict, that session simply vanished from every report.
+        # It took three rounds to spot, and the giveaway was a run logging
+        # "500 matured" against a limit of exactly 500.
+        while batches < MAX_BATCHES:
+            try:
+                due = await db.get_matured_ungraded_cones(now, limit=args.limit)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "intraday_cone_receipt: fetch failed (%s) — stopping", exc
+                )
+                break
+            if not due:
+                break
+
+            batches += 1
+            departed = 0
+            for row in due:
+                try:
+                    outcome = await _grade_one(db, row, now, args.dry_run)
+                except Exception as exc:  # noqa: BLE001 — one bad row is not a run
+                    logger.warning(
+                        "intraday_cone_receipt: grading %s %s +%sm failed: %s",
+                        row.get("symbol"), row.get("forecast_ts"),
+                        row.get("horizon_min"), exc,
+                    )
+                    outcome = "error"
+                tally[outcome] = tally.get(outcome, 0) + 1
+                # Only outcomes that actually LEFT the queue count as progress.
+                # "pending" is waiting on bars and "error" failed to write, so
+                # both come back on the next page — counting either as a
+                # departure would let a permanently bad row spin the loop.
+                if outcome in ("held", "broke", "abandoned", "already-graded"):
+                    departed += 1
+            total += len(due)
+
+            # A dry run never writes, so the same page would come back forever.
+            if args.dry_run:
+                break
+            # Nothing in this page left the queue: every row is waiting on
+            # bars or failing to write. Later pages are newer and no more
+            # likely to be ready, so stop rather than spin — the next
+            # scheduled run picks them up, and ABANDON_AFTER clears anything
+            # permanently stuck.
+            if departed == 0:
+                break
+
+        if total == 0:
             logger.info("intraday_cone_receipt: nothing matured to grade")
             return 0
 
-        tally: dict[str, int] = {}
-        for row in due:
-            try:
-                outcome = await _grade_one(db, row, now, args.dry_run)
-            except Exception as exc:  # noqa: BLE001 — one bad row is not a run
-                logger.warning(
-                    "intraday_cone_receipt: grading %s %s +%sm failed: %s",
-                    row.get("symbol"), row.get("forecast_ts"),
-                    row.get("horizon_min"), exc,
-                )
-                outcome = "error"
-            tally[outcome] = tally.get(outcome, 0) + 1
+        if batches >= MAX_BATCHES:
+            logger.warning(
+                "intraday_cone_receipt: stopped after %d pages of %d — a backlog "
+                "this large means claims are going ungraded; raise --limit",
+                batches, args.limit,
+            )
 
         logger.info(
-            "intraday_cone_receipt: %d matured — %s",
-            len(due),
+            "intraday_cone_receipt: %d matured across %d page(s) — %s",
+            total, batches,
             ", ".join(f"{k}={v}" for k, v in sorted(tally.items())) or "nothing written",
         )
         graded = tally.get("held", 0) + tally.get("broke", 0)
@@ -178,8 +226,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=int(os.environ.get("CONE_RECEIPT_LIMIT", "500")),
-        help="Maximum matured claims to grade in one run (default 500).",
+        default=int(os.environ.get("CONE_RECEIPT_LIMIT", "2000")),
+        help="Claims fetched per page; the run pages until drained (default 2000).",
     )
     parser.add_argument(
         "--at",
