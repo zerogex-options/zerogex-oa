@@ -131,6 +131,34 @@ DIURNAL_CLOSE_DECAY = 0.09   # ≈35 min e-folding
 # change in market character; its ablation says which knob still earns its
 # place.
 
+# ---------------------------------------------------------------------------
+# Known limitation: the anchor cannot see a regime change coming
+# ---------------------------------------------------------------------------
+# Over ten graded sessions the cone calibrates well in aggregate — per symbol
+# NDX -4.1, SPX -0.3, SPY -0.1, QQQ +2.3 points, roughly 824 claims each. That
+# average is carried by the quiet majority, and the error is concentrated
+# exactly where it would be expected to be.
+#
+# The vol anchor is the median of prior sessions' GRADED realized ratios. It
+# is by construction backward-looking, so on a day that breaks out of its
+# trailing range it is too low, the bands are too tight, and the published
+# probability is too high. Both such sessions in the history say the same
+# thing:
+#
+#   2026-09-16   vol_ratio 2.03-2.75   SPY -24.5   SPX -13.1   QQQ -22.9
+#   2026-09-21   vol_ratio 1.39-1.41   SPY -25.8   SPX -26.0   QQQ  -2.4
+#
+# Overconfidence is the dangerous direction — it says a level will hold when
+# it will not — and it lands on the days a reader is most likely to be acting.
+# It is not a bug to be fixed by tuning: no setting of a trailing median
+# anticipates a breakout. Closing it needs something that reacts WITHIN the
+# session, either a larger realized weight once the tape diverges from the
+# anchor, or explicit widening when it does.
+#
+# Deliberately not attempted on ten sessions with two active ones. Recorded
+# here so it is a known limitation rather than a discovery, and so the
+# reliability table is read as reporting it rather than hiding it.
+
 #: Half-width of the raw cone in horizon sigmas before gamma conditioning.
 #:
 #: Calibrated against the model's own output rather than assumed.  Note that
@@ -280,17 +308,32 @@ CONE_PATH_EXPONENT = 0.575
 #: |gap| 11.9 -> 4.4 pts, Brier 0.1806 -> 0.1699, with leave-one-out showing
 #: the exponent accounts for essentially all of it.
 #:
-#: The reading is microstructural. NDX is a cash index computed from a hundred
-#: constituents; QQQ is one liquid ETF. Their DAILY ranges match almost
-#: exactly (0.937 vs 0.924, 0.643 vs 0.659, and so on across nine sessions),
-#: but NDX's path covers that range with more sub-daily motion — so it earns
-#: no containment bonus over a driftless walk, while a single-instrument ETF
-#: does.
+#: The observation is solid: NDX and QQQ agree on DAILY range almost exactly
+#: (0.937 vs 0.924, 0.643 vs 0.659, and so on across nine sessions) and on the
+#: vol basis, yet NDX's path covers that range with more sub-daily motion, so
+#: it earns no containment bonus over a driftless walk.
 #:
-#: QQQ was run as a control and its own fit FAILED the holdout (4.8 -> 8.6),
-#: which is the result that makes this an override rather than a licence to
-#: fit every symbol separately. Add a symbol here only when its own holdout
-#: beats the shared value.
+#: The EXPLANATION first offered for it was wrong, and the record should say
+#: so. The guess was microstructural — a cash index computed from a hundred
+#: constituents against a single liquid ETF. SPX was then fitted as the test
+#: of that story, being a cash index built from five hundred, and it went the
+#: other way: on held-out sessions its leave-one-out reads
+#:
+#:   committed (0.575)            mean |gap| 0.9 pts    Brier 0.1631
+#:   path_exp -> 0.5 (Brownian)   mean |gap| 9.8 pts    Brier 0.1772
+#:
+#: Forcing NDX's value onto SPX costs nine points of calibration. So "cash
+#: index" is not the mechanism, and this is a one-off rather than the first
+#: instance of a rule. Whatever distinguishes NDX — index concentration, the
+#: strike grid, the quality of its bar data — remains unidentified. The
+#: override is justified by its own holdout, not by a story.
+#:
+#: Two controls now. QQQ's own fit FAILED its holdout (4.8 -> 8.6), and SPX's
+#: sweep landed back on the shared 0.575 with nothing in the grid beating it.
+#: Per-symbol fitting is therefore not finding noise wherever it looks, which
+#: is what makes this an override rather than a licence to fit every symbol
+#: separately. Add a symbol here only when its own holdout beats the shared
+#: value.
 CONE_PATH_EXPONENT_BY_SYMBOL: dict[str, float] = {
     "NDX": 0.50,
 }
