@@ -2419,6 +2419,260 @@ class SignalsQueriesMixin:
             )
             return []
 
+    # ------------------------------------------------------------------
+    # Intraday re-anchored cone (see src/jobs/intraday_cone_model.py)
+    # ------------------------------------------------------------------
+
+    async def insert_intraday_cone(
+        self, rows: List[Dict[str, Any]]
+    ) -> int:
+        """Commit one fire's horizon claims.
+
+        Idempotent per the same contract as the morning writer: the
+        (symbol, forecast_ts, horizon_min) primary key plus the immutability
+        trigger mean a re-run cannot restate a claim already on the record.
+        Returns the number of rows actually inserted — a re-run of an
+        already-committed fire returns 0, which is the caller's signal to log
+        "already committed" rather than to retry.
+
+        The whole fire goes in one transaction.  A half-written cone would
+        leave some horizons of one anchor committed and others not, and the
+        reliability table would then be sampling horizons rather than fires.
+        """
+        if not rows:
+            return 0
+        try:
+            async with self._acquire_connection() as conn:
+                async with conn.transaction():
+                    inserted = 0
+                    for r in rows:
+                        got = await conn.fetchrow(
+                            """
+                            INSERT INTO intraday_forecast (
+                                symbol, session_date, forecast_ts, horizon_min,
+                                target_ts, anchor_spot, band_low, band_high,
+                                hold_prob, sigma, call_wall, put_wall,
+                                gamma_flip, net_gex_at_spot, daily_sigma,
+                                gamma_mult, elapsed_min, model_version,
+                                content_hash
+                            )
+                            VALUES (
+                                $1, $2, $3, $4,
+                                $5, $6, $7, $8,
+                                $9, $10, $11, $12,
+                                $13, $14, $15,
+                                $16, $17, $18,
+                                $19
+                            )
+                            ON CONFLICT (symbol, forecast_ts, horizon_min)
+                            DO NOTHING
+                            RETURNING horizon_min
+                            """,
+                            r["symbol"], r["session_date"], r["forecast_ts"],
+                            r["horizon_min"], r["target_ts"], r["anchor_spot"],
+                            r["band_low"], r["band_high"], r.get("hold_prob"),
+                            r["sigma"], r.get("call_wall"), r.get("put_wall"),
+                            r.get("gamma_flip"), r.get("net_gex_at_spot"),
+                            r.get("daily_sigma"), r.get("gamma_mult"),
+                            r.get("elapsed_min"), r["model_version"],
+                            r["content_hash"],
+                        )
+                        if got is not None:
+                            inserted += 1
+                    return inserted
+        except Exception as exc:
+            logger.warning(
+                "insert_intraday_cone failed (%s, %s): %s",
+                rows[0].get("symbol"), rows[0].get("forecast_ts"), exc,
+            )
+            return 0
+
+    async def get_matured_ungraded_cones(
+        self, now: datetime, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """Claims whose horizon has elapsed but which carry no verdict yet.
+
+        Served by the partial index on ``target_ts WHERE graded_at IS NULL``,
+        so the grader's poll stays cheap however much history accumulates.
+        Oldest first, so a backlog drains in the order the claims were made.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, session_date, forecast_ts, horizon_min,
+                           target_ts, anchor_spot, band_low, band_high,
+                           hold_prob
+                    FROM intraday_forecast
+                    WHERE graded_at IS NULL AND target_ts <= $1
+                    ORDER BY target_ts ASC
+                    LIMIT $2
+                    """,
+                    now, limit,
+                )
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_matured_ungraded_cones failed: %s", exc)
+            return []
+
+    async def get_bar_extremes_between(
+        self, symbol: str, start_ts: datetime, end_ts: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """Low/high over the OPEN interval ``(start_ts, end_ts]``.
+
+        The exclusive left bound matters: the anchor bar is the bar the cone
+        was drawn from, spot sits inside its own band by construction, and
+        including it could only ever flatter the verdict.  Returns None when
+        no bar exists in the window so the grader withholds a verdict rather
+        than inventing a degenerate one from a gap in the tape.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT MIN(low) AS window_low,
+                           MAX(high) AS window_high,
+                           COUNT(*)  AS bars
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                      AND timestamp > $2
+                      AND timestamp <= $3
+                      AND low IS NOT NULL
+                      AND high IS NOT NULL
+                    """,
+                    symbol, start_ts, end_ts,
+                )
+            if row is None or not row["bars"]:
+                return None
+            return dict(row)
+        except Exception as exc:
+            logger.warning(
+                "get_bar_extremes_between(%s, %s, %s) failed: %s",
+                symbol, start_ts, end_ts, exc,
+            )
+            return None
+
+    async def update_intraday_cone_receipt(
+        self,
+        *,
+        symbol: str,
+        forecast_ts: datetime,
+        horizon_min: int,
+        graded_at: datetime,
+        window_low: Optional[float],
+        window_high: Optional[float],
+        held: Optional[bool],
+        brier: Optional[float],
+    ) -> bool:
+        """Write one verdict.  Write-once, enforced by the trigger.
+
+        The ``graded_at IS NULL`` guard makes a double-run a no-op at the
+        query level rather than an exception from the trigger, so a grader
+        re-run over an already-drained backlog is quiet instead of noisy.
+
+        ``held=None`` with ``graded_at`` set is the ABANDONED state — a claim
+        whose window never produced bars.  It is deliberately distinct from
+        both pending and graded: the reliability query requires
+        ``held IS NOT NULL``, so an abandoned claim leaves the scoreboard
+        without being deleted and without being counted as a win.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE intraday_forecast
+                       SET graded_at = $4,
+                           window_low = $5,
+                           window_high = $6,
+                           held = $7,
+                           brier = $8
+                     WHERE symbol = $1
+                       AND forecast_ts = $2
+                       AND horizon_min = $3
+                       AND graded_at IS NULL
+                    RETURNING horizon_min
+                    """,
+                    symbol, forecast_ts, horizon_min, graded_at,
+                    window_low, window_high, held, brier,
+                )
+            return row is not None
+        except Exception as exc:
+            logger.warning(
+                "update_intraday_cone_receipt failed (%s, %s, +%sm): %s",
+                symbol, forecast_ts, horizon_min, exc,
+            )
+            return False
+
+    async def get_intraday_cones_for_session(
+        self, symbol: str, session_date: date
+    ) -> List[Dict[str, Any]]:
+        """Every cone fired on one session, chronological.
+
+        This is what the chart draws: a session's worth of re-anchored bands,
+        each already carrying its verdict once the horizon matured.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, session_date, forecast_ts, horizon_min,
+                           target_ts, anchor_spot, band_low, band_high,
+                           hold_prob, sigma, call_wall, put_wall, gamma_flip,
+                           net_gex_at_spot, gamma_mult, elapsed_min,
+                           model_version, graded_at, window_low, window_high,
+                           held, brier
+                    FROM intraday_forecast
+                    WHERE symbol = $1 AND session_date = $2
+                    ORDER BY forecast_ts ASC, horizon_min ASC
+                    """,
+                    symbol, session_date,
+                )
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_intraday_cones_for_session(%s, %s) failed: %s",
+                symbol, session_date, exc,
+            )
+            return []
+
+    async def get_graded_cone_history(
+        self, symbol: str, since: date, horizon_min: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Graded claims since ``since`` — the reliability table's input.
+
+        Returns only what the receipt needs (the committed probability, the
+        outcome, the horizon and the session) rather than whole rows, because
+        a 30-session window across four horizons is ~2,400 rows per symbol and
+        the page recomputes the table on every request.
+        """
+        try:
+            params: List[Any] = [symbol, since]
+            clause = ""
+            if horizon_min is not None:
+                params.append(horizon_min)
+                clause = " AND horizon_min = $3"
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT session_date, forecast_ts, horizon_min,
+                           hold_prob, held, brier
+                    FROM intraday_forecast
+                    WHERE symbol = $1
+                      AND session_date >= $2
+                      AND graded_at IS NOT NULL
+                      AND hold_prob IS NOT NULL
+                      AND held IS NOT NULL{clause}
+                    ORDER BY session_date ASC, forecast_ts ASC
+                    """,
+                    *params,
+                )
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_graded_cone_history(%s, %s) failed: %s", symbol, since, exc,
+            )
+            return []
+
     async def get_iv_rank_30d(self, symbol: str) -> Optional[float]:
         """Compute the 30-day IV rank for ``symbol`` from ``daily_atm_iv``.
 
