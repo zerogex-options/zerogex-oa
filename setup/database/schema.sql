@@ -3403,6 +3403,124 @@ CREATE TRIGGER forecast_calibration_state_touch
     FOR EACH ROW
     EXECUTE FUNCTION touch_forecast_calibration_state();
 
+-- ============================================================================
+-- intraday_forecast (Phase 4: the re-anchored cone)
+-- ============================================================================
+-- ``daily_forecast`` commits one band before the open and grades it at 16:05.
+-- This table is its intraday counterpart: every 15 minutes from 09:45 to
+-- 15:30 ET the cone writer re-anchors on the current bar, re-reads the
+-- current dealer surface, and commits a band + hold probability for each
+-- horizon that can still complete before the bell.
+--
+-- GRAIN is one row per (symbol, forecast_ts, horizon_min) — one row, one
+-- falsifiable claim.  Horizons are NOT packed into a JSONB blob on a shared
+-- row: each is graded independently, and the reliability table buckets
+-- across horizons, so they need to be joinable and indexable individually.
+--
+-- The same immutability discipline as daily_forecast, for the same reason.
+-- A cone that re-forecasts intraday is exactly the kind of claim that would
+-- be trivial to quietly improve after the fact — nudge an 11:00 band at
+-- 12:30 once the tape has shown its hand and the track record becomes
+-- fiction.  The trigger below makes that impossible at the storage layer
+-- rather than by convention: committed columns are write-once, receipt
+-- columns are write-once, and NULL -> value is the only legal transition.
+--
+-- ``band_low``/``band_high``/``sigma`` are stored exactly as published, and
+-- ``hold_prob`` is computed from those rounded values (see
+-- intraday_cone_model.compute_cone), so anyone can recompute the published
+-- probability from the published band and reproduce it to the digit.
+
+CREATE TABLE IF NOT EXISTS intraday_forecast (
+    symbol          VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    session_date    DATE        NOT NULL,
+    forecast_ts     TIMESTAMPTZ NOT NULL,
+    horizon_min     SMALLINT    NOT NULL,
+    -- When this claim matures.  Stored rather than derived so a grader can
+    -- find due rows with an index scan instead of recomputing every row.
+    target_ts       TIMESTAMPTZ NOT NULL,
+
+    -- The commitment — immutable once written.
+    anchor_spot     NUMERIC(12,4) NOT NULL,
+    band_low        NUMERIC(12,4) NOT NULL,
+    band_high       NUMERIC(12,4) NOT NULL,
+    hold_prob       NUMERIC(5,4),
+    sigma           NUMERIC(12,4) NOT NULL,
+
+    -- The surface this cone was conditioned on, snapshotted at the fire.
+    -- Kept per-row because the walls migrate through a session: a 10:00 cone
+    -- and a 14:00 cone are conditioned on genuinely different structure, and
+    -- grading either against "the day's levels" would grade the wrong claim.
+    call_wall       NUMERIC(12,4),
+    put_wall        NUMERIC(12,4),
+    gamma_flip      NUMERIC(12,4),
+    net_gex_at_spot NUMERIC(20,4),
+    daily_sigma     NUMERIC(12,4),
+    gamma_mult      NUMERIC(6,4),
+    elapsed_min     SMALLINT,
+
+    model_version   VARCHAR(32) NOT NULL,
+    content_hash    TEXT        NOT NULL,
+
+    -- Receipt — written once the horizon matures, never rewritten.
+    graded_at       TIMESTAMPTZ,
+    -- Extremes over the OPEN interval (forecast_ts, target_ts].  The anchor
+    -- bar is excluded: spot starts inside its own band by construction, so
+    -- including it could only ever flatter the verdict.
+    window_low      NUMERIC(12,4),
+    window_high     NUMERIC(12,4),
+    held            BOOLEAN,
+    brier           NUMERIC(8,6),
+
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, forecast_ts, horizon_min)
+);
+
+-- The grader's working set: claims that have matured but carry no verdict.
+CREATE INDEX IF NOT EXISTS idx_intraday_forecast_ungraded
+    ON intraday_forecast(target_ts)
+    WHERE graded_at IS NULL;
+
+-- The page's working set: one session's cones, newest fire first.
+CREATE INDEX IF NOT EXISTS idx_intraday_forecast_session
+    ON intraday_forecast(symbol, session_date, forecast_ts DESC);
+
+-- The reliability table scans graded rows by horizon across many sessions.
+CREATE INDEX IF NOT EXISTS idx_intraday_forecast_graded
+    ON intraday_forecast(symbol, horizon_min, session_date DESC)
+    WHERE graded_at IS NOT NULL;
+
+-- Immutability: mirrors enforce_daily_forecast_immutability.  Committed
+-- columns are set once on INSERT; receipt columns are set once when the
+-- horizon matures.  NULL -> value is allowed (the grading path); any
+-- value -> value' rewrite raises.
+CREATE OR REPLACE FUNCTION enforce_intraday_forecast_immutability()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.anchor_spot IS NOT NULL AND NEW.anchor_spot IS DISTINCT FROM OLD.anchor_spot THEN RAISE EXCEPTION 'intraday_forecast.anchor_spot is immutable'; END IF;
+    IF OLD.band_low    IS NOT NULL AND NEW.band_low    IS DISTINCT FROM OLD.band_low    THEN RAISE EXCEPTION 'intraday_forecast.band_low is immutable'; END IF;
+    IF OLD.band_high   IS NOT NULL AND NEW.band_high   IS DISTINCT FROM OLD.band_high   THEN RAISE EXCEPTION 'intraday_forecast.band_high is immutable'; END IF;
+    IF OLD.hold_prob   IS NOT NULL AND NEW.hold_prob   IS DISTINCT FROM OLD.hold_prob   THEN RAISE EXCEPTION 'intraday_forecast.hold_prob is immutable'; END IF;
+    IF OLD.sigma       IS NOT NULL AND NEW.sigma       IS DISTINCT FROM OLD.sigma       THEN RAISE EXCEPTION 'intraday_forecast.sigma is immutable'; END IF;
+    IF OLD.target_ts   IS NOT NULL AND NEW.target_ts   IS DISTINCT FROM OLD.target_ts   THEN RAISE EXCEPTION 'intraday_forecast.target_ts is immutable'; END IF;
+    IF OLD.content_hash IS NOT NULL AND NEW.content_hash IS DISTINCT FROM OLD.content_hash THEN RAISE EXCEPTION 'intraday_forecast.content_hash is immutable'; END IF;
+    -- Receipt columns are immutable once written.
+    IF OLD.graded_at   IS NOT NULL AND NEW.graded_at   IS DISTINCT FROM OLD.graded_at   THEN RAISE EXCEPTION 'intraday_forecast.graded_at is immutable once set'; END IF;
+    IF OLD.window_low  IS NOT NULL AND NEW.window_low  IS DISTINCT FROM OLD.window_low  THEN RAISE EXCEPTION 'intraday_forecast.window_low is immutable once set'; END IF;
+    IF OLD.window_high IS NOT NULL AND NEW.window_high IS DISTINCT FROM OLD.window_high THEN RAISE EXCEPTION 'intraday_forecast.window_high is immutable once set'; END IF;
+    IF OLD.held        IS NOT NULL AND NEW.held        IS DISTINCT FROM OLD.held        THEN RAISE EXCEPTION 'intraday_forecast.held is immutable once set'; END IF;
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS intraday_forecast_immutable ON intraday_forecast;
+CREATE TRIGGER intraday_forecast_immutable
+    BEFORE UPDATE ON intraday_forecast
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_intraday_forecast_immutability();
+
+
 -- =============================================================================
 -- Gamma Regime Shift — one stored read per session
 -- =============================================================================
