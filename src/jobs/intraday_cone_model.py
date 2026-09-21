@@ -272,6 +272,39 @@ MAX_HALF_FRACTION = 0.0250
 #: the process assumption.
 CONE_PATH_EXPONENT = 0.575
 
+#: Per-symbol overrides, because one instrument genuinely differs.
+#:
+#: NDX ran 13 points OVERCONFIDENT under the shared 0.575 while QQQ, SPX and
+#: SPY sat near +2 — and NDX and QQQ track the same index, so that spread was
+#: never volatility. Fitted alone, NDX wants plain Brownian: held-out mean
+#: |gap| 11.9 -> 4.4 pts, Brier 0.1806 -> 0.1699, with leave-one-out showing
+#: the exponent accounts for essentially all of it.
+#:
+#: The reading is microstructural. NDX is a cash index computed from a hundred
+#: constituents; QQQ is one liquid ETF. Their DAILY ranges match almost
+#: exactly (0.937 vs 0.924, 0.643 vs 0.659, and so on across nine sessions),
+#: but NDX's path covers that range with more sub-daily motion — so it earns
+#: no containment bonus over a driftless walk, while a single-instrument ETF
+#: does.
+#:
+#: QQQ was run as a control and its own fit FAILED the holdout (4.8 -> 8.6),
+#: which is the result that makes this an override rather than a licence to
+#: fit every symbol separately. Add a symbol here only when its own holdout
+#: beats the shared value.
+CONE_PATH_EXPONENT_BY_SYMBOL: dict[str, float] = {
+    "NDX": 0.50,
+}
+
+
+def path_exponent_for(symbol: Optional[str]) -> float:
+    """The committed path exponent for ``symbol`` — its override, or the
+    shared default. One place, so the writer, the tuner and the tests cannot
+    disagree about what was actually published."""
+    return CONE_PATH_EXPONENT_BY_SYMBOL.get(
+        (symbol or "").upper(), CONE_PATH_EXPONENT
+    )
+
+
 #: Terms kept on each side of the image series in ``hold_probability``.  The
 #: reflections decay super-exponentially; 6 is far past the point where any
 #: term moves the fourth decimal.
@@ -301,7 +334,9 @@ _IMAGE_TERMS = 6
 #:   v1_5  sigma mult, term decay and path exponent fitted together against
 #:         3,024 claims, validated on held-out sessions including the volatile
 #:         one: holdout mean |gap| 12.5 -> 3.1 pts, Brier 0.206 -> 0.158
-MODEL_VERSION = "cone_v1_5"
+#:   v1_6  per-symbol path exponent; NDX to 0.50 on its own holdout
+#:         (|gap| 11.9 -> 4.4). QQQ tested as a control and left alone.
+MODEL_VERSION = "cone_v1_6"
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +781,7 @@ def _lean_to_wall(
 
 
 def compute_cone(
-    inp: ConeInputs, *, path_exponent: float = CONE_PATH_EXPONENT
+    inp: ConeInputs, *, path_exponent: Optional[float] = None
 ) -> ConeResult:
     """Build the full set of horizon claims for one fire.
 
@@ -756,6 +791,8 @@ def compute_cone(
     of the band without changing its scale.
     """
     result = ConeResult()
+    if path_exponent is None:
+        path_exponent = path_exponent_for(inp.symbol)
     spot = float(inp.spot)
     if spot <= 0:
         result.rationale.append("no usable spot — no cone")

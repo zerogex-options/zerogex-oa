@@ -60,7 +60,7 @@ def test_rebuild_reproduces_the_published_band_exactly(elapsed):
     claims = _claims_from(_inputs(elapsed_min=elapsed))
     assert claims, "the fixture must publish at least one horizon"
     for c in claims:
-        lo, hi, p = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
+        lo, hi, p = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, None)
         assert lo == pytest.approx(float(c["band_low"]), abs=1e-4)
         assert hi == pytest.approx(float(c["band_high"]), abs=1e-4)
         assert p == pytest.approx(float(c["hold_prob"]), abs=1e-6)
@@ -70,7 +70,7 @@ def test_rebuild_reproduces_a_wall_clamped_band():
     """The wall lean is where a reimplementation is most likely to drift."""
     claims = _claims_from(_inputs(call_wall=601.0, put_wall=599.0))
     for c in claims:
-        lo, hi, _ = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
+        lo, hi, _ = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, None)
         assert lo == pytest.approx(float(c["band_low"]), abs=1e-4)
         assert hi == pytest.approx(float(c["band_high"]), abs=1e-4)
 
@@ -106,6 +106,23 @@ def test_the_path_exponent_moves_only_the_prediction():
         assert b["pred"] > a["pred"], "less sub-daily motion must predict more holding"
 
 
+def test_the_baseline_follows_a_symbol_that_overrides_the_exponent():
+    """NDX ships a different path exponent from everything else. A tuner with
+    one literal baseline would score it against a config it does not run —
+    which is exactly the bug that made an earlier ablation meaningless."""
+    from src.jobs.intraday_cone_model import path_exponent_for
+
+    assert path_exponent_for("NDX") != path_exponent_for("QQQ")
+    for sym in ("NDX", "QQQ"):
+        c = _claims_from(_inputs(symbol=sym))[0]
+        auto = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, None)
+        explicit = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY,
+                            path_exponent_for(sym))
+        assert auto == explicit
+        # And it must match what compute_cone actually published for it.
+        assert auto[2] == pytest.approx(float(c["hold_prob"]), abs=1e-6)
+
+
 def test_summary_weights_by_sample_size():
     rows = [{"n": 100, "gap": 0.01, "brier": 0.10},
             {"n": 1, "gap": 0.90, "brier": 0.90}]
@@ -122,4 +139,4 @@ def test_rebuild_declines_a_claim_missing_its_inputs():
     for missing in ("anchor_spot", "daily_sigma", "elapsed_min", "gamma_mult"):
         c = _claims_from(_inputs())[0]
         c[missing] = None
-        assert _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT) is None
+        assert _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, None) is None

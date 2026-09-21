@@ -46,7 +46,6 @@ from typing import Any, Optional
 
 from src.api.database import DatabaseManager
 from src.jobs.intraday_cone_model import (
-    CONE_PATH_EXPONENT,
     CONE_SIGMA_MULT,
     CONE_TERM_DECAY,
     GAMMA_BAND_DAMPING,
@@ -55,6 +54,7 @@ from src.jobs.intraday_cone_model import (
     _clamp,
     _lean_to_wall,
     hold_probability,
+    path_exponent_for,
     variance_fraction,
 )
 
@@ -70,13 +70,20 @@ def _f(v: Any) -> Optional[float]:
         return None
 
 
-def _rebuild(claim: dict, sigma_mult: float, term_decay: float, path_exp: float):
+def _rebuild(claim: dict, sigma_mult: float, term_decay: float,
+             path_exp: Optional[float]):
     """Rebuild one claim's band and probability under candidate parameters.
 
     Mirrors ``compute_cone``'s per-horizon arithmetic exactly. Returns
     ``(band_low, band_high, hold_prob)`` or None when the claim lacks an
     input the reconstruction needs.
     """
+    # None = the value this symbol actually ships with. Resolving per claim
+    # matters now that one symbol overrides it: a single literal baseline
+    # would report NDX against a config it does not run, which is the bug
+    # that made the last ablation meaningless.
+    if path_exp is None:
+        path_exp = path_exponent_for(claim.get("symbol"))
     spot = _f(claim.get("anchor_spot"))
     daily_sigma = _f(claim.get("daily_sigma"))
     elapsed = _f(claim.get("elapsed_min"))
@@ -205,10 +212,10 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"  test:  {len(test):>5} claims / {len(test_s)} sessions "
           f"({'held out' if test else 'none — in-sample only'})\n")
 
-    baseline = _score(train, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
+    baseline = _score(train, CONE_SIGMA_MULT, CONE_TERM_DECAY, None)
     b_gap, b_brier = _summary(baseline)
     print(f"committed parameters  sigma_mult={CONE_SIGMA_MULT} "
-          f"term_decay={CONE_TERM_DECAY} path_exp={CONE_PATH_EXPONENT}")
+          f"term_decay={CONE_TERM_DECAY} path_exp=<per symbol>")
     for r in baseline:
         print(f"   +{r['horizon']:>3}m  n={r['n']:>4}  pred {r['pred']*100:5.1f}%  "
               f"real {r['real']*100:5.1f}%  gap {r['gap']*100:+6.1f}  "
@@ -239,8 +246,7 @@ async def _run(args: argparse.Namespace) -> int:
     if test:
         t_rows = _score(test, sm, td, pe)
         t_gap, t_brier = _summary(t_rows)
-        base_t = _summary(
-            _score(test, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT))
+        base_t = _summary(_score(test, CONE_SIGMA_MULT, CONE_TERM_DECAY, None))
         print(f"\nHELD-OUT sessions ({len(test_s)}):")
         for r in t_rows:
             print(f"   +{r['horizon']:>3}m  n={r['n']:>4}  pred {r['pred']*100:5.1f}%  "
@@ -263,15 +269,15 @@ async def _run(args: argparse.Namespace) -> int:
         print("\n   leave-one-out on held-out sessions "
               "(each knob returned to neutral):")
         rows = [
-            ("committed", (CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)),
+            ("committed", (CONE_SIGMA_MULT, CONE_TERM_DECAY, None)),
             ("path_exp -> 0.5 (Brownian)",
              (CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5)),
             ("term_decay -> 0 (no decay)",
-             (CONE_SIGMA_MULT, 0.0, CONE_PATH_EXPONENT)),
+             (CONE_SIGMA_MULT, 0.0, None)),
             ("sigma_mult -1 step",
-             (CONE_SIGMA_MULT - 0.2, CONE_TERM_DECAY, CONE_PATH_EXPONENT)),
+             (CONE_SIGMA_MULT - 0.2, CONE_TERM_DECAY, None)),
             ("sigma_mult +1 step",
-             (CONE_SIGMA_MULT + 0.2, CONE_TERM_DECAY, CONE_PATH_EXPONENT)),
+             (CONE_SIGMA_MULT + 0.2, CONE_TERM_DECAY, None)),
         ]
         for label, cand in rows:
             g, b = _summary(_score(test, *cand))
@@ -282,7 +288,7 @@ async def _run(args: argparse.Namespace) -> int:
         print("\n   held-out calibration PER SYMBOL at the committed config:")
         for sym in sorted({c["symbol"] for c in test}):
             sub = [c for c in test if c["symbol"] == sym]
-            r = _score(sub, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
+            r = _score(sub, CONE_SIGMA_MULT, CONE_TERM_DECAY, None)
             n = sum(x["n"] for x in r)
             signed = sum(x["gap"] * x["n"] for x in r) / n if n else 0.0
             g, b = _summary(r)
