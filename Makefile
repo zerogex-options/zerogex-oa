@@ -1937,6 +1937,16 @@ feed-probe: ## Measure ONE fetch from a provider before a real run (PROVIDER, UN
 		$(if $(STRIKE_COUNT_MAX),--strike-count-max '$(STRIKE_COUNT_MAX)') \
 		$(if $(JSON),--json)
 
+.PHONY: chain-depth-sweep
+chain-depth-sweep: ## Does the gamma flip converge as the chain deepens? (UNDERLYING, PROVIDER, DEPTHS, ROUNDS)
+	@echo "$(BLUE)=== Chain depth sweep (read-only; no DB writes) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.chain_depth_sweep \
+		--underlying "$${UNDERLYING:-SPY}" \
+		$(if $(PROVIDER),--provider '$(PROVIDER)') \
+		$(if $(DEPTHS),--depths '$(DEPTHS)') \
+		$(if $(ROUNDS),--rounds '$(ROUNDS)') \
+		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)')
+
 .PHONY: feed-compare-schema
 feed-compare-schema: ## Create the shadow tables the comparison harness writes to
 	@echo "$(BLUE)=== Applying shadow tables ===$(NC)"
