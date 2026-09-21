@@ -243,6 +243,24 @@ async def _run(args: argparse.Namespace) -> int:
         if t_gap >= base_t[0]:
             print("   -> does NOT beat the committed parameters out of sample. "
                   "Do not ship this fit.")
+
+        # Ablation. Three fitted constants against nine sessions is enough rope
+        # to overfit with, so show what each one earns ON THE HELD-OUT SET with
+        # the others left at their committed values. A knob that buys nothing
+        # here is complexity with no claim behind it and should be reverted.
+        print("\n   ablation on held-out sessions (one knob moved at a time):")
+        base_sm, base_td, base_pe = CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5
+        for label, cand in (
+            ("sigma_mult only", (sm, base_td, base_pe)),
+            ("term_decay only", (base_sm, td, base_pe)),
+            ("path_exp only",   (base_sm, base_td, pe)),
+            ("band knobs only", (sm, td, base_pe)),
+            ("all three",       (sm, td, pe)),
+        ):
+            g, b = _summary(_score(test, *cand))
+            print(f"     {label:18} gap {g*100:5.1f} pts   brier {b:.4f}")
+        print(f"     {'committed':18} gap {base_t[0]*100:5.1f} pts   "
+              f"brier {base_t[1]:.4f}")
     return 0
 
 

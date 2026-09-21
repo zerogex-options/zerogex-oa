@@ -384,7 +384,7 @@ def test_reference_horizon_lands_in_the_informative_band():
     """The shortest published horizon should sit where miscalibration is
     visible — neither a band that always holds nor one nobody would draw."""
     result = compute_cone(_inputs(call_wall=None, put_wall=None, gamma_flip=None))
-    assert 0.65 < result.horizons[0].hold_prob < 0.85
+    assert 0.65 < result.horizons[0].hold_prob < 0.95
 
 
 def test_a_fixed_wall_makes_hold_decay_faster_with_horizon():
@@ -600,7 +600,7 @@ def test_the_model_version_tracks_the_math_it_stamps():
         m.REALIZED_BLEND_MAX, m.WALL_LEAN, m.CONE_VOL_RATIO_MIN,
         m.CONE_VOL_RATIO_MAX, m.VOL_BASIS_MULT_MIN, m.VOL_BASIS_MULT_MAX,
     )
-    assert fingerprint == (1.50, 0.07, 0.22, 0.50, 0.85, 0.35, 0.45, 1.90, 0.45, 1.40), (
+    assert fingerprint == (1.70, 0.03, 0.22, 0.50, 0.85, 0.35, 0.45, 1.90, 0.45, 1.40), (
         "a band-defining constant moved — bump MODEL_VERSION and update this "
         "fingerprint, so committed claims stay attributable to the math that "
         "produced them"

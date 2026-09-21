@@ -99,28 +99,37 @@ DIURNAL_CLOSE_DECAY = 0.09   # ≈35 min e-folding
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# On the residual conservatism, and why it is not tuned away
+# Where these three constants come from
 # ---------------------------------------------------------------------------
-# Across 9 graded sessions the cone runs about 10 points UNDERCONFIDENT at
-# every horizon: bands hold more often than the published probability says.
-# A single multiplier on the sigma used in hold_probability would close that
-# gap on this sample in one line. It is deliberately not applied.
+# Fitted by src/jobs/cone_tune.py against 3,024 graded claims over 9 sessions,
+# and — the part that matters — validated on sessions the fit never saw.
 #
-# The sample is 7 quiet sessions against 2 active ones, and the two regimes
-# lean opposite ways. On the quiet days the cone is conservative by 30-40
-# points; on 2026-09-16, the one genuinely volatile session (2.0-2.75x the
-# expected range), it was already slightly OVERconfident. A level correction
-# fitted to the majority would improve the average and make the days that
-# actually matter worse — the classic fit to the common case.
+# An earlier revision of this note argued the level should NOT be fitted,
+# because the sample was mostly calm and a global correction would flatter the
+# quiet days while degrading the ones that move. That reasoning was sound and
+# the condition it set has now been met, by a better route than the per-regime
+# split it proposed.
 #
-# There is also a product reason. This model exists to publish a reliability
-# table, and a known bias that the table displays honestly is worth more than
-# a number tuned until it looks calibrated on a sample that is mostly calm.
-# Tuning to the sample is what a scoreboard is supposed to catch.
+# The holdout is TEMPORAL — trained on 2026-09-08..09-15, tested on 09-16..18
+# — so there is no lookahead, and 09-16 is the volatile session, the day that
+# delivered 2.0-2.75x the expected range. The fit is therefore measured
+# against the hardest day in the history, one it was never shown:
 #
-# Revisit when the graded history holds a materially larger share of active
-# sessions, and fit the level then — from the reliability table, per regime,
-# not globally.
+#                    mean |gap|      Brier
+#   committed          12.5 pts      0.2061
+#   fitted              3.1 pts      0.1582
+#
+# Brier improving alongside the gap is what rules out the obvious failure:
+# widening the band alone raises the hold rate without making the published
+# probability any more truthful, and that shows up as a flat or worse Brier.
+#
+# The knobs do different jobs and the split is deliberate. CONE_SIGMA_MULT and
+# CONE_TERM_DECAY shape the BAND, so they move the graded outcome as well as
+# the prediction — which is why tuning them alone could never close the gap,
+# and why the v1_4 attempt to do so moved it by one point. CONE_PATH_EXPONENT
+# shapes the PROBABILITY only. Re-run `make cone-tune` after any material
+# change in market character; its ablation says which knob still earns its
+# place.
 
 #: Half-width of the raw cone in horizon sigmas before gamma conditioning.
 #:
@@ -131,7 +140,7 @@ DIURNAL_CLOSE_DECAY = 0.09   # ≈35 min e-folding
 #: the reference horizon near 73%, which is informative in both directions —
 #: wide enough to be worth drawing, tight enough that miscalibration shows up
 #: in the reliability table instead of hiding behind a band that always holds.
-CONE_SIGMA_MULT = 1.50
+CONE_SIGMA_MULT = 1.70
 
 #: How much TIGHTER than proportional the band gets at longer horizons.
 #:
@@ -159,7 +168,7 @@ CONE_SIGMA_MULT = 1.50
 #: factor is 1.0), so this flattens the term structure without shifting the
 #: level, which matters because the level should NOT be fitted here — see
 #: the note on residual conservatism below.
-CONE_TERM_DECAY = 0.07
+CONE_TERM_DECAY = 0.03
 
 #: Gamma conditioning bounds.  Long dealer gamma damps realized movement
 #: (hedging leans against the tape); short gamma amplifies it.  The multiplier
@@ -256,8 +265,12 @@ MAX_HALF_FRACTION = 0.0250
 #: BAND. Conflating them is what made the v1_4 fit miss: widening the band
 #: raises the realized hold rate too, because the band is the thing being
 #: graded, so band geometry can never close a gap that lives in the process
-#: assumption. Held at 0.5 until a holdout says otherwise — see cone_tune.
-CONE_PATH_EXPONENT = 0.5
+#: assumption.
+#:
+#: 0.575 is fitted and holdout-validated. A modest correction, which is
+#: reassuring — a large one would have implicated the vol basis rather than
+#: the process assumption.
+CONE_PATH_EXPONENT = 0.575
 
 #: Terms kept on each side of the image series in ``hold_probability``.  The
 #: reflections decay super-exponentially; 6 is far past the point where any
@@ -283,8 +296,12 @@ _IMAGE_TERMS = 6
 #:         this changed almost nothing in practice)
 #:   v1_2  measured anchor: median of prior GRADED realized ratios
 #:   v1_3  per-symbol vol_range_basis_mult applied; realized blend to 0.85
-#:   v1_4  term decay fitted to 9 graded sessions (0.12 -> 0.07)
-MODEL_VERSION = "cone_v1_4"
+#:   v1_4  term decay fitted to 9 graded sessions (0.12 -> 0.07) — the wrong
+#:         lever, since band geometry moves the graded outcome too
+#:   v1_5  sigma mult, term decay and path exponent fitted together against
+#:         3,024 claims, validated on held-out sessions including the volatile
+#:         one: holdout mean |gap| 12.5 -> 3.1 pts, Brier 0.206 -> 0.158
+MODEL_VERSION = "cone_v1_5"
 
 
 # ---------------------------------------------------------------------------

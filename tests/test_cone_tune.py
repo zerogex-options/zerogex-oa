@@ -14,6 +14,7 @@ import pytest
 
 from src.jobs.cone_tune import _rebuild, _score, _summary
 from src.jobs.intraday_cone_model import (
+    CONE_PATH_EXPONENT,
     CONE_SIGMA_MULT,
     CONE_TERM_DECAY,
     ConeInputs,
@@ -59,7 +60,7 @@ def test_rebuild_reproduces_the_published_band_exactly(elapsed):
     claims = _claims_from(_inputs(elapsed_min=elapsed))
     assert claims, "the fixture must publish at least one horizon"
     for c in claims:
-        lo, hi, p = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5)
+        lo, hi, p = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
         assert lo == pytest.approx(float(c["band_low"]), abs=1e-4)
         assert hi == pytest.approx(float(c["band_high"]), abs=1e-4)
         assert p == pytest.approx(float(c["hold_prob"]), abs=1e-6)
@@ -69,7 +70,7 @@ def test_rebuild_reproduces_a_wall_clamped_band():
     """The wall lean is where a reimplementation is most likely to drift."""
     claims = _claims_from(_inputs(call_wall=601.0, put_wall=599.0))
     for c in claims:
-        lo, hi, _ = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5)
+        lo, hi, _ = _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
         assert lo == pytest.approx(float(c["band_low"]), abs=1e-4)
         assert hi == pytest.approx(float(c["band_high"]), abs=1e-4)
 
@@ -83,8 +84,8 @@ def test_a_wider_band_changes_the_realized_outcome_too():
     """
     # A window that sits outside the tight band and inside the wide one.
     claims = _claims_from(_inputs(), window=(597.0, 603.0))
-    tight = _score(claims, 1.0, CONE_TERM_DECAY, 0.5)
-    wide = _score(claims, 3.0, CONE_TERM_DECAY, 0.5)
+    tight = _score(claims, 1.0, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
+    wide = _score(claims, 3.0, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
     assert sum(r["real"] for r in tight) < sum(r["real"] for r in wide), (
         "widening the band must change the graded outcome, not just the odds"
     )
@@ -95,7 +96,7 @@ def test_the_path_exponent_moves_only_the_prediction():
     alone, which is what makes it able to close a calibration gap at all."""
     claims = _claims_from(_inputs(), window=(597.0, 603.0))
     brownian = _score(claims, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.50)
-    contained = _score(claims, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.70)
+    contained = _score(claims, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.75)
     for a, b in zip(brownian, contained):
         assert a["real"] == pytest.approx(b["real"]), "outcomes must not move"
         # Note the direction: the variance fraction is below 1, so a LARGER
@@ -121,4 +122,4 @@ def test_rebuild_declines_a_claim_missing_its_inputs():
     for missing in ("anchor_spot", "daily_sigma", "elapsed_min", "gamma_mult"):
         c = _claims_from(_inputs())[0]
         c[missing] = None
-        assert _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5) is None
+        assert _rebuild(c, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT) is None
