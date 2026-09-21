@@ -574,6 +574,47 @@ def test_the_basis_is_clamped_to_the_calibrators_own_range():
     assert compute_cone(_inputs(vol_basis_mult="nonsense")).horizons
 
 
+def test_the_model_version_tracks_the_math_it_stamps():
+    """A version string that never changes is worse than none at all.
+
+    This one sat at v1_0 through four substantive changes to the math, so
+    nine backfilled sessions spanning two very different models all claimed
+    to be the same model. The calibration report averaged them and the result
+    read as a regression that was really an averaging artifact.
+
+    The assertion is deliberately blunt: if someone changes how a band or a
+    probability is computed and leaves the version alone, this fails and says
+    why.
+    """
+    from src.jobs import intraday_cone_model as m
+
+    assert m.MODEL_VERSION != "cone_v1_0", (
+        "v1_0 predates the vol anchor, the measured anchor and the committed "
+        "vol basis — stamping it on current claims makes stale and current "
+        "rows indistinguishable in the calibration report"
+    )
+    # The constants whose values define the published band. Changing any of
+    # them changes every claim, so the version must move with them.
+    fingerprint = (
+        m.CONE_SIGMA_MULT, m.CONE_TERM_DECAY, m.GAMMA_TILT, m.GAMMA_BAND_DAMPING,
+        m.REALIZED_BLEND_MAX, m.WALL_LEAN, m.CONE_VOL_RATIO_MIN,
+        m.CONE_VOL_RATIO_MAX, m.VOL_BASIS_MULT_MIN, m.VOL_BASIS_MULT_MAX,
+    )
+    assert fingerprint == (1.50, 0.12, 0.22, 0.50, 0.85, 0.35, 0.45, 1.90, 0.45, 1.40), (
+        "a band-defining constant moved — bump MODEL_VERSION and update this "
+        "fingerprint, so committed claims stay attributable to the math that "
+        "produced them"
+    )
+
+
+def test_every_claim_carries_the_version(_=None):
+    result = compute_cone(_inputs())
+    from src.jobs import intraday_cone_model as m
+
+    assert result.model_version == m.MODEL_VERSION
+    assert result.horizons, "a version is only useful on rows that exist"
+
+
 def test_cone_degrades_rather_than_raises_on_a_thin_surface():
     bare = compute_cone(
         ConeInputs(symbol="SPY", spot=600.0, elapsed_min=90, implied_move=4.5)

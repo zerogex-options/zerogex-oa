@@ -4789,6 +4789,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       AVG(daily_sigma / NULLIF(anchor_spot,0)) AS sigma_frac, \
 		       AVG(vol_ratio_applied) AS vol_anchor, \
 		       MIN(vol_ratio_source) AS anchor_src, \
+		       MIN(model_version) AS model_ver, \
 		       AVG(anchor_spot) AS spot \
 		FROM intraday_forecast \
 		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
@@ -4813,13 +4814,21 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       ROUND(100.0 * (held_n::numeric / claims - mean_pred), 1) AS gap_pts, \
 		       ROUND(vol_anchor::numeric, 2)     AS vol_anchor, \
 		       anchor_src, \
+		       model_ver, \
 		       ROUND(100.0 * sigma_frac, 3)      AS model_sigma_pct, \
 		       ROUND(100.0 * realized_frac, 3)   AS realized_range_pct, \
 		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio \
 		FROM s ORDER BY session_date DESC, symbol;"; \
 	echo ""; \
-	echo "$(BLUE)--- Per horizon (all sessions in range) ---$(NC)"; \
-	$(PSQL) -c "SELECT horizon_min, COUNT(*) AS claims, \
+	echo "$(BLUE)--- Per horizon, SPLIT BY MODEL ---$(NC)"; \
+	echo "$(YELLOW)Never read across rows here. A session backfilled under an older$(NC)"; \
+	echo "$(YELLOW)model is not evidence about the current one, and averaging the two$(NC)"; \
+	echo "$(YELLOW)makes a stale cohort look like a regression. 'pre-anchor' marks rows$(NC)"; \
+	echo "$(YELLOW)written before the vol anchor existed -- re-backfill those sessions$(NC)"; \
+	echo "$(YELLOW)before drawing any conclusion from them.$(NC)"; \
+	$(PSQL) -c "SELECT model_version, \
+		       CASE WHEN vol_ratio_source IS NULL THEN 'pre-anchor' ELSE 'current' END AS cohort, \
+		       horizon_min, COUNT(*) AS claims, \
 		       ROUND(100.0 * COUNT(*) FILTER (WHERE held) / COUNT(*), 1) AS hold_pct, \
 		       ROUND(100.0 * AVG(hold_prob), 1) AS pred_pct, \
 		       ROUND(100.0 * (COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) - AVG(hold_prob)), 1) AS gap_pts, \
@@ -4827,7 +4836,8 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		FROM intraday_forecast \
 		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
 		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
-		GROUP BY horizon_min ORDER BY horizon_min;"; \
+		GROUP BY model_version, cohort, horizon_min \
+		ORDER BY model_version, cohort, horizon_min;"; \
 	echo ""; \
 	echo "$(YELLOW)One session decides nothing -- a quiet day and a wrong vol basis look$(NC)"; \
 	echo "$(YELLOW)identical in a single row. Backfill several sessions, including a$(NC)"; \

@@ -211,7 +211,26 @@ MAX_HALF_FRACTION = 0.0250
 #: term moves the fourth decimal.
 _IMAGE_TERMS = 6
 
-MODEL_VERSION = "cone_v1_0"
+#: Stamped on every committed claim.
+#:
+#: BUMP THIS whenever the math that produces a band or a probability changes.
+#: It is not decoration: the calibration report groups by it, and a sample
+#: that silently mixes versions reads as one model performing badly rather
+#: than two models measured together.
+#:
+#: That is not hypothetical — it already happened. This string sat at v1_0
+#: through the vol anchor, the measured anchor, the committed vol basis and
+#: the realized-blend change, so nine backfilled sessions spanning two very
+#: different models all claimed to be the same one, and the aggregate looked
+#: like a regression that was really an averaging artifact.
+#:
+#: Lineage:
+#:   v1_0  original — implied move only, no vol call
+#:   v1_1  committed expected_vol_ratio adopted (which defaults to 1.0, so
+#:         this changed almost nothing in practice)
+#:   v1_2  measured anchor: median of prior GRADED realized ratios
+#:   v1_3  per-symbol vol_range_basis_mult applied; realized blend to 0.85
+MODEL_VERSION = "cone_v1_3"
 
 
 # ---------------------------------------------------------------------------
