@@ -182,6 +182,11 @@ async def _run(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001
             pass
 
+    if args.symbol:
+        want = {x.strip().upper() for x in args.symbol.split(",") if x.strip()}
+        claims = [c for c in claims if c["symbol"] in want]
+        print(f"scoped to {', '.join(sorted(want))}\n")
+
     if not claims:
         print("no graded claims to tune against")
         return 0
@@ -293,6 +298,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--holdout", type=float, default=0.33,
                         help="Fraction of SESSIONS held out (0 disables).")
     parser.add_argument("--objective", choices=("gap", "brier"), default="brier")
+    parser.add_argument(
+        "--symbol",
+        help="Fit ONE symbol (or a comma list) instead of all of them. "
+             "The aggregate hides per-symbol bias — NDX ran 13 points "
+             "overconfident while the other three sat near +2 — so a symbol "
+             "that misbehaves should be fitted and judged on its own.",
+    )
     return asyncio.run(_run(parser.parse_args(argv)))
 
 

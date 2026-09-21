@@ -4863,7 +4863,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)basis is the problem and tuning the geometry would just paper over it.$(NC)"
 
 .PHONY: cone-tune
-cone-tune: ## Sweep cone parameters against GRADED claims offline -- no re-backfill. Vars: SESSIONS=60, HOLDOUT=0.33, OBJECTIVE=brier|gap
+cone-tune: ## Sweep cone parameters against GRADED claims offline -- no re-backfill. Vars: SESSIONS=60, HOLDOUT=0.33, OBJECTIVE=brier|gap, SYMBOL=NDX
 	@echo "$(BLUE)=== Cone Parameter Sweep (offline, against stored claims) ===$(NC)"
 	@echo "$(YELLOW)Every graded claim stores the window extremes the tape reached, which$(NC)"
 	@echo "$(YELLOW)decide whether ANY band would have held -- so candidates are scored$(NC)"
@@ -4874,7 +4874,8 @@ cone-tune: ## Sweep cone parameters against GRADED claims offline -- no re-backf
 	@$(PY) -m src.jobs.cone_tune \
 		$(if $(SESSIONS),--sessions $(SESSIONS)) \
 		$(if $(HOLDOUT),--holdout $(HOLDOUT)) \
-		$(if $(OBJECTIVE),--objective $(OBJECTIVE))
+		$(if $(OBJECTIVE),--objective $(OBJECTIVE)) \
+		$(if $(SYMBOL),--symbol $(SYMBOL))
 
 .PHONY: cone-prune
 cone-prune: ## Delete intraday_forecast rows for a session. Vars: SESSION=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
