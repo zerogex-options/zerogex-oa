@@ -2487,6 +2487,82 @@ class SignalsQueriesMixin:
             )
             return 0
 
+    async def get_quote_as_of(
+        self, symbol: str, as_of: datetime, not_before: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """The last ``underlying_quotes`` bar at or before ``as_of``.
+
+        The point-in-time counterpart to ``get_latest_quote``, which takes no
+        timestamp and always returns the newest row in the table.  That is the
+        right answer for "what is it trading at right now" and the WRONG answer
+        for any job that reconstructs a past moment: a backfill run on Sunday
+        got Friday's closing print for every fire of Friday's session, so a
+        cone that re-anchors every 15 minutes never re-anchored at all.
+
+        ``not_before`` bounds the lookback so a session with no bars yields
+        None rather than silently anchoring on a previous day's close — a
+        cone drawn around a stale price is worse than no cone, because it is
+        still graded.
+        """
+        query = """
+            SELECT timestamp, open, high, low, close
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND timestamp <= $2
+              AND timestamp >= $3
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, as_of, not_before)
+            return dict(row) if row else None
+        except Exception as exc:
+            logger.warning(
+                "get_quote_as_of(%s, %s) failed: %s", symbol, as_of, exc,
+            )
+            return None
+
+    async def get_gex_summary_as_of(
+        self, symbol: str, as_of: datetime, not_before: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """The last ``gex_summary`` row at or before ``as_of``.
+
+        Point-in-time counterpart to ``get_latest_gex_summary``.  Same hazard,
+        worse consequence: conditioning a cone on a surface that did not exist
+        when the claim was made is lookahead, and lookahead in the one system
+        whose whole value is honest grading would make every number it
+        publishes worthless.
+
+        Returns the subset the cone conditions on.  ``gamma_flip_point`` is
+        aliased to ``gamma_flip`` to match what the rest of the codebase calls
+        it (see ``get_intraday_level_series``).
+        """
+        query = """
+            SELECT timestamp,
+                   call_wall,
+                   put_wall,
+                   gamma_flip_point AS gamma_flip,
+                   net_gex_at_spot,
+                   total_net_gex,
+                   local_gex
+            FROM gex_summary
+            WHERE underlying = $1
+              AND timestamp <= $2
+              AND timestamp >= $3
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, as_of, not_before)
+            return dict(row) if row else None
+        except Exception as exc:
+            logger.warning(
+                "get_gex_summary_as_of(%s, %s) failed: %s", symbol, as_of, exc,
+            )
+            return None
+
     async def get_matured_ungraded_cones(
         self, now: datetime, limit: int = 500
     ) -> List[Dict[str, Any]]:

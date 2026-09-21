@@ -4757,6 +4757,51 @@ cone-backfill: ## Replay a whole session's cone fires at 15m spacing. Vars: FORE
 	done
 	@echo "$(YELLOW)Now grade them:  make cone-receipt$(NC)"
 
+.PHONY: cone-prune
+cone-prune: ## Delete intraday_forecast rows for a session. Vars: SESSION=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Cone Prune (intraday_forecast) ===$(NC)"
+	@if [ -z "$${SESSION}" ]; then \
+		echo "$(RED)SESSION=YYYY-MM-DD is required -- refusing to run without an explicit session.$(NC)"; \
+		echo "$(YELLOW)Deletes every cone committed for that ONE session.$(NC)"; \
+		echo "$(YELLOW)  make cone-prune SESSION=2026-09-18                 # all symbols$(NC)"; \
+		echo "$(YELLOW)  make cone-prune SESSION=2026-09-18 SYMBOL=SPY      # scope to one symbol$(NC)"; \
+		echo "$(YELLOW)  make cone-prune SESSION=2026-09-18 CONFIRM=yes     # actually delete$(NC)"; \
+		exit 1; \
+	fi; \
+	if ! echo "$${SESSION}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$$'; then \
+		echo "$(RED)SESSION='$${SESSION}' is not a YYYY-MM-DD date.$(NC)"; \
+		exit 1; \
+	fi; \
+	SYMBOL_FILTER=""; \
+	if [ -n "$${SYMBOL}" ]; then \
+		echo "$(YELLOW)Scoping to SYMBOL='$${SYMBOL}'.$(NC)"; \
+		SYMBOL_FILTER="AND symbol = '$${SYMBOL}'"; \
+	else \
+		echo "$(YELLOW)No SYMBOL set -> ALL symbols.$(NC)"; \
+	fi; \
+	echo "$(YELLOW)Target: intraday_forecast rows with session_date = '$${SESSION}' (permanent DELETE).$(NC)"; \
+	echo "$(YELLOW)Cones are immutable once written, so a backfill produced from bad inputs$(NC)"; \
+	echo "$(YELLOW)cannot be corrected in place -- it has to be deleted and re-run. That is$(NC)"; \
+	echo "$(YELLOW)the ONLY reason this target exists. Deleting a session that was committed$(NC)"; \
+	echo "$(YELLOW)live erases a public claim and the verdict it earned; do not.$(NC)"; \
+	echo "$(BLUE)--- Rows to delete (grouped by symbol) ---$(NC)"; \
+	$(PSQL) -c "SELECT symbol, COUNT(*) AS n_claims, COUNT(DISTINCT forecast_ts) AS n_fires, \
+		COUNT(*) FILTER (WHERE graded_at IS NOT NULL) AS graded, \
+		COUNT(*) FILTER (WHERE held) AS held, \
+		MIN(anchor_spot) AS min_anchor, MAX(anchor_spot) AS max_anchor \
+		FROM intraday_forecast WHERE session_date = '$${SESSION}' $${SYMBOL_FILTER} \
+		GROUP BY symbol ORDER BY symbol;"; \
+	echo "$(YELLOW)min_anchor = max_anchor means the writer never re-anchored -- the symptom$(NC)"; \
+	echo "$(YELLOW)of a backfill run before the point-in-time read fix.$(NC)"; \
+	if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to DELETE the rows above.$(NC)"; \
+	else \
+		echo "$(BLUE)--- Deleting ---$(NC)"; \
+		ROWS=$$($(PSQL) -t -A -c "WITH deleted AS (DELETE FROM intraday_forecast WHERE session_date = '$${SESSION}' $${SYMBOL_FILTER} RETURNING 1) SELECT COUNT(*) FROM deleted;"); \
+		echo "$(GREEN)✓ Deleted $${ROWS} intraday_forecast row(s) for $${SESSION}.$(NC)"; \
+		echo "$(YELLOW)Re-run:  make cone-backfill FORECAST_DATE=$${SESSION} && make cone-receipt$(NC)"; \
+	fi
+
 .PHONY: forecast-prune
 forecast-prune: ## Delete daily_forecast rows before a cutoff. Vars: BEFORE=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Forecast Prune (daily_forecast) ===$(NC)"

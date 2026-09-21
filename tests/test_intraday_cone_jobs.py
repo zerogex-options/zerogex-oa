@@ -45,24 +45,43 @@ def _fake_writer_db(
     extremes=None,
     inserted=4,
     gex_ts=None,
+    walk=None,
 ):
+    """A stubbed DB whose reads are POINT-IN-TIME, like the real ones.
+
+    ``walk`` maps an ET "HH:MM" anchor to the price printing then, so a test
+    can assert the writer actually re-anchors instead of reusing one quote.
+    When it is None every anchor sees the same ``quote``, which is the shape
+    most tests want.
+    """
     now = datetime(2026, 9, 21, 11, 0, tzinfo=ET)
     if gex is None:
         gex = {
-            "spot_price": Decimal("600.00"),
             "call_wall": Decimal("606.00"),
             "put_wall": Decimal("594.00"),
             "gamma_flip": Decimal("601.00"),
             "net_gex_at_spot": Decimal("400000000"),
             "timestamp": gex_ts if gex_ts is not None else now - timedelta(minutes=1),
         }
+
+    async def _quote_as_of(symbol, as_of, not_before):
+        if quote is None:
+            return None
+        if as_of < not_before:
+            return None
+        price = quote
+        if walk is not None:
+            key = as_of.strftime("%H:%M")
+            if key not in walk:
+                return None
+            price = walk[key]
+        return {"timestamp": as_of, "close": Decimal(str(price))}
+
     db = type("FakeDB", (), {})()
     db.connect = AsyncMock(return_value=None)
     db.disconnect = AsyncMock(return_value=None)
-    db.get_latest_quote = AsyncMock(
-        return_value={"close": Decimal(str(quote))} if quote is not None else None
-    )
-    db.get_latest_gex_summary = AsyncMock(return_value=gex)
+    db.get_quote_as_of = AsyncMock(side_effect=_quote_as_of)
+    db.get_gex_summary_as_of = AsyncMock(return_value=gex)
     db.get_daily_forecast = AsyncMock(
         return_value=morning if morning is not None else {"implied_move": Decimal("4.50")}
     )
@@ -188,7 +207,7 @@ async def test_writer_skips_when_there_is_no_spot(monkeypatch, caplog):
     monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
     assert await mod._run(_writer_args(mod)) == 0
     fake.insert_intraday_cone.assert_not_awaited()
-    assert "no spot" in caplog.text
+    assert "no SPY bar at or before" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -233,6 +252,101 @@ async def test_late_fire_publishes_only_horizons_that_fit(monkeypatch):
     assert await mod._run(_writer_args(mod, at="2026-09-21T15:00")) == 0
     rows = fake.insert_intraday_cone.await_args.args[0]
     assert [r["horizon_min"] for r in rows] == [30, 60]
+
+
+@pytest.mark.asyncio
+async def test_a_backfill_re_anchors_on_every_fire(monkeypatch):
+    """The bug that made the first real backfill meaningless.
+
+    The writer read "the newest quote" rather than "the quote as of this
+    anchor", so a Sunday run of Friday's session got Friday's CLOSING print
+    for all 25 fires: every band was drawn around the same price, the cone
+    that re-anchors every 15 minutes never re-anchored, and grading those
+    bands against a tape that was somewhere else all day produced a 23% hold
+    rate against a model predicting 50-81%.
+
+    The giveaway was visible in the log and nowhere in the tests: an
+    identical ``spot=`` on every line. This pins it.
+    """
+    mod = _reload("intraday_cone_writer")
+    walk = {"09:45": 600.0, "11:00": 604.5, "14:00": 597.25}
+    anchors = []
+    for at, expected in walk.items():
+        fake = _fake_writer_db(walk=walk)
+        monkeypatch.setattr(mod, "DatabaseManager", lambda f=fake: f)
+        assert await mod._run(_writer_args(mod, at=f"2026-09-21T{at}")) == 0
+        rows = fake.insert_intraday_cone.await_args.args[0]
+        got = float(rows[0]["anchor_spot"])
+        assert got == expected, f"{at} anchored at {got}, expected {expected}"
+        anchors.append(got)
+
+    assert len(set(anchors)) == len(anchors), "every fire must anchor on its own price"
+
+
+@pytest.mark.asyncio
+async def test_the_quote_read_is_bounded_to_the_anchors_own_session(monkeypatch):
+    """A point-in-time read still has to refuse to reach backwards forever.
+
+    Without a lower bound, a session with no bars anchors the cone on some
+    previous day's close — and that cone is still graded, which is worse than
+    no cone at all.
+    """
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db()
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    await mod._run(_writer_args(mod))
+
+    _symbol, as_of, not_before = fake.get_quote_as_of.await_args.args
+    assert as_of == datetime(2026, 9, 21, 11, 0, tzinfo=ET)
+    assert not_before == datetime(2026, 9, 21, 9, 30, tzinfo=ET), (
+        "the lookback must stop at the session open"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_surface_from_the_future_is_not_fresh(monkeypatch, caplog):
+    """The lookahead hole, and the reason it survived review.
+
+    ``(now - ts) <= GEX_MAX_STALENESS`` is True for a NEGATIVE age, so a
+    snapshot timestamped AFTER the anchor passed the freshness check. During
+    a backfill that is not a corner case, it is the normal case: the cone
+    would be conditioned on walls that did not exist when the claim was made.
+    Lookahead in the one system whose value is honest grading invalidates
+    every number it publishes, so a future-dated surface is rejected outright.
+    """
+    mod = _reload("intraday_cone_writer")
+    future = datetime(2026, 9, 23, 11, 0, tzinfo=ET)   # two days AFTER the anchor
+    fake = _fake_writer_db(gex_ts=future)
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_writer_args(mod)) == 0
+
+    rows = fake.insert_intraday_cone.await_args.args[0]
+    assert all(r["call_wall"] is None for r in rows), "future walls must not condition the cone"
+    assert all(r["gamma_flip"] is None for r in rows)
+    assert all(r["net_gex_at_spot"] is None for r in rows)
+    assert "stale" in caplog.text
+
+
+def test_freshness_rejects_negative_age_directly():
+    """The guard itself, independent of the job wiring."""
+    mod = _reload("intraday_cone_writer")
+    now = datetime(2026, 9, 21, 11, 0, tzinfo=ET)
+    assert mod._gex_is_fresh(now - timedelta(minutes=1), now) is True
+    assert mod._gex_is_fresh(now, now) is True
+    assert mod._gex_is_fresh(now - timedelta(hours=3), now) is False, "too old"
+    assert mod._gex_is_fresh(now + timedelta(minutes=1), now) is False, "from the future"
+    assert mod._gex_is_fresh(now + timedelta(days=2), now) is False
+    assert mod._gex_is_fresh(None, now) is False
+
+
+@pytest.mark.asyncio
+async def test_a_session_with_no_bars_commits_nothing(monkeypatch, caplog):
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db(walk={})     # no bar at any anchor
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_writer_args(mod)) == 0
+    fake.insert_intraday_cone.assert_not_awaited()
+    assert "no SPY bar at or before" in caplog.text
 
 
 # ---------------------------------------------------------------------------

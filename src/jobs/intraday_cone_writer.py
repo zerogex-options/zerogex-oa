@@ -110,6 +110,16 @@ async def _fetch_optional(db: DatabaseManager, method: str, symbol: str, *args) 
 
 
 def _gex_is_fresh(ts: Any, now: datetime) -> bool:
+    """Whether a GEX snapshot is a live read as of ``now``.
+
+    Note the lower bound.  A naive ``(now - ts) <= GEX_MAX_STALENESS`` is True
+    for a NEGATIVE age — a surface timestamped after the anchor — which is
+    exactly what a backfill sees: reading today's walls while reconstructing
+    a fire from two days ago.  That is lookahead, and lookahead in the one
+    system whose entire value is honest grading would quietly invalidate
+    every number it publishes.  A future-dated snapshot is not fresh; it is
+    impossible, and it is rejected.
+    """
     if ts is None:
         return False
     if isinstance(ts, str):
@@ -119,23 +129,33 @@ def _gex_is_fresh(ts: Any, now: datetime) -> bool:
             return False
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=ET)
-    return (now - ts) <= GEX_MAX_STALENESS
+    age = now - ts
+    return timedelta(0) <= age <= GEX_MAX_STALENESS
 
 
 async def _build_inputs(
     db: DatabaseManager, symbol: str, day: date, now: datetime
 ) -> Optional[tuple[ConeInputs, dict[str, Any]]]:
     """Assemble one fire's inputs, plus the provenance dict for the hash."""
-    quote = await _fetch_optional(db, "get_latest_quote", symbol)
-    gex = await _fetch_optional(db, "get_latest_gex_summary", symbol)
+    # Point-in-time reads, keyed to the anchor rather than to "newest row".
+    #
+    # In live operation `now` IS the present, so these resolve to the same
+    # rows get_latest_quote / get_latest_gex_summary would have returned —
+    # one code path, no backfill branch to drift out of step. In a backfill
+    # they are the difference between a cone that re-anchors and one that
+    # does not: a Sunday run of Friday's session read Friday's CLOSING print
+    # for all 25 fires, so every band was drawn around the same price and
+    # then graded against a tape that was somewhere else all day.
+    session_open = _session_open_ts(day)
+    quote = await _fetch_optional(db, "get_quote_as_of", symbol, now, session_open)
+    gex = await _fetch_optional(db, "get_gex_summary_as_of", symbol, now, session_open)
 
-    spot = None
-    if quote and quote.get("close") is not None:
-        spot = _f(quote["close"])
-    elif gex and gex.get("spot_price") is not None:
-        spot = _f(gex["spot_price"])
+    spot = _f(quote.get("close")) if quote else None
     if spot is None or spot <= 0:
-        logger.warning("intraday_cone_writer: no spot for %s — skipping fire", symbol)
+        logger.warning(
+            "intraday_cone_writer: no %s bar at or before %s — skipping fire",
+            symbol, now.strftime("%Y-%m-%d %H:%M"),
+        )
         return None
 
     # The committed morning vol basis (see the module docstring on why this is
@@ -162,7 +182,7 @@ async def _build_inputs(
     session_extremes = None
     try:
         session_extremes = await db.get_bar_extremes_between(
-            symbol, _session_open_ts(day), now
+            symbol, session_open, now
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
