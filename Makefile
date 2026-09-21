@@ -4757,6 +4757,57 @@ cone-backfill: ## Replay a whole session's cone fires at 15m spacing. Vars: FORE
 	done
 	@echo "$(YELLOW)Now grade them:  make cone-receipt$(NC)"
 
+.PHONY: cone-calibration
+cone-calibration: ## Per-session cone report: predicted vs realized hold, and model vol basis vs what the tape did. Vars: SESSIONS=20 (default), SYMBOL=SPY (optional scope).
+	@echo "$(BLUE)=== Cone Calibration Report ===$(NC)"
+	@SESSIONS="$${SESSIONS:-20}"; \
+	SYMBOL_FILTER=""; \
+	if [ -n "$${SYMBOL}" ]; then SYMBOL_FILTER="AND symbol = '$${SYMBOL}'"; fi; \
+	echo "$(YELLOW)vol_ratio = what the tape actually did, over what the model's vol basis$(NC)"; \
+	echo "$(YELLOW)expected. 1.00 is an ordinary day. Well BELOW 1 means the bands were$(NC)"; \
+	echo "$(YELLOW)drawn for more movement than happened, so they hold more often than$(NC)"; \
+	echo "$(YELLOW)predicted -- underconfident. Well ABOVE 1 is the reverse.$(NC)"; \
+	echo "$(YELLOW)gap = realized hold rate minus mean predicted. Near 0 is calibrated.$(NC)"; \
+	echo ""; \
+	echo "$(BLUE)--- Per session x symbol ---$(NC)"; \
+	$(PSQL) -c "WITH s AS ( \
+		SELECT session_date, symbol, \
+		       COUNT(*) AS claims, \
+		       COUNT(*) FILTER (WHERE held) AS held_n, \
+		       AVG(hold_prob) AS mean_pred, \
+		       AVG(daily_sigma / NULLIF(anchor_spot,0)) AS sigma_frac, \
+		       (MAX(window_high) - MIN(window_low)) / NULLIF(AVG(anchor_spot),0) AS realized_frac \
+		FROM intraday_forecast \
+		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
+		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY session_date, symbol) \
+		SELECT session_date, symbol, claims, \
+		       ROUND(100.0 * held_n / claims, 1) AS hold_pct, \
+		       ROUND(100.0 * mean_pred, 1)       AS pred_pct, \
+		       ROUND(100.0 * (held_n::numeric / claims - mean_pred), 1) AS gap_pts, \
+		       ROUND(100.0 * sigma_frac, 3)      AS model_sigma_pct, \
+		       ROUND(100.0 * realized_frac, 3)   AS realized_range_pct, \
+		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio \
+		FROM s ORDER BY session_date DESC, symbol;"; \
+	echo ""; \
+	echo "$(BLUE)--- Per horizon (all sessions in range) ---$(NC)"; \
+	$(PSQL) -c "SELECT horizon_min, COUNT(*) AS claims, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE held) / COUNT(*), 1) AS hold_pct, \
+		       ROUND(100.0 * AVG(hold_prob), 1) AS pred_pct, \
+		       ROUND(100.0 * (COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) - AVG(hold_prob)), 1) AS gap_pts, \
+		       ROUND(AVG(brier)::numeric, 4) AS brier \
+		FROM intraday_forecast \
+		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
+		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY horizon_min ORDER BY horizon_min;"; \
+	echo ""; \
+	echo "$(YELLOW)One session decides nothing -- a quiet day and a wrong vol basis look$(NC)"; \
+	echo "$(YELLOW)identical in a single row. Backfill several sessions, including a$(NC)"; \
+	echo "$(YELLOW)volatile one, before changing any constant. If vol_ratio sits near 1$(NC)"; \
+	echo "$(YELLOW)while gap_pts stays large, the vol basis is fine and the cone geometry$(NC)"; \
+	echo "$(YELLOW)is what needs tuning. If vol_ratio is persistently far from 1, the$(NC)"; \
+	echo "$(YELLOW)basis is the problem and tuning the geometry would just paper over it.$(NC)"
+
 .PHONY: cone-prune
 cone-prune: ## Delete intraday_forecast rows for a session. Vars: SESSION=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Cone Prune (intraday_forecast) ===$(NC)"
