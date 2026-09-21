@@ -224,6 +224,10 @@ freshness/validation harness rather than writing a one-off.
 
 **Done when:** the differences are written down and *explained*, not just measured.
 
+> **Findings:** `market-data-feed-comparison-findings-2026-09.md` — ThetaData Market Value vs
+> realtime, 116 paired samples over SPY / SPX / QQQ. Evidence bar met; calendar bar (five days
+> including an OPEX Friday) not met, and that gap is recorded there rather than papered over.
+
 ### 15. Switch over, keeping the old feed warm · 1 day
 Serve everything from the new supplier; leave TradeStation running but unused for a week so a
 problem is a rollback rather than an outage.
