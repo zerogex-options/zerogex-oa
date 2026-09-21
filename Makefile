@@ -4862,6 +4862,45 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)is what needs tuning. If vol_ratio is persistently far from 1, the$(NC)"; \
 	echo "$(YELLOW)basis is the problem and tuning the geometry would just paper over it.$(NC)"
 
+.PHONY: cone-install
+cone-install: ## Install + enable ONLY the two intraday cone timers (writer 15m 09:45-15:30, grader 10:05-16:50).
+	@echo "$(BLUE)=== Installing Intraday Cone Timers ===$(NC)"
+	@echo "$(YELLOW)Deliberately narrower than forecast-install, which also re-copies and$(NC)"
+	@echo "$(YELLOW)re-enables the four daily-forecast units. Those are already running in$(NC)"
+	@echo "$(YELLOW)production, and there is no reason to touch a working cron to start a$(NC)"
+	@echo "$(YELLOW)new one.$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-writer.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-cone-receipt.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-writer.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-cone-receipt.timer
+	@echo "$(GREEN)✅ Cone timers installed$(NC)"
+	@echo ""
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-cone-*' || true
+	@echo ""
+	@echo "$(YELLOW)The writer only fires 09:45-15:30 ET Mon-Fri, so NEXT will read$(NC)"
+	@echo "$(YELLOW)tomorrow morning outside those hours -- that is the window, not a fault.$(NC)"
+	@echo "$(YELLOW)Symbols come from FORECAST_SYMBOLS in .env (systemd reads that file, NOT$(NC)"
+	@echo "$(YELLOW)your shell); unset there, the writer silently does SPY alone.$(NC)"
+	@echo "$(YELLOW)Logs:  journalctl -u zerogex-oa-forecast-cone-writer -f$(NC)"
+
+.PHONY: cone-status
+cone-status: ## Cone timers, last/next fire, recent logs, and today's committed claims.
+	@echo "$(BLUE)=== Cone Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-cone-*' || true
+	@echo ""
+	@echo "$(BLUE)=== Today's committed claims ===$(NC)"
+	@$(PSQL) -c "SELECT symbol, COUNT(*) AS claims, COUNT(DISTINCT forecast_ts) AS fires, \
+		MIN(forecast_ts) AS first_fire, MAX(forecast_ts) AS last_fire, \
+		MIN(model_version) AS model_ver \
+		FROM intraday_forecast WHERE session_date = CURRENT_DATE \
+		GROUP BY symbol ORDER BY symbol;"
+	@echo ""
+	@echo "$(BLUE)=== Recent writer log ===$(NC)"
+	@sudo journalctl -u zerogex-oa-forecast-cone-writer -n 20 --no-pager || true
+
 .PHONY: cone-tune
 cone-tune: ## Sweep cone parameters against GRADED claims offline -- no re-backfill. Vars: SESSIONS=60, HOLDOUT=0.33, OBJECTIVE=brier|gap, SYMBOL=NDX
 	@echo "$(BLUE)=== Cone Parameter Sweep (offline, against stored claims) ===$(NC)"
