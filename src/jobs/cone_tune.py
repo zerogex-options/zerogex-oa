@@ -46,6 +46,7 @@ from typing import Any, Optional
 
 from src.api.database import DatabaseManager
 from src.jobs.intraday_cone_model import (
+    CONE_PATH_EXPONENT,
     CONE_SIGMA_MULT,
     CONE_TERM_DECAY,
     GAMMA_BAND_DAMPING,
@@ -199,10 +200,10 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"  test:  {len(test):>5} claims / {len(test_s)} sessions "
           f"({'held out' if test else 'none — in-sample only'})\n")
 
-    baseline = _score(train, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5)
+    baseline = _score(train, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
     b_gap, b_brier = _summary(baseline)
     print(f"committed parameters  sigma_mult={CONE_SIGMA_MULT} "
-          f"term_decay={CONE_TERM_DECAY} path_exp=0.5")
+          f"term_decay={CONE_TERM_DECAY} path_exp={CONE_PATH_EXPONENT}")
     for r in baseline:
         print(f"   +{r['horizon']:>3}m  n={r['n']:>4}  pred {r['pred']*100:5.1f}%  "
               f"real {r['real']*100:5.1f}%  gap {r['gap']*100:+6.1f}  "
@@ -233,7 +234,8 @@ async def _run(args: argparse.Namespace) -> int:
     if test:
         t_rows = _score(test, sm, td, pe)
         t_gap, t_brier = _summary(t_rows)
-        base_t = _summary(_score(test, CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5))
+        base_t = _summary(
+            _score(test, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT))
         print(f"\nHELD-OUT sessions ({len(test_s)}):")
         for r in t_rows:
             print(f"   +{r['horizon']:>3}m  n={r['n']:>4}  pred {r['pred']*100:5.1f}%  "
@@ -244,23 +246,43 @@ async def _run(args: argparse.Namespace) -> int:
             print("   -> does NOT beat the committed parameters out of sample. "
                   "Do not ship this fit.")
 
-        # Ablation. Three fitted constants against nine sessions is enough rope
-        # to overfit with, so show what each one earns ON THE HELD-OUT SET with
-        # the others left at their committed values. A knob that buys nothing
-        # here is complexity with no claim behind it and should be reverted.
-        print("\n   ablation on held-out sessions (one knob moved at a time):")
-        base_sm, base_td, base_pe = CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5
-        for label, cand in (
-            ("sigma_mult only", (sm, base_td, base_pe)),
-            ("term_decay only", (base_sm, td, base_pe)),
-            ("path_exp only",   (base_sm, base_td, pe)),
-            ("band knobs only", (sm, td, base_pe)),
-            ("all three",       (sm, td, pe)),
-        ):
+        # Ablation, LEAVE-ONE-OUT from the committed config.
+        #
+        # The first version compared candidates against "whatever is currently
+        # committed", which degenerates the moment a fit ships: the knobs
+        # already sit at their tuned values, so moving them to those values
+        # changes nothing and every row reads identical. Each knob is instead
+        # returned to its NEUTRAL setting one at a time, and the damage is
+        # what that knob earns. A knob that costs nothing to remove is
+        # complexity with no claim behind it.
+        print("\n   leave-one-out on held-out sessions "
+              "(each knob returned to neutral):")
+        rows = [
+            ("committed", (CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)),
+            ("path_exp -> 0.5 (Brownian)",
+             (CONE_SIGMA_MULT, CONE_TERM_DECAY, 0.5)),
+            ("term_decay -> 0 (no decay)",
+             (CONE_SIGMA_MULT, 0.0, CONE_PATH_EXPONENT)),
+            ("sigma_mult -1 step",
+             (CONE_SIGMA_MULT - 0.2, CONE_TERM_DECAY, CONE_PATH_EXPONENT)),
+            ("sigma_mult +1 step",
+             (CONE_SIGMA_MULT + 0.2, CONE_TERM_DECAY, CONE_PATH_EXPONENT)),
+        ]
+        for label, cand in rows:
             g, b = _summary(_score(test, *cand))
-            print(f"     {label:18} gap {g*100:5.1f} pts   brier {b:.4f}")
-        print(f"     {'committed':18} gap {base_t[0]*100:5.1f} pts   "
-              f"brier {base_t[1]:.4f}")
+            print(f"     {label:28} gap {g*100:5.1f} pts   brier {b:.4f}")
+
+        # Per symbol. An aggregate gap near zero can be four symbols at zero
+        # or two large biases cancelling, and those call for opposite actions.
+        print("\n   held-out calibration PER SYMBOL at the committed config:")
+        for sym in sorted({c["symbol"] for c in test}):
+            sub = [c for c in test if c["symbol"] == sym]
+            r = _score(sub, CONE_SIGMA_MULT, CONE_TERM_DECAY, CONE_PATH_EXPONENT)
+            n = sum(x["n"] for x in r)
+            signed = sum(x["gap"] * x["n"] for x in r) / n if n else 0.0
+            g, b = _summary(r)
+            print(f"     {sym:5} n={n:>4}  signed gap {signed*100:+6.1f} pts   "
+                  f"|gap| {g*100:5.1f}   brier {b:.4f}")
     return 0
 
 

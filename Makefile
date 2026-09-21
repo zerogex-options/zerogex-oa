@@ -4820,6 +4820,22 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio \
 		FROM s ORDER BY session_date DESC, symbol;"; \
 	echo ""; \
+	echo "$(BLUE)--- Per SYMBOL (current cohort only) ---$(NC)"; \
+	echo "$(YELLOW)Read this before the per-horizon table. An aggregate gap near zero$(NC)"; \
+	echo "$(YELLOW)can be every symbol calibrated, or two large biases cancelling -- and$(NC)"; \
+	echo "$(YELLOW)those call for opposite actions. The published page filters by symbol,$(NC)"; \
+	echo "$(YELLOW)so a reader on one symbol sees ITS numbers, not this average.$(NC)"; \
+	$(PSQL) -c "SELECT symbol, COUNT(*) AS claims, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE held) / COUNT(*), 1) AS hold_pct, \
+		       ROUND(100.0 * AVG(hold_prob), 1) AS pred_pct, \
+		       ROUND(100.0 * (COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) \
+		                      - AVG(hold_prob)), 1) AS gap_pts, \
+		       ROUND(AVG(brier)::numeric, 4) AS brier \
+		FROM intraday_forecast \
+		WHERE held IS NOT NULL AND vol_ratio_source IS NOT NULL $${SYMBOL_FILTER} \
+		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
+		GROUP BY symbol ORDER BY gap_pts;"; \
+	echo ""; \
 	echo "$(BLUE)--- Per horizon, SPLIT BY MODEL ---$(NC)"; \
 	echo "$(YELLOW)Never read across rows here. A session backfilled under an older$(NC)"; \
 	echo "$(YELLOW)model is not evidence about the current one, and averaging the two$(NC)"; \
