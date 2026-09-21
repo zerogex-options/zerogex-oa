@@ -322,9 +322,10 @@ SELECT underlying                                   AS sym,
 \echo 'Each expiry bucket ranked against ITS OWN history in the same'
 \echo 'half-hour of the session — the only honest way to ask whether the'
 \echo 'front expiry is unusual, since 0DTE is the widest book of the year'
-\echo 'every day. b0 = 0DTE, b1 = 1DTE, b2_3, b4_7, b8_30. A bucket'
-\echo 'with no listed expiry today (2-3 DTE over a weekend) anchors on'
-\echo 'the last session that had one — read the session column. Below'
+\echo 'every day. t0 = 0DTE, t1 = 1DTE, t2_3, t4_7, t8_30, counted in'
+\echo 'TRADING SESSIONS: from a Friday, t1 is the Monday expiry. A bucket'
+\echo 'with no listed expiry today anchors on the last session that had'
+\echo 'one — read the session column. Below'
 \echo :min_sessions 'comparable sessions the page publishes no rank,'
 \echo 'and neither should you.'
 \echo ''
@@ -339,10 +340,19 @@ WITH scoped AS (
        -- The DISJOINT buckets only. surface_scopes stores two families
        -- under money_bucket = 'all': these, and the cumulative universes
        -- u0/u1/u7/u30 that back the summary strip. Listing both puts u0
-       -- beside b0 holding the identical number by construction, and
+       -- beside t0 holding the identical number by construction, and
        -- invites reading "0DTE is wide" off four rows that are the same
        -- row. The cumulative view is §1's job; this is the by-expiry cut.
-       AND dte_scope IN ('b0', 'b1', 'b2_3', 'b4_7', 'b8_30')
+       --
+       -- t* not b*: the buckets are counted in TRADING SESSIONS. The old
+       -- calendar keys put a Monday expiry three days out from a Friday,
+       -- in 2-3 DTE, ranked against contracts with two or three real
+       -- sessions left — which printed SPX and NDX at exactly the 100th
+       -- percentile on 2026-09-18. Rows under b* are a different
+       -- population and are deliberately not read; seed t* with
+       -- `make spread-surface-backfill` or these sections come back
+       -- empty rather than wrong.
+       AND dte_scope IN ('t0', 't1', 't2_3', 't4_7', 't8_30')
        AND median_relative_spread_pct IS NOT NULL
        AND trading_date > CURRENT_DATE - (:days || ' days')::interval
 ),
@@ -405,9 +415,9 @@ SELECT underlying                                   AS sym,
        contract_count                               AS contracts
   FROM ranked
  ORDER BY sym,
-          CASE dte_scope WHEN 'b0'   THEN 0 WHEN 'b1'   THEN 1
-                         WHEN 'b2_3' THEN 2 WHEN 'b4_7' THEN 3
-                         WHEN 'b8_30' THEN 4 ELSE 9 END;
+          CASE dte_scope WHEN 't0'   THEN 0 WHEN 't1'   THEN 1
+                         WHEN 't2_3' THEN 2 WHEN 't4_7' THEN 3
+                         WHEN 't8_30' THEN 4 ELSE 9 END;
 
 \echo ''
 \echo '================================================================'
@@ -445,7 +455,7 @@ front AS (
        AND option_type = :'option_type'
        AND band_pct = :band::real
        AND money_bucket = 'all'
-       AND dte_scope = 'b0'
+       AND dte_scope = 't0'
        AND median_spread IS NOT NULL
      ORDER BY underlying, trading_date DESC, bucket_start_min DESC
 )
@@ -479,7 +489,7 @@ SELECT d.underlying                                 AS sym,
           FROM spread_surface_stats s
          WHERE s.underlying = d.underlying
            AND s.option_type = :'option_type'
-           AND s.dte_scope = 'b0'
+           AND s.dte_scope = 't0'
            AND s.band_pct = :band::real
            AND s.money_bucket = 'all'
            AND s.trading_date > CURRENT_DATE - (:days || ' days')::interval)
