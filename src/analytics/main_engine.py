@@ -2400,11 +2400,27 @@ class AnalyticsEngine:
         weighted_oi_by_bucket = dict(oi_by_bucket)
         tte_cache: Dict = {}
 
+        # The profile's own entry test is sigma > 0 and oi > 0 and K > 0, so
+        # a contract failing it is silently absent from the curve whose
+        # crossing we are hunting. Count WHY, separately: a chain that is
+        # half-excluded for want of a solved IV is a different problem from
+        # one that is genuinely one-sided, and ``usable_total`` alone cannot
+        # tell them apart without the denominator beside it. (IV-less rows
+        # still reach _calculate_gex_by_strike, which reads the stored gamma
+        # the calculator computed against its 0.20 fallback -- so the two
+        # published figures do not see the same chain.)
+        excluded_no_iv = 0
+        excluded_no_oi = 0
+
         for opt in options:
             sigma = float(opt.get("implied_volatility") or 0.0)
             oi = int(opt.get("open_interest") or 0)
             K = float(opt.get("strike") or 0.0)
             if sigma <= 0 or oi <= 0 or K <= 0:
+                if oi <= 0:
+                    excluded_no_oi += 1
+                elif sigma <= 0:
+                    excluded_no_iv += 1
                 continue
 
             usable_total += 1
@@ -2475,8 +2491,13 @@ class AnalyticsEngine:
             profile_reference = profile_peak
         structural_floor = profile_reference * GAMMA_PROFILE_STRUCTURAL_MIN_FRAC
 
+        considered = len(options)
         return {
+            "considered": considered,
             "usable_total": usable_total,
+            "usable_share": usable_total / max(1, considered),
+            "excluded_no_iv": excluded_no_iv,
+            "excluded_no_oi": excluded_no_oi,
             "usable_calls": usable_calls,
             "usable_puts": usable_puts,
             "iv_p10": iv_p10,
@@ -4604,7 +4625,9 @@ def format_cycle_timing(
     The log format carries no worker name and every symbol's worker logs
     into the same journal, so the symbol is in the line itself.
     """
-    stamp = snapshot_ts if snapshot_ts.tzinfo is not None else snapshot_ts.replace(tzinfo=timezone.utc)
+    stamp = (
+        snapshot_ts if snapshot_ts.tzinfo is not None else snapshot_ts.replace(tzinfo=timezone.utc)
+    )
     stamp_epoch = stamp.timestamp()
     phase = cycle_started_wall - stamp_epoch
     duration = published_wall - cycle_started_wall
@@ -4637,9 +4660,7 @@ def format_loop_timing(
     """
     over = calc_seconds + flow_seconds - interval_seconds
     tail = (
-        f" OVERRUN by {over:.1f}s: next cycle starts late, publish phase moves"
-        if over > 0
-        else ""
+        f" OVERRUN by {over:.1f}s: next cycle starts late, publish phase moves" if over > 0 else ""
     )
     return (
         f"Loop timing [{symbol}] calc={calc_seconds:.1f}s flow={flow_seconds:.1f}s "

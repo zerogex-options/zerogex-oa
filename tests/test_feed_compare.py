@@ -1218,3 +1218,37 @@ def test_a_chain_with_no_spot_centres_on_the_ladder():
     median = sorted(ladder)[len(ladder) // 2]
     assert len(strikes) == 4
     assert min(strikes) <= median <= max(strikes), "the picked strikes must bracket the median"
+
+
+def test_the_unresolved_diagnostic_reports_what_it_threw_away(caplog):
+    """``usable=132`` means nothing without the denominator.
+
+    A QQQ sweep on 2026-09-21 reported 132 usable contracts at depth 3 and
+    the reader had no way to see that was 132 out of 240 -- 45% of the chain
+    silently absent from the curve whose crossing was being hunted. The
+    profile skips any contract with no solved IV, while
+    ``_calculate_gex_by_strike`` still counts it via the gamma the
+    calculator produced against its 0.20 fallback, so the two published
+    figures are not reading the same chain. The split has to be visible.
+    """
+    now = datetime.now(timezone.utc).replace(hour=17, minute=30, second=0, microsecond=0)
+    rows = _flip_fixture_chain(6600.0, 5.0, 10, now, calls=False)
+    # Deliberately UNEQUAL, and disjoint: equal counts would let the two
+    # reasons be swapped without the output changing.
+    no_iv, no_oi = 9, 4
+    for row in rows[:no_iv]:
+        row["implied_volatility"] = None  # solver failed; OI is fine
+    for row in rows[no_iv : no_iv + no_oi]:
+        row["open_interest"] = 0  # no OI; IV is fine
+
+    with caplog.at_level("WARNING", logger="src.tools.feed_compare"):
+        out = feed_compare._compute_analytics(rows, 6600.0, "$SPXW.X", now, label="depth=3")
+
+    assert out["gamma_flip"] is None
+    message = next(
+        r.getMessage() for r in caplog.records if "gamma_flip unresolved" in r.getMessage()
+    )
+
+    assert f"usable={len(rows) - no_iv - no_oi}/{len(rows)}" in message
+    assert f"dropped {no_iv} no-IV" in message
+    assert f"{no_oi} no-OI" in message

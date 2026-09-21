@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from src.ingestion.providers import get_provider
 from src.tools.feed_compare import (
     _compute_analytics,
+    _detect_mangled_index_symbol,
     _enrich,
     _quotes_to_option_rows,
     sample_provider,
@@ -220,6 +221,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error(f"--depths must be a comma-separated list of integers; got {args.depths!r}")
     if not depths:
         parser.error("--depths resolved to an empty list")
+
+    # `make sweep UNDERLYING='$SPXW.X'` delivers 'PXW.X': make expands $S as
+    # a variable of its own BEFORE exporting. Six rounds of a symbol that
+    # cannot exist is six wasted minutes, so reject it in the first second.
+    mangled = _detect_mangled_index_symbol(args.underlying)
+    if mangled:
+        parser.error(mangled)
 
     provider = get_provider(args.provider)
     collected: List[Dict[str, Any]] = []
