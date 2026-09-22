@@ -1127,7 +1127,13 @@ def test_a_realtime_row_keeps_its_own_ohlc():
     them -- this is the branch that tells a fallback from an overwrite."""
     bar = _bar_from_row(_REALTIME_STOCK_ROW, "QQQ")
     assert (bar.open, bar.high, bar.low, bar.close) == (741.005, 746.6, 741.0, 746.52)
-    assert bar.volume == 11145125
+    # The row's `volume` deliberately does NOT come through here. This
+    # assertion used to read `== 11145125`, which pinned the row's running
+    # DAILY total into a field meaning "volume traded during this bar" --
+    # the two differ by three orders of magnitude at the close, and a VWAP
+    # built on the wrong one still looks plausible. _SessionVolumeDelta
+    # differences it in the stream instead; see the tests below.
+    assert bar.volume is None
 
 
 def test_a_zero_mark_yields_no_bar_at_all():
@@ -1169,3 +1175,168 @@ def test_bars_can_poll_faster_than_chains(monkeypatch):
         faster.stream_index_bars("$VIX.X"),
     ):
         assert stream._poll_interval == 1.0, "the bar stream must poll at the bar cadence"
+
+
+# ---------------------------------------------------------------------------
+# Session volume: cumulative in, per-bar out
+# ---------------------------------------------------------------------------
+def _et(h, m, s=0, day=22):
+    return datetime(2026, 9, day, h, m, s, tzinfo=timezone(timedelta(hours=-4)))
+
+
+def test_the_first_observation_anchors_rather_than_booking_the_whole_session():
+    """A midday start sees a cumulative figure of millions. Reporting that
+    as one minute's volume is a ~390x spike into every z-score reading the
+    column -- and a plausible-looking one, which is worse than an obvious
+    one. Anchor where we stand and report zero."""
+    from src.ingestion.providers.thetadata import _SessionVolumeDelta
+
+    d = _SessionVolumeDelta("QQQ")
+    assert d.delta(11_145_125, _et(13, 4)) == 0
+    # ... and the very next poll is a true delta off that anchor.
+    assert d.delta(11_147_000, _et(13, 4, 30)) == 1875
+
+
+def test_volume_accumulates_within_the_minute_and_resets_across_it():
+    """The upsert is last-write-wins on the minute, so each poll must carry
+    the whole minute so far -- not that poll's increment."""
+    from src.ingestion.providers.thetadata import _SessionVolumeDelta
+
+    d = _SessionVolumeDelta("QQQ")
+    d.delta(1_000_000, _et(13, 4))
+    assert d.delta(1_000_400, _et(13, 4, 20)) == 400
+    assert d.delta(1_000_900, _et(13, 4, 40)) == 900, "running total for the minute, not 500"
+
+    # New minute: the previous minute's LAST reading is this one's floor.
+    assert d.delta(1_001_100, _et(13, 5, 5)) == 200
+    assert d.delta(1_001_500, _et(13, 5, 45)) == 600
+
+
+def test_a_session_rollover_is_not_a_step_backwards():
+    """The cumulative counter restarts at the open. Having watched the
+    previous session, the whole new figure belongs to the new session's
+    first bar -- distinct from the cold-start case above, which cannot know
+    that and anchors instead."""
+    from src.ingestion.providers.thetadata import _SessionVolumeDelta
+
+    d = _SessionVolumeDelta("QQQ")
+    d.delta(1_000_000, _et(15, 59, day=22))
+    d.delta(1_002_000, _et(15, 59, 30, day=22))
+    assert d.delta(5_000, _et(9, 30, day=23)) == 5_000
+
+
+def test_the_session_date_is_read_in_the_feeds_own_timezone():
+    """is_prior_session's reason, applied here: the rows arrive localised to
+    America/New_York and the UTC date rolls at 20:00 ET, four hours after
+    the session closed. A UTC comparison would call 20:05 ET a new session
+    every evening and re-anchor at zero, booking the whole day's cumulative
+    volume as one after-hours bar."""
+    from src.ingestion.providers.thetadata import _SessionVolumeDelta
+
+    d = _SessionVolumeDelta("QQQ")
+    d.delta(1_000_000, _et(19, 55))
+    # 20:05 ET is the SAME session; in UTC it is already the next day.
+    later = _et(20, 5)
+    assert later.astimezone(timezone.utc).date() != later.date(), "fixture must span the roll"
+    assert d.delta(1_000_300, later) == 300
+
+
+def test_a_backwards_step_inside_a_session_is_unknown_not_zero():
+    """Not a volume, and not something to invent a value for. Bar's own
+    contract spells unknown as None."""
+    from src.ingestion.providers.thetadata import _SessionVolumeDelta
+
+    d = _SessionVolumeDelta("QQQ")
+    d.delta(1_000_000, _et(13, 4))
+    assert d.delta(999_000, _et(13, 5)) is None
+
+
+def test_no_cumulative_figure_means_no_volume_claim():
+    from src.ingestion.providers.thetadata import _SessionVolumeDelta
+
+    d = _SessionVolumeDelta("QQQ")
+    assert d.delta(None, _et(13, 4)) is None
+    assert d.delta(1_000, None) is None
+
+
+def test_a_bar_row_never_carries_the_cumulative_figure_as_a_per_bar_one():
+    """_bar_from_row maps a row; the running daily total is not this bar's
+    volume and must not reach Bar.volume wearing its name."""
+    assert _bar_from_row(_REALTIME_STOCK_ROW, "QQQ").volume is None
+
+
+class _FakeStockClient:
+    """Answers the Market Value stock endpoint and the realtime OHLC one."""
+
+    def __init__(self, cumulative):
+        self.calls = []
+        self._cumulative = list(cumulative)
+
+    def stock_snapshot_market_value(self, **kw):
+        self.calls.append(("market_value", kw))
+        return [dict(_MV_STOCK_ROW)]
+
+    def stock_snapshot_ohlc(self, **kw):
+        self.calls.append(("ohlc", kw))
+        volume, ts = self._cumulative.pop(0)
+        return [{"close": 746.52, "volume": volume, "symbol": "QQQ", "timestamp": ts}]
+
+
+def test_market_value_bars_fetch_volume_from_the_realtime_endpoint():
+    """stock_snapshot_market_value answers market_bid / market_ask /
+    market_price and nothing else, so the volume takes a second call -- the
+    same standing as option_snapshot_ohlc, which this provider already makes
+    unconditionally (F4)."""
+    client = _FakeStockClient([(1_000_000, _et(13, 4)), (1_000_250, _et(13, 4, 30))])
+    provider = ThetaDataProvider(client, stage="mv", market_value_endpoints=True)
+    stream = provider.stream_underlying_bars("QQQ")
+
+    first = stream._fetch()
+    assert [k for k, _ in client.calls] == ["market_value", "ohlc"]
+    assert first.close == pytest.approx(746.51), "price still comes from Market Value"
+    assert first.volume == 0
+
+    assert stream._fetch().volume == 250
+
+
+def test_index_bars_report_no_volume_at_all():
+    """A cash index is a calculation over its constituents, not something
+    that trades. None is the fact here, not a gap -- index VWAP comes from
+    an ETF proxy's volume instead.
+
+    Asserted against a row that DOES carry a volume column, because
+    index_snapshot_ohlc sends one (see the endpoint inventory in the
+    module docstring) and it is meaningless: a running daily figure for a
+    thing with no shares. A fixture without the column would pass this test
+    whatever the code did.
+    """
+
+    class _Idx:
+        def __init__(self):
+            self.calls = []
+
+        def index_snapshot_ohlc(self, **kw):
+            self.calls.append("ohlc")
+            return [
+                {
+                    "close": 14.33,
+                    "volume": 9_999_999,
+                    "symbol": "VIX",
+                    "timestamp": _et(13, 4),
+                }
+            ]
+
+        def stock_snapshot_ohlc(self, **kw):  # pragma: no cover - must not be called
+            raise AssertionError("an index must not reach for an equity volume")
+
+    client = _Idx()
+    provider = ThetaDataProvider(client, stage="thetadata", market_value_endpoints=False)
+    assert provider.stream_index_bars("$VIX.X")._fetch().volume is None
+
+    # And on the Market Value path, where no volume arrives at all.
+    class _MvIdx:
+        def index_snapshot_market_value(self, **kw):
+            return [dict(_MV_INDEX_ROW)]
+
+    mv = ThetaDataProvider(_MvIdx(), stage="mv", market_value_endpoints=True)
+    assert mv.stream_index_bars("$VIX.X")._fetch().volume is None

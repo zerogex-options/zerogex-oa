@@ -548,6 +548,13 @@ class IngestionEngine:
             "close": data["close"],
             "up_volume": data.get("up_volume", 0),
             "down_volume": data.get("down_volume", 0),
+            # Total volume as its own fact, not as the sum of a tick-test
+            # classification.  The accumulator has carried this since it was
+            # written (TradeStation's TotalVolume) and the payload dropped it
+            # -- harmless while one vendor supplied both, load-bearing the
+            # moment a vendor supplies only the total.  No `, 0` default:
+            # absent means unknown here, and the column is nullable to say so.
+            "volume": data.get("volume"),
         }
 
         payload_sig = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
@@ -656,8 +663,9 @@ class IngestionEngine:
                 cursor.execute(
                     """
                     INSERT INTO underlying_quotes
-                    (symbol, timestamp, open, high, low, close, up_volume, down_volume)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (symbol, timestamp, open, high, low, close, up_volume, down_volume,
+                     volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (symbol, timestamp) DO UPDATE SET
                         open = COALESCE(underlying_quotes.open, EXCLUDED.open),
                         high = GREATEST(underlying_quotes.high, EXCLUDED.high),
@@ -665,6 +673,12 @@ class IngestionEngine:
                         close = EXCLUDED.close,
                         up_volume = EXCLUDED.up_volume,
                         down_volume = EXCLUDED.down_volume,
+                        -- Last-write-wins like close, and for the same
+                        -- reason: both providers report a running figure for
+                        -- the minute in progress, so the final poll of that
+                        -- minute carries its whole volume.  COALESCE would
+                        -- pin it to the first, partial reading instead.
+                        volume = EXCLUDED.volume,
                         updated_at = NOW()
                 """,
                     (
@@ -676,6 +690,7 @@ class IngestionEngine:
                         quote["close"],
                         quote["up_volume"],
                         quote["down_volume"],
+                        quote.get("volume"),
                     ),
                 )
                 # Real-time fan-out to the API workers via Postgres NOTIFY,
@@ -750,6 +765,10 @@ class IngestionEngine:
                 "high": float(quote["high"]) if quote.get("high") is not None else None,
                 "low": float(quote["low"]) if quote.get("low") is not None else None,
                 "close": float(quote["close"]) if quote.get("close") is not None else None,
+                # quote_broadcaster already forwards a "volume" key to every
+                # websocket subscriber; until this line it was never sent, so
+                # the frontend has been receiving volume: null on every tick.
+                "volume": (int(quote["volume"]) if quote.get("volume") is not None else None),
                 "up_volume": (
                     int(quote["up_volume"]) if quote.get("up_volume") is not None else None
                 ),
