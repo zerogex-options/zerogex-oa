@@ -21,6 +21,7 @@ from src.ingestion.providers import available_providers
 from src.ingestion.providers.base import ProviderCapabilityError
 from src.ingestion.providers.thetadata import (
     ThetaDataProvider,
+    _bar_from_row,
     _coerce_date,
     _normalise_strike,
     build_occ_symbol,
@@ -1077,3 +1078,94 @@ def test_stopping_a_bar_stream_does_not_wait_out_the_poll_interval():
     started = time.monotonic()
     stream.stop()
     assert time.monotonic() - started < 2.0, "stop() waited out the poll interval"
+
+
+# ---------------------------------------------------------------------------
+# Underlying bars: a Market Value row is a mark, not a bar
+# ---------------------------------------------------------------------------
+
+#: Exactly what a live terminal returned for QQQ on 2026-09-22.
+_MV_STOCK_ROW = {
+    "market_ask": 746.53,
+    "market_bid": 746.5,
+    "market_price": 746.51,
+    "symbol": "QQQ",
+    "timestamp": None,
+}
+_MV_INDEX_ROW = {"market_price": 14.33, "symbol": "VIX", "timestamp": None}
+_REALTIME_STOCK_ROW = {
+    "close": 746.52,
+    "high": 746.6,
+    "low": 741.0,
+    "open": 741.005,
+    "volume": 11145125,
+    "symbol": "QQQ",
+    "timestamp": None,
+}
+
+
+def test_a_market_value_mark_becomes_a_degenerate_bar():
+    """The Market Value endpoints carry no open, high or low.
+
+    Passed through as None they reach ``underlying_quotes`` as NULL, and
+    the site's candles -- 1-minute rows aggregated to 5-minute OHLC -- lose
+    their bodies and wicks. Seeding all three from the mark lets
+    ``_upsert_underlying_quote`` build the real candle out of the sequence
+    of polls (first-seen open, GREATEST high, LEAST low, last close).
+    """
+    bar = _bar_from_row(_MV_STOCK_ROW, "QQQ")
+    assert bar is not None
+    assert bar.open == bar.high == bar.low == bar.close == 746.51
+
+    # Indices carry market_price alone -- no bid/ask either.
+    index_bar = _bar_from_row(_MV_INDEX_ROW, "$VIX.X")
+    assert index_bar.open == index_bar.high == index_bar.low == index_bar.close == 14.33
+
+
+def test_a_realtime_row_keeps_its_own_ohlc():
+    """stock_snapshot_ohlc does supply all three. Seeding must not clobber
+    them -- this is the branch that tells a fallback from an overwrite."""
+    bar = _bar_from_row(_REALTIME_STOCK_ROW, "QQQ")
+    assert (bar.open, bar.high, bar.low, bar.close) == (741.005, 746.6, 741.0, 746.52)
+    assert bar.volume == 11145125
+
+
+def test_a_zero_mark_yields_no_bar_at_all():
+    """``_as_float`` maps a price of exactly 0 to None on purpose -- a zero
+    quote means "no quote" -- so a zero close is an absent close and the
+    row produces nothing, rather than a bar pinned at the origin."""
+    assert _bar_from_row({"market_price": 0.0, "timestamp": None}, "QQQ") is None
+
+    # And a zero in one leg of a real bar falls back to close rather than
+    # dragging the candle to zero.
+    bar = _bar_from_row({"close": 5.0, "open": 0.0, "high": 7.0, "timestamp": None}, "X")
+    assert (bar.open, bar.high, bar.low) == (5.0, 7.0, 5.0)
+
+
+def test_bars_can_poll_faster_than_chains(monkeypatch):
+    """One underlying's bar is ONE call; its chain is expirations x
+    endpoints. Sharing a single interval means either coarse candles or
+    overlapping chain polls, and at a one-second bar poll the rate IS the
+    wick resolution."""
+    monkeypatch.setenv("THETADATA_POLL_SECONDS", "5")
+    monkeypatch.setenv("THETADATA_BAR_POLL_SECONDS", "1")
+
+    provider = ThetaDataProvider(object(), stage="mv")
+    assert provider._poll_interval == 5.0
+    assert provider._bar_poll_interval == 5.0, "explicit construction ignores the env"
+
+    faster = ThetaDataProvider(object(), stage="mv", poll_interval=5.0, bar_poll_interval=1.0)
+    assert faster._poll_interval == 5.0
+    assert faster._bar_poll_interval == 1.0
+
+    # Unset, bars inherit the chain cadence so existing deployments do not
+    # silently change rate.
+    same = ThetaDataProvider(object(), stage="mv", poll_interval=3.0)
+    assert same._bar_poll_interval == 3.0
+
+    # Storing the value is not the point -- the STREAM has to run at it.
+    for stream in (
+        faster.stream_underlying_bars("QQQ"),
+        faster.stream_index_bars("$VIX.X"),
+    ):
+        assert stream._poll_interval == 1.0, "the bar stream must poll at the bar cadence"
