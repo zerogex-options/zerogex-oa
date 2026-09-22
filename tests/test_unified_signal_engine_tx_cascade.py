@@ -81,12 +81,18 @@ def _stub_cursor_with_skew_timeout(now_ts):
     }
 
     def execute_side_effect(sql, params=None):
-        # Trigger the failure on the skew query (first option_chains
-        # SELECT that filters by strike BETWEEN).
+        # Trigger the failure on the skew query: the first option_chains
+        # SELECT that reads implied_volatility over a delta band.
+        #
+        # This used to key off "strike BETWEEN", which stopped matching when
+        # skew_delta moved from percent-of-spot to delta selection -- the
+        # stub then never fired and the test passed vacuously on its own
+        # setup assertion. Keyed on the delta band now, which is what makes
+        # this query the skew query.
         if (
             not call_state["skew_raised"]
             and "option_chains" in sql
-            and "strike BETWEEN" in sql
+            and "ABS(delta) BETWEEN" in sql
             and "implied_volatility" in sql
         ):
             call_state["skew_raised"] = True

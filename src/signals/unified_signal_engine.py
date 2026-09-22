@@ -25,6 +25,7 @@ from src.signals.components.put_call_ratio_state import PutCallRatioStateCompone
 from src.signals.components.volatility_regime import VolatilityRegimeComponent
 from src.signals.advanced import AdvancedSignalEngine
 from src.signals.basic import BasicSignalEngine
+from src.signals.basic.skew_delta import delta_band as skew_delta_band
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
 from src.signals.trade_bias import TradeBiasEngine
@@ -612,37 +613,89 @@ class UnifiedSignalEngine:
                     )
 
                 # Short-dated OTM put vs OTM call IV for skew_delta.
+                #
+                # Selected by DELTA, not by percent of spot. The previous
+                # 2-5%-OTM band was a ~30 DTE equity convention applied to a
+                # 0-2 DTE chain that reaches +/-1.29% on SPX and +/-1.71% on
+                # NDX, so on both index underlyings it selected nothing and
+                # the component had never produced a reading. See the note on
+                # delta_band() in src/signals/basic/skew_delta.py.
+                #
+                # `delta` is written from the contract's OWN solved IV, or set
+                # to None when that solve failed -- the implied_volatility
+                # filter below therefore also excludes every contract whose
+                # delta came from the 0.20 default, so nothing is selected on
+                # the strength of a fallback.
                 skew_info: dict = {}
                 try:
+                    delta_lo, delta_hi = skew_delta_band()
                     cur.execute(
                         """
                         SELECT option_type,
-                               AVG(implied_volatility) AS iv
+                               AVG(implied_volatility) AS iv,
+                               AVG(ABS(delta)) AS abs_delta,
+                               AVG(ABS(strike - %s) / NULLIF(%s, 0)) * 100 AS moneyness_pct,
+                               COUNT(*) AS contracts
                         FROM option_chains
                         WHERE underlying = %s
                           AND implied_volatility IS NOT NULL
                           AND implied_volatility > 0
+                          AND delta IS NOT NULL
+                          AND ABS(delta) BETWEEN %s AND %s
                           AND timestamp >= %s - INTERVAL '30 minutes'
                           AND (
-                                (option_type = 'P' AND strike BETWEEN %s AND %s)
-                             OR (option_type = 'C' AND strike BETWEEN %s AND %s)
+                                (option_type = 'P' AND strike < %s)
+                             OR (option_type = 'C' AND strike > %s)
                           )
                         GROUP BY option_type
                         """,
                         (
+                            close_f,
+                            close_f,
                             self.db_symbol,
+                            delta_lo,
+                            delta_hi,
                             ts,
-                            close_f * 0.95,
-                            close_f * 0.98,  # OTM puts: ~2-5% OTM
-                            close_f * 1.02,
-                            close_f * 1.05,  # OTM calls: ~2-5% OTM
+                            # Belt and braces on the OTM side. |delta| in the
+                            # sampled band already implies OTM -- an ITM put
+                            # runs -0.5 to -1 -- so this only matters if delta
+                            # signs were ever wrong, in which case selecting
+                            # nothing and abstaining beats averaging an ITM
+                            # contract's IV into the skew.
+                            close_f,
+                            close_f,
                         ),
                     )
                     for r in cur.fetchall():
-                        if r[0] == "P":
-                            skew_info["otm_put_iv"] = float(r[1]) if r[1] is not None else None
-                        elif r[0] == "C":
-                            skew_info["otm_call_iv"] = float(r[1]) if r[1] is not None else None
+                        side = "put" if r[0] == "P" else "call" if r[0] == "C" else None
+                        if side is None:
+                            continue
+                        skew_info[f"otm_{side}_iv"] = float(r[1]) if r[1] is not None else None
+                        skew_info[f"{side}_abs_delta"] = (
+                            round(float(r[2]), 4) if r[2] is not None else None
+                        )
+                        skew_info[f"{side}_moneyness_pct"] = (
+                            round(float(r[3]), 4) if r[3] is not None else None
+                        )
+                        skew_info[f"{side}_contracts"] = int(r[4]) if r[4] is not None else 0
+                    if (
+                        skew_info.get("otm_put_iv") is None
+                        or skew_info.get("otm_call_iv") is None
+                    ):
+                        # Not a warning: a thin chain or an early-session
+                        # cycle legitimately has no solved IV in the band.
+                        # Logged because the alternative -- a silent abstain
+                        # scoring identically to "skew is exactly normal" --
+                        # is the failure this selection was rewritten to fix.
+                        logger.info(
+                            "UnifiedSignalEngine [%s]: skew_delta abstains -- "
+                            "|delta| in [%.2f, %.2f] matched %s put / %s call contracts",
+                            self.db_symbol,
+                            delta_lo,
+                            delta_hi,
+                            skew_info.get("put_contracts", 0),
+                            skew_info.get("call_contracts", 0),
+                        )
                 except Exception as exc:  # pragma: no cover - defensive
                     self._reset_tx(conn)
                     logger.warning(

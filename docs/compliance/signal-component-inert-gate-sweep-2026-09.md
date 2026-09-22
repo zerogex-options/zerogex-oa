@@ -115,7 +115,7 @@ ThetaData continues filling the same column.
 
 ---
 
-## S2 — `skew_delta` abstains structurally on SPX and NDX
+## S2 — `skew_delta` abstains structurally on SPX and NDX · **resolved, this commit**
 
 `unified_signal_engine.py:613-637` sources the component's only input:
 
@@ -139,8 +139,55 @@ averages IV over roughly a one-percentage-point sliver at the very edge of the c
 the least reliable strikes in it.
 
 Unlike S3 this one is *not* physics: OTM IV at 2–5% is perfectly real and measurable.
-The chain simply does not reach it. Widening `INGEST_STRIKE_PCT_RANGE` to 5% with a
-matching `INGEST_STRIKE_COUNT_MAX` would make the component work as designed.
+The chain simply does not reach it.
+
+### What was done — and why not the obvious thing
+
+The obvious fix is to widen the chain until 2–5% is reachable. That was the wrong fix, and
+measuring first is what showed it.
+
+**2–5% of spot is a ~30 DTE equity convention.** Production ingests 0–2 DTE. Computed against
+this repo's own Black-Scholes at production tenors and IVs, a 2% OTM SPY put at 0.5 DTE is past
+the 15-delta strike by a factor of four — its IV is a tail artefact and its quote is a penny
+wide. So on SPY and QQQ, where the band *did* reach, it was sampling the least meaningful
+strikes in the chain. Widening would have bought more of that on SPX and NDX.
+
+**Delta is tenor-invariant; percent of spot is not.** That is the property this signal needs,
+and it is why 25-delta is the risk-reversal convention everywhere else in options analytics.
+Measured:
+
+| underlying | chain reach | 25Δ strike, 0.5 DTE | 1 DTE | 2 DTE |
+|---|---|---|---|---|
+| SPY | ±3.03% | 0.32% | 0.44% | 0.62% |
+| QQQ | ±2.68% | 0.42% | 0.58% | 0.82% |
+| `$NDXP.X` | ±1.71% | 0.44% | 0.62% | 0.86% |
+| `$SPXW.X` | **±1.29%** | 0.29% | 0.41% | 0.57% |
+
+Comfortably inside the chain on all four, SPX included — with no config change and no extra
+data. `option_chains.delta` is already computed and stored per contract.
+
+So the selection moved to `ABS(delta) BETWEEN 0.15 AND 0.35`, symmetric around 25 delta. The
+band rather than a point is what makes the sample robust to one bad IV solve on a discrete
+ladder. `delta IS NOT NULL` plus the existing `implied_volatility IS NOT NULL` filter means no
+contract is selected on the strength of a delta derived from the 0.20 default IV.
+
+`skew_available` is now published beside the score, because `ComponentBase` defines `0.0` as
+*both* "neutral" and "insufficient data" and the score alone cannot tell a caller which it got.
+The sampled contract counts, mean |delta| and mean moneyness are published too, so the selection
+is auditable from stored rows.
+
+**What is explicitly NOT fixed: the calibration.** `_SKEW_BASELINE = 0.02` and
+`_SKEW_SATURATION = 0.04` were never fitted to data under either selection, and changing which
+strikes are sampled changes the distribution of `spread`. The level of this score is unverified
+— for the same reason it was unverified before, not a new one. No normalizer was invented for
+it, because one fitted to no data is a constant with more moving parts. The measurement is now
+possible without new machinery: one RTH session of `signal_component_scores.context_values`
+gives the per-underlying distribution of `spread`.
+
+**Calibrate both copies together.** `src/signals/advanced/range_break_imminence.py` carries its
+own `_SKEW_BASELINE` / `_SKEW_SATURATION` (`SIGNAL_RBI_*`, same defaults) reading the same two
+IVs, and weights its skew sub-score at **30** — against this component's 0.04. A
+miscalibration costs far more there.
 
 ---
 
@@ -238,8 +285,10 @@ finding.
    goes to ThetaData: `stock_snapshot_ohlc` is the **equity** tape (CTA/UTP), not the OPRA
    exposure F4 accepted, and Exhibit A's stocks line covers the adjusted bid and ask — which
    does not obviously reach a plain OHLC call. Send it with F5.
-2. **S2** — pre-existing. Two of four underlyings have never had a working skew signal.
-   Fixable by widening the chain, which is a real cost and a separate decision.
+2. **S2** — ~~pre-existing~~ **selection fixed.** All four underlyings now sample a reachable,
+   tenor-invariant strike, and the widening that looked necessary turned out to be the wrong
+   fix. Calibration of the baseline and saturation is deliberately left open and is now
+   measurable from stored rows — covering `range_break_imminence`'s duplicate constants too.
 3. **S3** — pre-existing, now self-reporting, effect measured at ≤0.1%. No urgency.
 
 All three share one shape: **a number that reads as measured when the measurement was
