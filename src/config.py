@@ -744,12 +744,30 @@ TS_RATE_LIMIT_HEADER_STALE_SECONDS = _getenv_int("TS_RATE_LIMIT_HEADER_STALE_SEC
 #        recalibrating about once a minute, reaching 4% would take a 1–2.7%
 #        move *within that minute*.
 #
-#        Reaching ±4% on SPX means ~124 strikes per expiration against the
-#        current cap of 40, i.e. roughly triple the chain.  That is a
-#        product decision (widen the chain, or narrow ``_WING_WINDOW_PCT``
-#        to what is actually ingested), not a knob to turn casually.
-#        ``gex_gradient`` now logs when the window is unreachable and
-#        publishes ``wing_window_reached`` alongside ``wing_fraction``.
+#        **Widening the chain would not help, and this was measured.**
+#        Share of |net_gex| beyond 4% of spot, through the engine's own
+#        ``_calculate_gex_by_strike`` at the tenors production ingests:
+#        QQQ 0.001, SPY 0.000, SPX 0.000.  There is no gamma out there —
+#        a 1DTE option 4% OTM at 16% IV has d1 ≈ -4.8, so its gamma is some
+#        235,000x smaller than at the money and no amount of open interest
+#        rescues it.  Reaching ±4% on SPX costs ~124 strikes an expiration
+#        against a cap of 40, roughly triple the chain, to move the damper
+#        from 1.000 to 0.999.
+#
+#        The mismatch is between the COMPONENT'S MODEL and the ingestion
+#        WINDOW, not between the window and the threshold.  A 4% wing makes
+#        sense for a 30-60 DTE book (measured 0.126 there, a damper of
+#        0.874).  This deployment ingests 0-2 DTE, where gamma is a spike
+#        at the money.
+#
+#        The only change that makes the damper bite is narrowing
+#        ``_WING_WINDOW_PCT`` to ~2%: QQQ 0.101 (x0.899), SPY 0.067
+#        (x0.933).  SPX and NDX cannot reach even 2% at the current cap,
+#        and their true share there is 0.009 — so that fixes the equities
+#        and leaves the index products where they are.
+#
+#        ``gex_gradient`` logs when the window is unreachable and publishes
+#        ``wing_window_reached`` alongside ``wing_fraction``.
 #
 # Historical context: ``bb4a78b`` introduced chunking with a 200-symbol
 # default sized for a single-underlying deployment (1100 symbols → 6
