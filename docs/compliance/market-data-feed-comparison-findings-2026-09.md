@@ -359,6 +359,14 @@ afterwards and append the result here rather than holding the cutover for it.
   `net_gex` and `gamma_flip` are therefore not always computed over the same chain.
 - **VIX / VXN CGIF coverage** — unconfirmed (F5).
 - **F4's Exhibit A gap** — accepted; correspondence is the record.
+- **Signal components whose gates the ingested chain cannot reach.** Two turned up by accident
+  during this comparison, so all six basic signals, all six registered MSI components and the three
+  gamma delegates were swept deliberately for the same shape. Three found, one of them a regression
+  this migration introduces: signed
+  underlying volume goes NULL at cutover and takes four views with it (**blocks step 15**),
+  `skew_delta` has never produced a non-abstain reading on SPX or NDX, and `gex_gradient`'s wing
+  damper has never fired. See
+  [signal-component-inert-gate-sweep-2026-09.md](signal-component-inert-gate-sweep-2026-09.md).
 
 ---
 

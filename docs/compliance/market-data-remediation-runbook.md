@@ -232,6 +232,14 @@ freshness/validation harness rather than writing a one-off.
 Serve everything from the new supplier; leave TradeStation running but unused for a week so a
 problem is a rollback rather than an outage.
 
+**Blocked on one decision first.** ThetaData cannot report a signed volume split, so
+`underlying_quotes.up_volume` / `.down_volume` go NULL on the first cycle after cutover and take
+four views with them — including the VWAP the MSI engine reads for SPX and NDX through an ETF
+proxy. Three are recoverable by differencing `stock_snapshot_ohlc` volume per poll;
+`underlying_buying_pressure` is not recoverable at all. Settle it before flipping the switch,
+not after: see
+[signal-component-inert-gate-sweep-2026-09.md](signal-component-inert-gate-sweep-2026-09.md) (S1).
+
 **Done when:** live analytics read only from the new source — checked in the query path, not assumed
 from config.
 
