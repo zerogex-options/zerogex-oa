@@ -277,9 +277,49 @@ Recorded because each cost investigation time and each looked like a vendor prob
 4. **64 QQQ contracts with no solved IV, constant at every chain depth** — one expiration's worth
    of *expired* contracts. The run was 19 minutes after the close; past the settlement instant
    `calculate_time_to_expiration` returns exactly 0.0 and the IV solver cannot touch them.
+   Confirmed by re-running mid-session on 2026-09-22: the no-IV count falls to **0–8 contracts**
+   (QQQ 1–8 of 480–960, SPX 0–6 of 240–960) and chain usability runs **79–97%**, the remainder
+   being strikes with genuinely zero open interest. There is no IV-solve problem during RTH.
 5. **IV p90 falling with chain depth** (0.356 → 0.129 across 3 → 12 expirations) — compositional.
    A three-expiration chain on a daily-expiry underlying is entirely 0–2 DTE, where the smile is
    steepest; the median barely moved. Term structure flattening, not data quality.
+
+---
+
+## The expiration-depth question, answered — and not the way it was framed
+
+`INGEST_EXPIRATIONS = 3` was the one open configuration question. Two facts pointed at raising it:
+a measured $29.91 shift in the SPX flip between three and six expirations (2026-09-16), and the
+arithmetic that on a daily-expiry underlying the `min(1, DTE/5)` ramp can never reach weight 1.0 at
+this setting. The constraint the value was originally chosen under — a TradeStation streaming
+symbol cap — does not apply to a polling deployment.
+
+A mid-session sweep on 2026-09-22 (`make chain-depth-sweep`, one fetch analysed at 3/6/9/12
+expirations so every depth reads the same quotes at the same instant, six rounds each) inverts it:
+
+| Underlying | depth 3 | depth 6 | depth 9 | depth 12 |
+|---|---|---|---|---|
+| QQQ | **resolved 6/6** — 734.66, 1.35% below spot | 0/6 | 0/6 | 0/6 |
+| `$SPXW.X` | **resolved 3/6** — 7,562.86, 2.61% below spot | 0/6 | 0/6 | 0/6 |
+
+**Only the three-expiration chain produces an actionable flip at all.** The deeper chains are not
+disagreeing about where it sits — their crossings exist but fall outside
+`GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT = 0.08`, so the resolver correctly declines them. Adding
+expirations made the flip *less* resolvable, not better determined.
+
+The mechanism is the ramp working as designed, in the opposite direction from the one assumed.
+Contracts at 3–11 DTE carry weights of 0.6–1.0 against 0–0.4 for the front three, so a deeper chain
+is dominated by longer-dated open interest — which on index products clusters at round strikes far
+from spot. That pulls the crossing away from the money. The two settings answer different
+questions: three expirations asks where *near-dated* dealer gamma flips, twelve asks where the
+*whole book* flips, and only the first is actionable on any trading horizon.
+
+The 2026-09-16 measurement stands, but it was taken on one of the rarer occasions when both depths
+resolved. It is not representative.
+
+**Conclusion: leave `INGEST_EXPIRATIONS` at 3.** Raising it would very likely make `gamma_flip`
+NULL most of the time on the two underlyings tested. This closes the question rather than carrying
+it forward.
 
 ---
 
@@ -308,11 +348,8 @@ afterwards and append the result here rather than holding the cutover for it.
 
 ## Carried forward
 
-- **`INGEST_EXPIRATIONS = 3`.** Measured to move the SPX flip $29.91 (0.39% of spot) versus six
-  expirations, against near-flip gate bands 0.6% and 0.8% wide. On a daily-expiry underlying the
-  `min(1, DTE/5)` ramp can never reach weight 1.0 at this setting. Whether the flip *converges*
-  with depth is unanswered — three attempts, all defeated by regime or by running post-close.
-  `make chain-depth-sweep` exists to settle it. Production config unchanged.
+- **`INGEST_EXPIRATIONS = 3` — leave it alone.** See "The expiration-depth question, answered"
+  below. Production config unchanged, and on this evidence it should stay that way.
 - **250%+ solved IVs.** Present in 9 of 16 samples on 2026-09-21, at every chain depth, flickering
   between consecutive polls. Solver range is [0.01, 5.0] so it is not clipping. Depth-independent;
   not investigated.

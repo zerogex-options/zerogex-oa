@@ -206,8 +206,9 @@ def _print_summary(
         )
 
     steps = [abs(r["step_from_previous"]) for r in summary.values() if r["step_from_previous"]]
+    resolved_depths = [d for d, r in summary.items() if r["mean_flip"] is not None]
+    print()
     if len(steps) >= 2:
-        print()
         if steps[-1] < steps[0] / 2:
             print(
                 "  CONVERGING: each added block of expirations moves the flip less\n"
@@ -220,11 +221,27 @@ def _print_summary(
                 "  rung as at the shallowest. It tracks how much chain was bought,\n"
                 "  which is a property of the configuration and not of the market."
             )
+    elif len(resolved_depths) == 1:
+        # Not a failed run. "Only the shallow chain resolves" is a finding in
+        # its own right, and the opposite of the one this tool was built
+        # expecting: adding expirations pushed the crossing OUT of the
+        # actionable band rather than pinning it down.
+        only = resolved_depths[0]
+        deeper = [d for d in summary if d > only]
+        print(
+            f"  ONLY DEPTH {only} RESOLVES"
+            + (f" (of {', '.join(str(d) for d in summary)})" if deeper else "")
+            + ".\n"
+            "  Nothing to converge -- there is a single point. The deeper chains\n"
+            "  do not merely disagree, they put the crossing outside the\n"
+            "  actionable band entirely, so more chain made the flip LESS\n"
+            "  resolvable rather than better determined."
+        )
     elif not steps:
         print(
-            "\n  NO VERDICT: too few depths resolved a flip to compare. A chain whose\n"
-            "  crossing sits outside the actionable band is unresolved at EVERY\n"
-            "  depth -- see the per-depth diagnostics above for which gate rejected it."
+            "  NO VERDICT: no depth resolved a flip, so there is nothing to\n"
+            "  compare. See the per-depth diagnostics above for which gate\n"
+            "  rejected the crossing at each one."
         )
     print()
 

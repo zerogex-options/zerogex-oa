@@ -174,6 +174,27 @@ def test_steady_steps_read_as_no_convergence(capsys):
     assert "is truncation" not in out, "the converging verdict must not also appear"
 
 
+def test_only_the_shallow_chain_resolving_is_a_finding_not_a_failed_run(capsys):
+    """2026-09-22, QQQ and SPX both: depth 3 resolved, 6/9/12 did not.
+
+    That is the opposite of what this tool was built expecting. Reporting
+    it as "unresolved at EVERY depth" is simply false, and it buries the
+    result -- adding expirations pushed the crossing OUT of the actionable
+    band, so more chain made the flip less resolvable, not better
+    determined.
+    """
+    rounds = [_round({3: 734.35, 6: None, 9: None, 12: None})]
+    summary = chain_depth_sweep.summarise(rounds, (3, 6, 9, 12))
+    assert summary[3]["resolved"] == 1
+    assert summary[12]["resolved"] == 0
+
+    chain_depth_sweep._print_summary(summary, "QQQ", 1)
+    out = capsys.readouterr().out
+    assert "ONLY DEPTH 3 RESOLVES" in out
+    assert "NO VERDICT" not in out, "one resolved depth is not 'nothing resolved'"
+    assert "EVERY" not in out, "the old message claimed every depth failed"
+
+
 def test_an_unresolved_chain_gives_no_verdict_rather_than_a_wrong_one(capsys):
     """2026-09-21: SPX was so long-gamma the crossing sat ~30% above spot,
     outside the 8% actionable band, and NO depth resolved. Inventing a
@@ -187,6 +208,7 @@ def test_an_unresolved_chain_gives_no_verdict_rather_than_a_wrong_one(capsys):
     out = capsys.readouterr().out
     assert "NO VERDICT" in out
     assert "CONVERGING" not in out
+    assert "ONLY DEPTH" not in out
 
 
 def test_a_partially_resolved_sweep_still_counts_what_resolved():
