@@ -146,10 +146,36 @@ def test_upsert_bars_shapes_rows():
     n = upsert_bars(conn, "SPY", rows)
     assert n == 1
     (params,) = conn._cur.rows
-    # (symbol, ts, open, high, low, close, up, down)
+    # (symbol, ts, open, high, low, close, up, down, volume)
     assert params[0] == "SPY"
-    assert len(params) == 8
+    assert len(params) == 9
     assert params[2] == 470.10
+
+
+def test_a_backfilled_bar_carries_its_total_volume():
+    """The historical endpoint omits the Up/Down split but does carry
+    TotalVolume. Before underlying_quotes had a `volume` column there was
+    nowhere to put it, so every backfilled minute read as zero volume."""
+    row = _bar_to_row(_bar(TotalVolume="2500"))
+    assert row["volume"] == 2500
+
+
+def test_a_backfilled_bar_without_a_total_says_unknown_not_zero():
+    """`_safe_bigint`'s 0 is right for the tick split -- a backfilled bar
+    genuinely has no classified volume. It is wrong for the total, where 0
+    asserts that nothing traded and is indistinguishable from a quiet minute
+    to every mean and standard deviation reading the column."""
+    row = _bar_to_row(_bar())
+    assert row["volume"] is None
+    assert (row["up_volume"], row["down_volume"]) == (1200, 800), "the split keeps its 0 default"
+
+
+def test_a_backfill_never_blanks_a_streamed_total():
+    """This tool also runs over minutes the live stream already recorded, and
+    the streamed total is the better of the two."""
+    from src.tools.underlying_backfill import _UPSERT_SQL
+
+    assert "volume = COALESCE(EXCLUDED.volume, underlying_quotes.volume)" in _UPSERT_SQL
 
 
 def test_upsert_empty_is_noop():

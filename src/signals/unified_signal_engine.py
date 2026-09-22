@@ -29,6 +29,7 @@ from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
 from src.signals.trade_bias import TradeBiasEngine
 from src.symbols import get_canonical_symbol, resolve_volume_proxy
+from src.underlying_volume_sql import total_volume as _total_volume
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -281,7 +282,7 @@ class UnifiedSignalEngine:
                 vwap_proxy = resolve_volume_proxy(self.db_symbol)
                 if vwap_proxy:
                     cur.execute(
-                        """
+                        f"""
                         WITH session_start AS (
                             SELECT (DATE(%s AT TIME ZONE 'America/New_York'))::timestamp
                                    AT TIME ZONE 'America/New_York' AS day_start
@@ -294,7 +295,7 @@ class UnifiedSignalEngine:
                               AND timestamp <= %s
                         ),
                         proxy_volume AS (
-                            SELECT timestamp, (up_volume + down_volume) AS volume
+                            SELECT timestamp, {_total_volume()} AS volume
                             FROM underlying_quotes
                             WHERE symbol = %s
                               AND timestamp >= (SELECT day_start FROM session_start)

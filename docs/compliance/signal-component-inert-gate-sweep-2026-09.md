@@ -26,7 +26,7 @@ The strike-count cap binds before the percentage does on every dense chain, so t
 
 ---
 
-## S1 — Signed underlying volume dies at cutover · **blocks step 15**
+## S1 — Signed underlying volume dies at cutover · **resolved, `b391764` + this commit**
 
 `tradestation.py:447` declares `signed_underlying_volume=True`. `thetadata.py:743`
 declares `False`, and `_bar_from_row` sets `up_volume=None, down_volume=None` —
@@ -71,8 +71,47 @@ does not obviously reach a plain OHLC call. One email to Bill, alongside the ope
 question (F5).
 
 `underlying_buying_pressure` has no path at all: no ThetaData endpoint supplies a signed split
-for equities. That view goes dark whatever is decided — the only question is whether it is
-removed or left publishing NULLs.
+for equities.
+
+### What was done
+
+The premise turned out to be wrong in a useful way. `up_volume` / `down_volume` are a
+*classification* — `schema.sql` says so itself where it defines `underlying_buying_pressure`,
+and the "Buying"/"Selling" labels were walked back once already for claiming more precision than
+a tick test has. What nobody had noticed is that their **sum was also the only record of how much
+traded at all**. Two different facts in one pair of columns. That conflation, not the missing
+split, is what turned "the feed cannot classify" into "VWAP, opening range and volume spikes all
+go dark".
+
+So they were separated:
+
+- `underlying_quotes` gained a nullable `volume` column — NULL means unknown, 0 means nothing
+  traded, no `DEFAULT` collapses the two.
+- The ingestion payload stopped dropping it. `stream_manager` has carried `volume` in its bar
+  dict since it was written (TradeStation's `TotalVolume`); `_store_underlying` built a payload
+  without it.
+- `src/underlying_volume_sql.py` now names the two expressions once. The total-volume expression
+  had been written out by hand in **22 places** across four Python modules and four views; **8**
+  value columns and **3** label columns answered `50` / `⚪ Neutral` when the split was absent.
+  All of them now read the shared fragments. That spread is the actual lesson here — the defect
+  propagated because it was spelled out by hand everywhere instead of named once.
+- `underlying_backfill` writes `TotalVolume` into the new column, so backfilled minutes stop
+  reading as zero volume. Null, not zero, where the historical endpoint omits it.
+- `quote_broadcaster` already forwarded a `volume` key to every websocket subscriber and nothing
+  ever populated it, so the frontend had been receiving `volume: null` on every tick.
+- On the ThetaData side, `_SessionVolumeDelta` converts the vendor's running **daily** cumulative
+  into the per-bar figure `Bar.volume` is defined to mean.
+
+**What is still lost.** The uptick/downtick split itself, and only that: `buy_pct`,
+`period_buy_pct`, `uptick_vol_pct`, `tick_bias`. They now return NULL and a `⚪ No Tick Data`
+label rather than the `50` and `⚪ Neutral` they used to — which was the same defect this
+document is about, sitting inside the fix for this document's worst finding. `volume`,
+`vwap`, the opening range and spike z-scores all survive intact.
+
+**Why this is safe to ship before cutover.** The provider abstraction is not yet wired into
+production ingestion, so TradeStation starts filling the new column now and the views read it
+while TradeStation is still the source. Any defect surfaces while rollback is free; at cutover
+ThetaData continues filling the same column.
 
 ---
 
@@ -164,13 +203,41 @@ degrading it. Written down so the dependency is on the record, not because it is
 
 ---
 
+## Found in passing, not fixed here
+
+`get_flow_buying_pressure` (`src/api/database.py`) and the `flow-buying-pressure` Makefile target
+both difference the underlying's volume columns with `LAG()`:
+
+```sql
+GREATEST(up_volume - LAG(up_volume) OVER (PARTITION BY symbol, DATE(...) ORDER BY timestamp), 0)
+```
+
+That is only meaningful if `underlying_quotes.up_volume` is **session-cumulative**. Two things say
+it is **per-bar**: `get_stream_bars()` returns `TotalVolume / UpVolume / DownVolume` on each
+one-minute bar, and `underlying_vwap_deviation` accumulates `SUM(up_volume + down_volume)` across
+the session, which is only correct on per-bar rows. If that reading is right, `period_buy_pct` is
+the ratio of minute-over-minute *increases* in classified volume rather than of volume — noisy
+rather than visibly broken, which is how it would survive unnoticed.
+
+Probable origin: option flow in this codebase genuinely *is* session-cumulative and is correctly
+`LAG()`-differenced (`tests/test_ingestion_volume_baseline.py` documents that for `option_chains`).
+The pattern looks copied from there onto a per-bar table.
+
+**Not fixed here, and not asserted as fact** — it needs confirming against a session's rows first,
+which this sweep did not do. The two copies must be fixed together or neither. If the data says
+*cumulative* instead, then `underlying_vwap_deviation` is what is wrong, which is a much larger
+finding.
+
+---
+
 ## Ranked
 
-1. **S1** — regression, blocks cutover, reaches paying customers. Three of the four views are
-   recoverable by differencing `stock_snapshot_ohlc` volume per poll, on the same licensing
-   posture F4 already accepted for options; `underlying_buying_pressure` is not recoverable at
-   all. Decide before step 15, and put the equity-tape question to ThetaData in the same message
-   as F5.
+1. **S1** — ~~regression, blocks cutover~~ **done.** Total volume is now its own column, read
+   through one shared expression by all eighteen former hand-written sites. Only the tick-test
+   split is lost, and it abstains rather than publishing a fabricated 50%. One question still
+   goes to ThetaData: `stock_snapshot_ohlc` is the **equity** tape (CTA/UTP), not the OPRA
+   exposure F4 accepted, and Exhibit A's stocks line covers the adjusted bid and ask — which
+   does not obviously reach a plain OHLC call. Send it with F5.
 2. **S2** — pre-existing. Two of four underlyings have never had a working skew signal.
    Fixable by widening the chain, which is a real cost and a separate decision.
 3. **S3** — pre-existing, now self-reporting, effect measured at ≤0.1%. No urgency.

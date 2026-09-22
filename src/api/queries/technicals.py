@@ -19,6 +19,10 @@ from src.api.queries._sql_helpers import (
     _normalize_timeframe,
 )
 from src.symbols import resolve_volume_proxy
+from src.underlying_volume_sql import (
+    total_volume as _total_volume,
+    uptick_share_pct as _uptick_share_pct,
+)
 
 if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
@@ -134,13 +138,13 @@ class TechnicalsQueriesMixin:
                         symbol,
                         timestamp,
                         close AS price,
-                        (up_volume + down_volume) AS volume,
-                        SUM(close * (up_volume + down_volume)) OVER (
+                        {_total_volume()} AS volume,
+                        SUM(close * {_total_volume()}) OVER (
                             PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
                             ORDER BY timestamp
                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                         ) AS cum_pv,
-                        SUM(up_volume + down_volume) OVER (
+                        SUM({_total_volume()}) OVER (
                             PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
                             ORDER BY timestamp
                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
@@ -241,7 +245,7 @@ class TechnicalsQueriesMixin:
             proxy_volume AS (
                 SELECT
                     timestamp,
-                    (up_volume + down_volume) AS volume
+                    {_total_volume()} AS volume
                 FROM underlying_quotes
                 WHERE symbol = $3
             ),
@@ -643,7 +647,7 @@ class TechnicalsQueriesMixin:
         # idx(symbol, timestamp) instead of windowing the symbol's entire quote
         # history. Column list + sigma/label semantics mirror the view exactly;
         # see setup/database/schema.sql:unusual_volume_spikes.
-        query = """
+        query = f"""
             WITH base AS (
                 SELECT
                     timestamp AT TIME ZONE 'America/New_York' AS time_et,
@@ -652,27 +656,21 @@ class TechnicalsQueriesMixin:
                     close AS price,
                     up_volume,
                     down_volume,
-                    (up_volume + down_volume) AS current_volume,
+                    {_total_volume()} AS current_volume,
                     -- Rolling baseline partitioned by ET trading day so the
                     -- open's structurally-high volume isn't measured against
                     -- the prior session's tail.
-                    AVG(up_volume + down_volume) OVER (
+                    AVG({_total_volume()}) OVER (
                         PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
                         ORDER BY timestamp
                         ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
                     ) AS avg_volume,
-                    STDDEV_SAMP(up_volume + down_volume) OVER (
+                    STDDEV_SAMP({_total_volume()}) OVER (
                         PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
                         ORDER BY timestamp
                         ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
                     ) AS volume_stddev,
-                    ROUND(
-                        COALESCE(
-                            up_volume::numeric / NULLIF((up_volume + down_volume)::numeric, 0) * 100,
-                            50
-                        ),
-                        2
-                    ) AS buying_pressure_pct
+                    {_uptick_share_pct()} AS buying_pressure_pct
                 FROM underlying_quotes
                 WHERE symbol = $1
                   -- Bound the window input to recent history (idx range scan)
@@ -755,7 +753,7 @@ class TechnicalsQueriesMixin:
         includes a ``volume_proxy`` field so callers can see which ETF's
         volume profile was substituted.
         """
-        query = """
+        query = f"""
             WITH index_quotes AS (
                 SELECT timestamp, symbol, close AS price
                 FROM underlying_quotes
@@ -766,7 +764,7 @@ class TechnicalsQueriesMixin:
                     timestamp,
                     up_volume,
                     down_volume,
-                    (up_volume + down_volume) AS volume
+                    {_total_volume()} AS volume
                 FROM underlying_quotes
                 WHERE symbol = $2
             ),
@@ -789,17 +787,7 @@ class TechnicalsQueriesMixin:
                         ORDER BY iq.timestamp
                         ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
                     ) AS volume_stddev,
-                    ROUND(
-                        COALESCE(
-                            COALESCE(pv.up_volume, 0)::numeric
-                            / NULLIF(
-                                (COALESCE(pv.up_volume, 0) + COALESCE(pv.down_volume, 0))::numeric,
-                                0
-                            ) * 100,
-                            50
-                        ),
-                        2
-                    ) AS buying_pressure_pct
+                    {_uptick_share_pct('pv')} AS buying_pressure_pct
                 FROM index_quotes iq
                 LEFT JOIN proxy_volume pv ON pv.timestamp = iq.timestamp
             )
@@ -1083,7 +1071,7 @@ class TechnicalsQueriesMixin:
             proxy = resolve_volume_proxy(symbol)
             volume_source = proxy or symbol
 
-            query = """
+            query = f"""
                 WITH bucketed_target AS (
                     SELECT
                         date_trunc('hour', timestamp)
@@ -1107,7 +1095,7 @@ class TechnicalsQueriesMixin:
                             * INTERVAL '5 minutes' AS bucket_ts,
                         SUM(up_volume) AS up_volume,
                         SUM(down_volume) AS down_volume,
-                        SUM(up_volume + down_volume) AS volume
+                        SUM({_total_volume()}) AS volume
                     FROM underlying_quotes
                     WHERE symbol = $2
                       AND timestamp BETWEEN $3 AND $5
@@ -1259,15 +1247,7 @@ class TechnicalsQueriesMixin:
                         ),
                         2
                     ) AS volume_ratio,
-                    ROUND(
-                        COALESCE(
-                            c.up_volume::numeric
-                            / NULLIF((c.up_volume + c.down_volume)::numeric, 0)
-                            * 100,
-                            50
-                        ),
-                        2
-                    ) AS buying_pressure_pct,
+                    {_uptick_share_pct('c')} AS buying_pressure_pct,
                     CASE
                         WHEN COALESCE(
                             (c.volume::numeric - c.avg_volume)

@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from src.underlying_volume_sql import total_volume as _total_volume
+
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
@@ -424,8 +426,8 @@ def fetch_hedge_impulse(
         )
         frow = cur.fetchone()
         cur.execute(
-            """
-            SELECT SUM(COALESCE(up_volume, 0) + COALESCE(down_volume, 0))
+            f"""
+            SELECT SUM({_total_volume()})
             FROM underlying_quotes
             WHERE symbol = %s
               AND timestamp <= COALESCE(%s::timestamptz, NOW())
