@@ -1714,6 +1714,12 @@ async def get_gex_gradient_signal(
     - `above_spot_gamma_abs` / `below_spot_gamma_abs` — `|Σ gamma|` for each side; USD-scaled. `null` if `source="unavailable"`.
     - `asymmetry` — `[-1, +1]`; pre-regime adjustment. Matches score sign under `net_gex < 0`, flipped under `net_gex > 0`.
     - `wing_fraction` — `[0, 1]`; share of total `|gamma|` at wing strikes (`> ±4%` OTM).
+      **Read `wing_window_reached` first.** When it is `false` the ingested chain never
+      reached ±4% (production defaults reach ±1.3% on SPX to ±3.0% on SPY), so
+      `wing_fraction` is `0` because the bucket was unmeasurable, not because the wings
+      were empty — and the confidence damper below is inert.
+    - `wing_window_reached` / `max_strike_distance_pct` — whether the wing bucket was
+      reachable at all, and how far the widest surveyed strike sat from spot.
     - `context_values.atm_gamma_abs` / `wing_gamma_abs` — absolute gamma in each bucket.
     - `context_values.above_spot_gamma_signed` / `below_spot_gamma_signed` — signed sums.
     - `context_values.strike_count` — int; strikes surveyed. Thin data → widen thresholds.

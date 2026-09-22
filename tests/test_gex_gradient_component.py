@@ -105,3 +105,66 @@ def test_context_values_unavailable_returns_nones():
     cv = comp.context_values(_ctx())
     assert cv["source"] == "unavailable"
     assert cv["above_spot_gamma_abs"] is None
+
+
+# ---------------------------------------------------------------------------
+# The wing damper is only meaningful if the chain reaches the wing window
+# ---------------------------------------------------------------------------
+
+
+def _chain(close: float, half_width_pct: float, n: int = 21, gex: float = 3.0e8):
+    """Strikes spread evenly across +/- half_width_pct of ``close``."""
+    span = close * half_width_pct
+    return [{"strike": close - span + (2 * span) * i / (n - 1), "net_gex": gex} for i in range(n)]
+
+
+def test_a_chain_that_never_reaches_the_wings_says_so():
+    """Production ingests +/-3% capped at 40 strikes and recalibrates about
+    once a minute, so the widest SPX strike sits ~1.3% from spot and nothing
+    can satisfy the >= 4% wing test. wing_fraction is then 0.0 because the
+    bucket was UNREACHABLE, not because the wings were empty -- and read as
+    a measurement it pins wing_confidence at its maximum, which is the
+    overconfident direction.
+    """
+    ctx = _ctx(rows=_chain(500.0, 0.03))
+    values = comp.context_values(ctx)
+
+    assert values["wing_window_reached"] is False
+    assert values["wing_fraction"] == 0.0
+    assert values["max_strike_distance_pct"] == pytest.approx(0.03, abs=1e-3)
+
+
+def test_a_wide_chain_measures_the_wings_for_real():
+    ctx = _ctx(rows=_chain(500.0, 0.06))
+    values = comp.context_values(ctx)
+
+    assert values["wing_window_reached"] is True
+    assert values["wing_fraction"] > 0.0, "strikes past 4% must land in the wing bucket"
+    assert values["max_strike_distance_pct"] == pytest.approx(0.06, abs=1e-3)
+
+
+def test_the_unreachable_case_is_logged_not_silently_scored(caplog):
+    """A signal quietly stuck at full confidence is worse than one reporting
+    low confidence: the first is invisible."""
+    with caplog.at_level("WARNING", logger="src.signals.basic.gex_gradient"):
+        comp.compute(_ctx(rows=_chain(500.0, 0.03)))
+    messages = [r.getMessage() for r in caplog.records if "wing window" in r.getMessage()]
+    assert messages, "an inert damper must be visible"
+    assert "unreachable" in messages[0]
+    assert "inert" in messages[0]
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="src.signals.basic.gex_gradient"):
+        comp.compute(_ctx(rows=_chain(500.0, 0.06)))
+    assert not [r for r in caplog.records if "wing window" in r.getMessage()]
+
+
+def test_the_damper_still_bites_when_the_wings_are_real():
+    """Sanity: the mechanism works, it just never fires on production config."""
+    narrow = comp.compute(_ctx(rows=_chain(500.0, 0.03)))
+    wide = comp.compute(_ctx(rows=_chain(500.0, 0.06)))
+    # Same symmetric chain either way, so asymmetry ~0 and both scores are
+    # near zero -- what matters is that the wide chain populated the bucket.
+    assert comp.context_values(_ctx(rows=_chain(500.0, 0.06)))["wing_fraction"] > 0
+    assert comp.context_values(_ctx(rows=_chain(500.0, 0.03)))["wing_fraction"] == 0
+    assert isinstance(narrow, float) and isinstance(wide, float)

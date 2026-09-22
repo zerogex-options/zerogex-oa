@@ -25,6 +25,9 @@ from __future__ import annotations
 import os
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.utils import get_logger
+
+logger = get_logger(__name__)
 
 # Strikes within this percent of spot are treated as "near" (ATM window).
 _ATM_WINDOW_PCT = float(os.getenv("SIGNAL_GEX_GRADIENT_ATM_PCT", "0.015"))
@@ -74,6 +77,22 @@ class GexGradientComponent(ComponentBase):
         # dampens directional edge.
         wing_fraction = buckets["wing_fraction"]
         wing_confidence = max(0.25, 1.0 - wing_fraction)  # never fully dampen
+        if not buckets["wing_window_reached"]:
+            # The damper is inert, not satisfied. Left silent this reads as
+            # "measured the wings, found none" and the score goes out at
+            # FULL confidence -- the overconfident direction, which is the
+            # dangerous one. Widening the score's own behaviour here would
+            # change published signals, so say so and leave the number
+            # alone; the fix is a config decision, not this function's.
+            logger.warning(
+                "gex_gradient[%s]: wing window (>=%.1f%%) unreachable -- widest strike "
+                "is %.2f%% from spot, so wing_fraction=0 means UNMEASURED, not empty, "
+                "and the wing confidence damper is inert at %.2f",
+                getattr(ctx, "symbol", "?"),
+                100 * _WING_WINDOW_PCT,
+                100 * buckets["max_strike_distance_pct"],
+                wing_confidence,
+            )
 
         # Replace the previous hard cutoff at _MIN_TOTAL_GAMMA with a soft
         # confidence ramp so thin-OI snapshots taper toward zero rather
@@ -108,6 +127,11 @@ class GexGradientComponent(ComponentBase):
             "above_spot_gamma_signed": round(buckets["above_signed_gamma"], 2),
             "below_spot_gamma_signed": round(buckets["below_signed_gamma"], 2),
             "wing_fraction": round(buckets["wing_fraction"], 4),
+            #: False means the ingested chain never reached +/-_WING_WINDOW_PCT,
+            #: so wing_fraction above is not a measurement. Read it before
+            #: reading wing_fraction.
+            "wing_window_reached": buckets["wing_window_reached"],
+            "max_strike_distance_pct": round(buckets["max_strike_distance_pct"], 4),
             "asymmetry": round(asymmetry, 4),
             "strike_count": buckets["strike_count"],
         }
@@ -129,6 +153,7 @@ class GexGradientComponent(ComponentBase):
         above_signed = 0.0
         below_signed = 0.0
         strike_count = 0
+        max_abs_distance = 0.0
 
         for row in rows:
             strike = row.get("strike") if isinstance(row, dict) else None
@@ -150,6 +175,7 @@ class GexGradientComponent(ComponentBase):
             elif distance < 0:
                 below_abs += abs_gex
                 below_signed += gex_f
+            max_abs_distance = max(max_abs_distance, abs_distance)
             if abs_distance <= _ATM_WINDOW_PCT:
                 atm_abs += abs_gex
             elif abs_distance >= _WING_WINDOW_PCT:
@@ -157,6 +183,15 @@ class GexGradientComponent(ComponentBase):
 
         total_abs = above_abs + below_abs
         wing_fraction = wing_abs / total_abs if total_abs > 0 else 0.0
+        # Did the surveyed chain REACH the wing window at all? Ingestion
+        # selects strikes within INGEST_STRIKE_PCT_RANGE of spot, capped at
+        # INGEST_STRIKE_COUNT_MAX, and recalibrates about once a minute --
+        # so on production's defaults the widest strike sits ~1.3% (SPX) to
+        # ~3.0% (SPY) from the money and NOTHING ever satisfies the >= 4%
+        # test. wing_fraction is then 0.0 because the bucket was
+        # unreachable, not because the wings were empty, and those are
+        # different claims. Report which one this is.
+        wing_window_reached = max_abs_distance >= _WING_WINDOW_PCT
         return {
             "above_abs_gamma": above_abs,
             "below_abs_gamma": below_abs,
@@ -165,5 +200,7 @@ class GexGradientComponent(ComponentBase):
             "atm_gamma_abs": atm_abs,
             "wing_gamma_abs": wing_abs,
             "wing_fraction": min(1.0, wing_fraction),
+            "wing_window_reached": wing_window_reached,
+            "max_strike_distance_pct": max_abs_distance,
             "strike_count": strike_count,
         }

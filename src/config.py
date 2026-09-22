@@ -724,10 +724,32 @@ TS_RATE_LIMIT_HEADER_STALE_SECONDS = _getenv_int("TS_RATE_LIMIT_HEADER_STALE_SEC
 #        on dense-chain underlyings (typically SPX with $5 strikes);
 #        SPY/QQQ usually sit below the cap already.  Vol surface and GEX-
 #        gradient signals soft-clamp on lower density.
-#     3. ``INGEST_STRIKE_PCT_RANGE`` — DO NOT CUT BELOW 4.0.  The wing
-#        GEX signal (``src/signals/basic/gex_gradient.py`` ``_WING_WINDOW_PCT
-#        = 0.04``) hard-depends on streamed strikes reaching ±4%; below
-#        that the wing-fraction confidence collapses to zero.
+#     3. ``INGEST_STRIKE_PCT_RANGE`` — the wing GEX signal
+#        (``src/signals/basic/gex_gradient.py`` ``_WING_WINDOW_PCT = 0.04``)
+#        buckets any strike at ≥4% from spot as "wing", and dampens its
+#        confidence by ``max(0.25, 1 - wing_fraction)``.
+#
+#        **The default 3.0 is already below that, and the damper is inert
+#        in production.**  Worse, an earlier version of this note had the
+#        consequence backwards: confidence does not collapse, it pins at
+#        its MAXIMUM of 1.0, because an unreachable bucket and an empty one
+#        both read as ``wing_fraction = 0``.  The signal is systematically
+#        OVERCONFIDENT, which is the direction that does not announce
+#        itself.
+#
+#        ``INGEST_STRIKE_COUNT_MAX`` binds before the percentage does on
+#        every dense chain, so raising this alone fixes nothing.  Measured
+#        2026-09-22 at production defaults — widest strike from spot:
+#        SPY ±3.03%, QQQ ±2.68%, NDX ±1.71%, SPX ±1.29%.  With strikes
+#        recalibrating about once a minute, reaching 4% would take a 1–2.7%
+#        move *within that minute*.
+#
+#        Reaching ±4% on SPX means ~124 strikes per expiration against the
+#        current cap of 40, i.e. roughly triple the chain.  That is a
+#        product decision (widen the chain, or narrow ``_WING_WINDOW_PCT``
+#        to what is actually ingested), not a knob to turn casually.
+#        ``gex_gradient`` now logs when the window is unreachable and
+#        publishes ``wing_window_reached`` alongside ``wing_fraction``.
 #
 # Historical context: ``bb4a78b`` introduced chunking with a 200-symbol
 # default sized for a single-underlying deployment (1100 symbols → 6
