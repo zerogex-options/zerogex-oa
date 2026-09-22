@@ -97,6 +97,7 @@ def test_underlying_upsert_aggregates_intraminute_does_not_overwrite(monkeypatch
             "close": 5502.0,
             "up_volume": 1000,
             "down_volume": 400,
+            "volume": 1400,
         }
     )
 
@@ -123,9 +124,12 @@ def test_underlying_upsert_aggregates_intraminute_does_not_overwrite(monkeypatch
     assert "high = EXCLUDED.high" not in norm
     assert "low = EXCLUDED.low" not in norm
 
-    # The INSERT column/param contract is unchanged (8 cols, 8 params,
-    # same order) — the fix is conflict-clause-only.
-    assert norm.count("%s") == 8
+    # Total volume is last-write-wins like close, and for the same reason:
+    # both providers report a running figure for the minute in progress.
+    assert "volume = EXCLUDED.volume" in norm
+
+    # 9 cols, 9 params, same order (volume appended).
+    assert norm.count("%s") == 9
     assert params == (
         "SPX",
         datetime(2026, 5, 15, 14, 31, tzinfo=timezone.utc),
@@ -135,6 +139,7 @@ def test_underlying_upsert_aggregates_intraminute_does_not_overwrite(monkeypatch
         5502.0,
         1000,
         400,
+        1400,
     )
 
 

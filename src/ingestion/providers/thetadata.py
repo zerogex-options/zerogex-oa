@@ -118,6 +118,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -618,6 +619,83 @@ def _to_quote(symbol: str, state: Dict[str, Any]) -> OptionQuote:
         # this vendor's catalogue.
         implied_volatility=None,
     )
+
+
+class _SessionVolumeDelta:
+    """Running session-cumulative volume in, per-bar volume out.
+
+    ``stock_snapshot_ohlc`` serves a running DAILY bar, so its ``volume`` is
+    everything traded since the session open. ``Bar.volume`` means the volume
+    traded during one bar. Differencing successive observations converts the
+    first into the second.
+
+    Anchored on the minute the bar belongs to, the same shape as the
+    ``_bar_state`` carry-forward on the TradeStation path: the previous
+    minute's last reading is this minute's starting point. Within a minute
+    the delta grows with each poll, and the upsert is last-write-wins on
+    that minute, so the value that survives is the whole minute's volume.
+
+    Three cases are not a subtraction:
+
+    * **The first observation of the process.** Anchors where it stands and
+      reports zero rather than booking session-to-date as one bar -- at a
+      midday start that would be a ~390x spike into every z-score reading
+      this column, and a plausible-looking one. The cost is that the first
+      minute after a restart reports only what arrived after the restart.
+      One understated bar, self-healing at the next minute boundary.
+    * **A session rollover this object watched happen.** The cumulative
+      figure restarts at the open, so everything on the clock belongs to the
+      new session's first bar: anchor at zero and report it in full. Told
+      apart from the case above by having seen a prior session date, and
+      from the case below by the date actually changing.
+    * **A step backwards inside one session.** Not a volume, and not
+      something to guess a value for. Reported as ``None`` -- unknown, the
+      way ``Bar``'s own contract spells it -- and logged, because a vendor
+      unwinding a cumulative counter is worth seeing.
+
+    The session date is read in the timestamp's OWN timezone, for the reason
+    :func:`is_prior_session` gives: the rows arrive localised to
+    America/New_York and the UTC date rolls at 20:00 ET, four hours after
+    the session it belongs to has closed.
+    """
+
+    def __init__(self, db_symbol: str) -> None:
+        self._db_symbol = db_symbol
+        self._day: Optional[date] = None
+        self._bucket: Optional[datetime] = None
+        self._anchor: int = 0
+        self._last: Optional[int] = None
+
+    def delta(self, cumulative: Optional[int], timestamp: Any) -> Optional[int]:
+        """Per-bar volume, or ``None`` when it cannot be known."""
+        if cumulative is None or not isinstance(timestamp, datetime):
+            return None
+
+        day = timestamp.date()
+        bucket = timestamp.replace(second=0, microsecond=0)
+
+        if self._day is None:
+            self._anchor = cumulative
+        elif day != self._day:
+            self._anchor = 0
+        elif bucket != self._bucket:
+            self._anchor = self._last if self._last is not None else cumulative
+
+        self._day = day
+        self._bucket = bucket
+        self._last = cumulative
+
+        volume = cumulative - self._anchor
+        if volume < 0:
+            logger.warning(
+                "%s: session volume stepped backwards (%d below the %d anchor); "
+                "reporting this bar's volume as unknown",
+                self._db_symbol,
+                -volume,
+                self._anchor,
+            )
+            return None
+        return volume
 
 
 class _PollingBarStream(BarStream):
@@ -1262,10 +1340,52 @@ class ThetaDataProvider(MarketDataProvider):
         resolved = db_symbol or symbol
         root = option_root_for(symbol)
 
+        volume_delta = _SessionVolumeDelta(resolved)
+
         def fetch() -> Optional[Bar]:
             call = self._endpoint("stock_snapshot_market_value", "stock_snapshot_ohlc")
             rows = _rows(call(symbol=root))
-            return _bar_from_row(rows[0], resolved) if rows else None
+            if not rows:
+                return None
+            bar = _bar_from_row(rows[0], resolved)
+            if bar is None:
+                return None
+
+            # Volume comes from stock_snapshot_ohlc either way. On the
+            # Market Value path the primary call above is
+            # stock_snapshot_market_value, which answers market_bid /
+            # market_ask / market_price and nothing else -- so the volume
+            # takes a second call. That call is realtime data rather than
+            # Market Value, the same standing as option_snapshot_ohlc and
+            # option_snapshot_open_interest, which this provider already
+            # makes unconditionally: see F4 in
+            # docs/compliance/market-data-feed-comparison-findings-2026-09.md.
+            #
+            # Worth knowing what it is and is not. The client defaults
+            # stock_snapshot_quote to venue="nqb" -- Nasdaq Basic, a
+            # fraction of consolidated tape volume, not the whole market.
+            # Every view that reads this column is scale-invariant
+            # (a volume-weighted mean, a z-score against a rolling mean and
+            # standard deviation), so a consistent fraction cancels and the
+            # published figures stay correct. An absolute share count
+            # displayed as market volume would NOT be correct, and nothing
+            # should start doing that on the strength of this column.
+            source = rows[0]
+            if _pick(source, "volume") is None:
+                ohlc = _rows(self._client.stock_snapshot_ohlc(symbol=root))
+                source = ohlc[0] if ohlc else {}
+
+            return replace(
+                bar,
+                volume=volume_delta.delta(
+                    _as_int(_pick(source, "volume")),
+                    # The vendor's own localised timestamp, not bar.timestamp:
+                    # _coerce_datetime has already converted that one to UTC,
+                    # where the date rolls at 20:00 ET and would call the
+                    # afternoon a new session every evening.
+                    _pick(source, "timestamp"),
+                ),
+            )
 
         return _PollingBarStream(
             fetch, resolved, poll_interval=self._bar_poll_interval, wakeup=wakeup
@@ -1295,7 +1415,15 @@ class ThetaDataProvider(MarketDataProvider):
             # fees on half this deployment's underlyings.
             call = self._endpoint("index_snapshot_market_value", "index_snapshot_ohlc")
             rows = _rows(call(symbol=root))
-            return _bar_from_row(rows[0], resolved) if rows else None
+            if not rows:
+                return None
+            # volume stays None, and _bar_from_row already leaves it there.
+            # A cash index has no share volume of its own -- SPX is a
+            # calculation over its constituents, not something that trades --
+            # so None here is the fact, not a gap. Index VWAP is computed
+            # from an ETF proxy's volume instead; see the proxy_volume CTE in
+            # unified_signal_engine.
+            return _bar_from_row(rows[0], resolved)
 
         return _PollingBarStream(fetch, resolved, poll_interval=self._bar_poll_interval)
 
@@ -1410,7 +1538,18 @@ def _bar_from_row(row: Dict[str, Any], db_symbol: str) -> Optional[Bar]:
         high=_first_not_none(_as_float(_pick(row, "high")), close),
         low=_first_not_none(_as_float(_pick(row, "low")), close),
         close=close,
-        volume=_as_int(_pick(row, "volume")),
+        # NOT the row's own `volume`. ``Bar.volume`` means volume traded
+        # during THIS bar -- what TradeStation's TotalVolume carries and
+        # what every consumer of underlying_quotes.volume assumes: the VWAP
+        # view sums it, the opening-range and spike views take its mean and
+        # standard deviation. What stock_snapshot_ohlc reports is a running
+        # DAILY bar, so its `volume` is cumulative since the session open.
+        # Passing that through would be a unit mismatch across providers and
+        # a silent one -- cumulative volume climbs monotonically all day, so
+        # a VWAP built on it weights the close ~390x the open and still looks
+        # plausible. _PollingBarStream differences it instead, via
+        # _SessionVolumeDelta, and sets the per-bar figure here.
+        volume=None,
         # None, not 0: this feed cannot report a signed split at all, which
         # is a different statement from "no signed volume this bar".
         up_volume=None,

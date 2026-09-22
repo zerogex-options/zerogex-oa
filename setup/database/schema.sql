@@ -56,6 +56,22 @@ BEGIN
     END IF;
 END $$;
 
+-- Total volume traded during the bar, independent of the tick-test split.
+--
+-- up_volume/down_volume are a CLASSIFICATION (see the note on
+-- underlying_buying_pressure below), and until now their sum was also the
+-- only record of how much traded at all.  That conflated two different
+-- facts, and the cost showed up at the vendor migration: ThetaData cannot
+-- report a signed split, so every volume-derived view -- VWAP, opening
+-- range, volume spikes -- would have gone dark along with the
+-- classification, for want of a number the feed does supply.
+--
+-- NULL, not 0, and no DEFAULT: an absent volume is unknown, a zero volume
+-- is a bar in which nothing traded, and the views distinguish them.  Rows
+-- written before this column existed carry NULL and are read through
+-- COALESCE(volume, up_volume + down_volume), so history keeps working.
+ALTER TABLE underlying_quotes ADD COLUMN IF NOT EXISTS volume BIGINT;
+
 -- =============================================================================
 -- session_levels — captured pre-market + previous-session high/low
 -- =============================================================================
@@ -1210,8 +1226,19 @@ SELECT
     q.symbol,
     q.close AS price,
     (q.up_volume - q.down_volume)::bigint AS uptick_minus_downtick_vol,
-    ROUND(COALESCE((q.up_volume::numeric / NULLIF((q.up_volume + q.down_volume), 0)) * 100, 50), 2) AS uptick_vol_pct,
+    -- The 50 is for a bar in which nothing traded -- no ticks either way is
+    -- genuinely balanced.  It is NOT for a feed that cannot classify at all:
+    -- there the honest answer is that we do not know, and COALESCE alone
+    -- would answer "50%, Neutral" with total confidence, forever, on a
+    -- column nobody would think to re-check.  That is the failure this
+    -- project has now found four times; see
+    -- docs/compliance/signal-component-inert-gate-sweep-2026-09.md.
     CASE
+        WHEN q.up_volume IS NULL OR q.down_volume IS NULL THEN NULL
+        ELSE ROUND(COALESCE((q.up_volume::numeric / NULLIF((q.up_volume + q.down_volume), 0)) * 100, 50), 2)
+    END AS uptick_vol_pct,
+    CASE
+        WHEN q.up_volume IS NULL OR q.down_volume IS NULL THEN '⚪ No Tick Data'
         WHEN (q.up_volume - q.down_volume) >= 50000 THEN '🟢 Strong Uptick Bias'
         WHEN (q.up_volume - q.down_volume) > 0 THEN '✅ Uptick Bias'
         WHEN (q.up_volume - q.down_volume) <= -50000 THEN '❌ Downtick Bias'
@@ -1220,8 +1247,12 @@ SELECT
     -- Backwards-compat aliases so existing Makefile / dashboard SQL
     -- keeps working.  New code should read the canonical names above.
     (q.up_volume - q.down_volume)::bigint AS vol,
-    ROUND(COALESCE((q.up_volume::numeric / NULLIF((q.up_volume + q.down_volume), 0)) * 100, 50), 2) AS buy_pct,
     CASE
+        WHEN q.up_volume IS NULL OR q.down_volume IS NULL THEN NULL
+        ELSE ROUND(COALESCE((q.up_volume::numeric / NULLIF((q.up_volume + q.down_volume), 0)) * 100, 50), 2)
+    END AS buy_pct,
+    CASE
+        WHEN q.up_volume IS NULL OR q.down_volume IS NULL THEN '⚪ No Tick Data'
         WHEN (q.up_volume - q.down_volume) >= 50000 THEN '🟢 Strong Uptick Bias'
         WHEN (q.up_volume - q.down_volume) > 0 THEN '✅ Uptick Bias'
         WHEN (q.up_volume - q.down_volume) <= -50000 THEN '❌ Downtick Bias'
@@ -1239,13 +1270,16 @@ WITH base AS (
         symbol,
         timestamp,
         close AS price,
-        (up_volume + down_volume) AS volume,
-        SUM(close * (up_volume + down_volume)) OVER (
+        -- Prefer the measured total; fall back to the tick-test split's sum
+        -- for rows written before underlying_quotes.volume existed.  Both
+        -- are the same quantity, and only one vendor supplies both.
+        COALESCE(volume, up_volume + down_volume) AS volume,
+        SUM(close * COALESCE(volume, up_volume + down_volume)) OVER (
             PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
             ORDER BY timestamp
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS cum_pv,
-        SUM(up_volume + down_volume) OVER (
+        SUM(COALESCE(volume, up_volume + down_volume)) OVER (
             PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
             ORDER BY timestamp
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
@@ -1304,7 +1338,7 @@ SELECT
         WHEN q.close <= orb.orb_low * 1.002 THEN '⚡ Near ORB Low'
         ELSE '⏸️ Inside ORB'
     END AS orb_status,
-    (q.up_volume + q.down_volume) AS volume
+    COALESCE(q.volume, q.up_volume + q.down_volume) AS volume
 FROM underlying_quotes q
 JOIN first_30min orb
   ON q.symbol = orb.symbol
@@ -1320,30 +1354,35 @@ WITH base AS (
         close AS price,
         up_volume,
         down_volume,
-        (up_volume + down_volume) AS current_volume,
+        COALESCE(volume, up_volume + down_volume) AS current_volume,
         -- Rolling baseline must NOT span the trading-day boundary: the
         -- opening 30 minutes are structurally 5-20x midday volume, so a
         -- window that reaches back into the prior session's close/after-
         -- hours bars makes volume_sigma fire "Extreme Spike" on every
         -- routine open. Partition by ET trading day (same convention as
         -- the cumulative VWAP window in underlying_vwap_deviation).
-        AVG(up_volume + down_volume) OVER (
+        AVG(COALESCE(volume, up_volume + down_volume)) OVER (
             PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
             ORDER BY timestamp
             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
         ) AS avg_volume,
-        STDDEV_SAMP(up_volume + down_volume) OVER (
+        STDDEV_SAMP(COALESCE(volume, up_volume + down_volume)) OVER (
             PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
             ORDER BY timestamp
             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
         ) AS volume_stddev,
-        ROUND(
-            COALESCE(
-                up_volume::numeric / NULLIF((up_volume + down_volume)::numeric, 0) * 100,
-                50
-            ),
-            2
-        ) AS buying_pressure_pct
+        -- NULL when the feed cannot classify, 50 only when nothing traded.
+        -- Same reasoning as underlying_buying_pressure above.
+        CASE
+            WHEN up_volume IS NULL OR down_volume IS NULL THEN NULL
+            ELSE ROUND(
+                COALESCE(
+                    up_volume::numeric / NULLIF((up_volume + down_volume)::numeric, 0) * 100,
+                    50
+                ),
+                2
+            )
+        END AS buying_pressure_pct
     FROM underlying_quotes
 )
 SELECT
