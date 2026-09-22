@@ -755,6 +755,7 @@ class ThetaDataProvider(MarketDataProvider):
         *,
         stage: str = "realtime",
         poll_interval: float = 5.0,
+        bar_poll_interval: Optional[float] = None,
         oi_poll_interval: float = 900.0,
         strike_range: Optional[int] = None,
         market_value_endpoints: bool = False,
@@ -788,6 +789,11 @@ class ThetaDataProvider(MarketDataProvider):
         # endpoints on a single terminal; the terminal "stage" selects it
         # for websocket streaming instead. See the module docstring.
         self._market_value_endpoints = market_value_endpoints
+        #: Bars poll on their own cadence. One call per underlying, so this
+        #: can run far tighter than the chain without threatening the
+        #: 8-concurrent budget -- and the candles are built from the
+        #: sequence of marks, so the rate IS the wick resolution.
+        self._bar_poll_interval = poll_interval if bar_poll_interval is None else bar_poll_interval
 
     @classmethod
     def from_env(cls, *, stage: Optional[str] = None) -> "ThetaDataProvider":
@@ -841,6 +847,15 @@ class ThetaDataProvider(MarketDataProvider):
                 os.getenv("THETADATA_MAX_CONCURRENCY", str(_DEFAULT_MAX_CONCURRENCY))
             ),
             poll_interval=float(os.getenv("THETADATA_POLL_SECONDS", "5")),
+            # Bars and chains cost wildly different amounts and want
+            # different cadences. One underlying's bar is ONE call; its
+            # chain is expirations x endpoints. Tying both to one knob
+            # means either the candles are coarse or the chain polls
+            # overlap. Defaults to THETADATA_POLL_SECONDS so an unset
+            # deployment behaves exactly as before.
+            bar_poll_interval=float(
+                os.getenv("THETADATA_BAR_POLL_SECONDS") or os.getenv("THETADATA_POLL_SECONDS", "5")
+            ),
             oi_poll_interval=float(os.getenv("THETADATA_OI_POLL_SECONDS", "900")),
             strike_range=(
                 int(os.getenv("THETADATA_STRIKE_RANGE"))
@@ -1252,7 +1267,9 @@ class ThetaDataProvider(MarketDataProvider):
             rows = _rows(call(symbol=root))
             return _bar_from_row(rows[0], resolved) if rows else None
 
-        return _PollingBarStream(fetch, resolved, poll_interval=self._poll_interval, wakeup=wakeup)
+        return _PollingBarStream(
+            fetch, resolved, poll_interval=self._bar_poll_interval, wakeup=wakeup
+        )
 
     def stream_index_bars(
         self,
@@ -1280,7 +1297,7 @@ class ThetaDataProvider(MarketDataProvider):
             rows = _rows(call(symbol=root))
             return _bar_from_row(rows[0], resolved) if rows else None
 
-        return _PollingBarStream(fetch, resolved, poll_interval=self._poll_interval)
+        return _PollingBarStream(fetch, resolved, poll_interval=self._bar_poll_interval)
 
     def stream_futures_bars(
         self,
@@ -1349,6 +1366,17 @@ class ThetaDataProvider(MarketDataProvider):
         return build_occ_symbol(root, expiration, strike, option_type)
 
 
+def _first_not_none(value: Optional[float], fallback: float) -> float:
+    """``value`` unless it is absent.
+
+    Written as an explicit None test rather than ``or`` so the intent is
+    local. ``_as_float`` already maps a price of exactly 0 to None on
+    purpose -- a zero quote means "no quote" -- so today the two spellings
+    agree; this one keeps agreeing if that policy ever changes.
+    """
+    return fallback if value is None else value
+
+
 def _bar_from_row(row: Dict[str, Any], db_symbol: str) -> Optional[Bar]:
     close = _as_float(_pick(row, "close"))
     if close is None:
@@ -1361,9 +1389,26 @@ def _bar_from_row(row: Dict[str, Any], db_symbol: str) -> Optional[Bar]:
         # stale bar as current. Falls back to now() only when the feed
         # sent no timestamp at all.
         timestamp=_coerce_datetime(_pick(row, "timestamp")) or datetime.now(timezone.utc),
-        open=_as_float(_pick(row, "open")),
-        high=_as_float(_pick(row, "high")),
-        low=_as_float(_pick(row, "low")),
+        # A Market Value row is a MARK, not a bar: verified 2026-09-22, the
+        # stock endpoint answers market_bid / market_ask / market_price and
+        # the index endpoint answers market_price alone. Neither carries
+        # open, high or low.
+        #
+        # Passed through as None those reach underlying_quotes as NULL, and
+        # the candles the site draws -- 1-minute rows aggregated to 5-minute
+        # OHLC -- lose their bodies and wicks entirely. So present the mark
+        # as the degenerate bar it is, open = high = low = close, and let
+        # IngestionEngine._upsert_underlying_quote build the real candle out
+        # of the sequence: first-seen open, GREATEST high, LEAST low, last
+        # close. At a one-second poll that is sixty observations a minute.
+        #
+        # Only when the row carries none of its own. The realtime
+        # stock_snapshot_ohlc endpoint does supply all three -- as a running
+        # DAILY bar, which is its own problem and not this function's to
+        # solve.
+        open=_first_not_none(_as_float(_pick(row, "open")), close),
+        high=_first_not_none(_as_float(_pick(row, "high")), close),
+        low=_first_not_none(_as_float(_pick(row, "low")), close),
         close=close,
         volume=_as_int(_pick(row, "volume")),
         # None, not 0: this feed cannot report a signed split at all, which
