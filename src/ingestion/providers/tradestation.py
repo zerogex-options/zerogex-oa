@@ -149,7 +149,12 @@ class _OptionQuoteStreamAdapter(OptionQuoteStream):
         self._acc.stop()
 
     def is_alive(self) -> bool:
-        return bool(self._acc.is_alive())
+        # NO parentheses: the accumulator exposes is_alive as a PROPERTY.
+        # Calling it evaluates the property to a bool and then calls THAT,
+        # which raises "'bool' object is not callable" on every poll. The
+        # interface declares a method and the accumulator a property, and
+        # this adapter exists to bridge exactly that.
+        return bool(self._acc.is_alive)
 
     def snapshot(self) -> Dict[str, OptionQuote]:
         return {sym: _normalise_option_quote(sym, raw) for sym, raw in self._acc.snapshot().items()}
@@ -202,7 +207,12 @@ class _UnderlyingBarStreamAdapter(BarStream):
         self._acc.stop()
 
     def is_alive(self) -> bool:
-        return bool(self._acc.is_alive())
+        # NO parentheses: the accumulator exposes is_alive as a PROPERTY.
+        # Calling it evaluates the property to a bool and then calls THAT,
+        # which raises "'bool' object is not callable" on every poll. The
+        # interface declares a method and the accumulator a property, and
+        # this adapter exists to bridge exactly that.
+        return bool(self._acc.is_alive)
 
     def drain(self) -> Optional[Bar]:
         raw = self._acc.drain()

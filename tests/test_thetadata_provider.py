@@ -1340,3 +1340,61 @@ def test_index_bars_report_no_volume_at_all():
 
     mv = ThetaDataProvider(_MvIdx(), stage="mv", market_value_endpoints=True)
     assert mv.stream_index_bars("$VIX.X")._fetch().volume is None
+
+
+# ---------------------------------------------------------------------------
+# The property/method bridge the adapters exist for
+# ---------------------------------------------------------------------------
+def test_tradestation_adapters_bridge_is_alive_without_calling_a_bool():
+    """Caught in production, not here, which is why this test exists now.
+
+    OptionStreamAccumulator and UnderlyingBarAccumulator expose ``is_alive``
+    as a PROPERTY. BarStream and OptionQuoteStream declare it a METHOD.
+    Bridging the two is the adapter's whole job, and both adapters got it
+    backwards: ``self._acc.is_alive()`` evaluates the property to a bool and
+    then calls that bool, raising "'bool' object is not callable" on every
+    single poll.
+
+    It sat there harmlessly until StreamManager started taking its streams
+    from the provider, because nothing else had ever constructed these
+    adapters against a real accumulator. Then ingestion failed on the first
+    cycle after deploy.
+    """
+    from src.ingestion.providers.tradestation import (
+        _OptionQuoteStreamAdapter,
+        _UnderlyingBarStreamAdapter,
+    )
+
+    class _AccumulatorShape:
+        """Only the bit that matters: is_alive is a property, as in the real one."""
+
+        def __init__(self, alive: bool):
+            self._alive = alive
+
+        @property
+        def is_alive(self) -> bool:
+            return self._alive
+
+    for adapter_cls in (_OptionQuoteStreamAdapter, _UnderlyingBarStreamAdapter):
+        for alive in (True, False):
+            adapter = adapter_cls.__new__(adapter_cls)
+            adapter._acc = _AccumulatorShape(alive)
+            # Must not raise, and must carry the value through -- a bridge
+            # that always answered True would silence the dead-reader
+            # watchdog just as completely as one that raised.
+            assert adapter.is_alive() is alive, adapter_cls.__name__
+
+
+def test_the_accumulators_really_do_expose_is_alive_as_a_property():
+    """Pins the premise. If the accumulators ever become methods, the
+    adapters above must lose their parentheses in the same commit, and this
+    is what says so."""
+    from src.ingestion.stream_manager import (
+        OptionStreamAccumulator,
+        UnderlyingBarAccumulator,
+    )
+
+    for cls in (OptionStreamAccumulator, UnderlyingBarAccumulator):
+        assert isinstance(
+            getattr(cls, "is_alive"), property
+        ), f"{cls.__name__}.is_alive is no longer a property -- fix the adapters"

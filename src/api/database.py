@@ -6786,7 +6786,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
-        query = f"""
+        query = """
             WITH latest AS (
                 SELECT *
                 FROM futures_quotes
@@ -6812,7 +6812,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 l.close,
                 l.up_volume,
                 l.down_volume,
-                {_total_volume('l')}::bigint AS volume,
+                -- futures_quotes, NOT underlying_quotes: this table has no
+                -- `volume` column, so the shared total-volume fragment does
+                -- not apply here. Only underlying_quotes gained one.
+                (COALESCE(l.up_volume, 0) + COALESCE(l.down_volume, 0))::bigint AS volume,
                 (SELECT ref_open FROM session_open) AS reference_close
             FROM latest l
         """
