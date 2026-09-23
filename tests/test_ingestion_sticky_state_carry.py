@@ -130,8 +130,11 @@ class _StubAccumulator:
         self.seeded_new = None
         type(self).instances.append(self)
 
-    def start(self, seed_from_rest=True):
-        self.started_with_seed = seed_from_rest
+    def start(self, seed_from_snapshot=True):
+        # The interface spelling. The accumulator called this
+        # seed_from_rest, which named the transport rather than the intent
+        # -- ThetaData seeds from a snapshot call, not from REST.
+        self.started_with_seed = seed_from_snapshot
 
     def stop(self):
         pass
@@ -140,19 +143,33 @@ class _StubAccumulator:
         self.carried = carried
         return len(carried)
 
-    def seed_new_symbols_from_rest(self, known):
+    def seed_new_symbols(self, known):
         self.seeded_new = sorted(set(self.symbols) - set(known))
         return len(self.seeded_new)
+
+
+class _StubProvider:
+    """Hands back stub streams, the way a real provider hands back real ones.
+
+    StreamManager no longer constructs accumulators itself -- it asks a
+    provider for a stream -- so injecting the provider is what intercepts
+    the swap now. Patching the module-level accumulator name would sail
+    straight past it and the test would exercise nothing.
+    """
+
+    def stream_option_quotes(self, option_symbols, *, wakeup=None, **kw):
+        return _StubAccumulator(symbols=list(option_symbols), wakeup=wakeup)
+
+    def stream_underlying_bars(self, symbol, *, db_symbol=None, wakeup=None, **kw):
+        raise AssertionError("these tests skip the bar-stream branch")
 
 
 @pytest.fixture
 def _swap_manager(monkeypatch):
     _StubAccumulator.instances = []
-    monkeypatch.setattr(
-        "src.ingestion.stream_manager.OptionStreamAccumulator", _StubAccumulator
-    )
     mgr = object.__new__(StreamManager)
     mgr.client = None
+    mgr.provider = _StubProvider()
     mgr.tracked_option_symbols = ["A", "B"]
     mgr._wakeup = threading.Event()
     # Non-None so the underlying bar stream branch is skipped entirely.

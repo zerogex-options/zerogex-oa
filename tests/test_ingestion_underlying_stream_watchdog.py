@@ -12,14 +12,12 @@ the dead-thread check catches that, so the supervisor force-reconnects via
 
 from datetime import datetime, timedelta, timezone
 
-from src.ingestion import stream_manager
 from src.ingestion.stream_manager import (
     StreamManager,
     _bar_timestamp_advanced,
     _stale_thresholds_for_session,
 )
 from src.config import (
-    SESSION_TEMPLATE,
     UNDERLYING_STREAM_STALE_WARN_SECONDS,
     UNDERLYING_STREAM_STALE_RESTART_SECONDS,
     UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED,
@@ -49,10 +47,26 @@ def _bare_manager(monkeypatch):
         created.append(acc)
         return acc
 
-    monkeypatch.setattr(stream_manager, "UnderlyingBarAccumulator", _factory)
+    class _StubProvider:
+        """The seam StreamManager actually uses now.
+
+        It asks the provider for a bar stream rather than constructing an
+        UnderlyingBarAccumulator, so patching that name no longer
+        intercepts anything.
+        """
+
+        def stream_underlying_bars(self, symbol, *, db_symbol=None, wakeup=None, **kw):
+            return _factory(
+                client=None,
+                symbol=symbol,
+                db_symbol=db_symbol,
+                session_template=None,
+                wakeup=wakeup,
+            )
 
     mgr = object.__new__(StreamManager)
     mgr.client = object()
+    mgr.provider = _StubProvider()
     mgr.underlying = "$SPXW.X"
     mgr.db_underlying = "SPX"
     mgr._wakeup = object()
@@ -76,10 +90,14 @@ def test_restart_recreates_only_underlying_and_starts_it(monkeypatch):
     assert mgr._underlying_accumulator is new
     assert new is not old
     assert new.started == 1
-    assert new.kwargs["client"] is mgr.client
+    # No assertion on `client` any more, and that absence is the point:
+    # the manager asks its PROVIDER for a stream and never hands a vendor
+    # client across the boundary. What still matters is that the
+    # replacement stream is opened for the same symbol, under the same DB
+    # alias, sharing the same wakeup -- a restart that quietly re-pointed
+    # any of those would strand the feed while looking healthy.
     assert new.kwargs["symbol"] == "$SPXW.X"
     assert new.kwargs["db_symbol"] == "SPX"
-    assert new.kwargs["session_template"] == SESSION_TEMPLATE
     assert new.kwargs["wakeup"] is mgr._wakeup
     # Options stream object is left completely untouched.
     assert mgr._accumulator is options_sentinel
@@ -208,7 +226,13 @@ class _StaleRepeatingAcc:
     but every drained bar carries the same prior-session timestamp.
     """
 
-    is_alive = True
+    # A METHOD, because that is what BarStream declares. As a plain class
+    # attribute this stub still satisfied `if not acc.is_alive`, so the
+    # watchdog read a truthy bool and never questioned it -- the same shape
+    # of mistake the production call site made in reverse, where a bound
+    # method read as permanently alive.
+    def is_alive(self):
+        return True
 
     def __init__(self):
         self.updates_received = 0
@@ -239,8 +263,10 @@ class _QuietOptionAcc:
     """Option accumulator stub that drains nothing — keeps the option
     branch quiet so the test observes only the underlying watchdog path."""
 
-    is_alive = True
     updates_received = 0
+
+    def is_alive(self):
+        return True
 
     def drain(self):
         return {}

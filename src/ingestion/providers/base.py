@@ -52,7 +52,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 __all__ = [
     "Bar",
@@ -216,6 +216,49 @@ class OptionQuoteStream(abc.ABC):
     @abc.abstractmethod
     def updates_received(self) -> int:
         """Monotonic count of merged updates, for staleness watchdogs."""
+
+    # -- restart across a changing symbol set ---------------------------
+    #
+    # The tracked strike band moves with spot, so the engine periodically
+    # retires a stream and opens a replacement over a different symbol
+    # set. Three concrete methods carry what must survive that, with
+    # defaults that mean "this vendor needs nothing carried" -- a provider
+    # whose reader rebuilds full state on its own poll is correct to
+    # inherit them.
+
+    def sticky_state(self) -> Dict[str, Any]:
+        """Per-symbol state worth carrying to a replacement stream.
+
+        **Opaque to the caller.** The engine takes this from a retiring
+        stream and hands it to its replacement without inspecting it;
+        what is inside is the provider's own business, and different
+        vendors legitimately carry different fields.
+
+        What it is *for* is not opaque: open interest is the thing. Every
+        gamma exposure figure is OI-weighted, and a strike recalibration
+        that blanked OI on the contracts that survived it would publish a
+        hole in the surface until the next OI read -- which on a slower OI
+        cadence can be a minute of wrong numbers, not a gap anyone sees.
+        """
+        return {}
+
+    def carry_sticky_state(self, carried: Dict[str, Any]) -> int:
+        """Adopt ``carried`` from a retiring stream. Returns symbols adopted.
+
+        Called BEFORE :meth:`start` so a snapshot seed merges over the
+        carry rather than the other way round.
+        """
+        return 0
+
+    def seed_new_symbols(self, known: Set[str]) -> int:
+        """Snapshot-seed only the symbols NOT in ``known``. Returns seeded.
+
+        The narrow case: a restart that skips the full seed still leaves
+        strikes that have just entered the band with no state at all.
+        This bounds the work by how far spot moved rather than by the size
+        of the universe.
+        """
+        return 0
 
 
 class BarStream(abc.ABC):

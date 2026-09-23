@@ -15,6 +15,14 @@ Item #4 of the follow-up plan layers a second guard on top: cash-settled
 (SPX/NDX/...) option quotes outside their RTH session are skipped before
 the receive-time fallback runs, since those quotes carry stale data the
 downstream cash-index query filter would have excluded anyway.
+
+These now drive the method with provider ``OptionQuote`` objects rather
+than TradeStation's raw JSON. The behaviour under test is unchanged --
+what moved is WHERE the string ``TimeStamp``/``Bid``/``Ask`` is parsed:
+each provider does it in its own module, because only that module knows
+which spelling its feed uses. A quote whose time the feed sent empty,
+garbled, or not at all arrives here identically, as ``timestamp=None``,
+and the fallback this file exists to protect keys off exactly that.
 """
 
 from __future__ import annotations
@@ -22,7 +30,16 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from unittest.mock import patch
 
+from src.ingestion.providers.base import OptionQuote
 from src.ingestion.stream_manager import StreamManager
+
+UTC = timezone.utc
+
+
+def _q(symbol: str, *, ts=None, bid=None, ask=None, mid=None) -> OptionQuote:
+    """One provider quote. ``ts=None`` is what an absent or unparseable
+    feed timestamp becomes once the provider has had its say."""
+    return OptionQuote(option_symbol=symbol, timestamp=ts, bid=bid, ask=ask, mid=mid)
 
 
 def _bare_stream_manager(db_underlying: str = "QQQ") -> StreamManager:
@@ -46,11 +63,9 @@ def _bare_stream_manager(db_underlying: str = "QQQ") -> StreamManager:
 def test_valid_timestamp_is_used_as_is():
     sm = _bare_stream_manager()
     state = {
-        "QQQ 260616C740": {
-            "TimeStamp": "2026-06-15T13:30:00Z",
-            "Bid": "1.20",
-            "Ask": "1.25",
-        }
+        "QQQ 260616C740": _q(
+            "QQQ 260616C740", ts=datetime(2026, 6, 15, 13, 30, tzinfo=UTC), bid=1.20, ask=1.25
+        )
     }
     results = sm._yield_option_snapshot(state)
     assert len(results) == 1
@@ -62,11 +77,7 @@ def test_valid_timestamp_is_used_as_is():
 def test_empty_timestamp_with_valid_bid_ask_falls_back_to_now():
     sm = _bare_stream_manager()
     state = {
-        "QQQ 260616C740": {
-            "TimeStamp": "",
-            "Bid": "1.20",
-            "Ask": "1.25",
-        }
+        "QQQ 260616C740": _q("QQQ 260616C740", bid=1.20, ask=1.25)
     }
     before = datetime.now(timezone.utc)
     results = sm._yield_option_snapshot(state)
@@ -87,11 +98,8 @@ def test_empty_timestamp_with_valid_bid_ask_falls_back_to_now():
 def test_empty_timestamp_with_only_bid_still_recovered():
     sm = _bare_stream_manager()
     state = {
-        "QQQ 260616C740": {
-            "TimeStamp": "",
-            "Bid": "1.20",
-            # No Ask, no Mid -- a one-sided market still counts as a quote.
-        }
+        # No ask, no mid -- a one-sided market still counts as a quote.
+        "QQQ 260616C740": _q("QQQ 260616C740", bid=1.20)
     }
     results = sm._yield_option_snapshot(state)
     assert len(results) == 1
@@ -103,10 +111,7 @@ def test_empty_timestamp_with_only_bid_still_recovered():
 def test_empty_timestamp_with_only_mid_still_recovered():
     sm = _bare_stream_manager()
     state = {
-        "QQQ 260616C740": {
-            "TimeStamp": "",
-            "Mid": "1.225",
-        }
+        "QQQ 260616C740": _q("QQQ 260616C740", mid=1.225)
     }
     results = sm._yield_option_snapshot(state)
     assert len(results) == 1
@@ -118,24 +123,26 @@ def test_empty_timestamp_and_no_quote_data_drops_silently():
     """Stream heartbeat / placeholder with neither timestamp nor quote -> drop."""
     sm = _bare_stream_manager()
     state = {
-        "QQQ 260616C740": {
-            "TimeStamp": "",
-            # No Bid, Ask, or Mid -- nothing usable.
-        }
+        # No bid, ask or mid -- nothing usable.
+        "QQQ 260616C740": _q("QQQ 260616C740")
     }
     results = sm._yield_option_snapshot(state)
     assert results == []
 
 
 def test_garbled_timestamp_with_valid_quote_falls_back_to_now():
-    """Non-empty but unparseable TimeStamp should still trigger the fallback."""
+    """A time the feed sent but that could not be read still falls back.
+
+    The provider is what now decides a garbled timestamp is unusable, and
+    it says so the only way the interface allows: ``timestamp=None``. So at
+    THIS boundary garbled and absent are deliberately indistinguishable,
+    and that is the point -- the fallback must not depend on knowing which
+    it was. Whether each feed's own parser rejects the right strings is
+    tested in that provider's module, against that vendor's spellings.
+    """
     sm = _bare_stream_manager()
     state = {
-        "QQQ 260616C740": {
-            "TimeStamp": "not-a-date",
-            "Bid": "1.20",
-            "Ask": "1.25",
-        }
+        "QQQ 260616C740": _q("QQQ 260616C740", bid=1.20, ask=1.25)
     }
     before = datetime.now(timezone.utc)
     results = sm._yield_option_snapshot(state)
@@ -149,8 +156,12 @@ def test_unknown_symbol_in_state_is_skipped():
     """Quotes for symbols not in _symbol_metadata must not error out."""
     sm = _bare_stream_manager()
     state = {
-        "QQQ 260616C740": {"TimeStamp": "2026-06-15T13:30:00Z", "Bid": "1.20", "Ask": "1.25"},
-        "QQQ 260616C999": {"TimeStamp": "2026-06-15T13:30:00Z", "Bid": "0.01", "Ask": "0.05"},
+        "QQQ 260616C740": _q(
+            "QQQ 260616C740", ts=datetime(2026, 6, 15, 13, 30, tzinfo=UTC), bid=1.20, ask=1.25
+        ),
+        "QQQ 260616C999": _q(
+            "QQQ 260616C999", ts=datetime(2026, 6, 15, 13, 30, tzinfo=UTC), bid=0.01, ask=0.05
+        ),
     }
     results = sm._yield_option_snapshot(state)
     assert len(results) == 1
@@ -168,11 +179,7 @@ def test_cash_settled_off_session_skips_whole_batch():
     """
     sm = _bare_stream_manager(db_underlying="SPX")
     state = {
-        "SPXW 260618C5300": {
-            "TimeStamp": "",
-            "Bid": "10.50",
-            "Ask": "11.00",
-        }
+        "SPXW 260618C5300": _q("SPXW 260618C5300", bid=10.50, ask=11.00)
     }
     # 08:30 ET on a weekday = pre-market for cash index (which trades 09:30-16:00).
     with patch(
@@ -188,11 +195,12 @@ def test_cash_settled_in_session_writes_normally():
     """SPX option batch during 09:30-16:00 ET -> normal write path."""
     sm = _bare_stream_manager(db_underlying="SPX")
     state = {
-        "SPXW 260618C5300": {
-            "TimeStamp": "2026-06-15T13:30:00Z",
-            "Bid": "10.50",
-            "Ask": "11.00",
-        }
+        "SPXW 260618C5300": _q(
+            "SPXW 260618C5300",
+            ts=datetime(2026, 6, 15, 13, 30, tzinfo=UTC),
+            bid=10.50,
+            ask=11.00,
+        )
     }
     with patch(
         "src.ingestion.stream_manager.is_cash_index", return_value=True
@@ -208,11 +216,8 @@ def test_etf_off_session_still_writes():
     """SPY/QQQ off-session must NOT be skipped -- they trade extended hours."""
     sm = _bare_stream_manager(db_underlying="QQQ")
     state = {
-        "QQQ 260616C740": {
-            "TimeStamp": "",  # forces receive-time fallback
-            "Bid": "1.20",
-            "Ask": "1.25",
-        }
+        # No timestamp -- forces the receive-time fallback.
+        "QQQ 260616C740": _q("QQQ 260616C740", bid=1.20, ask=1.25)
     }
     # is_cash_index returns False for ETFs -> the cash-settled skip is bypassed
     # entirely.  is_underlying_active_session isn't even consulted for ETFs

@@ -31,7 +31,7 @@ import json
 import threading
 import time
 from datetime import date
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import requests as _requests
 
@@ -160,6 +160,23 @@ class _OptionQuoteStreamAdapter(OptionQuoteStream):
     @property
     def updates_received(self) -> int:
         return int(self._acc.updates_received)
+
+    # -- restart across a changing symbol set ---------------------------
+    #
+    # Delegated, not normalised. The accumulator's sticky payload is keyed
+    # on TradeStation's own field names (DailyOpenInterest, OpenInterest,
+    # Volume, the IV fields) and goes straight back into another
+    # accumulator, so translating it to OptionQuote and back would be two
+    # lossy conversions in service of nobody reading it.
+
+    def sticky_state(self) -> Dict[str, Any]:
+        return self._acc.sticky_state()
+
+    def carry_sticky_state(self, carried: Dict[str, Any]) -> int:
+        return int(self._acc.carry_sticky_state(carried))
+
+    def seed_new_symbols(self, known: Set[str]) -> int:
+        return int(self._acc.seed_new_symbols_from_rest(known))
 
     @property
     def raw(self) -> OptionStreamAccumulator:
