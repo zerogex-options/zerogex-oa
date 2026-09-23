@@ -105,3 +105,80 @@ def test_context_values_unavailable_returns_nones():
     cv = comp.context_values(_ctx())
     assert cv["source"] == "unavailable"
     assert cv["above_spot_gamma_abs"] is None
+
+
+# ---------------------------------------------------------------------------
+# Wing reach: "no wing gamma" vs "no wing data"
+#
+# Both produce wing_fraction == 0.0. Before the reach check they also produced
+# the same confidence (1.0), so a chain truncated short of the wing window
+# earned the FULL confidence of a genuinely wing-free book. These pin the two
+# apart.
+# ---------------------------------------------------------------------------
+
+_WING_PCT = 0.04
+
+
+def _rows_within(pct: float, spot: float = 500.0, gex: float = 1.4e9):
+    """Two rows straddling spot, both strictly inside ``pct`` of it."""
+    return [
+        {"strike": spot * (1 + pct), "net_gex": gex},
+        {"strike": spot * (1 - pct), "net_gex": gex * 0.5},
+    ]
+
+
+def test_reach_short_of_wing_window_is_flagged_unavailable():
+    rows = _rows_within(_WING_PCT / 2)  # ±2%, well inside a ±4% wing window
+    cv = comp.context_values(_ctx(rows=rows))
+    assert cv["wing_data_available"] is False
+    assert cv["wing_fraction"] == 0.0
+    assert cv["wing_reach_pct"] == pytest.approx(_WING_PCT / 2, abs=1e-6)
+
+
+def test_reach_past_wing_window_is_flagged_available():
+    rows = _rows_within(_WING_PCT * 2)  # ±8%, clears the window on both sides
+    cv = comp.context_values(_ctx(rows=rows))
+    assert cv["wing_data_available"] is True
+    assert cv["wing_reach_pct"] == pytest.approx(_WING_PCT * 2, abs=1e-6)
+
+
+def test_unmeasured_wings_score_lower_than_measured_empty_wings():
+    """The regression this guards.
+
+    Same book shape either side; the only difference is whether any strike
+    reached the wing window. Unmeasured must not score as confidently as
+    measured-and-empty, or a truncated chain reads as a clean one.
+    """
+    spot = 500.0
+    truncated = _rows_within(_WING_PCT / 2, spot=spot)
+    # Measured and genuinely empty: strikes reach past the window, but the
+    # gamma out there is negligible, so wing_fraction stays ~0.
+    measured = _rows_within(_WING_PCT / 2, spot=spot) + [
+        {"strike": spot * (1 + _WING_PCT * 2), "net_gex": 1.0},
+        {"strike": spot * (1 - _WING_PCT * 2), "net_gex": 1.0},
+    ]
+
+    s_truncated = comp.compute(_ctx(rows=truncated, close=spot))
+    s_measured = comp.compute(_ctx(rows=measured, close=spot))
+
+    assert comp.context_values(_ctx(rows=truncated, close=spot))["wing_data_available"] is False
+    assert comp.context_values(_ctx(rows=measured, close=spot))["wing_data_available"] is True
+    assert abs(s_truncated) < abs(s_measured)
+
+
+def test_heavy_wing_gamma_still_dampens_when_measured():
+    """The pre-existing damping path must survive the change."""
+    spot = 500.0
+    rows = _rows_within(_WING_PCT / 2, spot=spot) + [
+        {"strike": spot * (1 + _WING_PCT * 2), "net_gex": 5.0e9},
+        {"strike": spot * (1 - _WING_PCT * 2), "net_gex": 5.0e9},
+    ]
+    cv = comp.context_values(_ctx(rows=rows, close=spot))
+    assert cv["wing_data_available"] is True
+    assert cv["wing_fraction"] > 0.5
+
+
+def test_unavailable_context_carries_the_new_keys():
+    cv = comp.context_values(_ctx())
+    assert cv["wing_reach_pct"] is None
+    assert cv["wing_data_available"] is None

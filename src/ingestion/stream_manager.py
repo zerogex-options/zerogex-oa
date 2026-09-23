@@ -21,7 +21,7 @@ import random
 import threading
 import time
 from datetime import datetime, date, timezone
-from typing import Generator, List, Dict, Any, Optional, Set
+from typing import Generator, List, Dict, Any, Optional, Sequence, Set
 import pytz
 import requests as _requests
 
@@ -59,6 +59,7 @@ from src.config import (
     UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS,
     UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS,
     UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS,
+    SIGNAL_GEX_GRADIENT_WING_PCT,
 )
 
 logger = get_logger(__name__)
@@ -1354,6 +1355,29 @@ class UnderlyingBarAccumulator:
             self._wakeup.set()
 
 
+def effective_strike_reach_pct(strikes: Sequence[float], spot: float) -> float:
+    """How far, as a FRACTION of spot, the SELECTED strikes actually reach.
+
+    This is not ``INGEST_STRIKE_PCT_RANGE``.  Selection filters to that band
+    and then trims the furthest strikes inward to fit
+    ``INGEST_STRIKE_COUNT_MAX``, so on a dense chain the realized band is
+    narrower than the configured one -- and nothing downstream can tell,
+    because a truncated chain and a genuinely short one look identical once
+    the strikes are gone.
+
+    Returns the NARROWER of the two wings: a consumer asking for +/-X% needs
+    X% on BOTH sides, so 6% up and 1% down is a 1% reach, not 6%.  Zero when
+    there are no strikes, the spot is non-positive, or the selection is
+    entirely one-sided.
+    """
+    if not strikes or spot <= 0:
+        return 0.0
+    lo, hi = min(strikes), max(strikes)
+    down = (spot - lo) / spot
+    up = (hi - spot) / spot
+    return max(0.0, min(down, up))
+
+
 class StreamManager:
     """Manages streaming of real-time underlying and options data"""
 
@@ -1469,6 +1493,12 @@ class StreamManager:
         # per-cycle count measures the rebuild, not the data.
         self._session_oi_symbols: Set[str] = set()
         self._session_volume_date: Optional[date] = None
+
+        # Last reported starved/healthy state of each expiration's effective
+        # strike reach. Warning on TRANSITION only: this runs per expiration on
+        # every strike recalibration, and a line per expiration per cycle would
+        # bury the one thing worth seeing.
+        self._reach_starved: Dict[date, bool] = {}
 
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(
@@ -1827,13 +1857,73 @@ class StreamManager:
             )
             if trimmed_count:
                 log_msg += f"; trimmed {trimmed_count} furthest at cap {self.strike_count_max}"
+            reach = effective_strike_reach_pct(nearby_strikes, current_price)
+            log_msg += f"; effective reach ±{reach * 100:.2f}%"
             logger.debug(log_msg)
+            self._warn_on_starved_reach(expiration, exp_str, ts_symbol, reach, trimmed_count)
 
             return nearby_strikes
 
         except Exception as e:
             logger.error(f"Error fetching strikes for {expiration}: {e}", exc_info=True)
             return []
+
+    def _warn_on_starved_reach(
+        self,
+        expiration: date,
+        exp_str: str,
+        ts_symbol: str,
+        reach: float,
+        trimmed_count: int,
+    ) -> None:
+        """Warn when the SELECTED strikes don't reach far enough for the wings.
+
+        The failure this exists to catch is silent by construction: the count
+        cap trims the band, the trimmed strikes are simply never streamed, and
+        every consumer downstream sees a complete-looking chain that stops
+        short. ``gex_gradient`` then reports ``wing_fraction = 0`` -- which
+        reads as "no wing gamma" and is really "no wing data".
+
+        Warns on TRANSITION only (healthy -> starved and back), so a permanent
+        misconfiguration says so once per expiration instead of once per
+        recalibration cycle.
+        """
+        starved = reach < SIGNAL_GEX_GRADIENT_WING_PCT
+        if self._reach_starved.get(expiration) == starved:
+            return
+        self._reach_starved[expiration] = starved
+
+        if not starved:
+            logger.info(
+                "%s exp %s: effective strike reach recovered to ±%.2f%% "
+                "(wing analysis needs ±%.2f%%)",
+                ts_symbol,
+                exp_str,
+                reach * 100,
+                SIGNAL_GEX_GRADIENT_WING_PCT * 100,
+            )
+            return
+
+        cause = (
+            f"INGEST_STRIKE_COUNT_MAX={self.strike_count_max} trimmed "
+            f"{trimmed_count} strikes off the band"
+            if trimmed_count
+            else f"the chain itself lists no strikes that far out "
+            f"(INGEST_STRIKE_PCT_RANGE={self.strike_pct_range}% was not the limit)"
+        )
+        logger.warning(
+            "%s exp %s: effective strike reach is ±%.2f%% of spot, short of the "
+            "±%.2f%% wing analysis needs -- %s. INGEST_STRIKE_PCT_RANGE=%s%% is "
+            "NOT what you are seeing. While this holds, gex_gradient's wing "
+            "bucket takes no strikes and its wing_fraction reads 0 for lack of "
+            "data rather than lack of wing gamma.",
+            ts_symbol,
+            exp_str,
+            reach * 100,
+            SIGNAL_GEX_GRADIENT_WING_PCT * 100,
+            cause,
+            self.strike_pct_range,
+        )
 
     def _build_option_symbols(self) -> List[str]:
         """Build list of option symbols to track and pre-parse metadata.

@@ -1883,6 +1883,23 @@ INGEST_EXPIRATIONS = _getenv_int("INGEST_EXPIRATIONS", 3)
 INGEST_MONTHLY_EXPIRATIONS = _getenv_int("INGEST_MONTHLY_EXPIRATIONS", 0)
 INGEST_STRIKE_COUNT_MAX = _getenv_int("INGEST_STRIKE_COUNT_MAX", 40)
 INGEST_STRIKE_PCT_RANGE = _getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0)
+
+# Minimum +/-reach, as a FRACTION of spot, that the INGESTED strikes must
+# actually achieve for downstream wing analysis to have anything to read.
+# Declared here rather than inside the signal so ingestion can assert against
+# it: ``gex_gradient`` buckets a strike into ``wing_abs`` at >= this distance,
+# so if ingestion never reaches it that bucket is structurally empty and the
+# component cannot tell "no wing gamma" from "no wing data".
+#
+# THE TWO INGEST KNOBS ABOVE DO NOT COMPOSE THE WAY THEY READ.  Selection is
+# two-step (``StreamManager._get_nearby_strikes``): filter to
+# +/-INGEST_STRIKE_PCT_RANGE%, THEN trim the furthest strikes inward until the
+# count fits INGEST_STRIKE_COUNT_MAX.  On a dense chain the cap binds first and
+# the realized band is narrower than the configured percentage -- SPX at $5
+# strikes reaches only ~+/-2.6% under a count cap of 80, whatever the pct range
+# says.  So the effective reach is measured from the strikes actually selected
+# and warned on at runtime; it is never inferred from INGEST_STRIKE_PCT_RANGE.
+SIGNAL_GEX_GRADIENT_WING_PCT = _getenv_float("SIGNAL_GEX_GRADIENT_WING_PCT", 0.04, min=0.0, max=1.0)
 ANALYTICS_UNDERLYING = _getenv_str("ANALYTICS_UNDERLYING", "SPY")
 ANALYTICS_UNDERLYINGS = _getenv_str("ANALYTICS_UNDERLYINGS", "")
 ANALYTICS_INTERVAL = _getenv_int("ANALYTICS_INTERVAL", 60)

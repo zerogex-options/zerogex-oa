@@ -24,13 +24,27 @@ from __future__ import annotations
 
 import os
 
+from src.config import SIGNAL_GEX_GRADIENT_WING_PCT
 from src.signals.components.base import ComponentBase, MarketContext
 
 # Strikes within this percent of spot are treated as "near" (ATM window).
 _ATM_WINDOW_PCT = float(os.getenv("SIGNAL_GEX_GRADIENT_ATM_PCT", "0.015"))
 
-# Strikes beyond this percent of spot are treated as "wings".
-_WING_WINDOW_PCT = float(os.getenv("SIGNAL_GEX_GRADIENT_WING_PCT", "0.04"))
+# Strikes beyond this percent of spot are treated as "wings".  Sourced from
+# config so ingestion asserts its realized strike reach against the SAME
+# number this component buckets on; a second os.getenv here would let the two
+# drift apart silently.
+_WING_WINDOW_PCT = SIGNAL_GEX_GRADIENT_WING_PCT
+
+# Wing confidence to apply when NO surveyed strike reached the wing window.
+# ``wing_fraction`` is then 0 for lack of DATA, not for lack of wing gamma, and
+# the two must not earn the same confidence: 1.0 - 0.0 would hand an unmeasured
+# book the full confidence that a genuinely wing-free book earns.  Defaults to
+# the same floor a maximally wing-heavy book gets, i.e. unknown is treated as
+# the worst case rather than the best.  Set to 0.0 to abstain outright.
+_WING_UNKNOWN_CONFIDENCE = max(
+    0.0, min(1.0, float(os.getenv("SIGNAL_GEX_GRADIENT_WING_UNKNOWN_CONFIDENCE", "0.25")))
+)
 
 # Minimum total notional gamma (absolute sum across surveyed strikes) to
 # emit a non-zero score. Prevents over-reaction when OI is thin.  Calibrated
@@ -73,7 +87,13 @@ class GexGradientComponent(ComponentBase):
         # the wings. Heavy wing concentration = structural pinning, which
         # dampens directional edge.
         wing_fraction = buckets["wing_fraction"]
-        wing_confidence = max(0.25, 1.0 - wing_fraction)  # never fully dampen
+        if buckets["wing_data_available"]:
+            wing_confidence = max(0.25, 1.0 - wing_fraction)  # never fully dampen
+        else:
+            # Nothing in the survey reached the wing window, so wing_fraction
+            # is 0 because the strikes are absent, not because the wings are
+            # empty.  Do not read that as "no pinning pressure".
+            wing_confidence = _WING_UNKNOWN_CONFIDENCE
 
         # Replace the previous hard cutoff at _MIN_TOTAL_GAMMA with a soft
         # confidence ramp so thin-OI snapshots taper toward zero rather
@@ -93,6 +113,8 @@ class GexGradientComponent(ComponentBase):
                 "below_spot_gamma_abs": None,
                 "atm_gamma_abs": None,
                 "wing_gamma_abs": None,
+                "wing_reach_pct": None,
+                "wing_data_available": None,
                 "asymmetry": None,
             }
         above = buckets["above_abs_gamma"]
@@ -108,6 +130,11 @@ class GexGradientComponent(ComponentBase):
             "above_spot_gamma_signed": round(buckets["above_signed_gamma"], 2),
             "below_spot_gamma_signed": round(buckets["below_signed_gamma"], 2),
             "wing_fraction": round(buckets["wing_fraction"], 4),
+            # How far the survey actually reached, and whether that cleared the
+            # wing window. wing_data_available=False means wing_fraction above
+            # is uninformative -- read it with the ingestion reach, not alone.
+            "wing_reach_pct": round(buckets["wing_reach_pct"], 4),
+            "wing_data_available": buckets["wing_data_available"],
             "asymmetry": round(asymmetry, 4),
             "strike_count": buckets["strike_count"],
         }
@@ -129,6 +156,11 @@ class GexGradientComponent(ComponentBase):
         above_signed = 0.0
         below_signed = 0.0
         strike_count = 0
+        # Furthest any surveyed strike sat from spot. This is what separates
+        # "the wings hold no gamma" from "no strike was ingested far enough
+        # out to say", which are the same wing_fraction (0.0) and must not be
+        # the same confidence.
+        max_abs_distance = 0.0
 
         for row in rows:
             strike = row.get("strike") if isinstance(row, dict) else None
@@ -143,6 +175,7 @@ class GexGradientComponent(ComponentBase):
             strike_count += 1
             distance = (strike_f - ctx.close) / ctx.close
             abs_distance = abs(distance)
+            max_abs_distance = max(max_abs_distance, abs_distance)
             abs_gex = abs(gex_f)
             if distance > 0:
                 above_abs += abs_gex
@@ -165,5 +198,7 @@ class GexGradientComponent(ComponentBase):
             "atm_gamma_abs": atm_abs,
             "wing_gamma_abs": wing_abs,
             "wing_fraction": min(1.0, wing_fraction),
+            "wing_reach_pct": max_abs_distance,
+            "wing_data_available": max_abs_distance >= _WING_WINDOW_PCT,
             "strike_count": strike_count,
         }
