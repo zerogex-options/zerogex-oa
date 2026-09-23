@@ -232,12 +232,15 @@ freshness/validation harness rather than writing a one-off.
 Serve everything from the new supplier; leave TradeStation running but unused for a week so a
 problem is a rollback rather than an outage.
 
-**Blocked on one decision first.** ThetaData cannot report a signed volume split, so
-`underlying_quotes.up_volume` / `.down_volume` go NULL on the first cycle after cutover and take
-four views with them — including the VWAP the MSI engine reads for SPX and NDX through an ETF
-proxy. Three are recoverable by differencing `stock_snapshot_ohlc` volume per poll;
-`underlying_buying_pressure` is not recoverable at all. Settle it before flipping the switch,
-not after: see
+**Run the schema change first, and let the incumbent fill it.** ThetaData cannot report a signed
+volume split, which would have taken VWAP, the opening range and volume spikes down with it — not
+because the feed lacks the volume, but because `underlying_quotes` had no column for a total
+independent of the tick-test split. It does now. Apply
+`ALTER TABLE underlying_quotes ADD COLUMN IF NOT EXISTS volume BIGINT` and deploy the query
+changes **while TradeStation is still the source**, so the column fills and every view reads it
+with rollback still free. At cutover ThetaData continues filling the same column and customers
+see no change. Only the uptick/downtick split is lost, and it now abstains rather than reporting
+a fabricated 50%. See
 [signal-component-inert-gate-sweep-2026-09.md](signal-component-inert-gate-sweep-2026-09.md) (S1).
 
 **Done when:** live analytics read only from the new source — checked in the query path, not assumed

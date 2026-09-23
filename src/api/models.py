@@ -874,9 +874,14 @@ class FlowBuyingPressurePoint(BaseModel):
     timestamp: datetime
     symbol: str
     price: Decimal
+    # Optional because the uptick/downtick split is a feed CAPABILITY, not a
+    # reading: ThetaData cannot classify equity volume at all. Required here,
+    # these fields would force the query to invent a value -- and the value
+    # it invented was a permanent, confident "50%, Neutral". `volume` stays
+    # required: the total is measured independently of the classification.
     volume: int
-    buy_pct: Decimal
-    period_buy_pct: Decimal
+    buy_pct: Optional[Decimal] = None
+    period_buy_pct: Optional[Decimal] = None
     price_chg: Optional[Decimal] = None
     momentum: str
 

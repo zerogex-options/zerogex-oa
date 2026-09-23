@@ -38,6 +38,7 @@ from src.hedging_flow_sql import (
 )
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
+from src.underlying_volume_sql import total_volume as _total_volume
 from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
 
 logger = logging.getLogger(__name__)
@@ -3686,7 +3687,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         start_utc = start_et.astimezone(utc)
         end_utc = end_et.astimezone(utc)
 
-        query = """
+        query = f"""
             SELECT timestamp,
                    open,
                    high,
@@ -3694,7 +3695,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                    close,
                    COALESCE(up_volume, 0)::bigint AS up_volume,
                    COALESCE(down_volume, 0)::bigint AS down_volume,
-                   (COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS volume
+                   {_total_volume()}::bigint AS volume
             FROM underlying_quotes
             WHERE symbol = $1
               AND timestamp >= $2
@@ -6547,7 +6548,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self, symbol: str = "SPY", limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get underlying buying/selling pressure matching Makefile flow-buying-pressure."""
-        query = """
+        query = f"""
             WITH quote_deltas AS (
                 SELECT
                     timestamp,
@@ -6574,7 +6575,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             0
                         ),
                         0
-                    ) AS down_volume_delta
+                    ) AS down_volume_delta,
+                    -- Carried so the outer SELECT can total volume the same
+                    -- way every other call site does.
+                    volume
                 FROM underlying_quotes
                 WHERE symbol = $1
                   AND timestamp >= NOW() - INTERVAL '2 days'
@@ -6583,25 +6587,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 timestamp,
                 symbol,
                 ROUND(close, 2) AS price,
-                (up_volume_delta + down_volume_delta)::bigint AS volume,
-                ROUND(
-                    CASE
-                        WHEN (up_volume + down_volume) > 0
-                        THEN up_volume::numeric / (up_volume + down_volume) * 100
-                        ELSE 50
-                    END,
-                    2
-                ) AS buy_pct,
-                ROUND(
-                    CASE
-                        WHEN (up_volume_delta + down_volume_delta) > 0
-                        THEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100
-                        ELSE 50
-                    END,
-                    2
-                ) AS period_buy_pct,
+                {_total_volume()}::bigint AS volume,
+                -- NULL, not 50, when the feed cannot classify. The ELSE 50 is
+                -- kept for its real case: a bar with no ticks either way is
+                -- genuinely balanced. See src/underlying_volume_sql.py.
+                CASE
+                    WHEN up_volume IS NULL OR down_volume IS NULL THEN NULL
+                    ELSE ROUND(
+                        CASE
+                            WHEN (up_volume + down_volume) > 0
+                            THEN up_volume::numeric / (up_volume + down_volume) * 100
+                            ELSE 50
+                        END,
+                        2
+                    )
+                END AS buy_pct,
+                CASE
+                    WHEN up_volume IS NULL OR down_volume IS NULL THEN NULL
+                    ELSE ROUND(
+                        CASE
+                            WHEN (up_volume_delta + down_volume_delta) > 0
+                            THEN up_volume_delta::numeric
+                                 / (up_volume_delta + down_volume_delta) * 100
+                            ELSE 50
+                        END,
+                        2
+                    )
+                END AS period_buy_pct,
                 ROUND(close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp), 2) AS price_chg,
                 CASE
+                    WHEN up_volume IS NULL OR down_volume IS NULL THEN '⚪ No Tick Data'
                     WHEN (up_volume_delta + down_volume_delta) = 0 THEN '⚪ Neutral'
                     WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.7 THEN '🟢 Strong Buying'
                     WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.55 THEN '✅ Buying'
@@ -6771,7 +6786,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
-        query = """
+        query = f"""
             WITH latest AS (
                 SELECT *
                 FROM futures_quotes
@@ -6797,7 +6812,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 l.close,
                 l.up_volume,
                 l.down_volume,
-                (COALESCE(l.up_volume, 0) + COALESCE(l.down_volume, 0))::bigint AS volume,
+                {_total_volume('l')}::bigint AS volume,
                 (SELECT ref_open FROM session_open) AS reference_close
             FROM latest l
         """

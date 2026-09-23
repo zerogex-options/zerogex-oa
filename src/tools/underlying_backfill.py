@@ -127,6 +127,25 @@ def _safe_bigint(value: Any) -> int:
     return out if out >= 0 else 0
 
 
+def _optional_bigint(value: Any) -> Optional[int]:
+    """Non-negative integer, or ``None`` when the field is absent.
+
+    Deliberately NOT :func:`_safe_bigint`. That one answers 0, which is the
+    right default for the tick-test split -- a backfilled bar has no
+    classification and zero classified volume is literally true of it. It is
+    the wrong default for the TOTAL: 0 there asserts that nothing traded in
+    that minute, which is false and, worse, indistinguishable from a quiet
+    minute to every mean and standard deviation that reads the column.
+    ``underlying_quotes.volume`` is nullable precisely so this case has
+    somewhere to go.
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out >= 0 else None
+
+
 def _chunk_ranges(
     start: date, end: date, days_per_chunk: int = _DEFAULT_DAYS_PER_CHUNK
 ) -> List[Tuple[str, str]]:
@@ -205,6 +224,12 @@ def _bar_to_row(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "close": c,
         "up_volume": _safe_bigint(raw.get("UpVolume")),
         "down_volume": _safe_bigint(raw.get("DownVolume")),
+        # The historical barcharts endpoint carries TotalVolume even though it
+        # omits the Up/Down split. Where it does not, this stays None and the
+        # row reads through COALESCE(volume, up_volume + down_volume) exactly
+        # as it did before the column existed -- no better, but no worse, and
+        # never claiming a zero it cannot support.
+        "volume": _optional_bigint(raw.get("TotalVolume")),
     }
 
 
@@ -321,8 +346,8 @@ def _log_coverage(
 
 _UPSERT_SQL = """
     INSERT INTO underlying_quotes
-    (symbol, timestamp, open, high, low, close, up_volume, down_volume)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    (symbol, timestamp, open, high, low, close, up_volume, down_volume, volume)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (symbol, timestamp) DO UPDATE SET
         open = COALESCE(underlying_quotes.open, EXCLUDED.open),
         high = GREATEST(underlying_quotes.high, EXCLUDED.high),
@@ -330,6 +355,10 @@ _UPSERT_SQL = """
         close = EXCLUDED.close,
         up_volume = EXCLUDED.up_volume,
         down_volume = EXCLUDED.down_volume,
+        -- COALESCE, not a blind overwrite: this tool also runs over minutes a
+        -- live stream already recorded, and the streamed total is the better
+        -- of the two. A backfill must not blank it when its own bar has none.
+        volume = COALESCE(EXCLUDED.volume, underlying_quotes.volume),
         updated_at = NOW()
 """
 
@@ -351,6 +380,7 @@ def upsert_bars(conn, symbol: str, rows: List[Dict[str, Any]]) -> int:
                 r["close"],
                 r["up_volume"],
                 r["down_volume"],
+                r.get("volume"),
             )
             for r in rows
         ],
