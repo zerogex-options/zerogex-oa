@@ -36,6 +36,24 @@ from src.symbols import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _measured_path_enabled(monkeypatch):
+    """These tests are about the MEASURED basis, so turn the gate off.
+
+    Production now defaults FUTURES_BASIS_CARRY_ONLY on: the measured
+    basis is a median of CME print pairs and therefore a derived work from
+    CME's data, which we hold no licence for and which ThetaData does not
+    sell. The measured code is not deleted -- it is correct, and it comes
+    back the day there is a licence or a licensed redistributor behind it
+    -- so it keeps its tests. It just no longer runs by default, and a
+    test that silently exercised the carry path while claiming to measure
+    print pairs would be worse than no test.
+    """
+    monkeypatch.setattr(
+        "src.jobs.futures_projection.FUTURES_BASIS_CARRY_ONLY", False
+    )
+
+
 class _FakeDB:
     """Stands in for DatabaseManager's basis reader."""
 
@@ -325,3 +343,75 @@ def test_booleans_are_not_treated_as_prices():
     """bool is an int subclass — projecting one would emit 1.0067 for True."""
     out = project_payload({"close": True}, _basis(), tick=None)
     assert out["close"] is True
+
+
+# ---------------------------------------------------------------------------
+# The default path: carry only, and no CME data read at all
+# ---------------------------------------------------------------------------
+class _ExplodingDB:
+    """Any read of CME print pairs is a licensing failure, so make it loud."""
+
+    async def get_futures_basis_samples(self, *a, **kw):
+        raise AssertionError(
+            "carry-only must not read futures basis samples: those are CME "
+            "print pairs, and deriving from them is the exposure this flag exists "
+            "to remove"
+        )
+
+
+def test_carry_only_never_reads_a_cme_print(monkeypatch):
+    monkeypatch.setattr("src.jobs.futures_projection.FUTURES_BASIS_CARRY_ONLY", True)
+    basis = asyncio.run(resolve_basis(_ExplodingDB(), "ES"))
+    assert basis is not None
+    assert basis.source == "carry"
+    assert basis.sample_count == 0
+    assert basis.observed_at is None
+
+
+def test_carry_only_still_prices_from_the_index(monkeypatch):
+    """A basis of 1.0 would publish cash levels on a futures chart, which
+    is the one failure this function has always refused to produce."""
+    monkeypatch.setattr("src.jobs.futures_projection.FUTURES_BASIS_CARRY_ONLY", True)
+    basis = asyncio.run(resolve_basis(_ExplodingDB(), "ES"))
+    assert basis.ratio == pytest.approx(theoretical_ratio("SPX", None))
+    assert basis.ratio != 1.0
+
+
+def test_carry_only_still_declines_a_pair_it_cannot_project(monkeypatch):
+    """The gate must not turn "not a projectable symbol" into a projection."""
+    monkeypatch.setattr("src.jobs.futures_projection.FUTURES_BASIS_CARRY_ONLY", True)
+    assert asyncio.run(resolve_basis(_ExplodingDB(), "NOT_A_PAIR")) is None
+
+
+def test_production_default_is_carry_only():
+    """What actually ships. The autouse fixture turns the gate off for the
+    measured tests above; this asserts the value a deployment gets when it
+    sets nothing, because that is the one that decides whether we read CME
+    data in production."""
+    from src.config import FUTURES_BASIS_CARRY_ONLY as configured
+
+    assert configured is True
+
+
+def test_the_gate_is_consulted_not_hardcoded(monkeypatch):
+    """Both directions, because only both directions prove it is read.
+
+    Asserting carry behaviour with the flag forced True passes just as
+    happily against a branch someone hard-coded, which is exactly the
+    mutant that survived the first time this was tested.
+    """
+    reads = []
+
+    class _CountingDB:
+        async def get_futures_basis_samples(self, *a, **kw):
+            reads.append(1)
+            return []
+
+    monkeypatch.setattr("src.jobs.futures_projection.FUTURES_BASIS_CARRY_ONLY", True)
+    on = asyncio.run(resolve_basis(_CountingDB(), "ES"))
+    assert reads == [], "carry-only read CME print pairs"
+    assert on.source == "carry"
+
+    monkeypatch.setattr("src.jobs.futures_projection.FUTURES_BASIS_CARRY_ONLY", False)
+    asyncio.run(resolve_basis(_CountingDB(), "ES"))
+    assert reads == [1], "the measured path did not read its samples"

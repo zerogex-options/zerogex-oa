@@ -53,7 +53,13 @@ from math import exp
 from statistics import median
 from typing import Any, Dict, Iterable, Optional
 
-from src.config import RISK_FREE_RATE, _getenv_float, _getenv_int, resolve_dividend_yield
+from src.config import (
+    FUTURES_BASIS_CARRY_ONLY,
+    RISK_FREE_RATE,
+    _getenv_float,
+    _getenv_int,
+    resolve_dividend_yield,
+)
 from src.symbols import (
     is_futures_symbol,
     resolve_futures_alias,
@@ -486,6 +492,37 @@ async def resolve_basis(
     if pair is None:
         return None
     futures_symbol, index_symbol = pair
+
+    if FUTURES_BASIS_CARRY_ONLY:
+        # No CME data is read on this path, and that is the point.
+        #
+        # The measured basis is the median of recent ES/SPX print pairs,
+        # which means it is a derived work FROM CME's prices -- licensed
+        # separately under CME's Derived Data License, and one of the two
+        # breaches the 2026-09-02 audit found (the other being
+        # redistribution of the observed prices themselves). ThetaData
+        # sells no CME product, so at cutover there is no licensed source
+        # for those prints at all.
+        #
+        # The carry ratio is e^((r-q)T) from the configured risk-free rate
+        # and the index's dividend yield. Both are ours. Nothing an
+        # exchange owns enters the calculation, so the projection stops
+        # being a derived work and starts being a model.
+        #
+        # What this costs, and it must be labelled wherever it is shown:
+        # carry is FAIR VALUE, not the traded price. Futures trade away
+        # from fair value -- overnight, into risk events, when the roll is
+        # bid -- and this will not track those moves. It is honest as "the
+        # futures level implied by the index", and dishonest as "ES".
+        return FuturesBasis(
+            index_symbol=index_symbol,
+            futures_symbol=futures_symbol,
+            ratio=theoretical_ratio(index_symbol, at),
+            source="carry",
+            observed_at=None,
+            sample_count=0,
+            feed_symbol=resolve_index_future(index_symbol),
+        )
 
     samples: list[Dict[str, Any]] = []
     try:

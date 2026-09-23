@@ -231,9 +231,22 @@ class IngestionEngine:
         strike_pct_range: float = 3.0,
         num_monthly_expirations: int = 0,
         monthly_underlying: Optional[str] = None,
+        provider: Optional[Any] = None,
     ):
         """Initialize main ingestion engine"""
+        # ``client`` is the TradeStation client, and it is None on any feed
+        # that is not TradeStation. Everything that still reads it is
+        # TradeStation's own bookkeeping, guarded at the point of use.
         self.client = client
+        # The feed. None means "whatever MARKET_DATA_PROVIDER says", which
+        # is how the ingestion path finally reads that setting -- it has
+        # existed in config.py since the seam was built and nothing on this
+        # path had ever consulted it.
+        if provider is None:
+            from src.ingestion.providers import get_provider
+
+            provider = get_provider(client=client) if client is not None else get_provider()
+        self.provider = provider
         self.underlying = underlying.upper()  # TradeStation API symbol (e.g. "$SPX.X")
         self.db_symbol = get_canonical_symbol(
             self.underlying
@@ -2056,10 +2069,24 @@ class IngestionEngine:
                 # period: the client only flushes window counts on the next
                 # request or on close_all_streams, so a lull would otherwise
                 # drop the last window's count. Best-effort.
-                try:
-                    self.client.flush_api_call_window()
-                except Exception as flush_err:
-                    logger.debug("API-call window flush skipped: %s", flush_err)
+                # TradeStation's own API-quota accounting. A local
+                # ThetaData terminal has no quota and no window to flush,
+                # and self.client is None there -- guarded rather than left
+                # to the except, so a real failure on the TradeStation path
+                # is still distinguishable from "this feed has no such
+                # concept".
+                # getattr, not self.client: this is a best-effort flush on a
+                # path whose whole contract is that it degrades rather than
+                # raises, and reading the attribute directly moved that read
+                # OUTSIDE the try -- so an engine without one (a partially
+                # built instance, anything constructed for a narrow test)
+                # would propagate an AttributeError into the write path and
+                # lose the row it was persisting.
+                if getattr(self, "client", None) is not None:
+                    try:
+                        self.client.flush_api_call_window()
+                    except Exception as flush_err:
+                        logger.debug("API-call window flush skipped: %s", flush_err)
 
         except Exception as e:
             self._db_consecutive_failures += 1
@@ -2158,6 +2185,7 @@ class IngestionEngine:
 
         stream_manager = StreamManager(
             client=self.client,
+            provider=self.provider,
             underlying=self.underlying,
             db_underlying=self.db_symbol,
             num_expirations=self.num_expirations,
@@ -2218,10 +2246,14 @@ class IngestionEngine:
             # stream manager.
             self._active_stream_manager = None
             self._flush_all_buffers()
-            try:
-                self.client.close_all_streams()
-            except Exception as e:
-                logger.warning(f"Error closing TradeStation streams: {e}")
+            # Same shape: closing every stream a TradeStation client holds
+            # is that client's lifecycle, not the engine's. The provider's
+            # streams are stopped by the stream manager that owns them.
+            if getattr(self, "client", None) is not None:
+                try:
+                    self.client.close_all_streams()
+                except Exception as e:
+                    logger.warning(f"Error closing TradeStation streams: {e}")
             logger.info("Streaming stopped")
         return window_closed
 
@@ -2507,15 +2539,36 @@ def main():
     def run_for_symbol(symbol: str):
         from src.ingestion.api_call_tracker import attach_db_writer
 
-        client = TradeStationClient(
-            os.getenv("TRADESTATION_CLIENT_ID"),  # type: ignore[arg-type]
-            os.getenv("TRADESTATION_CLIENT_SECRET"),  # type: ignore[arg-type]
-            os.getenv("TRADESTATION_REFRESH_TOKEN"),  # type: ignore[arg-type]
-            sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
+        # Build the feed MARKET_DATA_PROVIDER names. A TradeStation client
+        # is constructed ONLY for the TradeStation feed: it needs three
+        # credentials that will not exist once TradeStation is
+        # decommissioned, and building one unconditionally would make the
+        # new feed depend on the old one's secrets.
+        #
+        # get_provider raises on an unknown name rather than defaulting,
+        # deliberately -- a typo here that quietly fell back would be a
+        # cutover that reports success while still reading the old feed.
+        from src.ingestion.providers import get_provider
+
+        provider_name = (os.getenv("MARKET_DATA_PROVIDER", "").strip() or "tradestation").lower()
+        client = None
+        if provider_name == "tradestation":
+            client = TradeStationClient(
+                os.getenv("TRADESTATION_CLIENT_ID"),  # type: ignore[arg-type]
+                os.getenv("TRADESTATION_CLIENT_SECRET"),  # type: ignore[arg-type]
+                os.getenv("TRADESTATION_REFRESH_TOKEN"),  # type: ignore[arg-type]
+                sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
+            )
+            attach_db_writer(client)
+            provider = get_provider(client=client)
+        else:
+            provider = get_provider()
+        logger.info(
+            "Market data feed: %s (provider=%s)", provider_name, type(provider).__name__
         )
-        attach_db_writer(client)
         engine = IngestionEngine(
             client=client,
+            provider=provider,
             underlying=symbol,
             num_expirations=args.expirations,
             strike_count_max=args.strike_count_max,

@@ -1868,6 +1868,24 @@ ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_P
 # cutover.
 MARKET_DATA_PROVIDER = _getenv_str("MARKET_DATA_PROVIDER", "tradestation")
 
+# ES / NQ levels come from cost-of-carry, not from CME prints.
+#
+# The measured basis is the median of recent future/index print pairs, so
+# it is a derived work from CME's data -- licensed separately under CME's
+# Derived Data License, and one of the two findings in the 2026-09-02
+# licensing audit. ThetaData sells no CME product, so after the TradeStation
+# cutover there is no licensed source for those prints at all.
+#
+# On (the default) the projection uses e^((r-q)T) from RISK_FREE_RATE and
+# the index's dividend yield -- both ours, nothing an exchange owns. The
+# cost is that carry is FAIR VALUE, not the traded price: futures trade
+# away from it overnight and into risk events. Anything published from it
+# must say "implied from the index", not "ES".
+#
+# Off restores the measured path, which requires a CME licence or a
+# licensed redistributor. Do not turn it off without one.
+FUTURES_BASIS_CARRY_ONLY = _getenv_bool("FUTURES_BASIS_CARRY_ONLY", True)
+
 # Provider used by the comparison harness as the CANDIDATE feed, run
 # alongside MARKET_DATA_PROVIDER (the incumbent). Empty disables the
 # harness. Never read by the live ingestion path.
