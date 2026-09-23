@@ -216,29 +216,41 @@ The fix needs no code. `DB_NAME` is a plain environment variable read at connect
 **second ingestion process pointed at a scratch database** runs the real engine, the real provider
 and the real write path while touching nothing a customer reads.
 
+Run it through the Makefile. The hand-rolled commands this section used to carry were both wrong:
+one omitted the port from the psql connection string (`~/.pgpass` keys on `host:port:database:user`,
+so it matched nothing and prompted for a password), and the other set `DB_NAME` in the environment
+for `make`, which this Makefile ignores — it does `-include .env`, and an included makefile's
+assignment beats the environment, so `DB_NAME=zerogex_shadow make schema-apply` silently applies the
+schema to **production**.
+
 ```bash
-# once, on RDS
-createdb zerogex_shadow          # or: psql -c 'CREATE DATABASE zerogex_shadow;'
-DB_NAME=zerogex_shadow make schema-apply
+# once, on the EC2 box
+make shadow-create               # CREATE DATABASE zerogex_shadow + schema-apply against it
 
 # the rehearsal — start before 09:30 ET, leave it for the session
-MARKET_DATA_PROVIDER=thetadata_mv DB_NAME=zerogex_shadow \
-  .venv/bin/python -m src.ingestion.main_engine \
-  --underlyings 'SPY,QQQ,$SPXW.X,$NDXP.X'
+make shadow-run                  # MARKET_DATA_PROVIDER=thetadata_mv, DB_NAME=zerogex_shadow
+
+# at the close
+make shadow-compare              # production vs rehearsal, side by side, today's ET session
 ```
 
-Rollback is `kill`. Production never sees it.
+Underlyings come from `INGEST_UNDERLYINGS` in `.env`, so the rehearsal covers exactly what
+production covers. `make shadow-drop CONFIRM=yes` cleans up afterwards.
 
-**Read at the close, against the live tables for the same session:**
+Rollback is `Ctrl-C`. Production never sees it. One caveat: the VIX, VXN and futures ingesters run
+inside the same process and still call TradeStation directly, so the rehearsal consumes TradeStation
+quota and does not exercise those three paths on the candidate feed.
 
-| Check | Passes when |
-|---|---|
-| Minute coverage | `underlying_quotes` row count per symbol within a few of live |
-| Gaps | no minute bucket missing between 09:30 and 16:00 |
-| Chain size | `option_chains` contracts per cycle comparable to live |
-| Open interest | OI present on the same share of contracts as live |
-| Volume | the new `volume` column populated for SPY/QQQ, NULL for the indices |
-| Errors | no circuit-breaker trips, no sustained reconnects in the log |
+**Read at the close. `make shadow-compare` prints both sides of every row but the last:**
+
+| Check | Column to compare | Passes when |
+|---|---|---|
+| Minute coverage | `bars` | `underlying_quotes` row count per symbol within a few of live |
+| Gaps | `rth_minutes` | the two sides match; a shortfall is dropped minutes |
+| Chain size | `contracts`, `expirations` | `option_chains` contracts comparable to live |
+| Open interest | `oi_pct` | OI present on the same share of contracts as live |
+| Volume | `total_volume`, `no_updown` | `volume` populated for SPY/QQQ; `no_updown` = every row on the candidate feed, which has no up/down split |
+| Errors | — | read the `shadow-run` log: no circuit-breaker trips, no sustained reconnects |
 
 **G2 passes on a clean session, not on "it ran".** A process that stayed up while dropping half
 its minutes is the failure this gate exists to catch.

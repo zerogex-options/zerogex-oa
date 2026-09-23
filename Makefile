@@ -1114,6 +1114,13 @@ help: ## Show this help message
 	@echo "  make schema-verify      - Verify schema components exist"
 	@echo "  make schema-backup      - Backup current schema to file"
 	@echo ""
+	@echo "$(GREEN)Cutover Rehearsal (shadow database):$(NC)"
+	@echo "  make shadow-create      - Create $(SHADOW_DB) and apply the schema to it"
+	@echo "  make shadow-run         - Run ingestion into it on SHADOW_PROVIDER (Ctrl-C to stop)"
+	@echo "  make shadow-compare     - Production vs rehearsal coverage for today's ET session"
+	@echo "  make shadow-psql        - Interactive psql against the rehearsal database"
+	@echo "  make shadow-drop        - Drop it (dry run; pass CONFIRM=yes)"
+	@echo ""
 	@echo "$(GREEN)DB Table Tail:$(NC)"
 	@echo "  make symbols-list                 - Last 20 rows from symbols"
 	@echo "  make db-tail-underlying-quotes    - Last 20 rows from underlying_quotes"
@@ -3300,6 +3307,150 @@ schema-backup: ## Backup current schema to file
 	PGPASSFILE=~/.pgpass pg_dump -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) --schema-only -f $$BACKUP_FILE; \
 	echo "$(GREEN)✅ Schema backed up to $$BACKUP_FILE$(NC)"
 
+
+# =============================================================================
+# Cutover rehearsal database
+# =============================================================================
+# A throwaway database on the SAME instance as production, so a candidate
+# market-data feed can be run through the REAL ingestion path for a full
+# session without writing a single row into the live tables.
+# See docs/compliance/cutover-checklist-2026-09.md (gate G2).
+#
+# These targets exist to remove two footguns that both bit during the
+# ThetaData rehearsal:
+#
+#   1. Connection details must come from .env like every other target here.
+#      ~/.pgpass matches on host:port:database:user, so a hand-rolled psql
+#      string that leaves out the port matches nothing and falls through to
+#      a password prompt.
+#
+#   2. DB_NAME must be passed as a MAKE ARGUMENT, never as an environment
+#      variable. This Makefile does `-include .env`, and a variable set in an
+#      included makefile beats one inherited from the environment -- so
+#      `DB_NAME=zerogex_shadow make schema-apply` silently applies to
+#      PRODUCTION, while `make schema-apply DB_NAME=zerogex_shadow` is right.
+#      The Python side is the opposite: src/config.py calls load_dotenv()
+#      without override=True, so there the environment wins, which is why
+#      shadow-run exports DB_NAME instead of passing it to make.
+SHADOW_DB ?= zerogex_shadow
+SHADOW_PROVIDER ?= thetadata_mv
+
+# Same string as PSQL above, pointed at the rehearsal database. Keep the two
+# in sync -- especially the port, which is what makes ~/.pgpass match.
+SHADOW_PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) dbname=$(SHADOW_DB) keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
+
+# Midnight of today's ET session expressed in UTC (same convention as the
+# flow-coverage queries above).
+SHADOW_DAY_START = (DATE_TRUNC('day', (NOW() AT TIME ZONE 'America/New_York'))) AT TIME ZONE 'America/New_York'
+
+# Every shadow-* target runs this first. A typo that left SHADOW_DB empty or
+# equal to DB_NAME would point a rehearsal at production.
+.PHONY: shadow-guard
+shadow-guard:
+	@if [ -z "$(SHADOW_DB)" ] || [ "$(SHADOW_DB)" = "$(DB_NAME)" ]; then \
+		echo "$(RED)❌ SHADOW_DB is empty or equals the production database ($(DB_NAME)). Refusing.$(NC)"; \
+		exit 1; \
+	fi
+
+.PHONY: shadow-create
+shadow-create: shadow-guard ## Create the cutover-rehearsal database and apply schema.sql to it
+	@echo "$(BLUE)=== Rehearsal database $(SHADOW_DB) on $(DB_HOST) ===$(NC)"
+	@EXISTS=$$($(PSQL) -tA -c "SELECT 1 FROM pg_database WHERE datname = '$(SHADOW_DB)'" | tr -d '[:space:]'); \
+	if [ "$$EXISTS" = "1" ]; then \
+		echo "$(YELLOW)✓ $(SHADOW_DB) already exists — keeping it$(NC)"; \
+	else \
+		$(PSQL) -c "CREATE DATABASE $(SHADOW_DB)" || exit 1; \
+		echo "$(GREEN)✅ Created $(SHADOW_DB)$(NC)"; \
+	fi
+	@$(MAKE) --no-print-directory schema-apply DB_NAME=$(SHADOW_DB)
+
+.PHONY: shadow-run
+shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate feed. Ctrl-C to stop. Vars: SHADOW_PROVIDER, DEBUG=1
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)CUTOVER REHEARSAL — feed=$(SHADOW_PROVIDER)  db=$(SHADOW_DB)$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "Production ingestion keeps running untouched; this writes only to $(SHADOW_DB)."
+	@echo "Underlyings: $(or $(INGEST_UNDERLYINGS),$(INGEST_UNDERLYING),SPY)  (from INGEST_UNDERLYINGS in .env)"
+	@echo "$(YELLOW)Note: the VIX/VXN/futures ingesters still call TradeStation directly,$(NC)"
+	@echo "$(YELLOW)so this run consumes TradeStation quota even on the candidate feed.$(NC)"
+	@echo "Leave it running for a full session, then run: make shadow-compare"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo ""
+	@DB_NAME=$(SHADOW_DB) MARKET_DATA_PROVIDER=$(SHADOW_PROVIDER) \
+		$(VENV_PYTHON) -m src.ingestion.main_engine $(if $(DEBUG),--debug)
+
+.PHONY: shadow-compare
+shadow-compare: shadow-guard ## Side-by-side coverage for today's ET session: production vs rehearsal DB (gate G2 evidence)
+	@echo "$(BLUE)=== option_chains — today's ET session ===$(NC)"
+	@echo "$(GREEN)PRODUCTION ($(DB_NAME)):$(NC)"
+	@$(PSQL) -c "\
+		SELECT underlying, COUNT(*) AS row_count, \
+		       COUNT(DISTINCT option_symbol) AS contracts, \
+		       COUNT(DISTINCT expiration) AS expirations, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE open_interest > 0) \
+		             / NULLIF(COUNT(*), 0), 1) AS oi_pct, \
+		       MIN(timestamp AT TIME ZONE 'America/New_York') AS first_et, \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') AS last_et \
+		FROM option_chains WHERE timestamp >= $(SHADOW_DAY_START) \
+		GROUP BY underlying ORDER BY underlying;"
+	@echo "$(GREEN)REHEARSAL ($(SHADOW_DB)):$(NC)"
+	@$(SHADOW_PSQL) -c "\
+		SELECT underlying, COUNT(*) AS row_count, \
+		       COUNT(DISTINCT option_symbol) AS contracts, \
+		       COUNT(DISTINCT expiration) AS expirations, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE open_interest > 0) \
+		             / NULLIF(COUNT(*), 0), 1) AS oi_pct, \
+		       MIN(timestamp AT TIME ZONE 'America/New_York') AS first_et, \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') AS last_et \
+		FROM option_chains WHERE timestamp >= $(SHADOW_DAY_START) \
+		GROUP BY underlying ORDER BY underlying;"
+	@echo ""
+	@echo "$(BLUE)=== underlying_quotes — today's ET session ===$(NC)"
+	@echo "$(GREEN)PRODUCTION ($(DB_NAME)):$(NC)"
+	@$(PSQL) -c "\
+		SELECT symbol, COUNT(*) AS bars, \
+		       COUNT(DISTINCT DATE_TRUNC('minute', timestamp)) \
+		         FILTER (WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		                       >= TIME '09:30' \
+		                   AND (timestamp AT TIME ZONE 'America/New_York')::time \
+		                       <  TIME '16:00') AS rth_minutes, \
+		       SUM(COALESCE(volume, up_volume + down_volume)) AS total_volume, \
+		       COUNT(*) FILTER (WHERE up_volume IS NULL OR down_volume IS NULL) AS no_updown, \
+		       MIN(timestamp AT TIME ZONE 'America/New_York') AS first_et, \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') AS last_et \
+		FROM underlying_quotes WHERE timestamp >= $(SHADOW_DAY_START) \
+		GROUP BY symbol ORDER BY symbol;"
+	@echo "$(GREEN)REHEARSAL ($(SHADOW_DB)):$(NC)"
+	@$(SHADOW_PSQL) -c "\
+		SELECT symbol, COUNT(*) AS bars, \
+		       COUNT(DISTINCT DATE_TRUNC('minute', timestamp)) \
+		         FILTER (WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		                       >= TIME '09:30' \
+		                   AND (timestamp AT TIME ZONE 'America/New_York')::time \
+		                       <  TIME '16:00') AS rth_minutes, \
+		       SUM(COALESCE(volume, up_volume + down_volume)) AS total_volume, \
+		       COUNT(*) FILTER (WHERE up_volume IS NULL OR down_volume IS NULL) AS no_updown, \
+		       MIN(timestamp AT TIME ZONE 'America/New_York') AS first_et, \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') AS last_et \
+		FROM underlying_quotes WHERE timestamp >= $(SHADOW_DAY_START) \
+		GROUP BY symbol ORDER BY symbol;"
+
+.PHONY: shadow-psql
+shadow-psql: shadow-guard ## Open an interactive psql session against the rehearsal database
+	@$(SHADOW_PSQL)
+
+.PHONY: shadow-drop
+shadow-drop: shadow-guard ## Drop the rehearsal database. Pass CONFIRM=yes.
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. This would: DROP DATABASE $(SHADOW_DB) on $(DB_HOST)$(NC)"; \
+		echo "$(YELLOW)Rerun with: make shadow-drop CONFIRM=yes$(NC)"; \
+		exit 0; \
+	fi
+	@$(PSQL) -c "\
+		SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+		WHERE datname = '$(SHADOW_DB)' AND pid <> pg_backend_pid();" >/dev/null
+	@$(PSQL) -c "DROP DATABASE IF EXISTS $(SHADOW_DB)" || exit 1
+	@echo "$(GREEN)✅ Dropped $(SHADOW_DB)$(NC)"
 # Refresh per-symbol normalizer rows so signal saturation tracks real
 # magnitude distributions instead of falling back to env-var defaults.
 # Override SYMBOLS / WINDOW_DAYS to scope the refresh.
