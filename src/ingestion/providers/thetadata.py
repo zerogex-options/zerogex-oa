@@ -120,7 +120,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.ingestion.providers.base import (
     Bar,
@@ -508,6 +508,73 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
         self._thread: Optional[threading.Thread] = None
         self._updates_received = 0
         self._last_oi_poll = 0.0
+
+    # -- restart across a changing symbol set -------------------------------
+    #
+    # The polling reader rebuilds prices on its own cadence, so only the
+    # STICKY fields need carrying -- open interest above all, because a
+    # strike recalibration that blanked it would publish an OI-weighted
+    # gamma surface with holes in it until the next open-interest poll,
+    # which runs on a deliberately slower cadence than quotes do.
+
+    _STICKY_CARRY_FIELDS = ("open_interest", "volume")
+
+    def sticky_state(self) -> Dict[str, Any]:
+        with self._lock:
+            out: Dict[str, Any] = {}
+            for symbol, st in self._state.items():
+                kept = {k: st[k] for k in self._STICKY_CARRY_FIELDS if st.get(k)}
+                if kept:
+                    out[symbol] = kept
+            return out
+
+    def carry_sticky_state(self, carried: Dict[str, Any]) -> int:
+        """Adopt sticky fields for symbols this stream tracks.
+
+        Only for symbols in THIS stream's set, and only where we do not
+        already hold a positive value -- the carry seeds a gap, it never
+        overwrites something the poller has since read for itself.
+        """
+        if not carried:
+            return 0
+        wanted = set(self._symbols)
+        adopted = 0
+        with self._lock:
+            for symbol, fields in carried.items():
+                if symbol not in wanted or not isinstance(fields, dict):
+                    continue
+                target = self._state.setdefault(symbol, {})
+                took = False
+                for key in self._STICKY_CARRY_FIELDS:
+                    value = fields.get(key)
+                    if value and not target.get(key):
+                        target[key] = value
+                        took = True
+                if took:
+                    adopted += 1
+        return adopted
+
+    def seed_new_symbols(self, known: Set[str]) -> int:
+        """Snapshot only the symbols absent from ``known``.
+
+        One call per (root, expiration) either way, so this is cheaper than
+        a full seed only when the new arrivals cluster into fewer
+        expirations than the whole set spans -- which is the usual shape of
+        a strike-band shift.
+        """
+        fresh = [s for s in self._symbols if s not in known]
+        if not fresh:
+            return 0
+        rows = self._provider.fetch_chain_state(fresh, include_open_interest=True)
+        if not rows:
+            return 0
+        with self._lock:
+            for symbol, incoming in rows.items():
+                self._state.setdefault(symbol, {}).update(
+                    {k: v for k, v in incoming.items() if v is not None}
+                )
+                self._dirty.add(symbol)
+        return len(rows)
 
     # -- lifecycle ---------------------------------------------------------
 

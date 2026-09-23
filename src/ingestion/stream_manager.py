@@ -321,6 +321,35 @@ def _has_positive_oi(raw: Dict[str, Any]) -> bool:
     return False
 
 
+def _bar_to_row(bar: Any) -> Optional[Dict[str, Any]]:
+    """A provider ``Bar`` as the dict this module has always yielded.
+
+    The provider interface speaks ``Bar``; ``IngestionEngine._store_underlying``
+    speaks a lowercase dict and has since long before providers existed.
+    Converting here rather than downstream keeps the change to the vendor
+    boundary: nothing past this point can tell which feed it is reading.
+
+    ``None`` in, ``None`` out -- an empty drain is "no new bar", not a bar
+    full of Nones, and the caller distinguishes them.
+    """
+    if bar is None:
+        return None
+    if isinstance(bar, dict):
+        # Belt and braces for any caller still handing us the raw shape.
+        return bar
+    return {
+        "symbol": bar.symbol,
+        "timestamp": bar.timestamp,
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+        "up_volume": bar.up_volume,
+        "down_volume": bar.down_volume,
+    }
+
+
 class _DecodeErrorTracker:
     """Counts stream JSON-decode failures and triggers a reconnect when sustained.
 
@@ -1367,9 +1396,27 @@ class StreamManager:
         strike_pct_range: float = 3.0,
         num_monthly_expirations: int = 0,
         monthly_underlying: Optional[str] = None,
+        provider: Optional[Any] = None,
     ):
         """Initialize stream manager"""
         self.client = client
+        # The streams come from a provider; everything else in this class is
+        # vendor-neutral orchestration that both feeds need.
+        #
+        # Defaulted rather than required so every existing caller and test
+        # keeps working unchanged: with no provider, this wraps the client it
+        # was given in the TradeStation provider, which is a pure indirection
+        # -- TradeStationProvider's stream adapters construct the very same
+        # accumulators this class used to construct itself.
+        #
+        # Imported here, not at module scope, because providers/tradestation.py
+        # imports the accumulators FROM this module. A top-level import would
+        # be a cycle.
+        if provider is None:
+            from src.ingestion.providers.tradestation import TradeStationProvider
+
+            provider = TradeStationProvider(client)
+        self.provider = provider
         self.underlying = (
             underlying.upper()
         )  # TradeStation API symbol for underlying (e.g. "$SPXW.X")
@@ -2148,18 +2195,15 @@ class StreamManager:
         # are still flowing. Option chunks degrading gracefully under cap
         # pressure is far less harmful than the underlying feed going dark.
         if restart_underlying or self._underlying_accumulator is None:
-            self._underlying_accumulator = UnderlyingBarAccumulator(
-                client=self.client,
-                symbol=self.underlying,
+            self._underlying_accumulator = self.provider.stream_underlying_bars(
+                self.underlying,
                 db_symbol=self.db_underlying,
-                session_template=SESSION_TEMPLATE,
                 wakeup=self._wakeup,
             )
             self._underlying_accumulator.start()
 
-        self._accumulator = OptionStreamAccumulator(
-            client=self.client,
-            symbols=self.tracked_option_symbols,
+        self._accumulator = self.provider.stream_option_quotes(
+            self.tracked_option_symbols,
             wakeup=self._wakeup,
         )
         # Adopt before start() so a REST seed (when enabled) merges over the
@@ -2176,7 +2220,7 @@ class StreamManager:
                 # let it break the restart: blank OI on a few new strikes is
                 # recoverable, a dead option feed is not.
                 try:
-                    arrivals = self._accumulator.seed_new_symbols_from_rest(set(carried_sticky))
+                    arrivals = self._accumulator.seed_new_symbols(set(carried_sticky))
                 except Exception as e:
                     logger.warning("REST seed of newly-tracked contracts failed: %s", e)
             logger.info(
@@ -2187,7 +2231,7 @@ class StreamManager:
                 "enabled" if seed_option_rest else "disabled",
                 arrivals,
             )
-        self._accumulator.start(seed_from_rest=seed_option_rest)
+        self._accumulator.start(seed_from_snapshot=seed_option_rest)
 
     def request_stop(self):
         """Ask :meth:`stream` to exit at its next checkpoint.
@@ -2217,22 +2261,20 @@ class StreamManager:
         logger.error("Restarting underlying bar stream: %s", reason)
         if self._underlying_accumulator is not None:
             self._underlying_accumulator.stop()
-        self._underlying_accumulator = UnderlyingBarAccumulator(
-            client=self.client,
-            symbol=self.underlying,
+        self._underlying_accumulator = self.provider.stream_underlying_bars(
+            self.underlying,
             db_symbol=self.db_underlying,
-            session_template=SESSION_TEMPLATE,
             wakeup=self._wakeup,
         )
         self._underlying_accumulator.start()
 
-    def _yield_option_snapshot(self, state: Dict[str, Dict[str, Any]]):
+    def _yield_option_snapshot(self, state: Dict[str, Any]):
         """
         Convert raw accumulator state into yielded option data dicts.
 
-        *state* should come from :meth:`OptionStreamAccumulator.drain` so
-        it only contains contracts that have received new data since the
-        last drain — no external change-detection needed.
+        *state* should come from :meth:`OptionQuoteStream.drain` so it only
+        contains contracts that have received new data since the last drain
+        — no external change-detection needed.
 
         Returns a list (not a generator) so callers can count results.
         """
@@ -2264,13 +2306,19 @@ class StreamManager:
             if not meta:
                 continue
 
-            raw_ts = raw.get("TimeStamp", "")
-            timestamp = safe_datetime(raw_ts, field_name="TimeStamp")
+            # ``raw`` is a provider OptionQuote: already parsed, already
+            # normalised, already carrying the vendor's own quote time. The
+            # safe_float/safe_datetime coercions that used to live here were
+            # reading TradeStation's raw JSON (Bid, Ask, Last, TimeStamp,
+            # DailyOpenInterest, the IV field ladder) and each provider now
+            # does that translation inside its own module, which is the only
+            # place that knows which spelling its feed uses.
+            timestamp = raw.timestamp
 
-            last = safe_float(raw.get("Last"), default=None, field_name="Last")
-            bid = safe_float(raw.get("Bid"), default=None, field_name="Bid")
-            ask = safe_float(raw.get("Ask"), default=None, field_name="Ask")
-            mid = safe_float(raw.get("Mid"), default=None, field_name="Mid")
+            last = raw.last
+            bid = raw.bid
+            ask = raw.ask
+            mid = raw.mid
 
             if mid is None and bid is not None and ask is not None:
                 mid = (bid + ask) / 2.0
@@ -2310,26 +2358,17 @@ class StreamManager:
                     )
                     continue
 
-            volume = safe_int(raw.get("Volume"), default=None, field_name="Volume")
+            volume = raw.volume
+            open_interest = raw.open_interest
 
-            open_interest = safe_int(
-                raw.get("DailyOpenInterest"),
-                default=None,  # type: ignore[arg-type]
-                field_name="DailyOpenInterest",
+            # Positive-only, matching the accumulator's own merge rule: a
+            # feed that sends 0 for "no reading this tick" must not be read
+            # as "this contract has no implied volatility".
+            implied_volatility = (
+                raw.implied_volatility
+                if raw.implied_volatility and raw.implied_volatility > 0
+                else None
             )
-            if open_interest is None:
-                open_interest = safe_int(
-                    raw.get("OpenInterest"),
-                    default=None,
-                    field_name="OpenInterest",
-                )
-
-            implied_volatility = None
-            for iv_field in _IV_FIELD_NAMES:
-                iv_val = safe_float(raw.get(iv_field), field_name=iv_field)
-                if iv_val and iv_val > 0:
-                    implied_volatility = iv_val
-                    break
 
             results.append(
                 {
@@ -2506,11 +2545,11 @@ class StreamManager:
                     # restart: the options stream is independent and may be
                     # healthy; restarting it would force an expensive REST
                     # re-seed and gap option ingestion for no reason.
-                    if feed_expected and not self._underlying_accumulator.is_alive:
+                    if feed_expected and not self._underlying_accumulator.is_alive():
                         self._restart_underlying_accumulator("reader thread is DEAD")
 
                     # Drain underlying bar from persistent stream.
-                    underlying_data = self._underlying_accumulator.drain()
+                    underlying_data = _bar_to_row(self._underlying_accumulator.drain())
                     bar_advanced = False
                     if underlying_data:
                         self.current_price = underlying_data["close"]
@@ -2593,7 +2632,7 @@ class StreamManager:
                                     _consecutive_empty_underlying,
                                     cur_updates,
                                     cur_updates - _last_bar_updates,
-                                    self._underlying_accumulator.is_alive,
+                                    self._underlying_accumulator.is_alive(),
                                 )
                                 _stale_warned = True
                                 _last_stale_warn_mono = now_mono
