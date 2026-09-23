@@ -782,9 +782,17 @@ def _try_llm_post(
             future_symbol=b.future_symbol,
             # How the levels moved through the session and what price did to
             # each print — so the prose narrates the real path instead of
-            # inferring one from the closing snapshot.
-            level_history=(b.level_history.to_prompt_dict() if b.level_history else None),
+            # inferring one from the closing snapshot.  The post-bell reset is
+            # shown by direction only: the post prints its value on its own
+            # line, and a number the model is handed is a number it will put
+            # next to "call wall".
+            level_history=(
+                b.level_history.to_prompt_dict(include_post_close_values=False)
+                if b.level_history
+                else None
+            ),
             historical_level_values=(b.level_history.quoted_values() if b.level_history else []),
+            level_paths=(b.level_history.session_values() if b.level_history else {}),
         )
         for b in present
     ]

@@ -119,6 +119,13 @@ def _tolerance(level: float) -> float:
     return max(abs(level) * TOUCH_PCT, TOUCH_MIN)
 
 
+def _reset_direction(session_value: float | None, post_close_value: float | None) -> str:
+    """Which way a level re-priced after the bell: "higher" or "lower"."""
+    if session_value is None or post_close_value is None:
+        return "moved"
+    return "higher" if post_close_value > session_value else "lower"
+
+
 # ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
@@ -254,18 +261,26 @@ class WallTrack:
             return False
         return abs(self.post_close_value - sv) > _tolerance(sv)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, include_post_close_value: bool = True) -> dict[str, Any]:
+        """The track as JSON.  ``include_post_close_value=False`` is the model's
+        view: the post-bell reset is reported by direction only, because a
+        number the model is handed is a number it will attach to the wall."""
         d: dict[str, Any] = {
             "changed_during_session": self.changed,
             "path": [s.to_dict() for s in self.segments],
             "at_session_close": self.session_value,
         }
         if self.post_close_shift:
-            d["after_the_bell"] = self.post_close_value
-            d["after_the_bell_note"] = (
-                "post-bell value only — the day's 0DTE rolled off the chain after "
-                "16:00 ET, so this level was NOT in play during the session"
-            )
+            if include_post_close_value:
+                d["after_the_bell"] = self.post_close_value
+                d["after_the_bell_note"] = (
+                    "post-bell value only — the day's 0DTE rolled off the chain after "
+                    "16:00 ET, so this level was NOT in play during the session"
+                )
+            else:
+                d["after_the_bell_reset"] = _reset_direction(
+                    self.session_value, self.post_close_value
+                )
         return d
 
 
@@ -382,7 +397,8 @@ class FlipTrack:
             return False
         return abs(self.post_close_value - self.last) > _tolerance(self.last)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, include_post_close_value: bool = True) -> dict[str, Any]:
+        """The track as JSON; see :meth:`WallTrack.to_dict` for the flag."""
         d: dict[str, Any] = {
             "drifted_during_session": self.drifted,
             "opened_at": self.first,
@@ -394,10 +410,13 @@ class FlipTrack:
             "spot_crossings": self.crossings,
         }
         if self.post_close_shift:
-            d["after_the_bell"] = self.post_close_value
-            d["after_the_bell_note"] = (
-                "post-bell value only — recomputed after the day's 0DTE rolled off"
-            )
+            if include_post_close_value:
+                d["after_the_bell"] = self.post_close_value
+                d["after_the_bell_note"] = (
+                    "post-bell value only — recomputed after the day's 0DTE rolled off"
+                )
+            else:
+                d["after_the_bell_reset"] = _reset_direction(self.last, self.post_close_value)
         return d
 
 
@@ -521,39 +540,65 @@ class LevelHistory:
         """Every level value the history legitimately lets the prose cite.
 
         Feeds the LLM output validator: once the model is told the put wall
-        walked 777 → 776 → 775, quoting 777 is a fact, not a hallucination."""
+        walked 777 → 776 → 775, quoting 777 is a fact, not a hallucination.
+
+        Post-bell values are deliberately NOT here.  They are tomorrow's chain,
+        the model is never shown them, and the post prints them itself on the
+        "After the bell" line.  Whitelisted, a reset call wall of 780 could be
+        written up as today's "780 call wall" on a session whose call wall was
+        765, and the guard would accept it in any sentence, next to any level."""
         out: list[float] = []
-        for track in (self.put_wall, self.call_wall):
-            if track is None:
-                continue
-            out.extend(track.values)
-            if track.post_close_value is not None:
-                out.append(track.post_close_value)
-        if self.gamma_flip is not None:
-            out.extend([self.gamma_flip.first, self.gamma_flip.last])
-            if self.gamma_flip.post_close_value is not None:
-                out.append(self.gamma_flip.post_close_value)
+        for values in self.session_values().values():
+            out.extend(values)
         return out
 
-    def to_prompt_dict(self) -> dict[str, Any]:
+    def session_values(self) -> dict[str, list[float]]:
+        """Per level, every value it held while the session traded.
+
+        The walls give their chain of prints; the flip, which drifts rather
+        than steps, gives the ends of its drift band as well as its open and
+        close.  This is what a sentence naming a level may put next to it."""
+        out: dict[str, list[float]] = {}
+        for key in WALL_KEYS:
+            track = self.track(key)
+            if isinstance(track, WallTrack) and track.values:
+                out[key] = list(track.values)
+        flip = self.gamma_flip
+        if flip is not None:
+            out[FLIP_KEY] = [flip.first, flip.last, flip.low, flip.high]
+        return out
+
+    def to_prompt_dict(self, include_post_close_values: bool = True) -> dict[str, Any]:
+        """The history as JSON — for the review record and, with
+        ``include_post_close_values=False``, for the model (see
+        :meth:`WallTrack.to_dict`)."""
         d: dict[str, Any] = {
             "session_frames": self.session_frames,
             "levels_moved_during_session": self.any_change,
             "structure_as_of": _hhmm(self.last_session_ts),
         }
         if self.put_wall is not None:
-            d["put_wall"] = self.put_wall.to_dict()
+            d["put_wall"] = self.put_wall.to_dict(include_post_close_values)
         if self.call_wall is not None:
-            d["call_wall"] = self.call_wall.to_dict()
+            d["call_wall"] = self.call_wall.to_dict(include_post_close_values)
         if self.gamma_flip is not None:
-            d["gamma_flip"] = self.gamma_flip.to_dict()
+            d["gamma_flip"] = self.gamma_flip.to_dict(include_post_close_values)
         if self.post_close_shifted:
-            d["post_close_roll_off"] = (
-                "The chain re-priced after the 16:00 bell as the day's 0DTE expiries "
-                "rolled off. Any 'after_the_bell' value is TOMORROW's structure — it "
-                "was never in play during the session, so never describe the tape as "
-                "having reacted to it."
-            )
+            if include_post_close_values:
+                d["post_close_roll_off"] = (
+                    "The chain re-priced after the 16:00 bell as the day's 0DTE expiries "
+                    "rolled off. Any 'after_the_bell' value is TOMORROW's structure — it "
+                    "was never in play during the session, so never describe the tape as "
+                    "having reacted to it."
+                )
+            else:
+                d["post_close_roll_off"] = (
+                    "The chain re-priced after the 16:00 bell as the day's 0DTE expiries "
+                    "rolled off. Each 'after_the_bell_reset' says which way that level "
+                    "moved for TOMORROW. It was never in play during the session, and "
+                    "its new value is printed on its own line for you: never write a "
+                    "number for it."
+                )
         return d
 
 
