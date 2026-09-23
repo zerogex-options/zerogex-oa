@@ -36,6 +36,7 @@ def _ctx(
     recent_lows: Optional[list] = None,
     dealer_delta_score: Optional[float] = None,
     vix_level: Optional[float] = None,
+    opening_range: Optional[tuple] = None,
 ) -> PlaybookContext:
     extra = {}
     if vix_level is not None:
@@ -72,7 +73,14 @@ def _ctx(
         msi_components={},
         advanced_signals={},
         basic_signals=basic,
-        levels={"max_pain": max_pain},
+        levels={
+            "max_pain": max_pain,
+            **(
+                {"opening_range_high": opening_range[0], "opening_range_low": opening_range[1]}
+                if opening_range
+                else {}
+            ),
+        },
         open_positions=[],
         recently_emitted={},
     )
@@ -174,27 +182,86 @@ def test_vix_breakout_stands_down_when_calm():
 # ---- opening_range_break -------------------------------------------------
 
 
+# The 09:30-10:00 ET range, as both context builders publish it in ``levels``.
+OPENING_RANGE = (678.2, 676.0)
+
+
 def test_orb_trades_the_break_in_window():
-    highs = [677.0, 677.5, 678.0, 678.2, 678.1]
-    lows = [676.0, 676.2, 676.1, 676.5, 676.3]
     card = ORB.match(
         _ctx(
             timestamp=TS_MID_MORNING,
             close=679.0,
-            recent_highs=highs,
-            recent_lows=lows,
+            opening_range=OPENING_RANGE,
             regime="trend_expansion",
         )
     )
     assert card is not None
     assert card.direction == "bullish"
+    assert card.action.value == "BUY_CALL_DEBIT"
+    assert card.stop.ref_price == 676.0  # the far side of the range
+    assert card.context["range_high"] == 678.2
+
+
+def test_orb_trades_the_breakdown_in_window():
+    card = ORB.match(
+        _ctx(
+            timestamp=TS_MID_MORNING,
+            close=675.5,
+            opening_range=OPENING_RANGE,
+            regime="controlled_trend",
+        )
+    )
+    assert card is not None
+    assert card.direction == "bearish"
+    assert card.action.value == "BUY_PUT_DEBIT"
+    assert card.stop.ref_price == 678.2
+    assert "opening-range low $676.00" in card.rationale
+
+
+def test_orb_fires_on_the_live_bar_shape():
+    """Regression: the live engine's trailing bars include the bar the close
+    came from, so the close always sits inside them. The old trigger (close
+    beyond max/min of those bars) could therefore never fire. The break must
+    be judged against the opening range, not the trailing bars."""
+    # A slide from 678 to 675.5; the last bar is the one the close came from.
+    closes = [678.0 - 0.1 * i for i in range(26)]
+    highs = [c + 0.05 for c in closes]
+    lows = [c - 0.05 for c in closes]
+    close = closes[-1]
+    assert min(lows) <= close <= max(highs)  # the only shape production produces
+    ctx = _ctx(
+        timestamp=TS_MID_MORNING,
+        close=close,
+        recent_highs=highs,
+        recent_lows=lows,
+        opening_range=OPENING_RANGE,
+        regime="controlled_trend",
+    )
+    card = ORB.match(ctx)
+    assert card is not None
+    assert card.direction == "bearish"
+
+
+def test_orb_stands_down_inside_the_range():
+    ctx = _ctx(timestamp=TS_MID_MORNING, close=677.0, opening_range=OPENING_RANGE)
+    assert ORB.match(ctx) is None
+    assert "price has not broken the opening range" in ORB.explain_miss(ctx)
+
+
+def test_orb_stands_down_without_an_opening_range():
+    """No published range (before 10:00, feed gap at the open) -> no card,
+    however far price has run from the trailing bars."""
+    ctx = _ctx(
+        timestamp=TS_MID_MORNING,
+        close=679.0,
+        recent_highs=[677.0, 677.5, 678.0],
+        recent_lows=[676.0, 676.2, 676.1],
+        regime="trend_expansion",
+    )
+    assert ORB.match(ctx) is None
+    assert "09:30–10:00 opening range unavailable" in ORB.explain_miss(ctx)
 
 
 def test_orb_stands_down_outside_window():
-    highs = [677.0, 677.5, 678.0, 678.2, 678.1]
-    lows = [676.0, 676.2, 676.1, 676.5, 676.3]
     # Afternoon timestamp is outside the 10:00–11:30 ET window.
-    assert (
-        ORB.match(_ctx(timestamp=TS_AFTERNOON, close=679.0, recent_highs=highs, recent_lows=lows))
-        is None
-    )
+    assert ORB.match(_ctx(timestamp=TS_AFTERNOON, close=679.0, opening_range=OPENING_RANGE)) is None

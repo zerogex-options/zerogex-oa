@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from src.config import SIGNALS_GEX_STALE_BUFFER_SECONDS
 from src.database import db_connection
 from src.market_calendar import is_rth_settled
+from src.opening_range import OPENING_RANGE_SQL, opening_range_from_row, opening_range_window
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import MarketContext
 from src.signals.components.gamma_anchor import GammaAnchorComponent
@@ -101,6 +102,13 @@ class UnifiedSignalEngine:
         # genuinely doesn't change minute-to-minute since it's a daily
         # percentile.  Stored as ``(computed_at_utc, iv_rank_value)``.
         self._iv_rank_cache: dict[str, tuple[datetime, Optional[float]]] = {}
+        # This session's 09:30-10:00 ET opening range as
+        # ``(window_start_utc, (high, low) | None, bar_ts_checked)``. It
+        # cannot change once its last bar is final, so it is read once per
+        # session instead of on every 1Hz cycle. See _fetch_opening_range.
+        self._opening_range_cache: Optional[
+            tuple[datetime, Optional[tuple[float, float]], datetime]
+        ] = None
         # IV rank query is opportunistic — falls back gracefully when the
         # 30-day daily IV history is missing — so it's safe to enable by
         # default.  Operators can disable via SIGNAL_IV_RANK_ENABLED=false
@@ -191,6 +199,42 @@ class UnifiedSignalEngine:
             put_delta = -max(0.0, min(1.0, 0.5 + distance_pct * 10))
             total -= (call_oi_f * call_delta + put_oi_f * put_delta) * 100
         return total
+
+    def _fetch_opening_range(self, cur, conn, ts) -> Optional[tuple[float, float]]:
+        """This session's 09:30-10:00 ET ``(high, low)``, or ``None``.
+
+        See :mod:`src.opening_range`. Read at most once per new bar until the
+        range is final (a bar at or after 10:01 ET), then not again that
+        session. An incomplete range (a feed gap at the open) keeps being
+        re-read once a bar, so a later backfill is picked up.
+        """
+        if not isinstance(ts, datetime):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        window = opening_range_window(ts)
+        if window is None:
+            return None
+        start, end = window
+        cached = self._opening_range_cache
+        if cached is not None and cached[0] == start:
+            _, value, checked_ts = cached
+            final = value is not None and checked_ts >= end + timedelta(minutes=1)
+            if final or checked_ts == ts:
+                return value
+        try:
+            cur.execute(OPENING_RANGE_SQL, (self.db_symbol, start, end))
+            value = opening_range_from_row(cur.fetchone())
+        except Exception as exc:
+            self._reset_tx(conn)
+            logger.debug(
+                "UnifiedSignalEngine [%s]: opening range read failed: %s",
+                self.db_symbol,
+                exc,
+            )
+            value = None
+        self._opening_range_cache = (start, value, ts)
+        return value
 
     def _fetch_market_context(self, conn=None) -> Optional[dict]:
         # Phase 2.5: defensive look-ahead guard.  Option quotes are aggregated
@@ -1215,6 +1259,9 @@ class UnifiedSignalEngine:
                             # Cache the failure too so retries are paced.
                             self._iv_rank_cache[self.db_symbol] = (now_utc, None)
 
+                # Read last, so a failure here cannot disturb any read above.
+                opening_range = self._fetch_opening_range(cur, conn, ts)
+
                 net_gex_f = float(net_gex or 0.0)
                 flip_distance_f = (
                     float(flip_distance)
@@ -1277,6 +1324,8 @@ class UnifiedSignalEngine:
                     "recent_closes": list(reversed(closes)),
                     "recent_lows": list(reversed(lows)),
                     "recent_highs": list(reversed(highs)),
+                    "opening_range_high": opening_range[0] if opening_range else None,
+                    "opening_range_low": opening_range[1] if opening_range else None,
                     "iv_rank": iv_rank,
                     "vwap": vwap,
                     "vwap_deviation_pct": vwap_deviation_pct,
@@ -1327,6 +1376,8 @@ class UnifiedSignalEngine:
                 "put_wall": ctx.get("put_wall"),
                 "prior_put_wall": ctx.get("prior_put_wall"),
                 "max_gamma_strike": ctx.get("max_gamma_strike"),
+                "opening_range_high": ctx.get("opening_range_high"),
+                "opening_range_low": ctx.get("opening_range_low"),
                 "gex_by_strike": ctx.get("gex_by_strike") or [],
                 "gex_by_strike_bucket": ctx.get("gex_by_strike_bucket") or {},
                 "flow_by_type": ctx.get("flow_by_type") or [],
