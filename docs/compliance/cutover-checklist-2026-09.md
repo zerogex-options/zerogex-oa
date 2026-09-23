@@ -14,9 +14,9 @@ Four conditions. All four must be true at launch or we do not launch.
 
 | # | Gate | State |
 |---|---|---|
-| G1 | Production ingestion can read ThetaData at all | ❌ **NOT BUILT** |
+| G1 | Production ingestion can read ThetaData at all | ✅ **built** — `4fd69a6`, `a94c8e6`; full suite clean |
 | G2 | ThetaData has written one full trading session through the real ingestion path | ❌ blocked on G1 |
-| G3 | ES / NQ has a source that survives TradeStation being switched off | ⚠️ decision open (§4.1) |
+| G3 | ES / NQ has a source that survives TradeStation being switched off | ✅ **done** — carry basis, `a94c8e6`; site label still to change |
 | G4 | Every known behaviour change at cutover is written down and accepted | ⚠️ §5 |
 
 **G1 is the whole job.** Everything else is small by comparison.
@@ -189,9 +189,19 @@ quotes — which are common in options and sit exactly where the band decides.
 flip and net GEX. No flow metric. This is the only remaining unknown in the evidence base, and it
 feeds the order-flow and tape-bias signals.
 
-**Action: extend `feed_compare` to diff classified flow (ask / mid / bid volume) between Market
-Value and real-time quotes over the same trades.** Small, mechanical, and it either closes the
-question or changes the design before we build on it.
+**Built** (`compare_flow_classification`, runs with every paired sample). It classifies the SAME
+trade twice — `last` and `volume` come from the same non-Market-Value endpoint on both paths, so
+the quote is the only variable — and reports disagreement per contract AND volume-weighted, plus
+which way the shifts go.
+
+Reasoning it through against the unit cases first, the shape is narrower than feared: a print **at
+the bid or the ask** survives a penny of quote movement, because it stays on its side of the band.
+The exposure is **midpoint fills**, where the band decides. Still needs a live RTH session to know
+the real rate — `INCUMBENT=thetadata CANDIDATE=thetadata_mv make feed-compare MINUTES=30`.
+
+**Read the volume-weighted number, not the contract count.** A chain is mostly untraded contracts
+and a thousand one-lot far-OTM disagreements matter less to a published flow figure than one on a
+heavily traded ATM strike.
 
 ---
 

@@ -630,6 +630,126 @@ def sample_provider(
         )
 
 
+def compare_flow_classification(
+    incumbent: "FeedSample",
+    candidate: "FeedSample",
+) -> Dict[str, Any]:
+    """How often the two feeds' quotes classify the SAME trade differently.
+
+    The one thing the chain comparison never tested, and the only remaining
+    unknown in the cutover evidence.
+
+    After cutover the Lee-Ready inputs come from two different places: the
+    trade price and volume from ``option_snapshot_ohlc``, real-time and
+    exact, and the bid/ask from ``option_snapshot_market_value``, where each
+    side has been randomised by up to a penny. ``_classify_volume_chunk``
+    decides buyer- from seller-initiated by where ``last`` sits relative to
+    that quote, with a mid band of 0.70 x half-spread. On a five-cent-wide
+    option the band is 1.75c and the quote has moved up to 1c.
+
+    The measurement isolates exactly that. Both feeds are sampled over the
+    same contracts at the same instant, and ``last`` and ``volume`` come
+    from the same non-Market-Value endpoint on both paths, so they are
+    identical by construction. The quote is the only thing that differs, and
+    any disagreement here is caused by the randomisation and nothing else.
+
+    Reported volume-weighted as well as per contract, because a thousand
+    one-lot far-OTM disagreements matter less to a published flow number
+    than one disagreement on a heavily traded ATM strike.
+    """
+    from src.config import FLOW_CLASSIFY_MID_BAND_PCT
+    from src.ingestion.main_engine import IngestionEngine
+
+    classify = IngestionEngine._classify_volume_chunk
+    shim = object.__new__(IngestionEngine)
+
+    def _bucket(quote: OptionQuote, volume: int, last: Optional[float]) -> Optional[str]:
+        ask_v, mid_v, bid_v = classify(
+            shim,
+            volume,
+            last,
+            quote.bid,
+            quote.ask,
+            quote.mid if quote.mid is not None else quote.effective_mid(),
+            band_pct=FLOW_CLASSIFY_MID_BAND_PCT,
+        )
+        if ask_v:
+            return "ask"
+        if bid_v:
+            return "bid"
+        if mid_v:
+            return "mid"
+        return None
+
+    compared = 0
+    disagreed = 0
+    volume_compared = 0
+    volume_disagreed = 0
+    shifts: Dict[str, int] = {}
+    no_trade = 0
+
+    for symbol, inc_q in incumbent.quotes.items():
+        cand_q = candidate.quotes.get(symbol)
+        if cand_q is None:
+            continue
+        # The trade is the same trade on both sides: same endpoint, same
+        # row. A contract that has not traded has nothing to classify.
+        volume = inc_q.volume or 0
+        last = inc_q.last
+        if volume <= 0 or last is None or last <= 0:
+            no_trade += 1
+            continue
+
+        inc_bucket = _bucket(inc_q, volume, last)
+        cand_bucket = _bucket(cand_q, volume, last)
+        if inc_bucket is None or cand_bucket is None:
+            continue
+
+        compared += 1
+        volume_compared += volume
+        if inc_bucket != cand_bucket:
+            disagreed += 1
+            volume_disagreed += volume
+            key = f"{inc_bucket}->{cand_bucket}"
+            shifts[key] = shifts.get(key, 0) + 1
+
+    return {
+        "contracts_compared": compared,
+        "contracts_disagreed": disagreed,
+        "contract_disagreement_pct": (100.0 * disagreed / compared) if compared else None,
+        "volume_compared": volume_compared,
+        "volume_disagreed": volume_disagreed,
+        "volume_disagreement_pct": (
+            (100.0 * volume_disagreed / volume_compared) if volume_compared else None
+        ),
+        "shifts": dict(sorted(shifts.items(), key=lambda kv: -kv[1])),
+        "contracts_without_a_trade": no_trade,
+        "band_pct": FLOW_CLASSIFY_MID_BAND_PCT,
+    }
+
+
+def _print_flow_classification(flow: Dict[str, Any]) -> None:
+    compared = flow.get("contracts_compared") or 0
+    if not compared:
+        print("\nFLOW CLASSIFICATION  no contract traded in this sample -- nothing to compare")
+        return
+    print("\nFLOW CLASSIFICATION (same trade, two quotes)")
+    print(
+        f"  contracts   {flow['contracts_disagreed']}/{compared} differ "
+        f"({flow['contract_disagreement_pct']:.2f}%)"
+    )
+    vol_pct = flow.get("volume_disagreement_pct")
+    if vol_pct is not None:
+        print(
+            f"  volume      {flow['volume_disagreed']:,}/{flow['volume_compared']:,} differ "
+            f"({vol_pct:.2f}%)   <- the number that reaches a published figure"
+        )
+    if flow.get("shifts"):
+        moves = ", ".join(f"{k} x{v}" for k, v in flow["shifts"].items())
+        print(f"  shifts      {moves}")
+    print(f"  mid band    {flow['band_pct']:.2f} x half-spread")
+
+
 def _is_index_underlying(underlying: str, canonical: str) -> bool:
     """True when this symbol's spot comes from an index feed, not an equity one.
 
@@ -994,6 +1114,10 @@ def run_once(
     return {
         "captured_at": candidate.captured_at.isoformat(),
         "underlying": underlying,
+        # What the penny randomisation does to Lee-Ready, which the chain
+        # metrics below cannot see: they average, and a classifier
+        # thresholds. Same trade, two quotes -- see the function.
+        "flow_classification": compare_flow_classification(incumbent, candidate),
         # How far apart the two chain snapshots actually landed. A live
         # cross-feed difference is the vendor's adjustment PLUS whatever the
         # market did in this many seconds; without it the two are not
@@ -1327,6 +1451,9 @@ def _print_report(result: Dict[str, Any]) -> None:
     print("  " + "-" * 62)
     for c in result["comparisons"]:
         print("  " + MetricComparison(**c).as_row())
+    flow = result.get("flow_classification")
+    if flow:
+        _print_flow_classification(flow)
     print(f"\n  verdict: {result['verdict']}\n")
 
 
