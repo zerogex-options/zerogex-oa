@@ -81,6 +81,18 @@ PERSISTENCE_WINDOW_BARS = 3
 PERSISTENCE_BUILDING_BARS = 2
 PERSISTENCE_PERSISTENT_BARS = 3
 
+#: Opposite bars that confirm a reversal. The same two-bar wait the header
+#: uses, so a turn in the pressure leg and a turn in the state are held to one
+#: standard.
+REVERSAL_CONFIRM_BARS = 2
+
+#: Quiet bars after which the old side is simply gone. Barrie's line: one or
+#: two quiet bars in between and the old run has not died, so the flip that
+#: follows is still a reversal; three and there is nothing left to reverse,
+#: and the other side starts as a fresh pulse. This is what keeps Reversed
+#: rare instead of firing on every later opposite print.
+REVERSAL_STALE_QUIET_BARS = 3
+
 #: State-age thresholds, in minutes. Duration is the thing being studied here:
 #: not whether gamma calls direction, but whether a condition that exists is
 #: healthy enough to persist.
@@ -119,6 +131,11 @@ TRANSITION_RATE_SHARE = 0.25
 PERSISTENCE_PULSE = "PULSE"
 PERSISTENCE_BUILDING = "BUILDING"
 PERSISTENCE_PERSISTENT = "PERSISTENT"
+#: Not a further rung on the maturity ladder, which is why it sits apart: the
+#: first three describe how settled one side is, this describes that side
+#: giving way. It is a moment rather than a condition, so it shows on the bar
+#: the flip confirms and the new side carries on from there.
+PERSISTENCE_REVERSED = "REVERSED"
 
 AGE_NEW = "NEW"
 AGE_ESTABLISHED = "ESTABLISHED"
@@ -162,6 +179,7 @@ PERSISTENCE_LABELS = {
     PERSISTENCE_PULSE: "Pulse",
     PERSISTENCE_BUILDING: "Building",
     PERSISTENCE_PERSISTENT: "Persistent",
+    PERSISTENCE_REVERSED: "Reversed",
 }
 
 AGE_LABELS = {
@@ -238,6 +256,11 @@ class Weather:
     pending_label: Optional[str] = None
     #: Completed bars the candidate has held, 1 .. CONFIRM_BARS - 1.
     pending_bars: int = 0
+    #: Opposite bars banked toward a reversal, 1 .. REVERSAL_CONFIRM_BARS - 1,
+    #: and 0 whenever no reversal is pending. Drives the "Pressure reversing"
+    #: chip, which by Barrie's rule appears only for a genuine reversal and
+    #: never for a fresh pulse on the other side.
+    pressure_reversing_bars: int = 0
     #: SECURE / NORMAL / THIN / CROSSING / NO_FLIP, echoed from the inputs.
     #: ``cushion`` above is the direction of travel; this is where the cushion
     #: actually is, and the two change independently. Carried so a change
@@ -345,6 +368,100 @@ def classify_persistence(
         return PERSISTENCE_BUILDING
 
     return PERSISTENCE_PULSE
+
+
+def bar_side(value: Optional[float]) -> int:
+    """Which side one bar printed on: +1 buying, -1 selling, 0 quiet.
+
+    Quiet means inside the pressure floor. Those bars are neither evidence for
+    a side nor against it, which is the rule the persistence ladder already
+    follows and the one Barrie asked to keep here.
+    """
+    if value is None or abs(value) <= PRESSURE_FLOOR_USD:
+        return 0
+    return 1 if value > 0 else -1
+
+
+class _PressurePhase:
+    """Tells a reversal from a fresh pulse on the other side.
+
+    A reversal is not "pressure is now selling". It is an established side
+    giving way while it is still established, and the distinction is the whole
+    point: without it the label fires on every later opposite print and stops
+    meaning anything, which is exactly what Barrie asked to avoid.
+
+    The rule, in his words and in this order:
+
+    * Reversed only if the old side was still Building or Persistent when the
+      opposite side started its two-bar wait;
+    * one or two quiet bars in between can still be Reversed, because the old
+      run has not died yet;
+    * three quiet bars and the old persistence is gone, so the opposite side
+      starts as a Pulse;
+    * quiet bars still do not count toward the new side;
+    * and the chip only appears in the reversal case.
+
+    Quiet bars neither advance the opposite streak nor reset it, matching how
+    they are treated everywhere else in this module. The one thing they do is
+    age out the old side.
+    """
+
+    def __init__(
+        self,
+        confirm_bars: int = REVERSAL_CONFIRM_BARS,
+        stale_quiet_bars: int = REVERSAL_STALE_QUIET_BARS,
+    ) -> None:
+        self.confirm_bars = confirm_bars
+        self.stale_quiet_bars = stale_quiet_bars
+        self.side = 0
+        self.established = False
+        self.quiet = 0
+        self.streak = 0
+        self.reversing = False
+
+    def push(self, value: Optional[float], ladder: str) -> tuple:
+        """Feed one bar; get ``(persistence_override, reversing_bars)``.
+
+        ``ladder`` is what :func:`classify_persistence` said for this bar, used
+        only to learn whether the current side ever became established. The
+        override is ``None`` on every bar except the one a reversal confirms.
+        """
+        side = bar_side(value)
+        settled = ladder in (PERSISTENCE_BUILDING, PERSISTENCE_PERSISTENT)
+
+        if side == 0:
+            self.quiet += 1
+            if self.quiet >= self.stale_quiet_bars:
+                # Nothing left to reverse. Whatever comes next is a new move.
+                self.side, self.established = 0, False
+                self.streak, self.reversing = 0, False
+            return None, self.streak if self.reversing else 0
+
+        if self.side == 0:
+            self.side, self.established = side, settled
+            self.quiet, self.streak, self.reversing = 0, 0, False
+            return None, 0
+
+        if side == self.side:
+            self.established = self.established or settled
+            self.quiet, self.streak, self.reversing = 0, 0, False
+            return None, 0
+
+        # An opposite print. The reversal question is settled the moment the
+        # wait starts, not when it completes: what matters is whether the old
+        # side was still standing then.
+        if self.streak == 0:
+            self.reversing = self.established and self.quiet < self.stale_quiet_bars
+        self.streak += 1
+        self.quiet = 0
+
+        if self.streak < self.confirm_bars:
+            return None, self.streak if self.reversing else 0
+
+        reversed_now = self.reversing
+        self.side, self.established = side, settled
+        self.streak, self.reversing = 0, False
+        return (PERSISTENCE_REVERSED if reversed_now else None), 0
 
 
 def classify_age(minutes: Optional[float]) -> Optional[str]:
@@ -528,6 +645,7 @@ def classify_series(
     states: List[str] = []
     pressures: List[Optional[float]] = []
     confirmation = _Confirmation(confirm_bars)
+    phase = _PressurePhase()
 
     for row in inputs:
         base = classify(row)
@@ -537,6 +655,13 @@ def classify_series(
         states.append(headline)
 
         persistence = classify_persistence(pressures, row.pressure_avg, base.pressure)
+        # Reversed is decided from the run of bars, not from this one, so it
+        # can only be settled here where the session is walked. It replaces the
+        # ladder on the single bar a reversal confirms; the new side carries on
+        # from the next bar under the ordinary rungs.
+        override, reversing_bars = phase.push(row.pressure_bar, persistence)
+        if override is not None:
+            persistence = override
         age_bars = state_age_bars(states)
         age_minutes = age_bars * bar_minutes
         age = classify_age(age_minutes)
@@ -559,6 +684,7 @@ def classify_series(
                 pending_bars=pending_bars,
                 persistence=persistence,
                 persistence_label=PERSISTENCE_LABELS[persistence],
+                pressure_reversing_bars=reversing_bars,
                 age_bars=age_bars,
                 age_minutes=age_minutes,
                 age=age,

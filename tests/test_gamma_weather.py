@@ -12,6 +12,7 @@ import itertools
 
 from src.analytics.gamma_weather import (
     AGE_CONFIRMED,
+    CONFIRM_BARS,
     AGE_ESTABLISHED,
     AGE_LABELS,
     AGE_MATURE,
@@ -500,7 +501,12 @@ def test_the_ladders_are_barries_wording():
     """Pinned because these are his words, agreed in writing, and a later
     tidy-up that renamed them would be a change to a shared vocabulary rather
     than to an internal detail."""
-    assert list(PERSISTENCE_LABELS.values()) == ["Pulse", "Building", "Persistent"]
+    assert list(PERSISTENCE_LABELS.values()) == [
+        "Pulse",
+        "Building",
+        "Persistent",
+        "Reversed",
+    ]
     assert list(AGE_LABELS.values()) == ["New", "Established", "Confirmed", "Mature"]
 
 
@@ -783,3 +789,126 @@ def test_a_cause_is_reported_before_its_consequence():
     same_bar = [c.kind for c in trail if c.bar_start == flip.bar_start]
 
     assert same_bar.index("PRESSURE") < same_bar.index("PERSISTENCE")
+
+
+# --------------------------------------------------------------------------- #
+# Reversed: an established side giving way, not a new side appearing.
+# --------------------------------------------------------------------------- #
+
+
+def _pressure(*values):
+    """A session of bars carrying only the pressure values that matter here."""
+    return classify_series([_inputs(pressure_bar=v, pressure_avg=v) for v in values])
+
+
+def test_reversed_needs_the_old_side_to_be_established():
+    """A pulse that dies is a new pulse on the other side, not a reversal. The
+    whole point is that Reversed stays rare enough to mean something."""
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED
+
+    series = _pressure(BIG, -BIG, -BIG, -BIG)
+
+    assert PERSISTENCE_REVERSED not in [w.persistence for w in series]
+
+
+def test_an_established_side_giving_way_is_reversed():
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED
+
+    series = _pressure(BIG, BIG, BIG, BIG, -BIG, -BIG)
+
+    assert series[-1].persistence == PERSISTENCE_REVERSED
+
+
+def test_the_reversal_takes_the_same_two_bars_the_header_takes():
+    """One opposite print is not a reversal, it is one print."""
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED, REVERSAL_CONFIRM_BARS
+
+    assert REVERSAL_CONFIRM_BARS == CONFIRM_BARS
+    series = _pressure(BIG, BIG, BIG, BIG, -BIG)
+
+    assert series[-1].persistence != PERSISTENCE_REVERSED
+    assert series[-1].pressure_reversing_bars == 1
+
+
+def test_two_quiet_bars_in_between_still_reverse():
+    """Barrie's line: the old run has not died yet."""
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED
+
+    series = _pressure(BIG, BIG, BIG, BIG, 0.0, 0.0, -BIG, -BIG)
+
+    assert series[-1].persistence == PERSISTENCE_REVERSED
+
+
+def test_three_quiet_bars_kill_the_old_side():
+    """Nothing left to reverse, so the other side starts as a pulse."""
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED
+
+    series = _pressure(BIG, BIG, BIG, BIG, 0.0, 0.0, 0.0, -BIG, -BIG)
+
+    assert PERSISTENCE_REVERSED not in [w.persistence for w in series]
+    assert all(w.pressure_reversing_bars == 0 for w in series)
+
+
+def test_quiet_bars_do_not_count_toward_the_new_side():
+    """They age out the old side and do nothing else. Two opposite prints are
+    still needed, however many quiet bars sat between them."""
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED
+
+    series = _pressure(BIG, BIG, BIG, BIG, -BIG, 0.0, -BIG)
+
+    assert series[4].persistence != PERSISTENCE_REVERSED
+    assert series[5].persistence != PERSISTENCE_REVERSED
+    assert series[6].persistence == PERSISTENCE_REVERSED
+
+
+def test_the_chip_appears_only_for_a_reversal():
+    """Never for a fresh pulse on the other side, which is the case that would
+    otherwise make the chip meaningless."""
+    fresh = _pressure(BIG, -BIG, -BIG)
+    real = _pressure(BIG, BIG, BIG, BIG, -BIG)
+
+    assert all(w.pressure_reversing_bars == 0 for w in fresh)
+    assert real[-1].pressure_reversing_bars == 1
+
+
+def test_the_chip_clears_when_the_old_side_prints_again():
+    """A flip that did not happen must not leave a chip on screen."""
+    series = _pressure(BIG, BIG, BIG, BIG, -BIG, BIG)
+
+    assert series[4].pressure_reversing_bars == 1
+    assert series[5].pressure_reversing_bars == 0
+
+
+def test_reversed_is_a_moment_and_the_new_side_carries_on():
+    """Not a fourth rung that sticks. Barrie: once confirmed, pressure restarts
+    on the new side and Weather re-evaluates."""
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED
+
+    series = _pressure(BIG, BIG, BIG, BIG, -BIG, -BIG, -BIG, -BIG)
+
+    assert series[5].persistence == PERSISTENCE_REVERSED
+    assert series[6].persistence != PERSISTENCE_REVERSED
+    assert series[7].persistence == PERSISTENCE_PERSISTENT
+
+
+def test_reversed_has_display_wording_like_every_other_rung():
+    from src.analytics.gamma_weather import PERSISTENCE_LABELS, PERSISTENCE_REVERSED
+
+    assert PERSISTENCE_LABELS[PERSISTENCE_REVERSED] == "Reversed"
+
+
+def test_a_session_that_never_establishes_never_reverses():
+    from src.analytics.gamma_weather import PERSISTENCE_REVERSED
+
+    series = _pressure(BIG, -BIG, BIG, -BIG, BIG, -BIG)
+
+    assert PERSISTENCE_REVERSED not in [w.persistence for w in series]
+
+
+def test_bar_side_treats_the_floor_as_quiet():
+    from src.analytics.gamma_weather import bar_side
+
+    assert bar_side(BIG) == 1
+    assert bar_side(-BIG) == -1
+    assert bar_side(PRESSURE_FLOOR_USD) == 0
+    assert bar_side(None) == 0
