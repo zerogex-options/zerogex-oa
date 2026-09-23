@@ -48,12 +48,28 @@ ET = ZoneInfo("America/New_York")
 LOOKBACK_RECEIPTS = 20
 MIN_RECEIPTS = 15            # cold-start guard; corrections stay neutral below this
 LEARNING_RATE = 0.05
-TARGET_COVERAGE = 0.90       # what fraction of days should the band contain
+# What fraction of days the COMMITTED band should contain.
+#
+# Was 0.90, the top of the advertised 80-90% range, which guaranteed the band
+# sat at the wide end of what we tell people it is. 0.85 is the middle of that
+# range and is what the measured data says is reachable: on the 34 sessions of
+# the persistence-anchored model, scaling the committed band to 0.70 of its
+# published width lands at 85.3% coverage, with the median session using 44%
+# of the band and ~79% of each side going unused.
+TARGET_COVERAGE = 0.85
 
 # Bounds — never let a scalar drift past these regardless of how many
 # consecutive misses accumulate.
 BOUNDS = {
-    "band_width_mult": (0.70, 1.50),
+    # Floor lowered 0.70 -> 0.45, for the same reason and with the same
+    # evidence as vol_range_basis_mult below: the controller pinned the old
+    # floor exactly. With the coverage loop OPEN (see _compute_updates) it
+    # could only ever drift to a bound, and 0.70 was clipping the width the
+    # data actually calls for -- 34 sessions at 100% coverage with a maximum
+    # required scale of 0.991 means the band has never once been filled.
+    # 1.50 still caps a widening spiral, and MIN_RANGE_FRACTION in the model
+    # remains the absolute backstop underneath this.
+    "band_width_mult": (0.45, 1.50),
     "pin_tolerance_mult": (0.50, 2.00),
     "upside_lean": (-0.20, 0.20),
     "downside_lean": (-0.20, 0.20),
@@ -138,20 +154,43 @@ def _compute_updates(
             "summary": summary,
         }
 
-    # Coverage: fraction of days where the raw band contained the actual L/H.
-    covered = sum(
-        1 for r in graded
-        if r.get("actual_low") is not None
-        and r.get("actual_high") is not None
-        and float(r["actual_low"]) >= float(r["raw_projected_low"])
-        and float(r["actual_high"]) <= float(r["raw_projected_high"])
-    )
-    coverage = covered / n
+    # Coverage of the COMMITTED band — the one that was published, graded and
+    # that people read.
+    #
+    # THIS USED TO MEASURE raw_projected_low/high, AND THAT WAS AN OPEN LOOP.
+    # The raw band is snapshotted in compute_forecast at step 6, BEFORE
+    # band_width_mult is applied at step 7, so it does not move when the
+    # multiplier moves. The controller was therefore adjusting a knob against a
+    # measurement the knob could not change: whatever the raw coverage happened
+    # to be, the error kept its sign forever and the multiplier walked to a
+    # bound and stayed there. Over target it pinned at the 0.70 floor; under
+    # target it would have pinned at 1.50. It never converged on anything.
+    #
+    # Measuring the committed band closes it. Narrowing lowers coverage, which
+    # flips the error, which stops the narrowing — an equilibrium at
+    # TARGET_COVERAGE instead of a bound. The multiplier that produced each
+    # committed band was set a day earlier, so the feedback carries one cycle
+    # of lag; LEARNING_RATE is small enough that this damps rather than
+    # oscillates.
+    def _covered(lo_key: str, hi_key: str) -> int:
+        return sum(
+            1 for r in graded
+            if r.get("actual_low") is not None
+            and r.get("actual_high") is not None
+            and r.get(lo_key) is not None
+            and r.get(hi_key) is not None
+            and float(r["actual_low"]) >= float(r[lo_key])
+            and float(r["actual_high"]) <= float(r[hi_key])
+        )
 
-    # Coverage error signals band-width correction.  Under target →
-    # widen; over target → tighten.  Learning rate keeps the daily
-    # step small; over months of nudges the scalar converges toward a
-    # stable band width.
+    coverage = _covered("projected_low", "projected_high") / n
+    # Kept purely as a diagnostic: it says how the model does BEFORE Layer 2,
+    # which is what tells you whether the multiplier is papering over a band
+    # that is wrong upstream. It no longer steers anything.
+    raw_coverage = _covered("raw_projected_low", "raw_projected_high") / n
+
+    # Under target → widen; over target → tighten. The learning rate keeps the
+    # daily step small so the scalar converges over weeks rather than lurching.
     coverage_error = TARGET_COVERAGE - coverage
     band = _bounded("band_width_mult", band + LEARNING_RATE * coverage_error * 5.0)
 
@@ -188,6 +227,7 @@ def _compute_updates(
     summary = {
         "n_receipts_used": n,
         "coverage": round(coverage, 4),
+        "raw_coverage": round(raw_coverage, 4),
         "coverage_error": round(coverage_error, 4),
         "up_break_rate": round(up_break_rate, 4),
         "down_break_rate": round(down_break_rate, 4),
