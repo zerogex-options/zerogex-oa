@@ -687,6 +687,15 @@ def compare_flow_classification(
     volume_disagreed = 0
     shifts: Dict[str, int] = {}
     no_trade = 0
+    # The disagreement RATE is not the thing that reaches a customer. What
+    # reaches a customer is the net imbalance -- ask volume minus bid volume
+    # -- which is what order_flow_imbalance and tape_flow_bias are built on.
+    # Reclassification that shuffles individual contracts but preserves the
+    # aggregate costs nothing published; reclassification that moves the
+    # aggregate is a changed number on the site.
+    net_inc = 0
+    net_cand = 0
+    crossed = 0
 
     for symbol, inc_q in incumbent.quotes.items():
         cand_q = candidate.quotes.get(symbol)
@@ -707,6 +716,20 @@ def compare_flow_classification(
 
         compared += 1
         volume_compared += volume
+        if inc_bucket == "ask":
+            net_inc += volume
+        elif inc_bucket == "bid":
+            net_inc -= volume
+        if cand_bucket == "ask":
+            net_cand += volume
+        elif cand_bucket == "bid":
+            net_cand -= volume
+        # A quote whose bid exceeds its ask cannot be classified against.
+        # ThetaData stated the Market Value adjustment never introduces one;
+        # counted here because a penny of movement either side of a
+        # penny-wide spread is exactly how one would arise.
+        if cand_q.bid is not None and cand_q.ask is not None and cand_q.bid > cand_q.ask:
+            crossed += 1
         if inc_bucket != cand_bucket:
             disagreed += 1
             volume_disagreed += volume
@@ -725,6 +748,13 @@ def compare_flow_classification(
         "shifts": dict(sorted(shifts.items(), key=lambda kv: -kv[1])),
         "contracts_without_a_trade": no_trade,
         "band_pct": FLOW_CLASSIFY_MID_BAND_PCT,
+        # The published quantity, both ways, and how far apart they land.
+        "net_imbalance_incumbent": net_inc,
+        "net_imbalance_candidate": net_cand,
+        "net_imbalance_shift_pct": (
+            (100.0 * (net_cand - net_inc) / abs(net_inc)) if net_inc else None
+        ),
+        "crossed_candidate_quotes": crossed,
     }
 
 
@@ -743,6 +773,19 @@ def _print_flow_classification(flow: Dict[str, Any]) -> None:
         print(
             f"  volume      {flow['volume_disagreed']:,}/{flow['volume_compared']:,} differ "
             f"({vol_pct:.2f}%)   <- the number that reaches a published figure"
+        )
+    ni, nc = flow.get("net_imbalance_incumbent"), flow.get("net_imbalance_candidate")
+    if ni is not None:
+        shift = flow.get("net_imbalance_shift_pct")
+        shift_s = f"{shift:+.1f}%" if shift is not None else "n/a"
+        print(
+            f"  NET imbalance  incumbent {ni:+,}   candidate {nc:+,}   "
+            f"shift {shift_s}   <- THIS is what reaches a signal"
+        )
+    if flow.get("crossed_candidate_quotes"):
+        print(
+            f"  crossed     {flow['crossed_candidate_quotes']} candidate quotes had "
+            f"bid > ask (unclassifiable)"
         )
     if flow.get("shifts"):
         moves = ", ".join(f"{k} x{v}" for k, v in flow["shifts"].items())
