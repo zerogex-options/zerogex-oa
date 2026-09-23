@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from src.ingestion.providers.base import OptionQuote
 from src.tools.feed_compare import FeedSample, compare_flow_classification
 
@@ -120,3 +122,48 @@ def test_the_trade_itself_is_taken_from_one_side_only():
     out = compare_flow_classification(_sample("rt", rt), _sample("mv", mv))
     assert out["volume_compared"] == 500, "candidate's volume leaked in"
     assert out["contracts_disagreed"] == 0, "candidate's last leaked in"
+
+
+def test_net_imbalance_is_reported_because_it_is_what_reaches_a_signal():
+    """The disagreement rate is not the decision number.
+
+    order_flow_imbalance and tape_flow_bias are built on ask volume minus
+    bid volume. Reclassification that shuffles individual contracts while
+    preserving that aggregate costs nothing a customer can see;
+    reclassification that moves the aggregate is a changed published number.
+    A 50% contract disagreement rate is consistent with either.
+    """
+    # Two contracts swap sides. Every contract is reclassified; the net is
+    # untouched.
+    rt = {
+        "A": _q("A", bid=1.20, ask=1.30, last=1.30, volume=100),  # ask
+        "B": _q("B", bid=1.20, ask=1.30, last=1.20, volume=100),  # bid
+    }
+    mv = {
+        "A": _q("A", bid=1.35, ask=1.45, last=1.30, volume=100),  # now bid
+        "B": _q("B", bid=1.05, ask=1.15, last=1.20, volume=100),  # now ask
+    }
+    out = compare_flow_classification(_sample("rt", rt), _sample("mv", mv))
+    assert out["contract_disagreement_pct"] == 100.0
+    assert out["net_imbalance_incumbent"] == 0
+    assert out["net_imbalance_candidate"] == 0
+    assert out["net_imbalance_shift_pct"] is None
+
+
+def test_a_one_sided_reclassification_moves_the_net():
+    rt = {"A": _q("A", bid=1.20, ask=1.30, last=1.30, volume=500)}
+    mv = {"A": _q("A", bid=1.35, ask=1.45, last=1.30, volume=500)}
+    out = compare_flow_classification(_sample("rt", rt), _sample("mv", mv))
+    assert out["net_imbalance_incumbent"] == 500
+    assert out["net_imbalance_candidate"] == -500
+    assert out["net_imbalance_shift_pct"] == pytest.approx(-200.0)
+
+
+def test_crossed_candidate_quotes_are_counted():
+    """A bid above its ask cannot be classified against. ThetaData stated
+    the Market Value adjustment never introduces one; a penny of movement
+    either side of a penny-wide spread is exactly how one would."""
+    rt = {"A": _q("A", bid=1.86, ask=1.87, last=1.87, volume=10)}
+    mv = {"A": _q("A", bid=1.87, ask=1.86, last=1.87, volume=10)}
+    out = compare_flow_classification(_sample("rt", rt), _sample("mv", mv))
+    assert out["crossed_candidate_quotes"] == 1
