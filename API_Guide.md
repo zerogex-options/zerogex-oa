@@ -360,7 +360,8 @@ upstream can change.
 | `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
 | `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
-| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
+| `cone_cycle` | `/api/cone/session/*`, `/api/cone/latest` | 15 min (09:45–15:30 ET only) | — | — |
+| `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/cone/reliability`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
 | `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
 
 A dash means no update is expected, which surfaces as
@@ -619,7 +620,18 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
 - `pin_score` (raw max pin score = restoring gamma × reachability) and
   `pin_confidence` (its dominance over all viable pins, `0..1`) are top-level
   scalar metadata a client can use to classify pin strength; both `null` when
-  there is no active pin.
+  there is no active pin. `pin_confidence` is
+  `winning_score / Σ(all positive candidate scores)` over every listed strike
+  within ±2.5 expected moves of spot, same-day expiration only — the buckets
+  the ZeroGEX UI renders are `>= 0.50` Strong, `>= 0.33` Moderate, else Weak.
+  **It measures dominance, not magnitude**, so a strike carrying several times
+  its neighbors' gamma can still score low: the kernel spreads that gamma
+  across the neighboring strikes, and each of those is itself a candidate in
+  the denominator. Two consequences worth handling if you classify your own:
+  the value is per-snapshot with no time smoothing (it can flicker on a
+  near-tie), and the candidate band narrows as `τ → 0`, so the same book reads
+  more confident late in the session than early. See the
+  [Pin Strike](https://zerogex.io/help/platform/pin-strike) methodology page.
 - `profile` is ascending by strike (histogram order). `net_gex` is dollar
   gamma per 1% move, calls positive / puts negative, and
   `net_gex == call_gex + put_gex` by construction.
@@ -707,6 +719,29 @@ Server-accumulated flow series — one row per 5-minute bar (cumulative call/put
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
 
+### GET /api/gex/weather
+The combined current-state read (Gamma Weather). Consolidates what is already on the Hedging Flow page into one sentence: whether estimated hedging pressure is persistently buying or selling, whether near-price dealer gamma is building or thinning, which side the book leans, and how much room is left before the gamma regime itself changes.
+
+**Parameters:** `symbol` (required), `session` (optional, `current` | `prior`).
+
+**Two precedence rules**, both of which the feature spec left open:
+- The **cushion is a modifier, not a state**. "Thin and closing" answers a different question from "stable bid", so they compose (`Stable bid` + `TRANSITION_RISK`) rather than compete. As peers, one always has to be suppressed.
+- **Stability decides the state; lean colors it.** They disagree often, and the panel exists to say whether a condition can persist, which is what stability speaks to. This keeps every input combination covered without inventing a dozen state names, and leaves `MIXED` meaning what it should: the inputs genuinely disagree.
+
+`persistence` grades how settled the pressure direction is: `PULSE` (one aligned bar), `DEVELOPING` (two of the last three plus an aligned 3-bar average), `ESTABLISHED` (three). A pulse is the first evidence, not yet a condition. Bars inside the pressure floor do not count as aligned, but they do not count against either.
+
+`age_label` and `age_minutes` report how long the current state has held: `DEVELOPING` below 15 minutes, `ESTABLISHED` to 30, `CONFIRMED` to 60, `DURABLE` beyond. Age is counted in consecutive bars sharing the state, walking backward from each point, so a bar's age is what it would have read at the time rather than what hindsight makes of it. It is recomputed on read like the state itself, because a retuned threshold has to re-age history as well as re-label it.
+
+States are `STABLE_BID`, `SUPPORTED_DIP`, `FRAGILE_RALLY`, `UNSTABLE`, `MIXED`. Cushion modifiers are `TRANSITION_RISK`, `NARROWING`, `WIDENING`, `STEADY`, `NONE`.
+
+**Nothing is stored.** The state is derived on read from components that are, so retuning a threshold reclassifies the whole archive rather than leaving old sessions labeled by a rule that is no longer live. Every tunable lives in one block in `src/analytics/gamma_weather.py`.
+
+`components` is returned alongside the verdict deliberately: a panel that shows only a conclusion cannot be checked against the charts directly underneath it.
+
+Reads the two materialized series and classifies their latest **common** bar, so the pressure and the structure in one sentence always describe the same five minutes. 404 for an unknown symbol; 409 when no bar yet carries both.
+
+This is a market-health classification, not a directional signal, entry, exit, or recommendation. It inherits the estimated-not-observed `basis` and `disclosure` from the hedging flow it reads; combining inputs does not upgrade that.
+
 ### GET /api/gex/regime-series
 The Gamma Shift read at every 5-minute bar of a session. Where `/api/gex/regime-shift` answers "how did dealer gamma change between these two moments" as a single card, this is the same maths as a line — so structure sits on the same timeline as `/api/flow/hedging` and can be read against it. Flow says how hard the tape is pushing; this says whether the book absorbs or amplifies it.
 
@@ -714,6 +749,18 @@ The Gamma Shift read at every 5-minute bar of a session. Where `/api/gex/regime-
 - `symbol` (required): `[A-Z.]{1,10}`
 - `session` (optional): `current` | `prior`, default `current`
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
+
+**Flip cushion.** Each bar also carries how much room price has before the gamma regime itself changes: `gamma_flip` (the stored level), `flip_distance_pts` / `flip_distance_frac` (signed, positive = spot above the flip), `cushion_pts` (unsigned room before crossing), `cushion_side`, `cushion_step_pts` (this bar) and `cushion_rate_pts` (trailing 15 minutes; negative is narrowing), `cushion_accelerating`, `cushion_state` and a one-line `cushion_summary`.
+
+Only the flip level and the move scale are stored. Everything else is derived on read, so retuning a threshold reclassifies history instead of leaving old bars labeled by a rule that is no longer live.
+
+`cushion_state` is classified against a **typical 30-minute realized move** (`typical_move_30m`), never against points and no longer against a fraction of spot. A fraction of spot adapts to price level but not to volatility, so a fixed percentage reads as thin on a quiet morning and comfortable on a fast afternoon while reporting the same label for both. Bands: `CROSSING` at or under 0.25x that move, `THIN` to 0.60x, `NORMAL` to 1.25x, `SECURE` above. `SECURE` means the flip is not the immediate threat, not that a reversal is impossible. `NO_FLIP` means the profile had no zero crossing at all, which is a different statement from a distant one.
+
+`cushion_basis` says which yardstick produced the state: `move_30m`, or `spot_fraction` for bars written before the scale existed. The two are not comparable, so a reader is never left to guess.
+
+`cushion_rate_context` grades the trailing window on the same scale — `STABLE`, `DRIFTING`, `CONTRACTING`, `ACCELERATING` — and is deliberately separate from the state, because thin-but-stable and thin-and-collapsing are very different conditions and one label cannot carry both. Only narrowing is graded past `DRIFTING`: a cushion opening up quickly is not a risk condition.
+
+The level used is `gamma_flip_point` (structural), not `gamma_flip_raw` (nearest crossing, no significance gate).
 
 **Two lenses per bar.** `anchored_*` is versus the session's first bar ("changed today"), the counterpart of the Hedging Flow cumulative curve. `rolling_*` is versus `rolling_bars` bars back ("changing right now"), the counterpart of the rate line and the one to read beside a flip. **They do not sum** — both weight strikes by proximity to each bar's *own* spot, so the kernel re-centres every bar; summing bar-to-bar diffs would assert a fixed kernel and match neither lens.
 
@@ -739,9 +786,12 @@ Positive means the hedge **buys** stock, the same sign convention and units as t
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all. Pass today's date to isolate 0DTE
 - `intervals` (optional): trailing N 5-minute bars, `1`–`390`
 - `smoothing` (optional): trailing SMA length in bars for the rate line and flip detection, `1`–`24`, default `3` (15 minutes)
-- `significance` (optional): a rate flip is marked significant at or above this multiple of the session's typical swing, `0`–`10`, default `1.0`
+- `significance` (optional): a rate flip is marked significant at or above this multiple of the session's typical swing, `0`–`10`, default `1.0`. Note the scale is a *median*, so 1.0 sits at the middle of the day's swings rather than the tail
+- `flat_band` (optional): half-width of the flat band around zero as a multiple of the session's typical rate, `0`–`5`, default `0.5`; `0` disables it
 
 **Response:** an object with `bars` (newest→oldest) and `flips`, plus `basis` and `disclosure`.
+
+A flip requires the series to **establish** itself outside a flat band around zero (`flat_band`), not merely to touch the far side. Without that, a rate hovering near zero reports a direction change on every nick across it, which on a live session buried the real turns among a dozen dots even with the significance filter on.
 
 `flips` carries two kinds. `rate` — the smoothed per-bar series changing sign, i.e. the immediate push turning over; this is the frequent, actionable one. `cumulative` — the session's net lean crossing zero; rare, and context rather than a trigger. `magnitude_usd` is the swing across zero, not the level at it (a series is near zero *at* a crossing by definition), and `session_ratio` scores that swing against the session's typical swing using only bars before the flip, so it is computable live.
 
@@ -885,6 +935,183 @@ when no option is trading, so the last snapshot before the close is the
 correct answer all evening. `/api/market/quote` sits beside them on the wider
 04:00–20:00 tape window and will still be updating; that difference is real,
 not an inconsistency.
+
+---
+
+## Spread Monitor (quoted spreads & liquidity) — Beta
+
+Scope: `market_raw` — **internal BFF only, not redistributable.** Excluded
+from the `analytics` tier issued to external customers, for the same reason
+`/api/gex/premium_surface` is.
+
+Nothing here is per-contract: every figure is a median or a p90 over a
+population of contracts, and a median does not invert to the values behind
+it. But the *caller* chooses the population — `moneyness_band_pct` goes down
+to `0.25`, `dte_max` to `0`, and each bucket reports its own
+`tradable_count`. Narrow a bucket to a single contract and the quote falls
+out by arithmetic:
+
+```
+median_spread              = ask - bid
+median_relative_spread_pct = 200 * (ask - bid) / (ask + bid)
+=> ask + bid = 200 * median_spread / median_relative_spread_pct
+=> bid and ask, for a contract the same response identifies by expiration,
+   strike band and option type.
+```
+
+There is no field to redact that closes that, so the gate is on the route.
+See the `scopes.py` docstring for where the MARKET_RAW line is drawn and why.
+
+Three measures, each answering a different question:
+
+| Field | Question it answers |
+| --- | --- |
+| `median_relative_spread_pct` | How much of the premium does crossing cost? `100 * (ask - bid) / mid`. The headline. |
+| `median_spread_bps_underlying` | Is this symbol worse than that one? `10000 * (ask - bid) / spot` — the only cross-symbol comparable measure, since SPX near 6,800 and NDX near 25,000 are not on one dollar scale. |
+| `zero_bid_pct` | What share of the chain has no market at all? Contracts quoted with an offer and no bid have no width by construction; they are excluded from every median and counted here instead. |
+
+**Quoted, not effective.** Every response carries a `disclosure` saying so.
+This measures the width market makers are showing, not what trades filled
+at, and the feed carries no sizes — a tight quote for one contract and a
+tight quote for a thousand are indistinguishable here.
+
+**Futures are refused, not projected.** ES / NQ carry no option chain of
+their own (their surfaces are SPX / NDX levels carried onto the futures
+price axis), so `symbol=ES` answers 400. Scaling an SPX quote by the futures
+basis would invent a width nobody published.
+
+### GET /api/market/spreads
+Current quoted width and liquidity across one symbol's near-dated chain,
+split into calls, puts and the blended chain, plus the curve across strike
+distance and a per-expiration breakdown.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `dte_max` (optional): `0`–`90`, default from `SPREAD_STATS_DTE_MAX` (7)
+- `moneyness_band_pct` (optional): `0.25`–`25`, default from `SPREAD_STATS_MONEYNESS_BAND_PCT` (5) — half-width of the strike band around spot
+- `history_days` (optional): `0`–`180`, default `60`; trailing sessions to rank today's reading against, `0` to skip
+
+`history` is null when the `daily_spread_stats` rollup has nothing
+comparable to rank against — a fresh deployment, rows measured under a
+different scope, or sessions whose anchor snapshot was too thin to be a
+measurement (below `SPREAD_STATS_MIN_CONTRACTS`, default 100; an ingestion
+outage is not a quiet market). "No comparison available" and "an ordinary
+day" are deliberately distinguishable.
+
+That includes the scope **you** asked for. The rollup writes one scope per
+session (`SPREAD_STATS_DTE_MAX` / `SPREAD_STATS_MONEYNESS_BAND_PCT`), so any
+other `dte_max` / `moneyness_band_pct` measures a population with no history
+behind it: the widths come back at the scope requested and the ranking is
+withheld rather than computed across two populations. `dte_max=0` is the case
+that matters — the 0DTE book is structurally the widest of the year, and
+ranking it against a through-7DTE window would report the widest 5% of
+sessions every session. For a ranked reading at another scope use
+`/api/market/spreads/surface`, whose rollup is stored per scope and per
+half-hour of the session.
+
+### GET /api/market/spreads/series
+How today's widths moved through the session, one reading per bucket taken
+at the last chain snapshot inside it. Calls and puts are returned
+separately; no blended row is computed, because the divergence between the
+two is the point.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `session` (optional): `current` or `prior`, default `current`
+- `bucket_minutes` (optional): `1`–`60`, default `15`
+- `dte_max`, `moneyness_band_pct`: as above
+
+### GET /api/market/spreads/compare
+The same reading side by side across symbols. A symbol whose chain cannot be
+read comes back with `unavailable` set rather than being dropped (which
+would read as "not compared") or zeroed (which would read as "perfectly
+tight").
+
+**Parameters:**
+- `symbols` (optional): comma-separated, max 8, default `SPX,NDX,SPY,QQQ`
+- `dte_max`, `moneyness_band_pct`, `history_days`: as above
+
+`puts_percentile` obeys the same scope rule as `history` above: null unless
+the requested scope is one the rollup stored.
+
+### GET /api/market/spreads/history
+Trailing daily quoted-width history from the `daily_spread_stats` rollup —
+what turns "spreads are 6.2% wide" into "spreads are wider than they have
+been all quarter". Rows are oldest first.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `option_type` (optional): `C`, `P` or `A` (blended), default `P`
+- `days` (optional): `1`–`180`, default `60`
+
+An empty `rows` list is a normal answer where neither the analytics writer
+nor `make daily-spread-stats-backfill` has run yet — not an error.
+
+### GET /api/market/spreads/surface
+Today's quoted width across the strike surface, ranked against the same
+symbol's own history **in the same strike band at the same time of day**.
+Answers the questions a width alone cannot: is this unusual, where across
+the strikes, and how much of the chain has no market at all. That last one
+matters because "untradeable" usually means a contract with NO bid rather
+than a wide one — and a no-bid contract has no width, so it is excluded from
+every median by construction. A chain can read TIGHTER as its wings die, and
+only `two_sided_percentile` will say so.
+
+One side of the book per call. Puts and calls are never blended, because the
+reading the view exists for — "the puts went wide and the calls did not" —
+is only visible against a side that has not moved.
+
+**Parameters:**
+- `symbol` (optional): default `SPX`
+- `option_type` (optional): `C` or `P`, default `P`
+- `dte_max` (optional): one of `0`, `1`, `7`, `30`, default `0` — cumulative
+- `moneyness_band_pct` (optional): one of `2`, `5`, `10`, default `5`
+- `history_days` (optional): `5`–`365`, default from `SPREAD_SURFACE_HISTORY_DAYS` (60)
+
+`dte_max` and `moneyness_band_pct` are enumerated rather than free, and an
+off-list value is a 400 rather than a best effort. History is stored per
+scope, so a scope nobody measured has no population to rank against — and
+ranking against the nearest one that does exist is how a ±3% reading gets
+called extreme because ±5% happens to be wider.
+
+**Response:**
+
+| Field | What it carries |
+| --- | --- |
+| `summary` | The headline strip: `current_pct`, `normal_pct` (the median of the matched sessions), `vs_normal`, `percentile`, `two_sided_pct`, `two_sided_normal_pct`, `two_sided_percentile`, `contract_count`, `sessions`. The two coverage baselines rank the same way the width does, over the same matched window and the same `SPREAD_SURFACE_MIN_SESSIONS` floor — but **high is good**: it is the share of the chain with a real two-sided market. Render it with the tone inverted, or the best-covered session of the quarter reads as an alarm. |
+| `baseline` | What the comparison was actually made against: `sessions`, `earliest_date`, `latest_date`, `time_matched`, `time_bucket_label` (e.g. `15:30-16:00 ET`), `fell_back_to_last_bucket`, `min_sessions`. |
+| `curve` | One entry per moneyness slice: `current_pct`, `historical_median_pct`, `historical_p25_pct`, `historical_p75_pct`, `percentile`, `vs_normal`, `sessions`. |
+| `by_dte` | One entry per disjoint expiry bucket (`t0`, `t1`, `t2_3`, `t4_7`, `t8_30`) with its `percentile` and `insufficient_history`. Buckets are measured in **trading sessions**, not calendar days — from a Friday, `t1` is the Monday expiry. The cumulative `dte_max` universes above stay in calendar days, which is why the two are not the same axis. The keys were `b*` on calendar days before 2026-09-18; the stored rows under those keys describe a different population and are no longer read, so a deployment needs `make spread-surface-backfill` to seed the new series. |
+
+**Time-of-day matched.** Spreads have a strong intraday shape — the open and
+the close are structurally wider than midday — so a 15:40 reading ranked
+against whole prior sessions would look anomalous purely because of the
+clock. History is stored in 30-minute buckets
+(`SPREAD_SURFACE_BUCKET_MINUTES`) and matched as an equality, and
+`baseline.time_bucket_label` names the bucket used. Outside the cash session
+the comparison clamps to the session's last bucket and
+`fell_back_to_last_bucket` says so.
+
+**Every refusal is explicit.** `percentile` is `null` below
+`SPREAD_SURFACE_MIN_SESSIONS` (default 8) comparable sessions rather than
+computed from a handful of days, and `by_dte[].insufficient_history` marks
+the buckets that could not be ranked. `baseline.sessions` and the date range
+beside it describe the SAME population, so a thin scope reports `0` sessions
+and null dates rather than a months-long range the comparison never used. A
+slice with a current reading but no stored history returns its `current_pct`
+with null baseline fields — a gap, to be rendered as a gap.
+
+Today's own rollup row is excluded from its own window; otherwise the
+reading would drag its baseline toward itself on exactly the day it matters.
+
+The current half of the response is reduced from the live chain through the
+same `spread_stats` functions that wrote every stored row, so "current" here
+is the same number `/api/market/spreads` reports for the same scope. There
+is deliberately no second definition of a spread in this feature.
+
+Seed the history with `make spread-surface-backfill` (`SURFACE_SYMBOLS=`,
+`SURFACE_DAYS=`); the analytics writer extends it each cycle during the cash
+session. An all-null `baseline` on a fresh deployment is a normal answer.
 
 ---
 

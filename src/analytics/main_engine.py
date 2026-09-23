@@ -53,6 +53,9 @@ from src.config import (
     PIN_STRIKE_CANDIDATE_MAX_Z,
     PIN_STRIKE_MIN_SCORE,
     PIN_STRIKE_ATM_IV_BAND_PCT,
+    SPREAD_STATS_DTE_MAX,
+    SPREAD_STATS_MIN_CONTRACTS,
+    SPREAD_STATS_MONEYNESS_BAND_PCT,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.tradeworkz.strikes import default_strike_increment
@@ -60,7 +63,10 @@ from src.analytics.walls import (
     compute_call_put_walls,
     compute_call_put_walls_with_strength,
 )
+from src.analytics import gamma_flip_carry
 from src.analytics import pin_strike as pin_strike_mod
+from src.analytics import spread_stats as spread_stats_mod
+from src.analytics import surface_store
 from src.greeks_fd import fd_charm, fd_vanna
 from src.analytics.forced_flow import (
     ContractLeg,
@@ -68,17 +74,133 @@ from src.analytics.forced_flow import (
     dealer_hedge_flow,
 )
 from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
+from src.hedging_flow_sql import (
+    HEDGING_FLOW_SCOPES,
+    HEDGING_FLOW_SNAPSHOT_UPSERT_PSYCOPG2,
+    SCOPE_0DTE,
+)
 from src.market_calendar import (
     calculate_time_to_expiration,
     expiration_close_time_et,
     is_engine_run_window,
-    is_spx_am_settled_expiration,
+    is_am_settled_contract,
     is_underlying_active_session,
     seconds_until_engine_run_window,
     settlement_close_time_for_contract,
 )
 
 logger = get_logger(__name__)
+
+# Why a cycle published no gamma flip.  NULL in gex_summary.gamma_flip_reason
+# when a flip WAS published, a code below when it was not -- the same shape as
+# pin_strike_reason in the same table.
+#
+# The point of these is that a blank Flip line stops being one event.  Three of
+# the four codes below describe a chain the resolver read correctly and
+# declined honestly ("the flip is 10% away", "there is no crossing in the
+# searched band"), and one describes a chain it could not read at all.  Until
+# this column existed they all rendered as the same em dash, and a five-week
+# NDX blackout sat behind an appearance identical to a quiet Tuesday.
+#: The chain produced no usable spot-shift profile at all -- no contracts with
+#: IV, OI and a strike survived.  A data problem, not a market one.
+FLIP_REASON_NO_PROFILE = "NO_PROFILE"
+#: The profile never changes sign across the whole span ladder.  Dealer gamma
+#: is one-signed everywhere within +/-max span, so there is no flip to find in
+#: the searched band.  A real (and extreme) market state.
+FLIP_REASON_ONE_SIDED = "ONE_SIDED"
+#: Crossings exist but every one sits within GAMMA_PROFILE_INTERIOR_MARGIN of a
+#: grid edge, so none is bracketed well enough to trust.
+FLIP_REASON_EDGE_ONLY = "EDGE_ONLY"
+#: A well-bracketed crossing exists but sits further from spot than
+#: GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT.  The flip is real and not actionable --
+#: the SPX 2026-08 blackout, where it sat 9-10% below spot for two weeks.
+FLIP_REASON_BEYOND_MAX_DISTANCE = "BEYOND_MAX_DISTANCE"
+#: A well-bracketed, near-enough crossing exists but the profile around it is
+#: below the structural floor -- a noise-floor sign change rather than
+#: structure.
+FLIP_REASON_BELOW_STRUCTURAL_FLOOR = "BELOW_STRUCTURAL_FLOOR"
+
+# gex_summary's upsert is assembled rather than written out, because the engine
+# can legitimately run one deploy ahead of its own columns: schema.sql is NOT
+# re-run by a bare `git pull` (only `make pull` / `make schema-apply` apply it),
+# and the Makefile documents a prior incident from exactly that skew. A hard
+# -coded column list turns that skew into a failed INSERT, and this write shares
+# a transaction with the by-strike, profile and rollup writes -- so ONE missing
+# optional column would roll back the entire snapshot and the whole cycle would
+# land nothing. 2635cb3 hardened the gamma_regime_5min writer against this after
+# it happened there; this is the same guard on the larger table.
+
+#: Every gex_summary column the writer binds a value for, in INSERT order.
+#: ``computed_at`` is deliberately absent: it is NOW() rather than a bound
+#: parameter, so it is appended to the statement separately.
+_GEX_SUMMARY_COLUMNS = (
+    "underlying",
+    "timestamp",
+    "max_gamma_strike",
+    "max_gamma_value",
+    "gamma_flip_point",
+    "put_call_ratio",
+    "max_pain",
+    "total_call_volume",
+    "total_put_volume",
+    "total_call_oi",
+    "total_put_oi",
+    "total_net_gex",
+    "net_gex_at_spot",
+    "flip_distance",
+    "local_gex",
+    "convexity_risk",
+    "call_wall",
+    "put_wall",
+    "call_wall_strength",
+    "put_wall_strength",
+    "max_pain_by_expiration",
+    "gamma_flip_span_used",
+    "gamma_flip_raw",
+    "pin_strike",
+    "pin_score",
+    "pin_confidence",
+    "pin_strike_reason",
+    "gamma_flip_reason",
+    "data_as_of",
+)
+
+#: The conflict key. Never assigned in DO UPDATE SET, never in its guard.
+_GEX_SUMMARY_KEY_COLUMNS = frozenset({"underlying", "timestamp"})
+
+#: The columns schema.sql adds by ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``
+#: rather than in the base CREATE TABLE -- everything bolted onto gex_summary
+#: after it first shipped, and so exactly the set a database can still lack
+#: while the code that writes it is already deployed.
+#:
+#: The split is the schema's own, not a judgement call re-made here: identity
+#: and the core GEX metrics are all in the original CREATE TABLE, so a database
+#: missing one of THOSE is broken rather than merely behind, and the writer
+#: should still fail loudly on it instead of quietly filing a gutted row.
+#: Keep this in step with schema.sql when a column is added -- the writer is
+#: only as skew-proof as this set is current.
+_GEX_SUMMARY_OPTIONAL_COLUMNS = frozenset(
+    {
+        "flip_distance",
+        "local_gex",
+        "convexity_risk",
+        "call_wall",
+        "put_wall",
+        "call_wall_strength",
+        "put_wall_strength",
+        "max_pain_by_expiration",
+        "net_gex_at_spot",
+        "gamma_flip_span_used",
+        "gamma_flip_raw",
+        "pin_strike",
+        "pin_score",
+        "pin_confidence",
+        "pin_strike_reason",
+        "computed_at",
+        "data_as_of",
+        "gamma_flip_reason",
+    }
+)
 
 # Underlyings whose AnalyticsEngine startup banner has already been logged at
 # INFO in this process. Per-process, per-symbol: the daemon's one engine per
@@ -99,6 +221,11 @@ class AnalyticsEngine:
 
     Decoupled from ingestion - runs on its own schedule against database data.
     """
+
+    #: Class-level default for the per-symbol DTE ramp reference, so an engine
+    #: built without ``__init__`` (the pattern several tests use to exercise a
+    #: single method) still resolves it.  ``__init__`` overrides it per symbol.
+    dte_ref_days: float = GAMMA_PROFILE_DTE_REF_DAYS
 
     def __init__(
         self,
@@ -259,6 +386,46 @@ class AnalyticsEngine:
         # underlying chain stats (IV, OI by DTE, peak/floor) instead of
         # the log going silent for hours.  An info line is emitted on
         # the unresolved→resolved transition so the recovery is visible.
+        # Horizon-occupancy reference for the DTE ramp, PER SYMBOL.
+        #
+        # The ramp exists to stop a same-day 0DTE wall pinning a multi-day
+        # regime level, and ONE horizon serves every underlying: the module
+        # default is 5 days and production overrides it to 2 through the
+        # environment for all symbols at once.  Two days is a fine horizon for
+        # a book whose weight genuinely lives in the multi-day tenors -- SPX
+        # runs ~12% of its open interest in 0DTE, so the ramp barely touches
+        # its structure.
+        #
+        # It is the wrong horizon for a book that IS same-day.  NDX carries
+        # ~76% of its open interest in 0DTE, and at a two-day reference the
+        # ramp does not down-weight an anomaly, it down-weights the market:
+        # what survives is too thin to place a crossing anywhere near spot, so
+        # the resolver walks the whole ladder and persists NULL.
+        # That is the 2026-07..09 NDX blackout, confirmed by replaying stored
+        # chains (src/tools/gamma_flip_gate_replay.py): on the cycles that
+        # reproduce blank, turning the ramp off is the ONLY relaxation that
+        # publishes, and it publishes a flip ~2% below spot while every gate
+        # stays exactly where it is.  Sweeping the horizon on the same cycles
+        # puts a number on it: at ref=2 NDX sits ON the boundary -- some
+        # cycles publish, some do not, which is what a session that is 31%
+        # blank looks like from the inside -- and at ref=1 every cycle
+        # publishes, within half a percent of the level ref=2 produced on the
+        # cycles where it managed to produce one.  The level was never wrong.
+        # It was intermittently invisible.
+        #
+        # So the reference becomes per-symbol, and DEFAULTS TO THE GLOBAL --
+        # setting nothing changes nothing.  Override one underlying with
+        # GAMMA_PROFILE_DTE_REF_DAYS_<SYMBOL> (e.g.
+        # GAMMA_PROFILE_DTE_REF_DAYS_NDX=1) once the replay sweep has shown
+        # which value publishes a sane flip for that chain.  Per-call
+        # overrides (compute_flip_term_structure's horizons) still win over
+        # this, so the term structure is untouched.
+        self.dte_ref_days: float = _getenv_float(
+            f"GAMMA_PROFILE_DTE_REF_DAYS_{self.db_symbol}",
+            GAMMA_PROFILE_DTE_REF_DAYS,
+            min=0.5,
+            max=60.0,
+        )
         self._gamma_flip_unresolved_state: bool = False
         self._gamma_flip_unresolved_last_warn_mono: float = 0.0
         self._gamma_flip_unresolved_warn_throttle_seconds: float = _getenv_float(
@@ -1000,19 +1167,19 @@ class AnalyticsEngine:
                 # already happened.  Their option_chains rows can linger
                 # for hours after settlement, but Greeks against an
                 # unsettled-but-actually-expired strike are nonsense.
-                # SPXW (weekly, PM-settled) shares the $SPX.X underlying
-                # and should NOT be filtered, so we branch on the option
-                # symbol prefix when available.
+                # The PM-settled series (SPXW, NDXP) shares its underlying
+                # with the AM-settled monthly and must NOT be filtered, so
+                # the rule branches on the option symbol when available.
+                # is_am_settled_contract holds both halves — this used to
+                # spell out the SPXW prefix here, which is how NDX went
+                # unfiltered through every third Friday.
                 today_et = ts_et.date()
                 am_dropped = 0
                 if ts_et.time() >= dt_time(9, 30):
                     filtered: List[Dict[str, Any]] = []
                     for opt in options:
-                        is_spxw = (opt["option_symbol"] or "").upper().startswith("SPXW")
-                        if (
-                            opt["expiration"] == today_et
-                            and not is_spxw
-                            and is_spx_am_settled_expiration(self.db_symbol, opt["expiration"])
+                        if opt["expiration"] == today_et and is_am_settled_contract(
+                            self.db_symbol, opt["option_symbol"], opt["expiration"]
                         ):
                             am_dropped += 1
                             continue
@@ -1050,16 +1217,45 @@ class AnalyticsEngine:
                 # timestamp alone cannot say whether anything changed since
                 # the last cycle; the latest table's write clock can. One
                 # indexed aggregate over this underlying's contracts.
-                cursor.execute(
-                    """
-                    SELECT MAX(updated_at)
-                    FROM option_chains_latest
-                    WHERE underlying = %s
-                    """,
-                    (self.db_symbol,),
-                )
-                updated_row = cursor.fetchone()
-                data_updated_at = updated_row[0] if updated_row else None
+                #
+                # ISOLATED. This reads option_chains_latest whether or not the
+                # cache flag is on, because it is a write clock rather than a
+                # data source. That makes it the one statement in _get_snapshot
+                # that can fail on an environment where the cache table has not
+                # been created yet -- and without this try, that failure is
+                # caught by the broad except below, which returns None and
+                # turns EVERY analytics cycle into a no-op. A missing write
+                # clock must cost the sub-minute skip guard (it falls back to
+                # the bucket timestamp) and nothing else.
+                data_updated_at = None
+                try:
+                    cursor.execute(
+                        """
+                        SELECT MAX(updated_at)
+                        FROM option_chains_latest
+                        WHERE underlying = %s
+                        """,
+                        (self.db_symbol,),
+                    )
+                    updated_row = cursor.fetchone()
+                    data_updated_at = updated_row[0] if updated_row else None
+                except Exception:
+                    # A failed statement aborts the transaction, so roll back
+                    # before returning or the context manager's commit raises
+                    # on the way out and takes the snapshot with it.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        logger.warning(
+                            "Rollback after data_as_of probe failure also failed",
+                            exc_info=True,
+                        )
+                    logger.warning(
+                        "option_chains_latest write-clock probe failed; this "
+                        "cycle's data_as_of is unset and the sub-minute skip "
+                        "guard falls back to the bucket timestamp",
+                        exc_info=True,
+                    )
 
                 return {
                     "timestamp": timestamp,
@@ -1227,7 +1423,7 @@ class AnalyticsEngine:
         """
         if not GAMMA_PROFILE_DTE_WEIGHTING:
             return 1.0
-        ref_days = GAMMA_PROFILE_DTE_REF_DAYS if dte_ref_days is None else float(dte_ref_days)
+        ref_days = self.dte_ref_days if dte_ref_days is None else float(dte_ref_days)
         if T <= 0.0 or ref_days <= 0.0:
             return 0.0
         chosen_shape = GAMMA_PROFILE_DTE_WEIGHT_SHAPE if shape is None else shape.strip().lower()
@@ -1995,6 +2191,93 @@ class AnalyticsEngine:
                 best_dist = dist
                 best_flip = candidate
         return best_flip
+
+    def _classify_unresolved_flip(
+        self,
+        options: List[Dict[str, Any]],
+        profile: List[Tuple[float, float]],
+        underlying_price: float,
+    ) -> str:
+        """Which gate left this cycle without a flip.
+
+        Re-walks the last ladder rung's profile applying the SAME gates in the
+        SAME order as :meth:`_find_structural_interior_crossing` -- interior
+        margin, then actionable distance, then structural floor -- and reports
+        the furthest one any candidate reached.  Furthest rather than first
+        because that is the most specific true statement about the chain: a
+        crossing rejected by the floor got past the interior and distance
+        tests, so saying "edge only" about it would be wrong.
+
+        This deliberately does NOT change the resolver.  It is called only on
+        the unresolved path, once per cycle, and it exists so the NULL that
+        the resolver honestly persists stops being indistinguishable from a
+        broken feed.  If it ever disagrees with the resolver about whether a
+        crossing qualifies, the resolver is right and this is the bug -- hence
+        the shared structural reference rather than a second opinion about it.
+
+        Returns one of the ``FLIP_REASON_*`` codes.
+        """
+        if not profile or len(profile) < 2:
+            return FLIP_REASON_NO_PROFILE
+
+        s_lo = profile[0][0]
+        s_hi = profile[-1][0]
+        width = s_hi - s_lo
+        if width <= 0:
+            return FLIP_REASON_NO_PROFILE
+
+        margin_abs = GAMMA_PROFILE_INTERIOR_MARGIN * width
+        interior_lo = s_lo + margin_abs
+        interior_hi = s_hi - margin_abs
+
+        # The same anchored reference the resolver gated on.  Slicing the last
+        # rung gives the identical value as slicing the first, because the
+        # canonical band is inside both and the grid step does not change with
+        # the rung.
+        reference = self._structural_reference_from_profile(
+            options, underlying_price, profile, GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT
+        )
+        floor_abs = GAMMA_PROFILE_STRUCTURAL_MIN_FRAC * reference if reference > 0 else None
+
+        saw_crossing = False
+        saw_interior = False
+        saw_near_enough = False
+
+        for i in range(len(profile) - 1):
+            s1, c1 = profile[i]
+            s2, c2 = profile[i + 1]
+            if c1 * c2 < 0.0:
+                candidate = s1 + (s2 - s1) * (-c1) / (c2 - c1)
+            elif c1 == 0.0:
+                candidate = s1
+            else:
+                continue
+            saw_crossing = True
+
+            if candidate < interior_lo or candidate > interior_hi:
+                continue
+            saw_interior = True
+
+            if (
+                underlying_price > 0
+                and abs(candidate - underlying_price) / underlying_price
+                > GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT
+            ):
+                continue
+            saw_near_enough = True
+
+        if not saw_crossing:
+            return FLIP_REASON_ONE_SIDED
+        if not saw_interior:
+            return FLIP_REASON_EDGE_ONLY
+        if not saw_near_enough:
+            return FLIP_REASON_BEYOND_MAX_DISTANCE
+        # Interior and near enough, so the floor is what rejected it -- either
+        # the window peak fell short, or there was no usable reference to
+        # measure against, which the resolver treats the same way.
+        if floor_abs is None:
+            return FLIP_REASON_NO_PROFILE
+        return FLIP_REASON_BELOW_STRUCTURAL_FLOOR
 
     def _resolve_gamma_flip(
         self,
@@ -2769,6 +3052,17 @@ class AnalyticsEngine:
         gamma_flip_raw = self._calculate_gamma_flip_point(raw_profile, underlying_price)
 
         gamma_flip_unresolved = gamma_flip_point is None
+        # Persisted on EVERY unresolved cycle, not only the ones that warn.
+        # The warning is throttled so a morning-long blackout does not spam
+        # the journal, but a reason that only lands on the transition would
+        # leave most blank rows unexplained -- which is the exact gap that
+        # made this investigation necessary. One extra pass over an
+        # already-built profile, once per unresolved cycle.
+        gamma_flip_reason = (
+            self._classify_unresolved_flip(options, gamma_profile, underlying_price)
+            if gamma_flip_unresolved
+            else None
+        )
         if gamma_flip_unresolved:
             # Throttle the verbose diagnostic so a persistent unresolved
             # regime (e.g. SPX with the actionable flip beyond
@@ -2971,6 +3265,7 @@ class AnalyticsEngine:
             "gamma_flip_point": gamma_flip_point,
             "gamma_flip_raw": gamma_flip_raw,
             "gamma_flip_unresolved": gamma_flip_unresolved,
+            "gamma_flip_reason": gamma_flip_reason,
             "gamma_flip_span_used": gamma_flip_span_used if gamma_flip_point is not None else None,
             "flip_distance": flip_distance,
             "local_gex": local_gex,
@@ -3087,6 +3382,85 @@ class AnalyticsEngine:
 
         logger.info(f"✅ Stored {len(gex_data)} GEX by strike records")
 
+    #: Which of gex_summary's optional columns this database actually has, and
+    #: the upsert assembled for them. Cached for the life of the process: None
+    #: = not yet probed. A service restart re-probes, which is exactly when the
+    #: answer can have changed. Per process rather than per write because a
+    #: per-row catalog lookup would be a query on every cycle to answer a
+    #: question that only a deploy can change.
+    _gex_summary_optional_cols = None
+    _gex_summary_sql = None
+
+    def _gex_summary_optional_columns(self, cursor) -> frozenset:
+        """Which of :data:`_GEX_SUMMARY_OPTIONAL_COLUMNS` this database has."""
+        if self._gex_summary_optional_cols is None:
+            wanted = sorted(_GEX_SUMMARY_OPTIONAL_COLUMNS)
+            # Interpolated, not bound: these are module constants naming the
+            # writer's own columns, never anything reaching this process from
+            # outside it.
+            in_list = ", ".join(f"'{c}'" for c in wanted)
+            cursor.execute(
+                f"""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'gex_summary'
+                  AND column_name IN ({in_list})
+                """
+            )
+            found = frozenset(row[0] for row in cursor.fetchall())
+            type(self)._gex_summary_optional_cols = found
+            missing = _GEX_SUMMARY_OPTIONAL_COLUMNS - found
+            if missing:
+                logger.warning(
+                    "gex_summary is missing %s; writing summary rows without "
+                    "those fields. Run `make schema-apply` (or `make pull`) to "
+                    "add them -- a bare `git pull` does not apply schema.sql.",
+                    ", ".join(sorted(missing)),
+                )
+        return self._gex_summary_optional_cols
+
+    def _gex_summary_upsert(self, cursor) -> str:
+        """The gex_summary upsert, assembled for the columns that exist.
+
+        One statement built from :data:`_GEX_SUMMARY_COLUMNS`, so the column
+        list, the VALUES list, the DO UPDATE SET and the IS DISTINCT FROM guard
+        are all generated from a single ordering and cannot fall out of step
+        with each other -- the mismatch an f-string splicing fragments into
+        four hand-maintained lists invites, and which psycopg2 would only
+        surface at execution time.
+        """
+        if self._gex_summary_sql is None:
+            present = self._gex_summary_optional_columns(cursor)
+            cols = [
+                c
+                for c in _GEX_SUMMARY_COLUMNS
+                if c not in _GEX_SUMMARY_OPTIONAL_COLUMNS or c in present
+            ]
+            updatable = [c for c in cols if c not in _GEX_SUMMARY_KEY_COLUMNS]
+            # computed_at is NOW() rather than a bound value, so it rides
+            # outside the parameter list -- and stays out of the guard below:
+            # it differs on every cycle, so including it there would make every
+            # row differ from itself and the upsert would rewrite the whole
+            # table forever.
+            stamped = "computed_at" in present
+            insert_cols = cols + (["computed_at"] if stamped else [])
+            insert_vals = [f"%({c})s" for c in cols] + (["NOW()"] if stamped else [])
+            sets = [f"{c} = EXCLUDED.{c}" for c in updatable] + (
+                ["computed_at = NOW()"] if stamped else []
+            )
+            guard = [f"EXCLUDED.{c} IS DISTINCT FROM gex_summary.{c}" for c in updatable]
+            type(self)._gex_summary_sql = (
+                f"INSERT INTO gex_summary\n"
+                f"    ({', '.join(insert_cols)})\n"
+                f"VALUES\n"
+                f"    ({', '.join(insert_vals)})\n"
+                f"ON CONFLICT (underlying, timestamp) DO UPDATE SET\n"
+                + ",\n".join(f"    {s}" for s in sets)
+                + "\nWHERE\n    "
+                + "\n    OR ".join(guard)
+                + "\n"
+            )
+        return self._gex_summary_sql
+
     def _store_gex_summary(self, summary: Dict[str, Any], cursor) -> None:
         """Write the GEX summary row on ``cursor``.
 
@@ -3164,106 +3538,64 @@ class AnalyticsEngine:
         pin_score_val = summary.get("pin_score")
         pin_confidence_val = summary.get("pin_confidence")
         pin_strike_reason_val = summary.get("pin_strike_reason")
-        cursor.execute(
-            """
-            INSERT INTO gex_summary
-            (underlying, timestamp, max_gamma_strike, max_gamma_value,
-             gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
-             total_put_volume, total_call_oi, total_put_oi, total_net_gex,
-             net_gex_at_spot, flip_distance, local_gex, convexity_risk,
-             call_wall, put_wall, call_wall_strength, put_wall_strength,
-             max_pain_by_expiration, gamma_flip_span_used,
-             gamma_flip_raw, pin_strike, pin_score, pin_confidence,
-             pin_strike_reason, computed_at, data_as_of)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
-            ON CONFLICT (underlying, timestamp) DO UPDATE SET
-                max_gamma_strike = EXCLUDED.max_gamma_strike,
-                max_gamma_value = EXCLUDED.max_gamma_value,
-                gamma_flip_point = EXCLUDED.gamma_flip_point,
-                gamma_flip_raw = EXCLUDED.gamma_flip_raw,
-                put_call_ratio = EXCLUDED.put_call_ratio,
-                max_pain = EXCLUDED.max_pain,
-                total_call_volume = EXCLUDED.total_call_volume,
-                total_put_volume = EXCLUDED.total_put_volume,
-                total_call_oi = EXCLUDED.total_call_oi,
-                total_put_oi = EXCLUDED.total_put_oi,
-                total_net_gex = EXCLUDED.total_net_gex,
-                net_gex_at_spot = EXCLUDED.net_gex_at_spot,
-                flip_distance = EXCLUDED.flip_distance,
-                local_gex = EXCLUDED.local_gex,
-                convexity_risk = EXCLUDED.convexity_risk,
-                call_wall = EXCLUDED.call_wall,
-                put_wall = EXCLUDED.put_wall,
-                call_wall_strength = EXCLUDED.call_wall_strength,
-                put_wall_strength = EXCLUDED.put_wall_strength,
-                max_pain_by_expiration = EXCLUDED.max_pain_by_expiration,
-                gamma_flip_span_used = EXCLUDED.gamma_flip_span_used,
-                pin_strike = EXCLUDED.pin_strike,
-                pin_score = EXCLUDED.pin_score,
-                pin_confidence = EXCLUDED.pin_confidence,
-                pin_strike_reason = EXCLUDED.pin_strike_reason,
-                computed_at = NOW(),
-                data_as_of = EXCLUDED.data_as_of
-            WHERE
-                EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
-                OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
-                OR EXCLUDED.gamma_flip_point IS DISTINCT FROM gex_summary.gamma_flip_point
-                OR EXCLUDED.put_call_ratio IS DISTINCT FROM gex_summary.put_call_ratio
-                OR EXCLUDED.max_pain IS DISTINCT FROM gex_summary.max_pain
-                OR EXCLUDED.total_call_volume IS DISTINCT FROM gex_summary.total_call_volume
-                OR EXCLUDED.total_put_volume IS DISTINCT FROM gex_summary.total_put_volume
-                OR EXCLUDED.total_call_oi IS DISTINCT FROM gex_summary.total_call_oi
-                OR EXCLUDED.total_put_oi IS DISTINCT FROM gex_summary.total_put_oi
-                OR EXCLUDED.total_net_gex IS DISTINCT FROM gex_summary.total_net_gex
-                OR EXCLUDED.net_gex_at_spot IS DISTINCT FROM gex_summary.net_gex_at_spot
-                OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
-                OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
-                OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
-                OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
-                OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
-                OR EXCLUDED.call_wall_strength IS DISTINCT FROM gex_summary.call_wall_strength
-                OR EXCLUDED.put_wall_strength IS DISTINCT FROM gex_summary.put_wall_strength
-                OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
-                OR EXCLUDED.gamma_flip_span_used IS DISTINCT FROM gex_summary.gamma_flip_span_used
-                OR EXCLUDED.gamma_flip_raw IS DISTINCT FROM gex_summary.gamma_flip_raw
-                OR EXCLUDED.pin_strike IS DISTINCT FROM gex_summary.pin_strike
-                OR EXCLUDED.pin_score IS DISTINCT FROM gex_summary.pin_score
-                OR EXCLUDED.pin_confidence IS DISTINCT FROM gex_summary.pin_confidence
-                OR EXCLUDED.pin_strike_reason IS DISTINCT FROM gex_summary.pin_strike_reason
-                OR EXCLUDED.data_as_of IS DISTINCT FROM gex_summary.data_as_of
-        """,
-            (
-                summary["underlying"],
-                summary["timestamp"],
-                float(summary["max_gamma_strike"]),
-                float(summary["max_gamma_value"]),
-                gamma_flip_point,
-                float(summary["put_call_ratio"]),
-                (float(summary["max_pain"]) if summary.get("max_pain") is not None else None),
-                int(summary["total_call_volume"]),
-                int(summary["total_put_volume"]),
-                int(summary["total_call_oi"]),
-                int(summary["total_put_oi"]),
-                float(summary["total_net_gex"]),
-                (float(net_gex_at_spot) if net_gex_at_spot is not None else None),
-                float(flip_distance) if flip_distance is not None else None,
-                float(summary.get("local_gex", 0.0)),
-                float(convexity_risk) if convexity_risk is not None else None,
-                float(call_wall_val) if call_wall_val is not None else None,
-                float(put_wall_val) if put_wall_val is not None else None,
-                (float(call_wall_strength_val) if call_wall_strength_val is not None else None),
-                (float(put_wall_strength_val) if put_wall_strength_val is not None else None),
-                mp_by_exp_json,
-                (float(gamma_flip_span_used) if gamma_flip_span_used is not None else None),
-                (float(gamma_flip_raw) if gamma_flip_raw is not None else None),
-                (float(pin_strike_val) if pin_strike_val is not None else None),
-                (float(pin_score_val) if pin_score_val is not None else None),
-                (float(pin_confidence_val) if pin_confidence_val is not None else None),
-                (str(pin_strike_reason_val) if pin_strike_reason_val is not None else None),
-                summary.get("data_as_of"),
+        # NULL whenever a flip was published -- including a carried-forward
+        # one, since the carry means a level WAS served and there is nothing
+        # to explain. Only the rows that render as an em dash carry a code.
+        gamma_flip_reason_val = summary.get("gamma_flip_reason")
+        # Values for every column the writer can fill, keyed by column name.
+        # Bound by NAME rather than position: a column the database does not
+        # have simply leaves an unused key here, where a positional %s tuple
+        # would shift every parameter after the gap one place left and file a
+        # row of silently wrong values under the right column names.
+        values = {
+            "underlying": summary["underlying"],
+            "timestamp": summary["timestamp"],
+            "max_gamma_strike": float(summary["max_gamma_strike"]),
+            "max_gamma_value": float(summary["max_gamma_value"]),
+            "gamma_flip_point": gamma_flip_point,
+            "put_call_ratio": float(summary["put_call_ratio"]),
+            "max_pain": (
+                float(summary["max_pain"]) if summary.get("max_pain") is not None else None
             ),
-        )
-        logger.info("✅ Stored GEX summary")
+            "total_call_volume": int(summary["total_call_volume"]),
+            "total_put_volume": int(summary["total_put_volume"]),
+            "total_call_oi": int(summary["total_call_oi"]),
+            "total_put_oi": int(summary["total_put_oi"]),
+            "total_net_gex": float(summary["total_net_gex"]),
+            "net_gex_at_spot": (
+                float(net_gex_at_spot) if net_gex_at_spot is not None else None
+            ),
+            "flip_distance": (float(flip_distance) if flip_distance is not None else None),
+            "local_gex": float(summary.get("local_gex", 0.0)),
+            "convexity_risk": (float(convexity_risk) if convexity_risk is not None else None),
+            "call_wall": (float(call_wall_val) if call_wall_val is not None else None),
+            "put_wall": (float(put_wall_val) if put_wall_val is not None else None),
+            "call_wall_strength": (
+                float(call_wall_strength_val) if call_wall_strength_val is not None else None
+            ),
+            "put_wall_strength": (
+                float(put_wall_strength_val) if put_wall_strength_val is not None else None
+            ),
+            "max_pain_by_expiration": mp_by_exp_json,
+            "gamma_flip_span_used": (
+                float(gamma_flip_span_used) if gamma_flip_span_used is not None else None
+            ),
+            "gamma_flip_raw": (float(gamma_flip_raw) if gamma_flip_raw is not None else None),
+            "pin_strike": (float(pin_strike_val) if pin_strike_val is not None else None),
+            "pin_score": (float(pin_score_val) if pin_score_val is not None else None),
+            "pin_confidence": (
+                float(pin_confidence_val) if pin_confidence_val is not None else None
+            ),
+            "pin_strike_reason": (
+                str(pin_strike_reason_val) if pin_strike_reason_val is not None else None
+            ),
+            "gamma_flip_reason": (
+                str(gamma_flip_reason_val) if gamma_flip_reason_val is not None else None
+            ),
+            "data_as_of": summary.get("data_as_of"),
+        }
+        cursor.execute(self._gex_summary_upsert(cursor), values)
+        logger.debug("✅ Stored GEX summary")
 
     def _store_gex_profile(self, summary: Dict[str, Any], cursor) -> None:
         """Write the spot-shift dealer gamma-exposure profile on ``cursor``.
@@ -3564,6 +3896,293 @@ class AnalyticsEngine:
                 exc,
             )
 
+    def _store_daily_spread_stats(
+        self,
+        options: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+        cursor,
+    ) -> None:
+        """Upsert today's rows in ``daily_spread_stats`` (calls, puts, blended).
+
+        Feeds the Spread Monitor's trailing comparison — the "are markets
+        wider than usual, or does it only feel that way?" read.  Three rows
+        per (underlying, trading_date): ``'C'``, ``'P'`` and ``'A'``.  The
+        blended row is stored rather than derived at read time because
+        medians do not combine.
+
+        The measured population is pinned by ``SPREAD_STATS_DTE_MAX`` and
+        ``SPREAD_STATS_MONEYNESS_BAND_PCT`` and both are written into the row.
+        That is not bookkeeping: a percentile against history is only
+        meaningful if every day in the window measured the same contracts, so
+        the scope has to travel with the reading.
+
+        Same cash-session gate as :meth:`_store_daily_atm_iv`, and for a
+        sharper version of the same reason.  Once the 16:00 ET close passes,
+        market makers stop quoting competitively and the chain goes wide by
+        definition — writing that would put a mechanical post-close blowout
+        into the very history the page uses to judge whether a blowout is
+        unusual, and every later session would then be scored against it.
+
+        Skips silently when spot is missing, the timestamp is outside the
+        cash session, or no contract in scope carries a usable quote.
+        Failures are logged and swallowed: the GEX persistence this shares a
+        transaction with must not fail over a liquidity rollup.
+        """
+        try:
+            spot = float(summary.get("underlying_price") or 0.0)
+            if spot <= 0:
+                return
+            underlying = summary["underlying"]
+            timestamp = summary["timestamp"]
+
+            ts_aware = (
+                timestamp if timestamp.tzinfo is not None else pytz.UTC.localize(timestamp)
+            )
+            et = ts_aware.astimezone(pytz.timezone("America/New_York"))
+            et_minute = et.hour * 60 + et.minute
+            # 09:30 ET = 570 min; 16:00 ET = 960 min.  The row updates all
+            # session and then FREEZES at 16:00 rather than 16:15, so the
+            # value that lands in the history is a quote someone could have
+            # traded on.  Running to 16:15 let the closing rotation define
+            # the day whenever a cycle happened to fall there — and only
+            # then, which made the trailing distribution noisy rather than
+            # merely biased.  ``daily_spread_stats_backfill`` samples the
+            # same 15:30-16:00 window, so seeded and live rows agree.
+            if not (570 <= et_minute <= 960):
+                return
+
+            today_et = et.date()
+            band = float(SPREAD_STATS_MONEYNESS_BAND_PCT)
+            low = spot * (1.0 - band / 100.0)
+            high = spot * (1.0 + band / 100.0)
+
+            in_scope: List[Dict[str, Any]] = []
+            for opt in options:
+                strike = opt.get("strike")
+                expiration = opt.get("expiration")
+                if strike is None or expiration is None:
+                    continue
+                try:
+                    strike_f = float(strike)
+                except (TypeError, ValueError):
+                    continue
+                if not (low <= strike_f <= high):
+                    continue
+                dte = (expiration - today_et).days
+                if dte < 0 or dte > SPREAD_STATS_DTE_MAX:
+                    continue
+                in_scope.append(opt)
+
+            # An outage-thin snapshot is worse than no row: stored beside
+            # full sessions it becomes an equal peer in the distribution the
+            # trailing percentile ranks against, and a median over a handful
+            # of contracts is not the same measurement as one over hundreds.
+            if len(in_scope) < SPREAD_STATS_MIN_CONTRACTS:
+                logger.debug(
+                    "daily_spread_stats %s: %d contracts in scope is below the "
+                    "%d floor; skipping this cycle rather than recording a "
+                    "reading the chain cannot support",
+                    underlying,
+                    len(in_scope),
+                    SPREAD_STATS_MIN_CONTRACTS,
+                )
+                return
+
+            spreads = spread_stats_mod.contract_spreads(in_scope, spot)
+            by_type = spread_stats_mod.aggregate_by_option_type(spreads)
+
+            # 'A' is the blended chain; the other two keys map to the option
+            # types stored in option_chains.
+            rows = [
+                ("C", by_type["calls"]),
+                ("P", by_type["puts"]),
+                ("A", by_type["all"]),
+            ]
+
+            for option_type, agg in rows:
+                # A type with no contracts in scope (an expiration listing
+                # only calls, say) writes nothing rather than a zeroed row
+                # that would later read as "a day when the puts were fine".
+                if agg.contract_count == 0:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO daily_spread_stats (
+                        underlying, trading_date, option_type, spot_price,
+                        dte_max, moneyness_band_pct,
+                        contract_count, tradable_count,
+                        two_sided_pct, zero_bid_pct, crossed_or_locked_pct,
+                        median_spread, median_relative_spread_pct,
+                        p90_relative_spread_pct, median_spread_bps_underlying,
+                        p90_spread_bps_underlying,
+                        total_open_interest, total_volume, source_timestamp
+                    )
+                    VALUES (
+                        %s,
+                        (%s::timestamptz AT TIME ZONE 'America/New_York')::date,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s
+                    )
+                    ON CONFLICT (underlying, trading_date, option_type) DO UPDATE
+                    SET spot_price                   = EXCLUDED.spot_price,
+                        dte_max                      = EXCLUDED.dte_max,
+                        moneyness_band_pct           = EXCLUDED.moneyness_band_pct,
+                        contract_count               = EXCLUDED.contract_count,
+                        tradable_count               = EXCLUDED.tradable_count,
+                        two_sided_pct                = EXCLUDED.two_sided_pct,
+                        zero_bid_pct                 = EXCLUDED.zero_bid_pct,
+                        crossed_or_locked_pct        = EXCLUDED.crossed_or_locked_pct,
+                        median_spread                = EXCLUDED.median_spread,
+                        median_relative_spread_pct   = EXCLUDED.median_relative_spread_pct,
+                        p90_relative_spread_pct      = EXCLUDED.p90_relative_spread_pct,
+                        median_spread_bps_underlying = EXCLUDED.median_spread_bps_underlying,
+                        p90_spread_bps_underlying    = EXCLUDED.p90_spread_bps_underlying,
+                        total_open_interest          = EXCLUDED.total_open_interest,
+                        total_volume                 = EXCLUDED.total_volume,
+                        source_timestamp             = EXCLUDED.source_timestamp,
+                        updated_at                   = NOW()
+                    """,
+                    (
+                        underlying,
+                        timestamp,
+                        option_type,
+                        spot,
+                        int(SPREAD_STATS_DTE_MAX),
+                        band,
+                        agg.contract_count,
+                        agg.tradable_count,
+                        agg.two_sided_pct,
+                        agg.zero_bid_pct,
+                        agg.crossed_or_locked_pct,
+                        agg.median_spread,
+                        agg.median_relative_spread_pct,
+                        agg.p90_relative_spread_pct,
+                        agg.median_spread_bps_underlying,
+                        agg.p90_spread_bps_underlying,
+                        agg.total_open_interest,
+                        agg.total_volume,
+                        timestamp,
+                    ),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to upsert daily_spread_stats for %s: %s",
+                summary.get("underlying", "?"),
+                exc,
+            )
+
+    def _store_spread_surface(
+        self,
+        options: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+        cursor,
+    ) -> None:
+        """Upsert this cycle's cells into ``spread_surface_stats``.
+
+        The sibling of :meth:`_store_daily_spread_stats`, and deliberately a
+        separate row set rather than a widening of it.  The daily rollup keeps
+        one reading per session so "are puts wider than usual today" stays a
+        cheap scalar; this keeps the same statistic sliced by moneyness, by
+        expiry and by time of day, which is what the Spread Surface view needs
+        and what no amount of re-reading the daily row can reconstruct.
+
+        Costs no query: the snapshot is already in memory, and the widest
+        scope the page offers (+/-10%, 30DTE) is a filter over it.
+
+        Gated to 09:30-16:00 ET.  Unlike the daily writer the reason is not
+        post-close drift — a 16:30 reading would be compared only against other
+        16:30 readings, so it would be self-consistent — it is that the page
+        exists to answer "can I trade this now", and there is no now after the
+        bell.  The last bucket of the session is the one the API falls back to,
+        labelled as such.
+
+        Failures are logged and swallowed: this shares a transaction with the
+        GEX persistence, which must not fail over a liquidity rollup.
+        """
+        try:
+            spot = float(summary.get("underlying_price") or 0.0)
+            if spot <= 0:
+                return
+            underlying = summary["underlying"]
+            timestamp = summary["timestamp"]
+
+            ts_aware = (
+                timestamp if timestamp.tzinfo is not None else pytz.UTC.localize(timestamp)
+            )
+            et = ts_aware.astimezone(pytz.timezone("America/New_York"))
+            et_minute = et.hour * 60 + et.minute
+            # Half-open so the closing bucket is 15:30-16:00 rather than a
+            # one-minute 16:00-16:30 sliver.  The bounds live in
+            # surface_store because the read path clamps to the same two
+            # numbers — a writer and a reader that disagreed about where the
+            # session ends would rank a real bucket against an empty one.
+            if not (
+                surface_store.SESSION_START_MIN
+                <= et_minute
+                < surface_store.SESSION_END_MIN
+            ):
+                return
+
+            today_et = et.date()
+            widest_band = max(spread_stats_mod.MONEYNESS_BANDS)
+            widest_dte = max(spread_stats_mod.DTE_UNIVERSES)
+            low = spot * (1.0 - widest_band / 100.0)
+            high = spot * (1.0 + widest_band / 100.0)
+
+            in_scope: List[Dict[str, Any]] = []
+            dte_of: Dict[Any, int] = {}
+            for opt in options:
+                strike = opt.get("strike")
+                expiration = opt.get("expiration")
+                if strike is None or expiration is None:
+                    continue
+                try:
+                    strike_f = float(strike)
+                except (TypeError, ValueError):
+                    continue
+                if not (low <= strike_f <= high):
+                    continue
+                dte = (expiration - today_et).days
+                if dte < 0 or dte > widest_dte:
+                    continue
+                dte_of[expiration] = dte
+                in_scope.append(opt)
+
+            if not in_scope:
+                return
+
+            spreads = spread_stats_mod.contract_spreads(in_scope, spot)
+            by_type = {
+                "C": [s for s in spreads if s.option_type == "C"],
+                "P": [s for s in spreads if s.option_type == "P"],
+            }
+
+            written = surface_store.store_surface_scopes(
+                cursor,
+                underlying,
+                today_et,
+                surface_store.bucket_start_minutes(et),
+                spot,
+                # The localised value, not the raw one: a naive datetime
+                # reaching a TIMESTAMPTZ column is interpreted in the session
+                # timezone, which is not knowably UTC on every deployment.
+                ts_aware,
+                by_type,
+                dte_of,
+            )
+            logger.debug(
+                "spread_surface_stats %s @ %s: %d cells",
+                underlying,
+                surface_store.bucket_label(surface_store.bucket_start_minutes(et)),
+                written,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to upsert spread_surface_stats for %s: %s",
+                summary.get("underlying", "?"),
+                exc,
+            )
+
     def _store_calculation_results(
         self,
         gex_data: List[Dict[str, Any]],
@@ -3581,10 +4200,13 @@ class AnalyticsEngine:
         grouping must not be split into independent transactions.
 
         ``options`` is the raw per-contract snapshot list from
-        ``_get_snapshot()``.  When provided, also UPSERTs today's row
-        into ``daily_atm_iv`` so the signals engine can compute iv_rank
-        without scanning 30 days of option_chains itself.  Kept optional
-        so legacy callers without a snapshot still work.
+        ``_get_snapshot()``.  When provided, also UPSERTs today's rows into
+        two daily rollups the read paths would otherwise have to rebuild by
+        scanning option_chains: ``daily_atm_iv`` (the signals engine's
+        iv_rank percentile) and ``daily_spread_stats`` (the Spread Monitor's
+        trailing quoted-width comparison).  Both are derived from the same
+        snapshot that is already in memory here, so neither costs a query.
+        Kept optional so legacy callers without a snapshot still work.
         """
         try:
             with db_connection() as conn:
@@ -3594,6 +4216,8 @@ class AnalyticsEngine:
                 self._store_gex_profile(summary, cursor)
                 if options is not None:
                     self._store_daily_atm_iv(options, summary, cursor)
+                    self._store_daily_spread_stats(options, summary, cursor)
+                    self._store_spread_surface(options, summary, cursor)
                 # db_connection() commits on a clean __exit__; the explicit
                 # commit makes the single-transaction boundary unambiguous
                 # and is a harmless no-op when the CM commits again.
@@ -3853,6 +4477,10 @@ class AnalyticsEngine:
         # one does not block the other.
         self._refresh_flow_caches(anchor_ts, underlying_price=underlying_price)
         self._refresh_flow_series_snapshot(anchor_ts)
+        # Reads flow_contract_facts directly rather than the caches above, so
+        # its position in this sequence is not load-bearing — it sits here to
+        # keep all three snapshot writers in one place.
+        self._refresh_hedging_flow_snapshot(anchor_ts)
         self._refresh_gamma_regime_snapshot(anchor_ts)
 
     #: How many 5-minute bars back the rolling lens compares against.
@@ -3929,6 +4557,129 @@ class AnalyticsEngine:
         spot = dicts[0].get("spot_price")
         return (float(spot) if spot is not None else None), dicts
 
+    #: Optional gamma_regime_5min columns that newer engine code writes. Cached
+    #: as a set for the life of the process: None = not yet probed. A service
+    #: restart re-probes, which is exactly when the answer can have changed.
+    _gamma_regime_optional_cols = None
+
+    #: Lookback for the typical-move estimate, and the minimum minutes a
+    #: 30-minute window needs before it counts as a complete sample.
+    GAMMA_MOVE_LOOKBACK_DAYS = 5
+    GAMMA_MOVE_MIN_MINUTES = 20
+
+    def _gamma_regime_optional_columns(self, cursor) -> set:
+        """Which optional gamma_regime_5min columns this database actually has.
+
+        Exists because schema.sql is NOT re-run by a bare ``git pull`` -- only
+        ``make pull`` / ``make schema-apply`` apply it, and the Makefile
+        documents a prior incident from exactly that skew. New code can
+        legitimately reach production one deploy ahead of its columns.
+
+        When that happens the affected reading is degraded. Without this probe
+        it was worse: a failed INSERT aborted the whole snapshot, so NO bars
+        were written and the entire structure series went dark over one
+        optional column. One catalog lookup per process buys that back.
+        """
+        if self._gamma_regime_optional_cols is None:
+            cursor.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'gamma_regime_5min'
+                  AND column_name IN ('gamma_flip', 'typical_move_30m')
+                """)
+            found = {row[0] for row in cursor.fetchall()}
+            type(self)._gamma_regime_optional_cols = found
+            missing = {"gamma_flip", "typical_move_30m"} - found
+            if missing:
+                logger.warning(
+                    "gamma_regime_5min is missing %s; writing bars without those "
+                    "fields. Run `make schema-apply` (or `make pull`) to add them -- "
+                    "a bare `git pull` does not apply schema.sql.",
+                    ", ".join(sorted(missing)),
+                )
+        return self._gamma_regime_optional_cols
+
+    def _typical_move_30m(self, cursor, until: datetime):
+        """Median 30-minute high-low range over the trailing lookback.
+
+        The yardstick the cushion is classified against. A fraction of spot
+        was the earlier choice and it adapts to price level but not to
+        volatility, so a fixed percentage reads as a thin cushion on a quiet
+        morning and a comfortable one on a fast afternoon while reporting the
+        same label for both. Distance measured in units of "how far price
+        usually travels in half an hour" means the same thing in both.
+
+        Median rather than mean: one gap or halt would otherwise redefine
+        normal for the whole lookback. Windows with too few minutes are
+        dropped rather than counted as small moves, since a partial window is
+        a data artifact and not a quiet half hour.
+
+        Computed once per cycle, not per bar. It is a multi-day median and
+        barely moves intraday, so a gap-fill stamping the current value on
+        backfilled bars is a small and bounded inaccuracy; recomputing it for
+        each of 78 bars would not be.
+        """
+        cursor.execute(
+            """
+            WITH windows AS (
+                SELECT
+                    date_trunc('hour', timestamp)
+                      + FLOOR(EXTRACT(MINUTE FROM timestamp)::int / 30)
+                        * INTERVAL '30 minutes' AS w,
+                    MAX(high) - MIN(low) AS rng,
+                    COUNT(*) AS mins
+                FROM underlying_quotes
+                WHERE symbol = %(symbol)s
+                  AND timestamp >= %(since)s
+                  AND timestamp <= %(until)s
+                GROUP BY 1
+            )
+            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY rng)
+            FROM windows
+            WHERE mins >= %(min_minutes)s
+            """,
+            {
+                "symbol": self.db_symbol,
+                "since": until - timedelta(days=self.GAMMA_MOVE_LOOKBACK_DAYS),
+                "until": until,
+                "min_minutes": self.GAMMA_MOVE_MIN_MINUTES,
+            },
+        )
+        row = cursor.fetchone()
+        value = float(row[0]) if row and row[0] is not None else None
+        # Zero would divide the cushion ratio into infinity; treat it as absent.
+        return value if value and value > 0 else None
+
+    def _gamma_flips_for_session(self, cursor, session_bars, session_start, session_end):
+        """Every bar's dealer-gamma flip level for one session, in one query.
+
+        Uses ``gamma_flip_point``, the structural crossing, NOT
+        ``gamma_flip_raw``. The raw column is the nearest zero crossing with no
+        significance gate, so it can land on a near-spot noise crossing and
+        sits far from the structural level; a cushion measured against it
+        would mostly track that noise. The schema comments on both columns
+        spell the difference out.
+
+        NULL is still a real answer -- the profile had no crossing at all --
+        but ONLY where a ``gex_summary`` row exists to have said so. A bar
+        whose five minutes hold no row measured nothing, and takes the last
+        level measured earlier in the SAME session rather than a NULL that
+        every consumer reads as "there is no boundary". The asymmetry is the
+        whole point; :mod:`src.analytics.gamma_flip_carry` argues it.
+
+        One query per cycle, not one per bar. The resolution needs the earlier
+        bars anyway, and a cold start walking a session used to issue a round
+        trip per bar to learn what a single grouped scan already says.
+        """
+        cursor.execute(
+            gamma_flip_carry.GAMMA_FLIP_OBSERVATIONS_SQL,
+            {
+                "symbol": self.db_symbol,
+                "session_start": session_start,
+                "session_end": session_end,
+            },
+        )
+        return gamma_flip_carry.resolve_session_flips(session_bars, cursor.fetchall())
+
     def _refresh_gamma_regime_snapshot(self, timestamp: datetime):
         """Materialise gamma_regime_5min for the current session.
 
@@ -3983,8 +4734,10 @@ class AnalyticsEngine:
                 written = {r[0] for r in cursor.fetchall()}
 
                 bar = session_start
+                session_bars = []
                 todo = []
                 while bar <= session_end:
+                    session_bars.append(bar)
                     # Always rewrite the newest bar: it is still filling.
                     if bar not in written or bar == session_end:
                         todo.append(bar)
@@ -4013,7 +4766,23 @@ class AnalyticsEngine:
                         )
                     return chains[bar_ts]
 
+                optional = self._gamma_regime_optional_columns(cursor)
+                has_flip = "gamma_flip" in optional
+                has_move = "typical_move_30m" in optional
+                typical_move = self._typical_move_30m(cursor, session_end) if has_move else None
+                # Resolved over the WHOLE grid, not just the bars being
+                # written: a bar with no gex_summary row of its own carries the
+                # last level measured before it, which can sit in a bar written
+                # cycles ago. Bounded by the session either way, so the carry
+                # can never reach back past 09:30 ET into yesterday.
+                flips = (
+                    self._gamma_flips_for_session(cursor, session_bars, session_start, session_end)
+                    if has_flip
+                    else {}
+                )
+
                 written_count = 0
+                written_flips = []
                 for bar_ts in todo:
                     current = chain_for(bar_ts)
                     if current is None:
@@ -4022,9 +4791,27 @@ class AnalyticsEngine:
                     lookback = chain_for(lookback_ts) if lookback_ts >= session_start else None
 
                     result = build_latest_bar(anchor=anchor, lookback=lookback, current=current)
+                    flip_at = flips.get(bar_ts)
+                    gamma_flip = flip_at.flip if flip_at is not None else None
+                    if flip_at is not None:
+                        written_flips.append(flip_at)
 
+                    flip_col = ", gamma_flip" if has_flip else ""
+                    flip_val = ", %(gamma_flip)s" if has_flip else ""
+                    move_col = ", typical_move_30m" if has_move else ""
+                    move_val = ", %(typical_move_30m)s" if has_move else ""
+                    move_set = (
+                        "\n                            typical_move_30m = EXCLUDED.typical_move_30m,"
+                        if has_move
+                        else ""
+                    )
+                    flip_set = (
+                        "\n                            gamma_flip = EXCLUDED.gamma_flip,"
+                        if has_flip
+                        else ""
+                    )
                     cursor.execute(
-                        """
+                        f"""
                         INSERT INTO gamma_regime_5min (
                             symbol, bar_start, spot,
                             anchored_lean, anchored_stability,
@@ -4032,7 +4819,7 @@ class AnalyticsEngine:
                             rolling_lean, rolling_stability,
                             rolling_net_shift, rolling_gross_shift,
                             sigma_price, near_spot_stock, strike_count,
-                            expired_expirations, rolling_bars
+                            expired_expirations, rolling_bars{flip_col}{move_col}
                         ) VALUES (
                             %(symbol)s, %(bar_start)s, %(spot)s,
                             %(anchored_lean)s, %(anchored_stability)s,
@@ -4040,7 +4827,7 @@ class AnalyticsEngine:
                             %(rolling_lean)s, %(rolling_stability)s,
                             %(rolling_net_shift)s, %(rolling_gross_shift)s,
                             %(sigma_price)s, %(near_spot_stock)s, %(strike_count)s,
-                            %(expired_expirations)s, %(rolling_bars)s
+                            %(expired_expirations)s, %(rolling_bars)s{flip_val}{move_val}
                         )
                         ON CONFLICT (symbol, bar_start) DO UPDATE SET
                             spot = EXCLUDED.spot,
@@ -4056,7 +4843,7 @@ class AnalyticsEngine:
                             near_spot_stock = EXCLUDED.near_spot_stock,
                             strike_count = EXCLUDED.strike_count,
                             expired_expirations = EXCLUDED.expired_expirations,
-                            rolling_bars = EXCLUDED.rolling_bars,
+                            rolling_bars = EXCLUDED.rolling_bars,{flip_set}{move_set}
                             updated_at = NOW()
                         """,
                         {
@@ -4076,6 +4863,8 @@ class AnalyticsEngine:
                             "strike_count": result.strike_count,
                             "expired_expirations": list(result.expired_expirations),
                             "rolling_bars": rolling,
+                            "gamma_flip": gamma_flip,
+                            "typical_move_30m": typical_move,
                         },
                     )
                     written_count += 1
@@ -4088,8 +4877,131 @@ class AnalyticsEngine:
                         self.db_symbol,
                         session_end.isoformat(),
                     )
+
+                # A carried level is a correct reading of a degraded feed, and
+                # without this line it is indistinguishable from a measured one
+                # -- which is the failure this whole path exists to remove. The
+                # newest bar is legitimately one carry deep on the first cycle
+                # after it opens, so only deeper than that is worth saying.
+                carry = gamma_flip_carry.summarize(written_flips)
+                if carry.notable:
+                    logger.log(
+                        logging.WARNING if carry.sustained else logging.INFO,
+                        "gamma_regime_5min gamma_flip for %s: %s. No gex_summary row landed "
+                        "in those 5-minute windows, so the level is standing in from an "
+                        "earlier bar of this session rather than measured (a profile that "
+                        "genuinely has no crossing is still stored NULL). Per-session "
+                        "history: python -m src.tools.gamma_flip_carry_healthcheck",
+                        self.db_symbol,
+                        gamma_flip_carry.describe(carry),
+                    )
         except Exception as e:
             logger.error(f"Error refreshing gamma regime snapshot: {e}", exc_info=True)
+
+    #: 5-minute session window helper shared by the two flow snapshot writers.
+    #: Both must resolve the window exactly as the API's
+    #: ``_resolve_flow_series_session`` does for session='current', or
+    #: engine-written rows land on a grid the API will not read back.
+    def _flow_session_window(self, timestamp: datetime):
+        """(session_start, session_end) in UTC, or None before the open.
+
+        ``session_end`` is now() floored to the 5-minute grid and capped at
+        16:15 ET, which is the same expression the API uses -- so a bar the
+        engine writes is a bar the API asks for, to the second.
+        """
+        ts_et = timestamp.astimezone(ET)
+        session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
+        session_start = session_open_et.astimezone(timezone.utc)
+        session_close = session_start + timedelta(hours=6, minutes=45)
+        now_utc = datetime.now(timezone.utc)
+        now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+        curr_bar = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+        session_end = min(curr_bar, session_close)
+        if session_end < session_start:
+            # Pre-open: the anchor's ET date has today's 09:30 in the future
+            # relative to wall-clock. Nothing to materialise yet.
+            return None
+        return session_start, session_end
+
+    def _refresh_hedging_flow_snapshot(self, timestamp: datetime):
+        """Materialise hedging_flow_5min for the current session, both scopes.
+
+        The stored rows are exactly what ``/api/flow/hedging`` computes for
+        session='current' -- same canonical CTE, rendered for psycopg2 from
+        the same template (:mod:`src.hedging_flow_sql`), so the snapshot and
+        the live read cannot drift into two different numbers for one bar.
+
+        Why a full-session UPSERT every cycle, with no incremental form
+        ----------------------------------------------------------------
+        The flow-series writer needs one because its CTE walks
+        ``flow_by_contract`` with LAG-and-recumulate over the whole session
+        (~30s/cycle measured on db.t3.small). This pipeline reads
+        ``flow_contract_facts``, whose values are already per-bucket deltas,
+        so the full-session form IS the cheap one; a second query shape would
+        be maintenance with nothing to buy.
+
+        It converges rather than churns because closed bars are
+        window-invariant -- the CTE's outer SUM is ROWS UNBOUNDED PRECEDING,
+        so once a bar's boundary passes its cumulative values are
+        mathematically fixed. The UPSERT's IS DISTINCT FROM guard then turns
+        every re-computation of a closed bar into a read with no write.
+
+        Two scopes per cycle
+        --------------------
+        ``all`` is the unfiltered series. ``0dte`` is the identical query with
+        the session's own date as the expirations filter, which is what the
+        page's toggle asks for. Writing it here rather than deriving it on
+        read is the whole point: on a historical session the trades it would
+        be derived FROM have been pruned.
+
+        The 0DTE pass writes nothing on a day that was not an expiry -- the
+        CTE's timeline is gated on its ``filtered`` CTE having rows, so a
+        filter matching nothing yields zero rows rather than a session of
+        synthetic zeros. A reader then sees no 0dte rows and says so.
+
+        Best-effort, like every other writer in this cycle: log, never raise.
+        A failure here must not cost the GEX path its cycle.
+        """
+        if not self._analytics_flow_cache_refresh_enabled:
+            return
+
+        try:
+            window = self._flow_session_window(timestamp)
+            if window is None:
+                return
+            session_start, session_end = window
+            # The 0DTE filter is the SESSION's date, not today's. They are the
+            # same thing on a live cycle and different things on a backfill,
+            # and this writer is the definition both of them follow.
+            session_date = session_start.astimezone(ET).date()
+
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                for scope in HEDGING_FLOW_SCOPES:
+                    cursor.execute(
+                        HEDGING_FLOW_SNAPSHOT_UPSERT_PSYCOPG2,
+                        {
+                            "symbol": self.db_symbol,
+                            "scope": scope,
+                            "session_start": session_start,
+                            "session_end": session_end,
+                            "strikes": None,
+                            "expirations": [session_date] if scope == SCOPE_0DTE else None,
+                        },
+                    )
+                    if cursor.rowcount:
+                        logger.info(
+                            "hedging_flow_5min upserted %d row(s) for %s scope=%s "
+                            "(window [%s, %s])",
+                            cursor.rowcount,
+                            self.db_symbol,
+                            scope,
+                            session_start.isoformat(),
+                            session_end.isoformat(),
+                        )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error refreshing hedging_flow_5min snapshot: {e}", exc_info=True)
 
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.
@@ -4129,16 +5041,13 @@ class AnalyticsEngine:
         try:
             # Resolve the current-session window exactly as the API's
             # _resolve_flow_series_session does for session='current', so
-            # engine-written rows match the window the API will read.
-            ts_et = timestamp.astimezone(ET)
-            session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
-            session_start = session_open_et.astimezone(timezone.utc)
-            session_close = session_start + timedelta(hours=6, minutes=45)
-            now_utc = datetime.now(timezone.utc)
-            now_floor_epoch = int(now_utc.timestamp() // 300) * 300
-            curr_bar = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
-            session_end = min(curr_bar, session_close)
-            if session_end < session_start:
+            # engine-written rows match the window the API will read. Shared
+            # with the hedging-flow writer: two copies of this arithmetic that
+            # drifted by one bar would put the two series on grids that no
+            # longer line up, which is precisely what the Hedging Flow page
+            # stacks them assuming.
+            window = self._flow_session_window(timestamp)
+            if window is None:
                 # Pre-session-open: the anchor timestamp's ET date has
                 # today's 09:30 open in the future relative to wall-clock
                 # (common pre-market for SPY/QQQ once the standalone flow
@@ -4147,6 +5056,7 @@ class AnalyticsEngine:
                 # rows on every cycle and mislabelling that as
                 # "cold-start or gap detected".
                 return
+            session_start, session_end = window
             prev_bar = max(session_start, session_end - timedelta(minutes=5))
 
             with db_connection() as conn:
@@ -4290,8 +5200,17 @@ class AnalyticsEngine:
                     )
                 return True
 
-            logger.info(f"Running calculation for timestamp: {latest_timestamp}")
-            logger.info(f"Underlying price: ${underlying_price:.2f}")
+            # Per-cycle narration is DEBUG, not INFO. At ANALYTICS_INTERVAL=30
+            # with four symbol workers this block ran ~40 INFO lines per cycle
+            # and put 130k lines a day into the journal, which is capped: two
+            # days later the window an operator needs is already rotated away.
+            # A gamma-flip question about Wednesday could not be answered on
+            # Friday for exactly this reason. Everything here is also in
+            # gex_summary, so the log is the redundant copy. The structured
+            # one-liners below (Stage timings, Cycle timing, Loop timing) and
+            # every warning stay at INFO.
+            logger.debug("Running calculation for timestamp: %s", latest_timestamp)
+            logger.debug("Underlying price: $%.2f", underlying_price)
 
             if not options:
                 # Expected closed-market state, NOT an error.  After the
@@ -4332,7 +5251,7 @@ class AnalyticsEngine:
             self._empty_snapshot_state = False
 
             # Calculate GEX by strike
-            logger.info("Calculating GEX by strike...")
+            logger.debug("Calculating GEX by strike...")
             t0 = _time.monotonic()
             gex_by_strike = self._calculate_gex_by_strike(
                 options,
@@ -4347,10 +5266,10 @@ class AnalyticsEngine:
                 self._last_stage_timings = stage_timings
                 return False
 
-            logger.info(f"Calculated GEX for {len(gex_by_strike)} strikes")
+            logger.debug("Calculated GEX for %d strikes", len(gex_by_strike))
 
             # Calculate GEX summary
-            logger.info("Calculating GEX summary metrics...")
+            logger.debug("Calculating GEX summary metrics...")
             t0 = _time.monotonic()
             gex_summary = self._calculate_gex_summary(
                 gex_by_strike, options, underlying_price, latest_timestamp
@@ -4366,7 +5285,7 @@ class AnalyticsEngine:
             self._validate_gex_calculations(gex_by_strike, gex_summary, underlying_price)
 
             # Store results
-            logger.info("Storing results to database...")
+            logger.debug("Storing results to database...")
             t0 = _time.monotonic()
             # What the numbers are as of: the newest quote write the snapshot
             # read, not the minute bucket it is filed under. See
@@ -4382,37 +5301,37 @@ class AnalyticsEngine:
             # cycle no longer skips the flow side. See _run_flow_cycle.
 
             # Log summary
-            logger.info("")
-            logger.info("=" * 80)
-            logger.info("GEX SUMMARY")
-            logger.info("=" * 80)
-            logger.info(f"Max Gamma Strike: ${gex_summary['max_gamma_strike']:.2f}")
-            logger.info(f"Max Gamma Value: {gex_summary['max_gamma_value']:,.0f}")
-            logger.info(
+            logger.debug("")
+            logger.debug("=" * 80)
+            logger.debug("GEX SUMMARY")
+            logger.debug("=" * 80)
+            logger.debug(f"Max Gamma Strike: ${gex_summary['max_gamma_strike']:.2f}")
+            logger.debug(f"Max Gamma Value: {gex_summary['max_gamma_value']:,.0f}")
+            logger.debug(
                 f"Gamma Flip Point: ${gex_summary['gamma_flip_point']:.2f}"
                 if gex_summary["gamma_flip_point"]
                 else "Gamma Flip Point: N/A"
             )
-            logger.info(
+            logger.debug(
                 f"Flip Distance: {gex_summary['flip_distance']:.4f}"
                 if gex_summary.get("flip_distance") is not None
                 else "Flip Distance: N/A"
             )
-            logger.info(f"Local GEX (±1%): {gex_summary.get('local_gex', 0.0):,.0f}")
-            logger.info(
+            logger.debug(f"Local GEX (±1%): {gex_summary.get('local_gex', 0.0):,.0f}")
+            logger.debug(
                 f"Convexity Risk: {gex_summary['convexity_risk']:,.0f}"
                 if gex_summary.get("convexity_risk") is not None
                 else "Convexity Risk: N/A"
             )
-            logger.info(
+            logger.debug(
                 f"Max Pain: ${gex_summary['max_pain']:.2f}"
                 if gex_summary.get("max_pain") is not None
                 else "Max Pain: N/A"
             )
-            logger.info(f"Put/Call Ratio: {gex_summary['put_call_ratio']:.2f}")
-            logger.info(f"Total Net GEX: {gex_summary['total_net_gex']:,.0f}")
-            logger.info("=" * 80)
-            logger.info("")
+            logger.debug(f"Put/Call Ratio: {gex_summary['put_call_ratio']:.2f}")
+            logger.debug(f"Total Net GEX: {gex_summary['total_net_gex']:,.0f}")
+            logger.debug("=" * 80)
+            logger.debug("")
 
             self.calculations_completed += 1
             self.last_calculation_time = datetime.now(ET)
@@ -4552,7 +5471,9 @@ class AnalyticsEngine:
                 )
 
                 if sleep_time > 0:
-                    logger.info(f"Sleeping for {sleep_time:.1f}s until next calculation...\n")
+                    # Loop timing above already reports the sleep; this was the
+                    # same number a second time, once per cycle per worker.
+                    logger.debug("Sleeping for %.1fs until next calculation", sleep_time)
                     time.sleep(sleep_time)
                 else:
                     stage_breakdown = getattr(self, "_last_stage_timings", None) or {}

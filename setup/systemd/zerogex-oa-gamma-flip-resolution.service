@@ -1,0 +1,88 @@
+[Unit]
+Description=ZeroGEX gamma-flip resolution check (alerts when the flip is left unpublished)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# WHY THIS EXISTS. The sibling carry check asks whether a five-minute bar had
+# a gex_summary row at all. This asks the opposite question about the rows
+# that ARE there: the row exists, the cycle ran, and the resolver declined to
+# publish a flip. Persisting NULL is the correct behaviour, and it is also
+# completely silent -- every consumer renders nothing, and on the NinjaTrader
+# panel the Flip line is simply an em dash.
+#
+# That silence cost us five weeks. SPX ran blank for the whole session from
+# 2026-08-07 to 2026-08-17 and NDX from 2026-08-07 to 2026-09-09, and the
+# first anybody heard of it was a beta tester's screenshot. Nothing was
+# watching, so nothing was reported. This unit is the thing that was missing.
+#
+# Requires `make alert-template-install` and a backend in /etc/zerogex/alert.env
+# (ALERT_BACKEND=resend + ALERT_EMAIL_TO for email). Without them the
+# dispatcher falls back to ALERT_BACKEND=stderr and the alert lands in
+# `journalctl -u zerogex-alert@*` -- degraded, but never a failed install.
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# ANALYTICS_UNDERLYINGS comes from here, so the check covers exactly the
+# symbols the analytics engine writes -- add an underlying to the engine and
+# it is covered on the next fire, with no unit to edit. Which matters here:
+# the outage above was cash-index-only, and a unit with a hardcoded symbol
+# list is exactly how the next one hides.
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# SESSIONS=1 so a firing judges the session in front of it, matching the carry
+# check; the default of 10 is for reading history by hand.
+#
+# NOTE ON RE-ALERTING. The threshold is on the LONGEST unbroken blank stretch,
+# which only grows within a session, so a session that breaches at 11:30 will
+# breach again at every fire until the close. That is deliberate and it is not
+# noise: the failure this catches is one nobody noticed for five weeks, and a
+# reminder every hour until it is looked at is the correct amount of nagging.
+#
+# Exits 0 when no symbol left the flip blank for longer than
+# GAMMA_FLIP_MAX_BLANK_MINUTES, 1 when one did, 2 on DB error. A nonzero exit
+# marks the unit failed, surfaces in `systemctl --failed`, logs the offending
+# symbol and session, and fires the OnFailure hook above.
+# NOTHING IS IGNORED HERE, DELIBERATELY.
+#
+# The check now reports gamma_flip_reason, and IGNORE_REASONS="CODE ..." would
+# stop a named cause from breaching. It is tempting to put
+# BEYOND_MAX_DISTANCE in it: on 2026-09-21 NDX was blank for all 390 rows with
+# 375 of them under that code, and the resolver was RIGHT -- Friday's monthly
+# opex left a book at 3.16 calls per put, long gamma everywhere, with the
+# crossing 12% to 37% below spot. This unit emailed about it seven times.
+#
+# Do not. The NDX blackout of 2026-07..09, which was a real bug in our own DTE
+# weighting and took five weeks and a customer to find, ALSO reported
+# BEYOND_MAX_DISTANCE. The code does not separate "the market moved the flip
+# away" from "our math did", so silencing it would have silenced the one
+# failure this unit exists for.
+#
+# What separates them is how far gamma_flip_raw (ungated, unweighted) sits
+# from spot: ~3% on 2026-09-17 when the ramp was hiding a near-spot crossing,
+# 12-37% on 2026-09-21 when no near-spot crossing existed. That is the rule
+# worth encoding, and it needs a spot price this check does not yet read.
+# Until then the reason is printed in the alert so triage is one glance
+# instead of one investigation.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-resolution-healthcheck SESSIONS=1
+
+# One indexed range scan and a rollback per symbol-session.
+TimeoutStartSec=120
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-gamma-flip-resolution

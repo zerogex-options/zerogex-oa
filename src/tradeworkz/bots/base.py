@@ -218,6 +218,37 @@ class BaseBot:
                 pass
         return float(tw_config.MAX_PREMIUM_LOSS_PCT)
 
+    def _premium_stop_grace_seconds(self) -> int:
+        """How long after entry the premium stop stays suppressed.
+
+        Per-bot ``params['premium_stop_grace_seconds']`` over the fleet-wide
+        ``TRADEWORKZ_PREMIUM_STOP_GRACE_SECONDS``, mirroring
+        :meth:`_max_premium_loss_pct`.
+
+        The fleet default (45s) is sized for tight 0DTE ATM debits marked
+        every few seconds. It is too short for two cases that both look like
+        a loss without any adverse move having happened:
+
+        * a WIDE structure — a multi-day OTM single leg can show a >50%
+          bid-vs-ask gap at entry, so the stop knifes the position on the
+          spread, which is exactly what this grace exists to prevent;
+        * the RESEARCH HARNESS — it replays at ``--interval-min`` (5 minutes
+          by default), so any grace shorter than one step has already expired
+          by the first mark and protects nothing.
+
+        A bot holding a wide structure for days should set this comfortably
+        above its replay interval.
+        """
+        from src.tradeworkz import config as tw_config
+
+        override = self.params.get("premium_stop_grace_seconds")
+        if override is not None:
+            try:
+                return max(0, int(override))
+            except (TypeError, ValueError):
+                pass
+        return int(tw_config.PREMIUM_STOP_GRACE_SECONDS)
+
     # -- Scale-out ladder knobs -----------------------------------------
     # Each resolves a per-bot ``params[...]`` override over the fleet-wide
     # config default, mirroring :meth:`_max_premium_loss_pct`. See
@@ -425,15 +456,15 @@ class BaseBot:
         # need a wider profit-loss check the reconciler can grow into
         # later. For now only long-debit structures (entry_price > 0)
         # get the check, which covers every current bot.
-        from src.tradeworkz import config as tw_config
-
         pct = self._max_premium_loss_pct()
         # Grace window: a freshly opened position is first marked at the close
         # side (bid − slippage), so the entry-tick bid/ask + slippage gap can
         # look like a large loss that is not a real adverse move. Suppress the
         # premium stop until the grace elapses so it fires on moves, not the
-        # spread. See PREMIUM_STOP_GRACE_SECONDS.
-        grace = int(tw_config.PREMIUM_STOP_GRACE_SECONDS)
+        # spread. Resolved per-bot — see _premium_stop_grace_seconds, which
+        # explains why the fleet default is too short for a wide structure or
+        # for the research harness's replay cadence.
+        grace = self._premium_stop_grace_seconds()
         in_premium_grace = (
             grace > 0
             and position.opened_at is not None

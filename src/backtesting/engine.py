@@ -1452,6 +1452,95 @@ def _preload_quotes_provider(conn, underlying: str, start_dt, end_dt, cards, spe
     return _provider
 
 
+def _catalog_cards(
+    conn, spec: BacktestSpec, start_dt: datetime, end_dt: datetime
+) -> tuple[list, list]:
+    """Source entries for a catalog-strategy selection.
+
+    ``spec.patterns`` holds STRATEGY CATALOG ids. Each selected strategy is
+    routed to whichever engine implements it:
+
+    * **pattern-backed** — replay the persisted Action Cards it emitted live.
+      Cards are relabelled from the legacy pattern id to the canonical catalog
+      id, so per-strategy rollups downstream key on one id per strategy however
+      it was measured.
+    * **bot-backed** — replay the bot's own entry rule over reconstructed
+      as-of snapshots (``bot_replay``), producing cards the same forward walk
+      then prices.
+
+    A strategy with both bindings is measured through its pattern, because
+    those cards are what actually fired live; the bot replay is the fallback
+    that gives the 12 bot-only strategies any backtest at all.
+
+    An EMPTY selection means "every persisted pattern card", preserving the
+    pre-catalog default. It deliberately does not fan out to every bot replay:
+    that would rebuild thousands of snapshots per run for strategies the user
+    did not ask for.
+
+    Returns ``(all_cards, in_scope)`` — the first for the run's "cards_total"
+    diagnostic, the second filtered to the selection.
+    """
+    from src.strategies import find
+
+    persisted = fetch_action_cards(conn, spec.underlying, start_dt, end_dt)
+    if not spec.patterns:
+        return persisted, _relabel_to_catalog(persisted)
+
+    pattern_legacy_ids: set[str] = set()
+    bot_only = []
+    for sid in spec.patterns:
+        entry = find(sid)
+        if entry is None:
+            # Unknown to the catalog: treat it as a raw pattern id so an older
+            # saved config or share link keeps resolving.
+            pattern_legacy_ids.add(sid)
+            continue
+        if entry.pattern_id:
+            pattern_legacy_ids.add(entry.pattern_id)
+        elif entry.bot_class is not None:
+            bot_only.append(entry)
+
+    in_scope = _relabel_to_catalog([c for c in persisted if c.pattern in pattern_legacy_ids])
+    if bot_only:
+        from src.backtesting.bot_replay import generate_bot_cards
+
+        max_hold = spec.exit.max_hold_minutes or _DEFAULT_MAX_HOLD_MIN
+        replayed = generate_bot_cards(conn, spec, bot_only, max_hold=max_hold)
+        in_scope = sorted(in_scope + replayed, key=lambda c: c.timestamp)
+        persisted = list(persisted) + replayed
+    return persisted, in_scope
+
+
+def _relabel_to_catalog(cards: list) -> list:
+    """Rewrite each card's ``pattern`` to its canonical catalog id.
+
+    A no-op for the majority, where the catalog id and the pattern id are the
+    same string; it matters for the ten strategies whose bot and pattern
+    shipped under different names.
+    """
+    from src.strategies import canonical_id
+
+    out = []
+    for card in cards:
+        canonical = canonical_id(card.pattern)
+        if canonical is None or canonical == card.pattern:
+            out.append(card)
+            continue
+        out.append(
+            CardRow(
+                underlying=card.underlying,
+                timestamp=card.timestamp,
+                pattern=canonical,
+                action=card.action,
+                tier=card.tier,
+                direction=card.direction,
+                confidence=card.confidence,
+                payload=card.payload,
+            )
+        )
+    return out
+
+
 def run_backtest(
     conn,
     spec: BacktestSpec,
@@ -1473,12 +1562,7 @@ def run_backtest(
         all_cards = generate_strategy_cards(conn, spec, max_hold=max_hold)
         in_scope = all_cards
     else:
-        all_cards = fetch_action_cards(conn, spec.underlying, start_dt, end_dt)
-        if spec.patterns:
-            wanted = set(spec.patterns)
-            in_scope = [c for c in all_cards if c.pattern in wanted]
-        else:
-            in_scope = list(all_cards)
+        all_cards, in_scope = _catalog_cards(conn, spec, start_dt, end_dt)
     cards = _apply_cooldown(in_scope, spec.cooldown_minutes)
 
     # Funnel diagnostics so a 0-trade run is explainable: where did cards go?

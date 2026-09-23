@@ -66,6 +66,33 @@ def _two_session_cutoff(now: Optional[datetime] = None) -> datetime:
     return datetime(prior_date.year, prior_date.month, prior_date.day, 9, 30, tzinfo=_ET)
 
 
+def _session_closes_since(cutoff: datetime, now: Optional[datetime] = None) -> List[datetime]:
+    """Regular-session closes, in UTC, for every weekday in ``[cutoff, now]``.
+
+    Used to bound forward-return lookups to the session the event belongs to.
+    Holidays are not filtered: an extra close on a day that had no session is
+    harmless, because no signal rows exist to match against it.
+
+    Half-days are honored through ``session_close_for``, so an early close
+    bounds its own session at 13:00 ET rather than 16:00.
+    """
+    from src.api.freshness import session_close_for
+
+    start = cutoff.astimezone(_ET).date()
+    end = (now or datetime.now(_ET)).astimezone(_ET).date()
+    out: List[datetime] = []
+    day = start
+    while day <= end:
+        if day.weekday() < 5:
+            out.append(
+                datetime.combine(day, session_close_for(day), tzinfo=_ET).astimezone(
+                    ZoneInfo("UTC")
+                )
+            )
+        day += timedelta(days=1)
+    return out
+
+
 class SignalsQueriesMixin:
     """Read-side methods for the signals feature.
 
@@ -660,6 +687,17 @@ class SignalsQueriesMixin:
                 FROM underlying_quotes uq
                 WHERE uq.symbol = scs.underlying
                   AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                  -- Bound to the close of the session this event belongs to:
+                  -- the earliest session close at or after the event. Without
+                  -- it a late-session flip is graded against an after-hours
+                  -- print, or against the next session's open over a weekend.
+                  -- No such close (an after-hours row) leaves this NULL, which
+                  -- yields a NULL forward price -- an unscored event, not a
+                  -- fabricated return.
+                  AND uq.timestamp <= (
+                        SELECT MIN(c) FROM UNNEST($5::timestamptz[]) AS c
+                        WHERE c >= scs.timestamp
+                      )
                 ORDER BY uq.timestamp ASC
                 LIMIT 1
             ) q1 ON TRUE
@@ -671,7 +709,10 @@ class SignalsQueriesMixin:
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, component_name, limit, cutoff)
+                rows = await conn.fetch(
+                    query, symbol, component_name, limit, cutoff,
+                    _session_closes_since(cutoff),
+                )
             # Compute sign-flips chronologically (oldest → newest), but
             # return newest → oldest to match the convention used by the
             # rest of the timeseries APIs.
@@ -1326,6 +1367,266 @@ class SignalsQueriesMixin:
             logger.warning("get_recent_action_cards failed (%s): %s", underlying, exc)
             return []
 
+    @staticmethod
+    def _session_close_utc(start_utc: datetime) -> datetime:
+        """The regular-session close, in UTC, for the ET day ``start_utc`` opens.
+
+        ``start_utc`` is ET local midnight of the scorecard's day, so its ET
+        calendar date is the trading day. ``session_close_for`` is the shared
+        NYSE-calendar helper and already returns 13:00 on an early-close day,
+        so half-days need no special handling here.
+
+        Imported lazily: ``src.api.freshness`` reaches back into the API layer,
+        and importing it at module scope would close an import cycle through
+        ``DatabaseManager``.
+        """
+        et_day = start_utc.astimezone(_ET).date()
+        try:
+            from src.api.freshness import session_close_for
+
+            close_t = session_close_for(et_day)
+        except Exception:  # noqa: BLE001 - never fail a scorecard over the calendar
+            logger.warning(
+                "get_daily_scorecard: NYSE calendar unavailable for %s; "
+                "falling back to a 16:00 ET close",
+                et_day,
+                exc_info=True,
+            )
+            close_t = time(16, 0)
+        return datetime.combine(et_day, close_t, tzinfo=_ET).astimezone(ZoneInfo("UTC"))
+
+    async def list_scorecard_sessions(
+        self,
+        symbol: str,
+        limit: int = 60,
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Recent ET trading days that have a scorecard, newest first.
+
+        Backs the /scorecard landing page's cards, and mirrors the
+        ``/api/replay/sessions`` contract: enough per-date metadata to render a
+        card without a second fetch per day.
+
+        A day qualifies on either signal — Action Cards emitted, or a closing
+        regime written. The FULL OUTER JOIN is deliberate: a quiet session that
+        emitted no cards still has a regime and still has a scorecard worth
+        reading, and dropping it would make the list lie about which days exist.
+
+        Scanned from a date floor rather than the whole table: ``limit``
+        trading days is at most ``limit * 2`` calendar days once weekends and
+        holidays are allowed for, plus a week of slack.
+        """
+        end_et = (now or datetime.now(_ET)).astimezone(_ET)
+        floor_days = max(1, limit) * 2 + 7
+        start_utc = (
+            datetime.combine(
+                end_et.date() - timedelta(days=floor_days), time(0, 0), tzinfo=_ET
+            ).astimezone(ZoneInfo("UTC"))
+        )
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH cards AS (
+                        SELECT
+                            (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                            COUNT(*) AS total
+                        FROM signal_action_cards
+                        WHERE underlying = $1
+                          AND timestamp >= $2
+                          AND action <> 'STAND_DOWN'
+                        GROUP BY 1
+                    ),
+                    regimes AS (
+                        SELECT DISTINCT ON ((timestamp AT TIME ZONE 'America/New_York')::date)
+                            (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                            direction,
+                            composite_score
+                        FROM signal_scores
+                        WHERE underlying = $1
+                          AND timestamp >= $2
+                        ORDER BY 1, timestamp DESC
+                    )
+                    SELECT
+                        COALESCE(cards.d, regimes.d) AS d,
+                        COALESCE(cards.total, 0) AS cards,
+                        regimes.direction AS direction,
+                        regimes.composite_score AS composite_score
+                    FROM cards
+                    FULL OUTER JOIN regimes ON cards.d = regimes.d
+                    WHERE COALESCE(cards.d, regimes.d) IS NOT NULL
+                    ORDER BY d DESC
+                    LIMIT $3
+                    """,
+                    symbol,
+                    start_utc,
+                    int(max(1, limit)),
+                )
+            return [
+                {
+                    "date": r["d"],
+                    "cards": int(r["cards"] or 0),
+                    "direction": r["direction"],
+                    "composite_score": (
+                        float(r["composite_score"])
+                        if r["composite_score"] is not None
+                        else None
+                    ),
+                }
+                for r in rows
+            ]
+        except Exception as exc:
+            logger.warning("list_scorecard_sessions failed (%s): %s", symbol, exc)
+            return []
+
+    async def get_signal_trailing_record(
+        self,
+        symbol: str,
+        signal_names: List[str],
+        sessions: int = 30,
+        horizon_minutes: int = 60,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Per-signal flip record across the last ``sessions`` trading days.
+
+        The daily scorecard answers "how did this signal do today", which is
+        one session and cannot answer "is this signal any good". Nothing
+        aggregated across sessions, so a subscriber asking that could only be
+        pointed at the strategy catalog — which measures *strategies*, not the
+        signals the product actually renders.
+
+        Same flip definition and same session-bounded forward return as
+        ``get_daily_scorecard``, so a trailing row is exactly the sum of the
+        daily rows over the window and the two surfaces can never disagree.
+
+        ``scored`` is reported alongside ``flips`` rather than folded away: a
+        signal that only fires near the close has flips that cannot be graded
+        within the session, and hiding that would reintroduce the bug this
+        method exists to make visible.
+        """
+        end_et = (now or datetime.now(_ET)).astimezone(_ET)
+        # Walk back `sessions` weekdays. Holidays are not filtered — an empty
+        # day contributes no rows, so it only makes the window slightly longer
+        # in calendar terms, never wrong.
+        day = end_et.date()
+        counted = 0
+        while counted < max(1, sessions):
+            if day.weekday() < 5:
+                counted += 1
+            if counted < max(1, sessions):
+                day -= timedelta(days=1)
+        start_utc = datetime.combine(day, time(0, 0), tzinfo=_ET).astimezone(ZoneInfo("UTC"))
+        end_utc = end_et.astimezone(ZoneInfo("UTC"))
+
+        out: Dict[str, Any] = {
+            "symbol": symbol,
+            "sessions_requested": sessions,
+            "window_start_utc": start_utc,
+            "window_end_utc": end_utc,
+            "horizon_minutes": horizon_minutes,
+            "signals": [],
+        }
+        if not signal_names:
+            return out
+
+        horizon_interval = f"{int(horizon_minutes)} minutes"
+        closes = _session_closes_since(start_utc, end_et)
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    WITH events AS (
+                        SELECT
+                            scs.component_name,
+                            scs.timestamp,
+                            SIGN(scs.clamped_score) AS sign_now,
+                            LAG(SIGN(scs.clamped_score)) OVER (
+                                PARTITION BY scs.component_name
+                                ORDER BY scs.timestamp
+                            ) AS sign_prev,
+                            q0.close AS close_at_ts,
+                            q1.close AS close_at_horizon
+                        FROM signal_component_scores scs
+                        LEFT JOIN LATERAL (
+                            SELECT close FROM underlying_quotes uq
+                            WHERE uq.symbol = scs.underlying
+                              AND uq.timestamp <= scs.timestamp
+                            ORDER BY uq.timestamp DESC LIMIT 1
+                        ) q0 ON TRUE
+                        LEFT JOIN LATERAL (
+                            SELECT close FROM underlying_quotes uq
+                            WHERE uq.symbol = scs.underlying
+                              AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                              -- Same session only. See get_daily_scorecard.
+                              AND uq.timestamp <= (
+                                    SELECT MIN(c) FROM UNNEST($5::timestamptz[]) AS c
+                                    WHERE c >= scs.timestamp
+                                  )
+                            ORDER BY uq.timestamp ASC LIMIT 1
+                        ) q1 ON TRUE
+                        WHERE scs.underlying = $1
+                          AND scs.component_name = ANY($2::varchar[])
+                          AND scs.timestamp >= $3
+                          AND scs.timestamp < $4
+                    ),
+                    flips AS (
+                        SELECT
+                            component_name,
+                            CASE
+                                WHEN close_at_ts IS NULL OR close_at_horizon IS NULL THEN NULL
+                                WHEN sign_now > 0 THEN (close_at_horizon - close_at_ts) / NULLIF(close_at_ts, 0)
+                                WHEN sign_now < 0 THEN (close_at_ts - close_at_horizon) / NULLIF(close_at_ts, 0)
+                                ELSE NULL
+                            END AS directional_return
+                        FROM events
+                        WHERE sign_now <> 0
+                          AND sign_prev IS NOT NULL
+                          AND sign_prev <> 0
+                          AND sign_now <> sign_prev
+                    )
+                    SELECT
+                        component_name,
+                        COUNT(*) AS flips,
+                        COUNT(directional_return) AS scored,
+                        SUM(CASE WHEN directional_return > 0 THEN 1 ELSE 0 END) AS wins,
+                        SUM(CASE WHEN directional_return < 0 THEN 1 ELSE 0 END) AS losses,
+                        AVG(directional_return) AS avg_directional_return
+                    FROM flips
+                    GROUP BY component_name
+                    """,
+                    symbol,
+                    list(signal_names),
+                    start_utc,
+                    end_utc,
+                    closes,
+                )
+            for r in rows:
+                avg = r["avg_directional_return"]
+                scored = int(r["scored"] or 0)
+                wins = int(r["wins"] or 0)
+                out["signals"].append(
+                    {
+                        "name": r["component_name"],
+                        "flips": int(r["flips"] or 0),
+                        "scored": scored,
+                        "wins": wins,
+                        "losses": int(r["losses"] or 0),
+                        # Only meaningful against `scored`; None rather than 0.0
+                        # when nothing could be graded, so a signal with no
+                        # scorable flips never reads as a 0% win rate.
+                        "win_rate": (wins / scored) if scored else None,
+                        "avg_directional_return": float(avg) if avg is not None else None,
+                    }
+                )
+            out["signals"].sort(key=lambda e: e["name"])
+        except Exception as exc:
+            logger.warning(
+                "get_signal_trailing_record failed (%s, %s sessions): %s",
+                symbol, sessions, exc,
+            )
+        return out
+
     async def get_daily_scorecard(
         self,
         symbol: str,
@@ -1347,6 +1648,14 @@ class SignalsQueriesMixin:
            (return same-sign as the flip direction), and the average
            directional return. Best/worst signal are picked from the names
            with at least two qualifying events.
+
+           The forward price is bounded to the same regular session, so a
+           flip within ``horizon_minutes`` of the close is reported as
+           ``flips`` without ``scored`` rather than being graded against an
+           after-hours print. ``scored`` is therefore ≤ ``flips``, and a
+           signal that fires only near the close (``eod_pressure``, whose
+           ramp is zero before 90 minutes to close) can legitimately return
+           ``avg_directional_return: None`` for a whole session.
         3. **Closing regime** — the most recent ``signal_scores`` row at or
            before ``end_utc``, used to label the day's MSI regime.
 
@@ -1407,6 +1716,25 @@ class SignalsQueriesMixin:
             )
 
         # 2. Per-signal flip events with realized return at horizon.
+        #
+        # The forward price must come from the SAME regular session. Without
+        # that bound the lateral join below takes the first quote at or after
+        # `event + horizon` with no upper limit, so a signal firing within
+        # `horizon` of the close is graded against an after-hours print — or,
+        # on a Friday, against the next Monday's open. A weekend gap then gets
+        # reported as an hour of trading.
+        #
+        # `eod_pressure` is the pathological case: its time ramp is zero until
+        # 90 minutes before the close, so EVERY flip it can register is inside
+        # the last 90 minutes and every one of them was mis-scored. Any other
+        # late-firing signal was affected intermittently.
+        #
+        # Bounding the join is the whole fix: when `event + horizon` lands past
+        # the close, no quote satisfies both predicates, `close_at_horizon` is
+        # NULL, and the CASE below already yields a NULL `directional_return`.
+        # Such a flip is then counted in `flips` but not in `scored` — the
+        # "not scorable" state the aggregate already models.
+        session_close_utc = self._session_close_utc(start_utc)
         if signal_names:
             horizon_interval = f"{int(horizon_minutes)} minutes"
             try:
@@ -1436,6 +1764,7 @@ class SignalsQueriesMixin:
                                 SELECT close FROM underlying_quotes uq
                                 WHERE uq.symbol = scs.underlying
                                   AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                                  AND uq.timestamp <= $5
                                 ORDER BY uq.timestamp ASC LIMIT 1
                             ) q1 ON TRUE
                             WHERE scs.underlying = $1
@@ -1480,6 +1809,7 @@ class SignalsQueriesMixin:
                         list(signal_names),
                         start_utc,
                         end_utc,
+                        session_close_utc,
                     )
                 events: List[Dict[str, Any]] = []
                 for r in sig_rows:
@@ -2086,6 +2416,423 @@ class SignalsQueriesMixin:
         except Exception as exc:
             logger.warning(
                 "get_daily_forecast_history failed (%s): %s", symbol, exc,
+            )
+            return []
+
+    # ------------------------------------------------------------------
+    # Intraday re-anchored cone (see src/jobs/intraday_cone_model.py)
+    # ------------------------------------------------------------------
+
+    async def insert_intraday_cone(
+        self, rows: List[Dict[str, Any]]
+    ) -> Optional[int]:
+        """Commit one fire's horizon claims.
+
+        Idempotent per the same contract as the morning writer: the
+        (symbol, forecast_ts, horizon_min) primary key plus the immutability
+        trigger mean a re-run cannot restate a claim already on the record.
+        Returns the number of rows actually inserted, or None if the write
+        FAILED.
+
+        Those are different answers and conflating them is not cosmetic. This
+        used to return 0 on an exception as well as on a clean conflict, so a
+        writer whose every insert was rejected — by a missing column, say —
+        reported "already committed" and exited 0. A whole session went missing
+        that way and the log read like a healthy idempotent re-run. A job that
+        announces success when it failed is worse than one that crashes.
+
+        The whole fire goes in one transaction.  A half-written cone would
+        leave some horizons of one anchor committed and others not, and the
+        reliability table would then be sampling horizons rather than fires.
+        """
+        if not rows:
+            return 0        # nothing asked for is a real zero, not a failure
+        try:
+            async with self._acquire_connection() as conn:
+                async with conn.transaction():
+                    inserted = 0
+                    for r in rows:
+                        got = await conn.fetchrow(
+                            """
+                            INSERT INTO intraday_forecast (
+                                symbol, session_date, forecast_ts, horizon_min,
+                                target_ts, anchor_spot, band_low, band_high,
+                                hold_prob, sigma, call_wall, put_wall,
+                                gamma_flip, net_gex_at_spot, daily_sigma,
+                                gamma_mult, elapsed_min, model_version,
+                                content_hash, vol_ratio_applied, vol_ratio_source
+                            )
+                            VALUES (
+                                $1, $2, $3, $4,
+                                $5, $6, $7, $8,
+                                $9, $10, $11, $12,
+                                $13, $14, $15,
+                                $16, $17, $18,
+                                $19, $20, $21
+                            )
+                            ON CONFLICT (symbol, forecast_ts, horizon_min)
+                            DO NOTHING
+                            RETURNING horizon_min
+                            """,
+                            r["symbol"], r["session_date"], r["forecast_ts"],
+                            r["horizon_min"], r["target_ts"], r["anchor_spot"],
+                            r["band_low"], r["band_high"], r.get("hold_prob"),
+                            r["sigma"], r.get("call_wall"), r.get("put_wall"),
+                            r.get("gamma_flip"), r.get("net_gex_at_spot"),
+                            r.get("daily_sigma"), r.get("gamma_mult"),
+                            r.get("elapsed_min"), r["model_version"],
+                            r["content_hash"],
+                            r.get("vol_ratio_applied"), r.get("vol_ratio_source"),
+                        )
+                        if got is not None:
+                            inserted += 1
+                    return inserted
+        except Exception as exc:
+            logger.warning(
+                "insert_intraday_cone failed (%s, %s): %s",
+                rows[0].get("symbol"), rows[0].get("forecast_ts"), exc,
+            )
+            return None
+
+    async def get_quote_as_of(
+        self, symbol: str, as_of: datetime, not_before: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """The last ``underlying_quotes`` bar at or before ``as_of``.
+
+        The point-in-time counterpart to ``get_latest_quote``, which takes no
+        timestamp and always returns the newest row in the table.  That is the
+        right answer for "what is it trading at right now" and the WRONG answer
+        for any job that reconstructs a past moment: a backfill run on Sunday
+        got Friday's closing print for every fire of Friday's session, so a
+        cone that re-anchors every 15 minutes never re-anchored at all.
+
+        ``not_before`` bounds the lookback so a session with no bars yields
+        None rather than silently anchoring on a previous day's close — a
+        cone drawn around a stale price is worse than no cone, because it is
+        still graded.
+        """
+        query = """
+            SELECT timestamp, open, high, low, close
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND timestamp <= $2
+              AND timestamp >= $3
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, as_of, not_before)
+            return dict(row) if row else None
+        except Exception as exc:
+            logger.warning(
+                "get_quote_as_of(%s, %s) failed: %s", symbol, as_of, exc,
+            )
+            return None
+
+    async def get_gex_summary_as_of(
+        self, symbol: str, as_of: datetime, not_before: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """The last ``gex_summary`` row at or before ``as_of``.
+
+        Point-in-time counterpart to ``get_latest_gex_summary``.  Same hazard,
+        worse consequence: conditioning a cone on a surface that did not exist
+        when the claim was made is lookahead, and lookahead in the one system
+        whose whole value is honest grading would make every number it
+        publishes worthless.
+
+        Returns the subset the cone conditions on.  ``gamma_flip_point`` is
+        aliased to ``gamma_flip`` to match what the rest of the codebase calls
+        it (see ``get_intraday_level_series``).
+        """
+        query = """
+            SELECT timestamp,
+                   call_wall,
+                   put_wall,
+                   gamma_flip_point AS gamma_flip,
+                   net_gex_at_spot,
+                   total_net_gex,
+                   local_gex
+            FROM gex_summary
+            WHERE underlying = $1
+              AND timestamp <= $2
+              AND timestamp >= $3
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, as_of, not_before)
+            return dict(row) if row else None
+        except Exception as exc:
+            logger.warning(
+                "get_gex_summary_as_of(%s, %s) failed: %s", symbol, as_of, exc,
+            )
+            return None
+
+    async def get_graded_cone_claims_for_tuning(
+        self, sessions: int = 60
+    ) -> List[Dict[str, Any]]:
+        """Graded claims with everything needed to rebuild them offline.
+
+        window_low/window_high are the point: they are what the tape actually
+        reached, so they decide whether any candidate band would have held —
+        which makes parameter changes testable without re-running a backfill.
+        """
+        query = """
+            SELECT symbol, session_date, forecast_ts, horizon_min,
+                   anchor_spot, daily_sigma, elapsed_min, gamma_mult,
+                   call_wall, put_wall, band_low, band_high, sigma,
+                   hold_prob, window_low, window_high, held
+            FROM intraday_forecast
+            WHERE held IS NOT NULL
+              AND window_low IS NOT NULL
+              AND daily_sigma IS NOT NULL
+              AND session_date >= (CURRENT_DATE - ($1 * 2))
+            ORDER BY session_date ASC, forecast_ts ASC, horizon_min ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, sessions)
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_graded_cone_claims_for_tuning failed: %s", exc)
+            return []
+
+    async def get_trailing_realized_vol_ratios(
+        self, symbol: str, before_date: date, limit: int = 10
+    ) -> List[float]:
+        """GRADED realized vol ratios from sessions strictly before ``before_date``.
+
+        Each value is one past session's actual high-low range as a multiple
+        of a normal day's range, written by the 16:05 receipt. Their median is
+        the vol-persistence anchor the daily model calls "the dominant driver"
+        — where realized vol has actually been sitting, rather than where a
+        model predicted it would sit.
+
+        Note ``before_date`` is EXCLUSIVE and not optional. The obvious
+        alternative, reusing ``get_daily_forecast_history``, takes no date
+        bound and returns the newest rows in the table — which during a
+        backfill are sessions AFTER the one being reconstructed. That is the
+        same lookahead that made the first backfill worthless, arriving by a
+        different door.
+
+        Returned oldest-first so the caller can hand them straight to
+        ``robust_persistence_anchor``, which reads the tail as most recent.
+        """
+        query = """
+            SELECT date, realized_vol_ratio
+            FROM daily_forecast
+            WHERE symbol = $1
+              AND date < $2
+              AND realized_vol_ratio IS NOT NULL
+              AND receipt_ts IS NOT NULL
+            ORDER BY date DESC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, before_date, limit)
+        except Exception as exc:
+            logger.warning(
+                "get_trailing_realized_vol_ratios(%s, before %s) failed: %s",
+                symbol, before_date, exc,
+            )
+            return []
+        out: List[float] = []
+        for r in reversed(rows):          # DESC -> oldest-first
+            try:
+                v = float(r["realized_vol_ratio"])
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                out.append(v)
+        return out
+
+    async def get_matured_ungraded_cones(
+        self, now: datetime, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """Claims whose horizon has elapsed but which carry no verdict yet.
+
+        Served by the partial index on ``target_ts WHERE graded_at IS NULL``,
+        so the grader's poll stays cheap however much history accumulates.
+        Oldest first, so a backlog drains in the order the claims were made.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, session_date, forecast_ts, horizon_min,
+                           target_ts, anchor_spot, band_low, band_high,
+                           hold_prob
+                    FROM intraday_forecast
+                    WHERE graded_at IS NULL AND target_ts <= $1
+                    ORDER BY target_ts ASC
+                    LIMIT $2
+                    """,
+                    now, limit,
+                )
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_matured_ungraded_cones failed: %s", exc)
+            return []
+
+    async def get_bar_extremes_between(
+        self, symbol: str, start_ts: datetime, end_ts: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """Low/high over the OPEN interval ``(start_ts, end_ts]``.
+
+        The exclusive left bound matters: the anchor bar is the bar the cone
+        was drawn from, spot sits inside its own band by construction, and
+        including it could only ever flatter the verdict.  Returns None when
+        no bar exists in the window so the grader withholds a verdict rather
+        than inventing a degenerate one from a gap in the tape.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT MIN(low) AS window_low,
+                           MAX(high) AS window_high,
+                           COUNT(*)  AS bars
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                      AND timestamp > $2
+                      AND timestamp <= $3
+                      AND low IS NOT NULL
+                      AND high IS NOT NULL
+                    """,
+                    symbol, start_ts, end_ts,
+                )
+            if row is None or not row["bars"]:
+                return None
+            return dict(row)
+        except Exception as exc:
+            logger.warning(
+                "get_bar_extremes_between(%s, %s, %s) failed: %s",
+                symbol, start_ts, end_ts, exc,
+            )
+            return None
+
+    async def update_intraday_cone_receipt(
+        self,
+        *,
+        symbol: str,
+        forecast_ts: datetime,
+        horizon_min: int,
+        graded_at: datetime,
+        window_low: Optional[float],
+        window_high: Optional[float],
+        held: Optional[bool],
+        brier: Optional[float],
+    ) -> bool:
+        """Write one verdict.  Write-once, enforced by the trigger.
+
+        The ``graded_at IS NULL`` guard makes a double-run a no-op at the
+        query level rather than an exception from the trigger, so a grader
+        re-run over an already-drained backlog is quiet instead of noisy.
+
+        ``held=None`` with ``graded_at`` set is the ABANDONED state — a claim
+        whose window never produced bars.  It is deliberately distinct from
+        both pending and graded: the reliability query requires
+        ``held IS NOT NULL``, so an abandoned claim leaves the scoreboard
+        without being deleted and without being counted as a win.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE intraday_forecast
+                       SET graded_at = $4,
+                           window_low = $5,
+                           window_high = $6,
+                           held = $7,
+                           brier = $8
+                     WHERE symbol = $1
+                       AND forecast_ts = $2
+                       AND horizon_min = $3
+                       AND graded_at IS NULL
+                    RETURNING horizon_min
+                    """,
+                    symbol, forecast_ts, horizon_min, graded_at,
+                    window_low, window_high, held, brier,
+                )
+            return row is not None
+        except Exception as exc:
+            logger.warning(
+                "update_intraday_cone_receipt failed (%s, %s, +%sm): %s",
+                symbol, forecast_ts, horizon_min, exc,
+            )
+            return False
+
+    async def get_intraday_cones_for_session(
+        self, symbol: str, session_date: date
+    ) -> List[Dict[str, Any]]:
+        """Every cone fired on one session, chronological.
+
+        This is what the chart draws: a session's worth of re-anchored bands,
+        each already carrying its verdict once the horizon matured.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, session_date, forecast_ts, horizon_min,
+                           target_ts, anchor_spot, band_low, band_high,
+                           hold_prob, sigma, call_wall, put_wall, gamma_flip,
+                           net_gex_at_spot, gamma_mult, elapsed_min,
+                           vol_ratio_applied, vol_ratio_source,
+                           model_version, graded_at, window_low, window_high,
+                           held, brier
+                    FROM intraday_forecast
+                    WHERE symbol = $1 AND session_date = $2
+                    ORDER BY forecast_ts ASC, horizon_min ASC
+                    """,
+                    symbol, session_date,
+                )
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_intraday_cones_for_session(%s, %s) failed: %s",
+                symbol, session_date, exc,
+            )
+            return []
+
+    async def get_graded_cone_history(
+        self, symbol: str, since: date, horizon_min: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Graded claims since ``since`` — the reliability table's input.
+
+        Returns only what the receipt needs (the committed probability, the
+        outcome, the horizon and the session) rather than whole rows, because
+        a 30-session window across four horizons is ~2,400 rows per symbol and
+        the page recomputes the table on every request.
+        """
+        try:
+            params: List[Any] = [symbol, since]
+            clause = ""
+            if horizon_min is not None:
+                params.append(horizon_min)
+                clause = " AND horizon_min = $3"
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT session_date, forecast_ts, horizon_min,
+                           hold_prob, held, brier
+                    FROM intraday_forecast
+                    WHERE symbol = $1
+                      AND session_date >= $2
+                      AND graded_at IS NOT NULL
+                      AND hold_prob IS NOT NULL
+                      AND held IS NOT NULL{clause}
+                    ORDER BY session_date ASC, forecast_ts ASC
+                    """,
+                    *params,
+                )
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_graded_cone_history(%s, %s) failed: %s", symbol, since, exc,
             )
             return []
 

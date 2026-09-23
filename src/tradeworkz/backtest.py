@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -611,6 +612,98 @@ def _load_backtest_bots(conn: Any, bot_ids: Optional[List[str]]) -> List[BotSpec
     return specs
 
 
+# Coverage window over ``option_chains_archive``, via a loose index scan.
+#
+# A plain ``SELECT MIN(timestamp), MAX(timestamp) FROM option_chains_archive``
+# SEQ-SCANS the whole archive, because no index has ``timestamp`` as its
+# leading column: the primary key is ``(option_symbol, timestamp)`` and the
+# only other index is ``(underlying, timestamp)``. Postgres can only shortcut
+# an unqualified min/max to an index endpoint when the target column leads.
+# The archive is retention-EXEMPT and grows forever, so that scan gets slower
+# every night until it exceeds ``statement_timeout`` and blocks every screen —
+# which is what it did on 2026-09-14 at the 90s limit.
+#
+# Adding ``option_chains_archive(timestamp)`` would fix the plan, but
+# docs/runbooks/option_chains_indexing.md is a record of this family of tables
+# carrying 3.5-21 GB indexes that were dropped for exactly that cost, and this
+# query runs once per research screen. So instead: walk the DISTINCT
+# underlyings off the leading column of the index that already exists (each
+# step an index seek), then take each one's endpoints with an equality
+# predicate the composite index serves perfectly. Cost is O(symbols x log n)
+# rather than O(rows), with no new index and no dependency on the ``symbols``
+# registry being a superset of what was archived.
+_ARCHIVE_WINDOW_SQL = """
+WITH RECURSIVE syms AS (
+    SELECT (SELECT MIN(underlying) FROM option_chains_archive) AS underlying
+    UNION ALL
+    SELECT (SELECT MIN(a.underlying)
+              FROM option_chains_archive a
+             WHERE a.underlying > s.underlying)
+      FROM syms s
+     WHERE s.underlying IS NOT NULL
+)
+SELECT MIN(lo), MAX(hi) FROM (
+    SELECT (SELECT MIN(a.timestamp) FROM option_chains_archive a
+             WHERE a.underlying = s.underlying) AS lo,
+           (SELECT MAX(a.timestamp) FROM option_chains_archive a
+             WHERE a.underlying = s.underlying) AS hi
+      FROM syms s
+     WHERE s.underlying IS NOT NULL
+) t
+"""
+
+#: Ceiling for the archive coverage probe. Bounded so a bad plan on some
+#: deployment degrades the window instead of killing the run: the clamp is an
+#: optimisation, not a correctness requirement.
+_ARCHIVE_WINDOW_TIMEOUT_MS = 10_000
+
+
+def _archive_chain_window(
+    conn: Any,
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Archive coverage endpoints, or ``(None, None)`` if it can't be had cheaply.
+
+    Isolated in a SAVEPOINT with its own statement timeout. Two hazards this
+    shape exists to avoid:
+
+    * a timed-out statement poisons the surrounding transaction — the same
+      hazard :func:`_archive_available` avoids — so a failure must roll back
+      cleanly and let the caller fall back to the hot window;
+    * ``SET LOCAL`` is reverted by a savepoint ROLLBACK but **survives a
+      RELEASE** to the end of the transaction. Releasing on the happy path
+      would therefore leave the 10-second ceiling in force over the whole
+      replay and kill its legitimately slow reads. So the savepoint is ALWAYS
+      rolled back: the probe is read-only, and the value it read is already
+      in Python by then, so rolling back costs nothing.
+    """
+    cur = conn.cursor()
+    row = None
+    try:
+        cur.execute("SAVEPOINT tw_bt_archive_window")
+    except Exception:  # pragma: no cover - no transaction to savepoint in
+        return (None, None)
+    try:
+        cur.execute(f"SET LOCAL statement_timeout = {_ARCHIVE_WINDOW_TIMEOUT_MS}")
+        cur.execute(_ARCHIVE_WINDOW_SQL)
+        row = cur.fetchone()
+    except Exception:
+        logger.warning(
+            "tradeworkz backtest: archive coverage probe failed; clamping the "
+            "replay window to option_chains only. Screens will not reach past "
+            "live retention until this is resolved.",
+            exc_info=True,
+        )
+        row = None
+    finally:
+        # Unconditional: discards the statement_timeout override on both paths.
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT tw_bt_archive_window")
+            cur.execute("RELEASE SAVEPOINT tw_bt_archive_window")
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return (row[0], row[1]) if row else (None, None)
+
+
 def _chain_window(conn: Any) -> Tuple[Optional[datetime], Optional[datetime]]:
     """Quotable coverage window: hot ∪ archive option-chain timestamps.
 
@@ -627,9 +720,7 @@ def _chain_window(conn: Any) -> Tuple[Optional[datetime], Optional[datetime]]:
     row = cur.fetchone()
     lo, hi = (row[0], row[1]) if row else (None, None)
     if _archive_available(conn):
-        cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM option_chains_archive")
-        arow = cur.fetchone()
-        alo, ahi = (arow[0], arow[1]) if arow else (None, None)
+        alo, ahi = _archive_chain_window(conn)
         if alo is not None:
             lo = alo if lo is None else min(lo, alo)
         if ahi is not None:
@@ -832,6 +923,17 @@ def summarize_bot(runner: _BotRunner, split_at: Optional[datetime] = None) -> Di
         "avg_hold_min": round(sum(t.hold_minutes for t in trades) / n, 1) if n else 0.0,
         "bias_vetoed": runner.vetoed,
         "no_quote_opens": runner.no_quote_opens,
+        # Why each round-trip closed, most frequent first. Without this a
+        # short-hold screen is undiagnosable: a 1-trade run with a 5-minute
+        # hold could be a target, a stop, or the premium stop firing on the
+        # entry bid/ask gap, and the aggregate numbers cannot tell you which.
+        "exit_reasons": dict(
+            sorted(
+                Counter(t.reason for t in trades).items(),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+        ),
         # Signals that cleared open_criteria, and where any that did not become
         # positions were rejected at the entry-viability gate. A large
         # ``signals`` with 0 trades and non-empty ``entry_rejects`` means the
@@ -951,6 +1053,19 @@ def format_report(result: Dict[str, Any]) -> str:
                 f"test {te['n_trades']}t/{te['expectancy']:+.0f}$ | "
                 f"{'ROBUST' if split['robust'] else 'not robust'}"
             )
+        # Exit-reason mix. On a thin or short-hold screen this is the line
+        # that says WHY, so the reader is not left inferring it from
+        # aggregates — e.g. 'premium_stop' dominating with a hold close to the
+        # replay interval means the stop is firing on the entry spread rather
+        # than on an adverse move.
+        exits = b.get("exit_reasons") or {}
+        if exits:
+            mix = ", ".join(f"{reason} {count}" for reason, count in exits.items())
+            lines.append(f"{'  └ exits':<26}{'':>40}  {mix}")
+        misses = b.get("miss_reasons") or {}
+        if misses and b.get("n_trades", 0) < _MIN_TRADES_FOR_VERDICT:
+            top = ", ".join(f"{r} {c}" for r, c in list(misses.items())[:4])
+            lines.append(f"{'  └ gates':<26}{'':>40}  {top}")
     f = result.get("fleet", {})
     lines.append("-" * 92)
     lines.append(

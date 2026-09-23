@@ -65,6 +65,18 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+# The gamma-flip proxy below is gated with the SAME constants the canonical
+# spot-shift resolver uses, so the two paths reject the same noise-floor
+# crossings.  src.config is stdlib + dotenv only, so this keeps walls.py free
+# of heavy imports on the API request path.
+from src.config import (
+    GAMMA_PROFILE_INTERIOR_MARGIN,
+    GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT,
+    GAMMA_PROFILE_STRUCTURAL_MIN_FRAC,
+    GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
+    GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
+)
+
 # ── Wall-ladder depth ───────────────────────────────────────────────────────
 # How many ranked walls per side the API computes by default (C1..C3 /
 # P1..P3) and the hard ceiling a caller may ask for.  The ceiling exists
@@ -300,6 +312,27 @@ def align_wall_ladder(
     return out
 
 
+def _percentile_linear(values: List[float], percentile: float) -> float:
+    """``numpy.percentile(values, percentile)`` with the default linear
+    interpolation, in pure Python.
+
+    :func:`compute_gamma_flip_from_strikes` needs the same p90 reference the
+    canonical resolver builds with numpy, but ``walls.py`` is deliberately
+    stdlib-only (it is imported by the API layer on every
+    strike-profile-timeseries request).  Reimplementing the one statistic
+    keeps that property and keeps the two floors numerically identical.
+    """
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    idx = (len(ordered) - 1) * (percentile / 100.0)
+    lo = int(idx)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (idx - lo) * (ordered[hi] - ordered[lo])
+
+
 def compute_gamma_flip_from_strikes(
     gex_by_strike: Iterable[Mapping[str, Any]],
     spot_price: float,
@@ -324,15 +357,56 @@ def compute_gamma_flip_from_strikes(
     scale-invariant — passing raw summed gamma yields the same answer as
     passing dollar GEX.
 
+    **Gated like the canonical resolver.**  A raw nearest-crossing scan is
+    not safe on this curve.  The cumulative starts at ~0 on the lowest
+    strike and ends at the book's TOTAL net gamma, so when that total is
+    negative — the ordinary state of an afternoon 0DTE book — the curve
+    leaves zero through the put mass and never returns.  The only sign
+    changes left are in the deep-OTM tail, where ``γ × OI`` has decayed to
+    denormal-small values and the running total wobbles across zero at the
+    1e-45 level.  Scanning for the crossing nearest spot then reports the
+    TOP EDGE OF THAT NOISE BAND as the flip: a line drawn tens of dollars
+    below the entire gamma cluster, which is the same "flip walked off the
+    bottom of the chart" pathology
+    :meth:`~src.analytics.main_engine.AnalyticsEngine._find_structural_interior_crossing`
+    exists to prevent on the canonical path.
+
+    So this applies that method's three gates, against the same config
+    constants, translated onto the cumulative curve:
+
+      * **Interior** — the candidate sits inside the strike range by
+        ``GAMMA_PROFILE_INTERIOR_MARGIN`` of its width; edge crossings are
+        the tail by construction.
+      * **Structural** — ``|cumulative|`` peaks at no less than
+        ``GAMMA_PROFILE_STRUCTURAL_MIN_FRAC × p90(|cumulative|)`` somewhere in
+        a window around the candidate.  A genuine crossing is a curve that
+        travels — it dives through real put gamma and climbs back through
+        real call gamma, so it is large on at least one side.  A noise
+        crossing is flat near zero on both.  The window is
+        ``GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT`` of the candidate but never
+        narrower than the two strikes bracketing it: a strike ladder is far
+        coarser than the canonical price grid, and a fixed 1% window can
+        otherwise contain no strike at all.
+      * **Actionable distance** — within
+        ``GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT`` of ``spot_price``.
+
+    With several qualifying crossings on a lumpy book, keep the one nearest
+    spot (the actionable level / established tie-break, matching the
+    canonical resolver).
+
     :param gex_by_strike: rows with at least ``strike``, ``call_gamma``,
         ``put_gamma``.  Rows may be per-(strike, expiration) — they're
         aggregated by strike first, same as :func:`compute_call_put_walls`.
         Filter to the desired expiration grouping on the caller side.
-    :param spot_price: current underlying price; used only as the
-        nearest-crossing tie-break when the cumulative curve crosses zero
-        more than once (a lumpy book), matching the canonical resolver.
+    :param spot_price: current underlying price; used for the
+        actionable-distance gate and as the nearest-crossing tie-break when
+        the cumulative curve crosses zero more than once (a lumpy book).
     :returns: the flip price, or ``None`` when the curve is one-signed
-        across the whole chain (no crossing) or the inputs are unusable.
+        across the whole chain, when no crossing clears the gates, or when
+        the inputs are unusable.  ``None`` means *unresolved* — callers draw
+        no flip line rather than substituting a differently-scoped level
+        (a whole-chain flip over subset bars is the contradiction
+        ``core/gammaRegime`` documents on the web side).
     """
     if spot_price is None or spot_price <= 0:
         return None
@@ -354,34 +428,67 @@ def compute_gamma_flip_from_strikes(
 
     # Build the ascending cumulative curve [(strike, running_net_gamma), …].
     cumulative = 0.0
-    curve: list[Tuple[float, float]] = []
+    curve: List[Tuple[float, float]] = []
     for strike in sorted(agg.keys()):
         cumulative += agg[strike]
         curve.append((strike, cumulative))
 
+    # ── Gate inputs ────────────────────────────────────────────────────────
+    lo_strike, hi_strike = curve[0][0], curve[-1][0]
+    width = hi_strike - lo_strike
+    if width <= 0:
+        return None
+    interior_lo = lo_strike + GAMMA_PROFILE_INTERIOR_MARGIN * width
+    interior_hi = hi_strike - GAMMA_PROFILE_INTERIOR_MARGIN * width
+
+    abs_curve = [abs(value) for _, value in curve]
+    if max(abs_curve) <= 0.0:
+        # Identically-zero curve: no basis for the structural test.
+        return None
+    reference = _percentile_linear(
+        abs_curve, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE
+    )
+    if reference <= 0.0:
+        reference = max(abs_curve)
+    floor_abs = GAMMA_PROFILE_STRUCTURAL_MIN_FRAC * reference
+
     best_flip: Optional[float] = None
     best_dist = float("inf")
 
-    def _consider(candidate: float) -> None:
+    def _consider(candidate: float, bracket_gap: float) -> None:
         nonlocal best_flip, best_dist
+        if candidate < interior_lo or candidate > interior_hi:
+            return
+        if abs(candidate - spot_price) / spot_price > GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT:
+            return
+        half = max(GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT * candidate, bracket_gap)
+        window_peak = 0.0
+        for strike, value in curve:
+            if candidate - half <= strike <= candidate + half:
+                magnitude = abs(value)
+                if magnitude > window_peak:
+                    window_peak = magnitude
+        if window_peak < floor_abs:
+            return
         dist = abs(candidate - spot_price)
         if dist < best_dist:
             best_dist = dist
             best_flip = candidate
 
     # Same crossing scan the canonical resolver uses: exact zeros count, and
-    # a sign change between adjacent points is linearly interpolated.  With
-    # multiple crossings keep the one nearest spot.
+    # a sign change between adjacent points is linearly interpolated.  Every
+    # candidate goes through the gates above; with several survivors keep the
+    # one nearest spot.
     for i in range(len(curve) - 1):
         s1, c1 = curve[i]
         s2, c2 = curve[i + 1]
         if c1 == 0.0:
-            _consider(s1)
+            _consider(s1, s2 - s1)
         elif c1 * c2 < 0.0:
-            _consider(s1 + (s2 - s1) * (-c1) / (c2 - c1))
+            _consider(s1 + (s2 - s1) * (-c1) / (c2 - c1), s2 - s1)
     last_s, last_c = curve[-1]
     if last_c == 0.0:
-        _consider(last_s)
+        _consider(last_s, last_s - curve[-2][0])
 
     return best_flip
 

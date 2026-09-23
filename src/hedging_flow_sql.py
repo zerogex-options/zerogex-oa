@@ -224,7 +224,140 @@ def _render_psycopg2(template: str) -> str:
 # asyncpg form: the live read path in get_hedging_flow_series.
 HEDGING_FLOW_CTE_ASYNCPG = _render_asyncpg(_HEDGING_FLOW_CTE_TEMPLATE)
 
-# psycopg2 form: no call site yet. Rendered here rather than at the point a
-# snapshot writer is added, so that writer inherits this text instead of
-# transcribing it -- the drift the flow-series module exists to prevent.
+# psycopg2 form: the Analytics Engine snapshot write and the backfill tool.
+# Rendered from the same template as the asyncpg form rather than transcribed,
+# which is the drift the flow-series module exists to prevent.
 HEDGING_FLOW_CTE_PSYCOPG2 = _render_psycopg2(_HEDGING_FLOW_CTE_TEMPLATE)
+
+
+# ---------------------------------------------------------------------------
+# hedging_flow_5min snapshot
+# ---------------------------------------------------------------------------
+#
+# Why a snapshot at all, when the live CTE is cheap
+# -------------------------------------------------
+# Not for speed. ``flow_contract_facts`` is in ``DB_MAINTAIN_TABLES``, so
+# ``make db-prune`` deletes it at ``DATA_RETENTION_DAYS`` (90). Recomputing a
+# past session from it therefore answers for a quarter and then returns an
+# empty session -- indistinguishable, to a reader, from a genuinely quiet day.
+# The snapshot exists so a session survives its source data, which is the same
+# reason ``gex_summary`` and ``underlying_quotes`` were made retention-exempt
+# in 2026-08 for the TradeWorkz screen.
+#
+# It is also tiny: 78 bars per symbol per session, two scopes, which is
+# smaller than either of those two tables at ~1 row/min/symbol.
+#
+# Why the rows can be written once and trusted
+# --------------------------------------------
+# The correctness argument is the one already made at the top of this module
+# and it is not re-derived here: the outer window is ROWS UNBOUNDED PRECEDING
+# ORDER BY bar_start, so a closed bar's cumulative values do not move when
+# ``:session_end`` extends. That is what makes an UPSERT-per-cycle converge
+# rather than churn, and it is why the IS DISTINCT FROM guard below suppresses
+# essentially every write after a bar closes.
+#
+# Scope, and why it is a column rather than a filter
+# --------------------------------------------------
+# The live CTE takes arbitrary ``strikes``/``expirations`` arrays, and a
+# snapshot cannot pre-compute an arbitrary filter -- which is why
+# ``flow_series_5min`` supersedes only the UNFILTERED read and leaves filtered
+# reads on the CTE. The Hedging Flow page, though, offers exactly one filter:
+# a 0DTE toggle that resolves to the session's own date. That is a closed set
+# of two, so both are materialised and the toggle picks a scope instead of
+# re-running a pipeline whose inputs have been pruned. Any OTHER filter still
+# falls through to the CTE and is still bounded by the prune window, exactly
+# as on the flow series.
+#
+# A session that was not an expiry simply has no ``0dte`` rows, which is the
+# same honest "no 0DTE contracts traded this session" the live page reports
+# rather than a fabricated flat line.
+
+#: The two materialised expiration scopes. ``all`` is the unfiltered series;
+#: ``0dte`` is the session's own date passed as the expirations filter.
+SCOPE_ALL = "all"
+SCOPE_0DTE = "0dte"
+HEDGING_FLOW_SCOPES = (SCOPE_ALL, SCOPE_0DTE)
+
+_COLS_CSV = ",\n    ".join(HEDGING_FLOW_COLUMNS)
+
+#: Snapshot read (asyncpg). Same columns, same order, same window resolution
+#: as the CTE path, so a dated read and a live read decode identically.
+HEDGING_FLOW_SNAPSHOT_SELECT_ASYNCPG = f"""
+    SELECT
+    {_COLS_CSV}
+    FROM hedging_flow_5min
+    WHERE symbol = $1
+      AND scope = $2
+      AND bar_start >= $3
+      AND bar_start <= $4
+    ORDER BY bar_start DESC
+"""
+
+_UPSERT_SET = ",\n        ".join(
+    f"{c} = EXCLUDED.{c}" for c in HEDGING_FLOW_COLUMNS if c != "bar_start"
+)
+_UPSERT_DISTINCT = "\n        OR ".join(
+    f"EXCLUDED.{c} IS DISTINCT FROM hedging_flow_5min.{c}"
+    for c in HEDGING_FLOW_COLUMNS
+    if c != "bar_start"
+)
+
+#: Snapshot UPSERT (psycopg2). Runs the canonical CTE as a subquery and
+#: prefixes the symbol and scope so the inserted columns line up. The
+#: IS DISTINCT FROM guard suppresses no-op writes, so re-running a cycle over
+#: closed bars costs a read and no write at all.
+#:
+#: Unlike the flow series this has no separate incremental form. That one
+#: exists because its CTE walks ``flow_by_contract`` with LAG-and-recumulate
+#: over the whole session (~30s/cycle measured); this pipeline reads
+#: ``flow_contract_facts``, whose values are already per-bucket deltas, so the
+#: full-session form is the cheap one and a second query shape would be
+#: maintenance for no gain.
+HEDGING_FLOW_SNAPSHOT_UPSERT_PSYCOPG2 = f"""
+INSERT INTO hedging_flow_5min (
+    symbol,
+    scope,
+    {_COLS_CSV}
+)
+SELECT %(symbol)s, %(scope)s, s.*
+FROM (
+{HEDGING_FLOW_CTE_PSYCOPG2}
+) s
+ON CONFLICT (symbol, scope, bar_start) DO UPDATE SET
+        {_UPSERT_SET},
+        updated_at = NOW()
+WHERE
+        {_UPSERT_DISTINCT}
+"""
+
+#: Trading days that have snapshot rows, newest first, with enough of a
+#: summary for a session card to say something about the day rather than only
+#: name it. ``had_0dte`` is read off the presence of ``0dte`` rows, which is
+#: exactly what the toggle needs to know before it is offered.
+HEDGING_FLOW_SESSIONS_ASYNCPG = """
+    WITH days AS (
+        SELECT
+            (bar_start AT TIME ZONE 'America/New_York')::date AS session_date,
+            scope,
+            bar_start,
+            cum_net_usd,
+            is_synthetic
+        FROM hedging_flow_5min
+        WHERE symbol = $1
+    )
+    SELECT
+        session_date,
+        COUNT(*) FILTER (WHERE scope = 'all')::int AS bar_count,
+        COUNT(*) FILTER (WHERE scope = 'all' AND NOT is_synthetic)::int AS real_bar_count,
+        BOOL_OR(scope = '0dte') AS had_0dte,
+        -- The session's closing lean: the last 'all' bar's running total.
+        (ARRAY_AGG(cum_net_usd ORDER BY bar_start DESC)
+            FILTER (WHERE scope = 'all'))[1] AS cum_net_usd,
+        MIN(bar_start) FILTER (WHERE scope = 'all') AS first_bar,
+        MAX(bar_start) FILTER (WHERE scope = 'all') AS last_bar
+    FROM days
+    GROUP BY session_date
+    HAVING COUNT(*) FILTER (WHERE scope = 'all') > 0
+    ORDER BY session_date DESC
+    LIMIT $2
+"""

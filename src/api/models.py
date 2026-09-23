@@ -333,6 +333,13 @@ class UnderlyingQuote(BaseModel):
     # card, and the candlestick chart read the futures fields.
     #   display_source: 'futures' when the future should be shown, else None.
     #   data_symbol:    the future's UI ticker (e.g. 'ES'), else None.
+    #   data_contract:  the CME contract that ticker resolves to right now
+    #       (e.g. 'ESZ26'), else None. The ticker alone is ambiguous across a
+    #       quarterly roll — two platforms showing "ES" can be on different
+    #       contracts, a quarter of carry apart — so this names the one being
+    #       shown. DISPLAY-only, derived from the roll calendar
+    #       (futures_projection.active_contract_code); never a data key.
+    #   data_contract_expiry: that contract's expiry, for the same reason.
     #   futures_close:  the future's last price (the number those surfaces show).
     #   futures_reference_close: the future's price at the 16:00 ET cash close
     #       — the baseline for the overnight change, measured futures-vs-futures
@@ -340,6 +347,8 @@ class UnderlyingQuote(BaseModel):
     #       basis.
     display_source: Optional[str] = None
     data_symbol: Optional[str] = None
+    data_contract: Optional[str] = None
+    data_contract_expiry: Optional[date] = None
     futures_close: Optional[Decimal] = None
     futures_reference_close: Optional[Decimal] = None
     # FEED freshness, for the natively-served futures quote (ES / NQ).
@@ -524,6 +533,39 @@ class HedgingFlowResponse(BaseModel):
     flips: List[HedgingFlowFlip]
 
 
+class HedgingFlowSession(BaseModel):
+    """One trading day that has stored hedging-flow bars.
+
+    A session CARD, not a date entry -- which is the difference between a
+    list of days that have data and a picker that invites a reader to land
+    on an empty one. ``bar_count`` grades how complete the day is (a full
+    regular session is 82 bars on the 5-minute grid) and ``real_bar_count``
+    excludes carry-forward bars, so "thin" is distinguishable from "short".
+    ``cum_net_usd`` is the session's closing lean, which is what lets a card
+    say something about the day rather than only name it.
+
+    ``had_0dte`` reports whether the 0DTE scope was materialised at all, so
+    the toggle is offered on that basis instead of being offered always and
+    resolving to nothing on a day that was not an expiry.
+    """
+
+    date: date
+    bar_count: int
+    real_bar_count: int
+    had_0dte: bool
+    cum_net_usd: Optional[float] = None
+    first_bar: Optional[datetime] = None
+    last_bar: Optional[datetime] = None
+
+
+class HedgingFlowSessionList(BaseModel):
+    """The index behind the dated Hedging Flow permalinks, newest first."""
+
+    symbol: str
+    count: int
+    sessions: List[HedgingFlowSession]
+
+
 class GammaRegimeBar(BaseModel):
     """One 5-minute bar of the intraday Gamma Shift read.
 
@@ -560,6 +602,39 @@ class GammaRegimeBar(BaseModel):
     expired_expirations: List[str] = []
     rolling_bars: Optional[int] = None
 
+    # Spot-to-flip cushion. Derived on read from the stored flip and spot, so
+    # a retuned threshold reclassifies history rather than leaving old bars
+    # labelled by whatever rule happened to be live that day.
+    gamma_flip: Optional[float] = None
+    #: Signed: positive means spot sits above the flip.
+    flip_distance_pts: Optional[float] = None
+    flip_distance_frac: Optional[float] = None
+    #: Unsigned room before crossing, which is what widening/narrowing track.
+    cushion_pts: Optional[float] = None
+    cushion_side: Optional[str] = None
+    #: Change in cushion: this bar, and over the rolling window. Negative is
+    #: narrowing. Null where there is no history, or either end had no flip.
+    cushion_step_pts: Optional[float] = None
+    cushion_rate_pts: Optional[float] = None
+    #: Only meaningful while narrowing; null otherwise, since "not
+    #: accelerating" and "not narrowing at all" are different statements.
+    cushion_accelerating: Optional[bool] = None
+    #: SECURE / THIN / CROSSING / NO_FLIP. Classified on the FRACTION, never
+    #: on points, so the label means the same thing on SPX and SPY.
+    cushion_state: Optional[str] = None
+    #: Cushion as a multiple of a typical 30-minute realized move, which is
+    #: the yardstick the state is classified against.
+    cushion_move_ratio: Optional[float] = None
+    #: Which yardstick produced the state: `move_30m`, or `spot_fraction` for
+    #: bars stored before the move scale existed. The two are not comparable.
+    cushion_basis: Optional[str] = None
+    #: STABLE / DRIFTING / CONTRACTING / ACCELERATING. Separate from the state
+    #: because thin-but-stable and thin-and-collapsing are different things.
+    cushion_rate_context: Optional[str] = None
+    typical_move_30m: Optional[float] = None
+    #: The one-line read, in the shape the Phase 1 spec asks for.
+    cushion_summary: Optional[str] = None
+
 
 class GammaRegimeSeriesResponse(BaseModel):
     """Intraday dealer-gamma structure across a session.
@@ -573,6 +648,132 @@ class GammaRegimeSeriesResponse(BaseModel):
     session: str
     rolling_bars: Optional[int] = None
     bars: List[GammaRegimeBar]
+
+
+class GammaWeatherResponse(BaseModel):
+    """One combined current-state read from the pieces already on the page.
+
+    A market-health classification. Not a directional signal, an entry or
+    exit, or a recommendation, and it inherits the estimated-not-observed
+    caveat from the hedging flow it reads.
+
+    ``components`` is returned alongside the verdict deliberately: a panel
+    that shows only a conclusion cannot be checked against the charts sitting
+    directly underneath it.
+    """
+
+    symbol: str
+    session: str
+    bar_start: Optional[str] = None
+    state: str
+    label: str
+    sentence: str
+    #: BUYING / SELLING / MIXED.
+    pressure: str
+    #: PINNING / ACCELERATIVE / FLAT, from the rolling stability.
+    structure: str
+    #: The same classification applied to since-open stability. The spec calls
+    #: it background health: structure is now, this is where the session has
+    #: migrated to.
+    gamma_trend: str
+    #: SUPPORTIVE / CAPPING.
+    lean_side: Optional[str] = None
+    #: TRANSITION_RISK / NARROWING / WIDENING / STEADY / NONE. A modifier on
+    #: the state, never a competing state.
+    cushion: str
+    #: PULSE / BUILDING / PERSISTENT. How settled the pressure direction is:
+    #: one bar is the first evidence, three is a condition.
+    persistence: str = "PULSE"
+    #: How long the current state has held. NEW / ESTABLISHED / CONFIRMED /
+    #: MATURE, with the raw bars and minutes alongside. Duration is the point:
+    #: the question is not whether gamma calls direction, but whether a
+    #: condition that exists is healthy enough to persist.
+    #:
+    #: The two ladders deliberately share no words. They used to both run
+    #: DEVELOPING -> ESTABLISHED, which left "established" ambiguous in a
+    #: payload that carries both fields at once.
+    age_bars: int = 0
+    age_minutes: Optional[float] = None
+    age: Optional[str] = None
+    #: Display wording for both ladders, emitted beside the codes exactly as
+    #: ``label`` is emitted beside ``state``, so a client never keeps its own
+    #: copy of the mapping.
+    persistence_label: str = "Pulse"
+    age_label: Optional[str] = None
+    #: The state this bar would read without confirmation, when it differs
+    #: from the one holding the header, plus how many bars it has held. The
+    #: header waits for a new state to repeat; this is the early read that
+    #: waiting would otherwise hide.
+    pending_state: Optional[str] = None
+    pending_label: Optional[str] = None
+    pending_bars: int = 0
+    #: Bars a new state must repeat before it takes the header, so a client
+    #: can render "1 of 2" without hard-coding the rule.
+    confirm_bars: int = 2
+    cushion_summary: Optional[str] = None
+    components: dict = {}
+    basis: str
+    disclosure: str
+
+
+class GammaWeatherBar(BaseModel):
+    """One bar of the session's Gamma Weather, as the panel read it at the time."""
+
+    bar_start: str
+    state: str
+    label: str
+    sentence: str
+    pressure: str
+    structure: str
+    gamma_trend: str
+    lean_side: Optional[str] = None
+    cushion: str
+    cushion_band: Optional[str] = None
+    persistence: str
+    persistence_label: str
+    age_bars: int
+    age_minutes: Optional[float] = None
+    age: Optional[str] = None
+    age_label: Optional[str] = None
+    pending_state: Optional[str] = None
+    pending_label: Optional[str] = None
+    pending_bars: int = 0
+
+
+class GammaWeatherChange(BaseModel):
+    """A moment the panel said something new.
+
+    ``field`` is which header field the line belongs under, so an open drawer
+    shows only its own story. ``opening`` marks the session's first read of a
+    field rather than a change to it.
+    """
+
+    bar_start: str
+    field: str
+    kind: str
+    text: str
+    opening: bool = False
+
+
+class GammaWeatherSeriesResponse(BaseModel):
+    """The session's Weather history, plus only the moments worth commenting on.
+
+    The current-state endpoint answers "what is it now". This answers "what
+    happened while I was away", which a header cannot: words capture one slice
+    of time and the question is about a pattern.
+
+    ``changes`` is deliberately not one entry per bar. A quiet stretch produces
+    nothing, so a session that sits in one state all afternoon yields one line
+    rather than fifty identical ones.
+    """
+
+    symbol: str
+    session: str
+    bars: List[GammaWeatherBar]
+    changes: List[GammaWeatherChange]
+    confirm_bars: int
+    basis: str
+    disclosure: str
 
 
 class MarketTideComponent(BaseModel):

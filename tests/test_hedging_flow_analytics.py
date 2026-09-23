@@ -184,12 +184,26 @@ def test_flat_bar_between_signs_flips_once_not_twice():
     assert events[0].direction == "to_selling"
 
 
-def test_tiny_flip_on_a_dead_tape_is_reported_but_not_significant():
+def test_sub_floor_tape_produces_no_flip_at_all():
+    """Below the session-scale floor there is no direction change to name.
+
+    This used to report the flip and mark it insignificant. The deadband
+    supersedes that: a tape whose whole range sits inside the noise floor is
+    flat, and emitting a "flip" for it is what put a dozen dots on a live
+    session even with the significance filter on.
+    """
     bars = _series([400.0] * 3 + [-400.0] * 3)
+
+    assert sign_flip_events(bars) == []
+
+
+def test_modest_but_real_flip_on_an_active_tape_is_still_reported():
+    """The guard against the deadband swallowing genuine, moderate turns."""
+    bars = _series([250_000.0] * 4 + [-250_000.0] * 4)
     events = sign_flip_events(bars)
 
     assert len(events) == 1
-    assert events[0].is_significant is False
+    assert events[0].direction == "to_selling"
 
 
 def test_large_flip_is_significant():
@@ -232,7 +246,9 @@ def test_default_window_is_used_when_unspecified():
 # Cumulative crossings
 # --------------------------------------------------------------------------- #
 def test_cumulative_zero_cross_detected():
-    bars = _series([0.0] * 5, cums=[100.0, 60.0, 20.0, -30.0, -90.0])
+    # Magnitudes in millions, as real cumulative delta notional is. The old
+    # fixture used dollars, which sits entirely inside the noise floor.
+    bars = _series([0.0] * 5, cums=[100e6, 60e6, 20e6, -30e6, -90e6])
     events = zero_cross_events(bars)
 
     assert [e.kind for e in events] == ["cumulative"]
@@ -240,7 +256,7 @@ def test_cumulative_zero_cross_detected():
 
 
 def test_cumulative_never_crossing_yields_nothing():
-    bars = _series([0.0] * 4, cums=[10.0, 50.0, 90.0, 200.0])
+    bars = _series([0.0] * 4, cums=[10e6, 50e6, 90e6, 200e6])
     assert zero_cross_events(bars) == []
 
 
@@ -290,3 +306,62 @@ def test_pass_through_exact_zero_still_reports_the_crossing():
     events = sign_flip_events(bars, window=1)
 
     assert [e.direction for e in events] == ["to_selling"]
+
+
+# --------------------------------------------------------------------------- #
+# The deadband — the fix for flip counts on a live tape
+# --------------------------------------------------------------------------- #
+def test_chatter_around_zero_produces_no_flips():
+    """The actual complaint: on a live session the rate hugged zero and nicked
+    across it repeatedly, and every nick became a dot even with the
+    significance filter on. A line that small is flat, not reversing."""
+    active = [900_000.0, -900_000.0] * 3  # establishes a real scale first
+    chatter = [12_000.0, -9_000.0, 8_000.0, -11_000.0, 7_000.0, -6_000.0]
+    bars = _series(active + chatter)
+
+    flips = sign_flip_events(bars, window=1)
+    chatter_start = _bar(len(active), 0.0).bar_start
+
+    assert [e for e in flips if e.bar_start >= chatter_start] == []
+
+
+def test_a_real_reversal_after_chatter_still_registers():
+    """Guard against the band swallowing the turn that matters."""
+    bars = _series([900_000.0, -900_000.0] * 3 + [10_000.0, -8_000.0, 9_000.0] + [1_400_000.0] * 4)
+    flips = sign_flip_events(bars, window=1)
+
+    assert flips
+    assert flips[-1].direction == "to_buying"
+
+
+def test_band_ratio_zero_restores_pre_band_behaviour():
+    """The knob is real: at 0 only exact zeros are flat, which is what the
+    scan did before the band existed."""
+    values = [600_000.0] * 3 + [-40_000.0, 50_000.0, -45_000.0] + [700_000.0] * 3
+    bars = _series(values)
+
+    banded = sign_flip_events(bars, window=1)
+    unbanded = sign_flip_events(bars, window=1, flat_band_ratio=0.0)
+
+    assert len(unbanded) > len(banded)
+
+
+def test_wider_band_never_reports_more_flips():
+    """Monotonic in the knob, so tuning it has a predictable direction."""
+    values = [800_000.0, -700_000.0, 60_000.0, -50_000.0, 900_000.0, -850_000.0]
+    bars = _series(values)
+
+    counts = [
+        len(sign_flip_events(bars, window=1, flat_band_ratio=r)) for r in (0.0, 0.25, 0.5, 1.0, 2.0)
+    ]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_flip_is_timestamped_where_the_move_establishes():
+    """The band delays the flag to the first bar the move is knowable as a
+    move, which is the earliest honest moment — not hindsight."""
+    bars = _series([500_000.0] * 3 + [-20_000.0, -60_000.0, -900_000.0])
+    flips = sign_flip_events(bars, window=1)
+
+    assert len(flips) == 1
+    assert flips[0].bar_start == bars[5].bar_start

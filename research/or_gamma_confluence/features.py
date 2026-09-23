@@ -378,6 +378,24 @@ def build_features(
         "direction_from_open": ("above" if event.level_price >= orange.open_price else "below"),
         "distance_from_open_pts": event.level_price - orange.open_price,
         "distance_from_open_r": ((event.level_price - orange.open_price) / r if r > _EPS else None),
+        # How far the touch bar CLOSED back inside the level, in units of R.
+        # The event fires on the bar's extreme reaching the rung, but the
+        # forward scan starts from its close — so price begins the race to
+        # prev/next already displaced toward prev by this much. Under a
+        # driftless walk that alone yields a reversal rate of
+        # 0.5 + offset/(2*step), which turns out to be essentially the whole
+        # observed baseline. It is a CONTROL, not a feature: see
+        # report._mechanical_null.
+        "touch_offset_r": (
+            (
+                (event.level_price - event.spot_at_touch)
+                if event.side == SIDE_UP
+                else (event.spot_at_touch - event.level_price)
+            )
+            / r
+            if r > _EPS
+            else None
+        ),
         # ── Clock ──
         "time_of_day_et": et.strftime("%H:%M:%S"),
         "minutes_since_open": (

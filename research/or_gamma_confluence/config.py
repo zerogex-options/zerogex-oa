@@ -101,6 +101,14 @@ DEFAULT_CONFLUENCE_BUCKETS_PTS: tuple[float, ...] = (2.0, 5.0, 10.0, 15.0, 20.0)
 DEFAULT_CONFLUENCE_BUCKETS_BP: tuple[float, ...] = (1.0, 2.0, 3.5, 5.0, 7.0)
 
 
+#: Absolute floor under ``ResearchConfig.min_or_width_bp``, in basis points of
+#: the opening price.  Below this an opening range is degenerate whatever the
+#: touch band is: the ladder rungs collapse toward a single price.  The value
+#: is the one the field carried as a hard-coded default before it also had to
+#: track the touch band.
+MIN_OR_WIDTH_FLOOR_BP = 2.0
+
+
 def _round(value: float, places: int = 10) -> float:
     """Kill float noise so two configs that mean the same thing hash the same."""
     return round(float(value), places)
@@ -129,10 +137,37 @@ class ResearchConfig:
     #: Minimum OR width, in basis points of the opening price, for a session to
     #: be usable.  A degenerate range makes every extension collapse onto the
     #: same price and the ladder meaningless.
-    min_or_width_bp: float = 2.0
-    #: Minimum bars required inside the OR window.  A 5-minute OR built from
-    #: one bar is not an opening range.
-    min_or_bars: int = 2
+    #:
+    #: ``None`` (the default) resolves it to ``max(2.0, touch_tolerance_bp /
+    #: extension_step)`` -- an absolute floor, and a derived one, whichever
+    #: binds.
+    #:
+    #: The absolute 2.0 is the original value and keeps its original job: below
+    #: it a range is degenerate whatever the touch band, because the rungs
+    #: collapse toward one price.  The derived term is the one that was
+    #: missing.  A ladder step is ``extension_step * R`` wide, so a step
+    #: narrower than the touch band makes adjacent rungs indistinguishable and
+    #: "price reached +150%" and "price reached +200%" become the same
+    #: statement.  With the shipped defaults the two agree at 2.0, which is
+    #: where the hard-coded number came from; they part company under the touch
+    #: sweep, where a fixed 2.0 would have measured mush at the wide end and
+    #: reported it as a result.
+    #:
+    #: Set it explicitly to demand a WIDER range.  Setting it below the derived
+    #: term raises, because the ladder would be finer than the instrument that
+    #: measures it.
+    min_or_width_bp: Optional[float] = None
+    #: Minimum bars required inside the OR window.
+    #:
+    #: ``None`` (the default) DERIVES it as ``min(2, opening_range_minutes)``.
+    #: The old fixed 2 encoded "a 5-minute OR built from one bar is not an
+    #: opening range", which is true and which also made a ONE-minute opening
+    #: range impossible: the window holds exactly one minute bar, so every
+    #: session was skipped and the sweep returned an empty sample rather than
+    #: an answer.  A tester's primary setting is the 1-minute range, so that
+    #: was not a hypothetical.  Explicitly asking for more bars than the
+    #: window can hold raises rather than silently never matching.
+    min_or_bars: Optional[int] = None
 
     # ── Extension ladder ─────────────────────────────────────────────
     extension_mode: str = MODE_BOUNDARY
@@ -278,6 +313,35 @@ class ResearchConfig:
     label: str = ""
 
     def __post_init__(self) -> None:
+        # Derived defaults first: the validation below reads them, and so does
+        # every caller.  ``object.__setattr__`` because the dataclass is frozen
+        # and these resolve exactly once, at construction, before the
+        # fingerprint can be taken.  With the shipped defaults they resolve to
+        # the previous hard-coded 2 and 2.0, so no existing run's fingerprint
+        # moves.
+        #
+        # Which ones were derived is remembered so ``variant`` can re-derive
+        # them.  It is a plain attribute rather than a field on purpose:
+        # ``asdict`` walks fields, so this stays out of ``to_dict`` and out of
+        # the fingerprint, where it would be provenance about provenance.
+        object.__setattr__(
+            self,
+            "_derived",
+            frozenset(
+                name
+                for name in ("min_or_bars", "min_or_width_bp")
+                if getattr(self, name) is None
+            ),
+        )
+        if self.min_or_bars is None:
+            object.__setattr__(self, "min_or_bars", min(2, self.opening_range_minutes))
+        if self.min_or_width_bp is None:
+            object.__setattr__(
+                self,
+                "min_or_width_bp",
+                _round(max(MIN_OR_WIDTH_FLOOR_BP, self.touch_tolerance_bp / self.extension_step)),
+            )
+
         if self.availability_clock not in AVAILABILITY_CLOCKS:
             raise ValueError(
                 f"availability_clock={self.availability_clock!r}; "
@@ -293,6 +357,22 @@ class ResearchConfig:
             raise ValueError("extension_step must be positive")
         if self.max_extension < self.extension_step:
             raise ValueError("max_extension must be at least one step")
+        if self.min_or_bars > self.opening_range_minutes:
+            raise ValueError(
+                f"min_or_bars={self.min_or_bars} exceeds opening_range_minutes="
+                f"{self.opening_range_minutes}: the window cannot hold that many "
+                "minute bars, so every session would be skipped"
+            )
+        if self.min_or_bars < 1:
+            raise ValueError("min_or_bars must be at least 1")
+        _floor = _round(self.touch_tolerance_bp / self.extension_step)
+        if self.min_or_width_bp < _floor:
+            raise ValueError(
+                f"min_or_width_bp={self.min_or_width_bp} is below "
+                f"touch_tolerance_bp/extension_step={_floor}: one ladder step "
+                "would be narrower than the touch band, so adjacent rungs "
+                "could not be told apart"
+            )
         if self.gamma_min_lead_seconds < 0:
             raise ValueError("gamma_min_lead_seconds must not be negative")
         if self.client_poll_lag_seconds < 0:
@@ -359,7 +439,23 @@ class ResearchConfig:
         return max(abs(level) * self.touch_tolerance_bp / 10_000.0, float(floor))
 
     def variant(self, **changes: Any) -> "ResearchConfig":
-        """A copy with ``changes`` applied — the only supported way to vary."""
+        """A copy with ``changes`` applied — the only supported way to vary.
+
+        A field that was DERIVED on this config is reset so the copy derives it
+        again.  ``replace`` re-runs ``__init__`` with the current values, which
+        would otherwise hand a resolved default back as though the caller had
+        asked for it — and freeze it.  That is not hypothetical: the sweep
+        varies ``touch_tolerance_bp`` through ``variant``, so a frozen
+        ``min_or_width_bp`` would have kept a 2 bp floor at a 5 bp touch band,
+        which is the exact miscalibration deriving it exists to prevent.  It
+        would also have made an ``opening_range_minutes=1`` cell raise instead
+        of lowering ``min_or_bars`` to fit the window.
+
+        A value the caller set explicitly is never derived and so is carried
+        through untouched.
+        """
+        for name in getattr(self, "_derived", frozenset()):
+            changes.setdefault(name, None)
         return replace(self, **changes)
 
     # ── Provenance ───────────────────────────────────────────────────

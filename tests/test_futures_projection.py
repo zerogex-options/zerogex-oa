@@ -12,14 +12,19 @@ so these tests pin the three things that make that safe:
 """
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from math import exp
 
 import pytest
+
+from src.config import RISK_FREE_RATE, resolve_dividend_yield
 
 from src.jobs.futures_projection import (
     NEVER_PROJECT,
     PRICE_FIELDS,
     FuturesBasis,
+    active_contract_code,
+    active_contract_expiry,
     next_quarterly_expiry,
     project_payload,
     projection_metadata,
@@ -346,6 +351,181 @@ def test_booleans_are_not_treated_as_prices():
 
 
 # ---------------------------------------------------------------------------
+# Active contract naming (the badge / tooltip label)
+# ---------------------------------------------------------------------------
+#
+# The roll offset is MEASURED, not assumed. On the Sep 2026 cycle (expiry Fri
+# Sep 18) the production @NQ basis against NDX sat at 8.5bp through Thu Sep 10
+# and stepped to 108.2bp on Fri Sep 11; @ES stepped 8.1 -> 93.7bp the same day.
+# So the continuous feed was on U26 through the 10th and Z26 from the 11th.
+
+
+@pytest.mark.parametrize(
+    "day, expected",
+    [
+        ("2026-09-09", "NQU26"),  # well before the roll
+        ("2026-09-10", "NQU26"),  # last day on the expiring contract
+        ("2026-09-11", "NQZ26"),  # the observed roll
+        ("2026-09-14", "NQZ26"),  # the day the mismatch was reported
+        ("2026-09-18", "NQZ26"),  # Sep expiry itself — already long gone
+        ("2026-12-10", "NQZ26"),  # last day before the next roll
+        ("2026-12-11", "NQH27"),  # rolls into the new year
+    ],
+)
+def test_active_contract_code_tracks_the_observed_roll(day, expected):
+    at = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+    assert active_contract_code("@NQ", at) == expected
+
+
+def test_active_contract_code_strips_the_continuous_prefix():
+    at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    assert active_contract_code("@ES", at) == "ESZ26"
+    assert active_contract_code("ES", at) == "ESZ26"
+
+
+def test_active_contract_code_is_none_without_a_future():
+    assert active_contract_code(None) is None
+    assert active_contract_code("") is None
+    assert active_contract_code("@") is None
+
+
+def test_active_contract_differs_from_next_quarterly_inside_the_roll_week():
+    """The two helpers disagree for exactly the week that caused the reports.
+
+    ``next_quarterly_expiry`` answers "next expiry on or after today", which
+    inside the roll window names the contract the feed has ALREADY LEFT.
+    Labelling a December quote September is the bug this guards.
+    """
+    at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    assert next_quarterly_expiry(at) == date(2026, 9, 18)
+    assert active_contract_expiry(at) == date(2026, 12, 18)
+
+
+def test_active_contract_expiry_is_always_a_third_friday():
+    for month_day in ("2026-01-05", "2026-03-16", "2026-06-30", "2026-09-14", "2026-12-31"):
+        at = datetime.fromisoformat(month_day).replace(tzinfo=timezone.utc)
+        expiry = active_contract_expiry(at)
+        assert expiry.weekday() == 4
+        assert 15 <= expiry.day <= 21
+        assert expiry.month in (3, 6, 9, 12)
+
+
+def test_active_contract_expiry_roll_days_is_overridable():
+    """CME publishes 8 days; TradeStation was observed at 7. Both reachable."""
+    at = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    assert active_contract_expiry(at, roll_days=7) == date(2026, 9, 18)
+    assert active_contract_expiry(at, roll_days=8) == date(2026, 12, 18)
+
+
+def test_carry_fallback_prices_to_the_active_contract_through_the_roll():
+    """The fallback must not collapse to ~1.0 during the roll week.
+
+    Between the roll and the old contract's expiry the nearest quarterly is
+    the contract the feed has ALREADY LEFT. Pricing a full quarter of carry
+    over the few days to it makes the ratio nearly 1.0 — which publishes cash
+    levels on a futures axis, the one outcome resolve_basis refuses to reach
+    by falling back rather than defaulting to 1.0.
+
+    This is the regime the fallback is actually for: overnight the cash index
+    is frozen, so there is no concurrent pair and the measured path has
+    nothing to read.
+    """
+    in_roll_week = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    ratio = theoretical_ratio("NDX", in_roll_week)
+
+    # Sanity: the two expiries genuinely disagree on this date.
+    assert next_quarterly_expiry(in_roll_week) == date(2026, 9, 18)
+    assert active_contract_expiry(in_roll_week) == date(2026, 12, 18)
+
+    # Priced to Dec, a quarter of carry is worth ~1% -- comfortably clear of
+    # the ~0.05% that pricing to the four-day-away Sep expiry would give.
+    assert ratio > 1.005, "carry fallback collapsed toward 1.0 inside the roll week"
+
+    days_to_sep = (date(2026, 9, 18) - in_roll_week.date()).days
+    wrong = exp((RISK_FREE_RATE - resolve_dividend_yield("NDX")) * (days_to_sep / 365.0))
+    assert ratio > wrong * 1.005
+
+
+def test_carry_fallback_is_continuous_across_the_roll():
+    """No cliff in the published ratio on the day the contract switches.
+
+    Before the fix the ratio decayed toward 1.0 into expiry and then jumped
+    when next_quarterly_expiry finally moved on. Pricing to the active
+    contract throughout means the step lands on the roll -- where the feed's
+    own basis steps too -- and not a week later.
+    """
+    day_before = theoretical_ratio("NDX", datetime(2026, 9, 10, tzinfo=timezone.utc))
+    day_of = theoretical_ratio("NDX", datetime(2026, 9, 11, tzinfo=timezone.utc))
+    week_after = theoretical_ratio("NDX", datetime(2026, 9, 21, tzinfo=timezone.utc))
+
+    # The roll is the only step: Sep 10 still prices to the expiring contract.
+    assert day_before < 1.002
+    assert day_of > 1.005
+    # And it decays smoothly from there, with no second jump at Sep expiry.
+    assert day_of > week_after > 1.005
+
+
+# ---------------------------------------------------------------------------
+# /api/gex/pin-stability — the pin under its other names
+# ---------------------------------------------------------------------------
+
+
+def _nq_basis():
+    return FuturesBasis(
+        futures_symbol="NQ",
+        index_symbol="NDX",
+        ratio=1.01047,  # measured on 2026-09-14
+        source="measured",
+        observed_at=datetime(2026, 9, 14, tzinfo=timezone.utc),
+        sample_count=5,
+        feed_symbol="@NQ",
+    )
+
+
+def test_pin_stability_levels_project_like_the_pin_they_are():
+    """Renaming the pin must not smuggle a cash strike onto the futures axis.
+
+    /api/gex/pin-stability sits under the projectable /api/gex/ prefix and
+    reports the pin three times under its own names. The allowlist matches on
+    KEY, so before those names were listed an NQ request returned raw NDX
+    strikes next to a correctly projected `pin_strike` in the same payload —
+    about 400 points below the axis they are drawn on.
+    """
+    payload = {
+        "pin_strike": 28900.0,
+        "current_pin": 28900.0,
+        "held_pin": 28850.0,
+        "session_open_pin": 28800.0,
+    }
+    out = project_payload(payload, _nq_basis())
+
+    # The decisive property: one value, one answer, whatever it is called.
+    assert out["current_pin"] == out["pin_strike"]
+    for field in ("current_pin", "held_pin", "session_open_pin"):
+        assert out[field] > payload[field], f"{field} was served on the cash axis"
+
+
+def test_pin_migration_projects_as_a_price_delta():
+    """net_migration is held_pin - session_open_pin, so it scales with them."""
+    payload = {"session_open_pin": 28800.0, "held_pin": 28850.0, "net_migration": 50.0}
+    out = project_payload(payload, _nq_basis())
+    assert out["net_migration"] == pytest.approx(
+        out["held_pin"] - out["session_open_pin"], rel=1e-9
+    )
+
+
+def test_pin_stability_counters_are_never_projected():
+    """Minutes observed and strikes occupied are counts, not prices."""
+    payload = {
+        "current_samples": 42,
+        "held_samples": 37,
+        "quiet_samples": 5,
+        "total_samples": 390,
+        "distinct_values": 3,
+    }
+    out = project_payload(payload, _nq_basis())
+    assert out == payload
+
 # The default path: carry only, and no CME data read at all
 # ---------------------------------------------------------------------------
 class _ExplodingDB:

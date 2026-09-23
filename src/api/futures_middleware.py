@@ -129,6 +129,23 @@ _UNSUPPORTED_PREFIXES = (
     # while the GEX ladders beside it — same SPX chain, same strikes —
     # rendered fine.
     "/api/gex/premium_surface",
+    # Quoted-spread / liquidity metrics.  Note this is NOT the premium
+    # surface's reason, and it is not the vol surface's either — it is a
+    # third one, and the distinction is worth stating because the IV
+    # argument immediately above looks like it should apply here.
+    #
+    # It does not.  An IV passes through untouched because it is a property
+    # of the shared underlying PROCESS: the same number describes SPX and ES
+    # because they are claims on the same index.  A quoted width is not a
+    # property of the index at all — it is a property of one order book.
+    # SPX options and ES options trade on different venues, quoted by
+    # different market makers, in different tick increments, and their
+    # liquidity genuinely diverges on the same day.  That divergence is the
+    # exact thing a reader comes to this surface to measure, so answering it
+    # by scaling an SPX width by the futures basis would fabricate the
+    # measurement rather than carry it.  There is no ES quote to substitute.
+    # Refuse.
+    "/api/market/spreads",
 )
 
 

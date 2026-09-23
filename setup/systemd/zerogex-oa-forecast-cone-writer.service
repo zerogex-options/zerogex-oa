@@ -1,0 +1,30 @@
+[Unit]
+Description=ZeroGEX intraday cone writer (every 15m, 09:45-15:30 ET)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Re-anchors on the current bar, re-reads the current dealer surface, and
+# commits one immutable row per horizon that can still complete before the
+# bell.  The (symbol, forecast_ts, horizon_min) key plus the immutability
+# trigger make a re-run a no-op rather than a restatement.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.intraday_cone_writer
+
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-forecast-cone-writer

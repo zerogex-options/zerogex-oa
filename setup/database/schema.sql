@@ -593,6 +593,21 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS computed_at TIMESTAMPTZ;
 -- age_seconds and the v2 freshness grade are measured from this. NULL on
 -- rows older than the column.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS data_as_of TIMESTAMPTZ;
+
+-- Why a cycle published no gamma flip.  NULL when one WAS published (including
+-- a carried-forward value -- a level was served, so there is nothing to
+-- explain); a FLIP_REASON_* code from src/analytics/main_engine.py when the
+-- resolver declined: NO_PROFILE / ONE_SIDED / EDGE_ONLY /
+-- BEYOND_MAX_DISTANCE / BELOW_STRUCTURAL_FLOOR.  Same shape as
+-- pin_strike_reason above, for the same reason.
+--
+-- A NULL gamma_flip_point is the resolver being honest, and three of those
+-- codes describe a chain it read correctly and declined to fabricate a level
+-- from.  Without this column all of them render as one em dash, which is also
+-- what a broken feed renders as -- so an NDX blackout ran from 2026-07 to
+-- 2026-09 looking exactly like a quiet session, and the only way to tell the
+-- difference afterwards was to replay the stored chains one cycle at a time.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_reason TEXT;
 COMMENT ON COLUMN gex_summary.data_as_of IS
     'Newest option_chains_latest.updated_at the snapshot read; what the row is as of. timestamp is the minute bucket.';
 
@@ -1122,6 +1137,33 @@ CREATE TABLE IF NOT EXISTS gamma_regime_5min (
     -- z-score denominator before any session history exists.
     near_spot_stock        DOUBLE PRECISION,
     strike_count           INTEGER,
+    -- Spot-to-flip cushion. Only the RAW flip level is stored; distance,
+    -- direction, rate and the secure/thin/crossing label are all derived at
+    -- read time from this plus `spot` (see src/analytics/flip_cushion.py).
+    -- Deliberate: the thresholds are the part most likely to be retuned, and
+    -- deriving them on read means a retune reclassifies history instead of
+    -- leaving every stored session labelled by whatever rule was live that
+    -- day. NULL is meaningful -- the gamma profile had no zero crossing.
+    --
+    -- That last sentence is load-bearing, and until 2026-09 it was not quite
+    -- true. The level came from whichever gex_summary row landed inside the
+    -- bar's own five minutes, so a window that received NO row stored NULL
+    -- too, and every consumer read it as "one-signed profile, no boundary".
+    -- The writer now carries the last level measured EARLIER IN THE SAME
+    -- SESSION across a window with no row, and writes NULL only where a row
+    -- exists and reported no crossing (src/analytics/gamma_flip_carry.py).
+    -- Whether a bar was measured or carried is NOT stored: gex_summary is
+    -- retention-exempt, so the join answers it for as long as the bar exists,
+    -- and retroactively -- which is what
+    -- src/tools/gamma_flip_carry_healthcheck.py reports.
+    gamma_flip             DOUBLE PRECISION,
+    -- Typical 30-minute realized move, the yardstick the cushion state is
+    -- classified against. Stored per bar rather than recomputed on read so a
+    -- historical reading always shows the scale actually in force at the time;
+    -- a fraction of spot was the earlier yardstick and adapted to price level
+    -- but not to volatility, which made the same label mean different things
+    -- on a quiet morning and a fast afternoon.
+    typical_move_30m       DOUBLE PRECISION,
     -- Expirations that left the board since the comparison point, reported so
     -- a roll-off is never read as dealers shedding gamma.
     expired_expirations    DATE[],
@@ -1132,11 +1174,96 @@ CREATE TABLE IF NOT EXISTS gamma_regime_5min (
 CREATE INDEX IF NOT EXISTS idx_gamma_regime_5min_symbol_bar
     ON gamma_regime_5min(symbol, bar_start DESC);
 
+ALTER TABLE gamma_regime_5min ADD COLUMN IF NOT EXISTS gamma_flip DOUBLE PRECISION;
+ALTER TABLE gamma_regime_5min ADD COLUMN IF NOT EXISTS typical_move_30m DOUBLE PRECISION;
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gamma_regime_5min_symbol') THEN
         ALTER TABLE gamma_regime_5min
         ADD CONSTRAINT fk_gamma_regime_5min_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
+-- Estimated hedging pressure per 5-minute bar -- the third of the three
+-- series behind the Hedging Flow page, and the last one to get a table.
+--
+-- WHY THIS IS A TABLE, AND WHY THE REASON IS NOT THE USUAL ONE. The other two
+-- snapshots on this page exist for cost: gamma_regime_5min because a bar is a
+-- diff of two per-strike chains, flow_series_5min because its CTE walks
+-- flow_by_contract with LAG-and-recumulate. Neither applies here -- the
+-- hedging pipeline reads flow_contract_facts, whose values are already
+-- per-bucket deltas, and it is the cheap one.
+--
+-- It exists for RETENTION. flow_contract_facts is in DB_MAINTAIN_TABLES, so
+-- `make db-prune` deletes it at DATA_RETENTION_DAYS (90). A past session
+-- recomputed from it therefore answers for a quarter and then comes back
+-- empty, which on a chart is indistinguishable from a genuinely quiet day --
+-- the worst available failure. Storing the finished bars lets a session
+-- outlive the trades that produced it, the same move made for gex_summary and
+-- underlying_quotes in 2026-08.
+--
+-- THEREFORE: this table is deliberately absent from DB_MAINTAIN_TABLES. Do
+-- NOT add it -- doing so deletes exactly the history the dated permalinks
+-- read. It is in DB_VACUUM_EXTRA_TABLES instead, which vacuums without
+-- pruning. The cost of keeping it forever is ~78 bars x 2 scopes per symbol
+-- per session: smaller than either table already exempted.
+--
+-- SCOPE. The live CTE accepts arbitrary strike/expiration filters, and a
+-- snapshot cannot pre-compute an arbitrary filter -- which is why
+-- flow_series_5min supersedes only the unfiltered read. The page offers
+-- exactly one filter, though (a 0DTE toggle that resolves to the session's
+-- own date), so both members of that closed set are materialised and the
+-- toggle picks a scope. A session that was not an expiry has no '0dte' rows
+-- at all, which is the same honest answer the live page gives rather than a
+-- fabricated flat line. Any other filter still falls through to the CTE and
+-- is still bounded by the prune window.
+--
+-- Column types match the CTE's emitted types so asyncpg decodes a snapshot
+-- read and a live read identically (NUMERIC -> Decimal, float8 -> float).
+CREATE TABLE IF NOT EXISTS hedging_flow_5min (
+    symbol            VARCHAR(10)  NOT NULL,
+    -- 'all' | '0dte'. See the SCOPE note above.
+    scope             VARCHAR(8)   NOT NULL,
+    bar_start         TIMESTAMPTZ  NOT NULL,
+    -- USD of stock the delta-flat hedge implies, positive for BUYING. Split
+    -- by the option type that PRODUCED the pressure, not by its direction:
+    -- customers selling puts push the net positive and land in put_flow_usd.
+    call_flow_usd     NUMERIC,
+    put_flow_usd      NUMERIC,
+    net_flow_usd      NUMERIC,
+    cum_call_usd      NUMERIC,
+    cum_put_usd       NUMERIC,
+    cum_net_usd       NUMERIC,
+    -- Share of the bar's traded volume that carried an aggressor
+    -- classification, in [0, 1]. NULL when the bar traded nothing. A low
+    -- ratio means the reading rests on a thin sample; stored rather than
+    -- derived so a historical bar keeps the coverage it actually had.
+    classified_ratio  DOUBLE PRECISION,
+    -- Mirrors underlying_quotes.close on the 5-minute grid, unfiltered, so
+    -- this series and /api/flow/series land on the same price at the same
+    -- bar. NULL-able: the carry-forward yields NULL before a session's first
+    -- quote.
+    underlying_price  NUMERIC(12, 4),
+    contract_count    INTEGER,
+    -- Carry-forward (no-flow) bar rather than a measured zero.
+    is_synthetic      BOOLEAN,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (symbol, scope, bar_start)
+);
+-- A dated read is (symbol, scope, window), which the primary key already
+-- serves. This index is for the sessions listing, which groups a symbol's
+-- whole history by ET date and never names a scope.
+CREATE INDEX IF NOT EXISTS idx_hedging_flow_5min_symbol_bar
+    ON hedging_flow_5min(symbol, bar_start DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_hedging_flow_5min_symbol') THEN
+        ALTER TABLE hedging_flow_5min
+        ADD CONSTRAINT fk_hedging_flow_5min_symbol
         FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
     END IF;
 END $$;
@@ -2477,6 +2604,202 @@ CREATE INDEX IF NOT EXISTS idx_daily_atm_iv_underlying_date
     ON daily_atm_iv(underlying, trading_date DESC);
 
 -- =============================================================================
+-- Daily quoted-spread / liquidity history (Spread Monitor)
+-- =============================================================================
+-- One row per (underlying, trading_date, option_type) summarising how wide
+-- that day's option markets were quoted.  ``option_type`` is 'C', 'P', or
+-- 'A' for the blended chain — three rows per symbol per day.  Medians do not
+-- combine, so the blended row is STORED rather than derived from the other
+-- two at read time.
+--
+-- Why a rollup rather than a live query: the question the Spread Monitor
+-- exists to answer is comparative — "spreads have gone bonkers RECENTLY" —
+-- and answering it from option_chains means scanning every minute bucket of
+-- every session in the window.  This table is ~3 rows per symbol per day and
+-- the trailing-window read is a sub-ms scalar, the same trade daily_atm_iv
+-- makes for iv_rank.
+--
+-- Writer: src/analytics/main_engine.py (`_store_daily_spread_stats`, UPSERTed
+-- once per analytics cycle for the current trading day, gated to the cash
+-- session for the same post-close-drift reason daily_atm_iv is).  Backfill:
+-- src/tools/daily_spread_stats_backfill.py seeds history from the ~90 days of
+-- option_chains already on disk.
+--
+-- SCOPE COLUMNS ARE LOAD-BEARING.  ``dte_max`` and ``moneyness_band_pct``
+-- record the filter the row was computed under.  A trailing percentile is
+-- only meaningful against rows measured the same way, so the API compares
+-- like with like and a scope change starts a new comparable series instead
+-- of silently corrupting the old one.
+--
+-- ``median_relative_spread_pct`` is the headline: quoted width as a share of
+-- the option's own mid.  ``*_bps_underlying`` is width in basis points of the
+-- index level, which is the only one of these that is comparable ACROSS
+-- symbols (SPX near 6,800 and NDX near 25,000 are not on one dollar scale).
+-- ``zero_bid_pct`` carries the failure that has no width at all: a contract
+-- quoted 0.00 x 2.40 has no market, and counting those separately is what
+-- stops a chain looking tighter as its wings go untradeable.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS daily_spread_stats (
+    underlying                   VARCHAR(10)      NOT NULL,
+    trading_date                 DATE             NOT NULL,
+    option_type                  CHAR(1)          NOT NULL,
+    spot_price                   NUMERIC(12, 4)   NOT NULL,
+    dte_max                      SMALLINT         NOT NULL,
+    moneyness_band_pct           DOUBLE PRECISION NOT NULL,
+    contract_count               INTEGER          NOT NULL DEFAULT 0,
+    tradable_count               INTEGER          NOT NULL DEFAULT 0,
+    two_sided_pct                DOUBLE PRECISION NOT NULL DEFAULT 0,
+    zero_bid_pct                 DOUBLE PRECISION NOT NULL DEFAULT 0,
+    crossed_or_locked_pct        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    median_spread                DOUBLE PRECISION,
+    median_relative_spread_pct   DOUBLE PRECISION,
+    p90_relative_spread_pct      DOUBLE PRECISION,
+    median_spread_bps_underlying DOUBLE PRECISION,
+    p90_spread_bps_underlying    DOUBLE PRECISION,
+    total_open_interest          BIGINT           NOT NULL DEFAULT 0,
+    total_volume                 BIGINT           NOT NULL DEFAULT 0,
+    source_timestamp             TIMESTAMPTZ      NOT NULL,
+    created_at                   TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, trading_date, option_type)
+);
+
+-- Trailing-window read: ``WHERE underlying = $1 AND option_type = $2
+-- ORDER BY trading_date DESC LIMIT $3`` — served by the primary key's
+-- leading equality plus a backward scan on this index.
+CREATE INDEX IF NOT EXISTS idx_daily_spread_stats_lookup
+    ON daily_spread_stats(underlying, option_type, trading_date DESC);
+
+-- =============================================================================
+-- Intraday spread surface history (Spread Surface vs History)
+-- =============================================================================
+-- daily_spread_stats answers "are puts wider than usual today" and nothing
+-- more: one row per (symbol, trading_date, option_type), with dte_max and
+-- moneyness_band_pct recorded as the scope it happened to be measured under
+-- rather than as dimensions you can vary.
+--
+-- The surface view asks three questions that row cannot answer:
+--
+--   * is the deterioration AT THE MONEY or out in the wings?
+--   * is it only 0DTE, or the whole term structure?
+--   * is it unusual FOR THIS TIME OF DAY?  (0DTE at 15:45 is not 0DTE at
+--     10:00, and ranking one against the other manufactures an anomaly)
+--
+-- So this table stores the SAME statistic -- computed by the same
+-- src/analytics/spread_stats.py functions, never a second SQL
+-- reimplementation -- at the granularity those questions are asked in.
+--
+-- SCOPE COLUMNS ARE THE PRIMARY KEY, and that is the point. A percentile is
+-- only meaningful against rows measured the same way, so the filter a row was
+-- computed under travels with it and the read path matches on it exactly:
+--
+--   dte_scope     'u0'/'u1'/'u7'/'u30'  cumulative universes (the page's
+--                                        "0DTE only / Through 1 / 7 / 30")
+--                 'b0'/'b1'/'b2_3'/'b4_7'/'b8_30'  disjoint buckets, for the
+--                                        by-expiry ranking
+--   band_pct      2 / 5 / 10            half-width of the moneyness band;
+--                                        filters CONTRACTS before bucketing,
+--                                        matching what the live page does
+--   money_bucket  'all'                 the whole band (summary + ranking)
+--                 'm:<low>:<high>'      one slice of it (the strike curve)
+--   bucket_start_min  minutes past ET midnight on a 30-minute grid; the
+--                     time-of-day bucket the observation belongs to
+--
+-- Writer: src/analytics/main_engine.py writes the current bucket each cycle
+-- from the snapshot already in memory, so it costs no extra query. Backfill:
+-- src/tools/spread_surface_backfill.py seeds history from option_chains.
+--
+-- 100% derived state: safe to TRUNCATE, the backfill rebuilds it. Roughly
+-- 110 rows per (symbol, day, time bucket, option type) -- about 700k rows for
+-- four symbols over a quarter, which is small enough that the trailing-window
+-- read is an index range scan.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS spread_surface_stats (
+    underlying                 VARCHAR(10)      NOT NULL,
+    trading_date               DATE             NOT NULL,
+    bucket_start_min           SMALLINT         NOT NULL,
+    option_type                CHAR(1)          NOT NULL,
+    dte_scope                  VARCHAR(8)       NOT NULL,
+    band_pct                   REAL             NOT NULL,
+    money_bucket               VARCHAR(20)      NOT NULL,
+    spot_price                 NUMERIC(12, 4)   NOT NULL,
+    contract_count             INTEGER          NOT NULL DEFAULT 0,
+    tradable_count             INTEGER          NOT NULL DEFAULT 0,
+    two_sided_pct              DOUBLE PRECISION NOT NULL DEFAULT 0,
+    zero_bid_pct               DOUBLE PRECISION NOT NULL DEFAULT 0,
+    crossed_or_locked_pct      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    median_relative_spread_pct DOUBLE PRECISION,
+    p90_relative_spread_pct    DOUBLE PRECISION,
+    median_spread              DOUBLE PRECISION,
+    source_timestamp           TIMESTAMPTZ      NOT NULL,
+    created_at                 TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at                 TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, trading_date, bucket_start_min, option_type,
+                 dte_scope, band_pct, money_bucket)
+);
+
+-- The trailing-window read: every prior session's reading for ONE scope at
+-- ONE time-of-day bucket. Leading equality on the scope columns with
+-- trading_date trailing, so the window is a contiguous range scan rather than
+-- a filter over the whole symbol.
+CREATE INDEX IF NOT EXISTS idx_spread_surface_scope_window
+    ON spread_surface_stats(underlying, option_type, dte_scope, band_pct,
+                            money_bucket, bucket_start_min, trading_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'spread_surface_stats_option_type_check'
+    ) THEN
+        ALTER TABLE spread_surface_stats
+        ADD CONSTRAINT spread_surface_stats_option_type_check
+        CHECK (option_type IN ('C', 'P'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'spread_surface_stats_bucket_min_check'
+    ) THEN
+        ALTER TABLE spread_surface_stats
+        ADD CONSTRAINT spread_surface_stats_bucket_min_check
+        CHECK (bucket_start_min BETWEEN 0 AND 1439);
+    END IF;
+END $$;
+
+COMMENT ON TABLE spread_surface_stats IS
+    'Intraday quoted-spread history at (moneyness bucket x DTE scope x band x time-of-day). Powers "Spread Surface vs History": the historical median/band per strike slice, the percentile per expiry bucket, and time-of-day-matched comparison. Same reduction as daily_spread_stats (src/analytics/spread_stats.py), finer granularity. Derived state; safe to TRUNCATE.';
+COMMENT ON COLUMN spread_surface_stats.bucket_start_min IS
+    'Minutes past ET midnight, floored to a 30-minute grid. 0DTE spreads at 15:45 behave nothing like 0DTE at 10:00, so a percentile that ranks one against the other reports an anomaly that is really just the clock.';
+COMMENT ON COLUMN spread_surface_stats.money_bucket IS
+    'Either all (the whole band) or m:<low>:<high> for one slice of it. Keyed by the edge values rather than an index so that inserting an edge cannot silently re-point historical rows at a different part of the surface.';
+COMMENT ON COLUMN spread_surface_stats.band_pct IS
+    'Half-width of the moneyness band the contracts were filtered to BEFORE bucketing -- the same order the live page applies, so a narrow-band curve describes exactly the contracts the narrow-band summary describes.';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'daily_spread_stats_option_type_check'
+    ) THEN
+        ALTER TABLE daily_spread_stats
+        ADD CONSTRAINT daily_spread_stats_option_type_check
+        CHECK (option_type IN ('C', 'P', 'A'));
+    END IF;
+END $$;
+
+COMMENT ON TABLE daily_spread_stats IS
+    'Daily quoted-spread / liquidity rollup per (underlying, trading_date, option_type). option_type ''A'' is the blended chain, stored rather than derived because medians do not combine. 100% derived state: safe to TRUNCATE, the backfill rebuilds it from option_chains.';
+COMMENT ON COLUMN daily_spread_stats.median_relative_spread_pct IS
+    'Median quoted width as a percentage of the option mid — 100 * (ask - bid) / mid. The headline "how much of the premium is the toll" number.';
+COMMENT ON COLUMN daily_spread_stats.median_spread_bps_underlying IS
+    'Median quoted width in basis points of the underlying level — 10000 * (ask - bid) / spot. The cross-symbol comparable measure.';
+COMMENT ON COLUMN daily_spread_stats.contract_count IS
+    'Contracts in scope for the row. Load-bearing, not diagnostic: a session below SPREAD_STATS_MIN_CONTRACTS is an ingestion outage rather than a quiet market, and both the writers and the trailing-percentile read exclude it -- a median over 21 contracts must not stand beside one over 684 in the distribution today is ranked against.';
+COMMENT ON COLUMN daily_spread_stats.zero_bid_pct IS
+    'Share of contracts quoted with an offer but no bid. These have NO width by construction and are excluded from every median here; the count is the liquidity failure a width statistic cannot express.';
+
+-- =============================================================================
 -- BACKTESTING PLATFORM (see docs/design/backtesting-platform.md)
 --
 -- Four tables power the customer-facing backtester:
@@ -3118,6 +3441,134 @@ CREATE TRIGGER forecast_calibration_state_touch
     BEFORE UPDATE ON forecast_calibration_state
     FOR EACH ROW
     EXECUTE FUNCTION touch_forecast_calibration_state();
+
+-- ============================================================================
+-- intraday_forecast (Phase 4: the re-anchored cone)
+-- ============================================================================
+-- ``daily_forecast`` commits one band before the open and grades it at 16:05.
+-- This table is its intraday counterpart: every 15 minutes from 09:45 to
+-- 15:30 ET the cone writer re-anchors on the current bar, re-reads the
+-- current dealer surface, and commits a band + hold probability for each
+-- horizon that can still complete before the bell.
+--
+-- GRAIN is one row per (symbol, forecast_ts, horizon_min) — one row, one
+-- falsifiable claim.  Horizons are NOT packed into a JSONB blob on a shared
+-- row: each is graded independently, and the reliability table buckets
+-- across horizons, so they need to be joinable and indexable individually.
+--
+-- The same immutability discipline as daily_forecast, for the same reason.
+-- A cone that re-forecasts intraday is exactly the kind of claim that would
+-- be trivial to quietly improve after the fact — nudge an 11:00 band at
+-- 12:30 once the tape has shown its hand and the track record becomes
+-- fiction.  The trigger below makes that impossible at the storage layer
+-- rather than by convention: committed columns are write-once, receipt
+-- columns are write-once, and NULL -> value is the only legal transition.
+--
+-- ``band_low``/``band_high``/``sigma`` are stored exactly as published, and
+-- ``hold_prob`` is computed from those rounded values (see
+-- intraday_cone_model.compute_cone), so anyone can recompute the published
+-- probability from the published band and reproduce it to the digit.
+
+CREATE TABLE IF NOT EXISTS intraday_forecast (
+    symbol          VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    session_date    DATE        NOT NULL,
+    forecast_ts     TIMESTAMPTZ NOT NULL,
+    horizon_min     SMALLINT    NOT NULL,
+    -- When this claim matures.  Stored rather than derived so a grader can
+    -- find due rows with an index scan instead of recomputing every row.
+    target_ts       TIMESTAMPTZ NOT NULL,
+
+    -- The commitment — immutable once written.
+    anchor_spot     NUMERIC(12,4) NOT NULL,
+    band_low        NUMERIC(12,4) NOT NULL,
+    band_high       NUMERIC(12,4) NOT NULL,
+    hold_prob       NUMERIC(5,4),
+    sigma           NUMERIC(12,4) NOT NULL,
+
+    -- The surface this cone was conditioned on, snapshotted at the fire.
+    -- Kept per-row because the walls migrate through a session: a 10:00 cone
+    -- and a 14:00 cone are conditioned on genuinely different structure, and
+    -- grading either against "the day's levels" would grade the wrong claim.
+    call_wall       NUMERIC(12,4),
+    put_wall        NUMERIC(12,4),
+    gamma_flip      NUMERIC(12,4),
+    net_gex_at_spot NUMERIC(20,4),
+    daily_sigma     NUMERIC(12,4),
+    gamma_mult      NUMERIC(6,4),
+    elapsed_min     SMALLINT,
+    -- What the cone assumed about today's volatility, and where that came
+    -- from ('measured' = median of prior graded sessions, 'committed' = the
+    -- morning forecast's prediction, 'none' = no claim). Stored because
+    -- twice the only way to establish what this model actually did was to
+    -- invert the published bands by hand.
+    vol_ratio_applied NUMERIC(6,4),
+    vol_ratio_source  VARCHAR(16),
+
+    model_version   VARCHAR(32) NOT NULL,
+    content_hash    TEXT        NOT NULL,
+
+    -- Receipt — written once the horizon matures, never rewritten.
+    graded_at       TIMESTAMPTZ,
+    -- Extremes over the OPEN interval (forecast_ts, target_ts].  The anchor
+    -- bar is excluded: spot starts inside its own band by construction, so
+    -- including it could only ever flatter the verdict.
+    window_low      NUMERIC(12,4),
+    window_high     NUMERIC(12,4),
+    held            BOOLEAN,
+    brier           NUMERIC(8,6),
+
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, forecast_ts, horizon_min)
+);
+
+-- The grader's working set: claims that have matured but carry no verdict.
+ALTER TABLE intraday_forecast ADD COLUMN IF NOT EXISTS vol_ratio_applied NUMERIC(6,4);
+ALTER TABLE intraday_forecast ADD COLUMN IF NOT EXISTS vol_ratio_source  VARCHAR(16);
+
+CREATE INDEX IF NOT EXISTS idx_intraday_forecast_ungraded
+    ON intraday_forecast(target_ts)
+    WHERE graded_at IS NULL;
+
+-- The page's working set: one session's cones, newest fire first.
+CREATE INDEX IF NOT EXISTS idx_intraday_forecast_session
+    ON intraday_forecast(symbol, session_date, forecast_ts DESC);
+
+-- The reliability table scans graded rows by horizon across many sessions.
+CREATE INDEX IF NOT EXISTS idx_intraday_forecast_graded
+    ON intraday_forecast(symbol, horizon_min, session_date DESC)
+    WHERE graded_at IS NOT NULL;
+
+-- Immutability: mirrors enforce_daily_forecast_immutability.  Committed
+-- columns are set once on INSERT; receipt columns are set once when the
+-- horizon matures.  NULL -> value is allowed (the grading path); any
+-- value -> value' rewrite raises.
+CREATE OR REPLACE FUNCTION enforce_intraday_forecast_immutability()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.anchor_spot IS NOT NULL AND NEW.anchor_spot IS DISTINCT FROM OLD.anchor_spot THEN RAISE EXCEPTION 'intraday_forecast.anchor_spot is immutable'; END IF;
+    IF OLD.band_low    IS NOT NULL AND NEW.band_low    IS DISTINCT FROM OLD.band_low    THEN RAISE EXCEPTION 'intraday_forecast.band_low is immutable'; END IF;
+    IF OLD.band_high   IS NOT NULL AND NEW.band_high   IS DISTINCT FROM OLD.band_high   THEN RAISE EXCEPTION 'intraday_forecast.band_high is immutable'; END IF;
+    IF OLD.hold_prob   IS NOT NULL AND NEW.hold_prob   IS DISTINCT FROM OLD.hold_prob   THEN RAISE EXCEPTION 'intraday_forecast.hold_prob is immutable'; END IF;
+    IF OLD.sigma       IS NOT NULL AND NEW.sigma       IS DISTINCT FROM OLD.sigma       THEN RAISE EXCEPTION 'intraday_forecast.sigma is immutable'; END IF;
+    IF OLD.target_ts   IS NOT NULL AND NEW.target_ts   IS DISTINCT FROM OLD.target_ts   THEN RAISE EXCEPTION 'intraday_forecast.target_ts is immutable'; END IF;
+    IF OLD.content_hash IS NOT NULL AND NEW.content_hash IS DISTINCT FROM OLD.content_hash THEN RAISE EXCEPTION 'intraday_forecast.content_hash is immutable'; END IF;
+    -- Receipt columns are immutable once written.
+    IF OLD.graded_at   IS NOT NULL AND NEW.graded_at   IS DISTINCT FROM OLD.graded_at   THEN RAISE EXCEPTION 'intraday_forecast.graded_at is immutable once set'; END IF;
+    IF OLD.window_low  IS NOT NULL AND NEW.window_low  IS DISTINCT FROM OLD.window_low  THEN RAISE EXCEPTION 'intraday_forecast.window_low is immutable once set'; END IF;
+    IF OLD.window_high IS NOT NULL AND NEW.window_high IS DISTINCT FROM OLD.window_high THEN RAISE EXCEPTION 'intraday_forecast.window_high is immutable once set'; END IF;
+    IF OLD.held        IS NOT NULL AND NEW.held        IS DISTINCT FROM OLD.held        THEN RAISE EXCEPTION 'intraday_forecast.held is immutable once set'; END IF;
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS intraday_forecast_immutable ON intraday_forecast;
+CREATE TRIGGER intraday_forecast_immutable
+    BEFORE UPDATE ON intraday_forecast
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_intraday_forecast_immutability();
+
 
 -- =============================================================================
 -- Gamma Regime Shift — one stored read per session

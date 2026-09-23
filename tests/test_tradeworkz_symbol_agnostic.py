@@ -19,7 +19,12 @@ from __future__ import annotations
 
 from src.tradeworkz import config as tw_config
 from src.tradeworkz.engine import _bot_underlyings
-from src.tradeworkz.registry import DEFAULT_ROSTER, RETIRED_BOT_IDS, SHELVED_SPECS
+from src.tradeworkz.registry import (
+    ALL_BOT_SPECS,
+    DEFAULT_ROSTER,
+    RETIRED_BOT_IDS,
+    SHELVED_SPECS,
+)
 
 
 def test_wildcard_expands_to_fleet_universe():
@@ -61,9 +66,9 @@ def test_every_shipped_bot_is_symbol_agnostic():
     """Regression: someone edits registry.py and pins a bot back to SPY
     without noticing — this catches that on CI. The intent of the v2
     fleet is that every bot trades every ticker; pinning is only for the
-    retired list. Checked against SHELVED_SPECS (the full shipped catalog)
-    since the active roster is currently empty."""
-    for spec in SHELVED_SPECS:
+    retired list. Checked against ALL_BOT_SPECS (every bot the strategy
+    catalog binds) since the active roster is currently empty."""
+    for spec in ALL_BOT_SPECS:
         assert spec.universe == "*", (
             f"{spec.id} is pinned to {spec.universe!r} — either widen it "
             "to '*' or add a comment explaining the pin"

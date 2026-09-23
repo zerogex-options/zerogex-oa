@@ -1,0 +1,20 @@
+[Unit]
+Description=Intraday trigger for ZeroGEX cone grading (every 15m, 10:05-16:50 ET Mon-Fri)
+
+[Timer]
+# Offset 5 minutes from the writer's grid so a horizon that just matured has
+# had its closing bar ingested before the grader looks for it.  Runs past the
+# bell because the last claims of the session (the 15:30 anchor's +30m) mature
+# exactly at 16:00, and the ingestion lag on that bar needs a few retries.
+OnCalendar=Mon..Fri *-*-* 10..16:05,20,35,50:00
+#
+# Host-TZ pinned to America/New_York, same as every other timer here.
+RandomizedDelaySec=30s
+# Persistent HERE, unlike the writer.  Grading is not time-sensitive — a
+# verdict computed late is the same verdict, because it reads bars that are
+# already on the record.  Catching up after downtime drains the backlog
+# instead of letting claims age into the abandon threshold.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

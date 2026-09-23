@@ -111,6 +111,20 @@ PRICE_FIELDS: frozenset[str] = frozenset(
         "put_wall",
         "max_pain",
         "pin_strike",
+        # /api/gex/pin-stability renames the pin per reading, and the renames
+        # need listing individually: the allowlist matches on KEY, so a field
+        # carrying the pin under any other name passes through unprojected.
+        # That endpoint sits under the projectable /api/gex/ prefix, so before
+        # these were listed an NQ request returned the pin as a raw NDX strike
+        # beside a correctly projected `pin_strike` in the same payload —
+        # ~400 points below the axis it is drawn on, with nothing marking it.
+        "current_pin",
+        "held_pin",
+        "session_open_pin",
+        # A DELTA between two settled pins. Projection is multiplicative, so a
+        # price difference carries across on the same ratio; leaving it raw
+        # would report an NDX-sized migration against NQ-sized levels.
+        "net_migration",
         "max_gamma_strike",
         "king_node",
         "hvl",
@@ -300,6 +314,13 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         "charm",
         "volume",
         "open_interest",
+        # pin-stability counters: minutes observed and distinct strikes
+        # occupied. Counts of samples, not prices.
+        "current_samples",
+        "held_samples",
+        "quiet_samples",
+        "total_samples",
+        "distinct_values",
     }
 )
 
@@ -415,6 +436,65 @@ def _third_friday(year: int, month: int) -> date:
     return first + timedelta(days=(4 - first.weekday()) % 7 + 14)
 
 
+# CME month codes for the quarterly cycle, and how many days before expiry
+# the CONTINUOUS series (@ES / @NQ) switches to the next contract.
+#
+# 7 is measured, not assumed: on the Sep 2026 cycle (expiry Fri Sep 18) the
+# @NQ basis against NDX sat at 8.5bp through Thu Sep 10 and stepped to 108.2bp
+# on Fri Sep 11 -- an expiring contract converged to cash, then one a quarter
+# out. @ES stepped the same day, 8.1 -> 93.7bp. The conventional equity-index
+# roll is 8 days (the Thursday before the third Friday), which would have
+# named December a day early here.
+#
+# What we do NOT know is the provider's RULE. The date above is observed, not
+# derived: TradeStation rolls @ES / @NQ on its own schedule and we only see
+# when it happened, not whether it keys on volume, open interest or a fixed
+# day count. So this is a measurement to re-take, not a law -- and it is why
+# our quote can differ from a platform that rolls on a different schedule.
+# Override with FUTURES_ROLL_DAYS_BEFORE_EXPIRY if the provider's behaviour
+# changes; `make futures-roll-check` re-measures it from futures_quotes.
+_MONTH_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
+_ROLL_DAYS_BEFORE_EXPIRY = _getenv_int("FUTURES_ROLL_DAYS_BEFORE_EXPIRY", 7)
+
+
+def active_contract_expiry(at: Optional[datetime] = None, roll_days: Optional[int] = None) -> date:
+    """Expiry of the contract a CONTINUOUS feed is quoting at ``at``.
+
+    Deliberately NOT :func:`next_quarterly_expiry`, which answers "the next
+    expiry on or after this date". Those two differ for the week between the
+    roll and expiry, and in that week the nearest expiry belongs to the
+    contract the feed has already left -- so naming it would label a December
+    quote as September, and price a whole quarter of carry over a few days.
+    """
+    today = (at or datetime.now(timezone.utc)).date()
+    cutoff = today + timedelta(days=_ROLL_DAYS_BEFORE_EXPIRY if roll_days is None else roll_days)
+    for year in (today.year, today.year + 1):
+        for month in _QUARTER_MONTHS:
+            expiry = _third_friday(year, month)
+            if expiry > cutoff:
+                return expiry
+    # Unreachable for any real date; keeps the return type honest.
+    return _third_friday(today.year + 1, _QUARTER_MONTHS[0])
+
+
+def active_contract_code(
+    future_symbol: Optional[str],
+    at: Optional[datetime] = None,
+    roll_days: Optional[int] = None,
+) -> Optional[str]:
+    """``"@NQ"`` -> ``"NQZ26"`` — the contract the continuous series is on.
+
+    DISPLAY-ONLY, and derived from the roll calendar rather than read back
+    from the provider, so it is a label and never a key for data, pricing or
+    persistence. Returns None when there is no future to name.
+    """
+    root = (future_symbol or "").lstrip("@").strip().upper()
+    if not root:
+        return None
+    expiry = active_contract_expiry(at, roll_days)
+    return f"{root}{_MONTH_CODES[expiry.month]}{expiry.year % 100:02d}"
+
+
 def next_quarterly_expiry(at: Optional[datetime] = None) -> date:
     """Expiry of the front quarterly contract on/after ``at``."""
     today = (at or datetime.now(timezone.utc)).date()
@@ -428,15 +508,27 @@ def next_quarterly_expiry(at: Optional[datetime] = None) -> date:
 
 
 def theoretical_ratio(index_symbol: str, at: Optional[datetime] = None) -> float:
-    """Cost-of-carry ratio ``e^((r - q) T)`` for the front quarterly future.
+    """Cost-of-carry ratio ``e^((r - q) T)`` for the ACTIVE quarterly future.
 
     The fallback when no concurrent print pair is available.  Uses the
     configured ``RISK_FREE_RATE`` and the per-symbol dividend yield, so it is
     only as good as those assumptions — which is exactly why the measured
     ratio is preferred whenever the tape offers one.
+
+    ``T`` runs to :func:`active_contract_expiry`, NOT
+    :func:`next_quarterly_expiry`.  The two differ for the week between the
+    roll and the old contract's expiry, and in that week the nearer expiry
+    belongs to the contract the feed has already left: pricing a whole
+    quarter of carry over the few days to it collapses the ratio to roughly
+    1.0.  On the Sep 2026 roll that was ~100bp low on NQ — about 290 points
+    of misplaced levels — and it lands in exactly the situation this fallback
+    exists for, because the cash index stops printing overnight and the
+    measured path has nothing to read.  ``FUTURES_BASIS_MAX_DEVIATION`` does
+    not catch it either: both the right and the wrong ratio sit well inside
+    the 3% bound.
     """
     now = at or datetime.now(timezone.utc)
-    days = max((next_quarterly_expiry(now) - now.date()).days, 0)
+    days = max((active_contract_expiry(now) - now.date()).days, 0)
     years = days / 365.0
     q = resolve_dividend_yield(index_symbol)
     return exp((RISK_FREE_RATE - q) * years)
