@@ -695,7 +695,8 @@ def compare_flow_classification(
     # aggregate is a changed number on the site.
     net_inc = 0
     net_cand = 0
-    crossed = 0
+    crossed_cand = 0
+    crossed_inc = 0
 
     for symbol, inc_q in incumbent.quotes.items():
         cand_q = candidate.quotes.get(symbol)
@@ -725,11 +726,21 @@ def compare_flow_classification(
         elif cand_bucket == "bid":
             net_cand -= volume
         # A quote whose bid exceeds its ask cannot be classified against.
-        # ThetaData stated the Market Value adjustment never introduces one;
-        # counted here because a penny of movement either side of a
-        # penny-wide spread is exactly how one would arise.
-        if cand_q.bid is not None and cand_q.ask is not None and cand_q.bid > cand_q.ask:
-            crossed += 1
+        # ThetaData stated the Market Value adjustment never introduces one,
+        # and a penny of movement either side of a penny-wide spread is
+        # exactly how one would arise -- so this counts them.
+        #
+        # On BOTH feeds, which the first version of this did not. A count on
+        # the candidate alone cannot tell "Market Value crossed this quote"
+        # from "the book was already crossed", and after the close the book
+        # frequently is. Only the difference between the two is evidence
+        # about the adjustment.
+        for q, key in ((inc_q, "inc"), (cand_q, "cand")):
+            if q.bid is not None and q.ask is not None and q.bid > q.ask:
+                if key == "inc":
+                    crossed_inc += 1
+                else:
+                    crossed_cand += 1
         if inc_bucket != cand_bucket:
             disagreed += 1
             volume_disagreed += volume
@@ -754,7 +765,9 @@ def compare_flow_classification(
         "net_imbalance_shift_pct": (
             (100.0 * (net_cand - net_inc) / abs(net_inc)) if net_inc else None
         ),
-        "crossed_candidate_quotes": crossed,
+        "crossed_candidate_quotes": crossed_cand,
+        "crossed_incumbent_quotes": crossed_inc,
+        "crossed_introduced": crossed_cand - crossed_inc,
     }
 
 
@@ -782,10 +795,12 @@ def _print_flow_classification(flow: Dict[str, Any]) -> None:
             f"  NET imbalance  incumbent {ni:+,}   candidate {nc:+,}   "
             f"shift {shift_s}   <- THIS is what reaches a signal"
         )
-    if flow.get("crossed_candidate_quotes"):
+    if flow.get("crossed_candidate_quotes") or flow.get("crossed_incumbent_quotes"):
         print(
-            f"  crossed     {flow['crossed_candidate_quotes']} candidate quotes had "
-            f"bid > ask (unclassifiable)"
+            f"  crossed     incumbent {flow['crossed_incumbent_quotes']}   "
+            f"candidate {flow['crossed_candidate_quotes']}   "
+            f"introduced {flow['crossed_introduced']:+d}  "
+            f"<- only the difference is about Market Value"
         )
     if flow.get("shifts"):
         moves = ", ".join(f"{k} x{v}" for k, v in flow["shifts"].items())

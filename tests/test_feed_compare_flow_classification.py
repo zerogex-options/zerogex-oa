@@ -167,3 +167,18 @@ def test_crossed_candidate_quotes_are_counted():
     mv = {"A": _q("A", bid=1.87, ask=1.86, last=1.87, volume=10)}
     out = compare_flow_classification(_sample("rt", rt), _sample("mv", mv))
     assert out["crossed_candidate_quotes"] == 1
+    assert out["crossed_incumbent_quotes"] == 0
+    assert out["crossed_introduced"] == 1
+
+
+def test_a_book_that_was_already_crossed_is_not_charged_to_market_value():
+    """Counting crossed quotes on the candidate alone cannot tell "Market
+    Value crossed this" from "the book was already crossed", and after the
+    close the book frequently is. Only the difference is evidence."""
+    crossed = dict(bid=1.87, ask=1.86, last=1.87, volume=10)
+    rt = {"A": _q("A", **crossed)}
+    mv = {"A": _q("A", **crossed)}
+    out = compare_flow_classification(_sample("rt", rt), _sample("mv", mv))
+    assert out["crossed_incumbent_quotes"] == 1
+    assert out["crossed_candidate_quotes"] == 1
+    assert out["crossed_introduced"] == 0
