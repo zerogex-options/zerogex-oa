@@ -302,23 +302,24 @@ _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 _STICKY_CARRY_FIELDS = ("DailyOpenInterest", "OpenInterest", "Volume") + _IV_FIELD_NAMES
 
 
-def _has_positive_oi(raw: Dict[str, Any]) -> bool:
-    """True when a raw stream/REST quote carries a positive open-interest value.
+def _has_positive_oi(quote: Any) -> bool:
+    """True when a drained quote carries a positive open-interest value.
 
-    Mirrors the accumulator's positive-only OI merge rule: TradeStation
-    sends 0 (or omits the field) on most stream deltas, and only a genuine
-    positive reading counts as "we know this contract's OI".
+    Takes a provider ``OptionQuote``, not a raw vendor row. It used to walk
+    TradeStation's own field names -- DailyOpenInterest then OpenInterest --
+    which is a decision only that provider's module can make, and which
+    raised ``'OptionQuote' object has no attribute 'get'`` the moment the
+    streams started arriving normalised.
+
+    The rule it encodes is unchanged and still belongs here: a feed sends 0,
+    or omits the field, on most stream deltas, so only a genuine positive
+    reading counts as "we know this contract's open interest".
     """
-    for key in ("DailyOpenInterest", "OpenInterest"):
-        val = raw.get(key)
-        if val is None:
-            continue
-        try:
-            if int(val) > 0:
-                return True
-        except (ValueError, TypeError):
-            continue
-    return False
+    oi = getattr(quote, "open_interest", None)
+    try:
+        return oi is not None and int(oi) > 0
+    except (ValueError, TypeError):
+        return False
 
 
 def _bar_to_row(bar: Any) -> Optional[Dict[str, Any]]:
@@ -1985,8 +1986,8 @@ class StreamManager:
         self._session_oi_symbols &= tracked_set
         self._session_oi_symbols.update(
             sym
-            for sym, raw in changed_state.items()
-            if sym in tracked_set and _has_positive_oi(raw)
+            for sym, quote in changed_state.items()
+            if sym in tracked_set and _has_positive_oi(quote)
         )
         if tracked_total <= 0:
             return 0.0
@@ -2026,8 +2027,8 @@ class StreamManager:
         self._session_volume_symbols &= tracked_set
         self._session_volume_symbols.update(
             sym
-            for sym, raw in changed_state.items()
-            if sym in tracked_set and int(raw.get("Volume") or 0) > 0
+            for sym, quote in changed_state.items()
+            if sym in tracked_set and int(getattr(quote, "volume", None) or 0) > 0
         )
         if tracked_total <= 0:
             return 0.0
