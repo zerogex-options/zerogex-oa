@@ -15,7 +15,7 @@ Four conditions. All four must be true at launch or we do not launch.
 | # | Gate | State |
 |---|---|---|
 | G1 | Production ingestion can read ThetaData at all | ✅ **built** — `4fd69a6`, `a94c8e6`; full suite clean |
-| G2 | ThetaData has written one full trading session through the real ingestion path | ❌ blocked on G1 |
+| G2 | ThetaData has written one full trading session through the real ingestion path | ⚠️ G1 done; needs the rehearsal in §6.1 |
 | G3 | ES / NQ has a source that survives TradeStation being switched off | ✅ **done** — carry basis, `a94c8e6`; site label still to change |
 | G4 | Every known behaviour change at cutover is written down and accepted | ⚠️ §5 |
 
@@ -205,6 +205,46 @@ heavily traded ATM strike.
 
 ---
 
+## 6.1 How G2 is actually run · **corrected**
+
+The earlier wording assumed flipping `MARKET_DATA_PROVIDER` could be rehearsed. It cannot. The
+ingestion engine has **no shadow-write mode** — only `feed_compare` writes the shadow tables — so
+setting that variable writes ThetaData straight into live `option_chains` and `underlying_quotes`.
+That is the cutover, not a rehearsal, and there is no way to watch a full session first.
+
+The fix needs no code. `DB_NAME` is a plain environment variable read at connection time, so a
+**second ingestion process pointed at a scratch database** runs the real engine, the real provider
+and the real write path while touching nothing a customer reads.
+
+```bash
+# once, on RDS
+createdb zerogex_shadow          # or: psql -c 'CREATE DATABASE zerogex_shadow;'
+DB_NAME=zerogex_shadow make schema-apply
+
+# the rehearsal — start before 09:30 ET, leave it for the session
+MARKET_DATA_PROVIDER=thetadata_mv DB_NAME=zerogex_shadow \
+  .venv/bin/python -m src.ingestion.main_engine \
+  --underlyings 'SPY,QQQ,$SPXW.X,$NDXP.X'
+```
+
+Rollback is `kill`. Production never sees it.
+
+**Read at the close, against the live tables for the same session:**
+
+| Check | Passes when |
+|---|---|
+| Minute coverage | `underlying_quotes` row count per symbol within a few of live |
+| Gaps | no minute bucket missing between 09:30 and 16:00 |
+| Chain size | `option_chains` contracts per cycle comparable to live |
+| Open interest | OI present on the same share of contracts as live |
+| Volume | the new `volume` column populated for SPY/QQQ, NULL for the indices |
+| Errors | no circuit-breaker trips, no sustained reconnects in the log |
+
+**G2 passes on a clean session, not on "it ran".** A process that stayed up while dropping half
+its minutes is the failure this gate exists to catch.
+
+---
+
 ## 7. Timeline
 
 Tight with no slack. The shadow session needs a market day, which fixes the order.
@@ -213,8 +253,8 @@ Tight with no slack. The shadow session needs a market day, which fixes the orde
 |---|---|---|
 | **Tue (today)** | Decisions §4.1 and §4.2. Build the flow-classification diff (§6). | decisions closed |
 | **Wed** | Wire the ingestion path to the provider seam (§3). Deploy to the server. Run the flow diff on Wednesday's session. | G1 |
-| **Thu, pre-open** | ThetaData writing through the real ingestion path, into shadow tables, before 09:30 ET. | — |
-| **Thu, full session** | Watch it write a clean day. Compare against the live TradeStation tables. | **G2** |
+| **Thu, pre-open** | Scratch database created and schema applied; the second ingestion process started before 09:30 ET (§6.1). | — |
+| **Thu, full session** | Watch it write a clean day. Compare against the live tables at the close, on the table in §6.1. | **G2** |
 | **Fri** | Cut over. TradeStation stays running and warm, unused, for a week. | G3, G4 |
 
 **The hard gate is Thursday's open.** If the wiring is not deployed and writing by then, there is
@@ -225,8 +265,11 @@ day. That is the abort trigger, not a thing to push through.
 
 ## 8. Abort and rollback
 
-- **Rollback is `MARKET_DATA_PROVIDER=tradestation` and a service restart** — once §3 is built.
-  That is the entire reason for doing the wiring properly rather than swapping clients by hand.
+- **Rollback is `MARKET_DATA_PROVIDER=tradestation` and a service restart.** Built and verified
+  (`4fd69a6`, `a94c8e6`). That is the entire reason for doing the wiring properly rather than
+  swapping clients by hand.
+- **Rollback for the rehearsal is `kill`** — it writes to its own database and production never
+  reads it.
 - TradeStation stays running and credentialed for one week after cutover. It is not switched off
   until seven consecutive days of clean ThetaData ingestion (runbook step 16).
 - **Abort Friday's launch if:** Thursday's session shows any gap in shadow ingestion; the flow
