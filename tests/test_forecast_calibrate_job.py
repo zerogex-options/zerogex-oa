@@ -265,3 +265,93 @@ async def test_recalibrate_swallows_db_errors():
         assert rc == 0
     finally:
         fc_mod.DatabaseManager = orig  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# The coverage loop must be CLOSED — it steers on the committed band.
+#
+# It used to measure raw_projected_low/high, which compute_forecast snapshots
+# BEFORE band_width_mult is applied. The raw band therefore does not move when
+# the multiplier moves, so the error kept its sign forever and the multiplier
+# walked to a bound and stayed there instead of converging. None of the tests
+# above caught it, because in all of them the raw and committed bands agree.
+# These deliberately disagree.
+# ---------------------------------------------------------------------------
+
+
+def _split_band_receipts(
+    n: int, *, committed_contains: bool, raw_contains: bool
+) -> list[dict]:
+    """Receipts where the RAW and COMMITTED verdicts deliberately differ.
+
+    Raw band is always [80, 120]; committed is the narrower [95, 105]. The
+    day's range is placed to fall inside one and outside the other.
+    """
+    out = []
+    for i in range(n):
+        if committed_contains:
+            lo, hi = 96.0, 104.0            # inside committed, so inside raw too
+        elif raw_contains:
+            lo, hi = 85.0, 115.0            # outside committed, inside raw
+        else:
+            lo, hi = 70.0, 130.0            # outside both
+        out.append(
+            _receipt(
+                projected_low=95.0, projected_high=105.0,
+                raw_low=80.0, raw_high=120.0,
+                actual_low=lo, actual_high=hi, actual_close=100.0,
+                day=date(2026, 6, 1 + (i % 28)),
+            )
+        )
+    return out
+
+
+def test_band_narrows_when_the_COMMITTED_band_over_covers():
+    mod = _reload_module()
+    receipts = _split_band_receipts(20, committed_contains=True, raw_contains=True)
+    updates = mod._compute_updates(receipts, _neutral_state())
+    assert updates["summary"]["coverage"] == 1.0
+    assert updates["band_width_mult"] < 1.0, "100% committed coverage must tighten the band"
+
+
+def test_band_widens_when_the_COMMITTED_band_misses_even_though_RAW_holds():
+    """The regression. Raw coverage is 100%, committed coverage is 0%.
+
+    Steering on raw would TIGHTEN an already-too-narrow band. Steering on the
+    committed band — the one that was published and graded — widens it.
+    """
+    mod = _reload_module()
+    receipts = _split_band_receipts(20, committed_contains=False, raw_contains=True)
+    updates = mod._compute_updates(receipts, _neutral_state())
+    assert updates["summary"]["coverage"] == 0.0, "committed band contained nothing"
+    assert updates["summary"]["raw_coverage"] == 1.0, "raw band contained everything"
+    assert updates["band_width_mult"] > 1.0, (
+        "a band that missed every single day must widen; steering on raw_coverage "
+        "would have narrowed it instead"
+    )
+
+
+def test_raw_coverage_is_reported_but_no_longer_steers():
+    mod = _reload_module()
+    same = mod._compute_updates(
+        _split_band_receipts(20, committed_contains=True, raw_contains=True),
+        _neutral_state(),
+    )
+    # Identical committed verdicts, opposite raw verdicts -> identical band.
+    flipped = _split_band_receipts(20, committed_contains=True, raw_contains=True)
+    for r in flipped:
+        r["raw_projected_low"], r["raw_projected_high"] = 99.0, 101.0  # raw now misses
+    other = mod._compute_updates(flipped, _neutral_state())
+    assert other["summary"]["raw_coverage"] != same["summary"]["raw_coverage"]
+    assert other["band_width_mult"] == same["band_width_mult"], (
+        "raw coverage is a diagnostic; it must not move the multiplier"
+    )
+
+
+def test_the_floor_allows_the_width_the_data_calls_for():
+    mod = _reload_module()
+    assert mod.BOUNDS["band_width_mult"][0] <= 0.49, (
+        "34 live sessions at 100% coverage with max required scale 0.991 need "
+        "room below the old 0.70 floor the open loop used to pin against"
+    )
+    assert mod.TARGET_COVERAGE == 0.85, "middle of the advertised 80-90% band"

@@ -47,7 +47,7 @@ def _inputs(**overrides) -> ForecastInputs:
 
 def test_range_model_tag():
     result = compute_forecast(_inputs())
-    assert result.range_model == "heuristic_v1_4"
+    assert result.range_model == "heuristic_v1_5"
 
 
 def test_asymmetric_walls_produce_asymmetric_band():

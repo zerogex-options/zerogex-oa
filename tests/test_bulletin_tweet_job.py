@@ -1056,6 +1056,186 @@ def test_llm_validator_accepts_input_prices():
     assert bulletin_llm._validate_no_invented_prices(post, inputs) is True
 
 
+# ---------------------------------------------------------------------------
+# Level claims: "the 780 call wall" has to BE the call wall
+# ---------------------------------------------------------------------------
+
+
+def _close_read_spy(**overrides):
+    """A close read where the call wall sat at 765 all session, the put wall
+    walked 757 → 756 → 755, and the chain re-priced after the bell."""
+    from src.jobs import bulletin_llm
+
+    fields = dict(
+        symbol="SPY",
+        spot=761.30,
+        prior_close=758.90,
+        session_open=759.20,
+        session_high=764.90,
+        session_low=757.10,
+        gamma_flip=758.40,
+        call_wall=765.0,
+        put_wall=755.0,
+        max_pain=760.0,
+        historical_level_values=[757.0, 756.0, 755.0, 765.0, 758.1, 758.9],
+        level_paths={
+            "put_wall": [757.0, 756.0, 755.0],
+            "call_wall": [765.0],
+            "gamma_flip": [758.1, 758.4, 758.1, 758.9],
+        },
+    )
+    fields.update(overrides)
+    return bulletin_llm.SymbolInput(**fields)
+
+
+def _draft(opening: str, **overrides):
+    from src.jobs import bulletin_llm
+
+    fields = dict(
+        header_label="Post-Market Read",
+        opening=opening,
+        bottom_line="Short gamma until the flip is reclaimed.",
+        reply="The tell was how fast every pop got sold.",
+        level_notes={},
+    )
+    fields.update(overrides)
+    return bulletin_llm.LlmPost(**fields)
+
+
+@pytest.mark.parametrize(
+    "opening, spy_overrides",
+    [
+        # The post-bell roll-off resets the chain's call wall to 780.  Even
+        # with 780 whitelisted (as the guard used to), the claim is caught.
+        (
+            "SPY stalled right under the 780 call wall into the bell.",
+            {"historical_level_values": [757.0, 756.0, 755.0, 765.0, 780.0]},
+        ),
+        # A round number near the session high, dressed up as the wall.
+        (
+            "Buyers pressed into the 780 call wall and stalled.",
+            {
+                "spot": 776.40,
+                "session_high": 778.10,
+                "call_wall": 785.0,
+                "level_paths": {"call_wall": [785.0]},
+            },
+        ),
+        # A real number carrying the wrong label.
+        ("Overhead, the call wall at 780 caps the upside.", {"max_pain": 780.0}),
+    ],
+)
+def test_level_claim_catches_a_call_wall_the_session_never_had(opening, spy_overrides):
+    """Regression: two days of posts named 780 as SPY's call wall when the
+    call wall was never 780.  The number guard passes every one of these —
+    780 sits within its tolerance of some input price — because it never
+    asks which level a number was attached to."""
+    from src.jobs import bulletin_llm
+
+    inputs = [_close_read_spy(**spy_overrides)]
+    post = _draft(opening)
+    assert bulletin_llm._validate_no_invented_prices(post, inputs) is True
+    problems = bulletin_llm._post_problems(post, inputs)
+    assert len(problems) == 1
+    assert "780" in problems[0]
+    assert "the call wall was" in problems[0]
+
+
+def test_level_claim_accepts_the_real_levels_and_their_session_path():
+    from src.jobs import bulletin_llm
+
+    inputs = [_close_read_spy()]
+    for opening in (
+        "SPY stalled well short of the 765 call wall.",
+        "The call wall at $765 capped every push.",
+        "It lost the 757 put wall, then 756, before the 755 put wall held.",
+        "The put wall walked lower: 757 put wall first, then the 756 put wall.",
+        "Spot closed above the gamma flip at 758.40.",
+        "Spot closed above the 758 flip.",  # the flip is a computed price
+        "Max pain at 760 did the pinning.",
+        "The roll-off resets the put wall well lower into tomorrow.",
+    ):
+        assert bulletin_llm._post_problems(_draft(opening), inputs) == [], opening
+
+
+def test_level_claim_ignores_numbers_not_tied_to_a_level():
+    from src.jobs import bulletin_llm
+
+    inputs = [_close_read_spy()]
+    for opening in (
+        "The call wall held and SPY faded back to 761.30.",
+        "SPY could flip 760 into support tomorrow.",  # a verb, not the level
+        "The put wall gave way to the 758 flip.",  # 758 is the flip's
+        "The call wall is 15 points overhead.",  # a distance, not a price
+    ):
+        assert bulletin_llm._post_problems(_draft(opening), inputs) == [], opening
+
+
+def _claude_reply(opening: str) -> dict:
+    body = {
+        "header_label": "Post-Market Read",
+        "opening": opening,
+        "level_notes": {},
+        "bottom_line": "Short gamma until the flip is reclaimed.",
+        "reply": "The tell was how fast every pop got sold.",
+    }
+    return {"content": [{"type": "text", "text": json.dumps(body)}], "stop_reason": "end_turn"}
+
+
+def test_generate_post_sends_a_misstated_level_back_once(monkeypatch):
+    """The draft goes back with the specifics, and the fixed draft is used."""
+    from src.jobs import bulletin_llm
+
+    calls = []
+    replies = iter(
+        [
+            _claude_reply("SPY stalled right under the 780 call wall."),
+            _claude_reply("SPY stalled right under the 765 call wall."),
+        ]
+    )
+
+    def _fake_call(system, messages, *args):
+        calls.append(list(messages))
+        return next(replies)
+
+    monkeypatch.setattr(bulletin_llm, "_call_claude", _fake_call)
+    post = bulletin_llm.generate_post(
+        mode="close",
+        day=date(2026, 9, 22),
+        symbols=[_close_read_spy()],
+        api_key="test-key",
+        featured_symbol="SPY",
+    )
+    assert post is not None
+    assert "765 call wall" in post.opening
+    assert len(calls) == 2
+    retry = calls[1]
+    assert [m["role"] for m in retry] == ["user", "assistant", "user"]
+    assert "780 call wall" in retry[1]["content"]
+    assert "the call wall was 765, never 780" in retry[2]["content"]
+
+
+def test_generate_post_falls_back_when_the_correction_still_misstates(monkeypatch):
+    from src.jobs import bulletin_llm
+
+    calls = []
+
+    def _fake_call(system, messages, *args):
+        calls.append(messages)
+        return _claude_reply("SPY stalled right under the 780 call wall.")
+
+    monkeypatch.setattr(bulletin_llm, "_call_claude", _fake_call)
+    post = bulletin_llm.generate_post(
+        mode="close",
+        day=date(2026, 9, 22),
+        symbols=[_close_read_spy()],
+        api_key="test-key",
+        featured_symbol="SPY",
+    )
+    assert post is None
+    assert len(calls) == 1 + bulletin_llm.MAX_CORRECTION_ROUNDS
+
+
 def test_llm_extract_json_block_ignores_preamble():
     from src.jobs import bulletin_llm
 
@@ -1964,8 +2144,13 @@ async def test_level_history_reaches_the_llm_inputs_and_the_review_record():
 
     payload = captured["symbols"][0].to_prompt_dict()["level_history"]
     assert [seg["value"] for seg in payload["put_wall"]["path"]] == [777.0, 776.0, 775.0]
-    assert payload["put_wall"]["after_the_bell"] == pytest.approx(765.0)
+    # The model learns the put wall reset lower after the bell, but not to
+    # what: that number is tomorrow's, and the post prints it itself.
+    assert payload["put_wall"]["after_the_bell_reset"] == "lower"
+    assert "after_the_bell" not in payload["put_wall"]
     assert 777.0 in captured["symbols"][0].historical_level_values
+    assert 765.0 not in captured["symbols"][0].historical_level_values
+    assert captured["symbols"][0].level_paths["put_wall"] == [777.0, 776.0, 775.0]
 
     record = mod.build_latest_record(
         mode="close",
@@ -1980,6 +2165,8 @@ async def test_level_history_reaches_the_llm_inputs_and_the_review_record():
     )
     assert record["levels"]["put_wall"] == pytest.approx(775.0)
     assert record["levels"]["level_history"]["put_wall"]["at_session_close"] == pytest.approx(775.0)
+    # The review record still carries the reset value, for tracing.
+    assert record["levels"]["level_history"]["put_wall"]["after_the_bell"] == pytest.approx(765.0)
 
 
 def test_llm_validator_accepts_superseded_wall_prints():

@@ -113,21 +113,25 @@ Expect `Tasks:` in the dozens and one child per configured feed.
 
 ## 5. Backfill the gap
 
-`underlying_quotes` is recoverable from TradeStation's barchart history. It is
-idempotent on `(symbol, timestamp)`, so a wider range than the gap is safe.
+`underlying_quotes` is recoverable from TradeStation's barchart history. The
+tool takes whole ET dates, so **pass `--only-missing`**: it inserts the minutes
+that have no row and leaves the rest of the day alone. Without it the write is
+an upsert over every minute in the range, and because the historical endpoint
+has no Up/Down volume split, it replaces the streamed split with 0/0 for the
+whole day, not just the gap — every buy/sell reading then shows a flat 50/50.
 
 ```bash
 venv/bin/python -m src.tools.underlying_backfill \
-  --symbols QQQ --start 2026-08-18 --end 2026-08-18 \
-  --session-template "$(grep '^SESSION_TEMPLATE=' .env | cut -d= -f2)" --dry-run
+  --symbols QQQ --start 2026-08-18 --end 2026-08-18 --only-missing --dry-run
 ```
 
-**Pass the same `--session-template` as `.env`.** The tool defaults to
-`Default` (09:30–16:00 ET); production runs `USEQ24Hour` (04:00–20:00). Using
-the default against a 24-hour deployment silently backfills only the regular
-session and leaves every pre/post-market bar missing — the bar count is how you
-catch it (~390/day under `Default` vs ~900 under `USEQ24Hour`). Drop
+The dry run reads the table and lists the minutes it would fill. Drop
 `--dry-run` to write.
+
+The tool's default session template is `USEQ24Hour` (04:00–20:00 ET), the
+window production streams. A narrower `--session-template` such as `Default`
+(09:30–16:00 ET) silently skips every pre/post-market bar — the bar count is how
+you catch it (~390/day under `Default` vs ~900 under `USEQ24Hour`).
 
 Only backfill what was actually lost: if the outage began after 16:00 ET, the
 cash indices lost nothing.

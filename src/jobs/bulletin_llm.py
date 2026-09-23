@@ -14,9 +14,12 @@ Division of labour — the same discipline the old template used, kept:
     takeaway, and the reply).
   * Python controls every price the post QUOTES in its ``Key levels:``
     block — the model NEVER invents a level.  The model may *reference* a
-    level in prose ("dumped through the 740 put wall"), but a best-effort
-    validator rejects any 3+ digit number that isn't in the input, and the
-    caller falls back to a deterministic template on any failure.
+    level in prose ("dumped through the 740 put wall"), but every draft is
+    checked: a number named as a level must be that level's value (its
+    standing value or a print from its own session path), and any other
+    in-band number must be a price from the input.  A draft that fails is
+    handed back to the model once with the specifics; if it still fails, the
+    caller falls back to a deterministic template.
 
 Contract:
   * Enabled when ``ANTHROPIC_API_KEY`` is set.  Missing key → returns
@@ -35,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
@@ -53,6 +57,12 @@ DEFAULT_MODEL = "claude-sonnet-5"
 # if the model still overflows, but at 3000 that's a rare case.
 DEFAULT_MAX_TOKENS = 3000
 DEFAULT_TIMEOUT_SECONDS = 45
+# How many times a draft that misstates a level is handed back to the model
+# with the specifics before we give up and post the static template.  The
+# usual failure is one sentence in an otherwise good post; "the call wall was
+# 765, never 780" lets the model fix that sentence instead of the whole post
+# being thrown away.
+MAX_CORRECTION_ROUNDS = 1
 
 # The three canonical level keys the model may annotate.  Python owns the
 # actual prices and base labels; the model only supplies an optional short
@@ -142,13 +152,13 @@ source for a claim about what happened at a level.
 * NEVER say a level was untested, defended, held or broken unless the
   matching "outcome" says so.  A level that only became the wall at 14:00 was
   not in play at the open — do not narrate it as if it were.
-* "after_the_bell" values are NOT the session's levels.  They are what the
-  chain re-priced to once the day's 0DTE expiries rolled off after 16:00 ET,
-  i.e. tomorrow's structure.  Never attribute any of today's price action to
-  them.  You may mention the reset as a forward-looking note ("the roll-off
-  resets the put wall well lower into tomorrow"), never as something the tape
-  traded against today.  A separate line stating the reset is appended for
-  you, so do not spell out those numbers yourself.
+* An "after_the_bell_reset" ("higher" / "lower") means the chain re-priced
+  that level once the day's 0DTE expiries rolled off after 16:00 ET — that is
+  tomorrow's structure, never a level the tape traded against today.  You may
+  mention the reset as a forward-looking note ("the roll-off resets the put
+  wall well lower into tomorrow").  You are not given the new value: a
+  separate line stating it is appended for you, so never write a number for
+  it.
 * The gamma flip is a drifting computed price, not a strike.  Use
   "spot_crossings", "spot_side_at_open" and "spot_side_at_close" for whether
   the tape ever changed regime — zero crossings means it never did, however
@@ -176,6 +186,13 @@ STRICT RULES:
   ANY symbol — MUST appear verbatim in the input's "levels" block.  Never
   invent a number.  If you are unsure of a number, describe it without quoting
   a figure.
+* A number you put next to a named level — "the 745 call wall", "call wall at
+  745", "the 740 put wall", "the 747.29 flip", "max pain at 744" — must be
+  THAT level's value in the input: its top-level figure, or a value from that
+  level's own "path" in "level_history".  Never round a level to a nearby
+  round number (a 778 call wall is not "the 780 call wall"), never give one
+  level another level's number, and never call a strike a wall because price
+  stalled there or because it is a round number.
 * When quoting net gamma, use the "net_gex_display" value ("+$7.74B",
   "−$125.0M") — NEVER the raw "net_gex" float.
 * Do NOT restate the levels as a bulleted list in your prose — the caller adds
@@ -260,9 +277,12 @@ class SymbolInput:
     # :func:`src.jobs.level_history.LevelHistory.to_prompt_dict`.  None on the
     # pre-market fire (no session path yet).  ``historical_level_values`` is
     # the flat list of every value in that path, so the invented-price guard
-    # accepts a wall print that has since been superseded.
+    # accepts a wall print that has since been superseded.  ``level_paths`` is
+    # the same values kept per level ("call_wall" / "put_wall" / "gamma_flip"),
+    # so a sentence naming a level can be held to that level's own values.
     level_history: dict[str, Any] | None = None
     historical_level_values: list[float] = field(default_factory=list)
+    level_paths: dict[str, list[float]] = field(default_factory=dict)
 
     def change_pct(self) -> float | None:
         if self.spot is None or self.prior_close in (None, 0):
@@ -464,7 +484,7 @@ def _extract_json_block(text: str) -> str | None:
 
 def _call_claude(
     system: str,
-    user_message: str,
+    messages: list[dict[str, str]],
     api_key: str,
     model: str,
     max_tokens: int,
@@ -474,7 +494,7 @@ def _call_claude(
         "model": model,
         "max_tokens": max_tokens,
         "system": system,
-        "messages": [{"role": "user", "content": user_message}],
+        "messages": messages,
     }
     req = Request(
         ANTHROPIC_API_URL,
@@ -584,11 +604,61 @@ def _parse_post(body_json: str) -> LlmPost | None:
     )
 
 
-def _validate_no_invented_prices(
-    post: LlmPost,
-    symbols: list[SymbolInput],
-) -> bool:
-    """Best-effort check that the model didn't quote a fake LEVEL for the symbol.
+def _post_text(post: LlmPost) -> str:
+    """Everything the model wrote (post + reply + notes), comma-thousands
+    collapsed so "7,483" reads as one number."""
+    combined = "\n".join(
+        [
+            post.opening,
+            post.bottom_line,
+            post.reply,
+            " ".join(post.level_notes.values()),
+        ]
+    )
+    return re.sub(r"(?<=\d),(?=\d{3}\b)", "", combined)
+
+
+def _input_prices(s: SymbolInput) -> list[float]:
+    """Every price the model was given for ``s``."""
+    values = (
+        s.spot,
+        s.prior_close,
+        s.session_open,
+        s.session_high,
+        s.session_low,
+        s.gamma_flip,
+        s.call_wall,
+        s.put_wall,
+        s.max_pain,
+        s.vwap,
+        *s.historical_level_values,
+    )
+    return [v for v in values if v is not None]
+
+
+def _price_band(s: SymbolInput) -> tuple[float, float] | None:
+    """The range where a number would read as a price for ``s``.
+
+    Anchored on spot when we have it, else the centre of the provided levels.
+    ±15% is wide enough to cover the walls / flip / session range and tight
+    enough to exclude typical macro news figures."""
+    if s.spot:
+        anchor = s.spot
+    else:
+        values = _input_prices(s)
+        if not values:
+            return None
+        anchor = sum(values) / len(values)
+    return anchor * 0.85, anchor * 1.15
+
+
+def _in_band(n: float, s: SymbolInput) -> bool:
+    band = _price_band(s)
+    return band is not None and band[0] <= n <= band[1]
+
+
+def _invented_prices(post: LlmPost, symbols: list[SymbolInput]) -> list[str]:
+    """In-band numbers in the narrative that match no price in the input.
 
     Scans the narrative (post + reply + notes) for numbers that fall inside the
     symbol's plausible PRICE BAND — i.e. numbers that could be mistaken for a
@@ -606,30 +676,16 @@ def _validate_no_invented_prices(
     the model has been told the put wall walked 777 → 776 → 775, "it lost 777
     and 776 before defending 775" is the accurate read, and rejecting it would
     force the post back to the closing-snapshot version this tracking exists
-    to replace."""
-    import re
+    to replace.
 
+    This check is deliberately loose (±2, and the nearest multiple of 5 of any
+    input price counts as known) so a plain price reference like "SPY pushed
+    toward 780" survives.  It says nothing about WHICH level a number is — that
+    is :func:`_misstated_levels`' job."""
     raw_values: list[float] = []
-    spots: list[float] = []
     known_values: set[int] = set()
     for s in symbols:
-        if s.spot:
-            spots.append(s.spot)
-        for v in (
-            s.spot,
-            s.prior_close,
-            s.session_open,
-            s.session_high,
-            s.session_low,
-            s.gamma_flip,
-            s.call_wall,
-            s.put_wall,
-            s.max_pain,
-            s.vwap,
-            *s.historical_level_values,
-        ):
-            if v is None:
-                continue
+        for v in _input_prices(s):
             raw_values.append(v)
             for candidate in (int(round(v)), int(round(v / 5) * 5)):
                 if candidate > 0:
@@ -638,46 +694,213 @@ def _validate_no_invented_prices(
     if not raw_values:
         # No prices were provided → nothing to validate against; don't reject
         # (the model has no levels to quote anyway).
-        return True
+        return []
 
-    # The band where a number would read as a level for THIS symbol.  Anchor on
-    # spot when we have it, else the centre of the provided levels.  ±15% is
-    # wide enough to cover the walls / flip / session range and tight enough to
-    # exclude typical macro news figures.
-    anchor = (sum(spots) / len(spots)) if spots else (sum(raw_values) / len(raw_values))
-    lo, hi = anchor * 0.85, anchor * 1.15
-
-    combined = "\n".join(
-        [
-            post.opening,
-            post.bottom_line,
-            post.reply,
-            " ".join(post.level_notes.values()),
-        ]
-    )
-    # Collapse comma-thousands so "7,483" tokenizes as one 4-digit number.
-    normalized = re.sub(r"(?<=\d),(?=\d{3}\b)", "", combined)
     # Match 3-6 digit integer parts (skip 1-2 digits — those are everywhere).
-    hits = re.findall(r"(?<!\d)(\d{3,6})(?:\.\d+)?(?!\d)", normalized)
+    hits = re.findall(r"(?<!\d)(\d{3,6})(?:\.\d+)?(?!\d)", _post_text(post))
     invented: list[str] = []
     for h in hits:
         n = int(h)
-        if not (lo <= n <= hi):
+        if not any(_in_band(n, s) for s in symbols):
             # Outside the symbol's price band → a news/other figure, not a
             # level claim.  Leave it alone.
             continue
         # Tolerate ±2 to handle the model quoting "7,483" for spot 7482.71.
-        if not any(abs(n - k) <= 2 for k in known_values):
+        if not any(abs(n - k) <= 2 for k in known_values) and h not in invented:
             invented.append(h)
+    return invented
 
-    if invented:
-        logger.warning(
-            "bulletin_llm: model quoted in-band prices not in input levels: %s "
-            "— falling back to template",
-            sorted(set(invented))[:8],
-        )
+
+def _validate_no_invented_prices(
+    post: LlmPost,
+    symbols: list[SymbolInput],
+) -> bool:
+    """True when every in-band number in the narrative is an input price.
+
+    See :func:`_invented_prices`."""
+    return not _invented_prices(post, symbols)
+
+
+# ---------------------------------------------------------------------------
+# Level claims — "the 780 call wall" has to BE the call wall
+# ---------------------------------------------------------------------------
+
+LEVEL_NAMES = {
+    "call_wall": "call wall",
+    "put_wall": "put wall",
+    "gamma_flip": "gamma flip",
+    "max_pain": "max pain",
+}
+
+# A price as the model writes it: "780", "$780", "761.30".  Never part of a
+# larger token, so "780s" (a range, not a level), "2026" inside a date, or
+# the "5" of "0.5%" don't read as one.
+_NUM = r"(?<![\w.$])\$?(?P<num>\d+(?:\.\d+)?)(?![\w])"
+
+# "<number> <level>": "the 780 call wall", "the 780-strike call wall",
+# "780 (the call wall)".  Bare "flip" / "wall" count here, since "the 747.29
+# flip" and "the 740 wall" are the voice.
+_NUM_THEN_LEVEL = re.compile(
+    _NUM
+    + r"(?:[\s-]+(?:strike|level))?(?:[\s-]+|\s*\(\s*(?:the\s+)?)"
+    + r"(?P<label>call[\s-]+wall|put[\s-]+wall|gamma[\s-]+flip|zero[\s-]+gamma"
+    + r"|max(?:imum)?[\s-]+pain|flip|wall)\b",
+    re.IGNORECASE,
+)
+
+# "<level> <connectives> <number>": "call wall at 780", "the put wall sat at
+# 755", "gamma flip (758.40)", "the flip, which sits at 758.4".  Only words
+# that keep the number ATTACHED to the level may sit between the two, so "the
+# call wall held and SPY ran to 780" is not read as a claim.  Bare "flip" and
+# "wall" need a "the" in front: "SPY could flip 760" is a verb, not a level.
+_CONNECTIVES = (
+    "at|of|near|around|is|was|sits|sat|sitting|stands|stood|now|still|up|down|"
+    "moved|moves|shifted|shifts|rolled|rolls|reset|resets|migrated|walked|stepped|"
+    "to|from|holding|held|pinned|parked|back|just|right|firmly|squarely|remains|"
+    "remained|stays|stayed|lives|overhead|higher|lower|broke|cracked|failed|gave|"
+    "way|which|point|level|line|the|a|its"
+)
+_LEVEL_THEN_NUM = re.compile(
+    r"\b(?P<label>call[\s-]+wall|put[\s-]+wall|gamma[\s-]+flip|zero[\s-]+gamma"
+    r"|max(?:imum)?[\s-]+pain|(?<=\bthe\s)flip|(?<=\bthe\s)wall)\b"
+    + rf"(?:[\s,:(=—–-]+(?:{_CONNECTIVES})\b)*[\s,:(=—–-]+"
+    + _NUM,
+    re.IGNORECASE,
+)
+
+
+def _label_key(label: str) -> str:
+    """Matched level wording → ``LEVEL_NAMES`` key, or "wall" for either."""
+    words = re.sub(r"[\s-]+", " ", label.lower())
+    if words.startswith("call"):
+        return "call_wall"
+    if words.startswith("put"):
+        return "put_wall"
+    if "flip" in words or "gamma" in words:
+        return "gamma_flip"
+    if "pain" in words:
+        return "max_pain"
+    return "wall"
+
+
+def _level_claims(text: str) -> list[tuple[float, str, str]]:
+    """Every (number, level key, matched text) pairing the prose makes."""
+    claims: list[tuple[float, str, str]] = []
+    claimed: set[int] = set()
+    for pattern in (_NUM_THEN_LEVEL, _LEVEL_THEN_NUM):
+        for m in pattern.finditer(text):
+            # A number is claimed once, and the level named right AFTER it
+            # wins: in "the put wall gave way to the 758 flip", 758 is the
+            # flip's, not the put wall's.
+            if m.start("num") in claimed:
+                continue
+            claimed.add(m.start("num"))
+            claims.append((float(m.group("num")), _label_key(m.group("label")), m.group(0).strip()))
+    return claims
+
+
+def _level_values(s: SymbolInput, key: str) -> list[float]:
+    """Every value ``key`` held for ``s`` in the window the read describes —
+    its path through the session, then the standing value."""
+    if key == "wall":
+        return _level_values(s, "call_wall") + _level_values(s, "put_wall")
+    standing = getattr(s, key)
+    out: list[float] = []
+    for v in (*s.level_paths.get(key, ()), standing):
+        if v is not None and v not in out:
+            out.append(v)
+    return out
+
+
+def _flip_tolerance(values: list[float]) -> float:
+    """The flip is a computed price, so "the 758 flip" for 758.40 is fine."""
+    return max(1.0, 0.001 * max(abs(v) for v in values))
+
+
+def _claim_holds(n: float, key: str, values: list[float]) -> bool:
+    if not values:
         return False
-    return True
+    if key == "gamma_flip":
+        # The flip drifts rather than steps: anything inside its session band
+        # is a value it actually held.
+        tol = _flip_tolerance(values)
+        return min(values) - tol <= n <= max(values) + tol
+    # Walls and max pain are strikes, and are quoted as strikes.
+    return any(abs(n - v) <= 0.5 for v in values)
+
+
+def _fmt_value(v: float) -> str:
+    """Print a level as the post would: "765", "758.4", "7,650"."""
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
+def _describe_level(s: SymbolInput, key: str) -> str:
+    """What the input says ``key`` was, for the correction note."""
+    if key == "wall":
+        parts = [_describe_level(s, k) for k in ("call_wall", "put_wall")]
+        return " and ".join(parts)
+    name = LEVEL_NAMES[key]
+    values = _level_values(s, key)
+    if not values:
+        return f"the input has no {name}"
+    if key == "gamma_flip" and len(values) > 1:
+        # Its values are the ends of a drift band, not a sequence of prints.
+        return f"the {name} ranged {_fmt_value(min(values))}–{_fmt_value(max(values))}"
+    if len(values) == 1:
+        return f"the {name} was {_fmt_value(values[0])}"
+    return f"the {name} was {' then '.join(_fmt_value(v) for v in values)}"
+
+
+def _misstated_levels(post: LlmPost, symbols: list[SymbolInput]) -> list[tuple[float, str]]:
+    """(number, problem) for each sentence that names a level with a number
+    that level never had.
+
+    This is the check the number-presence guard can't make.  "Stalled under
+    the 780 call wall" passes that guard whenever 780 is near ANY input price
+    — the session high, a round number off spot, a post-bell reset — while
+    the Key-levels block right below it says the call wall was 765.  Here the
+    number next to "call wall" has to be the call wall: its standing value or
+    a print from its own session path."""
+    problems: list[tuple[float, str]] = []
+    for n, key, snippet in _level_claims(_post_text(post)):
+        in_band = [s for s in symbols if _in_band(n, s)]
+        if not in_band:
+            # A points move or a news figure ("the call wall is 15 points
+            # up"), not a price for the level.
+            continue
+        if any(_claim_holds(n, key, _level_values(s, key)) for s in in_band):
+            continue
+        actual = _describe_level(in_band[0], key)
+        if _level_values(in_band[0], key):
+            actual += f", never {_fmt_value(n)}"
+        problems.append((n, f'"{snippet}": {actual}'))
+    return problems
+
+
+def _post_problems(post: LlmPost, symbols: list[SymbolInput]) -> list[str]:
+    """Everything wrong with a draft's numbers, most specific first.  A
+    number already reported against the level it was named for isn't
+    reported a second time as merely unknown."""
+    misstated = _misstated_levels(post, symbols)
+    named = {int(n) for n, _ in misstated}
+    return [problem for _, problem in misstated] + [
+        f"{h} is not a price anywhere in the input"
+        for h in _invented_prices(post, symbols)
+        if int(h) not in named
+    ]
+
+
+def _correction_message(problems: list[str]) -> str:
+    """The follow-up turn that hands a draft's problems back to the model."""
+    listed = "\n".join(f"* {p}" for p in problems)
+    return (
+        "Your draft doesn't match the input levels:\n"
+        f"{listed}\n\n"
+        "Rewrite the JSON object with those fixed and everything else kept.  A "
+        "number you tie to a level must be that level's value in the input; if a "
+        "sentence only works with a different number, drop the number or the "
+        "sentence.  Reply with the JSON object only."
+    )
 
 
 def generate_post(
@@ -718,23 +941,52 @@ def generate_post(
         headlines=headlines,
         featured_symbol=featured_symbol,
     )
-    resp = _call_claude(
-        SYSTEM_PROMPT,
-        user_msg,
-        key,
-        model_id,
-        max_tokens,
-        timeout_seconds,
-    )
-    if resp is None:
-        return None
+    messages: list[dict[str, str]] = [{"role": "user", "content": user_msg}]
+    for correction_round in range(MAX_CORRECTION_ROUNDS + 1):
+        resp = _call_claude(
+            SYSTEM_PROMPT,
+            messages,
+            key,
+            model_id,
+            max_tokens,
+            timeout_seconds,
+        )
+        if resp is None:
+            return None
 
-    text = _extract_text_from_response(resp)
-    if not text:
-        logger.warning("bulletin_llm: Claude response had no text content")
-        return None
+        text = _extract_text_from_response(resp)
+        if not text:
+            logger.warning("bulletin_llm: Claude response had no text content")
+            return None
 
-    stop_reason = resp.get("stop_reason")
+        post = _post_from_text(text, resp.get("stop_reason"), max_tokens)
+        if post is None:
+            return None
+
+        problems = _post_problems(post, symbols)
+        if not problems:
+            return post
+        if correction_round == MAX_CORRECTION_ROUNDS:
+            logger.warning(
+                "bulletin_llm: draft still misstates the levels after %d correction "
+                "round(s) — falling back to template: %s",
+                MAX_CORRECTION_ROUNDS,
+                "; ".join(problems),
+            )
+            return None
+        logger.warning(
+            "bulletin_llm: draft misstates the levels — sending it back to the model: %s",
+            "; ".join(problems),
+        )
+        messages = messages + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": _correction_message(problems)},
+        ]
+    return None
+
+
+def _post_from_text(text: str, stop_reason: Any, max_tokens: int) -> LlmPost | None:
+    """The ``LlmPost`` in one model reply, or None (logged) when there isn't one."""
     json_block = _extract_json_block(text)
     if not json_block:
         if stop_reason == "max_tokens":
@@ -752,12 +1004,4 @@ def generate_post(
                 text[:200],
             )
         return None
-
-    post = _parse_post(json_block)
-    if post is None:
-        return None
-
-    if not _validate_no_invented_prices(post, symbols):
-        return None
-
-    return post
+    return _parse_post(json_block)

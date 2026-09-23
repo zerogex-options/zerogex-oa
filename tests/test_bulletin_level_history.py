@@ -307,8 +307,26 @@ def test_prompt_dict_flags_the_roll_off_and_carries_the_path():
 def test_quoted_values_cover_superseded_prints():
     """The invented-price guard has to accept a wall the tape has moved past."""
     values = _history().quoted_values()
-    for expected in (777, 776, 775, 765, 780):
+    for expected in (777, 776, 775, 780):
         assert expected in values
+
+
+def test_quoted_values_leave_out_the_post_bell_reset():
+    """765 only became the put wall after the 0DTE rolled off.  The post prints
+    it on its own line; whitelisting it let the prose attach it to a wall."""
+    history = _history()
+    assert 765 not in history.quoted_values()
+    assert history.session_values()["put_wall"] == [777, 776, 775]
+    assert history.session_values()["call_wall"] == [780]
+
+
+def test_model_view_reports_the_reset_by_direction_only():
+    payload = _history().to_prompt_dict(include_post_close_values=False)
+    assert payload["put_wall"]["after_the_bell_reset"] == "lower"
+    assert "after_the_bell" not in payload["put_wall"]
+    assert "765" not in str(payload)
+    # The record keeps the number, for tracing a post back to its inputs.
+    assert _history().to_prompt_dict()["put_wall"]["after_the_bell"] == 765
 
 
 # ---------------------------------------------------------------------------

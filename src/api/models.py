@@ -681,9 +681,13 @@ class GammaWeatherResponse(BaseModel):
     #: TRANSITION_RISK / NARROWING / WIDENING / STEADY / NONE. A modifier on
     #: the state, never a competing state.
     cushion: str
-    #: PULSE / BUILDING / PERSISTENT. How settled the pressure direction is:
-    #: one bar is the first evidence, three is a condition.
+    #: PULSE / BUILDING / PERSISTENT, plus REVERSED on the single bar an
+    #: established side gives way. How settled the pressure direction is: one
+    #: bar is the first evidence, three is a condition.
     persistence: str = "PULSE"
+    #: Opposite bars banked toward a reversal, 0 when none is pending. Only a
+    #: genuine reversal counts, never a fresh pulse on the other side.
+    pressure_reversing_bars: int = 0
     #: How long the current state has held. NEW / ESTABLISHED / CONFIRMED /
     #: MATURE, with the raw bars and minutes alongside. Duration is the point:
     #: the question is not whether gamma calls direction, but whether a
@@ -731,6 +735,7 @@ class GammaWeatherBar(BaseModel):
     cushion_band: Optional[str] = None
     persistence: str
     persistence_label: str
+    pressure_reversing_bars: int = 0
     age_bars: int
     age_minutes: Optional[float] = None
     age: Optional[str] = None

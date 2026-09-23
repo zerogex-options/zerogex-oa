@@ -51,14 +51,26 @@ per trading day whose first bar lands after the session open — the silent
 failure this tool used to have was returning a plausible bar count that began
 mid-morning.
 
+**Gap repair: ``--only-missing``.** The default write is an upsert, which
+rewrites every minute in the range, including the minutes the live stream
+already recorded. The historical endpoint has no Up/Down volume split, so for
+those minutes the upsert replaces the streamed split with 0/0, and every
+tick-split reading (``buy_pct``, ``tick_bias``, ...) shows a flat 50/50 for the
+whole day, not just the gap. Dates are the only range this tool takes, so a
+repair of twenty minutes is a rewrite of the day. ``--only-missing`` inserts
+the minutes that have no row and leaves every existing row exactly as it was.
+With ``--dry-run`` it still reads the table, writes nothing, and lists the
+minutes it would fill.
+
 Usage::
 
     python -m src.tools.underlying_backfill --symbols SPY,SPX,QQQ,NDX \
         --start 2026-05-01 --end 2026-07-23
 
-    # Repair today's pre-market after an overnight ingester outage:
-    python -m src.tools.underlying_backfill --symbols QQQ \
-        --start 2026-08-18 --end 2026-08-18
+    # Repair a hole inside a day the live stream otherwise recorded (an
+    # ingester outage, a bad deploy). Fills only the missing minutes:
+    python -m src.tools.underlying_backfill --symbols SPY,QQQ,SPX,NDX \
+        --start 2026-09-23 --end 2026-09-23 --only-missing --dry-run
 
 Verify against a live TradeStation session + database — the pure range/parse
 and alias-resolution logic is unit-tested (``tests/test_underlying_backfill.py``),
@@ -362,14 +374,76 @@ _UPSERT_SQL = """
         updated_at = NOW()
 """
 
+# ``--only-missing``: insert, never update. ``missing_rows`` has already
+# dropped the minutes that have a row; DO NOTHING covers the one the live
+# stream writes between that read and this insert.
+_INSERT_MISSING_SQL = """
+    INSERT INTO underlying_quotes
+    (symbol, timestamp, open, high, low, close, up_volume, down_volume, volume)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp) DO NOTHING
+"""
 
-def upsert_bars(conn, symbol: str, rows: List[Dict[str, Any]]) -> int:
-    """Upsert parsed bars for ``symbol``; returns the number written."""
+
+def missing_rows(conn, symbol: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The subset of ``rows`` whose minute has no ``underlying_quotes`` row.
+
+    Compared as epoch seconds so the vendor's UTC stamps and whatever zone
+    the driver hands back for ``timestamptz`` can't disagree about a minute.
+    """
+    if not rows:
+        return []
+    stamps = [r["timestamp"] for r in rows]
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT timestamp FROM underlying_quotes "
+        "WHERE symbol = %s AND timestamp >= %s AND timestamp <= %s",
+        (symbol, min(stamps), max(stamps)),
+    )
+    present = {int(row[0].timestamp()) for row in cur.fetchall()}
+    return [r for r in rows if int(r["timestamp"].timestamp()) not in present]
+
+
+def _et_runs(rows: List[Dict[str, Any]]) -> str:
+    """Minutes as contiguous ET runs, e.g. ``2026-09-23 09:12-09:30, 09:41``.
+
+    What a gap repair reports: which minutes it filled, in the timezone the
+    operator reads the chart in, rather than a bare count.
+    """
+    stamps = sorted(r["timestamp"].astimezone(_ET) for r in rows)
+    if not stamps:
+        return "none"
+    step = timedelta(seconds=AGGREGATION_BUCKET_SECONDS)
+    runs: List[List[datetime]] = [[stamps[0], stamps[0]]]
+    for ts in stamps[1:]:
+        if ts - runs[-1][1] == step:
+            runs[-1][1] = ts
+        else:
+            runs.append([ts, ts])
+    parts = []
+    day = None
+    for first, last in runs:
+        label = f"{first:%H:%M}" if first == last else f"{first:%H:%M}-{last:%H:%M}"
+        if first.date() != day:
+            label = f"{first:%Y-%m-%d} {label}"
+            day = first.date()
+        parts.append(label)
+    return ", ".join(parts) + " ET"
+
+
+def upsert_bars(
+    conn, symbol: str, rows: List[Dict[str, Any]], *, only_missing: bool = False
+) -> int:
+    """Write parsed bars for ``symbol``; returns the number sent.
+
+    ``only_missing`` inserts without updating (see ``_INSERT_MISSING_SQL``);
+    the default upserts.
+    """
     if not rows:
         return 0
     cur = conn.cursor()
     cur.executemany(
-        _UPSERT_SQL,
+        _INSERT_MISSING_SQL if only_missing else _UPSERT_SQL,
         [
             (
                 symbol,
@@ -463,6 +537,7 @@ def backfill(
     session_template: str = _DEFAULT_SESSION_TEMPLATE,
     dry_run: bool = False,
     gaps: Optional[Dict[str, int]] = None,
+    only_missing: bool = False,
 ) -> Dict[str, int]:
     """Backfill each symbol; returns ``{symbol: rows_written}``.
 
@@ -470,6 +545,9 @@ def backfill(
     from the coverage check — an out-parameter rather than a second return
     value so the ``{symbol: rows_written}`` contract callers already depend on
     is unchanged.
+
+    ``only_missing`` writes only the minutes the table has no row for, and
+    reads the table even on a dry run so the run can say which those are.
     """
     from src.database import db_connection
     from src.ingestion.tradestation_client import TradeStationClient
@@ -513,7 +591,7 @@ def backfill(
         short_days = _log_coverage(symbol, rows, start, end, session_template=session_template)
         if gaps is not None:
             gaps[symbol] = short_days
-        if dry_run:
+        if dry_run and not only_missing:
             logger.info(
                 "[dry-run] %s (%s): %d bars parsed, not written",
                 symbol,
@@ -523,7 +601,19 @@ def backfill(
             written[symbol] = 0
             continue
         with db_connection() as conn:
-            written[symbol] = upsert_bars(conn, symbol, rows)
+            if only_missing:
+                rows = missing_rows(conn, symbol, rows)
+                logger.info(
+                    "%s: %d minute(s) missing from underlying_quotes: %s",
+                    symbol,
+                    len(rows),
+                    _et_runs(rows),
+                )
+            if dry_run:
+                logger.info("[dry-run] %s (%s): not written", symbol, ts_symbol)
+                written[symbol] = 0
+                continue
+            written[symbol] = upsert_bars(conn, symbol, rows, only_missing=only_missing)
         logger.info("%s: wrote %d bars to underlying_quotes", symbol, written[symbol])
     return written
 
@@ -547,6 +637,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Fetch + parse but do not write")
+    parser.add_argument(
+        "--only-missing",
+        action="store_true",
+        help=(
+            "Insert only the minutes underlying_quotes has no row for and leave every "
+            "existing row untouched. Use it to repair a hole inside a day the live stream "
+            "recorded: the default upsert rewrites the whole range and replaces the "
+            "streamed Up/Down split with the historical endpoint's 0/0."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -574,6 +674,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         session_template=args.session_template,
         dry_run=args.dry_run,
         gaps=gaps,
+        only_missing=args.only_missing,
     )
     total = sum(result.values())
     logger.info("Backfill complete: %s (total %d bars)", result, total)

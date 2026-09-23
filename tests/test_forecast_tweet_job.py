@@ -35,7 +35,7 @@ def _morning_row(**overrides):
         "projected_close": 744.00,
         "pin_strike": 744.00,
         "flagship_setup": None,
-        "range_model": "heuristic_v1_4",
+        "range_model": "heuristic_v1_5",
         "content_hash": "a" * 64,
         # v1.4 headline claims (what the site + tweet now grade).
         "expected_vol_state": "compression",

@@ -15,6 +15,7 @@ from src.tools.underlying_backfill import (
     _bar_to_row,
     _chunk_ranges,
     _coverage_gaps,
+    _et_runs,
     _et_span,
     _safe_bigint,
     fetch_symbol,
@@ -483,3 +484,91 @@ def test_main_exits_zero_when_the_premarket_open_is_covered(monkeypatch):
     ub = _install_fakes(monkeypatch, [_premarket_bar(4, 0)])
     rc = ub.main(["--symbols", "QQQ", "--start", "2026-08-18", "--end", "2026-08-18", "--dry-run"])
     assert rc == 0
+
+
+# ----------------------------------------------------------------------
+# --only-missing: repair a hole without rewriting the day around it
+# ----------------------------------------------------------------------
+
+
+def _et_minute(hh, mm):
+    return datetime(2026, 8, 18, hh, mm, tzinfo=ET)
+
+
+# The stream recorded the morning up to 09:11 and resumed at 09:31: the
+# 2026-09-23 deploy outage, moved onto the test day.
+_GAP_BARS = [_premarket_bar(4, 1)] + [_premarket_bar(9, m) for m in range(11, 34)]
+_STREAMED = [_et_minute(4, 0), _et_minute(9, 10), _et_minute(9, 11), _et_minute(9, 31)]
+_STREAMED.append(_et_minute(9, 32))
+
+
+def _install_gap_fakes(monkeypatch, bars, present):
+    """``_install_fakes`` over a table that already holds ``present``."""
+    import contextlib
+
+    ub = _install_fakes(monkeypatch, bars)
+    db: dict = {"writes": []}
+
+    class _Cur:
+        def execute(self, sql, params):
+            db["select"] = params
+
+        def fetchall(self):
+            # ET-aware on purpose: the driver's zone is not the vendor's UTC.
+            return [(ts,) for ts in present]
+
+        def executemany(self, sql, seq):
+            db["writes"].append((sql, list(seq)))
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    @contextlib.contextmanager
+    def _fake_db():
+        yield _Conn()
+
+    monkeypatch.setattr("src.database.db_connection", _fake_db)
+    return ub, db
+
+
+def test_only_missing_fills_the_hole_and_leaves_the_streamed_minutes_alone(monkeypatch):
+    """A day's range is the only range this tool takes. Upserting it rewrites
+    every streamed minute with the historical endpoint's 0/0 split, so the
+    repair has to insert the hole and nothing else."""
+    ub, db = _install_gap_fakes(monkeypatch, _GAP_BARS, _STREAMED)
+
+    written = ub.backfill(["QQQ"], _DAY, _DAY, only_missing=True)
+
+    assert db["select"][0] == "QQQ"
+    ((sql, params),) = db["writes"]
+    assert "DO NOTHING" in sql and "DO UPDATE" not in sql
+    filled = sorted(p[1].astimezone(ET) for p in params)
+    assert filled == [_et_minute(9, m) for m in range(12, 31)]
+    assert written == {"QQQ": 19}
+
+
+def test_only_missing_dry_run_lists_the_hole_and_writes_nothing(monkeypatch, caplog):
+    ub, db = _install_gap_fakes(monkeypatch, _GAP_BARS, _STREAMED)
+    argv = ["--symbols", "QQQ", "--start", "2026-08-18", "--end", "2026-08-18"]
+
+    with caplog.at_level("INFO", logger="src.tools.underlying_backfill"):
+        rc = ub.main(argv + ["--only-missing", "--dry-run"])
+
+    assert rc == 0
+    assert db["writes"] == []
+    assert "QQQ: 19 minute(s) missing from underlying_quotes: 2026-08-18 09:12-09:30 ET" in (
+        caplog.text
+    )
+
+
+def test_the_default_write_is_still_the_upsert():
+    conn = _FakeConn()
+    upsert_bars(conn, "SPY", [_bar_to_row(_bar())])
+    assert "DO UPDATE" in conn._cur.sql
+
+
+def test_et_runs_reads_the_way_the_chart_does():
+    rows = [{"timestamp": _et_minute(9, m)} for m in (41, 12, 13, 14)]
+    assert _et_runs(rows) == "2026-08-18 09:12-09:14, 09:41 ET"
+    assert _et_runs([]) == "none"
