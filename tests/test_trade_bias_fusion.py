@@ -138,7 +138,7 @@ def _trend_up():
 def _trend_down():
     return compute_bias(
         BiasInput(
-            netGEX=50, gexGradient=60, tapeFlow=-80, vannaCharm=-60, odtePositioning=-60, msi=-50
+            netGEX=50, gexGradient=60, tapeFlow=-80, vannaCharm=-60, odtePositioning=-60, msi=30
         )
     )
 
