@@ -1148,7 +1148,24 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         pin_tolerance=round(pin_tol, 4),
         regime=regime,
         regime_move_threshold=round(regime_threshold, 6),
-        range_model="heuristic_v1_4",
+        # BUMPED FROM heuristic_v1_4 WHEN THE PERSISTENCE ANCHOR SHIPPED, which
+        # it should have been at the time. The constants block above describes
+        # this model as v1.5 ("anchors on the trailing realized ratio ... then
+        # tilts") while this string still claimed v1.4, so every consumer that
+        # segments by range_model was silently pooling two different models.
+        #
+        # It cost a real analysis. Grouping the SPX archive by range_model gave
+        # one "heuristic_v1_4" cohort of 49 sessions holding 91.8%, which is in
+        # fact 15 pre-anchor sessions holding 53% and 34 anchored sessions
+        # holding 100%. Every conclusion drawn from the pooled figure -- the
+        # scale factor, the "fat tail", which misses were current -- was drawn
+        # about a blend that has not run since 2026-08-04.
+        #
+        # So: this string is the ONLY thing that lets anyone tell the two apart
+        # after the fact, because the committed rows are immutable and carry no
+        # other version marker. Bump it whenever the prediction path changes,
+        # even when the output shape does not.
+        range_model="heuristic_v1_5",
         rationale=rationale,
         raw_projected_low=raw_low,
         raw_projected_high=raw_high,
