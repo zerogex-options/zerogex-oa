@@ -272,6 +272,35 @@ def test_session_close_levels_exclude_the_post_bell_reset():
     assert history.post_close_shifted is True
 
 
+def test_the_16_00_frame_is_the_first_post_close_frame():
+    """Regression, SPY 2026-09-22: the call wall was 775 from the open through
+    15:30 and 780 only in the 16:00 frame, where the day's 0DTE has no time
+    left and so no gamma.  Counted in-session, that frame made the close read
+    say the wall "moved 775 → 780; 780 never tested"."""
+    day = date(2026, 9, 22)
+
+    def at(hour: int, minute: int) -> datetime:
+        return datetime(day.year, day.month, day.day, hour, minute, tzinfo=ET)
+
+    rows = []
+    cursor = at(9, 30)
+    while cursor < at(16, 0):
+        rows.append({"timestamp": cursor, "call_wall": 775.0, "put_wall": 770.0})
+        cursor += timedelta(minutes=1)
+    for minute in (0, 1, 5, 15):
+        rows.append({"timestamp": at(16, minute), "call_wall": 780.0, "put_wall": 770.0})
+    bars = [{"timestamp": at(9, 30), "low": 773.0, "high": 774.9, "close": 774.2}]
+
+    history = lh.build_level_history("SPY", day, "close", rows, bars)
+    assert history is not None
+    assert history.call_wall.values == [775.0]
+    assert history.session_close_levels["call_wall"] == 775.0
+    assert lh.note_for(history, "call_wall") == "tested and held"
+    assert history.call_wall.post_close_value == 780.0
+    assert "Call Wall resets to 780" in lh.post_close_line(history)
+    assert 780.0 not in history.quoted_values()
+
+
 def test_post_close_line_names_only_the_levels_that_actually_reset():
     line = lh.post_close_line(_history())
     assert line == (
@@ -294,7 +323,8 @@ def test_no_post_close_line_when_the_chain_did_not_reprice():
 def test_prompt_dict_flags_the_roll_off_and_carries_the_path():
     payload = _history().to_prompt_dict()
     assert payload["levels_moved_during_session"] is True
-    assert payload["structure_as_of"] == "16:00"
+    # The fixture steps every 5 minutes; the 16:00 frame is post-close.
+    assert payload["structure_as_of"] == "15:55"
     assert [seg["value"] for seg in payload["put_wall"]["path"]] == [777, 776, 775]
     assert [seg["outcome"] for seg in payload["put_wall"]["path"]] == ["broke", "broke", "held"]
     assert payload["put_wall"]["at_session_close"] == 775

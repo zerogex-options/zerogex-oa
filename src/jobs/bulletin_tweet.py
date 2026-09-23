@@ -1610,7 +1610,7 @@ async def _attach_level_history(
         ``gex_summary`` row is written after the day's 0DTE has rolled off,
         which re-prices the walls to the NEXT session.  For a close read we
         therefore re-anchor the quoted structure to the last in-session frame
-        (<= 16:00 ET) and let :func:`level_history.post_close_line` report the
+        (before 16:00 ET) and let :func:`level_history.post_close_line` report the
         reset separately — the value the attached card renders — instead of
         passing tomorrow's map off as today's tape.
 
