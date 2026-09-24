@@ -36,56 +36,56 @@ WorkingDirectory=/home/ubuntu/zerogex-oa
 Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
-# SESSIONS=1 so a firing judges the session in front of it, matching the carry
-# check; the default of 10 is for reading history by hand.
+# SESSIONS=2 and EDGES=1: alert on the CHANGE, not on the state.
 #
-# NOTE ON RE-ALERTING. The threshold is on the LONGEST unbroken blank stretch,
-# which only grows within a session, so a session that breaches at 11:30 will
-# breach again at every fire until the close. That is deliberate and it is not
-# noise: the failure this catches is one nobody noticed for five weeks, and a
-# reminder every hour until it is looked at is the correct amount of nagging.
+# An edge needs a predecessor, so a one-session window reports nothing at all.
+# The first session in any window has a known STATE and an unknown CHANGE, and
+# that distinction is the whole mechanism.
 #
-# Exits 0 when no symbol left the flip blank for longer than
-# GAMMA_FLIP_MAX_BLANK_MINUTES, 1 when one did, 2 on DB error. A nonzero exit
-# marks the unit failed, surfaces in `systemctl --failed`, logs the offending
-# symbol and session, and fires the OnFailure hook above.
-# NOTHING IS EXCUSED HERE. BOTH ATTEMPTS AT AN EXCUSE FAILED.
-#
-# The problem is real: on 2026-09-21..23 NDX was blank for three straight
-# sessions and the resolver was right every time. The monthly opex on 09-18
+# WHY NOT LEVEL-BASED. On 2026-09-21..23 NDX was blank for three straight
+# sessions and the resolver was right every time: the monthly opex on 09-18
 # left a book at 3.16 calls per put, long gamma across the whole band, crossing
-# 27% to 37% below spot. This unit emailed about it roughly twenty-one times.
-# A monitor people learn to ignore is the state the 2026-07..09 blackout hid in
-# for five weeks, so the noise matters.
+# 27% to 37% below spot. Level-based, this unit emailed about it roughly
+# twenty-one times, and a monitor people learn to ignore is the state the
+# 2026-07..09 blackout hid in for five weeks.
 #
-# IGNORE_REASONS=BEYOND_MAX_DISTANCE would silence it, and would also have
-# silenced that blackout, which reported the same code. Rejected on that basis.
+# Two attempts to excuse the harmless case by deciding WHY the flip was dark
+# both failed on real data, and both stay out of here deliberately:
 #
-# IGNORE_RAW_BEYOND=8 looked better and is worse. The idea was that
-# gamma_flip_raw -- the same cycle's crossing with no ramp and no gates -- sits
-# NEAR spot when our own math hid something actionable and FAR when the market
-# moved it out of reach. One day supported that: 2026-09-17 had raw 2.8% from
-# spot on a session our DTE ramp broke. Then it was measured across the whole
-# 2026-08-03..09-09 blackout and the separation is not there:
+#   IGNORE_REASONS=BEYOND_MAX_DISTANCE -- that code is reported both for a bug
+#     in our own DTE weighting and for a genuinely long-gamma book.
+#   IGNORE_RAW_BEYOND=8 -- the ungated crossing sat 0% to 21% from spot when
+#     the fault was ours and 27% to 35% when it was the market. At 8 it excused
+#     26 of the 31 breaching blackout sessions.
 #
-#     our-bug sessions (Aug 3 - Sep 11)      raw 0% to 21% from spot
-#     market sessions  (Sep 21 - Sep 23)     raw 27% to 35%
+# Nothing in the stored row separates them, so this stops trying. A bug
+# starting and a regime starting are both worth exactly one look.
 #
-# At 8 it excused 26 of the 31 breaching blackout sessions. The outage would
-# have stayed invisible. A threshold near 25 separates THESE two episodes, but
-# that is three market samples and a curve fit, and the cost of being wrong is
-# silence on a real outage.
+# REPLAYED BEFORE INSTALL, over 2026-07-01..09-23. Four alerts across 43
+# sessions against roughly two hundred level-based, and it catches every onset
+# including the one that took five weeks and a customer to find:
 #
-# So: nothing is excused, and this unit is noisy on purpose until something
-# better exists. The raw@ column is still reported, because knowing the
-# distance is useful for triage even though it cannot decide.
+#     2026-07-29   WENT DARK     0m -> 332m
+#     2026-08-03   WENT DARK     0m -> 221m     the five-week blackout begins
+#     2026-09-11   WENT DARK     6m -> 263m
+#     2026-09-21   WENT DARK     0m -> 389m     the post-opex regime begins
 #
-# The design that probably works is edge-triggered rather than level-triggered:
-# alert when a symbol STOPS publishing, not every hour that it is still not
-# publishing. That fires once at the onset of a bug and once at the onset of a
-# regime, which is the information either way, and it needs no theory about
-# which one it is looking at.
-ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-resolution-healthcheck SESSIONS=1
+# NOTE ON RE-ALERTING. Within the onset day the comparison stays "yesterday was
+# publishing, today is dark", so fires after the crossing repeat it: at most
+# six emails on the day something breaks, then silence while it stays broken.
+# Proportionate on the day it matters, quiet on the days it does not.
+#
+# KNOWN TRADE, stated rather than hidden. An edge speaks once. Miss that alert
+# and a long outage stays silent afterwards, because there is no second change
+# to report until it recovers. The backstop is a low-frequency digest of what
+# is currently dark, which does not exist yet. Until it does, the level view is
+# one command away:
+#     make gamma-flip-resolution-healthcheck SESSIONS=1
+#
+# Exits 0 when nothing newly went dark, 1 when something did, 2 on DB error. A
+# nonzero exit marks the unit failed, surfaces in `systemctl --failed`, logs
+# the offending symbol and session, and fires the OnFailure hook above.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-resolution-healthcheck SESSIONS=2 EDGES=1
 
 # One indexed range scan and a rollback per symbol-session.
 TimeoutStartSec=120
