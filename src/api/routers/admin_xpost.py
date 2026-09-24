@@ -14,8 +14,10 @@ Endpoints (prefix ``/api/admin/x-post``):
   (Morning / Midday / Post-Market).  ``record`` is null when nothing has
   been generated yet for that slot.
 * ``POST /regenerate``  — generate a fresh post+reply for (symbol, mode)
-  on demand, persist it as the new latest, and return it.  Never posts to X
-  and skips media rendering (the scheduled job owns that).
+  on demand, review it, persist it as the new latest, and return it.  Never
+  posts to X and skips media rendering (the scheduled job owns that).
+* ``GET  /image``       — the Live Bulletin PNG the last scheduled run
+  attached for (symbol, mode); 404 when that record has none.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from src.api.database import DatabaseManager
@@ -122,3 +125,17 @@ async def regenerate(
         logger.warning("admin_xpost: regenerate failed (%s)", exc, exc_info=True)
         raise HTTPException(status_code=502, detail="post generation failed") from exc
     return _envelope(sym, resolved_mode, record)
+
+
+@router.get("/image")
+async def image(
+    symbol: str = Query(max_length=16),
+    mode: str = Query(),
+) -> FileResponse:
+    """The Live Bulletin image the last run attached for (symbol, timing)."""
+    if mode not in bt.MODES:
+        raise HTTPException(status_code=400, detail=f"unknown mode {mode!r}")
+    path = bt.latest_image_path(bt.read_latest_record(symbol.upper(), mode))
+    if path is None:
+        raise HTTPException(status_code=404, detail="no image for this post")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})

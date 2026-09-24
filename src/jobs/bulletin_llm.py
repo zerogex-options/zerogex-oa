@@ -1,44 +1,48 @@
-"""LLM-generated narrative for bulletin tweets — the "human wrote it" voice.
+"""LLM-written narrative for bulletin tweets, plus the review that gates them.
 
 The bulletin auto-tweet fires three times a trading day (pre-market,
-midday, close).  Each fire hands the day's structured snapshot — the
-Live-Bulletin gamma structure, the featured symbol's price action vs the
-previous close, and the day's top market headlines scraped from CNBC — to
-Claude and asks it to write a natural, human-sounding market read plus a
+midday, close).  Each fire hands the day's structured snapshot (the
+Live Bulletin card's levels, the featured symbol's price action vs the
+previous close, and the latest market headlines from CNBC) to Claude and
+asks it to write a natural market read in the founder's voice, plus a
 threaded reply that plays off it and links back to ZeroGEX.
 
-Division of labour — the same discipline the old template used, kept:
+Division of labor:
 
-  * The LLM controls voice, framing and flow (the opening hook, the prose
-    that weaves news + price action + dealer-gamma regime, the bottom-line
+  * The LLM controls voice, framing and flow (the prose that ties news,
+    price action and the dealer-gamma regime together, the bottom-line
     takeaway, and the reply).
-  * Python controls every price the post QUOTES in its ``Key levels:``
-    block — the model NEVER invents a level.  The model may *reference* a
-    level in prose ("dumped through the 740 put wall"), but every draft is
-    checked: a number named as a level must be that level's value (its
-    standing value or a print from its own session path), and any other
-    in-band number must be a price from the input.  A draft that fails is
-    handed back to the model once with the specifics; if it still fails, the
-    caller falls back to a deterministic template.
+  * Python controls the header line and every price in the key-levels
+    list, and checks every number the prose ties to a level: it must be
+    that level's value (its standing value or a print from its own session
+    path), and any other in-band number must be a price from the input.  A
+    draft that fails is handed back to the model once with the specifics.
+  * A second, independent Claude call (:func:`review_post`) fact-checks the
+    finished post against the headlines, the numbers and the attached card
+    image before anything is sent.  The caller holds the post when it
+    finds a problem the writer couldn't fix.
 
 Contract:
-  * Enabled when ``ANTHROPIC_API_KEY`` is set.  Missing key → returns
-    None → caller falls back to the static template.
-  * Any API error / malformed response also returns None — never
-    raises.  A dud LLM run must never take the tweet down.
-  * Model default is ``claude-sonnet-5``; override with
-    ``BULLETIN_TWEET_LLM_MODEL`` for A/B tests.
+  * Enabled when ``ANTHROPIC_API_KEY`` is set.  Without it nothing can be
+    written or reviewed, and the caller holds the post.
+  * API errors and malformed responses never raise; they come back as None
+    (writer) or a failed :class:`Review`, with the reason appended to the
+    caller's ``errors`` list so the operator's notice can say what happened.
+  * Model default is ``claude-opus-5`` for both calls; override with
+    ``BULLETIN_TWEET_LLM_MODEL`` / ``BULLETIN_TWEET_REVIEW_MODEL``.
 
-Uses stdlib ``urllib`` so we inherit no new third-party dependency —
-same discipline as the X API clients.
+Uses stdlib ``urllib`` so we inherit no new third-party dependency (same
+discipline as the X API clients).
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
@@ -51,26 +55,29 @@ logger = logging.getLogger("zerogex.bulletin_llm")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MODEL = "claude-sonnet-5"
-# 3000 gives comfortable headroom over the typical output size for the
-# post + reply + JSON scaffolding.  The static template fallback kicks in
-# if the model still overflows, but at 3000 that's a rare case.
-DEFAULT_MAX_TOKENS = 3000
-DEFAULT_TIMEOUT_SECONDS = 45
+DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_REVIEW_MODEL = "claude-opus-5"
+# The model thinks before it answers, and those tokens count against the cap,
+# so this is sized for thinking plus the JSON.  A cut-off reply holds the post.
+DEFAULT_MAX_TOKENS = 16000
+DEFAULT_TIMEOUT_SECONDS = 180
+# Claude Opus 5's safety classifiers can decline a request.  With this beta the
+# API re-runs a declined request on Anthropic's recommended fallback model
+# inside the same call, instead of handing back a refusal.  Only sent for
+# DEFAULT_MODEL: another model named in the env may not accept the parameter.
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
 # How many times a draft that misstates a level is handed back to the model
-# with the specifics before we give up and post the static template.  The
-# usual failure is one sentence in an otherwise good post; "the call wall was
-# 765, never 780" lets the model fix that sentence instead of the whole post
-# being thrown away.
+# with the specifics before we give up.  The usual failure is one sentence in
+# an otherwise good post; "the call wall was 765, never 780" lets the model
+# fix that sentence instead of the whole post being thrown away.
 MAX_CORRECTION_ROUNDS = 1
+# A busy or unreachable API gets one more try after a short pause before the
+# post is held for it.
+API_ATTEMPTS = 2
+API_RETRY_PAUSE_SECONDS = 10
+_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
 
-# The three canonical level keys the model may annotate.  Python owns the
-# actual prices and base labels; the model only supplies an optional short
-# contextual note per level ("primary support", "successfully defended").
-LEVEL_KEYS = ("put_wall", "call_wall", "gamma_flip")
-
-# Per-mode header label the model should use verbatim.  Matches the
-# operator's approved examples ("Morning Read — $SPY", etc.).
+# The header label for each mode.  Python writes the header line itself.
 MODE_HEADER_LABEL = {
     "premarket": "Morning Read",
     "midday": "Midday Read",
@@ -79,155 +86,116 @@ MODE_HEADER_LABEL = {
 
 
 SYSTEM_PROMPT = """\
-You write market commentary for the ZeroGEX X (Twitter) account.  Your job is
-to sound like a sharp human trader wrote it — natural, confident, plain-spoken
-— NOT like an automated bot or a data readout.
+You write the market posts the ZeroGEX X account publishes three times each
+trading day.  The founder posts them as their own, so every one has to read
+like the founder typed it: a sharp trader explaining what the tape is doing,
+in plain American English.  Never like a bot, a newsletter or a data readout.
 
-Each post features ONE symbol — the one marked "featured": true in the input
-(also named in "featured_symbol").  Write about THAT symbol.
+Each post is about ONE symbol, the one named in "featured_symbol".
 
-You are given three things to weave together:
-  1. HEADLINES — the day's top market news scraped from CNBC (in "headlines").
-  2. THE LIVE BULLETIN — the featured symbol's dealer-gamma structure: gamma
-     flip, call wall, put wall, max pain, and net gamma (in "levels").
-  3. PRICE ACTION — where the symbol is trading now vs the previous close, the
-     session's path (open / high / low), and momentum (in "levels").
+WHAT YOU ARE GIVEN
+1. "headlines": the latest market headlines from CNBC, newest first, with the
+   time each was published.
+2. "levels": the featured symbol's numbers.  spot, put_wall, call_wall,
+   gamma_flip, max_pain and net_gex are exactly what the Live Bulletin image
+   attached to the post shows, and "regime" is the regime that image shows
+   ("positive": spot above the gamma flip, dealers long gamma; "negative":
+   below it, dealers short gamma; "neutral": sitting right on the flip).
+   Price action: prior_close, change_vs_prior_close_pct, session_open,
+   session_high, session_low and momentum.  On the midday and close posts,
+   "level_history" says how the walls and the flip moved during the session
+   and what price did at each one.
+3. "context": the mode (premarket, midday or close), the date and calendar
+   flags (a holiday tomorrow, a half day).
 
-STUDY THIS VOICE — it is exactly the shape we want:
+WHAT TO WRITE
+* "opening": two to four short paragraphs.  Tie the news to what price has
+  done and to where it sits against the dealer gamma levels.  Name the one or
+  two levels that matter, not all of them.  Explain the regime in plain
+  words: above the gamma flip dealers are long gamma and their hedging tends
+  to damp moves; below it they are short gamma and their hedging tends to add
+  to them.
+* "bottom_line": one to three sentences with the takeaway.  An opinion is
+  fine; a trade call is not.  Don't start it with "Bottom line", that label
+  is added for you.
+* "reply": ONE sentence posted as a threaded reply.  Add one more specific
+  point (a nuance, an implication, or the tell to watch next) about today's
+  setup.  Don't restate the bottom line, don't end with a colon or a call to
+  action, and don't include a link or hashtags; the zerogex.io link is added
+  after it for you.
+The caller adds the header line and the list of key levels.  Don't write
+either, and don't list the levels in your prose.
 
-  ---
-  The headlines changed.
+MATCH THE MODE
+* premarket (the Morning Read, 9:15 AM ET): look ahead to the open.  Where
+  the symbol sits against the levels going in, and what the overnight and
+  morning news sets up.
+* midday (the Midday Read, 12:30 PM ET): what has happened so far this
+  session, what held and what didn't.
+* close (the Post-Market Read, 4:05 PM ET): look back at the session, then
+  ahead.  On this post the top-level put_wall, call_wall and gamma_flip are
+  the map for the NEXT session: after the 4:00 PM bell the day's 0DTE
+  options expired, the chain re-priced, and the attached image shows the new
+  map.  What the levels were during the session is in "level_history".  Keep
+  the two apart, and never say today's tape reacted to a level that is only
+  in the new map.
 
-  The regime didn't.
+FACTS: ONLY WHAT YOU ARE GIVEN
+* Every piece of news comes from the headlines (a title or a summary).  Add
+  no details, figures, names, quotes or causes that aren't in them, and
+  nothing from your own memory of events.
+* Don't say a headline caused a move, or that a move came before or after a
+  headline, unless the inputs show the timing.  Say what the news is and what
+  price did.
+* Price comes from the numbers given: up or down on the day from
+  change_vs_prior_close_pct, the range from session_open, session_high and
+  session_low, and what happened at a level only from level_history's
+  outcomes ("broke", "held", "untested").  Without level_history, don't say a
+  level held, broke or was tested.
+* Every price or level you write must appear in "levels": a level's value,
+  or a value from its own path in level_history.  Write a level the way the
+  input gives it; a 778 call wall is never "the 780 call wall".  If you quote
+  net gamma, use "net_gex_display".
+* Use the most relevant of the headlines.  If none of them is about markets,
+  the economy, rates or companies, leave the news out rather than stretch.
 
-  SPY dumped straight through the 740 put wall this morning before news of
-  potential renewed U.S.–Iran talks sent oil lower and sparked a sharp
-  reversal.
+HOW IT SHOULD SOUND
+* American English spelling and usage (color, favor, center, analyze).
+* Short, plain sentences.  Contractions are fine.  Specific beats clever.
+* Punctuation a person types: periods, commas, colons, parentheses and plain
+  hyphens.  No em dashes or en dashes (use a comma or a period), no arrows,
+  no ellipsis character.  Negative numbers take a plain hyphen.
+* No emojis, hashtags, all-caps words, exclamation points, markdown or bullet
+  lists.
+* No stock phrases ("here's the thing", "let's dive in", "buckle up", "it's
+  worth noting", "all eyes on", "the stage is set", "at the end of the day",
+  "remains to be seen"), no formula openers such as a two-line "X changed. Y
+  didn't." hook, and no rhetorical questions.
+* No hype, no marketing and no trade recommendations (no buy, sell, target,
+  long or short calls).  Describe positioning and mechanics.
 
-  Price ripped back through 740, but the rally stalled well short of the 745
-  call wall and has since rolled back over.
+The voice, as an example (never reuse its wording):
+  SPY got hit early and went straight into the put wall, and buyers showed up
+  right there.  The bounce ran out of steam under the call wall, so it's been
+  a chop between the two ever since.
 
-  That's classic negative gamma: fast moves, sharp reversals, and little
-  follow-through.
-  ---
+  We're still below the gamma flip, which keeps dealers short gamma.  That's
+  why the swings have been quick in both directions.
 
-Notice:
-* A two-line contrasting HOOK to open ("The headlines changed." / "The regime
-  didn't.").  One idea per short line, blank line between.  Vary it every time.
-* Then prose that ties the NEWS to the PRICE ACTION to the GAMMA REGIME.  Say
-  what price DID at a level ("dumped straight through the 740 put wall",
-  "stalled well short of the 745 call wall", "buyers defended 735 into the
-  bell").
-* Explain the regime plainly: whether spot is above/below the gamma flip,
-  whether net gamma is positive or negative, and what that means for the tape
-  ("negative gamma = dealer hedging amplifies moves rather than dampens them:
-  fast moves, sharp reversals, little follow-through").
-* No hype, no marketing, no exclamation points, no all-caps words, no emojis,
-  no hashtags, no markdown (**, __, ##).
-
-MATCH THE MODE:
-* premarket ("Morning Read") — look AHEAD into the open.  Frame where the
-  symbol sits vs the flip/walls going in, and what the overnight news sets up.
-* midday ("Midday Read") — mid-session.  What has held, what hasn't, what the
-  morning's path says about the regime.
-* close ("Post-Market Read") — look BACK at the session's battle around the
-  levels, then the standing structure into tomorrow.
-
-THE LEVELS MOVE — READ "level_history" BEFORE YOU DESCRIBE ANY OF THEM:
-On the midday and close fires each symbol carries a "level_history" object
-describing what the walls and the gamma flip actually did during the session.
-The top-level "put_wall" / "call_wall" / "gamma_flip" figures are the
-structure as of the LAST IN-SESSION frame — the end of the story, not the
-whole of it.  When "level_history" is present it is the ONLY acceptable
-source for a claim about what happened at a level.
-
-* Each wall carries a "path": the ordered list of values it sat at, each with
-  the window it was in force and an "outcome" — "broke" (price traded
-  decisively through it), "held" (price came to it and turned), "untested"
-  (price never got near it), "unknown" (no tape to judge by).  Narrate the
-  path when "changed_during_session" is true: a put wall that walked
-  777 → 776 → 775, losing the first two and defending the third, is a far
-  better story than the closing number alone, and it is what actually
-  happened.
-* NEVER say a level was untested, defended, held or broken unless the
-  matching "outcome" says so.  A level that only became the wall at 14:00 was
-  not in play at the open — do not narrate it as if it were.
-* An "after_the_bell_reset" ("higher" / "lower") means the chain re-priced
-  that level once the day's 0DTE expiries rolled off after 16:00 ET — that is
-  tomorrow's structure, never a level the tape traded against today.  You may
-  mention the reset as a forward-looking note ("the roll-off resets the put
-  wall well lower into tomorrow").  You are not given the new value: a
-  separate line stating it is appended for you, so never write a number for
-  it.
-* The gamma flip is a drifting computed price, not a strike.  Use
-  "spot_crossings", "spot_side_at_open" and "spot_side_at_close" for whether
-  the tape ever changed regime — zero crossings means it never did, however
-  close it came.
-* Any value appearing in a wall's "path" is a real level from today and may
-  be quoted in prose even though it is no longer the standing wall.
-
-REPLY:
-Also write a threaded reply that is exactly ONE sentence — a sharp, specific
-add-on that builds on THIS post, not a generic lesson or a restatement of it.
-Make it particular to today's setup (the level that mattered, the news, the
-regime) so it reads fresh every time and never falls back on stock phrases.
-Think "one more incisive beat" — a nuance, an implication, or the tell to
-watch next — the kind of line that makes the reader smarter.  Examples of the
-SHAPE (do not reuse the wording):
-* "The tell wasn't 740 breaking — it was how fast it reclaimed once the
-  headline hit; that's short gamma doing the work in both directions."
-* "Flat on the close, violent underneath — that gap between the print and the
-  path is the whole story when dealers are this short."
-Do NOT restate the bottom line.  Do NOT end with a call-to-action or a colon.
-Do NOT include a URL or any hashtags — the zerogex.io link is appended for you.
-
-STRICT RULES:
-* Every dollar figure or strike price you write — in the post OR the reply, for
-  ANY symbol — MUST appear verbatim in the input's "levels" block.  Never
-  invent a number.  If you are unsure of a number, describe it without quoting
-  a figure.
-* A number you put next to a named level — "the 745 call wall", "call wall at
-  745", "the 740 put wall", "the 747.29 flip", "max pain at 744" — must be
-  THAT level's value in the input: its top-level figure, or a value from that
-  level's own "path" in "level_history".  Never round a level to a nearby
-  round number (a 778 call wall is not "the 780 call wall"), never give one
-  level another level's number, and never call a strike a wall because price
-  stalled there or because it is a round number.
-* When quoting net gamma, use the "net_gex_display" value ("+$7.74B",
-  "−$125.0M") — NEVER the raw "net_gex" float.
-* Do NOT restate the levels as a bulleted list in your prose — the caller adds
-  a clean "Key levels:" block after your opening.  Weave only the few levels
-  that matter into the sentences.
-* Do NOT give trading recommendations ("buy X", "sell Y", "target Z", "long
-  here").  Describe positioning and mechanics, not what the reader should do.
-* If a symbol has "spot_is_projected": true (a cash index outside the cash
-  session), its "spot" is IMPLIED from the futures ("spot_future_symbol"), not
-  a live cash quote — frame it that way, never as a live print.
-* If the input's "context" flags an event (holiday eve, FOMC, CPI, half-day),
-  work it into the framing naturally.
-
-OUTPUT — reply with a single JSON object and NOTHING else:
-{
-  "header_label": one of "Morning Read", "Midday Read", "Post-Market Read"
-                  (match the mode; use header_label_hint from the input),
-  "opening":      the hook + the prose body, everything from the top down to
-                  just before the "Key levels:" block.  Use "\\n\\n" between
-                  short paragraphs/lines.
-  "level_notes":  an object with any of the keys "put_wall", "call_wall",
-                  "gamma_flip" mapping to a SHORT contextual note (2-5 words,
-                  no numbers) — e.g. {"put_wall": "successfully defended",
-                  "call_wall": "first resistance"}.  Omit a key or use "" when
-                  there's nothing to add.  These annotate the Key levels block.
-                  When the input carries "level_history" the caller writes
-                  those notes itself from the session path and ignores yours,
-                  so spend the detail on the prose instead.
-  "bottom_line":  the takeaway — 1-3 sentences.  Opinionated but no trade
-                  calls.  Do NOT include the words "Bottom line:" — that label
-                  is added for you.
-  "reply":        the ONE-sentence sharp add-on described above.  No URL, no
-                  hashtags, no call-to-action, no colon ending.
-}
+Reply with the JSON object only.
 """
+
+# Structured output: the API guarantees a reply that parses to this shape.
+POST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "opening": {"type": "string"},
+        "bottom_line": {"type": "string"},
+        "reply": {"type": "string"},
+    },
+    "required": ["opening", "bottom_line", "reply"],
+    "additionalProperties": False,
+}
 
 
 @dataclass
@@ -263,8 +231,10 @@ class SymbolInput:
     put_wall: float | None = None
     max_pain: float | None = None
     net_gex: float | None = None
-    regime: str | None = None  # "positive", "negative", "neutral", "unresolved"
-    momentum_label: str | None = None  # e.g. "Rising", "Collapsing", "Stable"
+    # The regime the attached card shows (spot vs the flip): "positive",
+    # "negative", "neutral" (on the flip) or "unresolved".
+    regime: str | None = None
+    momentum_label: str | None = None  # e.g. "down on the day, pressing session lows"
     vwap: float | None = None
     vwap_position: str | None = None  # e.g. "Above VWAP", "Below VWAP"
     # True when ``spot`` is a futures-implied projection (cash index outside
@@ -313,16 +283,18 @@ class SymbolInput:
             "momentum": self.momentum_label,
             "vwap": self.vwap,
             "vwap_position": self.vwap_position,
-            # Present only on the midday / close fires.  The four level fields
-            # above are the structure as of the LAST IN-SESSION frame; this is
-            # the path they took to get there.
+            # Present only on the midday / close fires: how the levels moved
+            # during the session and what price did at each.  The level fields
+            # above are what the attached card shows now (on the close read,
+            # the map for the next session).
             "level_history": self.level_history,
         }
 
 
 def _short_scale_gex(v: float | None) -> str | None:
     """Mirror :func:`src.jobs.bulletin_tweet._fmt_net_gex` — the short-scale
-    form ("+$7.74B", "−$125.0M") the tweet's numeric block uses.
+    form ("+$7.74B", "-$125.0M") the post uses.  A plain hyphen, not the
+    typographic minus the card draws: the post has to read as typed.
 
     Duplicated here so bulletin_llm has no import dependency on
     bulletin_tweet (which imports the LLM module lazily).  Keeps them
@@ -330,7 +302,7 @@ def _short_scale_gex(v: float | None) -> str | None:
     if v is None:
         return None
     abs_v = abs(v)
-    sign = "+" if v >= 0 else "−"
+    sign = "+" if v >= 0 else "-"
     if abs_v >= 1e9:
         return f"{sign}${abs_v / 1e9:.2f}B"
     if abs_v >= 1e6:
@@ -355,7 +327,7 @@ class DayContext:
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
-            "header_label_hint": MODE_HEADER_LABEL.get(self.mode, "Market Read"),
+            "read_label": MODE_HEADER_LABEL.get(self.mode, "Market Read"),
             "date": self.date.isoformat(),
             "day_of_week": self.date.strftime("%A"),
             "is_holiday_eve": self.is_holiday_eve,
@@ -370,13 +342,16 @@ class DayContext:
 
 @dataclass
 class LlmPost:
-    """The composed narrative fragments the caller assembles into post + reply."""
+    """The narrative fragments the caller assembles into post + reply."""
 
-    header_label: str
     opening: str
     bottom_line: str
     reply: str
-    level_notes: dict[str, str] = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"opening": self.opening, "bottom_line": self.bottom_line, "reply": self.reply}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -450,12 +425,11 @@ def _build_user_message(
         "headlines": [h.to_prompt_dict() for h in (headlines or [])],
         "levels": levels,
         "instructions": (
-            "Feature the symbol marked featured=true (featured_symbol); write "
-            "the post about it, weaving the headlines, its price action, and its "
-            "dealer-gamma regime together in the voice described in the system "
-            "prompt.  Then write the threaded reply.  Every price you mention — "
-            "in the post or the reply, for any symbol — must appear in ``levels``. "
-            "Reply with the JSON object described in the system prompt."
+            "Write the post about the symbol marked featured=true, tying the "
+            "headlines, its price action and its dealer-gamma regime together "
+            "in the voice described in the system prompt, then the threaded "
+            "reply.  Every price you mention, in the post or the reply, must "
+            "appear in levels."
         ),
     }
     return json.dumps(payload, indent=2, default=str)
@@ -484,44 +458,93 @@ def _extract_json_block(text: str) -> str | None:
 
 def _call_claude(
     system: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     api_key: str,
     model: str,
     max_tokens: int,
     timeout_seconds: int,
+    schema: dict[str, Any] | None = None,
+    errors: list[str] | None = None,
 ) -> dict[str, Any] | None:
-    body = {
+    """POST one Messages API request; the parsed response, or None.
+
+    ``schema`` switches on structured output, so the reply is guaranteed to
+    parse to that shape.  Failures log and, when ``errors`` is given, append
+    a plain-English reason the operator's notice can quote."""
+    body: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "system": system,
         "messages": messages,
     }
-    req = Request(
-        ANTHROPIC_API_URL,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "content-type": "application/json",
-            "user-agent": "zerogex-bulletin-llm/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=timeout_seconds) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except (HTTPError, URLError) as exc:
-        logger.warning("bulletin_llm: Claude API call failed (%s)", exc)
-        return None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_llm: unexpected Claude API error (%s)", exc)
-        return None
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+        "user-agent": "zerogex-bulletin-llm/1.0",
+    }
+    if schema is not None:
+        body["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+    if model == DEFAULT_MODEL:
+        body["fallbacks"] = "default"
+        headers["anthropic-beta"] = FALLBACK_BETA
+    raw = ""
+    retries_left = API_ATTEMPTS - 1
+    while True:
+        req = Request(
+            ANTHROPIC_API_URL,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            break
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning("bulletin_llm: Claude API call failed (%s) %s", exc, detail)
+            if exc.code == 400 and "fallbacks" in body and "fallback" in detail.lower():
+                # The refusal fallback is a beta option; if this account is
+                # refused it, the post shouldn't be held for it.
+                logger.warning("bulletin_llm: retrying without the refusal fallback")
+                body.pop("fallbacks")
+                headers.pop("anthropic-beta", None)
+                continue
+            if exc.code in _RETRYABLE_STATUS and retries_left > 0:
+                retries_left -= 1
+                time.sleep(API_RETRY_PAUSE_SECONDS)
+                continue
+            _note(errors, f"the Claude API returned HTTP {exc.code} {detail}".strip())
+            return None
+        except (URLError, TimeoutError, OSError) as exc:
+            logger.warning("bulletin_llm: Claude API call failed (%s)", exc)
+            if retries_left > 0:
+                retries_left -= 1
+                time.sleep(API_RETRY_PAUSE_SECONDS)
+                continue
+            _note(errors, f"the Claude API could not be reached ({exc})")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bulletin_llm: unexpected Claude API error (%s)", exc)
+            _note(errors, f"unexpected Claude API error ({exc})")
+            return None
 
     try:
         return json.loads(raw) if raw else None
     except json.JSONDecodeError as exc:
         logger.warning("bulletin_llm: Claude response was not JSON (%s)", exc)
+        _note(errors, "the Claude API returned something that wasn't JSON")
         return None
+
+
+def _note(errors: list[str] | None, message: str) -> None:
+    if errors is not None:
+        errors.append(message)
 
 
 def _extract_text_from_response(payload: dict[str, Any]) -> str | None:
@@ -542,8 +565,7 @@ def _parse_post(body_json: str) -> LlmPost | None:
     """Parse the model's JSON body into an ``LlmPost``.
 
     Guards against missing fields, wrong types, and pathologically long
-    strings.  Returns None on any structural failure so the caller falls
-    back to the template."""
+    strings.  Returns None on any structural failure."""
     try:
         # strict=False accepts unescaped control chars inside string values;
         # Claude sometimes emits multi-para fields with literal newlines.
@@ -555,34 +577,22 @@ def _parse_post(body_json: str) -> LlmPost | None:
         logger.warning("bulletin_llm: model returned non-object payload")
         return None
 
-    def _str_field(name: str, required: bool = True) -> str | None:
+    def _str_field(name: str) -> str:
         value = obj.get(name)
-        if value is None:
-            return None if required else ""
         if not isinstance(value, str):
-            logger.warning(
-                "bulletin_llm: model field %r was %s, expected string",
-                name,
-                type(value).__name__,
-            )
-            return None
+            if value is not None:
+                logger.warning(
+                    "bulletin_llm: model field %r was %s, expected string",
+                    name,
+                    type(value).__name__,
+                )
+            return ""
         # Cap at 5000 chars per section — well under X's long-form ceiling.
         return value.strip()[:5000]
 
-    header_label = _str_field("header_label") or ""
-    opening = _str_field("opening") or ""
-    bottom_line = _str_field("bottom_line") or ""
-    reply = _str_field("reply") or ""
-
-    # level_notes is optional; tolerate absence / wrong type.
-    notes_raw = obj.get("level_notes")
-    level_notes: dict[str, str] = {}
-    if isinstance(notes_raw, dict):
-        for key in LEVEL_KEYS:
-            v = notes_raw.get(key)
-            if isinstance(v, str) and v.strip():
-                # 60-char cap keeps a runaway note from bloating the block.
-                level_notes[key] = v.strip()[:60]
+    opening = _str_field("opening")
+    bottom_line = _str_field("bottom_line")
+    reply = _str_field("reply")
 
     # opening + reply are the load-bearing fields; without them there's no
     # post worth composing.
@@ -595,26 +605,13 @@ def _parse_post(body_json: str) -> LlmPost | None:
         )
         return None
 
-    return LlmPost(
-        header_label=header_label,
-        opening=opening,
-        bottom_line=bottom_line,
-        reply=reply,
-        level_notes=level_notes,
-    )
+    return LlmPost(opening=opening, bottom_line=bottom_line, reply=reply)
 
 
 def _post_text(post: LlmPost) -> str:
-    """Everything the model wrote (post + reply + notes), comma-thousands
+    """Everything the model wrote (post + reply), comma-thousands
     collapsed so "7,483" reads as one number."""
-    combined = "\n".join(
-        [
-            post.opening,
-            post.bottom_line,
-            post.reply,
-            " ".join(post.level_notes.values()),
-        ]
-    )
+    combined = "\n".join([post.opening, post.bottom_line, post.reply])
     return re.sub(r"(?<=\d),(?=\d{3}\b)", "", combined)
 
 
@@ -903,6 +900,18 @@ def _correction_message(problems: list[str]) -> str:
     )
 
 
+def _revision_message(problems: list[str]) -> str:
+    """The follow-up turn that hands the final review's findings back."""
+    listed = "\n".join(f"* {p}" for p in problems)
+    return (
+        "A final review of your draft, as it will be posted (with the header "
+        "line and the key levels list added), found these problems:\n"
+        f"{listed}\n\n"
+        "Rewrite the JSON object with every one of them fixed and everything "
+        "else kept.  If a sentence can't be supported by the inputs, drop it."
+    )
+
+
 def generate_post(
     mode: str,
     day: date,
@@ -914,19 +923,24 @@ def generate_post(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     featured_symbol: str | None = None,
+    revise_from: LlmPost | None = None,
+    feedback: list[str] | None = None,
+    errors: list[str] | None = None,
 ) -> LlmPost | None:
-    """Call Claude and return an ``LlmPost`` — or None on any failure.
+    """Call Claude and return an ``LlmPost``, or None on any failure.
 
-    The caller invokes this AFTER assembling the deterministic bulletin
-    data + the scraped headlines.  ``featured_symbol`` is the single symbol
-    the post centers on.  A None return is expected and normal (no API key,
-    API outage, malformed response) and instructs the caller to fall back to
-    the static template."""
+    ``featured_symbol`` is the single symbol the post centers on.  With
+    ``revise_from`` and ``feedback``, the model gets its earlier draft back
+    with the review's findings and rewrites it.  None means no usable post
+    (no API key, API outage, malformed response, levels still misstated);
+    when ``errors`` is given, the reason is appended to it."""
     if not symbols:
+        _note(errors, "there was no symbol data to write about")
         return None
     key = (api_key or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
     if not key:
-        logger.debug("bulletin_llm: ANTHROPIC_API_KEY unset — skipping LLM")
+        logger.warning("bulletin_llm: ANTHROPIC_API_KEY unset — can't write the post")
+        _note(errors, "ANTHROPIC_API_KEY is not set, so the post could not be written")
         return None
 
     ctx = day_context or build_day_context(mode, day)
@@ -941,7 +955,12 @@ def generate_post(
         headlines=headlines,
         featured_symbol=featured_symbol,
     )
-    messages: list[dict[str, str]] = [{"role": "user", "content": user_msg}]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
+    if revise_from is not None and feedback:
+        messages += [
+            {"role": "assistant", "content": revise_from.to_json()},
+            {"role": "user", "content": _revision_message(feedback)},
+        ]
     for correction_round in range(MAX_CORRECTION_ROUNDS + 1):
         resp = _call_claude(
             SYSTEM_PROMPT,
@@ -950,17 +969,25 @@ def generate_post(
             model_id,
             max_tokens,
             timeout_seconds,
+            POST_SCHEMA,
+            errors,
         )
         if resp is None:
+            return None
+        if resp.get("stop_reason") == "refusal":
+            logger.warning("bulletin_llm: the model declined to write the post")
+            _note(errors, "the writing model declined the request")
             return None
 
         text = _extract_text_from_response(resp)
         if not text:
             logger.warning("bulletin_llm: Claude response had no text content")
+            _note(errors, "the writing model returned no text")
             return None
 
         post = _post_from_text(text, resp.get("stop_reason"), max_tokens)
         if post is None:
+            _note(errors, "the writing model's reply could not be read as a post")
             return None
 
         problems = _post_problems(post, symbols)
@@ -969,10 +996,11 @@ def generate_post(
         if correction_round == MAX_CORRECTION_ROUNDS:
             logger.warning(
                 "bulletin_llm: draft still misstates the levels after %d correction "
-                "round(s) — falling back to template: %s",
+                "round(s): %s",
                 MAX_CORRECTION_ROUNDS,
                 "; ".join(problems),
             )
+            _note(errors, "the draft kept misstating levels: " + "; ".join(problems))
             return None
         logger.warning(
             "bulletin_llm: draft misstates the levels — sending it back to the model: %s",
@@ -992,8 +1020,7 @@ def _post_from_text(text: str, stop_reason: Any, max_tokens: int) -> LlmPost | N
         if stop_reason == "max_tokens":
             logger.warning(
                 "bulletin_llm: model output truncated at max_tokens=%d — "
-                "increase BULLETIN_TWEET_LLM_MAX_TOKENS if this keeps happening. "
-                "Falling back to static template.",
+                "increase BULLETIN_TWEET_LLM_MAX_TOKENS if this keeps happening.",
                 max_tokens,
             )
         else:
@@ -1005,3 +1032,171 @@ def _post_from_text(text: str, stop_reason: Any, max_tokens: int) -> LlmPost | N
             )
         return None
     return _parse_post(json_block)
+
+
+# ---------------------------------------------------------------------------
+# The review: an independent fact-check of the finished post
+# ---------------------------------------------------------------------------
+
+REVIEW_SYSTEM_PROMPT = """\
+You are the last check before a market post goes out on the ZeroGEX X
+account.  The founder posts these as their own, so anything wrong in one is
+the founder's mistake in public.  You get the post and the threaded reply
+exactly as they will be published, the inputs they were written from, and
+usually the Live Bulletin image attached to the post.
+
+List a problem for each of these you find:
+1. News that isn't in the headlines: an event, figure, name, quote, cause or
+   timing that no headline's title or summary supports.  General market
+   mechanics (how dealer hedging works) are not news and need no source.
+2. Price action the numbers contradict: up or down on the day must match
+   change_vs_prior_close_pct; highs, lows and the range must match
+   session_open, session_high and session_low; "held", "broke", "tested" or
+   "never tested" at a level must match that level's outcome in
+   level_history, and without level_history no such claim is supported.
+3. A level with the wrong number: a number named as the put wall, call wall,
+   gamma flip or max pain must be that level's value in "levels" or a value
+   from its own level_history path.  A flip rounded to fewer decimals is
+   fine; a wall rounded to a different strike is not.
+4. A regime claim the data contradicts: above the gamma flip is positive
+   gamma (dealers long gamma), below it is negative gamma (dealers short
+   gamma), and "regime" is what the attached image shows.
+5. On the close post, the top-level levels are the next session's map (the
+   day's 0DTE options expired at the bell and the chain re-priced).  A
+   sentence that has today's tape reacting to a level that appears only
+   there, and not in level_history, is a problem.
+6. Headlines ignored: when the headlines include real market, economic, rate
+   or company news, the post should use at least one of them.
+7. Writing that gives it away as generated or careless: British spellings;
+   em dashes or en dashes; emojis, hashtags, markdown, all-caps words or
+   exclamation points; stock phrases or a formula hook; anything that reads
+   like a bot or a press release instead of a trader typing; trade
+   recommendations; hype.
+
+Don't flag correct statements you would phrase differently, wording
+preferences, the header line, or the key levels list (those are checked
+separately), or numbers that match the inputs.
+
+The image ("image_problems"): it should be a fully rendered ZeroGEX Live
+Bulletin card for the featured symbol.  Flag a blank, cut-off or error page,
+a card for a different symbol, or a card whose main levels show a dash
+instead of a number.  The exact numbers were read from the page itself and
+are in "levels", so don't re-read small digits from the picture.  The change
+shown next to the card's price is measured from the card's own reference
+close, which after the 4:00 PM bell is today's close; judge the day's move by
+change_vs_prior_close_pct only.
+
+Each problem is one short sentence that quotes the words at fault and says
+what is wrong.  Empty lists mean the post can go out.
+"""
+
+REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "problems": {"type": "array", "items": {"type": "string"}},
+        "image_problems": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["problems", "image_problems"],
+    "additionalProperties": False,
+}
+
+
+@dataclass
+class Review:
+    """The fact-check's verdict.  ``ran`` is False when no verdict came back
+    (no key, API trouble, an unreadable reply); ``error`` then says why."""
+
+    ran: bool
+    problems: list[str] = field(default_factory=list)
+    image_problems: list[str] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def approved(self) -> bool:
+        return self.ran and not self.problems and not self.image_problems
+
+
+def review_post(
+    mode: str,
+    day: date,
+    post_text: str,
+    reply_text: str,
+    symbol: SymbolInput,
+    headlines: list[Headline] | None = None,
+    card_png: bytes | None = None,
+    day_context: DayContext | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> Review:
+    """Fact-check the finished post against its inputs and the card image.
+
+    A separate call from the writer, so it reads the post the way a reader
+    will rather than the way it was meant.  Never raises."""
+    key = (api_key or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
+    if not key:
+        return Review(ran=False, error="ANTHROPIC_API_KEY is not set")
+    model_id = (
+        model or os.environ.get("BULLETIN_TWEET_REVIEW_MODEL", "").strip() or DEFAULT_REVIEW_MODEL
+    )
+    ctx = day_context or build_day_context(mode, day)
+    payload = {
+        "context": ctx.to_prompt_dict(),
+        "featured_symbol": symbol.symbol.upper(),
+        "headlines": [h.to_prompt_dict() for h in (headlines or [])],
+        "levels": symbol.to_prompt_dict(),
+        "post": post_text,
+        "reply": reply_text,
+    }
+    content: list[dict[str, Any]] = []
+    if card_png:
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(card_png).decode("ascii"),
+                },
+            }
+        )
+    content.append({"type": "text", "text": json.dumps(payload, indent=2, default=str)})
+
+    errors: list[str] = []
+    resp = _call_claude(
+        REVIEW_SYSTEM_PROMPT,
+        [{"role": "user", "content": content}],
+        key,
+        model_id,
+        max_tokens,
+        timeout_seconds,
+        REVIEW_SCHEMA,
+        errors,
+    )
+    if resp is None:
+        return Review(ran=False, error="; ".join(errors) or "the review call failed")
+    if resp.get("stop_reason") == "refusal":
+        return Review(ran=False, error="the review model declined the request")
+    if resp.get("stop_reason") == "max_tokens":
+        return Review(ran=False, error="the review was cut off before it finished")
+    text = _extract_text_from_response(resp)
+    block = _extract_json_block(text or "")
+    try:
+        verdict = json.loads(block, strict=False) if block else None
+    except json.JSONDecodeError:
+        verdict = None
+    if not isinstance(verdict, dict):
+        return Review(ran=False, error="the review's reply could not be read")
+
+    def _strings(name: str) -> list[str]:
+        items = verdict.get(name)
+        if not isinstance(items, list):
+            return []
+        return [str(i).strip() for i in items if str(i).strip()]
+
+    return Review(
+        ran=True,
+        problems=_strings("problems"),
+        image_problems=_strings("image_problems"),
+    )

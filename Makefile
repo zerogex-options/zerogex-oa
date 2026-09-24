@@ -5464,17 +5464,17 @@ forecast-tweet-status: ## Show forecast tweet timers + last/next fire + recent l
 # =============================================================================
 # Live Bulletin auto-tweet (09:15 pre-market, 12:30 midday, 16:05 close ET)
 # =============================================================================
-# Three fires per trading day, one script.  Each fire builds a
-# multi-paragraph read across SPY/SPX/QQQ from get_latest_gex_summary,
-# renders the lead symbol's Live Bulletin PNG via the frontend's
-# /api/bulletin/card endpoint, and (best-effort) records the day's Replay
-# scrubber via the frontend's Playwright helper.  Every mode is dry-run
-# by default; artifacts (tweet text + PNG + clip + manifest.json) land
+# Three fires per trading day, one script.  Each fire screenshots the lead
+# symbol's live Live Bulletin card (the frontend's Playwright helper), writes
+# the post from that card's numbers and the latest CNBC headlines, has it
+# fact-checked, and only then posts it with the card attached.  Anything
+# that goes wrong holds the post and emails the reasons.  Every mode is
+# dry-run by default; artifacts (post + reply + PNG + manifest.json) land
 # in $BULLETIN_TWEET_ARTIFACT_DIR (default /var/lib/zerogex-oa/
 # bulletin-tweets) for operator inspection before flipping --post on.
 #
-# Override symbols with BULLETIN_TWEET_SYMBOLS=SPY,SPX,QQQ (default), the
-# lead attachment symbol with BULLETIN_TWEET_LEAD_SYMBOL=SPX (default),
+# Override the symbols fetched with BULLETIN_TWEET_SYMBOLS (default SPY), the
+# symbol the post is about with BULLETIN_TWEET_LEAD_SYMBOL (default SPY),
 # or a specific date with BULLETIN_TWEET_DATE=YYYY-MM-DD.
 .PHONY: bulletin-tweet-premarket-dry-run
 bulletin-tweet-premarket-dry-run: ## Dry-run today's pre-market bulletin tweet (09:15 slot)
@@ -5501,7 +5501,7 @@ bulletin-tweet-close-dry-run: ## Dry-run today's post-market bulletin tweet (16:
 		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
 
 .PHONY: bulletin-tweet-premarket-post
-bulletin-tweet-premarket-post: ## Post today's pre-market bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+bulletin-tweet-premarket-post: ## Post today's pre-market bulletin tweet (needs the four X OAuth1 keys)
 	@echo "$(BLUE)=== Posting pre-market bulletin tweet ===$(NC)"
 	@$(PY) -m src.jobs.bulletin_tweet --mode premarket --post \
 		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
@@ -5509,7 +5509,7 @@ bulletin-tweet-premarket-post: ## Post today's pre-market bulletin tweet (needs 
 		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
 
 .PHONY: bulletin-tweet-midday-post
-bulletin-tweet-midday-post: ## Post today's mid-session bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+bulletin-tweet-midday-post: ## Post today's mid-session bulletin tweet (needs the four X OAuth1 keys)
 	@echo "$(BLUE)=== Posting mid-session bulletin tweet ===$(NC)"
 	@$(PY) -m src.jobs.bulletin_tweet --mode midday --post \
 		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
@@ -5517,7 +5517,7 @@ bulletin-tweet-midday-post: ## Post today's mid-session bulletin tweet (needs X_
 		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
 
 .PHONY: bulletin-tweet-close-post
-bulletin-tweet-close-post: ## Post today's post-market bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+bulletin-tweet-close-post: ## Post today's post-market bulletin tweet (needs the four X OAuth1 keys)
 	@echo "$(BLUE)=== Posting post-market bulletin tweet ===$(NC)"
 	@$(PY) -m src.jobs.bulletin_tweet --mode close --post \
 		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \

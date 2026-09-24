@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -52,6 +53,134 @@ def _summary_row(
     }
 
 
+def _stub_writer(
+    monkeypatch,
+    mod,
+    opening: str = "SPY is chopping between the walls after the jobs report.",
+    bottom_line: str = "Patience until the flip gives way.",
+    reply: str = "The tell is how fast the dips get bought.",
+):
+    """Stand in for the Claude writer.  build_tweet_body has no template
+    fallback, so every test that expects a post supplies one."""
+    from src.jobs import bulletin_llm
+
+    calls: list[dict] = []
+
+    def _fake(
+        mode,
+        day,
+        present,
+        featured_symbol,
+        headlines=None,
+        revise_from=None,
+        feedback=None,
+        errors=None,
+    ):
+        calls.append(
+            {
+                "mode": mode,
+                "featured_symbol": featured_symbol,
+                "revise_from": revise_from,
+                "feedback": feedback,
+                "headlines": headlines,
+                "present": present,
+            }
+        )
+        return bulletin_llm.LlmPost(opening=opening, bottom_line=bottom_line, reply=reply)
+
+    monkeypatch.setattr(mod, "_try_llm_post", _fake)
+    return calls
+
+
+def _headline(title: str = "Stocks slip after the jobs report", minutes_ago: int = 30) -> dict:
+    published = datetime.now(tz=ZoneInfo("UTC")) - timedelta(minutes=minutes_ago)
+    return {
+        "title": title,
+        "summary": "",
+        "source": "CNBC",
+        "link": "https://www.cnbc.com/example",
+        "published": published.isoformat(),
+    }
+
+
+def _card_levels(symbol: str = "SPY", **overrides) -> dict:
+    """The numbers the snapshot page reports for its card."""
+    levels = {
+        "symbol": symbol,
+        "spot": 744.62,
+        "spot_is_projected": False,
+        "spot_source": None,
+        "prior_close": 749.1,
+        "change_pct": -0.6,
+        "gamma_flip": 747.29,
+        "call_wall": 745.0,
+        "put_wall": 740.0,
+        "max_pain": 744.0,
+        "net_gex": -1_250_000_000.0,
+        "regime": "negative",
+        "summary_timestamp": "2026-07-06T16:30:00+00:00",
+        "as_of": "Jul 6, 2026 · 12:30 PM EDT",
+    }
+    levels.update(overrides)
+    return levels
+
+
+def _png_bytes(width: int = 1280, height: int = 1932) -> bytes:
+    """A PNG signature + IHDR header: all the size check reads."""
+    return (
+        b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, height)
+    )
+
+
+def _db_stub() -> MagicMock:
+    db = MagicMock()
+    db.connect = AsyncMock()
+    db.disconnect = AsyncMock()
+    db.get_latest_gex_summary = AsyncMock(side_effect=lambda symbol: _summary_row(symbol))
+    return db
+
+
+def _passing_run(monkeypatch, mod, review_problems: list[list[str]] | None = None) -> dict:
+    """Stub everything _run reaches outside the process (the DB, the card
+    screenshot, the headlines, the writer and the fact-check) so a fire
+    passes review.  ``review_problems`` feeds the fact-check's findings, one
+    list per call."""
+    from src.jobs import bulletin_llm
+
+    db = _db_stub()
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: db)
+
+    cards: list[str] = []
+
+    def _fake_card(symbol, mode, site_url, out_path, **kwargs):
+        cards.append(symbol)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(_png_bytes())
+        return mod.CardRender(png_path=out_path, levels=_card_levels(symbol))
+
+    monkeypatch.setattr(mod, "render_bulletin_card", _fake_card)
+    monkeypatch.setattr(mod, "_fetch_fresh_headlines", lambda: ([_headline()], None))
+    writer_calls = _stub_writer(monkeypatch, mod)
+    pending = [list(p) for p in (review_problems or [])]
+    review_calls: list[dict] = []
+
+    def _fake_review(**kwargs):
+        review_calls.append(kwargs)
+        return bulletin_llm.Review(ran=True, problems=pending.pop(0) if pending else [])
+
+    monkeypatch.setattr(bulletin_llm, "review_post", _fake_review)
+    held: list[dict] = []
+    monkeypatch.setattr(
+        mod,
+        "_send_xpost_held_email",
+        lambda mode, symbol, problems, tweet, png_path, posting: held.append(
+            {"mode": mode, "problems": problems, "png": png_path, "posting": posting}
+        )
+        or True,
+    )
+    return {"db": db, "cards": cards, "writer": writer_calls, "review": review_calls, "held": held}
+
+
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
@@ -68,7 +197,7 @@ def test_fmt_net_gex_scales_by_magnitude():
     mod = _reload_module()
     assert mod._fmt_net_gex(72_300_000.0) == "+$72.3M"
     assert mod._fmt_net_gex(19_500_000_000.0) == "+$19.50B"
-    assert mod._fmt_net_gex(-1_200_000_000.0) == "−$1.20B"
+    assert mod._fmt_net_gex(-1_200_000_000.0) == "-$1.20B"
     assert mod._fmt_net_gex(None) == "—"
 
 
@@ -96,10 +225,13 @@ def test_shape_bulletin_prefers_net_gex_at_spot():
 
 
 def test_build_tweet_body_close_shape(monkeypatch):
-    # Force the deterministic static-template path so the body content is
-    # stable regardless of whether the test host has an API key/network.
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
+    _stub_writer(
+        monkeypatch,
+        mod,
+        opening="SPY closed right on its flip.",
+        reply="The tell was how quickly 740 got bought.",
+    )
     bulletins = [
         mod._shape_bulletin(
             _summary_row(
@@ -129,7 +261,7 @@ def test_build_tweet_body_close_shape(monkeypatch):
     ]
     body = mod.build_tweet_body(
         mode="close",
-        day=date(2026, 7, 3),
+        day=date(2026, 7, 1),  # a Wednesday: the next session is tomorrow
         bulletins=bulletins,
         site_url="https://zerogex.io",
         lead_symbol="SPX",
@@ -138,36 +270,36 @@ def test_build_tweet_body_close_shape(monkeypatch):
     # SPY's spot sits exactly on its gamma flip → cleanest setup → featured.
     assert body.featured_symbol == "SPY"
     assert body.lead_symbol == "SPY"
-    # Header is the "…Read — $SYM" format the operator specified.
-    assert "Post-Market Read — $SPY" in body.text
-    # The deterministic Key levels block (Python owns the prices).
-    assert "Key levels:" in body.text
-    assert "• 740 → Put Wall" in body.text
-    assert "• 750 → Call Wall" in body.text
-    assert "• 744.51 → Gamma Flip" in body.text
-    # Net GEX is woven into the static hook prose.
-    assert "+$72.3M" in body.text
+    lines = body.text.splitlines()
+    # The header takes a plain hyphen, not a dash.
+    assert lines[0] == "Post-Market Read - $SPY"
+    assert "SPY closed right on its flip." in body.text
+    # The close read's levels are the next session's map, and say so; Python
+    # owns every price, written the way a person types them.
+    assert "Levels for tomorrow:\n• 740 put wall\n• 750 call wall\n• 744.51 gamma flip" in body.text
+    assert "DTE" not in body.text and "→" not in body.text and "—" not in body.text
     assert "Bottom line:" in body.text
     # The other two symbols get NO numeric block of their own.
-    assert "SPX spot:" not in body.text
-    assert "QQQ spot:" not in body.text
+    assert "$SPX" not in body.text and "$QQQ" not in body.text
     # No site link and no hashtags in the main post.
     assert "zerogex.io" not in body.text
     assert "http" not in body.text
     assert "#" not in body.text
     # All three still count as present (fetched so the copy can cross-reference).
     assert body.symbols_present == ["SPY", "SPX", "QQQ"]
-    # The link rides in the threaded reply instead (static fallback reply).
-    assert body.reply_text == "Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io"
+    # The link rides in the threaded reply instead.
+    assert body.reply_text == "The tell was how quickly 740 got bought.\n\nhttps://zerogex.io"
 
 
-def test_build_tweet_body_labels_per_mode():
+def test_build_tweet_body_labels_per_mode(monkeypatch):
     mod = _reload_module()
+    _stub_writer(monkeypatch, mod)
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
-    for mode, expected in (
-        ("premarket", "Morning Read — $SPY"),
-        ("midday", "Midday Read — $SPY"),
-        ("close", "Post-Market Read — $SPY"),
+    for mode, header, heading in (
+        ("premarket", "Morning Read - $SPY", "Key levels:"),
+        ("midday", "Midday Read - $SPY", "Key levels:"),
+        # 2026-07-03 is a Friday, so the close read's map is for Monday.
+        ("close", "Post-Market Read - $SPY", "Levels for Monday:"),
     ):
         body = mod.build_tweet_body(
             mode=mode,
@@ -176,7 +308,8 @@ def test_build_tweet_body_labels_per_mode():
             site_url="https://zerogex.io",
             lead_symbol="SPY",
         )
-        assert expected in body.text, f"mode={mode} missing label"
+        assert body.text.splitlines()[0] == header, f"mode={mode} header"
+        assert heading in body.text, f"mode={mode} levels heading"
 
 
 def test_build_tweet_body_skips_symbols_with_no_data(monkeypatch):
@@ -265,18 +398,19 @@ async def test_fetch_bulletins_projects_spx_spot(monkeypatch):
     assert by_sym["SPY"].spot_is_projected is False
 
 
-def test_build_tweet_body_lead_variant_deterministic_per_day():
-    """The lead sentence should be stable within a fire (dry-run and live
-    match), so the seed is deterministic on (date, mode)."""
+def test_build_tweet_body_has_no_template_fallback(monkeypatch):
+    """Without the writer there is no post, and the body says why: the
+    operator doesn't want a post that skips the news going out."""
     mod = _reload_module()
-    bulletins = [mod._shape_bulletin(_summary_row("SPY"), "SPY")]
-    a = mod.build_tweet_body(
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
+    body = mod.build_tweet_body(
         "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPY"
     )
-    b = mod.build_tweet_body(
-        "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPY"
-    )
-    assert a.text == b.text
+    assert body.text == ""
+    assert body.reply_text == ""
+    assert body.featured_symbol == "SPY"
+    assert body.problems and "ANTHROPIC_API_KEY" in body.problems[0]
 
 
 def test_fallback_tweet_fits_in_280(monkeypatch):
@@ -384,8 +518,8 @@ def test_select_featured_symbol_weights_gamma_flip_over_walls():
 def test_build_tweet_body_force_featured_pins_lead_symbol(monkeypatch):
     """force_featured (the scheduled auto-post's lead) pins the featured symbol
     even when another symbol has a 'cleaner setup'."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
+    _stub_writer(monkeypatch, mod)
     # SPX sits right on its flip (cleanest); SPY is far from all its levels.
     spy = mod._shape_bulletin(
         _summary_row(
@@ -421,7 +555,7 @@ def test_build_tweet_body_force_featured_pins_lead_symbol(monkeypatch):
         force_featured="SPY",
     )
     assert body.featured_symbol == "SPY"
-    assert "Post-Market Read — $SPY" in body.text
+    assert body.text.startswith("Post-Market Read - $SPY")
     # If the forced symbol has no data this fire, fall through to cleanest.
     body2 = mod.build_tweet_body(
         "close",
@@ -447,19 +581,19 @@ def test_select_featured_symbol_falls_back_when_none_eligible():
 
 
 def test_reply_text_carries_the_link(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
+    _stub_writer(monkeypatch, mod, reply="Watch how 740 trades on the first test.")
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
     body = mod.build_tweet_body(
         "midday", date(2026, 7, 3), bulletins, site_url="https://zerogex.io/", lead_symbol="SPY"
     )
     # Trailing slash on the site URL is trimmed.
-    assert body.reply_text == ("Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io")
+    assert body.reply_text == "Watch how 740 trades on the first test.\n\nhttps://zerogex.io"
 
 
 def test_reply_text_env_override(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
+    _stub_writer(monkeypatch, mod)
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
     body = mod.build_tweet_body(
         "midday",
@@ -467,71 +601,132 @@ def test_reply_text_env_override(monkeypatch):
         bulletins,
         site_url="https://zerogex.io",
         lead_symbol="SPY",
-        reply_text="Custom reply — zerogex.io",
+        reply_text="Custom reply: https://zerogex.io",
     )
-    assert body.reply_text == "Custom reply — zerogex.io"
+    assert body.reply_text == "Custom reply: https://zerogex.io"
 
 
-def test_post_bulletin_posts_main_then_link_reply(monkeypatch):
-    """post_bulletin posts the main tweet, then threads the link comment
-    as a reply to the returned tweet id."""
-    mod = _reload_module()
-    calls: list[dict] = []
+def _fake_x(
+    monkeypatch, fail_reply: bool = False, fail_upload: bool = False, fail_post: bool = False
+):
+    """Stub the X client: records every upload and post."""
+    from src.jobs import x_media_client
 
-    def _fake_post(text, bearer, media_ids=None, reply_to=None, timeout_seconds=15):
-        calls.append({"text": text, "reply_to": reply_to})
-        tid = "main-123" if reply_to is None else "reply-456"
-        return {"data": {"id": tid}}
+    calls: dict[str, list] = {"upload": [], "post": []}
+    creds = x_media_client.OAuth1Credentials("ck", "cs", "at", "ats")
+    monkeypatch.setattr(x_media_client, "load_credentials_from_env", lambda: creds)
 
-    monkeypatch.setattr(mod, "post_tweet_via_x_api", _fake_post)
-    monkeypatch.setattr(mod, "_upload_media_files", lambda media: [])
+    def _upload(path, credentials, timeout_seconds=60):
+        calls["upload"].append(path)
+        if fail_upload:
+            raise x_media_client.XApiError("v1.1 upload HTTP 403; v2 upload HTTP 403")
+        return "media-1"
 
-    tweet = mod.TweetBody(
-        text="$SPY midday update:\n\nbody",
-        fallback="$SPY midday",
+    def _post(text, credentials, media_ids=None, reply_to=None, timeout_seconds=30):
+        calls["post"].append({"text": text, "media_ids": media_ids, "reply_to": reply_to})
+        if fail_post and reply_to is None:
+            raise x_media_client.XApiError("HTTP 403: text too long")
+        if fail_reply and reply_to is not None:
+            raise x_media_client.XApiError("HTTP 429: too many requests")
+        return "main-123" if reply_to is None else "reply-456"
+
+    monkeypatch.setattr(x_media_client, "upload_image", _upload)
+    monkeypatch.setattr(x_media_client, "post_tweet", _post)
+    return calls
+
+
+def _png_media(mod, tmp_path):
+    png = tmp_path / "bulletin-spy.png"
+    png.write_bytes(_png_bytes())
+    return mod.MediaArtifacts(png_path=png)
+
+
+def _tweet(mod):
+    return mod.TweetBody(
+        text="Midday Read - $SPY\n\nbody",
+        fallback="Midday Read - $SPY: spot 744.62",
         lead_symbol="SPY",
         symbols_present=["SPY"],
-        reply_text="Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io",
+        reply_text="One more beat.\n\nhttps://zerogex.io",
         featured_symbol="SPY",
     )
-    result = mod.post_bulletin(
-        tweet, mod.MediaArtifacts(), bearer="tok", long=True, mode_label="midday"
-    )
-    assert result["id"] == "main-123"
-    assert result["reply_id"] == "reply-456"
-    # Two posts: main (reply_to None) then the link reply (reply_to = main id).
-    assert len(calls) == 2
-    assert calls[0]["reply_to"] is None
-    assert calls[1]["reply_to"] == "main-123"
-    assert calls[1]["text"].startswith("Free delayed SPY / SPX / QQQ gamma levels:")
 
 
-def test_post_bulletin_survives_failed_reply(monkeypatch):
-    """A failing link reply doesn't fail the whole post — the main tweet
-    id is still returned."""
+def test_post_bulletin_posts_main_with_image_then_link_reply(monkeypatch, tmp_path):
+    """The image uploads first, the post carries it, and the link comment is
+    threaded under the post."""
     mod = _reload_module()
-
-    def _fake_post(text, bearer, media_ids=None, reply_to=None, timeout_seconds=15):
-        if reply_to is not None:
-            raise RuntimeError("reply rejected")
-        return {"data": {"id": "main-789"}}
-
-    monkeypatch.setattr(mod, "post_tweet_via_x_api", _fake_post)
-    monkeypatch.setattr(mod, "_upload_media_files", lambda media: [])
-
-    tweet = mod.TweetBody(
-        text="body",
-        fallback="body",
-        lead_symbol="SPY",
-        symbols_present=["SPY"],
-        reply_text="link",
-        featured_symbol="SPY",
-    )
+    calls = _fake_x(monkeypatch)
     result = mod.post_bulletin(
-        tweet, mod.MediaArtifacts(), bearer="tok", long=True, mode_label="midday"
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
     )
-    assert result["id"] == "main-789"
-    assert "reply_id" not in result
+    assert result.ok
+    assert result.tweet_id == "main-123"
+    assert result.reply_id == "reply-456"
+    assert result.tweet_url == "https://x.com/i/web/status/main-123"
+    assert len(calls["upload"]) == 1
+    assert calls["post"][0] == {
+        "text": "Midday Read - $SPY\n\nbody",
+        "media_ids": ["media-1"],
+        "reply_to": None,
+    }
+    assert calls["post"][1]["reply_to"] == "main-123"
+    assert calls["post"][1]["text"].endswith("https://zerogex.io")
+
+
+def test_post_bulletin_survives_failed_reply(monkeypatch, tmp_path):
+    """A failing link reply doesn't undo the post — it's reported instead."""
+    mod = _reload_module()
+    _fake_x(monkeypatch, fail_reply=True)
+    result = mod.post_bulletin(
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+    )
+    assert result.ok
+    assert result.tweet_id == "main-123"
+    assert result.reply_id is None
+    assert "link reply failed" in result.reply_error
+
+
+def test_post_bulletin_never_posts_without_the_image(monkeypatch, tmp_path):
+    mod = _reload_module()
+    calls = _fake_x(monkeypatch)
+    result = mod.post_bulletin(_tweet(mod), mod.MediaArtifacts(), long=True, mode_label="midday")
+    assert not result.ok
+    assert "image" in result.error
+    assert calls == {"upload": [], "post": []}
+
+
+def test_post_bulletin_stops_when_the_upload_fails(monkeypatch, tmp_path):
+    """No text-only post when X refuses the image."""
+    mod = _reload_module()
+    calls = _fake_x(monkeypatch, fail_upload=True)
+    result = mod.post_bulletin(
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+    )
+    assert not result.ok
+    assert "image upload" in result.error
+    assert calls["post"] == []
+
+
+def test_post_bulletin_does_not_swap_in_the_short_body(monkeypatch, tmp_path):
+    """A rejected post is not retried with a different, unreviewed text."""
+    mod = _reload_module()
+    calls = _fake_x(monkeypatch, fail_post=True)
+    result = mod.post_bulletin(
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+    )
+    assert not result.ok
+    assert "X rejected the post" in result.error
+    assert len(calls["post"]) == 1
+
+
+def test_post_bulletin_needs_the_oauth_keys(monkeypatch, tmp_path):
+    mod = _reload_module()
+    result = mod.post_bulletin(
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+    )
+    assert not result.ok
+    assert "X_BOT_API_KEY" in result.error
 
 
 @pytest.mark.asyncio
@@ -539,25 +734,14 @@ async def test_dry_run_persists_reply_artifact(tmp_path, monkeypatch):
     """A dry-run writes tweet_reply.md and records the reply text +
     featured symbol in the manifest so the operator can inspect them."""
     mod = _reload_module()
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-    db_instance = MagicMock()
-    db_instance.connect = AsyncMock()
-    db_instance.disconnect = AsyncMock()
-    db_instance.get_latest_gex_summary = AsyncMock(
-        side_effect=lambda symbol: _summary_row(symbol),
-    )
-    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
-    monkeypatch.setattr(mod, "render_bulletin_png", lambda *a, **k: None)
-    monkeypatch.setattr(mod, "render_replay_clip", lambda *a, **k: None)
-    monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
+    _passing_run(monkeypatch, mod)
 
     args = mod._parse_args(
         [
             "--mode",
             "close",
             "--date",
-            "2026-07-06",
+            "2026-07-06",  # Monday
             "--artifact-dir",
             str(tmp_path),
             "--allow-non-trading-day",
@@ -571,10 +755,10 @@ async def test_dry_run_persists_reply_artifact(tmp_path, monkeypatch):
     assert reply_md.exists()
     assert "zerogex.io" in reply_md.read_text()
     manifest = json.loads((day_dir / "manifest.json").read_text())
-    assert manifest["featured_symbol"]
-    assert manifest["reply_text"].startswith(
-        "Free delayed SPY / SPX / QQQ gamma levels:",
-    )
+    assert manifest["featured_symbol"] == "SPY"
+    assert manifest["state"] == "dry_run"
+    assert manifest["problems"] == []
+    assert manifest["reply_text"].startswith("The tell is how fast the dips get bought.")
 
 
 # ---------------------------------------------------------------------------
@@ -585,31 +769,14 @@ async def test_dry_run_persists_reply_artifact(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_dry_run_writes_artifacts_and_never_posts(tmp_path, monkeypatch):
     mod = _reload_module()
+    stubs = _passing_run(monkeypatch, mod)
 
-    # Force DB to return real-looking summary rows.
-    db_instance = MagicMock()
-    db_instance.connect = AsyncMock()
-    db_instance.disconnect = AsyncMock()
-    db_instance.get_latest_gex_summary = AsyncMock(
-        side_effect=lambda symbol: _summary_row(symbol),
-    )
-    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
-
-    # Fail loudly if the runner ever tries to POST or upload media in
-    # dry-run mode — that's the failure the whole `--post`-required
-    # gate is supposed to prevent.
+    # Fail loudly if the runner ever tries to POST in dry-run mode — that's
+    # the failure the whole `--post`-required gate is supposed to prevent.
     def _boom_post(*args, **kwargs):
         raise AssertionError("dry-run posted to X!")
 
-    monkeypatch.setattr(mod, "post_tweet_via_x_api", _boom_post)
-    monkeypatch.setattr(mod, "_upload_media_files", lambda media: [])
-    # Skip actual network calls to the frontend PNG endpoint and to the
-    # Playwright helper.  Return None so both media renders "fail" —
-    # exactly like a fresh install with no frontend reachable.
-    monkeypatch.setattr(mod, "render_bulletin_png", lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "render_replay_clip", lambda *args, **kwargs: None)
-
-    monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
+    monkeypatch.setattr(mod, "post_bulletin", _boom_post)
 
     args = mod._parse_args(
         [
@@ -629,10 +796,20 @@ async def test_dry_run_writes_artifacts_and_never_posts(tmp_path, monkeypatch):
     day_dir = tmp_path / "close" / "2026-07-06"
     assert (day_dir / "tweet_text.md").exists()
     assert (day_dir / "tweet_text_fallback.md").exists()
+    assert (day_dir / "bulletin-spy.png").exists()
     manifest = json.loads((day_dir / "manifest.json").read_text())
     assert manifest["mode"] == "close"
+    assert manifest["state"] == "dry_run"
     assert manifest["symbols_present"]
     assert manifest["text_len"] > 0
+    assert manifest["media"]["png"].endswith("bulletin-spy.png")
+    # The card was rendered for the featured symbol, and the post quotes the
+    # card's numbers (744.62 spot / 747.29 flip), not the DB row's.
+    assert stubs["cards"] == ["SPY"]
+    text = (day_dir / "tweet_text.md").read_text()
+    assert "• 747.29 gamma flip" in text
+    assert manifest["bulletins"][0]["spot"] == pytest.approx(744.62)
+    assert manifest["bulletins"][0]["card_as_of"] == "Jul 6, 2026 · 12:30 PM EDT"
 
 
 @pytest.mark.asyncio
@@ -665,14 +842,13 @@ async def test_skips_non_trading_days(tmp_path, monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
-async def test_skips_when_every_symbol_missing(tmp_path, monkeypatch, caplog):
+async def test_holds_when_every_symbol_missing(tmp_path, monkeypatch):
+    """No data on a trading day is something going wrong, not a quiet skip:
+    the run fails, the review page says why, and (on a scheduled fire) the
+    operator is emailed."""
     mod = _reload_module()
-
-    db_instance = MagicMock()
-    db_instance.connect = AsyncMock()
-    db_instance.disconnect = AsyncMock()
-    db_instance.get_latest_gex_summary = AsyncMock(return_value=None)
-    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
+    stubs = _passing_run(monkeypatch, mod)
+    stubs["db"].get_latest_gex_summary = AsyncMock(return_value=None)
 
     args = mod._parse_args(
         [
@@ -683,23 +859,23 @@ async def test_skips_when_every_symbol_missing(tmp_path, monkeypatch, caplog):
             "--artifact-dir",
             str(tmp_path),
             "--allow-non-trading-day",
+            "--stage",
         ]
     )
-    with caplog.at_level("INFO", logger="zerogex.bulletin_tweet"):
-        rc = await mod._run(args)
-    assert rc == 0
-    # Empty-day path should NOT have written an artifact — we log and skip.
-    assert not (tmp_path / "close" / "2026-07-06" / "tweet_text.md").exists()
+    rc = await mod._run(args)
+    assert rc == 1
+    manifest = json.loads((tmp_path / "close" / "2026-07-06" / "manifest.json").read_text())
+    assert manifest["state"] == "blocked"
+    assert "GEX summary was missing" in manifest["problems"][0]
+    assert len(stubs["held"]) == 1
+    assert stubs["writer"] == []  # nothing to write about
 
 
 @pytest.mark.asyncio
-async def test_never_raises_on_db_failure(tmp_path, monkeypatch, caplog):
+async def test_never_raises_on_db_failure(tmp_path, monkeypatch):
     mod = _reload_module()
-
-    db_instance = MagicMock()
-    db_instance.connect = AsyncMock(side_effect=RuntimeError("db down"))
-    db_instance.disconnect = AsyncMock()
-    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
+    stubs = _passing_run(monkeypatch, mod)
+    stubs["db"].connect = AsyncMock(side_effect=RuntimeError("db down"))
 
     args = mod._parse_args(
         [
@@ -709,11 +885,12 @@ async def test_never_raises_on_db_failure(tmp_path, monkeypatch, caplog):
             "2026-07-06",  # Monday
             "--artifact-dir",
             str(tmp_path),
+            "--stage",
         ]
     )
-    with caplog.at_level("WARNING", logger="zerogex.bulletin_tweet"):
-        rc = await mod._run(args)
-    assert rc == 0
+    rc = await mod._run(args)
+    assert rc == 1
+    assert "db down" in stubs["held"][0]["problems"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -854,11 +1031,9 @@ def test_load_credentials_from_env_reports_all_missing(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_build_tweet_body_falls_back_to_template_without_api_key(monkeypatch):
-    """No ANTHROPIC_API_KEY → the static template path runs unchanged.
-
-    This is the "safe default" — nothing about the LLM path should
-    take the tweet down when the operator hasn't opted in yet."""
+def test_build_tweet_body_without_api_key_is_held_with_the_reason(monkeypatch):
+    """No ANTHROPIC_API_KEY → no post, and the reason names the key.  There
+    is no static template to fall back to."""
     mod = _reload_module()
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
@@ -869,27 +1044,22 @@ def test_build_tweet_body_falls_back_to_template_without_api_key(monkeypatch):
     body = mod.build_tweet_body(
         "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPX"
     )
-    # Static fallback = the deterministic "…Read — $SYM" header + hook +
-    # Key levels + Bottom line, no LLM-specific phrasing.
-    assert "Post-Market Read — $" in body.text
-    assert "Key levels:" in body.text
-    assert "Bottom line:" in body.text
-    # The static fallback never appends a site link or a hashtag row.
-    assert "#Gamma" not in body.text
-    assert "zerogex.io" not in body.text
-    assert "http" not in body.text
+    assert body.text == ""
+    assert body.problems == [
+        "The AI writer didn't produce a post (ANTHROPIC_API_KEY is not set, "
+        "so the post could not be written)."
+    ]
 
 
 def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
     """When bulletin_llm.generate_post returns a post, the composed body
-    swaps in the LLM prose but keeps the deterministic Key levels block, and
-    the reply carries the LLM copy + the ZeroGEX link."""
+    carries the LLM prose around the Python-composed levels list, and the
+    reply carries the LLM copy + the ZeroGEX link."""
     mod = _reload_module()
     from src.jobs import bulletin_llm
 
     def _fake_generate(**kwargs):
         return bulletin_llm.LlmPost(
-            header_label="Post-Market Read",
             opening=(
                 "Interesting close into the holiday.\n\n"
                 "The morning started long-gamma, then the walls broke down."
@@ -898,7 +1068,6 @@ def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
                 "With the market closed tomorrow, this is a fitting place " "to leave it."
             ),
             reply="The tell was how fast 740 reclaimed once the headline hit.",
-            level_notes={"put_wall": "held", "gamma_flip": "the pivot"},
         )
 
     monkeypatch.setattr(bulletin_llm, "generate_post", _fake_generate)
@@ -925,15 +1094,10 @@ def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
 
     # SPY sits on its gamma flip → it's the featured symbol.
     assert body.featured_symbol == "SPY"
-    # The LLM's narrative shows up verbatim, under the validated read header.
-    assert "Post-Market Read — $SPY" in body.text
-    assert "Interesting close into the holiday." in body.text
+    assert body.text.startswith("Post-Market Read - $SPY\n\nInteresting close into the holiday.")
     assert "Bottom line: With the market closed tomorrow" in body.text
-    # The Key levels block is still the deterministic Python-composed one,
-    # with the LLM's short notes in parentheses.
-    assert "Key levels:" in body.text
-    assert f"• 740 → Put Wall ({mod._wall_scope_label()} · held)" in body.text
-    assert "• 744.51 → Gamma Flip (the pivot)" in body.text
+    # The levels list is still the Python-composed one, with no notes.
+    assert "• 740 put wall\n• 750 call wall\n• 744.51 gamma flip" in body.text
     # No hashtag row / link in the main post; the link rides in the reply.
     assert "#Gamma" not in body.text
     assert "zerogex.io" not in body.text
@@ -941,26 +1105,28 @@ def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
     assert body.reply_text == (
         "The tell was how fast 740 reclaimed once the headline hit.\n\n" "https://zerogex.io"
     )
+    assert body.llm_post is not None
 
 
-def test_llm_post_falls_back_when_generator_returns_none(monkeypatch):
-    """A None from the LLM path → static fallback composes the body.
-
-    Covers the API-error + malformed-reply paths without needing to
-    mock the whole HTTP layer."""
+def test_llm_post_failure_leaves_no_post(monkeypatch):
+    """A None from the LLM path (API error, malformed reply, levels still
+    misstated) means no post, with the reason recorded."""
     mod = _reload_module()
     from src.jobs import bulletin_llm
 
-    monkeypatch.setattr(bulletin_llm, "generate_post", lambda **k: None)
+    def _fail(**kwargs):
+        kwargs["errors"].append("the Claude API returned HTTP 529")
+        return None
+
+    monkeypatch.setattr(bulletin_llm, "generate_post", _fail)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
 
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
     body = mod.build_tweet_body(
         "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPY"
     )
-    # Static fallback shape: the "…Read — $SYM" header + Bottom line.
-    assert "Post-Market Read — $SPY" in body.text
-    assert "Bottom line:" in body.text
+    assert body.text == ""
+    assert "HTTP 529" in body.problems[0]
 
 
 def test_llm_invented_price_guard():
@@ -969,13 +1135,11 @@ def test_llm_invented_price_guard():
     from src.jobs import bulletin_llm
 
     post = bulletin_llm.LlmPost(
-        header_label="Midday Read",
         # 762 is in SPY's price band but is not a provided level — a fabricated
         # level near spot is exactly what the guard must catch.
         opening="SPY looks pinned to a hidden 762 shelf.",
         bottom_line="Nothing to see here.",
         reply="Watch the levels.",
-        level_notes={},
     )
     inputs = [
         bulletin_llm.SymbolInput(symbol="SPY", spot=744.51, gamma_flip=744.51),
@@ -988,11 +1152,9 @@ def test_llm_invented_price_guard_scans_reply():
     from src.jobs import bulletin_llm
 
     post = bulletin_llm.LlmPost(
-        header_label="Midday Read",
         opening="SPY held its structure.",
         bottom_line="Still short gamma.",
         reply="Real risk is a fade to 812.",  # in-band, not a provided level
-        level_notes={},
     )
     inputs = [
         bulletin_llm.SymbolInput(symbol="SPY", spot=744.51, gamma_flip=744.51),
@@ -1024,11 +1186,9 @@ def test_llm_validator_allows_news_figures_out_of_band():
         "A $500 billion buyback wave has SPY pinned near 744.60.",
     ):
         post = bulletin_llm.LlmPost(
-            header_label="Midday Read",
             opening=opening,
             bottom_line="Constructive while it holds.",
             reply="The tell was the reclaim.",
-            level_notes={},
         )
         assert bulletin_llm._validate_no_invented_prices(post, inputs) is True, opening
 
@@ -1038,11 +1198,9 @@ def test_llm_validator_accepts_input_prices():
     from src.jobs import bulletin_llm
 
     post = bulletin_llm.LlmPost(
-        header_label="Midday Read",
         opening="SPX sits at 7,483 with the gamma flip at 7,448.",
         bottom_line="Call wall 7,500, put wall 7,480. Watch the flip.",
         reply="More analytics:",
-        level_notes={},
     )
     inputs = [
         bulletin_llm.SymbolInput(
@@ -1092,11 +1250,9 @@ def _draft(opening: str, **overrides):
     from src.jobs import bulletin_llm
 
     fields = dict(
-        header_label="Post-Market Read",
         opening=opening,
         bottom_line="Short gamma until the flip is reclaimed.",
         reply="The tell was how fast every pop got sold.",
-        level_notes={},
     )
     fields.update(overrides)
     return bulletin_llm.LlmPost(**fields)
@@ -1173,9 +1329,7 @@ def test_level_claim_ignores_numbers_not_tied_to_a_level():
 
 def _claude_reply(opening: str) -> dict:
     body = {
-        "header_label": "Post-Market Read",
         "opening": opening,
-        "level_notes": {},
         "bottom_line": "Short gamma until the flip is reclaimed.",
         "reply": "The tell was how fast every pop got sold.",
     }
@@ -1313,47 +1467,36 @@ def test_compose_reply_static_fallback_when_no_llm():
 
 
 def test_key_levels_block_orders_and_formats():
+    """Put wall, call wall, gamma flip; whole strikes lose their ".00", the
+    flip keeps its cents, and nothing else rides on the line."""
     mod = _reload_module()
     b = mod._shape_bulletin(
         _summary_row(
             "SPY",
-            spot=743.0,
+            spot=744.51,
             gamma_flip=747.29,
             call_wall=745.0,
             put_wall=740.0,
-            max_pain=742.0,
-            net_gex=-3_400_000_000.0,
         ),
         "SPY",
     )
-    block = mod._key_levels_block(b, {"put_wall": "now the level to watch"})
-    lines = block.splitlines()
-    scope = mod._wall_scope_label()
-    # Order: Put Wall, Call Wall, Gamma Flip.  The walls carry their
-    # expiration scope; the flip doesn't have one.
-    assert lines[0] == f"• 740 → Put Wall ({scope} · now the level to watch)"
-    assert lines[1] == f"• 745 → Call Wall ({scope})"
-    # Whole-dollar walls print without decimals; the flip keeps two.
-    assert lines[2] == "• 747.29 → Gamma Flip"
+    assert mod._key_levels_block(b).splitlines() == [
+        "• 740 put wall",
+        "• 745 call wall",
+        "• 747.29 gamma flip",
+    ]
 
 
-@pytest.mark.parametrize("expirations, label", [(3, "0–2DTE"), (5, "0–4DTE"), (1, "0DTE")])
-def test_walls_carry_the_expiration_scope_they_were_ranked_over(monkeypatch, expirations, label):
-    """The walls are ranked across every ingested expiration, not today's
-    alone.  On 2026-09-21 that put SPY's call wall at 780 while a 0DTE chart
-    showed 773-775, and the post read like a level that never existed."""
+def test_fmt_level_matches_the_cards_digits():
+    """The card rounds half up on the exact value (the browser's toFixed /
+    toLocaleString); the post must show the same digits."""
     mod = _reload_module()
-    monkeypatch.setattr(mod, "INGEST_EXPIRATIONS", expirations)
-    assert mod._wall_scope_label() == label
-    b = mod._shape_bulletin(
-        _summary_row("SPY", spot=773.4, gamma_flip=766.2, call_wall=780.0, put_wall=770.0),
-        "SPY",
-    )
-    lines = mod._key_levels_block(b, {"call_wall": "first resistance"}).splitlines()
-    assert lines[0] == f"• 770 → Put Wall ({label})"
-    assert lines[1] == f"• 780 → Call Wall ({label} · first resistance)"
-    assert lines[2] == "• 766.20 → Gamma Flip"
-    assert f"CW 780.00 / PW 770.00 ({label})" in mod._build_fallback_tweet(b, "Midday Read")
+    assert mod._fmt_level(745.0) == "745"
+    assert mod._fmt_level(747.29) == "747.29"
+    assert mod._fmt_level(747.125) == "747.13"  # an exact tie rounds up
+    assert mod._fmt_level(744.996) == "745"
+    assert mod._fmt_level(7482.71) == "7,483"  # index scale: whole, like the card
+    assert mod._fmt_level(7500.0) == "7,500"
 
 
 def test_derive_regime_prefers_net_gex_sign():
@@ -1644,32 +1787,26 @@ def test_xpost_admin_url_defaults_to_site_url(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stage_flag_writes_pending_and_calls_hook(tmp_path, monkeypatch):
-    """--stage writes state=pending manifest and calls notify hook.
+    """--stage writes state=pending manifest, calls the notify hook and
+    emails "X-Post Ready" with the image once the review passes.
 
-    Must NOT POST to X, even when X_BOT_BEARER_TOKEN is set — safe by
-    default so the timer can't accidentally tweet before the operator
-    has flipped autopilot on."""
+    Must NOT POST to X, even when the X keys are set — safe by default so
+    the timer can't accidentally tweet before the operator has flipped
+    autopilot on."""
     mod = _reload_module()
+    _passing_run(monkeypatch, mod)
 
-    db_instance = MagicMock()
-    db_instance.connect = AsyncMock()
-    db_instance.disconnect = AsyncMock()
-    db_instance.get_latest_gex_summary = AsyncMock(
-        side_effect=lambda symbol: _summary_row(symbol),
-    )
-    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
-
-    # Fail loudly if the runner ever tries to POST or upload media in
-    # --stage mode.
     def _boom(*args, **kwargs):
         raise AssertionError("--stage mode posted to X!")
 
     monkeypatch.setattr(mod, "post_bulletin", _boom)
-    monkeypatch.setattr(mod, "render_bulletin_png", lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "render_replay_clip", lambda *args, **kwargs: None)
-
-    # Even with the bearer set, --stage without autopilot must not post.
-    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+    ready: list[dict] = []
+    monkeypatch.setattr(
+        mod,
+        "_send_xpost_ready_email",
+        lambda mode, png_path=None: ready.append({"mode": mode, "png": png_path}) or True,
+    )
+    monkeypatch.setenv("X_BOT_API_KEY", "k")
     monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT", raising=False)
 
     # Set up a notify hook to confirm it gets called.
@@ -1696,17 +1833,16 @@ async def test_stage_flag_writes_pending_and_calls_hook(tmp_path, monkeypatch):
     rc = await mod._run(args)
     assert rc == 0
 
-    # Manifest should say state=pending
     manifest_path = tmp_path / "artifacts" / "close" / "2026-07-06" / "manifest.json"
-    assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text())
     assert manifest["state"] == "pending"
 
-    # And the notify hook must have fired with the right mode arg.
+    # The notify hook fired with the right mode arg.
     assert hook_called_marker.exists()
-    mode_marker = tmp_path / "hook_fired.mode"
-    assert mode_marker.exists()
-    assert mode_marker.read_text().strip() == "close"
+    assert (tmp_path / "hook_fired.mode").read_text().strip() == "close"
+    # And the Ready email carries the live bulletin image.
+    assert len(ready) == 1
+    assert ready[0]["png"].name == "bulletin-spy.png"
 
 
 @pytest.mark.asyncio
@@ -1716,25 +1852,18 @@ async def test_autopilot_env_var_upgrades_stage_to_post(tmp_path, monkeypatch):
     Enables one-line-env-flip switch to autopilot without editing the
     systemd unit file or touching daemon-reload."""
     mod = _reload_module()
-
-    db_instance = MagicMock()
-    db_instance.connect = AsyncMock()
-    db_instance.disconnect = AsyncMock()
-    db_instance.get_latest_gex_summary = AsyncMock(
-        side_effect=lambda symbol: _summary_row(symbol),
-    )
-    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
-    monkeypatch.setattr(mod, "render_bulletin_png", lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "render_replay_clip", lambda *args, **kwargs: None)
+    _passing_run(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_deadline_problem", lambda *a, **k: None)
 
     posts: list[dict] = []
 
     def _fake_post(**kwargs):
         posts.append(kwargs)
-        return {"id": "fake-tweet-id-42"}
+        return mod.PostResult(ok=True, tweet_id="fake-tweet-id-42", reply_id="r-1")
 
+    sent: list = []
     monkeypatch.setattr(mod, "post_bulletin", _fake_post)
-    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+    monkeypatch.setattr(mod, "_send_xpost_sent_email", lambda *a: sent.append(a) or True)
     monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
     monkeypatch.delenv("BULLETIN_TWEET_NOTIFY_HOOK", raising=False)
 
@@ -1743,24 +1872,196 @@ async def test_autopilot_env_var_upgrades_stage_to_post(tmp_path, monkeypatch):
             "--mode",
             "close",
             "--date",
-            "2026-07-06",
+            "2026-07-06",  # Monday
             "--artifact-dir",
-            str(tmp_path),
-            "--stage",  # would normally skip POST — but autopilot upgrades it
+            str(tmp_path / "artifacts"),
+            "--stage",
             "--allow-non-trading-day",
         ]
     )
     rc = await mod._run(args)
     assert rc == 0
 
-    # Post_bulletin should have been called once.
+    # post_bulletin was called once, with the rendered card attached.
     assert len(posts) == 1
-    # And the manifest should reflect state=posted with the returned id.
+    assert posts[0]["media"].png_path.name == "bulletin-spy.png"
     manifest = json.loads(
-        (tmp_path / "close" / "2026-07-06" / "manifest.json").read_text(),
+        (tmp_path / "artifacts" / "close" / "2026-07-06" / "manifest.json").read_text(),
     )
     assert manifest["state"] == "posted"
     assert manifest["posted_id"] == "fake-tweet-id-42"
+    assert len(sent) == 1
+    record = mod.read_latest_record("SPY", "close")
+    assert record["status"] == "posted"
+    assert record["tweet_url"] == "https://x.com/i/web/status/fake-tweet-id-42"
+
+
+@pytest.mark.asyncio
+async def test_review_findings_go_back_to_the_writer_once(tmp_path, monkeypatch):
+    """What the fact-check finds is handed back for one rewrite, and the
+    rewrite is what's reviewed and kept."""
+    mod = _reload_module()
+    stubs = _passing_run(monkeypatch, mod, review_problems=[["'rallied' but SPY is down 0.6%."]])
+
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--stage",
+            "--allow-non-trading-day",
+        ]
+    )
+    monkeypatch.setattr(mod, "_send_xpost_ready_email", lambda mode, png_path=None: True)
+    rc = await mod._run(args)
+    assert rc == 0
+    assert len(stubs["writer"]) == 2
+    assert stubs["writer"][1]["feedback"] == ["'rallied' but SPY is down 0.6%."]
+    assert stubs["writer"][1]["revise_from"] is not None
+    assert len(stubs["review"]) == 2
+    # The fact-check saw the post as it will go out, with the card image.
+    assert stubs["review"][0]["post_text"].startswith("Post-Market Read - $SPY")
+    assert stubs["review"][0]["card_png"] == _png_bytes()
+
+
+@pytest.mark.asyncio
+async def test_autopilot_holds_the_post_when_the_review_still_finds_problems(tmp_path, monkeypatch):
+    mod = _reload_module()
+    problem = "The post says CPI came in hot; no headline says that."
+    stubs = _passing_run(monkeypatch, mod, review_problems=[[problem], [problem]])
+    monkeypatch.setattr(mod, "_deadline_problem", lambda *a, **k: None)
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+
+    def _boom(**kwargs):
+        raise AssertionError("posted a post the review rejected!")
+
+    monkeypatch.setattr(mod, "post_bulletin", _boom)
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--stage",
+            "--allow-non-trading-day",
+        ]
+    )
+    rc = await mod._run(args)
+    assert rc == 1
+    manifest = json.loads(
+        (tmp_path / "artifacts" / "close" / "2026-07-06" / "manifest.json").read_text(),
+    )
+    assert manifest["state"] == "blocked"
+    assert manifest["problems"] == [problem]
+    # The operator is told, with the reasons, the draft and the image.
+    assert len(stubs["held"]) == 1
+    assert stubs["held"][0]["problems"] == [problem]
+    assert stubs["held"][0]["posting"] is True
+    assert stubs["held"][0]["png"].name == "bulletin-spy.png"
+    record = mod.read_latest_record("SPY", "close")
+    assert record["status"] == "blocked"
+    assert record["problems"] == [problem]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_card_render_holds_the_post(tmp_path, monkeypatch):
+    """No live bulletin image, no post: there is no text-only fallback."""
+    mod = _reload_module()
+    stubs = _passing_run(monkeypatch, mod)
+    monkeypatch.setattr(
+        mod,
+        "render_bulletin_card",
+        lambda *a, **k: mod.CardRender(
+            error="The live bulletin screenshot failed: Chromium couldn't start."
+        ),
+    )
+    monkeypatch.setattr(mod, "_deadline_problem", lambda *a, **k: None)
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    monkeypatch.setattr(mod, "post_bulletin", lambda **k: pytest.fail("posted without the image"))
+
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--stage",
+            "--allow-non-trading-day",
+        ]
+    )
+    rc = await mod._run(args)
+    assert rc == 1
+    assert stubs["held"][0]["problems"][0].startswith("The live bulletin screenshot failed")
+
+
+@pytest.mark.asyncio
+async def test_no_fresh_headlines_holds_the_post(tmp_path, monkeypatch):
+    mod = _reload_module()
+    stubs = _passing_run(monkeypatch, mod)
+    monkeypatch.setattr(
+        mod, "_fetch_fresh_headlines", lambda: ([], "No CNBC headlines from the last 24 hours.")
+    )
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--stage",
+            "--allow-non-trading-day",
+        ]
+    )
+    rc = await mod._run(args)
+    assert rc == 1
+    assert "No CNBC headlines" in stubs["held"][0]["problems"][0]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_holds_a_post_past_its_cutoff(tmp_path, monkeypatch):
+    """A catch-up run after downtime must not publish a stale read."""
+    mod = _reload_module()
+    stubs = _passing_run(monkeypatch, mod)
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    monkeypatch.setattr(mod, "post_bulletin", lambda **k: pytest.fail("posted after the cutoff"))
+
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--stage",
+            "--allow-non-trading-day",
+        ]
+    )
+    rc = await mod._run(args)
+    assert rc == 1
+    # 2026-07-06 isn't today, so the deadline check refuses it.
+    assert "not today" in stubs["held"][0]["problems"][-1]
+
+
+def test_deadline_problem_by_mode():
+    mod = _reload_module()
+    et = ZoneInfo("America/New_York")
+    day = date(2026, 9, 24)
+    assert mod._deadline_problem("premarket", day, datetime(2026, 9, 24, 9, 19, tzinfo=et)) is None
+    late = mod._deadline_problem("premarket", day, datetime(2026, 9, 24, 11, 0, tzinfo=et))
+    assert "past the 9:30 AM cutoff for the Morning Read" in late
+    assert mod._deadline_problem("close", day, datetime(2026, 9, 24, 16, 9, tzinfo=et)) is None
+    assert "not today" in mod._deadline_problem(
+        "close", day, datetime(2026, 9, 25, 9, 0, tzinfo=et)
+    )
 
 
 def test_approve_module_reads_pending_manifest_and_posts(tmp_path, monkeypatch):
@@ -1794,12 +2095,20 @@ def test_approve_module_reads_pending_manifest_and_posts(tmp_path, monkeypatch):
 
     posts: list[dict] = []
 
+    from src.jobs.bulletin_tweet import PostResult
+
     def _fake_post(**kwargs):
         posts.append(kwargs)
-        return {"id": "approved-tweet-id-99"}
+        return PostResult(ok=True, tweet_id="approved-tweet-id-99")
 
     monkeypatch.setattr(bulletin_approve, "post_bulletin", _fake_post)
-    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+    for key in (
+        "X_BOT_API_KEY",
+        "X_BOT_API_SECRET",
+        "X_BOT_ACCESS_TOKEN",
+        "X_BOT_ACCESS_TOKEN_SECRET",
+    ):
+        monkeypatch.setenv(key, "test")
 
     args = bulletin_approve._parse_args(
         [
@@ -1819,7 +2128,45 @@ def test_approve_module_reads_pending_manifest_and_posts(tmp_path, monkeypatch):
     manifest = json.loads((art_dir / "manifest.json").read_text())
     assert manifest["state"] == "posted"
     assert manifest["posted_id"] == "approved-tweet-id-99"
+    assert manifest["tweet_url"] == "https://x.com/i/web/status/approved-tweet-id-99"
     assert "approved_ts" in manifest
+
+
+def test_approve_refuses_a_draft_that_failed_review(tmp_path, monkeypatch):
+    """A blocked draft can be printed or discarded, never posted from here."""
+    from src.jobs import bulletin_approve
+
+    art_dir = tmp_path / "close" / "2026-07-06"
+    art_dir.mkdir(parents=True)
+    (art_dir / "tweet_text.md").write_text("hi\n")
+    (art_dir / "tweet_text_fallback.md").write_text("hi\n")
+    (art_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "close",
+                "date": "2026-07-06",
+                "state": "blocked",
+                "problems": ["The fact-check found an unsupported claim."],
+                "lead_symbol": "SPY",
+                "media": {"png": None, "clip": None},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        bulletin_approve, "post_bulletin", lambda **k: pytest.fail("posted a blocked draft")
+    )
+    for key in (
+        "X_BOT_API_KEY",
+        "X_BOT_API_SECRET",
+        "X_BOT_ACCESS_TOKEN",
+        "X_BOT_ACCESS_TOKEN_SECRET",
+    ):
+        monkeypatch.setenv(key, "test")
+    args = bulletin_approve._parse_args(
+        ["--mode", "close", "--date", "2026-07-06", "--artifact-dir", str(tmp_path)]
+    )
+    assert bulletin_approve._run(args) == 1
+    assert json.loads((art_dir / "manifest.json").read_text())["state"] == "blocked"
 
 
 def test_approve_module_is_idempotent_when_already_posted(tmp_path, monkeypatch):
@@ -2038,12 +2385,11 @@ def _history_db() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_close_read_reanchors_levels_to_the_last_in_session_frame():
-    """Regression: the 16:05 fire quoted "765 → Put Wall (never tested)".
-
-    765 only became the put wall after the bell, when the day's 0DTE rolled
-    off the chain — the session's wall was 775.  The close read must quote
-    what was actually in play and keep the reset for the roll-off line."""
+async def test_close_read_keeps_the_live_levels_and_carries_the_session_path():
+    """The 16:05 post quotes what the live card shows: the post-bell chain
+    (put wall 765 once the day's 0DTE rolled off), labeled as the next
+    session's map.  What the session's wall actually did (777 → 776 → 775)
+    rides along in the level history for the prose."""
     mod = _reload_module()
     b = mod._shape_bulletin(
         # What get_latest_gex_summary returns at 16:05: the POST-BELL row.
@@ -2052,8 +2398,8 @@ async def test_close_read_reanchors_levels_to_the_last_in_session_frame():
     )
     await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
 
-    assert b.put_wall == pytest.approx(775.0)
-    assert b.gamma_flip == pytest.approx(769.75)
+    assert b.put_wall == pytest.approx(765.0)
+    assert b.gamma_flip == pytest.approx(769.80)
     assert b.call_wall == pytest.approx(780.0)
     assert b.level_history is not None
     assert b.level_history.put_wall.values == [777.0, 776.0, 775.0]
@@ -2061,14 +2407,12 @@ async def test_close_read_reanchors_levels_to_the_last_in_session_frame():
 
 
 @pytest.mark.asyncio
-async def test_close_read_net_gex_comes_from_the_session_not_the_roll_off():
-    """The expiring gamma is what was holding net GEX up; a post-roll-off
-    figure describes tomorrow's book, not the session just traded."""
+async def test_close_read_net_gex_stays_what_the_card_shows():
     mod = _reload_module()
     b = mod._shape_bulletin(_summary_row("SPY", spot=776.80, put_wall=765.0, net_gex=-4.0e8), "SPY")
     b.net_gex = -4.0e8  # the post-bell value the latest row carried
     await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
-    assert b.net_gex == pytest.approx(-1.4e9)
+    assert b.net_gex == pytest.approx(-4.0e8)
 
 
 @pytest.mark.asyncio
@@ -2107,42 +2451,42 @@ async def test_attach_level_history_survives_a_db_failure():
 
 
 @pytest.mark.asyncio
-async def test_key_levels_block_reports_the_session_path_over_the_llm_note():
-    """The model only ever saw the closing snapshot; the tape is the authority."""
+async def test_key_levels_block_carries_no_notes_even_when_the_walls_moved():
+    """The list says where the levels are; the prose says what they did."""
     mod = _reload_module()
     b = mod._shape_bulletin(
         _summary_row("SPY", spot=776.80, gamma_flip=769.80, call_wall=780.0, put_wall=765.0),
         "SPY",
     )
     await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
-    block = mod._key_levels_block(b, {"put_wall": "never tested"})
-    lines = block.splitlines()
-    scope = mod._wall_scope_label()
-    assert lines[0] == (
-        f"• 775 → Put Wall ({scope} · moved 777 → 776 → 775; both broke, 775 tested and held)"
-    )
-    assert lines[1] == f"• 780 → Call Wall ({scope} · tested and held)"
-    assert lines[2] == "• 769.75 → Gamma Flip (spot held above all session)"
-    assert "never tested" not in block
+    assert mod._key_levels_block(b).splitlines() == [
+        "• 765 put wall",
+        "• 780 call wall",
+        "• 769.80 gamma flip",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_close_post_carries_the_after_the_bell_line():
-    """Named explicitly so the post and the attached (live) card agree."""
+async def test_close_post_labels_the_levels_as_the_next_sessions_map():
+    """The post quotes the card's post-bell levels, so it says whose map they
+    are instead of appending a separate after-the-bell line."""
     mod = _reload_module()
+    from src.jobs import bulletin_llm
+
     b = mod._shape_bulletin(
         _summary_row("SPY", spot=776.80, gamma_flip=769.80, call_wall=780.0, put_wall=765.0),
         "SPY",
     )
     await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
-    text = mod._build_static_post("close", b)
-    assert (
-        f"• 775 → Put Wall ({mod._wall_scope_label()} · moved 777 → 776 → 775; "
-        "both broke, 775 tested and held)"
-    ) in text
-    assert "After the bell: today's 0DTE rolled off and Put Wall resets to 765." in text
-    # ...and it lands between the levels block and the takeaway.
-    assert text.index("Key levels:") < text.index("After the bell:") < text.index("Bottom line:")
+    post = bulletin_llm.LlmPost(
+        opening="SPY lost 777 and 776 before 775 finally held.",
+        bottom_line="The roll-off drops the put wall to 765 for tomorrow.",
+        reply="Watch whether 765 gets tested early.",
+    )
+    text = mod._compose_new_post(post, b, "close", date(2026, 8, 13))  # a Thursday
+    assert "Levels for tomorrow:\n• 765 put wall\n• 780 call wall\n• 769.80 gamma flip" in text
+    assert "After the bell" not in text
+    assert text.index("Levels for tomorrow:") < text.index("Bottom line:")
 
 
 @pytest.mark.asyncio
@@ -2158,7 +2502,7 @@ async def test_level_history_reaches_the_llm_inputs_and_the_review_record():
 
     def _fake_generate_post(**kwargs):
         captured.update(kwargs)
-        return None  # force the static path; we only care about the inputs
+        return None  # we only care about the inputs
 
     from src.jobs import bulletin_llm
 
@@ -2171,10 +2515,13 @@ async def test_level_history_reaches_the_llm_inputs_and_the_review_record():
 
     payload = captured["symbols"][0].to_prompt_dict()["level_history"]
     assert [seg["value"] for seg in payload["put_wall"]["path"]] == [777.0, 776.0, 775.0]
-    # The model learns the put wall reset lower after the bell, but not to
-    # what: that number is tomorrow's, and the post prints it itself.
+    # The model learns the put wall reset lower after the bell; the new
+    # value is the top-level put wall (what the card shows), and the
+    # session path stays separate so the prose can't mix the two.
     assert payload["put_wall"]["after_the_bell_reset"] == "lower"
     assert "after_the_bell" not in payload["put_wall"]
+    assert "next session" in payload["post_close_roll_off"]
+    assert captured["symbols"][0].put_wall == pytest.approx(765.0)
     assert 777.0 in captured["symbols"][0].historical_level_values
     assert 765.0 not in captured["symbols"][0].historical_level_values
     assert captured["symbols"][0].level_paths["put_wall"] == [777.0, 776.0, 775.0]
@@ -2183,14 +2530,17 @@ async def test_level_history_reaches_the_llm_inputs_and_the_review_record():
         mode="close",
         day=date(2026, 8, 13),
         tweet=mod.TweetBody(
-            text="Post-Market Read — $SPY",
+            text="Post-Market Read - $SPY",
             fallback="$SPY",
             lead_symbol="SPY",
             featured_symbol="SPY",
         ),
         featured=b,
+        status="dry_run",
     )
-    assert record["levels"]["put_wall"] == pytest.approx(775.0)
+    assert record["status"] == "dry_run"
+    assert record["problems"] == []
+    assert record["levels"]["put_wall"] == pytest.approx(765.0)
     assert record["levels"]["level_history"]["put_wall"]["at_session_close"] == pytest.approx(775.0)
     # The review record still carries the reset value, for tracing.
     assert record["levels"]["level_history"]["put_wall"]["after_the_bell"] == pytest.approx(765.0)
@@ -2206,11 +2556,9 @@ def test_llm_validator_accepts_superseded_wall_prints():
     from src.jobs import bulletin_llm
 
     post = bulletin_llm.LlmPost(
-        header_label="Post-Market Read",
         opening="SPY lost 777, lost 776, and finally found bids at 775.",
         bottom_line="775 is the line into tomorrow.",
         reply="The tell was how little follow-through each break got.",
-        level_notes={},
     )
     inputs = [
         bulletin_llm.SymbolInput(

@@ -3,6 +3,9 @@ Description=ZeroGEX Live-Bulletin pre-market X post (09:15 ET)
 Documentation=https://github.com/zerogex/options/zerogex-oa
 After=network-online.target postgresql.service
 Wants=network-online.target
+# A held-back post exits 1; the job has already emailed the reasons, and this
+# alert is the backup for when that email couldn't go out.
+OnFailure=zerogex-alert@%n.service
 
 [Service]
 Type=oneshot
@@ -14,17 +17,20 @@ Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
 # Stages the pre-market bulletin tweet for human approval.  Writes the
-# full draft (text + PNG + clip + manifest with state=pending) and
-# calls $BULLETIN_TWEET_NOTIFY_HOOK if configured — operator then runs
-# ``bin/bulletin-approve.sh premarket`` to actually POST to X.
+# full draft (text + the live bulletin PNG + manifest), has it reviewed,
+# and emails the operator: "X-Post Ready" when it passed (state=pending;
+# ``bin/bulletin-approve.sh premarket`` posts it), "X-Post NOT ready" with
+# the reasons when it didn't (state=blocked, exit 1).
 #
 # Flip to full autopilot (no approval) by setting
 # ``BULLETIN_TWEET_AUTOPILOT=1`` in the EnvironmentFile — that upgrades
-# --stage to --post at runtime.  Safe-by-default: without the env var,
-# nothing goes out until you approve.
+# --stage to --post at runtime.  Even then nothing goes out unless the
+# review passes and the image uploads.
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode premarket --stage
 
-TimeoutStartSec=240
+# Screenshot + writing + an independent fact-check (and one rewrite when it
+# finds something) takes a few minutes; this is the ceiling, not the norm.
+TimeoutStartSec=1200
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
