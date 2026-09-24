@@ -227,3 +227,32 @@ def test_a_recipe_cannot_guard_itself_with_exit_0():
                     f"{target}: `exit 0` on shell {i + 1} of {len(lines)} does "
                     "not stop make; the lines after it still run"
                 )
+
+
+def test_shadow_run_reads_underlyings_from_env_as_text_not_through_make():
+    """`-include .env` parses that file AS A MAKEFILE.
+
+    "SPY,QQQ,$SPXW.X,$NDXP.X" therefore has `$S` and `$N` expanded as empty
+    make variables and arrives as "SPY,QQQ,PXW.X,DXP.X" -- two symbols that
+    do not exist. The 2026-09-24 rehearsal ran an hour on those. systemd
+    reads .env directly and is unaffected, which is why production never saw
+    it and why this target must not route the value through make.
+    """
+    body = _recipe("shadow-run")
+    assert "$(INGEST_UNDERLYINGS)" not in body, (
+        "the underlying list must not come through make -- $S and $N are "
+        "eaten as empty variables and the index symbols are silently mangled"
+    )
+    assert "$(INGEST_UNDERLYING)" not in body
+    assert re.search(
+        r"sed -n[^\n]*INGEST_UNDERLYINGS=[^\n]*\.env", body
+    ), "read it out of .env as literal text"
+    assert "--underlyings" in body, "and pass it explicitly on the command line"
+
+
+def test_shadow_run_refuses_to_start_with_no_underlyings():
+    """An empty list silently becomes the engine's SPY default, which would
+    look like a successful rehearsal covering one quarter of production."""
+    body = _recipe("shadow-run")
+    assert '-z "$$UL"' in body
+    assert "exit 1" in body

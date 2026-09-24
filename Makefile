@@ -3412,20 +3412,34 @@ shadow-create: shadow-guard ## Create the cutover-rehearsal database and apply s
 	}
 	@$(MAKE) --no-print-directory schema-apply DB_NAME=$(SHADOW_DB)
 
+# Reads INGEST_UNDERLYINGS out of .env as TEXT, with sed, and passes it on the
+# command line. It must NOT come through make: `-include .env` parses that file
+# AS A MAKEFILE, so `$$S` and `$$N` in "SPY,QQQ,$$SPXW.X,$$NDXP.X" are expanded as
+# (empty) make variables and the value becomes "SPY,QQQ,PXW.X,DXP.X" -- two
+# symbols that do not exist. Observed 2026-09-24: the rehearsal ran for an hour
+# on mangled index symbols. systemd reads .env directly and is unaffected, which
+# is why production never saw this.
 .PHONY: shadow-run
 shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate feed. Ctrl-C to stop. Vars: SHADOW_PROVIDER, DEBUG=1
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo "$(BLUE)CUTOVER REHEARSAL — feed=$(SHADOW_PROVIDER)  db=$(SHADOW_DB)$(NC)"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo "Production ingestion keeps running untouched; this writes only to $(SHADOW_DB)."
-	@echo "Underlyings: $(or $(INGEST_UNDERLYINGS),$(INGEST_UNDERLYING),SPY)  (from INGEST_UNDERLYINGS in .env)"
 	@echo "$(YELLOW)Note: the VIX/VXN/futures ingesters still call TradeStation directly,$(NC)"
 	@echo "$(YELLOW)so this run consumes TradeStation quota even on the candidate feed.$(NC)"
 	@echo "Leave it running for a full session, then run: make shadow-compare"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo ""
-	@DB_NAME=$(SHADOW_DB) MARKET_DATA_PROVIDER=$(SHADOW_PROVIDER) \
-		$(VENV_PYTHON) -m src.ingestion.main_engine $(if $(DEBUG),--debug)
+	@UL="$$(sed -n 's/^INGEST_UNDERLYINGS=//p' .env | tail -1 | tr -d '\042\047')"; \
+	if [ -z "$$UL" ]; then \
+		echo "$(RED)❌ INGEST_UNDERLYINGS is not set in .env$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "Underlyings (read from .env as text): $$UL"; \
+	echo ""; \
+	DB_NAME=$(SHADOW_DB) MARKET_DATA_PROVIDER=$(SHADOW_PROVIDER) \
+		$(VENV_PYTHON) -m src.ingestion.main_engine \
+		--underlyings "$$UL" $(if $(DEBUG),--debug)
 
 .PHONY: shadow-compare
 shadow-compare: shadow-guard ## Side-by-side coverage for today's ET session: production vs rehearsal DB (gate G2 evidence)
