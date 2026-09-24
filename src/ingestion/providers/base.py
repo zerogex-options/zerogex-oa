@@ -401,6 +401,31 @@ class MarketDataProvider(abc.ABC):
         engine seeds from here at start and on strike recalibration.
         """
 
+    @abc.abstractmethod
+    def snapshot_underlying_bar(self, symbol: str) -> Optional[Bar]:
+        """The latest bar for ``symbol``, one shot, no stream.
+
+        The engine needs a single current price at ``initialize()`` and on
+        every strike recalibration -- before any stream exists the first
+        time, and without disturbing one that does.  Only ``close`` is read
+        by the caller, so an implementation may leave the volume fields
+        ``None``; in particular it must NOT advance any cumulative-to-delta
+        volume state owned by ``stream_underlying_bars``, or the next
+        streamed bar loses the difference.
+
+        Returns ``None`` when the feed has no bar yet -- a symbol that has
+        not traded since the session opened is the ordinary case, not an
+        error.
+        """
+
+    def invalidate_strikes_cache(self) -> None:
+        """Drop any cached strike lists. Default is a no-op.
+
+        Called on the session day rollover, where newly listed expirations
+        make yesterday's cached strike grid point at the wrong rows.  A
+        provider that does not cache strikes has nothing to do here.
+        """
+
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:

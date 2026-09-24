@@ -56,6 +56,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Sequence
 
 from src.ingestion.providers.base import (
+    Bar,
     BarStream,
     MarketDataProvider,
     OptionQuote,
@@ -152,4 +153,8 @@ class StubProvider(MarketDataProvider):
 
     def snapshot_option_quotes(self, option_symbols: Sequence[str]) -> Dict[str, OptionQuote]:
         self._capabilities.require("option_open_interest")
+        raise NotImplementedError(_TODO)
+
+    def snapshot_underlying_bar(self, symbol: str) -> Optional[Bar]:
+        self._capabilities.require("underlying_bars")
         raise NotImplementedError(_TODO)

@@ -272,6 +272,24 @@ def option_root_for(symbol: str) -> str:
     return (symbol or "").upper().lstrip("$").split(".")[0]
 
 
+def is_index_symbol(symbol: str) -> bool:
+    """Whether ``symbol`` names a cash index rather than a tradable security.
+
+    ZeroGEX carries TradeStation's decoration through as the canonical
+    spelling, and it decorates cash indices and only cash indices:
+    ``$SPXW.X``, ``$NDXP.X``, ``$VIX.X`` against a bare ``SPY`` or ``QQQ``.
+    ``IngestionEngine._infer_asset_type`` already reads the same prefix to
+    classify a symbol for the ``symbols`` table, so this is the codebase's
+    existing rule rather than a new one.
+
+    It matters here because ThetaData serves indices from a different family
+    of endpoints than equities, under a different symbol (see
+    ``index_symbol_for``). TradeStation serves both through one barchart
+    call, which is why nothing above this layer has ever had to care.
+    """
+    return (symbol or "").startswith("$")
+
+
 def index_symbol_for(symbol: str) -> str:
     """ThetaData index symbol for a ZeroGEX/TradeStation underlying.
 
@@ -1405,18 +1423,35 @@ class ThetaDataProvider(MarketDataProvider):
     ) -> BarStream:
         self._CAPABILITIES.require("underlying_bars")
         resolved = db_symbol or symbol
-        root = option_root_for(symbol)
+        # An index underlying ($SPXW.X, $NDXP.X) is not a stock. Its level
+        # comes from the index endpoints, under the INDEX symbol rather than
+        # the option root -- ThetaData has no security called SPXW, so the
+        # stock call returns "No data found" and initialize() fails.
+        # TradeStation answers both from one barchart call, so StreamManager
+        # has only ever called stream_underlying_bars and must keep working
+        # unchanged against either feed. Routing here, not at the call site,
+        # is what keeps that true.
+        index = is_index_symbol(symbol)
+        root = index_symbol_for(symbol) if index else option_root_for(symbol)
 
+        # Built unconditionally; the index path returns before using it.
         volume_delta = _SessionVolumeDelta(resolved)
 
         def fetch() -> Optional[Bar]:
-            call = self._endpoint("stock_snapshot_market_value", "stock_snapshot_ohlc")
+            if index:
+                call = self._endpoint("index_snapshot_market_value", "index_snapshot_ohlc")
+            else:
+                call = self._endpoint("stock_snapshot_market_value", "stock_snapshot_ohlc")
             rows = _rows(call(symbol=root))
             if not rows:
                 return None
             bar = _bar_from_row(rows[0], resolved)
             if bar is None:
                 return None
+            if index:
+                # volume stays None: a cash index has no share volume of its
+                # own. Same reasoning as stream_index_bars.
+                return bar
 
             # Volume comes from stock_snapshot_ohlc either way. On the
             # Market Value path the primary call above is
@@ -1548,6 +1583,31 @@ class ThetaDataProvider(MarketDataProvider):
             if strike is not None:
                 out.append(strike)
         return sorted(set(out))
+
+    def snapshot_underlying_bar(self, symbol: str) -> Optional[Bar]:
+        """One current bar, no stream and no stream state touched.
+
+        Same endpoint choice as ``stream_underlying_bars`` -- index symbols
+        come from the index family under the index symbol -- but
+        deliberately NOT the same volume handling. That path converts the
+        vendor's cumulative session volume into a per-bar delta by
+        remembering the previous reading; calling it here would consume the
+        difference and the next streamed bar would report the remainder.
+        The only caller reads ``close``, so ``volume`` is left as
+        ``_bar_from_row`` sets it.
+        """
+        self._CAPABILITIES.require("underlying_bars")
+        if is_index_symbol(symbol):
+            call = self._endpoint("index_snapshot_market_value", "index_snapshot_ohlc")
+            root = index_symbol_for(symbol)
+        else:
+            call = self._endpoint("stock_snapshot_market_value", "stock_snapshot_ohlc")
+            root = option_root_for(symbol)
+        rows = _rows(call(symbol=root))
+        if not rows:
+            logger.debug("No bar returned for %s (%s)", symbol, root)
+            return None
+        return _bar_from_row(rows[0], symbol)
 
     def snapshot_option_quotes(self, option_symbols: Sequence[str]) -> Dict[str, OptionQuote]:
         self._CAPABILITIES.require("option_open_interest")

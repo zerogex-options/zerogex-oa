@@ -1553,49 +1553,44 @@ class StreamManager:
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
-        Fetch a single underlying bar via REST (used only for initialization
-        and strike recalibration, NOT for the hot streaming path).
+        Fetch a single underlying bar via the provider (used only for
+        initialization and strike recalibration, NOT for the hot streaming
+        path).
+
+        This used to reach for the TradeStation client's ``get_stream_bars``
+        directly, which made it TradeStation-only: ``main_engine`` builds no client for any
+        other feed, so ``self.client`` was ``None`` and every initialize()
+        died on ``'NoneType' object has no attribute 'get_stream_bars'`` --
+        then retried forever, because the caller treats a failed initialize
+        as retryable. The provider's snapshot answers the same question for
+        whichever feed is configured.
         """
         try:
-            bars_data = self.client.get_stream_bars(
-                symbol=self.underlying,
-                interval=1,
-                unit="Minute",
-                barsback=1,
-                sessiontemplate=SESSION_TEMPLATE,
-                warn_if_closed=False,
-            )
-
-            if "Bars" not in bars_data or len(bars_data["Bars"]) == 0:
+            bar = self.provider.snapshot_underlying_bar(self.underlying)
+            if bar is None:
                 logger.debug(f"No bar data returned for {self.underlying}")
                 return None
 
-            bar = bars_data["Bars"][0]
-            if not validate_bar_data(bar):
-                logger.warning("Invalid bar data, skipping")
+            row = _bar_to_row(bar)
+            if row is None:
+                return None
+            # Keyed on the DB spelling like every other row this class
+            # produces; the provider answers under the symbol it was asked
+            # about, which is the vendor's.
+            row["symbol"] = self.db_underlying
+            if not row.get("timestamp"):
+                row["timestamp"] = datetime.now(ET)
+
+            close = row.get("close")
+            if close is None:
+                logger.warning(
+                    "Bar for %s carries no close price; treating as no bar",
+                    self.underlying,
+                )
                 return None
 
-            timestamp_str = bar.get("TimeStamp", "")
-            timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
-            if not timestamp:
-                timestamp = datetime.now(ET)
-
-            underlying_data = {
-                "symbol": self.db_underlying,
-                "timestamp": timestamp,
-                "open": safe_float(bar.get("Open"), field_name="Open"),
-                "high": safe_float(bar.get("High"), field_name="High"),
-                "low": safe_float(bar.get("Low"), field_name="Low"),
-                "close": safe_float(bar.get("Close"), field_name="Close"),
-                "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume"),
-                "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume"),
-                "volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume"),
-            }
-
-            logger.debug(
-                f"Bar (REST): {self.underlying} @ {timestamp} " f"C=${underlying_data['close']:.2f}"
-            )
-            return underlying_data
+            logger.debug(f"Bar (REST): {self.underlying} @ {row['timestamp']} C=${close:.2f}")
+            return row
 
         except Exception as e:
             logger.error(f"Error fetching underlying bar: {e}", exc_info=True)
@@ -1809,7 +1804,7 @@ class StreamManager:
         """
         if limit <= 0:
             return []
-        all_expirations = self.client.get_option_expirations(ts_symbol)
+        all_expirations = self.provider.get_option_expirations(ts_symbol)
         if not all_expirations:
             logger.warning(
                 "No %s expirations found for %s", label, ts_symbol
@@ -1847,7 +1842,7 @@ class StreamManager:
             ts_symbol = chains[0] if chains else self.underlying
         try:
             exp_str = expiration.strftime("%m-%d-%Y")
-            all_strikes = self.client.get_option_strikes(ts_symbol, expiration=exp_str)
+            all_strikes = self.provider.get_option_strikes(ts_symbol, expiration=exp_str)
 
             if not all_strikes:
                 logger.warning(f"No strikes found for exp {exp_str} ({ts_symbol})")
@@ -1914,8 +1909,16 @@ class StreamManager:
 
                 for strike in strikes:
                     for opt_type in ("C", "P"):
-                        symbol = self.client.build_option_symbol(
-                            ts_symbol, expiration, opt_type, strike
+                        # KEYWORDS, not positional. TradeStationClient takes
+                        # option_type BEFORE strike; the provider interface
+                        # takes strike BEFORE option_type. Positionally this
+                        # still "works" and yields symbols like
+                        # "SPY 260221450.0C" that quote empty forever.
+                        symbol = self.provider.build_option_symbol(
+                            underlying=ts_symbol,
+                            expiration=expiration,
+                            strike=strike,
+                            option_type=opt_type,
                         )
                         option_symbols.append(symbol)
                         self.tracked_strikes.add(strike)
@@ -2050,7 +2053,7 @@ class StreamManager:
         whole cache so the first fetch after rollover gets a fresh view.
         """
         try:
-            self.client.invalidate_strikes_cache()
+            self.provider.invalidate_strikes_cache()
         except Exception as e:
             # Cache invalidation must never crash the stream loop.
             logger.warning("Strikes-cache invalidation on day rollover failed: %s", e)
@@ -2077,7 +2080,19 @@ class StreamManager:
             logger.debug(f"Cleaned up strikes for expired expiration: {exp}")
 
     def _validate_option_quote_symbol(self) -> bool:
-        """Validate at least one built option symbol returns a quote without API symbol errors."""
+        """Smoke-test that one built symbol is a symbol the feed recognises.
+
+        Was a raw ``get_option_quotes`` envelope with a vendor ``Errors``
+        list. The provider interface has no error channel -- an unrecognised
+        symbol simply does not come back -- so "rejected" and "no quote yet"
+        are now the same observation, and this cannot fail the engine on the
+        difference without failing it every quiet pre-market open too.
+
+        So it stays advisory, as it already was for the empty case, and
+        keeps the diagnostic that made it worth having: the symbol it tried,
+        logged at ERROR so it is greppable when a chain yields nothing all
+        session.
+        """
         if not self.tracked_option_symbols:
             logger.error("No option symbols available for validation")
             return False
@@ -2086,22 +2101,16 @@ class StreamManager:
         logger.info(f"Validating option quote symbol: {test_symbol}")
 
         try:
-            result = self.client.get_option_quotes([test_symbol])
+            quotes = self.provider.snapshot_option_quotes([test_symbol])
 
-            errors = result.get("Errors", []) if isinstance(result, dict) else []
-            if errors:
-                logger.error(f"Option quote validation failed for {test_symbol}: {errors[0]}")
-                logger.error(
-                    "This usually means the option symbol format is not accepted "
-                    "by TradeStation quotes endpoint for this underlying."
-                )
-                return False
-
-            quotes = result.get("Quotes", []) if isinstance(result, dict) else []
             if not quotes:
-                logger.warning(
-                    f"Option quote validation returned no quotes for {test_symbol}; continuing "
-                    "because endpoint did not report INVALID SYMBOL"
+                logger.error(
+                    "Option quote validation returned nothing for %s. Either the "
+                    "feed does not recognise that symbol spelling for this "
+                    "underlying, or it has no quote yet. Continuing; if the "
+                    "chain stays empty all session, this line names the symbol "
+                    "to check first.",
+                    test_symbol,
                 )
                 return True
 
