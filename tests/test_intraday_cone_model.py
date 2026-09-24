@@ -27,6 +27,7 @@ import pytest
 
 from src.jobs.intraday_cone_model import (
     CONE_HORIZONS_MIN,
+    MIN_BRIER_SKILL,
     CONE_VOL_RATIO_MAX,
     CONE_VOL_RATIO_MIN,
     VOL_BASIS_MULT_MAX,
@@ -38,7 +39,9 @@ from src.jobs.intraday_cone_model import (
     SESSION_MINUTES,
     ConeInputs,
     base_rate_brier,
+    beats_base_rate,
     blended_daily_sigma,
+    brier_skill,
     calibration_error,
     compute_cone,
     diurnal_density,
@@ -748,3 +751,39 @@ def test_empty_inputs_yield_no_receipt_rather_than_a_zero():
     assert reliability_table([], buckets=5) == []
     assert calibration_error([], buckets=5) is None
     assert base_rate_brier([]) is None
+
+
+# ---------------------------------------------------------------------------
+# Skill margin — the verdict the page and the tweet both consult
+# ---------------------------------------------------------------------------
+
+
+def test_brier_skill_is_zero_when_the_forecast_is_just_the_base_rate():
+    """A model that always says 80%, on a set that holds 80% of the time, has
+    removed none of the strawman's error — however good the Brier looks."""
+    flat = [(0.8, i < 320) for i in range(400)]
+    assert brier_skill(flat) == pytest.approx(0.0, abs=1e-9)
+    assert beats_base_rate(flat) is False
+
+
+def test_a_dead_heat_is_not_a_win_in_either_direction():
+    """Regression.  Rounding one side of the comparison and not the other made
+    0.15999999999999998 < 0.16 read as skill, and the two symbols that lands
+    on in live data (SPX, NDX) sit exactly there."""
+    flat = [(0.8, i < 320) for i in range(400)]
+    skill = brier_skill(flat)
+    assert abs(skill) < MIN_BRIER_SKILL
+    assert beats_base_rate(flat) is False
+
+
+def test_brier_skill_rewards_confidence_that_discriminates():
+    pairs = [(0.95, i < 190) for i in range(200)] + [(0.65, i < 130) for i in range(200)]
+    assert brier_skill(pairs) > MIN_BRIER_SKILL
+    assert beats_base_rate(pairs) is True
+
+
+def test_brier_skill_is_undefined_when_there_is_nothing_to_beat():
+    """Every claim resolving the same way makes the strawman perfect."""
+    assert brier_skill([(0.9, True)] * 50) is None
+    assert beats_base_rate([(0.9, True)] * 50) is None
+    assert brier_skill([]) is None

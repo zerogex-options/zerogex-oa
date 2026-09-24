@@ -4825,16 +4825,32 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)can be every symbol calibrated, or two large biases cancelling -- and$(NC)"; \
 	echo "$(YELLOW)those call for opposite actions. The published page filters by symbol,$(NC)"; \
 	echo "$(YELLOW)so a reader on one symbol sees ITS numbers, not this average.$(NC)"; \
-	$(PSQL) -c "SELECT symbol, COUNT(*) AS claims, \
-		       ROUND(100.0 * COUNT(*) FILTER (WHERE held) / COUNT(*), 1) AS hold_pct, \
-		       ROUND(100.0 * AVG(hold_prob), 1) AS pred_pct, \
-		       ROUND(100.0 * (COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) \
-		                      - AVG(hold_prob)), 1) AS gap_pts, \
-		       ROUND(AVG(brier)::numeric, 4) AS brier \
+	echo "$(YELLOW)baseline is the Brier of the honest strawman: always predict this$(NC)"; \
+	echo "$(YELLOW)symbol's own realized hold rate. skill = 1 - brier/baseline, so it$(NC)"; \
+	echo "$(YELLOW)asks whether the PER-CLAIM confidence carried information or whether$(NC)"; \
+	echo "$(YELLOW)the cone merely discovered that ~80%% of bands hold. gap_pts near zero$(NC)"; \
+	echo "$(YELLOW)with skill near zero is a calibrated model that has told you nothing,$(NC)"; \
+	echo "$(YELLOW)and it is the state a published hold probability must not be in --$(NC)"; \
+	echo "$(YELLOW)which is why cone_tweet gates on skill and not on gap_pts.$(NC)"; \
+	$(PSQL) -c "WITH s AS ( \
+		SELECT symbol, COUNT(*) AS claims, \
+		       COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) AS h, \
+		       AVG(hold_prob) AS pred, \
+		       AVG(brier)     AS brier \
 		FROM intraday_forecast \
 		WHERE held IS NOT NULL AND vol_ratio_source IS NOT NULL $${SYMBOL_FILTER} \
 		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
-		GROUP BY symbol ORDER BY gap_pts;"; \
+		GROUP BY symbol) \
+		SELECT symbol, claims, \
+		       ROUND(100.0 * h, 1)            AS hold_pct, \
+		       ROUND(100.0 * pred, 1)         AS pred_pct, \
+		       ROUND(100.0 * (h - pred), 1)   AS gap_pts, \
+		       ROUND(brier::numeric, 4)       AS brier, \
+		       ROUND((h * (1 - h))::numeric, 4) AS baseline, \
+		       ROUND((1 - brier / NULLIF(h * (1 - h), 0))::numeric, 4) AS skill, \
+		       CASE WHEN (1 - brier / NULLIF(h * (1 - h), 0)) >= 0.01 \
+		            THEN 'yes' ELSE 'NO' END AS publishable \
+		FROM s ORDER BY skill DESC NULLS LAST;"; \
 	echo ""; \
 	echo "$(BLUE)--- Per horizon, SPLIT BY MODEL ---$(NC)"; \
 	echo "$(YELLOW)Never read across rows here. A session backfilled under an older$(NC)"; \
@@ -4861,6 +4877,44 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)while gap_pts stays large, the vol basis is fine and the cone geometry$(NC)"; \
 	echo "$(YELLOW)is what needs tuning. If vol_ratio is persistently far from 1, the$(NC)"; \
 	echo "$(YELLOW)basis is the problem and tuning the geometry would just paper over it.$(NC)"
+
+.PHONY: cone-tweet-preview
+cone-tweet-preview: ## Render what the cone receipt tweet WOULD have said on each of the last N sessions. Never posts. Vars: SESSIONS=10
+	@echo "$(BLUE)=== Cone tweet preview (nothing is posted) ===$(NC)"
+	@echo "$(YELLOW)Each block is one session: the exact copy that would have gone out$(NC)"
+	@echo "$(YELLOW)that evening, the gate's verdict on it, and the per-symbol numbers$(NC)"
+	@echo "$(YELLOW)underneath. The record shown is the record AS OF that session's$(NC)"
+	@echo "$(YELLOW)close -- not today's totals backdated, which would be reporting a$(NC)"
+	@echo "$(YELLOW)track record that did not exist yet.$(NC)"
+	@echo "$(YELLOW)Read the per-symbol block before deciding anything: an aggregate can$(NC)"
+	@echo "$(YELLOW)clear the gate while one symbol inside it has no skill at all.$(NC)"
+	@echo ""
+	@$(PY) -m src.jobs.cone_tweet --preview-sessions $${SESSIONS:-10}
+
+.PHONY: cone-tweet-dry-run
+cone-tweet-dry-run: ## Dry-run today's cone receipt tweet (assembles + gates + logs, posts nothing). Vars: FORECAST_DATE=YYYY-MM-DD
+	@echo "$(BLUE)=== Dry-run cone receipt tweet ===$(NC)"
+	@$(PY) -m src.jobs.cone_tweet --mode receipt \
+		$$( [ -n "$${FORECAST_DATE}" ] && echo "--date $${FORECAST_DATE}" ) \
+		$$( [ -n "$${FORECAST_DATE}" ] && echo "--allow-non-trading-day" )
+
+.PHONY: cone-tweet-install
+cone-tweet-install: ## Install the 16:15 ET cone tweet timer IN DRY-RUN MODE (assembles + logs, posts nothing).
+	@echo "$(BLUE)=== Installing Cone Tweet Timer (dry-run) ===$(NC)"
+	@echo "$(YELLOW)The unit ships WITHOUT --post. It will run every weekday at 16:15 ET,$(NC)"
+	@echo "$(YELLOW)build the tweet, run the publication gate, write both to the journal,$(NC)"
+	@echo "$(YELLOW)and post nothing. Watch it for as many sessions as you want before$(NC)"
+	@echo "$(YELLOW)deciding. To go live: add --post to the ExecStart line in$(NC)"
+	@echo "$(YELLOW)/etc/systemd/system/zerogex-oa-cone-tweet.service, then daemon-reload.$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-cone-tweet.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-cone-tweet.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-cone-tweet.timer
+	@echo "$(GREEN)✅ Cone tweet timer installed (dry-run)$(NC)"
+	@echo ""
+	@systemctl list-timers --all --no-pager 'zerogex-oa-cone-tweet.timer' || true
+	@echo ""
+	@echo "$(YELLOW)Logs:  journalctl -u zerogex-oa-cone-tweet -f$(NC)"
 
 .PHONY: cone-install
 cone-install: ## Install + enable ONLY the two intraday cone timers (writer 15m 09:45-15:30, grader 10:05-16:50).
