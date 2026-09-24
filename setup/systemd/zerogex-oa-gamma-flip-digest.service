@@ -1,0 +1,56 @@
+[Unit]
+Description=ZeroGEX weekly dark-flip digest (what is still not publishing)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# THE BACKSTOP FOR THE EDGE ALERT.
+#
+# zerogex-oa-gamma-flip-resolution.service pages when a symbol NEWLY goes dark,
+# which is the right amount of noise and has one weakness: an edge speaks once.
+# Miss that alert and a long outage is silent afterwards, because there is no
+# second change to report until it recovers. Replayed over 2026-07-01..09-23,
+# the edge check sends nothing at all between 08-03 and 09-09 -- thirty-odd
+# consecutive dark sessions and not one thing to say, because the state never
+# changed. That is exactly the five-week blackout a customer found before we
+# did.
+#
+# So: once a week, a standing statement of what is currently dark. It cannot be
+# missed twice.
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Exit 1 when ANY symbol is dark, 0 with an explicit all-clear when none is.
+# Nonzero is how the alert dispatcher above sends mail, so "exit 1" here means
+# "there is something to say", not "the check broke". A week where everything
+# published sends nothing.
+#
+# No excuses apply in this mode, deliberately. Deciding which blackouts are
+# harmless is the thing that failed twice (see the resolution unit's comments);
+# the digest reports what is dark and lets a person judge it.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-dark-digest
+
+# Ten sessions is two trading weeks, enough to date a run that started inside
+# the window. A run that fills the whole window is reported as ">= 10", never
+# as a start date it cannot support.
+TimeoutStartSec=120
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-gamma-flip-digest

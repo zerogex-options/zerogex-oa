@@ -447,6 +447,101 @@ def format_transitions(edges: Sequence[Transition], results_count: int) -> List[
     return lines
 
 
+@dataclass(frozen=True)
+class DarkRun:
+    """A symbol whose most recent stored session was dark, and for how long."""
+
+    symbol: str
+    sessions: int
+    since: date
+    latest: "SessionResolution"
+    #: True when every session in the loaded window was dark, so the run is a
+    #: LOWER BOUND.  The digest says "at least" rather than inventing a start.
+    truncated: bool
+
+    def as_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "sessions": self.sessions,
+            "since": self.since.isoformat(),
+            "since_is_lower_bound": self.truncated,
+            "latest_session": self.latest.session_date.isoformat(),
+            "latest_blank_minutes": round(self.latest.longest_blank_minutes, 1),
+            "latest_reason": self.latest.dominant_reason,
+        }
+
+
+def currently_dark(
+    results: Sequence["SessionResolution"], max_blank_minutes: float
+) -> List[DarkRun]:
+    """Which symbols are dark RIGHT NOW, and since when.
+
+    The backstop for an edge-triggered alert.  An edge speaks once, so a
+    missed alert leaves a long outage silent afterwards -- there is no second
+    change to report until it recovers.  This is the standing statement that
+    cannot be missed twice: nothing to say while everything publishes, one
+    line per dark symbol when something does not.
+
+    Keyed on the symbol's MOST RECENT stored session, because "currently" is
+    the whole question.  A symbol that was dark for a month and recovered
+    yesterday does not belong in a digest of what is broken.
+    """
+    by_symbol: dict = {}
+    for r in sorted(results, key=lambda r: (r.symbol, r.session_date)):
+        by_symbol.setdefault(r.symbol, []).append(r)
+
+    out: List[DarkRun] = []
+    for symbol, rows in by_symbol.items():
+        if not rows or session_state(rows[-1], max_blank_minutes) != STATE_DARK:
+            continue
+        run = 0
+        for r in reversed(rows):
+            if session_state(r, max_blank_minutes) != STATE_DARK:
+                break
+            run += 1
+        out.append(
+            DarkRun(
+                symbol=symbol,
+                sessions=run,
+                since=rows[-run].session_date,
+                latest=rows[-1],
+                truncated=run == len(rows),
+            )
+        )
+    return sorted(out, key=lambda d: (-d.sessions, d.symbol))
+
+
+def format_digest(
+    dark: Sequence[DarkRun], results: Sequence["SessionResolution"]
+) -> List[str]:
+    """One line per dark symbol, and an explicit all-clear when there are none."""
+    symbols = sorted({r.symbol for r in results})
+    if not dark:
+        return [
+            "All clear. Every symbol published a flip in its most recent session: "
+            + ", ".join(symbols)
+        ]
+
+    lines = [f"{'symbol':<8} {'dark since':<14} {'sessions':>9} {'blank':>7}  reason"]
+    for d in dark:
+        since = f"{d.since.isoformat()}"
+        count = f"{'>=' if d.truncated else ''}{d.sessions}"
+        lines.append(
+            f"{d.symbol:<8} {since:<14} {count:>9} "
+            f"{d.latest.longest_blank_minutes:>6.0f}m  {d.latest.dominant_reason or '-'}"
+        )
+    still_fine = [s for s in symbols if s not in {d.symbol for d in dark}]
+    lines.append("")
+    if still_fine:
+        lines.append("Publishing normally: " + ", ".join(still_fine))
+    if any(d.truncated for d in dark):
+        lines.append(
+            "A >= count means every session in the window was dark, so the run "
+            "started before it; widen --sessions to date it."
+        )
+    return lines
+
+
 def format_report(
     results: Sequence[SessionResolution],
     max_blank_minutes: float,
@@ -543,6 +638,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--digest",
+        action="store_true",
+        help=(
+            "Report which symbols are dark RIGHT NOW and since when, instead of "
+            "session-by-session. Exits 1 when anything is dark so the weekly "
+            "timer's alert hook fires, and 0 with an explicit all-clear when "
+            "nothing is. This is the backstop for --edges: an edge speaks once, "
+            "so a missed alert would otherwise leave a long outage silent."
+        ),
+    )
+    parser.add_argument(
         "--edges",
         action="store_true",
         help=(
@@ -597,8 +703,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ignore = [str(code).strip().upper() for code in (args.ignore_reasons or [])]
     edges = transitions(results, args.max_blank_minutes) if args.edges else []
+    dark = currently_dark(results, args.max_blank_minutes) if args.digest else []
 
-    if args.edges:
+    if args.digest:
+        # Every dark symbol is the message. No excuses apply: the digest exists
+        # precisely because deciding which blackouts are harmless is the thing
+        # that failed twice.
+        excused = []
+        breaches = [d.latest for d in dark]
+    elif args.edges:
         # Only a change pages. A symbol that has been dark for a month is not
         # news every hour, and a symbol that has been dark since before the
         # window started has no established change at all.
@@ -617,6 +730,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "ignore_reasons": ignore,
                     "ignore_raw_beyond": args.ignore_raw_beyond,
                     "edges": [t.as_dict() for t in edges],
+                    "currently_dark": [d.as_dict() for d in dark],
                     "sessions": [r.as_dict() for r in results],
                     "breaches": [r.as_dict() for r in breaches],
                     "excused": [r.as_dict() for r in excused],
@@ -625,6 +739,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         )
     else:
+        if args.digest:
+            for line in format_digest(dark, results):
+                print(line)
+            return 1 if dark else 0
         for line in format_report(results, args.max_blank_minutes, by_date=args.by_date):
             print(line)
         if args.edges:

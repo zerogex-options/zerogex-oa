@@ -1,0 +1,19 @@
+[Unit]
+Description=Weekly ZeroGEX dark-flip digest (Monday before the open)
+
+[Timer]
+# Monday morning, before the open. The most recent stored session is Friday's,
+# so the digest describes the week that just ended and lands before the week
+# that is starting -- which is when knowing a symbol is dark is still useful
+# rather than merely historical.
+#
+# Server timezone is America/New_York (deploy/steps/010.setup), so this is ET.
+OnCalendar=Mon *-*-* 08:00:00
+RandomizedDelaySec=5m
+# A host that was down on Monday still reports when it comes back. A weekly
+# digest that silently skips a week is worse than no digest, because its
+# silence is what people read as "nothing is wrong".
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -489,3 +489,81 @@ def test_the_replay_prints_every_alert_it_would_have_sent():
 def test_a_quiet_window_says_so_rather_than_printing_nothing():
     body = "\n".join(tool.format_transitions([], 30))
     assert "no state changes" in body
+
+
+# --- the digest, backstop for the edge ------------------------------------
+#
+# An edge speaks once. Miss that alert and a long outage is silent afterwards,
+# because there is no second change to report until it recovers -- which is
+# exactly how 2026-08-04 through 09-09 would read: thirty-odd dark sessions and
+# not one thing to say. The digest is the statement that cannot be missed
+# twice.
+
+
+def test_a_symbol_dark_in_its_latest_session_is_in_the_digest():
+    dark = tool.currently_dark([_session(18, 0), _session(21, 389)], 30.0)
+    assert [d.symbol for d in dark] == ["NDX"]
+    assert dark[0].sessions == 1
+    assert dark[0].since == date(2026, 9, 21)
+
+
+def test_the_run_is_counted_back_to_where_it_started():
+    days = [_session(18, 0), _session(21, 389), _session(22, 389), _session(23, 389)]
+    dark = tool.currently_dark(days, 30.0)
+    assert dark[0].sessions == 3
+    assert dark[0].since == date(2026, 9, 21)
+    assert not dark[0].truncated
+
+
+def test_an_all_dark_window_reports_a_lower_bound_not_a_start_date():
+    """2026-08-04..09-09 was dark for five weeks. A ten-session window cannot
+    date that, and must not pretend to."""
+    days = [_session(d, 389) for d in (21, 22, 23)]
+    dark = tool.currently_dark(days, 30.0)
+    assert dark[0].truncated
+    assert dark[0].sessions == 3
+
+
+def test_a_symbol_that_recovered_is_not_in_a_digest_of_what_is_broken():
+    days = [_session(21, 389), _session(22, 389), _session(23, 0)]
+    assert tool.currently_dark(days, 30.0) == []
+
+
+def test_symbols_are_judged_independently():
+    rows = [
+        _session(22, 0, "NDX"),
+        _session(23, 389, "NDX"),
+        _session(22, 389, "SPX"),
+        _session(23, 0, "SPX"),
+    ]
+    assert [d.symbol for d in tool.currently_dark(rows, 30.0)] == ["NDX"]
+
+
+def test_the_longest_outage_is_listed_first():
+    rows = [
+        _session(21, 389, "NDX"),
+        _session(22, 389, "NDX"),
+        _session(23, 389, "NDX"),
+        _session(22, 0, "SPX"),
+        _session(23, 389, "SPX"),
+    ]
+    assert [d.symbol for d in tool.currently_dark(rows, 30.0)] == ["NDX", "SPX"]
+
+
+def test_an_all_clear_names_the_symbols_it_checked():
+    """Silence and "I checked and everything is fine" are different messages."""
+    rows = [_session(23, 0, "NDX"), _session(23, 0, "SPX")]
+    body = "\n".join(tool.format_digest(tool.currently_dark(rows, 30.0), rows))
+    assert "All clear" in body
+    assert "NDX" in body and "SPX" in body
+
+
+def test_the_digest_names_what_is_dark_and_what_is_not():
+    rows = [
+        _session(22, 0, "NDX"),
+        _session(23, 389, "NDX"),
+        _session(23, 0, "SPX"),
+    ]
+    body = "\n".join(tool.format_digest(tool.currently_dark(rows, 30.0), rows))
+    assert "NDX" in body
+    assert "Publishing normally: SPX" in body
