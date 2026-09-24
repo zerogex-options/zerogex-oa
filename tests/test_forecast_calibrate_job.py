@@ -348,10 +348,59 @@ def test_raw_coverage_is_reported_but_no_longer_steers():
     )
 
 
-def test_the_floor_allows_the_width_the_data_calls_for():
+def test_target_is_the_middle_of_the_advertised_band():
     mod = _reload_module()
-    assert mod.BOUNDS["band_width_mult"][0] <= 0.49, (
-        "34 live sessions at 100% coverage with max required scale 0.991 need "
-        "room below the old 0.70 floor the open loop used to pin against"
-    )
     assert mod.TARGET_COVERAGE == 0.85, "middle of the advertised 80-90% band"
+    # The floor stays 0.70. Production pinned the CEILING (SPX 1.45, NDX 1.50),
+    # so the floor was never the binding constraint; with the loop closed the
+    # multiplier should settle near 1.0.
+    assert mod.BOUNDS["band_width_mult"] == (0.70, 1.50)
+
+
+def test_leans_follow_the_COMMITTED_band_not_the_raw_one():
+    """Same open loop as coverage, in the lean terms.
+
+    Raw band is symmetric and contains everything; the COMMITTED band is
+    shifted so only the upside breaks. Steering on raw sees no imbalance and
+    leaves the leans alone; steering on the committed band leans upside out.
+    """
+    mod = _reload_module()
+    receipts = [
+        _receipt(
+            projected_low=90.0, projected_high=101.0,   # upside breaks, downside holds
+            raw_low=50.0, raw_high=150.0,               # raw contains everything
+            actual_low=95.0, actual_high=110.0, actual_close=100.0,
+            day=date(2026, 6, 1 + (i % 28)),
+        )
+        for i in range(20)
+    ]
+    updates = mod._compute_updates(receipts, _neutral_state())
+    assert updates["summary"]["up_break_rate"] == 1.0
+    assert updates["summary"]["down_break_rate"] == 0.0
+    assert updates["upside_lean"] > 0.0, "every day broke the upside; lean must widen it"
+    assert updates["downside_lean"] < 0.0
+
+
+def test_pin_tolerance_follows_the_committed_verdict():
+    mod = _reload_module()
+    hit = [
+        _receipt(95.0, 105.0, 95.0, 105.0, 96.0, 104.0, 100.0,
+                 raw_pin_hit=False, day=date(2026, 6, 1 + (i % 28)))
+        for i in range(20)
+    ]
+    for r in hit:
+        r["pin_hit"] = True          # committed says hit, raw says miss
+    updates = mod._compute_updates(hit, _neutral_state())
+    assert updates["summary"]["pin_hit_rate"] == 1.0, "must read the committed verdict"
+    assert updates["pin_tolerance_mult"] < 1.0, "pinning every day means tolerance is too wide"
+
+
+def test_pin_tolerance_falls_back_to_raw_when_committed_is_absent():
+    mod = _reload_module()
+    rows = [
+        _receipt(95.0, 105.0, 95.0, 105.0, 96.0, 104.0, 100.0,
+                 raw_pin_hit=True, day=date(2026, 6, 1 + (i % 28)))
+        for i in range(20)
+    ]  # no "pin_hit" key at all — pre-backfill rows
+    updates = mod._compute_updates(rows, _neutral_state())
+    assert updates["summary"]["pin_hit_rate"] == 1.0, "must degrade to raw_pin_hit, not to 0"

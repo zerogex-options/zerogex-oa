@@ -61,15 +61,14 @@ TARGET_COVERAGE = 0.85
 # Bounds — never let a scalar drift past these regardless of how many
 # consecutive misses accumulate.
 BOUNDS = {
-    # Floor lowered 0.70 -> 0.45, for the same reason and with the same
-    # evidence as vol_range_basis_mult below: the controller pinned the old
-    # floor exactly. With the coverage loop OPEN (see _compute_updates) it
-    # could only ever drift to a bound, and 0.70 was clipping the width the
-    # data actually calls for -- 34 sessions at 100% coverage with a maximum
-    # required scale of 0.991 means the band has never once been filled.
-    # 1.50 still caps a widening spiral, and MIN_RANGE_FRACTION in the model
-    # remains the absolute backstop underneath this.
-    "band_width_mult": (0.45, 1.50),
+    # Left at 0.70. An earlier version of this change lowered it to 0.45 on the
+    # belief that the controller had pinned the FLOOR; production showed it
+    # pinned the CEILING (SPX 1.45, NDX 1.50), so the floor was never the
+    # binding constraint and there is no evidence for moving it. With the loop
+    # closed the multiplier should settle near 1.0 -- the committed band needs
+    # to be ~0.66 of its current width, and its current width is ~1.45x raw,
+    # so ~0.96x raw. Nowhere near either bound.
+    "band_width_mult": (0.70, 1.50),
     "pin_tolerance_mult": (0.50, 2.00),
     "upside_lean": (-0.20, 0.20),
     "downside_lean": (-0.20, 0.20),
@@ -195,15 +194,21 @@ def _compute_updates(
     band = _bounded("band_width_mult", band + LEARNING_RATE * coverage_error * 5.0)
 
     # Upside vs downside imbalance — which side breaks the band more often?
+    # Committed band, for the same reason as coverage above: the leans are
+    # applied in _apply_calibration alongside band_width_mult, so measuring the
+    # pre-calibration band means the lean cannot see its own effect. SPX and
+    # NDX both sat at +0.20/-0.20 in production, which are the exact bounds.
     upside_breaks = sum(
         1 for r in graded
         if r.get("actual_high") is not None
-        and float(r["actual_high"]) > float(r["raw_projected_high"])
+        and r.get("projected_high") is not None
+        and float(r["actual_high"]) > float(r["projected_high"])
     )
     downside_breaks = sum(
         1 for r in graded
         if r.get("actual_low") is not None
-        and float(r["actual_low"]) < float(r["raw_projected_low"])
+        and r.get("projected_low") is not None
+        and float(r["actual_low"]) < float(r["projected_low"])
     )
     up_break_rate = upside_breaks / n
     down_break_rate = downside_breaks / n
@@ -218,7 +223,15 @@ def _compute_updates(
     # Pin tolerance: aim for ~50% pin_hit rate (a real-world "pinning"
     # market pins about half the time on liquid indices).  Below that
     # widen; above tighten.
-    pin_hits = sum(1 for r in graded if r.get("raw_pin_hit") is True)
+    # Committed pin verdict, not raw_pin_hit: pin_tolerance_mult is applied to
+    # the committed tolerance, so grading the raw one is the same open loop.
+    # All four symbols sat at 2.0000 in production -- the exact ceiling.
+    # Falls back to raw_pin_hit for rows written before pin_hit was recorded,
+    # so a partial backfill degrades instead of dropping the signal.
+    pin_hits = sum(
+        1 for r in graded
+        if (r["pin_hit"] if r.get("pin_hit") is not None else r.get("raw_pin_hit")) is True
+    )
     pin_hit_rate = pin_hits / n
     pin_target = 0.50
     pin_error = pin_target - pin_hit_rate
