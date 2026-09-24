@@ -3,6 +3,11 @@
 **Status:** shipped (OFF by default) · **Last updated:** 2026-06-28
 **Repo:** `zerogex-oa`
 
+> **See also** [`playbook-learning-loop.md`](playbook-learning-loop.md): every
+> live Card graded after the fact, and a per-symbol entry bar learned from those
+> grades (on by default). Calibration shades a pattern's confidence; the entry
+> bar decides whether its Card is published at all.
+
 > **Data source note:** calibration can feed from either of two measurement
 > harnesses, both writing `playbook_pattern_stats` (tagged by a `source`
 > column):

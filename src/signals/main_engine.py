@@ -13,7 +13,9 @@ import time
 from multiprocessing import Process
 
 from src.config import SIGNALS_INTERVAL, SIGNALS_UNDERLYINGS
+from src.signals.playbook import adaptive_gate
 from src.signals.playbook import calibration as pattern_calibration
+from src.signals.playbook import grading as playbook_grading
 from src.signals.unified_signal_engine import UnifiedSignalEngine
 from src.symbols import parse_underlyings
 from src.utils import get_logger
@@ -65,6 +67,11 @@ class SignalEngineService:
         # elapsed. Cheap no-op between reloads and fully best-effort — a
         # failed refresh never blocks the signal cycle (handled internally).
         pattern_calibration.maybe_refresh()
+        # The Playbook's learning loop, both no-ops between their intervals and
+        # both best-effort: grade this symbol's Cards that have played out,
+        # then reload the per-symbol entry bars those grades set.
+        playbook_grading.maybe_grade(self.underlying)
+        adaptive_gate.maybe_refresh()
         unified_ok = self.unified_engine.run_cycle()
         # DEBUG, not INFO: this is a heartbeat on a ONE-SECOND loop, so at INFO
         # it is ~3,600 identical lines an hour per symbol and says nothing a

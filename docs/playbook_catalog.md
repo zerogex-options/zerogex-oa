@@ -167,9 +167,9 @@ Outside the regular session (09:30 ET to the close, 13:00 on an early-close day)
 1. Build `PlaybookContext`.
 2. Collect candidate Cards by calling `match()` on every registered pattern (built-in + custom).
 3. **Regime gate**: drop Cards whose pattern's `valid_regimes` doesn't include the current MSI regime.
-4. **Position-state gate**: management Cards (`TAKE_PROFIT`, `TIGHTEN_STOP`, `CLOSE`) are only valid when there's a matching open position. Entry Cards are dropped when the same pattern's prior trade is still open within its `max_hold_minutes`.
-5. **Confidence floor**: drop Cards with `confidence < 0.25`.
-6. **Hysteresis**: drop a Card if the same `(pattern_id, instrument_signature)` was emitted within the pattern's tier dwell window (default 5 min for 0DTE, 15 min for 1DTE, 60 min for swing).
+4. **One Card per idea** (position-state gate): management Cards (`TAKE_PROFIT`, `TIGHTEN_STOP`, `CLOSE`) are only valid when there's a matching open position. An entry Card is dropped while the same pattern's latest idea on the symbol (its last published Card, or an idea the entry bar held back) is inside that idea's `max_hold_minutes`. A stopped-out idea frees the slot for a Card in the other direction only; a target hit does not free it. Without this, a pattern whose trigger stays true for the whole move re-issued the same trade every dwell window at a worse price. `PLAYBOOK_ONE_CARD_PER_IDEA=0` turns it off. See `docs/design/playbook-learning-loop.md`.
+5. **Hysteresis**: drop a Card if the same pattern was emitted within its tier dwell window (default 5 min for 0DTE, 15 min for 1DTE, 60 min for swing).
+6. **Entry bar**: drop Cards below the confidence the pattern has earned on this symbol and direction from its graded record (`adaptive_gate.py`). With no record yet the bar is the old flat floor, 0.25. A pattern that has been losing there needs up to 0.75, or is paused; one that has been winning needs as little as 0.20. Ideas the bar holds back are still recorded and graded. `PLAYBOOK_ADAPTIVE_GATE_ENABLED=0` restores the flat 0.25 floor.
 7. **Resolve**:
    - 0 surviving Cards → emit a structured `STAND_DOWN` Card. See §6.
    - 1 → emit it.
@@ -193,7 +193,7 @@ confidence = clamp(confidence, 0.20, 0.95)
 
 The historical hit rate of the pattern, capped to prevent overstating untested patterns.
 
-**Until PR-3 backtests land, every pattern uses its prior-belief base specified in §7.** These priors range 0.50–0.55 and reflect intuition, not data. PR-3 onwards replaces each prior with the empirical hit rate over a ≥ 90-day backtest window. A pattern whose backtested hit rate is below 0.40 is automatically dropped from the catalog.
+**Every pattern uses its prior-belief base specified in §7** unless `SIGNALS_PATTERN_CALIBRATION_ENABLED` swaps in the backtested hit rate (`docs/design/pattern-calibration.md`). These priors range 0.50–0.65 and reflect intuition, not data. Dropping a losing pattern is the entry bar's job (§4 step 6): it is set per symbol from the pattern's graded live record, and pauses the pattern there when that record is bad enough.
 
 ### `confluence_multiplier` (0.7 – 1.4)
 
@@ -219,7 +219,7 @@ How well the current MSI regime matches the pattern's preferred regime.
 `STAND_DOWN` is emitted only when, after gating and hysteresis:
 
 - Zero patterns produced a surviving Card, OR
-- All surviving Cards have `confidence < 0.25`, AND
+- All surviving Cards are below their entry bar (§4 step 6), AND
 - There is no open position requiring management.
 
 It is also emitted, without evaluating any pattern, whenever the cycle falls outside the regular session (09:30 ET to the close). That Card's rationale reads "Market closed", its `near_misses` is empty, and its `context.session` is `"closed"`.

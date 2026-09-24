@@ -50,6 +50,9 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     # live UI can deep-link to /cards/{id}.
     dbmod.DatabaseManager.insert_action_card = AsyncMock(return_value=4221)
     dbmod.DatabaseManager.get_recent_action_cards = AsyncMock(return_value=[])
+    # Learning loop inputs: no live idea per pattern, nothing graded yet.
+    dbmod.DatabaseManager.get_open_playbook_ideas = AsyncMock(return_value=[])
+    dbmod.DatabaseManager.get_playbook_track_records = AsyncMock(return_value=[])
     # The newest bar's close is the Card's price (678.40, a touch above the
     # 677.80 VWAP the confluence signal reports). Three bars keep call_wall_fade's
     # realized-vol read at zero, as before.
@@ -294,6 +297,65 @@ def test_no_bars_means_no_trade_card(monkeypatch: pytest.MonkeyPatch):
     with TestClient(app) as client:
         body = client.get("/api/signals/action?underlying=SPY").json()
     assert body["action"] == "STAND_DOWN"
+
+
+def test_a_live_idea_blocks_a_repeat_card(monkeypatch: pytest.MonkeyPatch):
+    """The board still says "fade the call wall", but the pattern's Card from
+    20 minutes ago is still inside its hold window: no second Card."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_cwf_adv, basic=_cwf_basic)
+    )
+    dbmod.DatabaseManager.get_open_playbook_ideas = AsyncMock(
+        return_value=[
+            {
+                "pattern": "call_wall_fade",
+                "direction": "bearish",
+                "action": "SELL_CALL_SPREAD",
+                "issued_at": datetime(2026, 5, 1, 18, 10, tzinfo=timezone.utc),
+                "max_hold": "90",
+                "outcome": None,
+            }
+        ]
+    )
+
+    with TestClient(app) as client:
+        body = client.get("/api/signals/action?underlying=SPY").json()
+    assert body["action"] == "STAND_DOWN"
+    misses = {nm["pattern"]: nm["missing"] for nm in body["near_misses"]}
+    assert "one Card per idea" in misses["call_wall_fade"][0]
+    dbmod.DatabaseManager.get_open_playbook_ideas.assert_awaited_with("SPY")
+
+
+def test_a_pattern_paused_on_the_symbol_issues_no_card(monkeypatch: pytest.MonkeyPatch):
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_cwf_adv, basic=_cwf_basic)
+    )
+    dbmod.DatabaseManager.get_playbook_track_records = AsyncMock(
+        return_value=[
+            {
+                "pattern": "call_wall_fade",
+                "underlying": "SPY",
+                "direction": "bearish",
+                "n": 40,
+                "weight": 40.0,
+                "wins": 10,
+                "losses": 30,
+                "sum_wr": -20.0,
+            }
+        ]
+    )
+
+    with TestClient(app) as client:
+        body = client.get("/api/signals/action?underlying=SPY").json()
+    assert body["action"] == "STAND_DOWN"
+    misses = {nm["pattern"]: nm["missing"] for nm in body["near_misses"]}
+    assert misses["call_wall_fade"][0].startswith("paused")
+    dbmod.DatabaseManager.insert_action_card.assert_called_once()
+    assert dbmod.DatabaseManager.insert_action_card.call_args.args[0]["action"] == "STAND_DOWN"
 
 
 # --------------------------------------------------------------------------

@@ -41,6 +41,7 @@ from src.database.connection import db_connection
 from src.backtesting import calibration_feed
 from src.signals.playbook import backtest as playbook_backtest
 from src.signals.playbook import calibration as pattern_calibration
+from src.signals.playbook import grading as playbook_grading
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +355,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         run_pnl = SIGNALS_PATTERN_CALIBRATION_SOURCE in ("option_pnl", "auto")
 
     with db_connection() as conn:
+        # Backstop for the Playbook grader the signals service runs every few
+        # minutes: re-sync and grade the full lookback, including any symbol
+        # whose Cards came only through the API. Best-effort per symbol.
+        if not args.no_backtest:
+            try:
+                grade_symbols = sorted(
+                    set(underlyings)
+                    | set(
+                        playbook_grading.graded_underlyings(
+                            conn, config.PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS
+                        )
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("could not list symbols to grade; grading configured ones")
+                conn.rollback()
+                grade_symbols = list(underlyings)
+            for u in grade_symbols:
+                try:
+                    result = playbook_grading.run(
+                        conn, u, days=config.PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS
+                    )
+                    logger.info("playbook grading %s: %s", u, result)
+                except Exception:  # noqa: BLE001 - one underlying must not abort the rest
+                    logger.exception("playbook grading failed for %s; continuing", u)
+                    conn.rollback()
         if not args.no_backtest:
             for u in underlyings:
                 if not args.no_touch:

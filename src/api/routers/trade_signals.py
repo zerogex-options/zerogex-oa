@@ -435,13 +435,14 @@ async def get_action_card(
     }
     ```
 
-    **Notes for PR-2.** The engine is computed on-demand each request from
-    the latest persisted signal state — no Action Card persistence yet.
-    Hysteresis (re-trigger suppression across cycles) is a no-op until
-    PR-3 wires Card persistence and the cycle loop. Open-position
-    awareness is also disabled until PR-3, so management Cards
-    (`TAKE_PROFIT`, etc.) won't fire in PR-2.
+    **Notes.** The Card is computed on demand from the latest persisted
+    signal state and persisted when it is a trade. A pattern issues one Card
+    per idea: while its last Card on the symbol is inside its hold window it
+    stays quiet. Each pattern must also clear the entry bar its graded record
+    on the symbol has earned (`track_record` in `context`); a pattern that
+    has been losing there needs far more confidence or is paused.
     """
+    from src.signals.playbook import adaptive_gate
     from src.signals.playbook.context_builder import build_playbook_context
 
     sym = underlying.upper()
@@ -449,6 +450,9 @@ async def get_action_card(
     if cached is not None:
         return cached
 
+    # The entry bar each pattern has earned per symbol. A no-op between
+    # reloads; the signals service keeps its own copy the same way.
+    await adaptive_gate.refresh_async(db)
     ctx = await build_playbook_context(db=db, underlying=sym)
     if ctx is None:
         raise HTTPException(

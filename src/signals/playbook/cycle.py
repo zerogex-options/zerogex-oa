@@ -21,6 +21,7 @@ from typing import Any, Iterable, Optional
 from src.signals.components.base import MarketContext
 from src.signals.playbook.context import PlaybookContext, SignalSnapshot
 from src.signals.playbook.engine import PlaybookEngine
+from src.signals.playbook.ideas import insert_held_back_idea_sync, load_open_ideas_sync
 from src.signals.playbook.types import ActionCard, ActionEnum
 
 # AdvancedSignalResult is imported lazily inside the helpers — pulling
@@ -175,11 +176,12 @@ def build_context_from_cycle(
     in memory.  ``score_history`` on each snapshot is left empty;
     history-needy patterns fall back to "accept current trigger".
 
-    ``conn`` and ``underlying`` (when supplied) drive a single-row query
-    against ``signal_action_cards`` to populate ``recently_emitted`` so
-    the engine's hysteresis gate works in the sync path identically to
-    the async API builder. Backward compatible — callers that omit them
-    get the prior empty-dict behavior.
+    ``conn`` and ``underlying`` (when supplied) drive a query against
+    ``signal_action_cards`` to populate ``recently_emitted`` so the
+    engine's hysteresis gate works in the sync path identically to the
+    async API builder, and a second that loads each pattern's latest idea
+    into ``open_positions`` for the one-Card-per-idea gate. Backward
+    compatible — callers that omit them get empty inputs.
     """
     advanced: dict[str, SignalSnapshot] = {}
     for r in advanced_results or ():
@@ -189,8 +191,10 @@ def build_context_from_cycle(
         basic[r.name] = _snapshot_from_result(r)
 
     recently_emitted: dict = {}
+    open_positions: list = []
     if conn is not None and underlying:
         recently_emitted = _load_recently_emitted_sync(conn, underlying)
+        open_positions = load_open_ideas_sync(conn, underlying)
 
     return PlaybookContext(
         market=market_context,
@@ -200,7 +204,7 @@ def build_context_from_cycle(
         advanced_signals=advanced,
         basic_signals=basic,
         levels=_extract_levels(market_context.extra or {}, advanced),
-        open_positions=[],  # PR-15 will wire portfolio state through.
+        open_positions=open_positions,
         recently_emitted=recently_emitted,
     )
 
@@ -270,7 +274,8 @@ def evaluate_and_persist(
     """End-to-end cycle integration: build ctx, evaluate, persist.
 
     Returns the ActionCard so the caller can log it.  Persistence is
-    best-effort; STAND_DOWN cards are not persisted.
+    best-effort; STAND_DOWN cards are not persisted.  Ideas the entry bar
+    held back are recorded (unpublished) so the grader can grade them.
     """
     ctx = build_context_from_cycle(
         market_context=market_context,
@@ -280,7 +285,9 @@ def evaluate_and_persist(
         conn=conn,
         underlying=getattr(market_context, "underlying", None),
     )
-    card = engine.evaluate(ctx)
+    card, held_back = engine.evaluate_with_held_back(ctx)
     if conn is not None:
         insert_action_card_sync(conn, card.to_dict())
+        for idea, reason in held_back:
+            insert_held_back_idea_sync(conn, idea.to_dict(), reason)
     return card

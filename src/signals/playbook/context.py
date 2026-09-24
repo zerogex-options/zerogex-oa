@@ -78,7 +78,12 @@ class SignalSnapshot:
 
 @dataclass
 class OpenPosition:
-    """Compact view of an open position for management Card matching."""
+    """A pattern's most recent idea on this symbol: its last Card, published or
+    held back by the adaptive gate.
+
+    The engine uses it to issue one Card per idea: while the idea's hold window
+    is open, the same pattern does not issue another Card on the symbol.
+    """
 
     pattern_id: str  # which pattern opened it (if known)
     direction: str  # bullish | bearish | non_directional
@@ -87,6 +92,12 @@ class OpenPosition:
     opened_at: Optional[datetime] = None
     entry_premium: Optional[float] = None
     underlying: str = ""
+    # The idea's own hold window. None falls back to the new Card's.
+    max_hold_minutes: Optional[int] = None
+    # The grader's verdict so far: "pending" until the target or stop is
+    # touched, then "target_hit" / "stop_hit". A stopped idea frees the slot
+    # for a Card in the other direction.
+    status: str = "pending"
 
 
 @dataclass

@@ -2137,6 +2137,66 @@ CREATE INDEX IF NOT EXISTS idx_playbook_pattern_stats_source
     ON playbook_pattern_stats(source, underlying, window_end DESC);
 
 -- ---------------------------------------------------------------------------
+-- playbook_card_outcomes
+-- The Playbook engine's report card: one row per trade idea, graded against
+-- what the underlying did after it (src/signals/playbook/grading.py).
+--
+-- A published Card has card_id set. An idea the adaptive entry bar held back
+-- has card_id NULL and held_back_reason set; it is graded the same way, so a
+-- paused pattern can earn its way back. The adaptive gate
+-- (src/signals/playbook/adaptive_gate.py) turns the graded rows into the
+-- confidence each pattern needs per symbol, and the one-Card-per-idea gate
+-- reads the latest row per pattern (src/signals/playbook/ideas.py).
+--
+-- outcome: pending until graded, then target_hit | stop_hit | time_exit,
+-- or no_fill | no_data | unresolved | off_session | mispriced (not counted).
+-- r_multiple: the result in units of the Card's risk (entry to stop).
+-- prior_move_pct: how far price had already moved the Card's way in the 30
+-- minutes before it. is_repeat: a Card re-issued while the same idea was
+-- still live; the record counts the idea once.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS playbook_card_outcomes (
+    id                BIGSERIAL PRIMARY KEY,
+    card_id           BIGINT UNIQUE REFERENCES signal_action_cards(id) ON DELETE CASCADE,
+    underlying        VARCHAR(10)      NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    pattern           VARCHAR(64)      NOT NULL,
+    action            VARCHAR(32)      NOT NULL,
+    tier              VARCHAR(8)       NOT NULL,
+    direction         VARCHAR(20)      NOT NULL,
+    confidence        DOUBLE PRECISION NOT NULL,
+    issued_at         TIMESTAMPTZ      NOT NULL,
+    held_back_reason  TEXT,
+    is_repeat         BOOLEAN          NOT NULL DEFAULT FALSE,
+    entry_price       DOUBLE PRECISION,
+    entry_trigger     VARCHAR(16),
+    target_price      DOUBLE PRECISION,
+    stop_price        DOUBLE PRECISION,
+    max_hold_minutes  INTEGER,
+    prior_move_pct    DOUBLE PRECISION,
+    outcome           VARCHAR(16)      NOT NULL DEFAULT 'pending',
+    resolved_at       TIMESTAMPTZ,
+    exit_price        DOUBLE PRECISION,
+    mfe_pct           DOUBLE PRECISION,
+    mae_pct           DOUBLE PRECISION,
+    r_multiple        DOUBLE PRECISION,
+    graded_at         TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+-- A held-back idea is written once per cycle that produces it; this keeps a
+-- retried write from recording it twice.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_playbook_card_outcomes_held_back
+    ON playbook_card_outcomes(underlying, pattern, issued_at)
+    WHERE card_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_playbook_card_outcomes_pending
+    ON playbook_card_outcomes(underlying, issued_at)
+    WHERE outcome = 'pending';
+CREATE INDEX IF NOT EXISTS idx_playbook_card_outcomes_pattern_ts
+    ON playbook_card_outcomes(underlying, pattern, issued_at DESC);
+CREATE INDEX IF NOT EXISTS idx_playbook_card_outcomes_issued
+    ON playbook_card_outcomes(issued_at DESC);
+
+-- ---------------------------------------------------------------------------
 -- portfolio_snapshots (schema only — used in Part 2)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (

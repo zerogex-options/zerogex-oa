@@ -5634,6 +5634,22 @@ pattern-calibration-structures: ## Compare per-pattern economics as single long 
 		$(if $(CALIB_DAYS),--days $(CALIB_DAYS)) \
 		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
 
+# Playbook learning loop: every Card graded against what price did next, and
+# the entry bar each pattern has earned per symbol. See
+# docs/design/playbook-learning-loop.md.
+.PHONY: playbook-grade
+playbook-grade: ## Grade Playbook Cards against what price did next (backfill; DAYS=90, SYMBOLS="SPY QQQ")
+	@echo "$(BLUE)=== Grading Playbook Cards ===$(NC)"
+	@$(PY) -m src.signals.playbook.grading \
+		$(if $(DAYS),--days $(DAYS)) \
+		$(if $(SYMBOLS),--underlyings $(SYMBOLS))
+
+.PHONY: playbook-record
+playbook-record: ## Playbook track record and entry bar per pattern and symbol (read-only; DAYS=90, SYMBOL=SPY)
+	@$(PY) -m src.tools.playbook_record \
+		$(if $(DAYS),--days $(DAYS)) \
+		$(if $(SYMBOL),--symbol $(SYMBOL))
+
 .PHONY: backtest-worker
 backtest-worker: ## Run the backtest worker (drains queued runs; needs BACKTEST_WORKER_ENABLED=1)
 	@echo "$(BLUE)=== Starting backtest worker ===$(NC)"

@@ -5,7 +5,8 @@ Responsibilities (per ``docs/playbook_catalog.md`` §4):
   1. Discover registered patterns (built-in + custom dir).
   2. Call ``match()`` on each pattern with the PlaybookContext, but only in
      the regular session; outside it, emit a STAND_DOWN without running any.
-  3. Apply gates: regime, position-state, confidence floor, hysteresis.
+  3. Apply gates: regime, one Card per idea, hysteresis, and the entry bar
+     each pattern has earned on the symbol (``adaptive_gate``).
   4. Resolve conflicts: highest confidence wins, tier-priority tiebreak.
   5. Surface losing candidates as ``alternatives_considered``.
   6. Emit a structured STAND_DOWN Card when nothing survives.
@@ -26,8 +27,10 @@ from datetime import time
 from pathlib import Path
 from typing import Optional
 
+from src import config
+from src.signals.playbook import adaptive_gate
 from src.signals.playbook.base import PatternBase
-from src.signals.playbook.context import PlaybookContext
+from src.signals.playbook.context import OpenPosition, PlaybookContext
 from src.signals.playbook.types import (
     ActionCard,
     ActionEnum,
@@ -41,7 +44,9 @@ from src.signals.playbook.types import (
 logger = logging.getLogger(__name__)
 
 
-CONFIDENCE_FLOOR = 0.25  # Cards below this are dropped (see spec §4.5).
+# The flat floor from spec §4.5. It is now the neutral bar the adaptive gate
+# uses for a pattern with no graded record yet (PLAYBOOK_ADAPTIVE_NEUTRAL_BAR).
+CONFIDENCE_FLOOR = 0.25
 DEFAULT_CUSTOM_DIR = "~/.zerogex/playbook/custom"
 
 
@@ -131,6 +136,19 @@ class PlaybookEngine:
 
     def evaluate(self, ctx: PlaybookContext) -> ActionCard:
         """Run patterns through all gates and return one ActionCard."""
+        card, _held_back = self.evaluate_with_held_back(ctx)
+        return card
+
+    def evaluate_with_held_back(
+        self, ctx: PlaybookContext
+    ) -> tuple[ActionCard, list[tuple[ActionCard, str]]]:
+        """``evaluate`` plus the ideas the entry bar held back.
+
+        A held-back idea passed every other gate and would have been published
+        under the old flat floor; only its pattern's record on this symbol
+        kept it back. The cycle records these so the grader can grade them,
+        which is how a paused pattern earns its way back.
+        """
         # Step 0: session gate. A Card is an instruction to trade options at
         # the prices printed on it, and those options trade only in the
         # regular session. The signal cycle runs 24x5, so without this gate
@@ -140,21 +158,27 @@ class PlaybookEngine:
         # any pattern runs also keeps such a cycle out of the table, since a
         # STAND_DOWN is never persisted.
         if not ctx.is_regular_session:
-            return self._outside_session(
-                ctx,
-                "Market closed: Cards are issued only in the regular session, "
-                "09:30 ET to the close.",
-                session="closed",
+            return (
+                self._outside_session(
+                    ctx,
+                    "Market closed: Cards are issued only in the regular session, "
+                    "09:30 ET to the close.",
+                    session="closed",
+                ),
+                [],
             )
         # A cash index's 09:30 bar is its stale opening print, near the prior
         # close, not a level anyone traded. NDX and SPX Cards fired off it at the
         # open quoted yesterday's price.
         if ctx.is_index_opening_bar:
-            return self._outside_session(
-                ctx,
-                "Index opening print: a cash index's 09:30 prints are stale until "
-                "its stocks open, so Cards start at 09:31 ET.",
-                session="index_open",
+            return (
+                self._outside_session(
+                    ctx,
+                    "Index opening print: a cash index's 09:30 prints are stale until "
+                    "its stocks open, so Cards start at 09:31 ET.",
+                    session="index_open",
+                ),
+                [],
             )
 
         # Step 1: collect raw candidates.
@@ -192,7 +216,10 @@ class PlaybookEngine:
                     )
             candidates = after_regime
 
-        # Step 3: position-state gate.
+        # Step 3: position-state gate, which is also "one Card per idea".
+        # ``open_positions`` holds each pattern's latest idea on this symbol
+        # (see ideas.py), so a pattern whose last Card is still inside its
+        # hold window does not issue another one.
         management_actions = {ActionEnum.TAKE_PROFIT, ActionEnum.TIGHTEN_STOP, ActionEnum.CLOSE}
         after_position: list[tuple[PatternBase, ActionCard]] = []
         for pattern, card in candidates:
@@ -207,34 +234,42 @@ class PlaybookEngine:
                         )
                     )
             else:
-                # Entry card: drop if same pattern already has an open position
-                # within its max_hold_minutes window.
                 existing = ctx.open_position_for(pattern.id)
-                if existing and existing.opened_at and card.max_hold_minutes:
-                    age = (ctx.timestamp - existing.opened_at).total_seconds() / 60.0
-                    if age < float(card.max_hold_minutes):
-                        miss_diagnostics.append(
-                            NearMiss(
-                                pattern=pattern.id,
-                                missing=[
-                                    f"entry suppressed: pattern already open "
-                                    f"({age:.0f}m of {card.max_hold_minutes}m hold window)"
-                                ],
-                            )
-                        )
-                        continue
+                blocked = self._idea_still_live(ctx, existing, card)
+                if blocked:
+                    miss_diagnostics.append(NearMiss(pattern=pattern.id, missing=[blocked]))
+                    continue
                 after_position.append((pattern, card))
         candidates = after_position
 
-        # Step 4: confidence floor.
-        candidates = [(p, c) for (p, c) in candidates if c.confidence >= CONFIDENCE_FLOOR]
-
-        # Step 5: hysteresis.
+        # Step 4: hysteresis. Ahead of the entry bar so an idea the bar holds
+        # back is always a fresh one, never a re-trigger inside the dwell.
         candidates = self._apply_hysteresis(ctx, candidates, miss_diagnostics)
+
+        # Step 5: the entry bar each pattern has earned on this symbol. A
+        # pattern with no graded record gets the old flat floor; one that has
+        # been losing here needs far more confidence or is paused; one that
+        # has been winning is let through at lower confidence.
+        held_back: list[tuple[ActionCard, str]] = []
+        after_bar: list[tuple[PatternBase, ActionCard]] = []
+        for pattern, card in candidates:
+            verdict = adaptive_gate.assess(pattern.id, ctx.underlying, card.direction)
+            if card.confidence >= verdict.bar:
+                card.context = {**(card.context or {}), "track_record": verdict.summary()}
+                after_bar.append((pattern, card))
+                continue
+            reason = verdict.miss_reason(card.confidence)
+            miss_diagnostics.append(NearMiss(pattern=pattern.id, missing=[reason]))
+            # Record it for grading only if the record, not the flat floor,
+            # is what kept it back.
+            if verdict.is_adaptive and card.confidence >= config.PLAYBOOK_ADAPTIVE_NEUTRAL_BAR:
+                card.context = {**(card.context or {}), "track_record": verdict.summary()}
+                held_back.append((card, reason))
+        candidates = after_bar
 
         # Step 6: resolve.
         if not candidates:
-            return self._stand_down(ctx, miss_diagnostics)
+            return self._stand_down(ctx, miss_diagnostics), held_back
 
         winner_pattern, winner_card = self._resolve_conflict(ctx, candidates)
         winner_card.alternatives_considered = [
@@ -245,11 +280,46 @@ class PlaybookEngine:
             for (p, c) in candidates
             if p.id != winner_pattern.id
         ]
-        return winner_card
+        return winner_card, held_back
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _idea_still_live(
+        ctx: PlaybookContext, existing: Optional[OpenPosition], card: ActionCard
+    ) -> Optional[str]:
+        """Why ``card`` repeats an idea that is still live, or None if it doesn't.
+
+        The pattern's last idea holds the slot for its whole hold window: a
+        second Card inside it would be the same trade, later and at a worse
+        price. The one exception is a stopped-out idea, which frees the slot
+        for a Card the other way (the move it bet on failed; a reversal is a
+        new idea). A target hit does not free it: re-entering after the move
+        played out is the chase this gate exists to stop.
+        """
+        if existing is None or existing.opened_at is None:
+            return None
+        hold = existing.max_hold_minutes or card.max_hold_minutes
+        if not hold:
+            return None
+        age = (ctx.timestamp - existing.opened_at).total_seconds() / 60.0
+        if age >= float(hold):
+            return None
+        if existing.status == "stop_hit" and existing.direction != card.direction:
+            return None
+        side = f"{existing.direction} " if existing.direction in ("bullish", "bearish") else ""
+        if existing.status == "target_hit":
+            state = "already reached its target"
+        elif existing.status == "stop_hit":
+            state = "was stopped out; no re-entry the same way"
+        else:
+            state = "is still live"
+        return (
+            f"one Card per idea: its {side}Card from {age:.0f}m ago {state} "
+            f"({hold}m hold window)"
+        )
 
     def _apply_hysteresis(
         self,
@@ -311,6 +381,8 @@ class PlaybookEngine:
         "open position",
         "hold window",
         "regime",
+        "track record",
+        "paused",
     )
 
     def _outside_session(self, ctx: PlaybookContext, rationale: str, *, session: str) -> ActionCard:
@@ -343,8 +415,13 @@ class PlaybookEngine:
 
         ordered = sorted(miss_diagnostics, key=lambda nm: (0 if _is_gate_miss(nm) else 1))
         capped = ordered[:10]
+        # A pattern whose own Card is still live did find structure; saying
+        # "no tradable structure" would contradict the Card it just issued.
+        live = [nm.pattern for nm in capped if any("is still live" in m for m in nm.missing)]
         if not capped:
             rationale = "No tradable structure: no patterns produced a candidate this cycle."
+        elif live:
+            rationale = f"No new Card: the Card already issued by {', '.join(live)} is still live."
         else:
             patterns_named = ", ".join(m.pattern for m in capped)
             rationale = f"No tradable structure. Closest patterns: {patterns_named}."

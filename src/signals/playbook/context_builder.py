@@ -15,8 +15,10 @@ from typing import Any, Optional
 
 import pytz
 
+from src import config
 from src.signals.components.base import MarketContext
 from src.signals.playbook.context import OpenPosition, PlaybookContext, SignalSnapshot
+from src.signals.playbook.ideas import open_positions_from_rows
 
 logger = logging.getLogger(__name__)
 
@@ -386,7 +388,15 @@ async def build_playbook_context(
     composite = score_row.get("composite_score")
     regime = score_row.get("direction")
 
-    open_positions: list[OpenPosition] = []  # PR-4+ will populate from portfolio_engine state.
+    # Each pattern's latest idea on this symbol, for the one-Card-per-idea gate.
+    open_positions: list[OpenPosition] = []
+    if config.PLAYBOOK_ONE_CARD_PER_IDEA:
+        try:
+            idea_rows = await db.get_open_playbook_ideas(underlying)
+        except Exception as exc:
+            logger.warning("get_open_playbook_ideas unavailable (%s): %s", underlying, exc)
+            idea_rows = []
+        open_positions = open_positions_from_rows(idea_rows, underlying)
 
     # Hysteresis input: pull last-emit timestamp per pattern from recent
     # signal_action_cards rows.  90 minutes of lookback covers swing dwells.

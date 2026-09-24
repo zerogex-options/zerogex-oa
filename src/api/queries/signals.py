@@ -1371,6 +1371,50 @@ class SignalsQueriesMixin:
             logger.warning("get_recent_action_cards failed (%s): %s", underlying, exc)
             return []
 
+    async def get_open_playbook_ideas(self, underlying: str) -> List[Dict[str, Any]]:
+        """Each pattern's latest idea on ``underlying``: its last published
+        Card with the grade so far, or an idea the entry bar held back.
+
+        Feeds the Playbook's one-Card-per-idea gate (see
+        ``src/signals/playbook/ideas.py``). Falls back to published Cards
+        alone when ``playbook_card_outcomes`` is missing, and to ``[]`` on any
+        other failure.
+        """
+        from src.signals.playbook import ideas
+
+        if ideas.outcomes_table_available():
+            try:
+                async with self._acquire_connection() as conn:
+                    rows = await conn.fetch(ideas.open_ideas_sql("asyncpg"), underlying, underlying)
+                    return [dict(r) for r in rows]
+            except Exception as exc:
+                if ideas.is_missing_table_error(exc):
+                    ideas.note_table_missing()
+                logger.debug("get_open_playbook_ideas failed (%s): %s", underlying, exc)
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(ideas.published_only_sql("asyncpg"), underlying)
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_open_playbook_ideas fallback failed (%s): %s", underlying, exc)
+            return []
+
+    async def get_playbook_track_records(self) -> Optional[List[Dict[str, Any]]]:
+        """Graded record per (pattern, symbol, direction) for the adaptive gate.
+
+        Returns ``None`` on failure (the gate then keeps its previous records)
+        and ``[]`` when nothing has been graded yet.
+        """
+        from src.signals.playbook import adaptive_gate
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(adaptive_gate.records_sql())
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_playbook_track_records failed: %s", exc)
+            return None
+
     @staticmethod
     def _session_close_utc(start_utc: datetime) -> datetime:
         """The regular-session close, in UTC, for the ET day ``start_utc`` opens.

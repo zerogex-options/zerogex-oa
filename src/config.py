@@ -1236,6 +1236,63 @@ SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES = _getenv_int(
 )
 
 # ---------------------------------------------------------------------------
+# Playbook learning loop: grade every Action Card after the fact, then set the
+# confidence each pattern needs, per symbol, from that graded record.
+#
+# The grader (src/signals/playbook/grading.py) checks each Card against what
+# the underlying actually did over its hold: target first, stop first, or
+# neither. Each result is scored in R, the move measured in units of the
+# Card's own risk (entry to stop), less a small friction charge.
+#
+# The adaptive gate (src/signals/playbook/adaptive_gate.py) turns that record
+# into an entry bar per (pattern, symbol, direction). A pattern that has been
+# losing on a symbol needs far more confidence, or is paused outright; one
+# that has been winning is let through at lower confidence. Paused ideas are
+# still recorded and graded in the background, so a pattern whose ideas start
+# working again earns its way back. See docs/design/playbook-learning-loop.md.
+# ---------------------------------------------------------------------------
+# One Card per idea: while a pattern's last Card on a symbol is still inside
+# its hold window, the pattern issues no new Card there. The prior idea frees
+# the slot early only when its stop was hit, and then only for a Card in the
+# other direction. Off restores the old re-issue-every-dwell behavior.
+PLAYBOOK_ONE_CARD_PER_IDEA = _getenv_bool("PLAYBOOK_ONE_CARD_PER_IDEA", True)
+# Master switch for the per-symbol entry bar. Off = the flat 0.25 floor.
+PLAYBOOK_ADAPTIVE_GATE_ENABLED = _getenv_bool("PLAYBOOK_ADAPTIVE_GATE_ENABLED", True)
+# The signals service grades its own symbol's Cards every this many seconds.
+PLAYBOOK_GRADING_ENABLED = _getenv_bool("PLAYBOOK_GRADING_ENABLED", True)
+PLAYBOOK_GRADING_INTERVAL_SECONDS = _getenv_int("PLAYBOOK_GRADING_INTERVAL_SECONDS", 120, min=60)
+# How far back the record reaches, and how fast old results fade: an idea
+# this many days old counts half as much as one from today.
+PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS = _getenv_int(
+    "PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS", 90, min=10, max=365
+)
+PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS = _getenv_float(
+    "PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS", 30.0, min=1.0, max=365.0
+)
+# A pattern keeps the neutral bar until it has this many graded ideas.
+PLAYBOOK_ADAPTIVE_MIN_IDEAS = _getenv_int("PLAYBOOK_ADAPTIVE_MIN_IDEAS", 8, min=1)
+# Shrinkage: a symbol's record is blended with how the same pattern did
+# everywhere else (itself blended with "no edge"), each side counted as this
+# many ideas, so a handful of lucky or unlucky trades can't swing the bar.
+PLAYBOOK_ADAPTIVE_PRIOR_WEIGHT = _getenv_float("PLAYBOOK_ADAPTIVE_PRIOR_WEIGHT", 10.0, min=0.0)
+# Friction charged against every graded idea, in R (spread, slippage, and the
+# premium a long option loses while the underlying goes nowhere).
+PLAYBOOK_ADAPTIVE_COST_R = _getenv_float("PLAYBOOK_ADAPTIVE_COST_R", 0.10, min=0.0, max=1.0)
+# The bar itself. NEUTRAL is the old flat floor, used when a pattern has no
+# record yet. At PROVEN_R per idea or better the bar drops to MIN_BAR; as the
+# record falls toward PAUSE_R it climbs to MAX_BAR, and at PAUSE_R or worse the
+# pattern is paused on that symbol.
+PLAYBOOK_ADAPTIVE_NEUTRAL_BAR = _getenv_float(
+    "PLAYBOOK_ADAPTIVE_NEUTRAL_BAR", 0.25, min=0.0, max=1.0
+)
+PLAYBOOK_ADAPTIVE_MIN_BAR = _getenv_float("PLAYBOOK_ADAPTIVE_MIN_BAR", 0.20, min=0.0, max=1.0)
+PLAYBOOK_ADAPTIVE_MAX_BAR = _getenv_float("PLAYBOOK_ADAPTIVE_MAX_BAR", 0.75, min=0.0, max=1.0)
+PLAYBOOK_ADAPTIVE_PROVEN_R = _getenv_float("PLAYBOOK_ADAPTIVE_PROVEN_R", 0.25, min=0.01, max=5.0)
+PLAYBOOK_ADAPTIVE_PAUSE_R = _getenv_float("PLAYBOOK_ADAPTIVE_PAUSE_R", -0.25, min=-5.0, max=-0.01)
+# How often a running process reloads the record from the database.
+PLAYBOOK_ADAPTIVE_REFRESH_SECONDS = _getenv_int("PLAYBOOK_ADAPTIVE_REFRESH_SECONDS", 900, min=60)
+
+# ---------------------------------------------------------------------------
 # Backtesting platform — signal cooldown / dedup
 #
 # The live engine emits an Action Card nearly every cycle, so a naive backtest
