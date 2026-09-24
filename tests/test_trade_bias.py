@@ -7,6 +7,8 @@ dashboard's. Keep the two suites in lockstep.
 
 from __future__ import annotations
 
+import pytest
+
 from src.signals.trade_bias.bias import BiasInput, compute_bias
 
 
@@ -28,9 +30,10 @@ def test_trend_up_long_gamma_bullish_flow():
 
 
 def test_trend_down_long_gamma_bearish_flow():
+    # msi is the 0-100 composite. 35 used to block TREND_DOWN outright.
     r = _bias(
         netGEX=50, gexGradient=60, tapeFlow=-80, vannaCharm=-60, odtePositioning=-60,
-        positioningTrap=-40, trapDetection=-60, gammaVWAP=-40, msi=-50,
+        positioningTrap=-40, trapDetection=-60, gammaVWAP=-40, msi=35,
     )
     assert r.marketState == "TREND_DOWN"
     assert r.trend == "bearish"
@@ -94,15 +97,55 @@ def test_has_data_flips_true_at_three_inputs():
     assert three.hasData is True
 
 
-def test_trend_up_blocked_when_msi_outside_tolerance_falls_to_chop():
-    r = _bias(netGEX=50, gexGradient=60, tapeFlow=80, vannaCharm=60, odtePositioning=60, msi=-15)
-    assert r.marketState == "CHOP"
-    assert r.trend == "neutral"
+@pytest.mark.parametrize("msi", [None, 0, 10, 11, 35, 65, 100])
+def test_msi_never_gates_either_trend_state(msi):
+    """The MSI is 0-100 regime strength. It used to gate the trend states as
+    if it ran -100..+100: TREND_UP's ``msi >= -10`` always passed, while
+    TREND_DOWN's ``msi <= 10`` needed the gauge at 10 or below."""
+    up = _bias(netGEX=50, gexGradient=60, tapeFlow=80, vannaCharm=60, odtePositioning=60, msi=msi)
+    down = _bias(
+        netGEX=50, gexGradient=60, tapeFlow=-80, vannaCharm=-60, odtePositioning=-60, msi=msi
+    )
+    assert up.marketState == "TREND_UP"
+    assert down.marketState == "TREND_DOWN"
 
 
-def test_msi_within_tolerance_does_not_block_trend_up():
-    r = _bias(netGEX=50, gexGradient=60, tapeFlow=80, vannaCharm=60, odtePositioning=60, msi=-8)
-    assert r.marketState == "TREND_UP"
+@pytest.mark.parametrize("msi", [5, 35, 80])
+def test_trend_down_is_the_mirror_of_trend_up(msi):
+    up = _bias(
+        netGEX=50,
+        gexGradient=60,
+        tapeFlow=80,
+        vannaCharm=60,
+        odtePositioning=60,
+        positioningTrap=40,
+        trapDetection=60,
+        gammaVWAP=40,
+        msi=msi,
+    )
+    down = _bias(
+        netGEX=50,
+        gexGradient=60,
+        tapeFlow=-80,
+        vannaCharm=-60,
+        odtePositioning=-60,
+        positioningTrap=-40,
+        trapDetection=-60,
+        gammaVWAP=-40,
+        msi=msi,
+    )
+    assert (up.bias, down.bias) == ("BUY_DIPS", "SELL_RIPS")
+    assert down.confidence == up.confidence
+    assert down.convictionDriven == up.convictionDriven
+
+
+def test_2026_09_23_spx_late_morning_reads_trend_down():
+    """SPX at 11:30 ET on 2026-09-23 (the session readout): long gamma by
+    total net GEX, tape and vanna/charm both leaning bearish, MSI 14.5 --
+    and the panel said Range-Bound while SPX fell another 15 points."""
+    r = _bias(netGEX=50, gexGradient=-7, tapeFlow=-35, vannaCharm=-19, odtePositioning=-6, msi=14.5)
+    assert r.marketState == "TREND_DOWN"
+    assert r.bias == "SELL_RIPS"
 
 
 def test_single_dominant_flow_signal_carries_majority():

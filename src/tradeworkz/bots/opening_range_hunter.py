@@ -2,6 +2,11 @@
 
 Fires between 10:00 and 11:30 ET when spot closes outside the opening 30-min
 range and net_gex is not strongly positive (which would kill follow-through).
+
+The range is ``snap.opening_range_high`` / ``snap.opening_range_low`` (see
+src/opening_range.py). It used to be ``session_high`` / ``session_low`` -- the
+trailing 24 hours, including the bar ``spot`` came from -- and spot can never
+sit beyond its own bar, so the bot could never open a trade.
 """
 
 from __future__ import annotations
@@ -27,18 +32,17 @@ class OpeningRangeHunter(BaseBot):
         m = snap.minutes_since_open
         if m is None or m < 30 or m > 120:
             return None
-        if snap.session_high is None or snap.session_low is None:
+        range_high, range_low = snap.opening_range_high, snap.opening_range_low
+        if range_high is None or range_low is None:
             return None
-        # Not a hard 30-min window without a separate persistence layer, so we
-        # use the running session_high / session_low as the working proxy.
         if snap.gex_regime() == "positive_strong":
             return None  # pin regime kills breakout follow-through
 
         buffer_pct = float(self.params.get("break_buffer_pct", 0.0005))
         direction: Optional[str] = None
-        if snap.spot > snap.session_high * (1.0 + buffer_pct):
+        if snap.spot > range_high * (1.0 + buffer_pct):
             direction = "bullish"
-        elif snap.spot < snap.session_low * (1.0 - buffer_pct):
+        elif snap.spot < range_low * (1.0 - buffer_pct):
             direction = "bearish"
         else:
             return None
@@ -46,9 +50,9 @@ class OpeningRangeHunter(BaseBot):
         target = (
             snap.call_wall if direction == "bullish" else snap.put_wall
         ) or (snap.spot * (1.006 if direction == "bullish" else 0.994))
-        stop = (snap.session_high if direction == "bullish" else snap.session_low)
+        stop = range_high if direction == "bullish" else range_low
 
-        rng = snap.session_high - snap.session_low
+        rng = range_high - range_low
         quality = min(1.0, rng / (snap.spot * 0.006)) * 0.7 + 0.3
         conviction = self.compute_conviction(snap, quality)
         if conviction < self.confidence_threshold():
@@ -70,8 +74,8 @@ class OpeningRangeHunter(BaseBot):
             time_stop_at=_utcnow() + timedelta(minutes=int(self.params.get("max_hold_minutes", 90))),
             rationale=f"Opening-range break; regime {snap.gex_regime()}",
             components_at_entry={
-                "session_high": snap.session_high,
-                "session_low": snap.session_low,
+                "opening_range_high": range_high,
+                "opening_range_low": range_low,
                 "net_gex": snap.net_gex,
             },
         )

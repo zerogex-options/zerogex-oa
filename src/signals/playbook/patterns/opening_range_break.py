@@ -1,12 +1,17 @@
 """Pattern: ``opening_range_break`` — Early-Session Range Break.
 
-After the market's first half hour, a decisive break of the early-session range
+After the market's first half hour, a decisive break of the opening range
 often sets the day's direction. Between 10:00 and 11:30 ET this trades a break
-of the session's early high/low in the direction of the break. It stands down
+of the 09:30-10:00 ET high/low in the direction of the break. It stands down
 before 10:00 (the range is still forming) and after 11:30 (the edge fades).
 
-Backtestable twin of the TradeWorkz Opening Range Hunter bot. (Uses the recent
-session high/low as the live range proxy.)
+The range comes from ``ctx.levels`` (``opening_range_high`` /
+``opening_range_low``), which both context builders fill from
+:mod:`src.opening_range`. It used to be the max/min of the trailing bars,
+including the bar the close came from -- a close can never sit outside its own
+bar, so the pattern could never fire.
+
+Backtestable twin of the TradeWorkz Opening Range Hunter bot.
 """
 
 from __future__ import annotations
@@ -22,11 +27,19 @@ from src.signals.playbook.types import ActionCard, ActionEnum, Entry, Leg, Stop,
 _START_ET = time(10, 0)
 _END_ET = time(11, 30)
 _TARGET_PCT = float(os.getenv("PLAYBOOK_ORB_TARGET_PCT", "0.005"))
-_MIN_BARS = int(os.getenv("PLAYBOOK_ORB_MIN_BARS", "5"))
 
 
 def _round_to_strike(price: float) -> float:
     return round(price)
+
+
+def _opening_range(ctx: PlaybookContext) -> Optional[tuple[float, float]]:
+    """``(high, low)`` of this session's 09:30-10:00 ET range, or ``None``."""
+    high = ctx.level("opening_range_high")
+    low = ctx.level("opening_range_low")
+    if high is None or low is None or high <= 0 or low <= 0 or high < low:
+        return None
+    return float(high), float(low)
 
 
 class OpeningRangeBreakPattern(PatternBase):
@@ -42,21 +55,22 @@ class OpeningRangeBreakPattern(PatternBase):
     confluence_signals_against = ("positioning_trap",)
 
     def match(self, ctx: PlaybookContext) -> Optional[ActionCard]:
-        if self._check_triggers(ctx):
+        opening_range = _opening_range(ctx)
+        if opening_range is None or self._check_triggers(ctx):
             return None
         close = ctx.close
-        highs = [h for h in (ctx.market.recent_highs or []) if h and h > 0]
-        lows = [low for low in (ctx.market.recent_lows or []) if low and low > 0]
-        range_high, range_low = max(highs), min(lows)
+        range_high, range_low = opening_range
 
         if close > range_high:
             direction, action, right = "bullish", ActionEnum.BUY_CALL_DEBIT, "C"
             target_ref = close * (1.0 + _TARGET_PCT)
             stop_ref = range_low  # back into the range invalidates
+            broken_edge = range_high
         else:
             direction, action, right = "bearish", ActionEnum.BUY_PUT_DEBIT, "P"
             target_ref = close * (1.0 - _TARGET_PCT)
             stop_ref = range_high
+            broken_edge = range_low
 
         strike = _round_to_strike(close)
         legs = [Leg(expiry=ctx.et_date.isoformat(), strike=strike, right=right, side="BUY", qty=1)]
@@ -77,8 +91,8 @@ class OpeningRangeBreakPattern(PatternBase):
             target=Target(ref_price=round(target_ref, 4), kind="level", level_name="orb_extension"),
             stop=Stop(ref_price=round(stop_ref, 4), kind="level", level_name="orb_reentry"),
             rationale=(
-                f"Spot ${close:.2f} broke the early-session "
-                f"{'high' if direction == 'bullish' else 'low'} in the 10:00–11:30 window "
+                f"Spot ${close:.2f} broke the 09:30–10:00 opening-range "
+                f"{'high' if direction == 'bullish' else 'low'} ${broken_edge:.2f} "
                 f"→ trade the {direction} break."
             ),
             context={
@@ -98,12 +112,11 @@ class OpeningRangeBreakPattern(PatternBase):
             missing.append("close price unavailable")
         if not (_START_ET <= ctx.et_time <= _END_ET):
             missing.append(f"outside 10:00–11:30 ET window ({ctx.et_time} ET)")
-        highs = [h for h in (ctx.market.recent_highs or []) if h and h > 0]
-        lows = [low for low in (ctx.market.recent_lows or []) if low and low > 0]
-        if len(highs) < _MIN_BARS or len(lows) < _MIN_BARS:
-            missing.append("not enough recent bars to define the opening range")
-        elif not (close > max(highs) or close < min(lows)):
-            missing.append("price has not broken the early-session range")
+        opening_range = _opening_range(ctx)
+        if opening_range is None:
+            missing.append("09:30–10:00 opening range unavailable")
+        elif not (close > opening_range[0] or close < opening_range[1]):
+            missing.append("price has not broken the opening range")
         return missing
 
     def explain_miss(self, ctx: PlaybookContext) -> list[str]:
