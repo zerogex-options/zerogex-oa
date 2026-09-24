@@ -986,6 +986,8 @@ help: ## Show this help message
 	@echo "  make gamma-flip-gate-replay - Replay a blank flip cycle and name the gate that rejected it"
 	@echo "  make gamma-flip-resolution-install - Install gamma-flip resolution timer (hourly in-session + post-close)"
 	@echo "  make gamma-flip-resolution-status - Show gamma-flip resolution timer status + recent log"
+	@echo "  make gamma-flip-dark-digest - Which symbols are dark right now and since when"
+	@echo "  make gamma-flip-digest-install - Install the weekly dark-flip digest timer"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
 	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
@@ -4587,6 +4589,7 @@ gamma-flip-resolution-healthcheck: ## Report how long the gamma flip was left UN
 		$(if $(IGNORE_REASONS),--ignore-reasons $(IGNORE_REASONS)) \
 		$(if $(IGNORE_RAW_BEYOND),--ignore-raw-beyond $(IGNORE_RAW_BEYOND)) \
 		$(if $(EDGES),--edges) \
+		$(if $(DIGEST),--digest) \
 		$(if $(JSON),--json)
 
 .PHONY: gamma-flip-blackout-forensics
@@ -4607,6 +4610,26 @@ gamma-flip-gate-replay: ## Replay a blank flip cycle and name the gate that reje
 		$(if $(SAMPLES),--samples $(SAMPLES)) \
 		$(if $(DTE_REFS),--dte-ref-days $(DTE_REFS)) \
 		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-dark-digest
+gamma-flip-dark-digest: ## Which symbols are dark RIGHT NOW and since when. Backstop for the edge alert. 0=all clear 1=something dark 2=db error
+	@$(PY) -m src.tools.gamma_flip_resolution_healthcheck \
+		--digest \
+		--max-blank-minutes $(GAMMA_FLIP_MAX_BLANK_MINUTES) \
+		--sessions $(or $(SESSIONS),10) \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
+		$(if $(JSON),--json)
+
+.PHONY: gamma-flip-digest-install
+gamma-flip-digest-install: ## Install the weekly dark-flip digest timer (Mon 08:00 ET)
+	@echo "$(BLUE)=== Installing Gamma-Flip Dark Digest Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-digest.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-gamma-flip-digest.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-gamma-flip-digest.timer
+	@echo "$(GREEN)✅ Weekly dark-flip digest installed$(NC)"
+	@echo "$(YELLOW)Run it now:  make gamma-flip-dark-digest$(NC)"
+	@echo "$(YELLOW)Timer:       systemctl list-timers 'zerogex-oa-gamma-flip-digest.timer'$(NC)"
 
 .PHONY: gamma-flip-resolution-install
 gamma-flip-resolution-install: ## Install the gamma-flip resolution timer (hourly 10:30-15:30 ET + 16:05 ET post-close)
