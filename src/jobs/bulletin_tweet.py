@@ -92,6 +92,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
+from src.config import INGEST_EXPIRATIONS
 from src.jobs import level_history as lh
 from src.jobs.index_projection import implied_index_spot
 from src.market_calendar import NYSE_HOLIDAYS
@@ -303,6 +304,20 @@ def _fmt_level(v: float | None) -> str:
     if abs(v) >= 1000:
         return f"{v:,.0f}" if whole else f"{v:,.2f}"
     return f"{int(round(v))}" if whole else f"{v:.2f}"
+
+
+def _wall_scope_label() -> str:
+    """The expirations the Call and Put Wall are ranked over, as a DTE range.
+
+    The analytics engine ranks the walls across every expiration ingestion
+    carries: today's plus the next ``INGEST_EXPIRATIONS - 1`` (SPY has no
+    monthly chain alias), so by default they are 0–2DTE figures.  The site's
+    0DTE charts rank today's expiry alone and can show a different strike —
+    on 2026-09-21 the 0–2DTE call wall was 780 all afternoon while the 0DTE
+    wall walked 773 → 775 — so the post names the scope it is quoting."""
+    if INGEST_EXPIRATIONS <= 1:
+        return "0DTE"
+    return f"0–{INGEST_EXPIRATIONS - 1}DTE"
 
 
 def _derive_regime(
@@ -651,8 +666,8 @@ def build_tweet_body(
         <opening — hook + news + price action + dealer-gamma regime>
 
         Key levels:
-        • <put wall>  → Put Wall (<note>)
-        • <call wall> → Call Wall (<note>)
+        • <put wall>  → Put Wall (0–2DTE · <note>)
+        • <call wall> → Call Wall (0–2DTE · <note>)
         • <flip>      → Gamma Flip (<note>)
 
         Bottom line: <takeaway>
@@ -843,7 +858,8 @@ def _key_levels_block(featured: SymbolBulletin, level_notes: dict[str, str] | No
 
     Order matches the operator's examples: Put Wall, Call Wall, Gamma Flip.
     Only levels present in the DB row render; a short note is shown in
-    parentheses after the base label.
+    parentheses after the base label, behind the walls' expiration scope
+    ("Call Wall (0–2DTE · tested and held)") — see :func:`_wall_scope_label`.
 
     The note comes from the session's own level path when we have one — the
     walls migrate through the day, and what price did to each print is a fact
@@ -863,7 +879,9 @@ def _key_levels_block(featured: SymbolBulletin, level_notes: dict[str, str] | No
         if value is None:
             continue
         note = lh.note_for(featured.level_history, key) or (notes.get(key) or "").strip()
-        label = f"{base} ({note})" if note else base
+        scope = _wall_scope_label() if key in lh.WALL_KEYS else ""
+        detail = " · ".join(part for part in (scope, note) if part)
+        label = f"{base} ({detail})" if detail else base
         lines.append(f"• {_fmt_level(value)} → {label}")
     return "\n".join(lines)
 
@@ -977,7 +995,10 @@ def _build_fallback_tweet(featured: SymbolBulletin, label: str) -> str:
     if featured.gamma_flip is not None:
         parts.append(f"Flip {_fmt_price(featured.gamma_flip)}")
     if featured.call_wall is not None and featured.put_wall is not None:
-        parts.append(f"CW {_fmt_price(featured.call_wall)} / PW {_fmt_price(featured.put_wall)}")
+        parts.append(
+            f"CW {_fmt_price(featured.call_wall)} / PW {_fmt_price(featured.put_wall)} "
+            f"({_wall_scope_label()})"
+        )
     if featured.net_gex is not None:
         parts.append(f"Net GEX {_fmt_net_gex(featured.net_gex)}")
     text = " · ".join(parts)
