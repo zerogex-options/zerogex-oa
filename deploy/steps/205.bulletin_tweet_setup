@@ -202,16 +202,28 @@ fi
 # 7. Smoke test: render one bulletin PNG standalone.
 # ---------------------------------------------------------------------------
 
+# One value from .env, without surrounding quotes.
+env_value() {
+    local v
+    v="$(grep "^$1=" "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2-)"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    printf '%s' "$v"
+}
+
 if [ -f "$WEB_DIR/frontend/scripts/render-bulletin-png.mjs" ]; then
     log "  → Smoke-testing PNG helper..."
     SMOKE_OUT="$(mktemp -u --suffix=.png)"
     SMOKE_META="${SMOKE_OUT%.png}.json"
-    TOKEN="$(grep '^BULLETIN_SNAPSHOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+    TOKEN="$(env_value BULLETIN_SNAPSHOT_TOKEN)"
+    # Same address the job uses: the website on this box, not the public domain.
+    RENDER_URL="$(env_value BULLETIN_TWEET_RENDER_URL)"
+    RENDER_URL="${RENDER_URL:-http://127.0.0.1:3000}"
+    # The helper never prints the token, so this log is safe to share.
     if PLAYWRIGHT_BROWSERS_PATH=/var/log/playwright-browsers \
        TMPDIR=/var/lib/zerogex-oa/playwright-tmp \
        node "$WEB_DIR/frontend/scripts/render-bulletin-png.mjs" \
            --symbol SPY --mode close \
-           --site-url "${ZEROGEX_SITE_URL:-https://zerogex.io}" \
+           --site-url "$RENDER_URL" \
            ${TOKEN:+--token "$TOKEN"} \
            --out "$SMOKE_OUT" \
            --meta-out "$SMOKE_META" \
@@ -223,7 +235,9 @@ if [ -f "$WEB_DIR/frontend/scripts/render-bulletin-png.mjs" ]; then
             log "     ⚠ PNG smoke test produced no image or no levels — see /tmp/bulletin-png-smoke.log"
         fi
     else
-        log "     ⚠ PNG smoke test failed (rc=$?) — see /tmp/bulletin-png-smoke.log"
+        rc=$?
+        log "     ⚠ PNG smoke test failed (rc=$rc): $(tail -n 1 /tmp/bulletin-png-smoke.log)"
+        log "       Full output: /tmp/bulletin-png-smoke.log"
     fi
 fi
 
