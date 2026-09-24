@@ -3498,8 +3498,23 @@ shadow-status: shadow-guard ## One-screen answer to "is the rehearsal healthy ri
 	echo "  rehearsal processes: $$N"; \
 	if [ -f "$$LOG" ]; then \
 		echo "  log: $$LOG ($$(du -h "$$LOG" | cut -f1), $$(wc -l < "$$LOG") lines)"; \
-		echo "  initialized: $$(grep -c 'Streaming initialized' "$$LOG" 2>/dev/null)"; \
-		echo "  errors:      $$(grep -c ' - ERROR - ' "$$LOG" 2>/dev/null)"; \
+		RUNS=$$(grep -c '^=== shadow-run ' "$$LOG" 2>/dev/null); \
+		START=$$(grep -n '^=== shadow-run ' "$$LOG" 2>/dev/null | tail -1 | cut -d: -f1); \
+		if [ -n "$$START" ]; then \
+			echo "  counting the LAST start only (run $$RUNS of $$RUNS in this file)"; \
+		else \
+			START=1; \
+			echo "$(YELLOW)  no run header found; counting the whole file$(NC)"; \
+		fi; \
+		echo "  initialized: $$(tail -n +$$START "$$LOG" | grep -c 'Streaming initialized')"; \
+		ERRS=$$(tail -n +$$START "$$LOG" | grep -c ' - ERROR - '); \
+		echo "  errors:      $$ERRS"; \
+		if [ "$$ERRS" -gt 0 ]; then \
+			echo "$(BLUE)--- distinct errors in this run ---$(NC)"; \
+			tail -n +$$START "$$LOG" | grep ' - ERROR - ' \
+				| sed 's/.*ERROR - //' | cut -c1-110 \
+				| sort | uniq -c | sort -rn | head -5; \
+		fi; \
 		echo "$(BLUE)--- last 3 lines ---$(NC)"; \
 		tail -3 "$$LOG"; \
 	else \

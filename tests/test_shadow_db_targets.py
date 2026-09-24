@@ -306,3 +306,30 @@ def test_shadow_status_never_kills_anything():
     body = _recipe("shadow-status")
     for danger in ("kill", "DROP", "DELETE", "rm "):
         assert danger not in body, f"shadow-status must not {danger.strip()}"
+
+
+def test_shadow_status_counts_only_the_current_run():
+    """The log accumulates every run of the day, so whole-file counts mislead.
+
+    On 2026-09-24 a healthy run reported "errors: 123" because two earlier
+    failed starts were in the same file. A status line you have to
+    second-guess is worse than none.
+
+    Checked per counter, not once for the whole recipe: the first version of
+    this test asserted only that "tail -n +$START" appeared somewhere, and
+    passed against a mutant that reverted just the initialized count.
+    """
+    body = _recipe("shadow-status")
+    assert "=== shadow-run " in body, "it must find the last run header"
+
+    for pattern in ("Streaming initialized", " - ERROR - "):
+        counter = f"grep -c '{pattern}'"
+        assert counter in body, f"no counter for {pattern!r}"
+        for match in re.finditer(re.escape(counter), body):
+            # Whatever feeds this grep must be the scoped stream, not $LOG.
+            before = body[: match.start()]
+            piece = before[before.rfind("$$(") :]
+            assert "tail -n +$$START" in piece, (
+                f"the {pattern!r} count reads the whole file; earlier runs in "
+                "the same log would be counted as this run's"
+            )
