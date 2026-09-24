@@ -58,7 +58,11 @@ Every published Card, and every idea the entry bar held back, becomes a row.
 When the underlying reaches the target or stop, or the hold runs out, the row
 is graded with the backtest harness's own `compute_outcome` (intrabar
 high/low, touch/break entries must fill, a same-bar tie goes to the stop). A
-0DTE Card's hold is capped at that day's close.
+0DTE Card's hold is capped at that day's close. The target and stop are the
+prices the Card printed: `call_wall_fade` and `put_wall_bounce` label their
+stop `premium_pct` but set it to the wall price the catalog names, and the Card
+page shows it as the stop, so it is graded as that price (a value too far from
+the entry to be an underlying price is ignored).
 
 | Column | Meaning |
 |---|---|
@@ -105,7 +109,7 @@ expected result climbs and the bar comes down.
 | Command | What it does |
 |---|---|
 | `make schema-apply` | Creates `playbook_card_outcomes` (before restarting services). |
-| `make playbook-grade` | Grades the lookback of existing Cards. Safe to re-run. |
+| `make playbook-grade` | Grades the lookback of existing Cards. Safe to re-run. `REBUILD=1` regrades published Cards from scratch after a change to the grading rules; ideas the gate held back are kept. |
 | `make playbook-record` | Read-only report: per pattern, symbol and direction, graded ideas, won/lost/flat, average R, how far price had already moved, repeats, held-back ideas, and the status and bar the gate applies now. Also compares first Cards with re-issued ones. `DAYS=30 SYMBOL=SPY` to narrow. |
 
 Switches (`.env`, then restart the signals and API services):

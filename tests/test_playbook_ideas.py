@@ -168,9 +168,21 @@ def test_held_back_idea_is_written_with_its_levels():
     assert "ON CONFLICT DO NOTHING" in sql
     assert params[0:2] == ("SPY", "call_wall_fade")
     assert params[7] == "paused: record"
-    # entry, trigger, target (a level), stop (not a level), hold
-    assert params[8:13] == (678.4, "at_touch", 675.0, None, 90)
+    # entry, trigger, target, stop, hold. call_wall_fade labels its stop
+    # premium_pct but prints the wall price; it is graded as that price.
+    assert params[8:13] == (678.4, "at_touch", 675.0, 680.0, 90)
     assert conn.commits == 1
+
+
+def test_a_printed_stop_price_is_read_as_a_price_whatever_its_label():
+    levels = ideas.idea_levels(_card_dict())
+    assert levels["stop_price"] == 680.0
+    # A premium-sized number is not an underlying price.
+    card = _card_dict(stop={"ref_price": 1.35, "kind": "premium_pct"})
+    assert ideas.idea_levels(card)["stop_price"] is None
+    # No price at all (signal-event exits).
+    card = _card_dict(stop={"ref_price": None, "kind": "signal_event"})
+    assert ideas.idea_levels(card)["stop_price"] is None
 
 
 def test_held_back_write_backs_off_when_the_table_is_missing():

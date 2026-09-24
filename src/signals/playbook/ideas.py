@@ -187,23 +187,43 @@ def load_open_ideas_sync(conn, underlying: str) -> list[OpenPosition]:
         return []
 
 
-def _level(section: Any) -> Optional[float]:
-    """A target/stop price, only when it is a price level."""
-    if not isinstance(section, dict) or section.get("kind") != "level":
+# A target/stop ``ref_price`` more than this fraction away from the entry is
+# not read as an underlying price (it could only be an option premium).
+_MAX_LEVEL_DISTANCE = 0.20
+
+
+def _level(section: Any, entry_price: Optional[float]) -> Optional[float]:
+    """A target/stop as an underlying price, or None.
+
+    ``kind == "level"`` is a price by definition. Any other kind still counts
+    when it carries a price near the entry: call_wall_fade and put_wall_bounce
+    label their stop ``premium_pct`` but set it to the wall price the catalog
+    names ("close above call_wall x 1.003"), and the Card page shows it as the
+    stop price. Grading them as if they had no stop meant they could never
+    lose. A value far from the entry can only be a premium and is ignored.
+    """
+    if not isinstance(section, dict):
         return None
     value = section.get("ref_price")
-    return float(value) if isinstance(value, (int, float)) else None
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    if section.get("kind") == "level":
+        return float(value)
+    if entry_price and abs(float(value) / entry_price - 1.0) <= _MAX_LEVEL_DISTANCE:
+        return float(value)
+    return None
 
 
 def idea_levels(card: dict[str, Any]) -> dict[str, Any]:
     """Entry / target / stop / hold from a Card dict, for playbook_card_outcomes."""
     entry = card.get("entry") or {}
-    entry_price = entry.get("ref_price") if isinstance(entry, dict) else None
+    raw_entry = entry.get("ref_price") if isinstance(entry, dict) else None
+    entry_price = float(raw_entry) if isinstance(raw_entry, (int, float)) else None
     return {
-        "entry_price": float(entry_price) if isinstance(entry_price, (int, float)) else None,
+        "entry_price": entry_price,
         "entry_trigger": (str(entry.get("trigger") or "")[:16] if isinstance(entry, dict) else ""),
-        "target_price": _level(card.get("target")),
-        "stop_price": _level(card.get("stop")),
+        "target_price": _level(card.get("target"), entry_price),
+        "stop_price": _level(card.get("stop"), entry_price),
         "max_hold_minutes": _parse_hold(card.get("max_hold_minutes")),
     }
 

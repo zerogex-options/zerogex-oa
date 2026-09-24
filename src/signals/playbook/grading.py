@@ -36,6 +36,7 @@ nightly calibration job re-runs it as a backstop.
 CLI:
     python -m src.signals.playbook.grading                    # all symbols, lookback
     python -m src.signals.playbook.grading --days 30 --underlyings SPY QQQ
+    python -m src.signals.playbook.grading --rebuild          # regrade from scratch
 """
 
 from __future__ import annotations
@@ -239,12 +240,14 @@ def grade_idea(
     hold = effective_hold_minutes(idea.tier, idea.issued_at, idea.max_hold_minutes)
     if entry is None or entry <= 0 or hold <= 0:
         return Grade(outcome="no_data")
+    # Mispriced first: a Card priced at VWAP often also has its levels on the
+    # wrong side of that price, and the price is the cause.
+    if quoted_off_market(idea, bars, times):
+        return Grade(outcome="mispriced")
     if idea.target_price is None and idea.stop_price is None:
         return Grade(outcome="unresolved")
     if not valid_geometry(idea.direction, entry, idea.target_price, idea.stop_price):
         return Grade(outcome="unresolved")
-    if quoted_off_market(idea, bars, times):
-        return Grade(outcome="mispriced")
 
     deadline = idea.issued_at + timedelta(minutes=hold)
     window = bars[bisect_left(times, idea.issued_at) : bisect_right(times, min(deadline, now))]
@@ -484,12 +487,47 @@ def grade_pending(conn, underlying: str, now: Optional[datetime] = None) -> dict
     return counts
 
 
-def run(conn, underlying: str, *, days: int, now: Optional[datetime] = None) -> dict[str, int]:
-    """Sync the last ``days`` of published Cards, then grade what's pending."""
+def clear_published_grades(conn, underlying: str, since: datetime) -> int:
+    """Delete the graded rows of published Cards since ``since``, so the next
+    sync rebuilds them with the current grading rules.
+
+    Only published Cards: they are rebuilt from ``signal_action_cards``. Ideas
+    the gate held back exist only in this table and are kept.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        DELETE FROM playbook_card_outcomes
+        WHERE underlying = %s AND card_id IS NOT NULL AND issued_at >= %s
+        """,
+        (underlying, since),
+    )
+    removed = cur.rowcount or 0
+    conn.commit()
+    return removed
+
+
+def run(
+    conn,
+    underlying: str,
+    *,
+    days: int,
+    now: Optional[datetime] = None,
+    rebuild: bool = False,
+) -> dict[str, int]:
+    """Sync the last ``days`` of published Cards, then grade what's pending.
+
+    ``rebuild`` first clears those Cards' existing grades, for when the
+    grading rules themselves have changed.
+    """
     now = now or datetime.now(timezone.utc)
-    added = sync_published_cards(conn, underlying, now - timedelta(days=days))
-    counts = grade_pending(conn, underlying, now)
-    return {"added": added, **counts}
+    since = now - timedelta(days=days)
+    out: dict[str, int] = {}
+    if rebuild:
+        out["cleared"] = clear_published_grades(conn, underlying, since)
+    out["added"] = sync_published_cards(conn, underlying, since)
+    out.update(grade_pending(conn, underlying, now))
+    return out
 
 
 _last_pass: dict[str, float] = {}
@@ -554,6 +592,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Grade Playbook Cards and held-back ideas")
     parser.add_argument("--underlyings", nargs="*", default=None)
     parser.add_argument("--days", type=int, default=config.PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS)
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="regrade published Cards from scratch (after a change to the grading rules)",
+    )
     args = parser.parse_args(argv)
 
     from src.database.connection import db_connection
@@ -563,7 +606,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         for symbol in symbols:
             symbol = symbol.upper()
             try:
-                result = run(conn, symbol, days=args.days)
+                result = run(conn, symbol, days=args.days, rebuild=args.rebuild)
             except Exception:  # noqa: BLE001 - one symbol must not stop the rest
                 logger.exception("grading failed for %s; continuing", symbol)
                 conn.rollback()

@@ -274,3 +274,81 @@ def test_at_market_card_at_the_traded_price_is_graded():
     idea = _idea(entry_price=100.04, target_price=101.0, stop_price=99.5)
     grade = _grade(idea, _bars([100.0] * 120), now=_et(12, 0))
     assert grade.outcome == "time_exit"
+
+
+def test_mispriced_is_named_before_bad_geometry():
+    """A Card priced at VWAP often has its target at that same price too; the
+    price is the cause, so that is the label."""
+    idea = _idea(entry_price=101.0, target_price=101.0, stop_price=100.5)
+    grade = _grade(idea, _bars([100.0] * 120), now=_et(12, 0))
+    assert grade.outcome == "mispriced"
+
+
+def test_wall_fade_card_is_stopped_at_its_printed_stop():
+    """call_wall_fade prints its stop as a price labeled premium_pct. Read as
+    no stop, it could never lose; read as printed, a break of the wall stops it."""
+    from src.signals.playbook.ideas import idea_levels
+
+    levels = idea_levels(
+        {
+            "entry": {"ref_price": 100.0, "trigger": "at_touch"},
+            "target": {"ref_price": 99.0, "kind": "level"},
+            "stop": {"ref_price": 100.3, "kind": "premium_pct"},
+            "max_hold_minutes": 90,
+        }
+    )
+    idea = _idea(
+        direction="bearish",
+        entry_trigger=levels["entry_trigger"],
+        entry_price=levels["entry_price"],
+        target_price=levels["target_price"],
+        stop_price=levels["stop_price"],
+    )
+    path = [100.0] * 30 + [100.0 + 0.05 * i for i in range(1, 30)]
+    grade = _grade(idea, _bars(path), now=_et(10, 40))
+    assert grade.outcome == "stop_hit"
+    assert grade.r_multiple == -1.0
+
+
+class _RebuildCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        self.conn.executed.append((sql, params))
+        if sql.lstrip().startswith("DELETE"):
+            self.rowcount = 7
+
+    def fetchall(self):
+        return []
+
+
+class _RebuildConn:
+    def __init__(self):
+        self.executed = []
+        self.commits = 0
+
+    def cursor(self):
+        return _RebuildCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+
+def test_rebuild_clears_published_grades_first_and_keeps_held_back_ideas():
+    conn = _RebuildConn()
+    out = grading.run(conn, "SPY", days=90, now=_et(16, 30), rebuild=True)
+    assert out["cleared"] == 7
+    deletes = [s for s, _ in conn.executed if s.lstrip().startswith("DELETE")]
+    assert len(deletes) == 1
+    assert "card_id IS NOT NULL" in deletes[0]  # held-back ideas can't be rebuilt
+    first_sql = conn.executed[0][0]
+    assert first_sql.lstrip().startswith("DELETE")  # before the sync reads
+
+
+def test_plain_run_clears_nothing():
+    conn = _RebuildConn()
+    out = grading.run(conn, "SPY", days=90, now=_et(16, 30))
+    assert "cleared" not in out
+    assert not [s for s, _ in conn.executed if s.lstrip().startswith("DELETE")]

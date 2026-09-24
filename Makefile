@@ -5638,11 +5638,12 @@ pattern-calibration-structures: ## Compare per-pattern economics as single long 
 # the entry bar each pattern has earned per symbol. See
 # docs/design/playbook-learning-loop.md.
 .PHONY: playbook-grade
-playbook-grade: ## Grade Playbook Cards against what price did next (backfill; DAYS=90, SYMBOLS="SPY QQQ")
+playbook-grade: ## Grade Playbook Cards against what price did next (backfill; DAYS=90, SYMBOLS="SPY QQQ", REBUILD=1 regrades from scratch)
 	@echo "$(BLUE)=== Grading Playbook Cards ===$(NC)"
 	@$(PY) -m src.signals.playbook.grading \
 		$(if $(DAYS),--days $(DAYS)) \
-		$(if $(SYMBOLS),--underlyings $(SYMBOLS))
+		$(if $(SYMBOLS),--underlyings $(SYMBOLS)) \
+		$(if $(REBUILD),--rebuild)
 
 .PHONY: playbook-record
 playbook-record: ## Playbook track record and entry bar per pattern and symbol (read-only; DAYS=90, SYMBOL=SPY)
