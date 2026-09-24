@@ -12,11 +12,12 @@
 #   * Node.js 20 via NodeSource (for the frontend helpers).
 #   * A /usr/local/bin/node symlink so systemd (which runs with a
 #     stripped PATH) can find the nvm-installed binary.
-#   * Playwright + Chromium in the frontend workspace, browsers
-#     redirected to /var/log/playwright-browsers so root doesn't
-#     fill up.
+#   * The Chromium build the website's pinned playwright-core expects,
+#     in /var/log/playwright-browsers so root doesn't fill up.
+#     (playwright-core itself is a zerogex-web dependency, installed by
+#     that repo's `make deploy`.)
 #   * A smoke test that verifies the render-bulletin-png.mjs helper
-#     produces a real PNG.
+#     produces a real PNG and reads the card's levels.
 #
 # Every step is guarded — if the piece is already installed / set up,
 # the step is a no-op.  Safe to run any number of times to bring a
@@ -114,33 +115,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Playwright + Chromium in the zerogex-web workspace
+# 5. Chromium for the website's playwright-core
+#
+#    playwright-core is pinned in zerogex-web/frontend/package.json, so the
+#    website's `make deploy` (npm ci) installs it; this step only fetches
+#    the browser build that version expects.  The install command is
+#    idempotent: it downloads nothing when that build is already there.
+#    Re-run this step after a deploy that bumps playwright-core.
 # ---------------------------------------------------------------------------
 
 if [ -d "$WEB_DIR/frontend" ]; then
-    log "  → Ensuring Playwright + Chromium (browsers → /var/log/playwright-browsers)..."
+    log "  → Ensuring Chromium for playwright-core (browsers → /var/log/playwright-browsers)..."
     export PLAYWRIGHT_BROWSERS_PATH=/var/log/playwright-browsers
     export TMPDIR=/var/lib/zerogex-oa/playwright-tmp
 
-    if [ -d "$WEB_DIR/frontend/node_modules/playwright" ]; then
-        log "     ✓ node_modules/playwright already installed"
+    PW_CLI="$WEB_DIR/frontend/node_modules/playwright-core/cli.js"
+    if [ -f "$PW_CLI" ]; then
+        log "     ✓ playwright-core $(node -p "require('$WEB_DIR/frontend/node_modules/playwright-core/package.json').version") installed"
+        (cd "$WEB_DIR/frontend" && node "$PW_CLI" install chromium)
+        # The system libraries that Chromium build needs (apt; a no-op when
+        # they're already installed).
+        if sudo "$(command -v node)" "$PW_CLI" install-deps chromium >/dev/null; then
+            log "     ✓ Chromium ready"
+        else
+            log "     ⚠ Chromium downloaded, but installing its system libraries failed;"
+            log "       run: sudo \"\$(command -v node)\" $PW_CLI install-deps chromium"
+        fi
     else
-        (cd "$WEB_DIR/frontend" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --no-save --silent playwright)
-        log "     ✓ npm install playwright completed"
-    fi
-
-    # Playwright organizes browsers as chromium-<version>/chrome-linux/chrome.
-    # If ANY subdirectory matching that pattern exists, we've already
-    # downloaded — skip the ~450MB fetch on re-runs.
-    if compgen -G "/var/log/playwright-browsers/chromium-*/chrome-linux*/chrome" >/dev/null; then
-        log "     ✓ Chromium already downloaded"
-    else
-        log "     • Downloading Chromium (~450MB)..."
-        (cd "$WEB_DIR/frontend" && npx --yes playwright install chromium)
-        log "     ✓ Chromium installed"
+        log "     ⚠ playwright-core isn't installed in $WEB_DIR/frontend yet."
+        log "       Deploy the website first (cd $WEB_DIR && make deploy), then re-run this step."
     fi
 else
-    log "  ⚠ Skipping Playwright — $WEB_DIR/frontend not found"
+    log "  ⚠ Skipping Chromium — $WEB_DIR/frontend not found"
     log "    (clone zerogex-web into $WEB_DIR, then re-run this step)"
 fi
 
@@ -199,21 +205,22 @@ fi
 if [ -f "$WEB_DIR/frontend/scripts/render-bulletin-png.mjs" ]; then
     log "  → Smoke-testing PNG helper..."
     SMOKE_OUT="$(mktemp -u --suffix=.png)"
+    SMOKE_META="${SMOKE_OUT%.png}.json"
     TOKEN="$(grep '^BULLETIN_SNAPSHOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
     if PLAYWRIGHT_BROWSERS_PATH=/var/log/playwright-browsers \
        TMPDIR=/var/lib/zerogex-oa/playwright-tmp \
        node "$WEB_DIR/frontend/scripts/render-bulletin-png.mjs" \
-           --symbol SPX --mode close \
-           --date "$(date +%F)" \
+           --symbol SPY --mode close \
            --site-url "${ZEROGEX_SITE_URL:-https://zerogex.io}" \
            ${TOKEN:+--token "$TOKEN"} \
            --out "$SMOKE_OUT" \
+           --meta-out "$SMOKE_META" \
        > /tmp/bulletin-png-smoke.log 2>&1; then
-        if [ -s "$SMOKE_OUT" ]; then
-            log "     ✓ PNG smoke test OK ($(stat -c%s "$SMOKE_OUT") bytes → $SMOKE_OUT)"
-            rm -f "$SMOKE_OUT"
+        if [ -s "$SMOKE_OUT" ] && grep -q '"call_wall"' "$SMOKE_META" 2>/dev/null; then
+            log "     ✓ PNG smoke test OK ($(stat -c%s "$SMOKE_OUT") bytes, card levels read)"
+            rm -f "$SMOKE_OUT" "$SMOKE_META"
         else
-            log "     ⚠ PNG smoke test wrote empty file — see /tmp/bulletin-png-smoke.log"
+            log "     ⚠ PNG smoke test produced no image or no levels — see /tmp/bulletin-png-smoke.log"
         fi
     else
         log "     ⚠ PNG smoke test failed (rc=$?) — see /tmp/bulletin-png-smoke.log"

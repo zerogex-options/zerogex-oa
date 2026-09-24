@@ -88,6 +88,15 @@ for _key, _default in _PINNED_DEFAULTS.items():
 # email POSTs to the Resend API when it's set. Blank it so the runner tests
 # that reach the stage/post path take the "not configured" skip instead of a
 # live send; the two email tests set it per-test via monkeypatch + stub urlopen.
-_BLANKED_CREDENTIALS = ("ANTHROPIC_API_KEY", "RESEND_API_KEY")
+# The four X OAuth1 keys sign bulletin_tweet's real posts, so a test that
+# reached the post path on a configured server would publish to X.
+_BLANKED_CREDENTIALS = (
+    "ANTHROPIC_API_KEY",
+    "RESEND_API_KEY",
+    "X_BOT_API_KEY",
+    "X_BOT_API_SECRET",
+    "X_BOT_ACCESS_TOKEN",
+    "X_BOT_ACCESS_TOKEN_SECRET",
+)
 for _cred in _BLANKED_CREDENTIALS:
     os.environ[_cred] = ""

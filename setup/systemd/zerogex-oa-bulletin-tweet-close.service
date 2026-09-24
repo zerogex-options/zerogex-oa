@@ -3,6 +3,9 @@ Description=ZeroGEX Live-Bulletin post-market X post (16:05 ET)
 Documentation=https://github.com/zerogex/options/zerogex-oa
 After=network-online.target postgresql.service
 Wants=network-online.target
+# A held-back post exits 1; the job has already emailed the reasons, and this
+# alert is the backup for when that email couldn't go out.
+OnFailure=zerogex-alert@%n.service
 
 [Service]
 Type=oneshot
@@ -14,15 +17,16 @@ Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
 # Stages the post-market bulletin tweet for human approval.  See the
-# premarket unit for the full stage → approve → post lifecycle.  This
-# is the highest-signal fire of the three: closing print + the
-# auction, and the day's replay clip is complete so the video
-# attachment shows the full session sweep.  Flip
-# BULLETIN_TWEET_AUTOPILOT=1 in the EnvironmentFile to auto-post
-# without approval.
+# premarket unit for the full stage → review → approve → post lifecycle.
+# The attached card is the live bulletin at 16:05, which is the next
+# session's map once the day's 0DTE has rolled off; the post labels its
+# levels that way.  Flip BULLETIN_TWEET_AUTOPILOT=1 in the
+# EnvironmentFile to auto-post without approval.
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode close --stage
 
-TimeoutStartSec=240
+# Screenshot + writing + an independent fact-check (and one rewrite when it
+# finds something) takes a few minutes; this is the ceiling, not the norm.
+TimeoutStartSec=1200
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

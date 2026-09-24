@@ -5,17 +5,16 @@
 # Convenience wrapper around ``python -m src.jobs.bulletin_tweet`` so the
 # operator can preview any of the three daily fires without having to
 # remember the flag grammar.  Every invocation is dry-run by default: it
-# renders the tweet body, fetches the PNG from the frontend, and (if the
-# host has Playwright installed) the Replay video, then writes all three
-# to a per-mode/per-date directory under
+# screenshots the live bulletin card, writes the post from its numbers
+# and the latest CNBC headlines, runs the review, and writes the post,
+# reply, PNG and manifest to a per-mode/per-date directory under
 # $BULLETIN_TWEET_ARTIFACT_DIR (default /var/lib/zerogex-oa/bulletin-tweets)
-# so the operator can inspect exactly what would have gone out.
+# so the operator can inspect exactly what would have gone out.  A run the
+# review holds back exits 1 and lists the reasons.
 #
-# Add ``--post`` (or ``-p``) to actually fire the tweet — requires the
-# X_BOT_BEARER_TOKEN plus the four OAuth1 secrets configured in
-# ~/zerogex-oa/.env.  Missing any of them silently degrades the run
-# back to dry-run, so a half-configured rollout can never accidentally
-# post.
+# Add ``--post`` to actually post (only once the review passes) — requires
+# the four X OAuth1 keys in ~/zerogex-oa/.env.  Without them nothing is
+# posted.
 #
 # Usage:
 #   bin/bulletin-tweet.sh <premarket|midday|close> [flags]
@@ -27,7 +26,7 @@
 #
 #   bin/bulletin-tweet.sh close --post        # live post the close read
 #   bin/bulletin-tweet.sh midday --date 2026-07-03 --allow-non-trading-day
-#   bin/bulletin-tweet.sh close --no-media    # skip PNG + video render
+#   bin/bulletin-tweet.sh close --no-media    # skip the screenshot (can't post)
 #   bin/bulletin-tweet.sh close --short       # force 280-char fallback
 #   bin/bulletin-tweet.sh close --artifact-dir /tmp/preview
 #
@@ -38,7 +37,7 @@ set -euo pipefail
 if [[ $# -lt 1 ]]; then
     cat <<EOF >&2
 Usage: bin/bulletin-tweet.sh <premarket|midday|close> [--post] [--date YYYY-MM-DD]
-                             [--symbols SPY,SPX,QQQ] [--lead-symbol SPX]
+                             [--symbols SPY,SPX,QQQ] [--lead-symbol SPY]
                              [--artifact-dir /path] [--no-media] [--short]
                              [--allow-non-trading-day]
 

@@ -119,3 +119,39 @@ def test_news_item_to_dict_shape():
     item = cnbc_news.NewsItem(title="t", summary="s", source="CNBC", link="l", published="p")
     d = item.to_dict()
     assert d == {"title": "t", "summary": "s", "source": "CNBC", "link": "l", "published": "p"}
+
+
+def test_fetch_headlines_keeps_only_recent_items_when_asked(monkeypatch):
+    """The bulletin post has to use the latest news: with max_age_hours, an
+    old item (or one with no date to prove its age) doesn't count, and the
+    cap applies to what's left."""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    now = datetime.now(tz=timezone.utc)
+
+    def _item(title, age_hours=None):
+        pub = (
+            f"<pubDate>{format_datetime(now - timedelta(hours=age_hours))}</pubDate>"
+            if age_hours is not None
+            else ""
+        )
+        return f"<item><title>{title}</title>{pub}</item>"
+
+    feed = (
+        "<rss><channel>"
+        + _item("An hour old", 1)
+        + _item("Two days old", 48)
+        + _item("No date")
+        + _item("Five hours old", 5)
+        + "</channel></rss>"
+    )
+    monkeypatch.setenv("BULLETIN_TWEET_NEWS_ENABLED", "1")
+    monkeypatch.setattr(cnbc_news, "_fetch_feed", lambda url, timeout: feed)
+    items = cnbc_news.fetch_headlines(feeds=["x"], max_age_hours=24)
+    assert [i.title for i in items] == ["An hour old", "Five hours old"]
+    assert [
+        i.title for i in cnbc_news.fetch_headlines(feeds=["x"], max_age_hours=24, max_items=1)
+    ] == ["An hour old"]
+    # Without the argument nothing changes for the other callers.
+    assert len(cnbc_news.fetch_headlines(feeds=["x"])) == 4

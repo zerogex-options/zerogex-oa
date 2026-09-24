@@ -31,6 +31,7 @@ import html
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -187,11 +188,15 @@ def fetch_headlines(
     max_items: int | None = None,
     feeds: list[str] | None = None,
     timeout: int | None = None,
+    max_age_hours: float | None = None,
 ) -> list[NewsItem]:
     """Return the day's top market headlines, most-recent first.
 
     Best-effort: returns ``[]`` when news is disabled or every feed fails.
-    Deduplicates by title across feeds and caps the result at ``max_items``."""
+    Deduplicates by title across feeds and caps the result at ``max_items``.
+    With ``max_age_hours``, only items published that recently count (an
+    item with no parseable date can't be shown to be recent, so it's
+    dropped); the cap applies after that."""
     if not _news_enabled():
         logger.info("cnbc_news: disabled via BULLETIN_TWEET_NEWS_ENABLED — no headlines")
         return []
@@ -216,6 +221,17 @@ def fetch_headlines(
     # Sort most-recent first when we have timestamps; items without one sink
     # to the bottom in feed order (stable sort keeps their relative order).
     collected.sort(key=lambda i: i.published_ts or 0.0, reverse=True)
+
+    if max_age_hours is not None:
+        cutoff = time.time() - max_age_hours * 3600
+        fresh = [i for i in collected if i.published_ts is not None and i.published_ts >= cutoff]
+        if collected and not fresh:
+            logger.info(
+                "cnbc_news: %d headline(s) resolved but none from the last %gh",
+                len(collected),
+                max_age_hours,
+            )
+        collected = fresh
 
     if not collected:
         logger.info("cnbc_news: no headlines resolved from %d feed(s)", len(urls))

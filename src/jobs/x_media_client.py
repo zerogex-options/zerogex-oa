@@ -1,15 +1,18 @@
-"""OAuth1-signed client for the X (Twitter) v1.1 media/upload endpoint.
+"""OAuth1-signed client for posting to X (Twitter) with an image.
 
 Split out of :mod:`src.jobs.bulletin_tweet` so the tweet job stays
 readable and the crypto has one place to be audited. Uses stdlib
 ``hmac`` + ``hashlib`` so no new third-party dependency lands.
 
-Why v1.1: the v2 tweet endpoint accepts media by ID, but the v2 media
-upload endpoint is behind a separate access tier we don't have. v1.1
-``media/upload.json`` still works, is authenticated via OAuth1
-user-context, and returns a ``media_id_string`` that plugs straight
-into ``POST /2/tweets`` — the same shape :func:`bulletin_tweet.
-post_tweet_via_x_api` already handles.
+Everything here signs with the bot's OAuth1 user-context keys, including
+the post itself (:func:`post_tweet`): ``POST /2/tweets`` refuses an
+app-only bearer token, so the four keys the image upload needs are the
+ones that post, too.
+
+Images (:func:`upload_image`) go to v1.1 ``media/upload.json`` first,
+which returns a ``media_id_string`` that plugs straight into
+``POST /2/tweets``; X has been moving uploads to ``POST /2/media/upload``,
+so when v1.1 refuses, the v2 endpoint is tried with the same keys.
 
 Two modes:
 
@@ -37,12 +40,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger("zerogex.x_media_client")
 
 X_MEDIA_UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
+X_MEDIA_UPLOAD_V2_URL = "https://api.x.com/2/media/upload"
+X_TWEETS_URL = "https://api.x.com/2/tweets"
 
 # Chunked upload threshold: X requires it for video, and per docs for
 # PNG > ~5 MB. We flip at 4 MB to stay comfortably inside the simple-
@@ -59,6 +65,10 @@ STATUS_POLL_INTERVAL_SECONDS = 2
 
 class MissingCredentialsError(RuntimeError):
     """Raised when one or more of the four OAuth1 secrets is unset."""
+
+
+class XApiError(RuntimeError):
+    """X refused a request or couldn't be reached; the message says how."""
 
 
 @dataclass(frozen=True)
@@ -497,3 +507,121 @@ def upload_media(
     except Exception as exc:  # noqa: BLE001
         logger.warning("bulletin_tweet: media upload of %s failed (%s)", path, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Posting with an image
+# ---------------------------------------------------------------------------
+
+
+def _error_detail(exc: HTTPError) -> str:
+    """HTTP status plus the start of X's error body, which names the cause."""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        body = ""
+    body = " ".join(body.split())[:300]
+    return f"HTTP {exc.code}{': ' + body if body else ''}"
+
+
+def _upload_image_v2(
+    path: Path, credentials: OAuth1Credentials, timeout_seconds: int
+) -> str | None:
+    """One-shot image upload to ``POST /2/media/upload`` (multipart)."""
+    mime = _mime_for(path, None)
+    body, boundary = _build_multipart_body(
+        fields={"media_category": _category_for(mime), "media_type": mime},
+        file_field="media",
+        file_bytes=path.read_bytes(),
+        filename=path.name,
+        file_mime=mime,
+    )
+    req = Request(
+        X_MEDIA_UPLOAD_V2_URL,
+        data=body,
+        headers={
+            # Multipart fields stay out of the OAuth1 signature (RFC 5849).
+            "Authorization": _oauth1_header("POST", X_MEDIA_UPLOAD_V2_URL, credentials),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "zerogex-x-media/1.0",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout_seconds) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+    data = payload.get("data") or {}
+    media_id = data.get("id") or payload.get("media_id_string")
+    return str(media_id) if media_id else None
+
+
+def upload_image(path: Path, credentials: OAuth1Credentials, timeout_seconds: int = 60) -> str:
+    """Upload one image and return its media id, or raise :class:`XApiError`.
+
+    Tries v1.1 then v2 (see the module docstring); the error names what
+    each endpoint said."""
+    if not path.exists() or path.stat().st_size == 0:
+        raise XApiError(f"the image {path} is missing or empty")
+    failures: list[str] = []
+    for label, upload in (
+        ("v1.1", lambda: _simple_upload(path, credentials, _mime_for(path, None), timeout_seconds)),
+        ("v2", lambda: _upload_image_v2(path, credentials, timeout_seconds)),
+    ):
+        try:
+            media_id = upload()
+        except HTTPError as exc:
+            failures.append(f"{label} upload {_error_detail(exc)}")
+            continue
+        except Exception as exc:  # noqa: BLE001 — network trouble, bad JSON
+            failures.append(f"{label} upload failed ({exc})")
+            continue
+        if media_id:
+            logger.info(
+                "x_media_client: uploaded %s via %s (media_id=%s)", path.name, label, media_id
+            )
+            return media_id
+        failures.append(f"{label} upload returned no media id")
+    raise XApiError("; ".join(failures))
+
+
+def post_tweet(
+    text: str,
+    credentials: OAuth1Credentials,
+    media_ids: list[str] | None = None,
+    reply_to: str | None = None,
+    timeout_seconds: int = 30,
+) -> str:
+    """``POST /2/tweets`` signed with the OAuth1 keys; returns the new post's id.
+
+    ``media_ids`` attaches uploaded media; ``reply_to`` threads it under that
+    post (how the link reply goes out).  Raises :class:`XApiError`."""
+    payload: dict[str, Any] = {"text": text}
+    if media_ids:
+        payload["media"] = {"media_ids": list(media_ids)}
+    if reply_to:
+        payload["reply"] = {"in_reply_to_tweet_id": reply_to}
+    req = Request(
+        X_TWEETS_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            # A JSON body is not part of the OAuth1 signature.
+            "Authorization": _oauth1_header("POST", X_TWEETS_URL, credentials),
+            "Content-Type": "application/json",
+            "User-Agent": "zerogex-bulletin-tweet/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raise XApiError(_error_detail(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — network trouble
+        raise XApiError(f"couldn't reach X ({exc})") from exc
+    try:
+        body = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise XApiError(f"X answered with something that wasn't JSON ({raw[:200]})") from exc
+    tweet_id = (body.get("data") or {}).get("id")
+    if not tweet_id:
+        raise XApiError(f"X's answer had no post id ({raw[:200]})")
+    return str(tweet_id)
