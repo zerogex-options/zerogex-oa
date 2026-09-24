@@ -206,3 +206,48 @@ def test_daily_scorecard_best_only_no_worst(monkeypatch: pytest.MonkeyPatch):
     tweet = r.json()["tweet_text"]
     assert "Best: Skew Delta +0.50%" in tweet
     assert "Worst:" not in tweet
+
+
+def test_daily_scorecard_lists_every_card_with_a_permalink(monkeypatch: pytest.MonkeyPatch):
+    """The page lists the whole day, so each card must carry its own link."""
+    app, dbmod = _build_app(monkeypatch)
+    items = [
+        {
+            "id": 4221,
+            "timestamp": datetime(2026, 6, 29, 13, 42, tzinfo=timezone.utc),
+            "pattern": "call_wall_fade",
+            "action": "SELL_CALL_SPREAD",
+            "tier": "0DTE",
+            "direction": "bearish",
+            "confidence": 0.68,
+        },
+        {
+            "id": 4230,
+            "timestamp": datetime(2026, 6, 29, 15, 5, tzinfo=timezone.utc),
+            "pattern": "put_wall_bounce",
+            "action": "BUY_CALL_DEBIT",
+            "tier": "0DTE",
+            "direction": "bullish",
+            "confidence": 0.51,
+        },
+    ]
+    payload = _scorecard_payload()
+    payload["cards"]["items"] = items
+    dbmod.DatabaseManager.get_daily_scorecard = AsyncMock(return_value=payload)
+
+    with TestClient(app) as client:
+        r = client.get("/api/scorecard/daily?date=2026-06-29")
+    assert r.status_code == 200, r.text
+    listed = r.json()["cards"]["items"]
+    assert [c["permalink"] for c in listed] == ["/cards/4221", "/cards/4230"]
+    assert listed[0]["timestamp"] == "2026-06-29T13:42:00+00:00"
+    assert listed[0]["pattern"] == "call_wall_fade"
+
+
+def test_daily_scorecard_items_default_to_empty(monkeypatch: pytest.MonkeyPatch):
+    """A query result without ``items`` still returns the key, as a list."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_daily_scorecard = AsyncMock(return_value=_scorecard_payload())
+    with TestClient(app) as client:
+        r = client.get("/api/scorecard/daily?date=2026-06-29")
+    assert r.json()["cards"]["items"] == []

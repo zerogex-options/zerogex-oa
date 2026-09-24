@@ -165,7 +165,14 @@ async def get_daily_scorecard(
         "total": 12,
         "by_action": [{"action": "SELL_CALL_SPREAD", "count": 4}, ...],
         "first_card_id": 4221,
-        "first_card_permalink": "/cards/4221"
+        "first_card_permalink": "/cards/4221",
+        "items": [
+          {"id": 4221, "timestamp": "2026-06-29T13:42:00+00:00",
+           "pattern": "call_wall_fade", "action": "SELL_CALL_SPREAD",
+           "tier": "0DTE", "direction": "bearish", "confidence": 0.68,
+           "permalink": "/cards/4221"},
+          ...
+        ]
       },
       "signals": {
         "events": [{"name": "...", "flips": 3, "wins": 2, "losses": 1,
@@ -203,6 +210,11 @@ async def get_daily_scorecard(
     cards["first_card_permalink"] = (
         f"/cards/{cards['first_card_id']}" if cards.get("first_card_id") else None
     )
+    # Every card of the day, oldest first, each with its own permalink.
+    # ``items`` holds at most SCORECARD_CARD_ITEMS_CAP rows; ``total`` is exact.
+    cards.setdefault("items", [])
+    for item in cards["items"]:
+        item["permalink"] = f"/cards/{item['id']}"
 
     regime = payload.get("regime")
     regime_label = _label_regime(regime)

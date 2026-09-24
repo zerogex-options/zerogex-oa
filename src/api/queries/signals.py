@@ -35,6 +35,10 @@ _ET = ZoneInfo("America/New_York")
 SIGNAL_HISTORY_LIMIT = 600
 SIGNAL_HISTORY_LOOKBACK_DAYS = 4
 
+# Most Action Cards the daily scorecard lists individually. ``total`` still
+# counts every card; the cap only bounds the payload on a runaway day.
+SCORECARD_CARD_ITEMS_CAP = 500
+
 
 def _two_session_cutoff(now: Optional[datetime] = None) -> datetime:
     """Return the ET timestamp marking the start of the older of the two
@@ -1640,8 +1644,10 @@ class SignalsQueriesMixin:
         Returns a single dict combining three independent reads:
 
         1. **Action Cards** persisted in the window — total count, breakdown
-           by ``action`` enum, and the id of the first non-STAND_DOWN card
-           emitted that day (used as the OG card's anchor permalink).
+           by ``action`` enum, the id of the first non-STAND_DOWN card
+           emitted that day (used as the OG card's anchor permalink), and
+           ``items``: every card oldest-first (capped at
+           ``SCORECARD_CARD_ITEMS_CAP``) so the page can list the whole day.
         2. **Per-signal flip events** with realized return at the requested
            horizon — for each of the 13 signal names, counts the number of
            direction-flip events in the window, the number that "won"
@@ -1675,6 +1681,7 @@ class SignalsQueriesMixin:
                 "total": 0,
                 "by_action": [],
                 "first_card_id": None,
+                "items": [],
             },
             "signals": {
                 "events": [],
@@ -1689,7 +1696,7 @@ class SignalsQueriesMixin:
             async with self._acquire_connection() as conn:
                 card_rows = await conn.fetch(
                     """
-                    SELECT id, action
+                    SELECT id, timestamp, pattern, action, tier, direction, confidence
                     FROM signal_action_cards
                     WHERE underlying = $1
                       AND timestamp >= $2
@@ -1708,6 +1715,20 @@ class SignalsQueriesMixin:
                 out["cards"]["by_action"] = [
                     {"action": action, "count": count}
                     for action, count in counts.most_common(5)
+                ]
+                out["cards"]["items"] = [
+                    {
+                        "id": int(r["id"]),
+                        "timestamp": r["timestamp"],
+                        "pattern": r["pattern"],
+                        "action": r["action"],
+                        "tier": r["tier"],
+                        "direction": r["direction"],
+                        "confidence": (
+                            float(r["confidence"]) if r["confidence"] is not None else None
+                        ),
+                    }
+                    for r in card_rows[:SCORECARD_CARD_ITEMS_CAP]
                 ]
         except Exception as exc:
             logger.warning(
