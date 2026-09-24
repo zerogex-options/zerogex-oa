@@ -103,7 +103,8 @@ def test_skill_margin_must_clear_the_floor_not_merely_be_positive():
     assert stats["brier_skill"] > MIN_BRIER_SKILL
     # ...and the floor is what the verdict consults, not the raw sign.
     borderline = dict(stats, brier_skill=MIN_BRIER_SKILL / 2, beats_baseline=False)
-    ok, reason = publication_gate(borderline)
+    # Empty breakdown: the aggregate check fires first and never reaches it.
+    ok, reason = publication_gate(borderline, [])
     assert ok is False
     assert "below the" in reason
 
@@ -130,43 +131,114 @@ def test_summarize_empty_is_not_an_error():
 # ---------------------------------------------------------------------------
 
 
+def _gate(claims):
+    """The gate exactly as the job calls it — aggregate plus breakdown."""
+    return publication_gate(summarize(claims), per_symbol_breakdown(claims))
+
+
 def test_gate_blocks_a_record_with_no_skill_over_the_base_rate():
     """The whole point of the gate.  Big sample, many sessions, calibrated -
     and still refused, because none of that is evidence of skill."""
-    stats = summarize(_claims(800, 0.8, 0.8, sessions=20))
-    ok, reason = publication_gate(stats)
+    ok, reason = _gate(_claims(800, 0.8, 0.8, sessions=20))
     assert ok is False
     assert "too close to the strawman" in reason
 
 
 def test_gate_blocks_a_thin_sample_even_when_it_beats_baseline():
     few = _skillful(n=MIN_CLAIMS_FOR_PUBLICATION - 40, sessions=8)
-    stats = summarize(few)
-    assert stats["beats_baseline"] is True
-    ok, reason = publication_gate(stats)
+    assert summarize(few)["beats_baseline"] is True
+    ok, reason = _gate(few)
     assert ok is False
     assert "sample too thin" in reason
 
 
 def test_gate_blocks_one_busy_session_masquerading_as_a_record():
     """Enough claims, but all from too few days - they are not independent."""
-    stats = summarize(_skillful(n=600, sessions=MIN_SESSIONS_FOR_PUBLICATION - 1))
+    claims = _skillful(n=600, sessions=MIN_SESSIONS_FOR_PUBLICATION - 1)
+    stats = summarize(claims)
     assert stats["n"] >= MIN_CLAIMS_FOR_PUBLICATION
     assert stats["beats_baseline"] is True
-    ok, reason = publication_gate(stats)
+    ok, reason = _gate(claims)
     assert ok is False
     assert "too few sessions" in reason
 
 
 def test_gate_passes_a_real_record():
-    ok, reason = publication_gate(summarize(_skillful()))
+    ok, reason = _gate(_skillful())
     assert ok is True
     assert "over the base rate" in reason
+    assert "every symbol clears" in reason
 
 
 def test_gate_blocks_empty():
-    ok, _ = publication_gate(summarize([]))
+    ok, _ = _gate([])
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Every symbol has to earn its place, not just the pool
+# ---------------------------------------------------------------------------
+
+
+def _mixed_pool():
+    """The 2026-09-24 shape: one symbol carrying a symbol that is a dead heat
+    with its own base rate.  SPY +7.9% and QQQ +3.6% pooled with SPX +0.02%
+    and NDX -0.04% is what the live data looked like when this gate was
+    tightened."""
+    carried = _skillful(n=800, sessions=8)
+    for c in carried:
+        c["symbol"] = "SPY"
+    return carried + _claims(800, 0.8, 0.8, symbol="NDX", sessions=8)
+
+
+def test_gate_blocks_a_dead_heat_symbol_the_aggregate_would_have_carried():
+    claims = _mixed_pool()
+    # The pool on its own looks like a track record...
+    assert summarize(claims)["beats_baseline"] is True
+    # ...and the gate must still refuse it.
+    ok, reason = _gate(claims)
+    assert ok is False
+    assert "NDX" in reason
+
+
+def test_gate_names_only_the_symbols_that_fell_short():
+    ok, reason = _gate(_mixed_pool())
+    assert ok is False
+    assert "NDX" in reason
+    assert "SPY" not in reason
+
+
+def test_gate_blocks_a_symbol_with_too_little_data_rather_than_skipping_it():
+    """"We do not know yet" is a reason not to publish, not a reason to look
+    away — the thin symbol is still inside the number being tweeted."""
+    claims = _skillful(n=800, sessions=8)
+    for c in claims:
+        c["symbol"] = "SPY"
+    newcomer = _claims(20, 0.8, 0.8, symbol="QQQ", sessions=4)
+    ok, reason = _gate(claims + newcomer)
+    assert ok is False
+    assert "QQQ" in reason
+    assert "claims" in reason
+
+
+def test_gate_passes_when_every_symbol_clears_on_its_own():
+    claims = []
+    for sym in ("SPY", "QQQ"):
+        part = _skillful(n=800, sessions=8)
+        for c in part:
+            c["symbol"] = sym
+        claims.extend(part)
+    ok, reason = _gate(claims)
+    assert ok is True
+    assert "SPY" in reason and "QQQ" in reason
+
+
+def test_per_symbol_argument_is_required_so_no_lenient_path_exists():
+    """An optional breakdown would leave a lenient gate a caller could reach
+    by forgetting an argument, and the lenient gate is the one that publishes
+    something unearned."""
+    with pytest.raises(TypeError):
+        publication_gate(summarize(_skillful()))
 
 
 # ---------------------------------------------------------------------------

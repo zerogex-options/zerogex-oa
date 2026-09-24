@@ -209,11 +209,45 @@ def summarize(claims: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def publication_gate(cume: dict[str, Any]) -> tuple[bool, str]:
+def _symbol_shortfall(row: dict[str, Any]) -> Optional[str]:
+    """Why this symbol has not earned its place in the record, or None."""
+    n = row.get("n") or 0
+    if n < MIN_CLAIMS_FOR_PUBLICATION:
+        return f"{row['symbol']} ({n:,} claims)"
+    if (row.get("sessions") or 0) < MIN_SESSIONS_FOR_PUBLICATION:
+        return f"{row['symbol']} ({row['sessions']} sessions)"
+    if row.get("beats_baseline") is None:
+        return f"{row['symbol']} (no baseline to beat)"
+    if not row["beats_baseline"]:
+        return f"{row['symbol']} (skill {row['brier_skill']:+.4f})"
+    return None
+
+
+def publication_gate(
+    cume: dict[str, Any], per_symbol: Sequence[dict[str, Any]]
+) -> tuple[bool, str]:
     """May this record be published?  Returns ``(ok, reason)``.
 
     Checked before every live post.  The reason is logged either way, so a
     stood-down day leaves the same trail as a posted one.
+
+    EVERY symbol has to clear the bar, not just the pooled aggregate.  The
+    aggregate alone is a weaker test than it looks: over the 20 sessions to
+    2026-09-24 it scores +2.9% skill while SPX (+0.02%) and NDX (-0.04%) are
+    dead heats with their own base rate, carried by SPY (+7.9%) and QQQ
+    (+3.6%).  The tweet's number covers all four, so a reader is entitled to
+    assume all four earned it.  Pooling until the claim comes out true is the
+    same move as choosing the symbols that look good, run in reverse.
+
+    ``per_symbol`` is required rather than optional on purpose: an optional
+    argument would leave a lenient path that a caller could take by forgetting
+    it, and the lenient path is the one that publishes something unearned.
+
+    A symbol with too little data blocks rather than being skipped.  Skipping
+    would let a symbol sit inside the tweeted aggregate while being excluded
+    from the test the aggregate is supposed to pass — which is precisely the
+    hole this gate exists to close.  "We do not know yet" is a reason not to
+    publish, not a reason to look away.
     """
     n = cume.get("n") or 0
     sessions = cume.get("sessions") or 0
@@ -238,10 +272,23 @@ def publication_gate(cume: dict[str, Any]) -> tuple[bool, str]:
             f"base-rate {cume['baseline_brier']:.4f}) - too close to the "
             "strawman to call it a record, so it stays unpublished"
         )
+    shortfalls = [s for s in map(_symbol_shortfall, per_symbol) if s]
+    if shortfalls:
+        return False, (
+            "the aggregate clears the bar but these symbols do not: "
+            + ", ".join(shortfalls)
+            + f" — the record covers all {len(per_symbol)}, so one that has "
+            "not earned its place blocks the whole claim"
+        )
+
+    cleared = ", ".join(
+        f"{r['symbol']} {r['brier_skill']:+.4f}" for r in per_symbol
+    )
     return True, (
         f"Brier skill {cume['brier_skill']:+.4f} over the base rate "
         f"(cone {cume['brier']:.4f} vs {cume['baseline_brier']:.4f}) "
-        f"across {n:,} claims / {sessions} sessions"
+        f"across {n:,} claims / {sessions} sessions; every symbol clears "
+        f"[{cleared}]"
     )
 
 
@@ -456,12 +503,13 @@ async def _run_preview(
         today_claims, cume_claims = _split(claims, day)
         day_stats = summarize(today_claims)
         cume_stats = summarize(cume_claims)
-        gate_ok, gate_reason = publication_gate(cume_stats)
+        breakdown = per_symbol_breakdown(cume_claims)
+        gate_ok, gate_reason = publication_gate(cume_stats, breakdown)
         text = build_receipt_tweet(day_stats, cume_stats, args.site_url)
         print(
             render_preview(
                 day, day_stats, cume_stats, text, gate_ok, gate_reason,
-                per_symbol_breakdown(cume_claims),
+                breakdown,
             )
         )
         print()
@@ -482,10 +530,11 @@ async def _run_live(
 
     day_stats = summarize(today_claims)
     cume_stats = summarize(cume_claims)
-    gate_ok, gate_reason = publication_gate(cume_stats)
+    breakdown = per_symbol_breakdown(cume_claims)
+    gate_ok, gate_reason = publication_gate(cume_stats, breakdown)
     tweet_text = build_receipt_tweet(day_stats, cume_stats, args.site_url)
 
-    for row in per_symbol_breakdown(cume_claims):
+    for row in breakdown:
         logger.info("cone_tweet: %s", _fmt_stats(row["symbol"], row).strip())
 
     if not gate_ok:
