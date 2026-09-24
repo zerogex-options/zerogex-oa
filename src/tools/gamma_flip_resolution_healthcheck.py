@@ -145,12 +145,24 @@ class SessionResolution:
         there an actionable crossing that OUR pipeline refused, or was there no
         actionable crossing at all?
 
-        On 2026-09-17 raw sat 2.8% from spot while the published flip was NULL,
-        and that was a real bug in our DTE weighting that took five weeks and a
-        customer to find.  On 2026-09-21..23 raw sat 27-37% away, and the NULL
-        was the correct reading of a book that was long gamma across the whole
-        band.  The reason code says BEYOND_MAX_DISTANCE for both, which is why
-        it cannot be the thing that decides.
+        MEASURED AND FOUND WANTING -- read this before using it.  The idea was
+        that raw sits NEAR spot when our own math hid something actionable and
+        FAR when the market moved it out of reach.  2026-09-17 supported it:
+        raw 2.8% from spot on a session the DTE ramp broke.  Measured across
+        the whole 2026-08-03..09-09 blackout, the separation is not there:
+
+            our-bug sessions (Aug 3 - Sep 11)    raw 0% to 21% from spot
+            market sessions  (Sep 21 - Sep 23)   raw 27% to 35%
+
+        At 8 -- GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT, the natural choice -- this
+        excused 26 of the 31 breaching blackout sessions, so the outage it
+        exists to catch would have stayed invisible.  A threshold near 25
+        separates those two episodes and is a curve fit over three market
+        samples, with silence on a real outage as the cost of being wrong.
+
+        Kept because the distance is worth REPORTING for triage, and because a
+        caller who has established a separation on their own data should be
+        able to act on it.  The unit sets it to nothing.
 
         Measured, never assumed: a session with no raw on any blank row, or no
         stored spot, is NOT excused.  An absence is not evidence that the

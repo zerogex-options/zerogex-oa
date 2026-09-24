@@ -49,34 +49,43 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 # GAMMA_FLIP_MAX_BLANK_MINUTES, 1 when one did, 2 on DB error. A nonzero exit
 # marks the unit failed, surfaces in `systemctl --failed`, logs the offending
 # symbol and session, and fires the OnFailure hook above.
-# IGNORE_RAW_BEYOND=8, AND NOTHING ELSE.
+# NOTHING IS EXCUSED HERE. BOTH ATTEMPTS AT AN EXCUSE FAILED.
 #
-# IGNORE_REASONS is deliberately NOT set. It was tempting to put
-# BEYOND_MAX_DISTANCE in it after 2026-09-21..23, when NDX was blank for three
-# straight sessions under that code and the resolver was right every time --
-# the monthly opex on 09-18 left a book at 3.16 calls per put, long gamma
-# across the whole band, crossing 27% to 37% below spot. This unit emailed
-# about it roughly twenty-one times.
+# The problem is real: on 2026-09-21..23 NDX was blank for three straight
+# sessions and the resolver was right every time. The monthly opex on 09-18
+# left a book at 3.16 calls per put, long gamma across the whole band, crossing
+# 27% to 37% below spot. This unit emailed about it roughly twenty-one times.
+# A monitor people learn to ignore is the state the 2026-07..09 blackout hid in
+# for five weeks, so the noise matters.
 #
-# It would also have silenced the NDX blackout of 2026-07..09, a real bug in
-# our own DTE weighting that took five weeks and a customer to find, because
-# THAT reported BEYOND_MAX_DISTANCE too. The reason code cannot tell "the
-# market moved the flip away" from "our math did".
+# IGNORE_REASONS=BEYOND_MAX_DISTANCE would silence it, and would also have
+# silenced that blackout, which reported the same code. Rejected on that basis.
 #
-# IGNORE_RAW_BEYOND can. gamma_flip_raw is the same cycle's crossing with no
-# ramp and no gates, so its distance from spot says whether there was an
-# actionable crossing for us to refuse:
+# IGNORE_RAW_BEYOND=8 looked better and is worse. The idea was that
+# gamma_flip_raw -- the same cycle's crossing with no ramp and no gates -- sits
+# NEAR spot when our own math hid something actionable and FAR when the market
+# moved it out of reach. One day supported that: 2026-09-17 had raw 2.8% from
+# spot on a session our DTE ramp broke. Then it was measured across the whole
+# 2026-08-03..09-09 blackout and the separation is not there:
 #
-#     2026-09-17   raw 2.8% from spot   our ramp hid it      -> page
-#     2026-09-21   raw 12-37% away      nothing to show      -> quiet
-#     2026-09-23   raw 27-37% away      nothing to show      -> quiet
+#     our-bug sessions (Aug 3 - Sep 11)      raw 0% to 21% from spot
+#     market sessions  (Sep 21 - Sep 23)     raw 27% to 35%
 #
-# 8 is not a new number to tune. It is GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT,
-# the same ceiling the resolver already judges a crossing against, so the unit
-# pages exactly when a crossing the resolver would have called actionable went
-# unpublished anyway. A session whose blank rows carry no raw at all is never
-# excused by this, because an absence is not evidence that the market did it.
-ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-resolution-healthcheck SESSIONS=1 IGNORE_RAW_BEYOND=8
+# At 8 it excused 26 of the 31 breaching blackout sessions. The outage would
+# have stayed invisible. A threshold near 25 separates THESE two episodes, but
+# that is three market samples and a curve fit, and the cost of being wrong is
+# silence on a real outage.
+#
+# So: nothing is excused, and this unit is noisy on purpose until something
+# better exists. The raw@ column is still reported, because knowing the
+# distance is useful for triage even though it cannot decide.
+#
+# The design that probably works is edge-triggered rather than level-triggered:
+# alert when a symbol STOPS publishing, not every hour that it is still not
+# publishing. That fires once at the onset of a bug and once at the onset of a
+# regime, which is the information either way, and it needs no theory about
+# which one it is looking at.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gamma-flip-resolution-healthcheck SESSIONS=1
 
 # One indexed range scan and a rollback per symbol-session.
 TimeoutStartSec=120
