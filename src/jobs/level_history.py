@@ -14,7 +14,8 @@ distinct classes of wrong statement in the midday and post-market reads:
     written AFTER the bell, once the day's 0DTE contracts have rolled off
     the chain.  That resets the walls to the next session's structure — a
     put wall of 765 that was never in play during the session it is
-    supposedly describing.
+    supposedly describing.  The 16:00 frame itself is already on that side
+    of the line: see :data:`SESSION_END`.
 
 This module turns the day's per-minute ``gex_summary`` path plus the
 underlying's 1-min bars into an honest account of what each level actually
@@ -26,7 +27,7 @@ did:
   * :class:`FlipTrack` — the gamma flip's drift band plus how many times
     spot crossed it and which side it started and ended on.
   * ``session_close_levels`` — the structure in force at the last in-session
-    frame (<= 16:00 ET).  This is what the close read must quote.
+    frame (before 16:00 ET).  This is what the close read must quote.
   * ``post_close_levels`` — the latest post-bell frame, kept separately so
     the post can say "after the bell the 0DTE rolled off and the put wall
     reset to X" instead of silently passing it off as the day's level.
@@ -49,6 +50,13 @@ logger = logging.getLogger("zerogex.level_history")
 ET = ZoneInfo("America/New_York")
 
 SESSION_START = time(9, 30)
+# Exclusive.  A frame stamped 16:00:00 is the first one AFTER the session,
+# not its last: the day's 0DTE contracts have zero time left at the bell
+# (``calculate_time_to_expiration`` returns 0 there, and gamma with it), so
+# that frame's walls and flip are built from tomorrow's expiries alone.
+# SPY on 2026-09-22 had a call wall of 775 from the open through 15:30 and
+# 780 only in the 16:00 frame; with 16:00 counted in-session, the close read
+# reported the wall as "moved 775 → 780".
 SESSION_END = time(16, 0)
 
 # The two discrete strike-space levels.  Both migrate in whole-strike jumps,
@@ -175,10 +183,11 @@ def _split_frames(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Partition level rows into (in-session, post-close) by ET wall clock.
 
-    In-session is ``[09:30, 16:00]`` of ``session_date`` — the window the
-    read is describing.  Anything stamped after 16:00 is the next session's
-    structure forming as the day's expiries roll off the chain, and is kept
-    apart so it can be reported as such rather than quoted as today's."""
+    In-session is ``[09:30, 16:00)`` of ``session_date`` — the window the
+    read is describing.  Anything stamped 16:00 or later is the next
+    session's structure forming as the day's expiries roll off the chain,
+    and is kept apart so it can be reported as such rather than quoted as
+    today's."""
     in_session: list[dict[str, Any]] = []
     post_close: list[dict[str, Any]] = []
     for row in rows or []:
@@ -188,9 +197,9 @@ def _split_frames(
         ts_et = ts.astimezone(ET)
         if ts_et.date() != session_date:
             continue
-        if SESSION_START <= ts_et.time() <= SESSION_END:
+        if SESSION_START <= ts_et.time() < SESSION_END:
             in_session.append(row)
-        elif ts_et.time() > SESSION_END:
+        elif ts_et.time() >= SESSION_END:
             post_close.append(row)
     in_session.sort(key=lambda r: r["timestamp"])
     post_close.sort(key=lambda r: r["timestamp"])
@@ -645,7 +654,7 @@ def build_level_history(
     history.gamma_flip = _build_flip_track(in_session, post_close, bars)
 
     # The last in-session frame is the canonical "on the close" structure.
-    # Walk backwards per column so a single NULL on the 16:00 row falls back
+    # Walk backwards per column so a single NULL on the last row falls back
     # to the most recent frame that actually carried the value.
     for key in SESSION_CLOSE_KEYS:
         for row in reversed(in_session):
