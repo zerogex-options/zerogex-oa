@@ -640,9 +640,14 @@ class TradeStationProvider(MarketDataProvider):
         self._CAPABILITIES.require("option_chain_discovery")
         return self._client.get_option_expirations(underlying, strike_price)
 
-    def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:
+    def get_option_strikes(
+        self, underlying: str, expiration: Optional[date] = None
+    ) -> List[float]:
         self._CAPABILITIES.require("option_chain_discovery")
-        return self._client.get_option_strikes(underlying, expiration)
+        # TradeStation's own spelling. The interface passes a date so that
+        # this line, and not the caller, decides what that looks like.
+        exp = expiration.strftime("%m-%d-%Y") if expiration is not None else None
+        return self._client.get_option_strikes(underlying, exp)
 
     def snapshot_option_quotes(self, option_symbols: Sequence[str]) -> Dict[str, OptionQuote]:
         self._CAPABILITIES.require("option_open_interest")

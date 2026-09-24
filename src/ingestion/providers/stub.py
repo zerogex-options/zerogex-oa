@@ -147,7 +147,9 @@ class StubProvider(MarketDataProvider):
         self._capabilities.require("option_chain_discovery")
         raise NotImplementedError(_TODO)
 
-    def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:
+    def get_option_strikes(
+        self, underlying: str, expiration: Optional[date] = None
+    ) -> List[float]:
         self._capabilities.require("option_chain_discovery")
         raise NotImplementedError(_TODO)
 

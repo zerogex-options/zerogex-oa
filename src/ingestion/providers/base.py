@@ -389,8 +389,19 @@ class MarketDataProvider(abc.ABC):
         """
 
     @abc.abstractmethod
-    def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:
-        """Listed strikes for ``underlying``, optionally one expiration."""
+    def get_option_strikes(
+        self, underlying: str, expiration: Optional[date] = None
+    ) -> List[float]:
+        """Listed strikes for ``underlying``, optionally one expiration.
+
+        ``expiration`` is a ``date``, NOT a preformatted string. Each vendor
+        spells dates its own way -- TradeStation wants ``MM-DD-YYYY``,
+        ThetaData an ISO string or ``YYYYMMDD`` -- and a caller that formats
+        before the boundary has picked one of them. StreamManager did, with
+        TradeStation's, and ThetaData rejected every expiration it was
+        handed: "requires an expiration for option_list_strikes; got
+        '09-24-2026'". Formatting belongs in the implementation.
+        """
 
     @abc.abstractmethod
     def snapshot_option_quotes(self, option_symbols: Sequence[str]) -> Dict[str, OptionQuote]:

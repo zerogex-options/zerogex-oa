@@ -1841,11 +1841,13 @@ class StreamManager:
             chains = self._expiration_underlying.get(expiration, [self.underlying])
             ts_symbol = chains[0] if chains else self.underlying
         try:
-            exp_str = expiration.strftime("%m-%d-%Y")
-            all_strikes = self.provider.get_option_strikes(ts_symbol, expiration=exp_str)
+            # The date itself, not a vendor's spelling of it. Formatting
+            # here picked TradeStation's MM-DD-YYYY, which ThetaData
+            # rejected for every expiration on every cycle.
+            all_strikes = self.provider.get_option_strikes(ts_symbol, expiration=expiration)
 
             if not all_strikes:
-                logger.warning(f"No strikes found for exp {exp_str} ({ts_symbol})")
+                logger.warning(f"No strikes found for exp {expiration} ({ts_symbol})")
                 return []
 
             pct = self.strike_pct_range / 100.0
@@ -1864,7 +1866,7 @@ class StreamManager:
             above = len(nearby_strikes) - below
 
             log_msg = (
-                f"Exp {exp_str} ({ts_symbol}): {len(nearby_strikes)} strikes "
+                f"Exp {expiration} ({ts_symbol}): {len(nearby_strikes)} strikes "
                 f"({below} below, {above} above ${current_price:.2f}) "
                 f"within ±{self.strike_pct_range}% [{low:.2f}, {high:.2f}]"
             )

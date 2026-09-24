@@ -504,8 +504,9 @@ def _resolve_chain(
     metadata: Dict[str, Dict[str, Any]] = {}
 
     for expiration in expirations:
-        exp_str = expiration.isoformat() if isinstance(expiration, date) else str(expiration)
-        ladder = provider.get_option_strikes(underlying, exp_str)
+        # get_option_expirations contracts to List[date]; the interface
+        # takes the date and each provider spells it for its own vendor.
+        ladder = provider.get_option_strikes(underlying, expiration)
         if spot is None:
             # Probe fallback: no spot, so centre on the ladder's own median.
             # Which strikes get picked barely matters when the question is

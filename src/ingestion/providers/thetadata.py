@@ -1568,7 +1568,9 @@ class ThetaDataProvider(MarketDataProvider):
                 out.append(parsed)
         return sorted(set(out))
 
-    def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:
+    def get_option_strikes(
+        self, underlying: str, expiration: Optional[date] = None
+    ) -> List[float]:
         self._CAPABILITIES.require("option_chain_discovery")
         root = option_root_for(underlying)
         parsed = _coerce_date(expiration) if expiration else None

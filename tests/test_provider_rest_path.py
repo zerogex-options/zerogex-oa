@@ -532,3 +532,68 @@ def test_initialize_builds_calls_and_puts_at_every_strike():
         assert "C" in symbol or "P" in symbol
     assert any("C" in s for s in sm.tracked_option_symbols)
     assert any("P" in s for s in sm.tracked_option_symbols)
+
+
+# ---------------------------------------------------------------------------
+# 9. Dates cross the boundary as dates, not as one vendor's spelling
+# ---------------------------------------------------------------------------
+
+
+def test_stream_manager_passes_a_date_object_to_get_option_strikes():
+    """It used to pass TradeStation's MM-DD-YYYY string.
+
+    ThetaData rejected every expiration it was handed -- "requires an
+    expiration for option_list_strikes; got '09-24-2026'" -- so the chain
+    was empty on every cycle for every symbol. feed_compare passed
+    ``.isoformat()`` and worked, which is why the probes looked fine.
+    """
+    provider = MagicMock()
+    provider.get_option_strikes.return_value = [100.0]
+
+    sm = StreamManager.__new__(StreamManager)
+    sm.provider = provider
+    sm.underlying = "SPY"
+    sm.strike_pct_range = 3.0
+    sm.strike_count_max = 40
+    sm._expiration_underlying = {}
+
+    sm._get_strikes_near_price(date(2026, 9, 24), 100.0, ts_symbol="SPY")
+
+    passed = provider.get_option_strikes.call_args.kwargs["expiration"]
+    assert isinstance(passed, date), f"expected a date, got {type(passed).__name__}: {passed!r}"
+    assert passed == date(2026, 9, 24)
+
+
+def test_tradestation_spells_the_date_for_its_own_client():
+    from src.ingestion.providers.tradestation import TradeStationProvider
+
+    client = MagicMock()
+    client.get_option_strikes.return_value = [450.0]
+    TradeStationProvider(client).get_option_strikes("SPY", date(2026, 9, 24))
+
+    client.get_option_strikes.assert_called_once_with("SPY", "09-24-2026")
+
+
+def test_tradestation_passes_none_through_untouched():
+    from src.ingestion.providers.tradestation import TradeStationProvider
+
+    client = MagicMock()
+    client.get_option_strikes.return_value = []
+    TradeStationProvider(client).get_option_strikes("SPY", None)
+    client.get_option_strikes.assert_called_once_with("SPY", None)
+
+
+def test_thetadata_accepts_the_date_object():
+    class _StrikeClient:
+        def __init__(self) -> None:
+            self.seen: List[Any] = []
+
+        def option_list_strikes(self, symbol: str, expiration: Any):
+            self.seen.append(expiration)
+            return [{"strike": 6700.0}, {"strike": 6710.0}]
+
+    client = _StrikeClient()
+    strikes = _theta(client).get_option_strikes("$SPXW.X", date(2026, 9, 24))
+
+    assert strikes == [6700.0, 6710.0]
+    assert client.seen == [date(2026, 9, 24)]
