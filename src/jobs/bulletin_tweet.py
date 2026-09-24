@@ -1,68 +1,59 @@
-"""Live-Bulletin auto-tweet — three daily reads posted to @zerogex_io.
+"""Live-Bulletin auto-tweet — three daily reads posted to the ZeroGEX X account.
 
 Fires three times per trading day, backed by the same script + three
 systemd timers:
 
-  * ``--mode premarket`` at 09:15 ET — pre-market update posted 15 min
-    before the cash open, framing the day's Gamma Flip / Call Wall /
-    Put Wall structure across SPY, SPX and QQQ.
-  * ``--mode midday`` at 12:30 ET — mid-session update, same shape,
-    posted against the noon-hour snapshot.
-  * ``--mode close`` at 16:05 ET — closing update posted 5 min after
-    the cash bell.
+  * ``--mode premarket`` at 09:15 ET — the Morning Read, 15 min before the
+    cash open.
+  * ``--mode midday`` at 12:30 ET — the Midday Read.
+  * ``--mode close`` at 16:05 ET — the Post-Market Read, 5 min after the
+    cash bell.
 
-Every post FEATURES ONE symbol — the one with the cleanest setup at
-the moment the job fires (see :func:`select_featured_symbol`: the
-symbol whose spot is pressed closest to a decision level, with the
-gamma flip — the regime boundary — weighted above the walls, since a
-symbol straddling its flip is a stronger story than one merely pinned).
-SPY / SPX / QQQ are all still fetched so
-the copy can cross-reference the other two, but the headline, the
-numeric map and the attached card all center on the featured symbol.
+Every post features ONE symbol: ``$BULLETIN_TWEET_LEAD_SYMBOL`` (SPY by
+default), falling back to the symbol with the cleanest setup only when the
+lead has no data (see :func:`select_featured_symbol`).
 
-Every post includes:
+Every post is:
 
-  * A multi-paragraph, X-native read-out of the featured symbol's
-    levels sourced live from the same ``get_latest_gex_summary``
-    powering the Live Bulletin admin page — so the tweet and the
-    on-site card can never contradict each other.  The main post
-    carries NO site link and NO hashtags (the cashtag is in the
-    header); the ``https://zerogex.io`` link is posted separately as a
-    threaded reply so it doesn't suppress the main post's reach.
-  * A PNG attachment: a screenshot of the exact ``GammaReportCard``
-    component the paid /live-bulletin page renders, captured by the
-    frontend Playwright helper ``scripts/render-bulletin-png.mjs``
-    against the public snapshot route ``/live-bulletin/snapshot/<sym>``.
-    Optional — if Playwright isn't installed on the host the tweet
-    still goes out text-only.
-  * A short video/GIF clip attachment: the day's Replay scrubber
-    animated across the session frames, rendered by the frontend
-    ``scripts/render-replay-clip.mjs`` Playwright helper. Also optional
-    on the same graceful-degradation path.
+  * **The live bulletin, attached.**  The job screenshots the exact
+    ``GammaReportCard`` the paid /live-bulletin page renders (the frontend
+    Playwright helper ``scripts/render-bulletin-png.mjs`` against
+    ``/live-bulletin/snapshot/<sym>``) at the moment it fires, and attaches
+    that PNG to the post.
+  * **Quoting the card's own numbers.**  The helper also returns the levels
+    the card drew, and the post's key-levels list and prose are built from
+    those, so the post and the picture can't disagree.  On the close read
+    those are the next session's map (the day's 0DTE rolled off at the
+    bell), and the list is labeled as such; what the levels did during the
+    session comes from :mod:`src.jobs.level_history`.
+  * **Written from the latest CNBC headlines** (:mod:`src.jobs.cnbc_news`,
+    only items from the last ``$BULLETIN_TWEET_NEWS_MAX_AGE_HOURS``) and the
+    featured symbol's price action, by Claude (:mod:`src.jobs.bulletin_llm`),
+    in plain American English.  No site link or hashtags in the main post;
+    the ``https://zerogex.io`` link goes out as a threaded reply.
+  * **Reviewed before it goes anywhere.**  Python checks the header, the
+    levels list, the characters and the lengths; a second Claude call
+    fact-checks every claim against the headlines, the numbers and the card
+    image.  Problems the writer can fix go back to it once.
 
-Design rules — inherited wholesale from
-:mod:`src.jobs.forecast_tweet` and :mod:`src.jobs.scorecard_tweet`:
+**If anything goes wrong, nothing is posted.**  A missing image, a failed
+render, no fresh headlines, a writer or review failure, a problem the
+review still finds, a missed deadline, or an X API error all hold the post:
+the job writes the draft and the reasons to the artifact dir and the
+/admin/x-post review page, emails the operator (Resend), and exits 1 so
+systemd marks the run failed.  There is no text-only or template fallback.
 
-* **Never throws.** Every failure logs a WARNING and exits 0 so the
-  systemd timer keeps running tomorrow.
-* **Dry-run by default.** Live posting requires BOTH the ``--post``
-  flag AND ``X_BOT_BEARER_TOKEN`` (v2 tweet) plus the four OAuth1
+Other rules:
+
+* **Dry-run by default.**  Live posting requires the ``--post`` flag (or
+  ``--stage`` with ``BULLETIN_TWEET_AUTOPILOT=1``) plus the four OAuth1
   credentials (``X_BOT_API_KEY``, ``X_BOT_API_SECRET``,
-  ``X_BOT_ACCESS_TOKEN``, ``X_BOT_ACCESS_TOKEN_SECRET``) needed for
-  the v1.1 media/upload endpoint. Missing any of them silently
-  degrades to dry-run.
-* **Skip silently on non-trading days.** Half-days count as trading
-  days — the close still produces a legitimate read.
-* **Skip silently when the required data is missing.** A single
-  symbol's GEX row not being present doesn't kill the whole tweet;
-  the level block for that symbol is elided and the post goes out
-  with what did resolve. If NO symbols resolve, skip the post
-  entirely rather than emit a broken carcass.
-* **Dry-run writes to disk.** The rendered tweet body, PNG and clip
-  are persisted under
-  ``$BULLETIN_TWEET_ARTIFACT_DIR/<mode>/<date>/`` so the operator
-  can inspect exactly what would have gone out before flipping
-  ``--post`` on. Defaults to
+  ``X_BOT_ACCESS_TOKEN``, ``X_BOT_ACCESS_TOKEN_SECRET``), which sign both
+  the image upload and the post.
+* **Skip silently on non-trading days.**  Half-days count as trading days.
+* **Artifacts on disk.**  The post, reply, PNG and a manifest (with the
+  state and any problems) land under
+  ``$BULLETIN_TWEET_ARTIFACT_DIR/<mode>/<date>/``.  Defaults to
   ``/var/lib/zerogex-oa/bulletin-tweets`` and falls back to
   ``$XDG_STATE_HOME`` / ``$HOME/.local/state/zerogex-oa/…`` when the
   primary path isn't writable (dev laptops).
@@ -77,14 +68,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import html
 import json
 import logging
 import os
 import re
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
@@ -92,7 +87,6 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
-from src.config import INGEST_EXPIRATIONS
 from src.jobs import level_history as lh
 from src.jobs.index_projection import implied_index_spot
 from src.market_calendar import NYSE_HOLIDAYS
@@ -126,6 +120,16 @@ FLIP_PROXIMITY_WEIGHT = 0.6
 LONG_TWEET_MAX_LEN = 25_000  # X Premium long-form ceiling; classic 280 is the
 # floor the fallback body targets when the caller
 # doesn't have Premium enabled on the bot handle.
+# The threaded link reply is a standard post, so it has to fit X's classic cap
+# (a link counts as 23 characters however long it is).
+REPLY_MAX_LEN = 280
+X_LINK_LEN = 23
+# The latest ET time each fire may still post.  The timers are Persistent, so
+# a run delayed by downtime still fires later; a Morning Read that says
+# "heading into the open" must not go out at noon.
+POST_DEADLINE_ET = {"premarket": time(9, 30), "midday": time(14, 0), "close": time(18, 0)}
+# Only headlines published within this many hours count as the latest news.
+DEFAULT_NEWS_MAX_AGE_HOURS = 24.0
 
 # Modes ---------------------------------------------------------------------
 MODES = ("premarket", "midday", "close")
@@ -265,7 +269,9 @@ def _fmt_net_gex(v: float | None) -> str:
     if v is None:
         return "—"
     abs_v = abs(v)
-    sign = "+" if v >= 0 else "−"
+    # A plain hyphen, not the typographic minus the card draws: the post has
+    # to read as typed.
+    sign = "+" if v >= 0 else "-"
     if abs_v >= 1e9:
         return f"{sign}${abs_v / 1e9:.2f}B"
     if abs_v >= 1e6:
@@ -293,31 +299,22 @@ _CHARM_HEADLINE_MIN_USD = 1_000_000.0
 
 
 def _fmt_level(v: float | None) -> str:
-    """Format a strike/level for the ``Key levels:`` block.
+    """Format a level for the post, with the same digits the card shows.
 
-    Matches the operator's examples: whole-dollar walls print with no
-    decimals ("735", "740"), a computed gamma flip keeps two ("747.29"),
-    and index-scale values (>= 1000) get thousands separators."""
+    The Live Bulletin card prints prices under 1,000 to the cent ("745.00",
+    "747.29") and index-scale prices as whole numbers with separators
+    ("7,483").  The post rounds the same way (half up on the exact value, as
+    the browser does) and drops a whole number's ".00", which is how a
+    person writes a strike: "745", "747.29", "7,483"."""
     if v is None:
         return "—"
-    whole = abs(v - round(v)) < 0.005
+    exact = Decimal(v)
     if abs(v) >= 1000:
-        return f"{v:,.0f}" if whole else f"{v:,.2f}"
-    return f"{int(round(v))}" if whole else f"{v:.2f}"
-
-
-def _wall_scope_label() -> str:
-    """The expirations the Call and Put Wall are ranked over, as a DTE range.
-
-    The analytics engine ranks the walls across every expiration ingestion
-    carries: today's plus the next ``INGEST_EXPIRATIONS - 1`` (SPY has no
-    monthly chain alias), so by default they are 0–2DTE figures.  The site's
-    0DTE charts rank today's expiry alone and can show a different strike —
-    on 2026-09-21 the 0–2DTE call wall was 780 all afternoon while the 0DTE
-    wall walked 773 → 775 — so the post names the scope it is quoting."""
-    if INGEST_EXPIRATIONS <= 1:
-        return "0DTE"
-    return f"0–{INGEST_EXPIRATIONS - 1}DTE"
+        return f"{exact.quantize(Decimal(1), rounding=ROUND_HALF_UP):,}"
+    cents = exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if cents == cents.to_integral_value():
+        return f"{int(cents)}"
+    return f"{cents}"
 
 
 def _derive_regime(
@@ -414,9 +411,11 @@ class SymbolBulletin:
     # How the walls / flip MOVED through the session, and what price did to
     # each one while it was in force (see :mod:`src.jobs.level_history`).
     # Populated on the midday and close fires only — the pre-market read has
-    # no session path yet.  None everywhere else, and the post then renders
-    # exactly as it did before the tracking existed.
+    # no session path yet.  None everywhere else.
     level_history: "lh.LevelHistory | None" = None
+    # The card's own "as of" label once its numbers have replaced the ones
+    # from the database (see :func:`_apply_card_levels`); None until then.
+    card_as_of: str | None = None
 
     def has_any_level(self) -> bool:
         return any(
@@ -507,6 +506,11 @@ class TweetBody:
     symbols_present: list[str] = field(default_factory=list)
     reply_text: str = ""
     featured_symbol: str = ""
+    # The writer's raw fragments, so a review can hand them back for a rewrite.
+    llm_post: Any = None
+    # Why there's no post, when the writer couldn't produce one (``text`` is
+    # then empty).
+    problems: list[str] = field(default_factory=list)
 
 
 def _future_label(future_symbol: str | None) -> str:
@@ -656,28 +660,31 @@ def build_tweet_body(
     reply_text: str | None = None,
     headlines: list | None = None,
     force_featured: str | None = None,
+    revise_from: Any = None,
+    feedback: list[str] | None = None,
 ) -> TweetBody:
-    """Assemble the "…Read — $SYM" post + threaded reply for one fire.
+    """Assemble the "…Read - $SYM" post + threaded reply for one fire.
 
-    Layout (operator-approved voice):
+    Layout (the operator-approved voice):
 
-        <Morning|Midday|Post-Market> Read — $<FEATURED>
+        <Morning|Midday|Post-Market> Read - $<FEATURED>
 
-        <opening — hook + news + price action + dealer-gamma regime>
+        <two to four short paragraphs: news, price action, regime>
 
-        Key levels:
-        • <put wall>  → Put Wall (0–2DTE · <note>)
-        • <call wall> → Call Wall (0–2DTE · <note>)
-        • <flip>      → Gamma Flip (<note>)
+        Key levels:            (the close read: "Levels for tomorrow:")
+        • <put wall> put wall
+        • <call wall> call wall
+        • <flip> gamma flip
 
         Bottom line: <takeaway>
 
     The prose comes from Claude (:func:`_try_llm_post`), fed the day's
     headlines + the featured symbol's price action + its gamma structure.
-    Python owns every price in the ``Key levels:`` block and the reply's
-    link — the model never invents a level.  No site link / hashtags ride
-    in the main post; the ZeroGEX link goes out in the threaded reply.  On
-    any LLM failure we fall back to a deterministic post in the same shape."""
+    Python owns the header, every price in the levels list, and the reply's
+    link.  ``revise_from`` + ``feedback`` hand an earlier draft back with a
+    review's findings.  When the writer can't produce a post, ``text`` is
+    empty and ``problems`` says why: there is no template fallback, because a
+    post without the news is not one the operator wants published."""
     if mode not in MODE_READ_LABEL:
         raise ValueError(f"Unknown mode: {mode!r}")
     read_label = _mode_read_label(mode)
@@ -697,44 +704,49 @@ def build_tweet_body(
     if featured is None:
         featured = select_featured_symbol(bulletins, fallback=lead_symbol)
     if featured is None:
-        # Defensive floor — the runner skips empty days before we get here.
         featured_symbol = lead_symbol.upper()
-        header = f"{read_label} — ${featured_symbol}"
         return TweetBody(
-            text=header,
-            fallback=header,
+            text="",
+            fallback="",
             lead_symbol=featured_symbol,
             symbols_present=symbols_present,
-            reply_text=_compose_reply(None, site_url, reply_text),
             featured_symbol=featured_symbol,
+            problems=["No symbol had any data to write about."],
         )
 
     featured_symbol = featured.symbol
-
-    # LLM-generated post + reply if ANTHROPIC_API_KEY is set. Any failure
-    # (no key, API down, malformed reply, invented prices) returns None and
-    # we fall back to the deterministic post below — never fail the tweet
-    # just because the LLM path had a bad day.  Only the featured symbol is
-    # handed to the model — the posts are single-symbol, so this keeps the
-    # prose clean and the no-invented-price guard scoped to that symbol.
-    post = _try_llm_post(mode, day, [featured], featured_symbol, headlines)
-    if post is not None:
+    # Only the featured symbol is handed to the model — the posts are
+    # single-symbol, so this keeps the prose clean and the no-invented-price
+    # guard scoped to that symbol.
+    errors: list[str] = []
+    post = _try_llm_post(
+        mode,
+        day,
+        [featured],
+        featured_symbol,
+        headlines,
+        revise_from=revise_from,
+        feedback=feedback,
+        errors=errors,
+    )
+    if post is None:
+        reason = "; ".join(errors) or "no reason was given"
         return TweetBody(
-            text=_compose_new_post(post, featured, mode),
+            text="",
             fallback=_build_fallback_tweet(featured, read_label),
             lead_symbol=featured_symbol,
             symbols_present=symbols_present,
-            reply_text=_compose_reply(post.reply, site_url, reply_text),
             featured_symbol=featured_symbol,
+            problems=[f"The AI writer didn't produce a post ({reason})."],
         )
-
     return TweetBody(
-        text=_build_static_post(mode, featured),
+        text=_compose_new_post(post, featured, mode, day),
         fallback=_build_fallback_tweet(featured, read_label),
         lead_symbol=featured_symbol,
         symbols_present=symbols_present,
-        reply_text=_compose_reply(None, site_url, reply_text),
+        reply_text=_compose_reply(post.reply, site_url, reply_text),
         featured_symbol=featured_symbol,
+        llm_post=post,
     )
 
 
@@ -745,40 +757,43 @@ def _hget(h: Any, name: str, default: Any = None) -> Any:
     return getattr(h, name, default)
 
 
-def _fetch_headlines_safe() -> list:
-    """Scrape CNBC headlines for the LLM — never raises, ``[]`` on any issue."""
+def _news_max_age_hours() -> float:
+    raw = os.environ.get("BULLETIN_TWEET_NEWS_MAX_AGE_HOURS", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_NEWS_MAX_AGE_HOURS
+    except ValueError:
+        return DEFAULT_NEWS_MAX_AGE_HOURS
+    return value if value > 0 else DEFAULT_NEWS_MAX_AGE_HOURS
+
+
+def _fetch_fresh_headlines() -> tuple[list, str | None]:
+    """The latest CNBC headlines for the writer, and a problem when there are none.
+
+    Only items published within ``$BULLETIN_TWEET_NEWS_MAX_AGE_HOURS``
+    (default 24) count: the post has to be about today's news.  Never
+    raises."""
+    max_age = _news_max_age_hours()
     try:
         from src.jobs import cnbc_news  # noqa: WPS433 — optional
+
+        items = cnbc_news.fetch_headlines(max_age_hours=max_age)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet: cnbc_news import failed (%s)", exc)
-        return []
-    try:
-        return cnbc_news.fetch_headlines()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet: headline scrape failed (%s)", exc)
-        return []
+        logger.warning("bulletin_tweet: headline fetch failed (%s)", exc)
+        return [], f"The CNBC headlines couldn't be fetched ({exc})."
+    if not items:
+        return [], (
+            f"No CNBC headlines from the last {max_age:g} hours came back "
+            "(the feeds were down, stale, or turned off with "
+            "BULLETIN_TWEET_NEWS_ENABLED=0)."
+        )
+    return items, None
 
 
-def _try_llm_post(
-    mode: str,
-    day: date,
-    present: list[SymbolBulletin],
-    featured_symbol: str,
-    headlines: list | None = None,
-):
-    """Attempt LLM post+reply generation. Returns an ``LlmPost`` or None.
+def _llm_symbol_inputs(present: list[SymbolBulletin]) -> list:
+    """The writer's (and the reviewer's) view of each symbol."""
+    from src.jobs import bulletin_llm  # noqa: WPS433 — optional
 
-    Imports the LLM helper lazily so a broken import cannot take down the
-    static-template path.  All ``present`` symbols are passed so the model
-    can cross-reference; ``featured_symbol`` is the one the post centers on.
-    ``headlines`` are the scraped CNBC items (NewsItem objects or dicts)."""
-    try:
-        from src.jobs import bulletin_llm  # noqa: WPS433 — optional
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet: bulletin_llm import failed (%s)", exc)
-        return None
-
-    inputs = [
+    return [
         bulletin_llm.SymbolInput(
             symbol=b.symbol,
             spot=b.spot,
@@ -811,6 +826,12 @@ def _try_llm_post(
         )
         for b in present
     ]
+
+
+def _llm_headlines(headlines: list | None) -> list:
+    """The scraped CNBC items (NewsItem objects or dicts) as prompt Headlines."""
+    from src.jobs import bulletin_llm  # noqa: WPS433 — optional
+
     heads = []
     for h in headlines or []:
         title = _hget(h, "title", "")
@@ -824,23 +845,42 @@ def _try_llm_post(
                 published=_hget(h, "published"),
             )
         )
+    return heads
+
+
+def _try_llm_post(
+    mode: str,
+    day: date,
+    present: list[SymbolBulletin],
+    featured_symbol: str,
+    headlines: list | None = None,
+    revise_from: Any = None,
+    feedback: list[str] | None = None,
+    errors: list[str] | None = None,
+):
+    """Attempt LLM post+reply generation. Returns an ``LlmPost`` or None.
+
+    ``featured_symbol`` is the symbol the post centers on; ``headlines``
+    are the scraped CNBC items.  On failure the reason is appended to
+    ``errors``.  Never raises."""
     try:
+        from src.jobs import bulletin_llm  # noqa: WPS433 — optional
+
         return bulletin_llm.generate_post(
             mode=mode,
             day=day,
-            symbols=inputs,
-            headlines=heads,
+            symbols=_llm_symbol_inputs(present),
+            headlines=_llm_headlines(headlines),
             featured_symbol=featured_symbol,
+            revise_from=revise_from,
+            feedback=feedback,
+            errors=errors,
         )
     except Exception as exc:  # noqa: BLE001 — never let the LLM path throw
         logger.warning("bulletin_tweet: LLM post generation failed (%s)", exc)
+        if errors is not None:
+            errors.append(f"the writer crashed ({exc})")
         return None
-
-
-def _valid_read_label(label: str | None, mode: str) -> str:
-    """Accept the model's header only if it's one of the three read labels."""
-    want = {v.lower(): v for v in MODE_READ_LABEL.values()}
-    return want.get((label or "").strip().lower(), _mode_read_label(mode))
 
 
 def _append_para(blocks: list[str], value: str) -> None:
@@ -853,158 +893,368 @@ def _append_para(blocks: list[str], value: str) -> None:
     blocks.append(stripped)
 
 
-def _key_levels_block(featured: SymbolBulletin, level_notes: dict[str, str] | None) -> str:
-    """The deterministic ``• <price> → <label>`` block — Python owns the prices.
+# The key-levels list, in the order the operator reads it.
+KEY_LEVELS = (("put_wall", "put wall"), ("call_wall", "call wall"), ("gamma_flip", "gamma flip"))
 
-    Order matches the operator's examples: Put Wall, Call Wall, Gamma Flip.
-    Only levels present in the DB row render; a short note is shown in
-    parentheses after the base label, behind the walls' expiration scope
-    ("Call Wall (0–2DTE · tested and held)") — see :func:`_wall_scope_label`.
 
-    The note comes from the session's own level path when we have one — the
-    walls migrate through the day, and what price did to each print is a fact
-    the tape already settled, not something to leave to the model.  That
-    reading beats the LLM's note, which only ever saw the closing snapshot
-    and would happily call a wall "never tested" when the tape had broken two
-    earlier prints of it.  The LLM note is the fallback for pre-market fires
-    and for days with too thin a path to read."""
-    notes = level_notes or {}
-    specs = (
-        ("put_wall", featured.put_wall, "Put Wall"),
-        ("call_wall", featured.call_wall, "Call Wall"),
-        ("gamma_flip", featured.gamma_flip, "Gamma Flip"),
-    )
-    lines: list[str] = []
-    for key, value, base in specs:
-        if value is None:
-            continue
-        note = lh.note_for(featured.level_history, key) or (notes.get(key) or "").strip()
-        scope = _wall_scope_label() if key in lh.WALL_KEYS else ""
-        detail = " · ".join(part for part in (scope, note) if part)
-        label = f"{base} ({detail})" if detail else base
-        lines.append(f"• {_fmt_level(value)} → {label}")
+def _next_trading_day(day: date) -> date | None:
+    cursor = day + timedelta(days=1)
+    for _ in range(10):
+        if _is_trading_day(cursor):
+            return cursor
+        cursor += timedelta(days=1)
+    return None
+
+
+def _levels_heading(mode: str, day: date) -> str:
+    """The key-levels list's heading.
+
+    The close read quotes what the live card shows at 16:05, which is the
+    next session's map (the day's 0DTE rolled off at the bell), so it says so
+    rather than passing tomorrow's levels off as today's."""
+    if mode != "close":
+        return "Key levels:"
+    nxt = _next_trading_day(day)
+    if nxt is None or nxt == day + timedelta(days=1):
+        return "Levels for tomorrow:"
+    return f"Levels for {nxt.strftime('%A')}:"
+
+
+def _key_level_line(value: float, label: str) -> str:
+    return f"• {_fmt_level(value)} {label}"
+
+
+def _key_levels_block(featured: SymbolBulletin) -> str:
+    """The ``• <price> <level>`` lines, written the way a person types them.
+
+    Python owns every price here, and they are the live card's numbers (see
+    :func:`_apply_card_levels`).  No expiration scope and no annotations: the
+    prose says what happened at a level, the list just says where it is."""
+    lines = [
+        _key_level_line(value, label)
+        for key, label in KEY_LEVELS
+        if (value := getattr(featured, key)) is not None
+    ]
     return "\n".join(lines)
 
 
-def _append_key_levels(blocks: list[str], featured: SymbolBulletin, notes: dict[str, str]) -> None:
-    """Append the ``Key levels:`` paragraph plus the after-the-bell line.
-
-    The trailing line only renders on a close fire whose chain re-priced once
-    the day's 0DTE rolled off — see :func:`level_history.post_close_line`.  It
-    is its own paragraph so the bullets stay a clean, scannable block."""
-    levels = _key_levels_block(featured, notes)
+def _append_key_levels(blocks: list[str], featured: SymbolBulletin, mode: str, day: date) -> None:
+    levels = _key_levels_block(featured)
     if levels:
-        _append_para(blocks, "Key levels:\n" + levels)
-    _append_para(blocks, lh.post_close_line(featured.level_history))
+        _append_para(blocks, f"{_levels_heading(mode, day)}\n{levels}")
 
 
-def _compose_new_post(post, featured: SymbolBulletin, mode: str) -> str:
+def _post_header(mode: str, symbol: str) -> str:
+    """The first line, with a plain hyphen: "Midday Read - $SPY"."""
+    return f"{_mode_read_label(mode)} - ${symbol}"
+
+
+_BOTTOM_LINE_LABEL_RE = re.compile(r"^\s*bottom\s+line\s*[:\-]\s*", re.IGNORECASE)
+
+
+def _compose_new_post(post, featured: SymbolBulletin, mode: str, day: date) -> str:
     """Assemble the post body around an LLM-generated ``LlmPost``.
 
-        <Read label> — $<SYM>
+        <Read label> - $<SYM>
 
         {opening}
 
         Key levels:
-        {• … block}
+        {• … list}
 
         Bottom line: {bottom_line}
 
     Empty sections are elided.  No link / hashtags — the link rides in the
     threaded reply."""
-    header_label = _valid_read_label(post.header_label, mode)
-    blocks: list[str] = [f"{header_label} — ${featured.symbol}"]
+    blocks: list[str] = [_post_header(mode, featured.symbol)]
     _append_para(blocks, post.opening)
-    _append_key_levels(blocks, featured, post.level_notes)
-    if post.bottom_line.strip():
-        _append_para(blocks, f"Bottom line: {post.bottom_line.strip()}")
-    return "\n".join(blocks).strip()
-
-
-def _static_hook(featured: SymbolBulletin, mode: str) -> str:
-    """A short, factual opener for the no-LLM fallback — no invented color."""
-    parts: list[str] = []
-    if featured.spot is not None:
-        if featured.gamma_flip is not None:
-            rel = "below" if featured.spot < featured.gamma_flip else "above"
-            parts.append(
-                f"{featured.symbol} is trading ~{_fmt_price_spot(featured.spot)}, "
-                f"{rel} the {_fmt_level(featured.gamma_flip)} gamma flip."
-            )
-        else:
-            parts.append(f"{featured.symbol} is trading ~{_fmt_price_spot(featured.spot)}.")
-    if featured.net_gex is not None:
-        regime = featured.regime or _derive_regime(
-            featured.net_gex, featured.spot, featured.gamma_flip
-        )
-        if regime == "negative":
-            parts.append(
-                f"Dealers are net {_fmt_net_gex(featured.net_gex)} — short gamma, so "
-                f"hedging tends to amplify moves rather than dampen them."
-            )
-        elif regime == "positive":
-            parts.append(
-                f"Dealers are net {_fmt_net_gex(featured.net_gex)} — long gamma, so "
-                f"hedging tends to dampen moves."
-            )
-        else:
-            parts.append(f"Dealers are net {_fmt_net_gex(featured.net_gex)}.")
-    return " ".join(parts) if parts else f"{featured.symbol} {_mode_read_label(mode).lower()}."
-
-
-def _static_bottom_line(featured: SymbolBulletin) -> str:
-    if featured.gamma_flip is not None and featured.spot is not None:
-        if featured.spot < featured.gamma_flip:
-            return (
-                f"Structure stays defensive until {featured.symbol} can reclaim the "
-                f"{_fmt_level(featured.gamma_flip)} gamma flip."
-            )
-        return (
-            f"{featured.symbol} is holding above the {_fmt_level(featured.gamma_flip)} "
-            f"gamma flip — constructive as long as that holds."
-        )
-    return "Watch the levels above for where dealer hedging shifts."
-
-
-def _build_static_post(mode: str, featured: SymbolBulletin) -> str:
-    """Deterministic new-voice post for when the LLM is unavailable.
-
-    Same shape as the LLM path (header, hook, Key levels, Bottom line) but
-    built only from the DB numbers — no scraped news, no narrated path."""
-    blocks: list[str] = [f"{_mode_read_label(mode)} — ${featured.symbol}"]
-    _append_para(blocks, _static_hook(featured, mode))
-    _append_key_levels(blocks, featured, {})
-    _append_para(blocks, f"Bottom line: {_static_bottom_line(featured)}")
+    _append_key_levels(blocks, featured, mode, day)
+    bottom = _BOTTOM_LINE_LABEL_RE.sub("", post.bottom_line or "").strip()
+    if bottom:
+        _append_para(blocks, f"Bottom line: {bottom}")
     return "\n".join(blocks).strip()
 
 
 def _build_fallback_tweet(featured: SymbolBulletin, label: str) -> str:
-    """A ≤280-char compression of the featured symbol's read.
+    """A ≤280-char version of the featured symbol's levels, for ``--short``.
 
-    Used when the bot handle isn't X-Premium enabled: we still want to
-    post *something* rather than silently swallowing the fire.  Carries
-    the featured symbol's spot + gamma flip + walls + Net GEX and NO
-    link (the link goes out as the threaded reply).  Trimmed with an
-    ellipsis if it somehow overflows (rare — one symbol fits easily)."""
-    parts = [f"${featured.symbol} {label}"]
+    Only the card's numbers, written out plainly, with no link (the link goes
+    out as the threaded reply).  Trimmed if it somehow overflows (rare; one
+    symbol fits easily)."""
+    parts: list[str] = []
     if featured.spot is not None:
-        spot_txt = f"~{_fmt_price(featured.spot)}"
+        spot_txt = f"spot {_fmt_level(featured.spot)}"
         if featured.spot_is_projected:
-            spot_txt += f" (impl {_future_label(featured.future_symbol)})"
+            spot_txt += f" (implied from {_future_label(featured.future_symbol)} futures)"
         parts.append(spot_txt)
-    if featured.gamma_flip is not None:
-        parts.append(f"Flip {_fmt_price(featured.gamma_flip)}")
-    if featured.call_wall is not None and featured.put_wall is not None:
-        parts.append(
-            f"CW {_fmt_price(featured.call_wall)} / PW {_fmt_price(featured.put_wall)} "
-            f"({_wall_scope_label()})"
-        )
+    for key, name in (
+        ("gamma_flip", "gamma flip"),
+        ("call_wall", "call wall"),
+        ("put_wall", "put wall"),
+    ):
+        value = getattr(featured, key)
+        if value is not None:
+            parts.append(f"{name} {_fmt_level(value)}")
     if featured.net_gex is not None:
-        parts.append(f"Net GEX {_fmt_net_gex(featured.net_gex)}")
-    text = " · ".join(parts)
+        parts.append(f"net GEX {_fmt_net_gex(featured.net_gex)}")
+    head = f"{label} - ${featured.symbol}"
+    text = f"{head}: {', '.join(parts)}" if parts else head
     if len(text) <= 280:
         return text
-    return text[:279].rstrip(" ·,.") + "…"
+    return text[:279].rstrip(" ,.") + "…"
+
+
+# ---------------------------------------------------------------------------
+# Review gate — nothing goes out until the finished post passes
+# ---------------------------------------------------------------------------
+
+# Characters that give a post away as generated: nobody types these by hand.
+_BANNED_CHARACTERS = {
+    "—": "an em dash",
+    "–": "an en dash",
+    "→": "an arrow",
+    "…": "an ellipsis character",
+    "−": "a typographic minus sign",
+}
+# Common British spellings and their American forms.  Lowercase matches only,
+# so a proper noun ("Ministry of Defence") doesn't trip it; the fact-check
+# reads for spelling too.
+_BRITISH_SPELLINGS = {
+    "colour": "color",
+    "colours": "colors",
+    "favour": "favor",
+    "favoured": "favored",
+    "favourable": "favorable",
+    "behaviour": "behavior",
+    "neighbour": "neighbor",
+    "rumour": "rumor",
+    "rumours": "rumors",
+    "centre": "center",
+    "centred": "centered",
+    "defence": "defense",
+    "offence": "offense",
+    "licence": "license",
+    "analyse": "analyze",
+    "analysed": "analyzed",
+    "analysing": "analyzing",
+    "realise": "realize",
+    "realised": "realized",
+    "recognise": "recognize",
+    "recognised": "recognized",
+    "emphasise": "emphasize",
+    "stabilise": "stabilize",
+    "stabilised": "stabilized",
+    "normalise": "normalize",
+    "summarise": "summarize",
+    "prioritise": "prioritize",
+    "whilst": "while",
+    "amongst": "among",
+    "programme": "program",
+    "grey": "gray",
+    "sceptical": "skeptical",
+    "manoeuvre": "maneuver",
+}
+_BRITISH_RE = re.compile(
+    r"\b(" + "|".join(sorted(_BRITISH_SPELLINGS, key=len, reverse=True)) + r")\b"
+)
+_EMOJI_RE = re.compile("[\U0001f000-\U0001faff☀-➿️]")
+_HASHTAG_RE = re.compile(r"(?<![\w&/])#[A-Za-z]\w*")
+_MARKDOWN_RE = re.compile(r"\*\*|__|^\s{0,3}#{1,6}\s", re.MULTILINE)
+_SITE_MENTION_RE = re.compile(r"https?://\S+|\bzerogex\.io\b", re.IGNORECASE)
+
+
+def _x_length(text: str) -> int:
+    """A post's length as X counts it: every link is 23 characters."""
+    return len(_URL_RE.sub("x" * X_LINK_LEN, text))
+
+
+def _text_problems(
+    tweet: TweetBody,
+    featured: SymbolBulletin | None,
+    mode: str,
+) -> list[str]:
+    """Checks on the finished post and reply that the writer can fix."""
+    text = tweet.text or ""
+    if not text.strip() or featured is None:
+        return []
+    problems: list[str] = []
+    first_line = text.splitlines()[0]
+    want = _post_header(mode, featured.symbol)
+    if first_line != want:
+        problems.append(f'The first line is "{first_line}" but should be "{want}".')
+    for key, label in KEY_LEVELS:
+        value = getattr(featured, key)
+        if value is not None and _key_level_line(value, label) not in text:
+            problems.append(f"The key levels list is missing the {label} at {_fmt_level(value)}.")
+    reply = tweet.reply_text or ""
+    for where, body in (("post", text), ("reply", reply)):
+        for char, name in _BANNED_CHARACTERS.items():
+            if char in body:
+                problems.append(
+                    f"The {where} uses {name} ({char}); use a comma, a period or a plain hyphen."
+                )
+        if _EMOJI_RE.search(body):
+            problems.append(f"The {where} contains an emoji.")
+        if _HASHTAG_RE.search(body):
+            problems.append(f"The {where} contains a hashtag.")
+        if _MARKDOWN_RE.search(body):
+            problems.append(f"The {where} contains markdown formatting.")
+        for word in sorted(set(_BRITISH_RE.findall(body))):
+            problems.append(
+                f'The {where} uses the British spelling "{word}" '
+                f'(American: "{_BRITISH_SPELLINGS[word]}").'
+            )
+    if _SITE_MENTION_RE.search(text):
+        problems.append("The post contains a link; the link belongs in the threaded reply only.")
+    if len(text) > LONG_TWEET_MAX_LEN:
+        problems.append(
+            f"The post is {len(text):,} characters, over X's {LONG_TWEET_MAX_LEN:,} limit."
+        )
+    if not reply.strip():
+        problems.append("There's no threaded reply.")
+    else:
+        if not _URL_RE.search(reply):
+            problems.append("The threaded reply has no link.")
+        if _x_length(reply) > REPLY_MAX_LEN:
+            problems.append(
+                f"The reply is {_x_length(reply)} characters as X counts them, "
+                f"over the {REPLY_MAX_LEN} limit."
+            )
+    return problems
+
+
+def _data_problems(
+    featured: SymbolBulletin | None,
+    card: "CardRender | None",
+    news_problem: str | None,
+    image_required: bool = True,
+) -> list[str]:
+    """What's missing from the inputs.  The writer can't fix these."""
+    if featured is None:
+        return ["No symbol had any data to post about."]
+    problems: list[str] = []
+    if image_required:
+        if card is None:
+            problems.append("The live bulletin image wasn't rendered.")
+        elif card.error:
+            problems.append(card.error)
+    for key, label in KEY_LEVELS:
+        if getattr(featured, key) is None:
+            problems.append(
+                f"The live bulletin shows no {label} for {featured.symbol}, "
+                "so the key levels would be incomplete."
+            )
+    if featured.spot is None:
+        problems.append(f"There's no {featured.symbol} price to write from.")
+    if news_problem:
+        problems.append(news_problem)
+    return problems
+
+
+@dataclass
+class ReviewResult:
+    """What the review found.  ``fixable`` goes back to the writer once;
+    ``blocking`` (image problems, a review that couldn't run) can't be fixed
+    by rewriting."""
+
+    fixable: list[str] = field(default_factory=list)
+    blocking: list[str] = field(default_factory=list)
+
+    @property
+    def problems(self) -> list[str]:
+        return self.fixable + self.blocking
+
+
+def _review(
+    mode: str,
+    day: date,
+    tweet: TweetBody,
+    featured: SymbolBulletin,
+    headlines: list | None,
+    card_png: bytes | None,
+) -> ReviewResult:
+    """The deterministic checks plus the independent fact-check."""
+    result = ReviewResult(fixable=_text_problems(tweet, featured, mode))
+    try:
+        from src.jobs import bulletin_llm  # noqa: WPS433 — optional
+
+        review = bulletin_llm.review_post(
+            mode=mode,
+            day=day,
+            post_text=tweet.text,
+            reply_text=tweet.reply_text,
+            symbol=_llm_symbol_inputs([featured])[0],
+            headlines=_llm_headlines(headlines),
+            card_png=card_png,
+        )
+    except Exception as exc:  # noqa: BLE001 — a crash here holds the post
+        logger.warning("bulletin_tweet: review crashed (%s)", exc)
+        result.blocking.append(f"The fact-check crashed ({exc}).")
+        return result
+    if not review.ran:
+        result.blocking.append(f"The fact-check couldn't run ({review.error}).")
+    result.fixable += review.problems
+    result.blocking += [f"Image: {p}" for p in review.image_problems]
+    return result
+
+
+def _write_and_review(
+    mode: str,
+    day: date,
+    bulletins: list[SymbolBulletin],
+    featured: SymbolBulletin,
+    headlines: list | None,
+    card_png: bytes | None,
+    site_url: str,
+) -> tuple[TweetBody, list[str]]:
+    """Write the post, review it, and give the writer one chance to fix
+    what the review found.  Returns the final post and what's still wrong."""
+    reply_override = os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None
+
+    def _write(revise_from: Any = None, feedback: list[str] | None = None) -> TweetBody:
+        return build_tweet_body(
+            mode=mode,
+            day=day,
+            bulletins=bulletins,
+            site_url=site_url,
+            lead_symbol=featured.symbol,
+            reply_text=reply_override,
+            headlines=headlines,
+            force_featured=featured.symbol,
+            revise_from=revise_from,
+            feedback=feedback,
+        )
+
+    tweet = _write()
+    if not tweet.text:
+        return tweet, list(tweet.problems)
+    review = _review(mode, day, tweet, featured, headlines, card_png)
+    if review.fixable:
+        logger.warning(
+            "bulletin_tweet[%s]: review found problems, asking for a rewrite: %s",
+            mode,
+            "; ".join(review.fixable),
+        )
+        revised = _write(revise_from=tweet.llm_post, feedback=review.fixable)
+        if not revised.text:
+            return tweet, review.problems + revised.problems
+        tweet = revised
+        review = _review(mode, day, tweet, featured, headlines, card_png)
+    return tweet, review.problems
+
+
+def _deadline_problem(mode: str, day: date, now: datetime | None = None) -> str | None:
+    """Why it's too late to post this fire, or None."""
+    now = now or datetime.now(tz=ET)
+    if day != now.date():
+        return f"The post is for {day.isoformat()}, not today, so it wasn't sent."
+    deadline = POST_DEADLINE_ET.get(mode)
+    if deadline is not None and now.time() >= deadline:
+        return (
+            f"It was {now.strftime('%-I:%M %p')} ET, past the {deadline.strftime('%-I:%M %p')} "
+            f"cutoff for the {_mode_read_label(mode)}, so it wasn't sent."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1103,8 +1353,15 @@ def build_latest_record(
     headlines: list | None = None,
     media: "MediaArtifacts | None" = None,
     generated_at: str | None = None,
+    status: str | None = None,
+    problems: list[str] | None = None,
+    tweet_url: str | None = None,
 ) -> dict[str, Any]:
-    """The JSON payload the review page renders (post text + reply + meta)."""
+    """The JSON payload the review page renders (post text + reply + meta).
+
+    ``status`` says what happened to the post: ``posted``, ``ready`` (passed
+    review, waiting for the operator), ``blocked`` (held back; ``problems``
+    says why), ``post_failed``, ``dry_run`` or ``regenerated``."""
     heads = []
     for h in (headlines or [])[:8]:
         heads.append(
@@ -1127,6 +1384,8 @@ def build_latest_record(
             "max_pain": featured.max_pain,
             "net_gex": featured.net_gex,
             "regime": featured.regime,
+            # The live card's "as of" label when the levels came from it.
+            "card_as_of": featured.card_as_of,
             # The session's level path (walls that migrated, what price did
             # to each print, the post-bell roll-off).  Null on pre-market
             # fires and on days with too thin a path to read.  Lets the
@@ -1150,6 +1409,9 @@ def build_latest_record(
             "png": str(media.png_path) if media and media.png_path else None,
             "clip": str(media.clip_path) if media and media.clip_path else None,
         },
+        "status": status,
+        "problems": list(problems or []),
+        "tweet_url": tweet_url,
     }
 
 
@@ -1198,6 +1460,29 @@ def read_latest_record(symbol: str, mode: str) -> dict[str, Any] | None:
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("bulletin_tweet: failed to read latest record %s (%s)", path, exc)
             # Keep looking in the remaining candidate roots.
+    return None
+
+
+def latest_image_path(record: dict[str, Any] | None) -> Path | None:
+    """The PNG a latest record attached, if it's still on disk.
+
+    Only a .png inside one of the artifact roots is served, so a hand-edited
+    record can't point the review page at any other file on the box."""
+    png = ((record or {}).get("media") or {}).get("png")
+    if not png:
+        return None
+    try:
+        path = Path(str(png)).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if path.suffix.lower() != ".png" or not path.is_file():
+        return None
+    for root in _artifact_root_candidates():
+        try:
+            path.relative_to(root.resolve())
+            return path
+        except (ValueError, OSError, RuntimeError):
+            continue
     return None
 
 
@@ -1252,12 +1537,13 @@ async def generate_and_store(
     day: date | None = None,
     site_url: str | None = None,
 ) -> dict[str, Any]:
-    """Generate a post+reply for (symbol, mode), persist it, and return the record.
+    """Generate a post+reply for (symbol, mode), review it, persist it, and return the record.
 
     Backs the /admin review page's Regenerate button.  Reuses an already-
-    connected ``db`` (the API's shared manager) — it never connects/posts and
-    skips media rendering so the page responds fast; the scheduled job remains
-    the one that renders the PNG/clip for the eventual X post."""
+    connected ``db`` (the API's shared manager) and never posts.  The API
+    can't run the screenshot, so the levels come from the same latest
+    summary the live card reads, the fact-check runs without the image, and
+    the page points the operator at the Live Bulletin page to export one."""
     if mode not in MODE_READ_LABEL:
         raise ValueError(f"Unknown mode: {mode!r}")
     day = day or _today_et()
@@ -1265,21 +1551,16 @@ async def generate_and_store(
     site = site_url or os.environ.get("ZEROGEX_SITE_URL", "").strip() or DEFAULT_SITE_URL
 
     bulletins = await _fetch_bulletins(db, [symbol], day, mode)
-    headlines = _fetch_headlines_safe()
-    tweet = build_tweet_body(
-        mode=mode,
-        day=day,
-        bulletins=bulletins,
-        site_url=site,
-        lead_symbol=symbol,
-        reply_text=os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None,
-        headlines=headlines,
-        force_featured=symbol,
-    )
-    featured = next(
-        (b for b in bulletins if b.symbol == tweet.featured_symbol),
-        next((b for b in bulletins if b.symbol == symbol), None),
-    )
+    featured = _choose_featured(bulletins, symbol)
+    headlines, news_problem = _fetch_fresh_headlines()
+    problems = _data_problems(featured, None, news_problem, image_required=False)
+    if featured is None:
+        tweet = TweetBody(text="", fallback="", lead_symbol=symbol, featured_symbol=symbol)
+    else:
+        tweet, draft_problems = _write_and_review(
+            mode, day, bulletins, featured, headlines, None, site
+        )
+        problems += draft_problems
     record = build_latest_record(
         mode=mode,
         day=day,
@@ -1287,9 +1568,21 @@ async def generate_and_store(
         featured=featured,
         headlines=headlines,
         generated_at=datetime.now(tz=ET).isoformat(),
+        status="regenerated",
+        problems=problems,
     )
     write_latest_record(record)
     return record
+
+
+def _choose_featured(bulletins: list[SymbolBulletin], lead_symbol: str) -> SymbolBulletin | None:
+    """The symbol this fire is about: the lead symbol when it has data, else
+    the cleanest setup (see :func:`select_featured_symbol`)."""
+    lead = lead_symbol.upper()
+    for b in bulletins:
+        if b.symbol.upper() == lead and (b.has_any_level() or b.spot is not None):
+            return b
+    return select_featured_symbol(bulletins, fallback=lead)
 
 
 # ---------------------------------------------------------------------------
@@ -1299,10 +1592,27 @@ async def generate_and_store(
 
 @dataclass
 class MediaArtifacts:
-    """Paths to the rendered media, or None when a render failed."""
+    """Paths to the rendered media, or None when a render failed.
+
+    ``clip_path`` is kept for the manifest's shape; the replay clip is no
+    longer attached (X takes up to four images or one video per post, not a
+    mix, and the post's picture is the live bulletin)."""
 
     png_path: Path | None = None
     clip_path: Path | None = None
+
+
+@dataclass
+class CardRender:
+    """One screenshot of the live bulletin card and the numbers it drew."""
+
+    png_path: Path | None = None
+    levels: dict[str, Any] | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.png_path is not None and self.levels is not None
 
 
 def _locate_frontend_helper(
@@ -1340,23 +1650,17 @@ def _locate_frontend_helper(
 def _run_frontend_helper(
     helper: Path,
     cmd_args: list[str],
-    out_path: Path,
     timeout_seconds: int,
     label: str,
-) -> Path | None:
-    """Run a node <helper> subprocess and return ``out_path`` on success.
-
-    Shared by both media helpers so their failure-logging and non-zero-
-    exit handling stays consistent. Any non-zero exit or empty output
-    file returns None and logs a warning — the caller degrades to a
-    text-only (or PNG-only) tweet.
+) -> tuple[int | None, str]:
+    """Run ``node <helper> <args>``: (exit code, stderr tail), or (None, why)
+    when it couldn't run at all.
 
     Systemd runs with a stripped PATH — nvm-installed node isn't
     reachable via bare ``node``.  Operators can either symlink node
     into /usr/local/bin OR set ``BULLETIN_TWEET_NODE_BINARY`` in .env
     to the full path (e.g.
     ``/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node``)."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     node_bin = os.environ.get("BULLETIN_TWEET_NODE_BINARY", "").strip() or "node"
     cmd = [node_bin, str(helper), *cmd_args]
     try:
@@ -1367,178 +1671,171 @@ def _run_frontend_helper(
             timeout=timeout_seconds,
             check=False,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        logger.warning("bulletin_tweet: %s helper failed (%s) — %s", label, cmd, exc)
-        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("bulletin_tweet: %s helper timed out after %ds", label, timeout_seconds)
+        return None, f"it took longer than {timeout_seconds} seconds"
+    except FileNotFoundError:
+        return None, (
+            f"{node_bin!r} wasn't found (set BULLETIN_TWEET_NODE_BINARY, or run "
+            "make bulletin-tweet-bootstrap)"
+        )
     except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: %s helper couldn't start (%s)", label, exc)
+        return None, f"it couldn't start ({exc})"
+    tail = (proc.stderr or "").strip()[-500:]
+    if proc.returncode != 0:
         logger.warning(
-            "bulletin_tweet: %s helper unexpected error (%s) — %s",
-            label,
-            cmd,
-            exc,
+            "bulletin_tweet: %s helper exited %d, stderr: %s", label, proc.returncode, tail
         )
+    return proc.returncode, tail
+
+
+# What each of render-bulletin-png.mjs's exit codes means, for the notice.
+_CARD_EXIT_REASONS = {
+    2: (
+        "playwright-core isn't installed in zerogex-web/frontend (deploy the website, "
+        "then run make bulletin-tweet-bootstrap in zerogex-oa)"
+    ),
+    3: (
+        "the snapshot page had no bulletin card (check BULLETIN_SNAPSHOT_TOKEN is the "
+        "same in both .env files)"
+    ),
+    4: "the screenshot came out empty",
+    5: "the card never finished loading (its data or logo didn't load)",
+    6: "Chromium couldn't start (run make bulletin-tweet-bootstrap in zerogex-oa)",
+}
+# A rendered card is ~1280 px wide (640 CSS px at 2x); much smaller isn't one.
+_MIN_CARD_PX = (600, 400)
+
+
+def _png_dimensions(path: Path) -> tuple[int, int] | None:
+    """(width, height) from a PNG's header, or None when it isn't a PNG."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(24)
+    except OSError:
         return None
-
-    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
-        logger.warning(
-            "bulletin_tweet: %s helper exited %d, stderr: %s",
-            label,
-            proc.returncode,
-            proc.stderr[:500],
-        )
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
         return None
-    return out_path
+    return struct.unpack(">II", head[16:24])
 
 
-def render_bulletin_png(
+def render_bulletin_card(
     symbol: str,
-    day: date,
     mode: str,
     site_url: str,
     out_path: Path,
     helper_path: str | None = None,
-    timeout_seconds: int = 90,
-) -> Path | None:
-    """Screenshot the Live Bulletin card via the frontend's Playwright helper.
+    timeout_seconds: int = 120,
+) -> CardRender:
+    """Screenshot the live bulletin card and read back the numbers it drew.
 
     The helper (``frontend/scripts/render-bulletin-png.mjs``) visits
-    ``/live-bulletin/snapshot/{symbol}``, waits for the card's ready
-    signal, and captures the ``[data-bulletin-card]`` element as PNG.
-    This screenshots the SAME ``<GammaReportCard>`` component the paid
-    /live-bulletin page renders — no parallel implementation, no drift.
+    ``/live-bulletin/snapshot/{symbol}``, waits for the card's ready signal,
+    captures the ``[data-bulletin-card]`` element as PNG, and writes the
+    card's own levels next to it.  This is the SAME ``<GammaReportCard>``
+    the paid /live-bulletin page renders, at the moment the job fires.
 
-    Requires Playwright installed on the host running this cron. When
-    it isn't, the helper exits with code 2 and we log + return None so
-    the tweet still goes out text-only. The v1 dry-run + text-only
-    posting paths were validated against the ripped-out ``next/og``
-    fallback; the render is graceful-degradation-tested.
+    The snapshot page is token-gated by ``BULLETIN_SNAPSHOT_TOKEN`` on the
+    frontend side; we pass the same value from env here so a stranger can't
+    hit the public route and scrape gamma data.
 
-    The snapshot page is token-gated by ``BULLETIN_SNAPSHOT_TOKEN`` on
-    the frontend side; we pass the same value from env here so a
-    stranger can't hit the public route and scrape gamma data."""
+    Every failure comes back as ``error``, in words the operator's notice
+    can use; the caller holds the post."""
     helper = _locate_frontend_helper(
         "render-bulletin-png.mjs",
         helper_path,
         "BULLETIN_TWEET_PNG_HELPER",
     )
     if helper is None:
-        logger.info(
-            "bulletin_tweet: bulletin-png helper not found — skipping PNG attachment",
+        return CardRender(
+            error=(
+                "The live bulletin screenshot script (zerogex-web/frontend/scripts/"
+                "render-bulletin-png.mjs) wasn't found on this server; set "
+                "ZEROGEX_WEB_DIR in the zerogex-oa .env."
+            )
         )
-        return None
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = out_path.with_suffix(".json")
+    # A failed run must not leave an older picture behind to be attached.
+    for stale in (out_path, meta_path):
+        stale.unlink(missing_ok=True)
 
-    token = os.environ.get("BULLETIN_SNAPSHOT_TOKEN", "").strip()
     cmd_args = [
         "--symbol",
         symbol.upper(),
         "--mode",
         mode,
-        "--date",
-        day.isoformat(),
         "--site-url",
         site_url,
         "--out",
         str(out_path),
+        "--meta-out",
+        str(meta_path),
     ]
+    token = os.environ.get("BULLETIN_SNAPSHOT_TOKEN", "").strip()
     if token:
         cmd_args.extend(["--token", token])
 
-    return _run_frontend_helper(
-        helper,
-        cmd_args,
-        out_path,
-        timeout_seconds,
-        label="bulletin-png",
-    )
-
-
-def render_replay_clip(
-    symbol: str,
-    day: date,
-    site_url: str,
-    out_path: Path,
-    helper_path: str | None = None,
-    timeout_seconds: int = 180,
-) -> Path | None:
-    """Invoke the frontend Playwright helper to record the replay clip.
-
-    The helper lives in the ``zerogex-web`` repo at
-    ``frontend/scripts/render-replay-clip.mjs`` and is called as a
-    subprocess with ``--symbol``, ``--date``, ``--site-url`` and
-    ``--out`` args. Playwright is not a hard dependency of this job;
-    when the helper is missing or Playwright/Chromium isn't
-    installed on the host, the subprocess exits non-zero and we log
-    a warning and return None so the tweet still goes out with the
-    PNG only."""
-    helper = _locate_frontend_helper(
-        "render-replay-clip.mjs",
-        helper_path,
-        "BULLETIN_TWEET_REPLAY_HELPER",
-    )
-    if helper is None:
-        logger.info(
-            "bulletin_tweet: replay-clip helper not found — skipping video attachment",
+    rc, detail = _run_frontend_helper(helper, cmd_args, timeout_seconds, "bulletin-png")
+    if rc is None:
+        return CardRender(error=f"The live bulletin screenshot failed: {detail}.")
+    if rc != 0:
+        reason = _CARD_EXIT_REASONS.get(rc, f"the screenshot script failed (exit {rc})")
+        last = detail.splitlines()[-1] if detail else ""
+        return CardRender(error=f"The live bulletin screenshot failed: {reason}. {last}".strip())
+    dims = _png_dimensions(out_path)
+    if dims is None or dims[0] < _MIN_CARD_PX[0] or dims[1] < _MIN_CARD_PX[1]:
+        return CardRender(
+            error=f"The live bulletin screenshot isn't a usable image ({dims or 'not a PNG'})."
         )
-        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    levels = meta.get("levels") if isinstance(meta, dict) else None
+    if not isinstance(levels, dict) or not meta.get("ready"):
+        return CardRender(
+            png_path=out_path,
+            error=(
+                "The screenshot script didn't report the card's levels, so the post "
+                "couldn't be matched to the picture (deploy the latest zerogex-web)."
+            ),
+        )
+    card_symbol = str(levels.get("symbol") or "").upper()
+    if card_symbol != symbol.upper():
+        return CardRender(
+            png_path=out_path,
+            error=(
+                f"The live bulletin card came back for {card_symbol or 'no symbol'}, "
+                f"not {symbol.upper()}."
+            ),
+        )
+    return CardRender(png_path=out_path, levels=levels)
 
-    cmd_args = [
-        "--symbol",
-        symbol.upper(),
-        "--date",
-        day.isoformat(),
-        "--site-url",
-        site_url,
-        "--out",
-        str(out_path),
-    ]
-    return _run_frontend_helper(
-        helper,
-        cmd_args,
-        out_path,
-        timeout_seconds,
-        label="replay-clip",
-    )
+
+_CARD_LEVEL_FIELDS = ("spot", "gamma_flip", "call_wall", "put_wall", "max_pain", "net_gex")
+_CARD_REGIMES = ("positive", "negative", "neutral", "unresolved")
 
 
-# ---------------------------------------------------------------------------
-# X API client — v2 tweet (bearer) + v1.1 media upload (OAuth1) for images
-# ---------------------------------------------------------------------------
+def _apply_card_levels(bulletin: SymbolBulletin, levels: dict[str, Any]) -> None:
+    """Make the post quote exactly what the attached card shows.
 
-
-def post_tweet_via_x_api(
-    text: str,
-    bearer_token: str,
-    media_ids: list[str] | None = None,
-    reply_to: str | None = None,
-    timeout_seconds: int = 15,
-) -> dict[str, Any]:
-    """POST to https://api.x.com/2/tweets with optional media IDs.
-
-    Mirrors :func:`src.jobs.forecast_tweet.post_tweet_via_x_api` but
-    optionally attaches ``media`` when ``media_ids`` is given — the
-    v2 endpoint takes uploaded v1.1 media by ID — and threads the tweet
-    under ``reply_to`` (the parent tweet id) when given, which is how the
-    link comment is posted as a reply to the main bulletin.
-
-    Uses urllib so we inherit no new third-party dependency."""
-    payload: dict[str, Any] = {"text": text}
-    if media_ids:
-        payload["media"] = {"media_ids": media_ids}
-    if reply_to:
-        payload["reply"] = {"in_reply_to_tweet_id": reply_to}
-    req = Request(
-        "https://api.x.com/2/tweets",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {bearer_token}",
-            "Content-Type": "application/json",
-            "User-Agent": "zerogex-bulletin-tweet/1.0",
-        },
-        method="POST",
-    )
-    with urlopen(req, timeout=timeout_seconds) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
-        return json.loads(body) if body else {}
+    The database query ran a few seconds before the screenshot and the
+    analytics engine republishes every minute, so the card's own numbers
+    replace ours: spot, the flip, both walls, max pain, net GEX (at spot)
+    and the regime the card's badge shows.  A level the card doesn't show
+    stays empty here too, and the post is held for it."""
+    for name in _CARD_LEVEL_FIELDS:
+        setattr(bulletin, name, _to_float(levels.get(name)))
+    bulletin.spot_is_projected = bool(levels.get("spot_is_projected"))
+    if bulletin.spot_is_projected and levels.get("spot_source"):
+        bulletin.future_symbol = str(levels["spot_source"])
+    regime = levels.get("regime")
+    if regime in _CARD_REGIMES:
+        bulletin.regime = regime
+    bulletin.card_as_of = str(levels.get("as_of") or "") or None
+    bulletin.momentum_label = _derive_momentum_label(bulletin)
 
 
 # ---------------------------------------------------------------------------
@@ -1620,23 +1917,17 @@ async def _attach_level_history(
 ) -> None:
     """Best-effort: hang the day's level path off the bulletin.
 
-    Two things come out of this, both of which the old single-snapshot read
-    got wrong:
+    The walls migrate: a put wall that walked 777 → 776 → 775, breaking the
+    first two and holding the third, is three separate stories, and the
+    latest snapshot alone tells none of them.  The writer narrates the
+    session from this path, and the checks hold a level claim to it.
 
-      * **The walls migrate.**  A put wall that walked 777 → 776 → 775,
-        breaking the first two and holding the third, is three separate
-        stories — and the closing snapshot alone tells none of them.  The
-        Key-levels note now states what actually happened at each print.
-      * **The close fire reads a post-bell chain.**  At 16:05 the latest
-        ``gex_summary`` row is written after the day's 0DTE has rolled off,
-        which re-prices the walls to the NEXT session.  For a close read we
-        therefore re-anchor the quoted structure to the last in-session frame
-        (before 16:00 ET) and let :func:`level_history.post_close_line` report the
-        reset separately — the value the attached card renders — instead of
-        passing tomorrow's map off as today's tape.
+    The bulletin's own levels are NOT changed.  They stay what the live card
+    shows, which on the 16:05 close fire is the post-bell chain (the day's
+    0DTE has rolled off, so the walls are the next session's); the post labels
+    them that way and tells the session's story from this path instead.
 
-    Every failure just leaves ``level_history`` None and the post renders the
-    way it always did."""
+    Every failure just leaves ``level_history`` None."""
     if mode not in LEVEL_HISTORY_MODES:
         return
     sym = bulletin.symbol
@@ -1668,28 +1959,6 @@ async def _attach_level_history(
     if history is None:
         return
     bulletin.level_history = history
-
-    if mode != "close":
-        return
-    for attr in ("put_wall", "call_wall", "gamma_flip", "max_pain"):
-        value = history.session_close_levels.get(attr)
-        if value is not None and value != getattr(bulletin, attr):
-            logger.info(
-                "bulletin_tweet: %s close read re-anchored %s %s → %s "
-                "(post-bell value kept for the roll-off line)",
-                sym,
-                attr,
-                getattr(bulletin, attr),
-                value,
-            )
-            setattr(bulletin, attr, value)
-    # Net GEX collapses across the roll-off too (the expiring gamma is what
-    # was holding it), so the close read's headline figure has to come from
-    # the same in-session frame.  Only swap when both sides are the at-spot
-    # quantity, so we never silently switch the basis under the number.
-    session_net_gex = history.session_close_levels.get("net_gex_at_spot")
-    if session_net_gex is not None and history.post_close_levels.get("net_gex_at_spot") is not None:
-        bulletin.net_gex = session_net_gex
 
 
 async def _fetch_bulletins(
@@ -1760,9 +2029,7 @@ async def _fetch_bulletins(
                 proj.cash_ref_close,
                 proj.gap_points,
             )
-        # The day's level path.  Runs BEFORE the price-action attach because
-        # a close read re-anchors the walls / flip / net GEX to the last
-        # in-session frame, and the regime label is derived from those.
+        # The day's level path (midday and close fires).
         await _attach_level_history(db, bulletin, day, mode)
         # Price action (prior close, session range, regime, momentum) — the
         # inputs the LLM narrates the day's path from.  Best-effort.
@@ -1781,14 +2048,18 @@ def _write_manifest_and_text(
     state: str = "dry_run",
     posted_id: str | None = None,
     reply_id: str | None = None,
+    problems: list[str] | None = None,
 ) -> None:
     """Persist a JSON manifest + the raw tweet text next to the media.
 
-    Written at three points in the fire lifecycle:
+    The ``state`` is one of:
 
-      * dry_run — no --post flag, just showing what would go out
-      * pending — --stage was used, waiting for approval to post
-      * posted  — the tweet was successfully sent to X
+      * dry_run     — no --post flag, just showing what would go out
+      * pending     — --stage was used and the review passed; waiting for
+                      approval to post
+      * blocked     — held back; ``problems`` says why
+      * post_failed — the review passed but X rejected the post
+      * posted      — the tweet was successfully sent to X
 
     Operators need to be able to open one directory and see everything
     that would have gone out — the main text, the threaded link reply,
@@ -1816,6 +2087,7 @@ def _write_manifest_and_text(
         "reply_text": tweet.reply_text,
         "text_len": len(tweet.text),
         "fallback_len": len(tweet.fallback),
+        "problems": list(problems or []),
         "media": {
             "png": str(media.png_path) if media.png_path else None,
             "clip": str(media.clip_path) if media.clip_path else None,
@@ -1829,9 +2101,10 @@ def _write_manifest_and_text(
                 "put_wall": b.put_wall,
                 "max_pain": b.max_pain,
                 "net_gex": b.net_gex,
-                # Traceability: on a close fire the four level fields above are
-                # the last IN-SESSION frame, not the live post-roll-off chain,
-                # so the manifest carries the path they were read off.
+                # The live card's label when the fields above came from it.
+                "card_as_of": b.card_as_of,
+                # Traceability: the session path behind anything the post
+                # says about a level.
                 "level_history": (b.level_history.to_prompt_dict() if b.level_history else None),
             }
             for b in bulletins
@@ -1843,55 +2116,20 @@ def _write_manifest_and_text(
     )
 
 
-def _upload_media_files(
-    media: MediaArtifacts,
-) -> list[str]:
-    """Upload the PNG (and video, when present) and return media_ids.
+def _will_post(args: argparse.Namespace) -> bool:
+    """Whether this run posts to X once the review passes.
 
-    The v1.1 media/upload endpoint requires OAuth1 signing — the
-    signing helpers live in :mod:`src.jobs.x_media_client` to keep
-    this module readable. Returns an empty list when either the
-    credentials are missing or an upload failed, so the tweet still
-    gets posted text-only."""
-    from src.jobs import x_media_client  # local import — optional dep path
-
-    try:
-        creds = x_media_client.load_credentials_from_env()
-    except x_media_client.MissingCredentialsError as exc:
-        logger.info(
-            "bulletin_tweet: media upload skipped — %s. Text-only post.",
-            exc,
-        )
-        return []
-
-    media_ids: list[str] = []
-    if media.png_path is not None:
-        try:
-            mid = x_media_client.upload_media(media.png_path, creds, mime_type="image/png")
-            if mid:
-                media_ids.append(mid)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "bulletin_tweet: PNG upload failed (%s) — dropping attachment",
-                exc,
-            )
-
-    if media.clip_path is not None:
-        # Category has to be video_tweet (chunked) for MP4; the helper
-        # dispatches on file extension.
-        try:
-            mid = x_media_client.upload_media(media.clip_path, creds)
-            if mid:
-                media_ids.append(mid)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "bulletin_tweet: clip upload failed (%s) — dropping attachment",
-                exc,
-            )
-    return media_ids
+    Autopilot: BULLETIN_TWEET_AUTOPILOT=1 in .env silently upgrades
+    --stage to --post at runtime, so switching to full autopost is a
+    one-line env-var flip — no systemd surgery required.  Explicit
+    --post on the CLI always wins regardless."""
+    autopilot = os.environ.get("BULLETIN_TWEET_AUTOPILOT", "").strip() in ("1", "true", "yes")
+    return bool(args.post) or (bool(args.stage) and autopilot)
 
 
 async def _run(args: argparse.Namespace) -> int:
+    """One fire.  Returns 0 when it posted, staged, dry-ran cleanly or skipped
+    a non-trading day; 1 when the post was held back or X rejected it."""
     day = date.fromisoformat(args.date) if args.date else _today_et()
     if not _is_trading_day(day) and not args.allow_non_trading_day:
         logger.info(
@@ -1905,17 +2143,24 @@ async def _run(args: argparse.Namespace) -> int:
     if not symbols:
         logger.warning("bulletin_tweet: no symbols resolved — exiting 0")
         return 0
+    lead = args.lead_symbol.upper()
+
+    effective_post = _will_post(args)
+    effective_stage = bool(args.stage) and not effective_post
+    fire = _Fire(
+        mode=args.mode,
+        day=day,
+        artifact_dir=resolve_artifact_dir(args.artifact_dir, args.mode, day),
+        notify=effective_post or effective_stage,
+        posting=effective_post,
+    )
 
     db = DatabaseManager()
     try:
         await db.connect()
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "bulletin_tweet[%s]: DB connect failed (%s) — exiting 0",
-            args.mode,
-            exc,
-        )
-        return 0
+        logger.warning("bulletin_tweet[%s]: DB connect failed (%s)", args.mode, exc)
+        return fire.hold([f"Couldn't connect to the database ({exc})."], symbol=lead)
 
     try:
         bulletins = await _fetch_bulletins(db, symbols, day, args.mode)
@@ -1925,252 +2170,249 @@ async def _run(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001
             pass
 
-    if not any(b.has_any_level() or b.spot is not None for b in bulletins):
-        logger.info(
-            "bulletin_tweet[%s]: every symbol's GEX summary was missing — skipping",
-            args.mode,
+    featured = _choose_featured(bulletins, lead)
+    if featured is None:
+        return fire.hold(
+            ["Every symbol's GEX summary was missing, so there was nothing to post."],
+            symbol=lead,
+            bulletins=bulletins,
         )
-        return 0
 
-    # Scrape the day's CNBC headlines to feed the LLM (best-effort, never fatal).
-    headlines = _fetch_headlines_safe()
-
-    tweet = build_tweet_body(
-        mode=args.mode,
-        day=day,
-        bulletins=bulletins,
-        site_url=args.site_url,
-        lead_symbol=args.lead_symbol.upper(),
-        reply_text=os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None,
-        headlines=headlines,
-        # The scheduled auto-post is always the lead symbol (default SPY), not
-        # the "cleanest setup" among a multi-symbol dropdown list.
-        force_featured=args.lead_symbol.upper(),
-    )
-
-    artifact_dir = resolve_artifact_dir(args.artifact_dir, args.mode, day)
-
-    # Media render — always attempted even in dry-run so the operator
-    # can inspect the PNG/clip before flipping --post on. Failures
-    # degrade gracefully to text-only.
+    # The live bulletin, as it stands now: the picture that gets attached,
+    # and the numbers the post quotes (see _apply_card_levels).
     media = MediaArtifacts()
-    if not args.no_media:
-        png_out = artifact_dir / f"bulletin-{tweet.lead_symbol.lower()}.png"
-        media.png_path = render_bulletin_png(
-            tweet.lead_symbol,
-            day,
+    if args.no_media:
+        card = CardRender(error="Rendering the live bulletin image was skipped (--no-media).")
+    else:
+        card = render_bulletin_card(
+            featured.symbol,
             args.mode,
             args.site_url,
-            png_out,
+            fire.artifact_dir / f"bulletin-{featured.symbol.lower()}.png",
         )
-        # Clip lands on the same lead symbol so the visual pairing
-        # (card + video) is coherent.
-        clip_out = artifact_dir / f"replay-{tweet.lead_symbol.lower()}.mp4"
-        media.clip_path = render_replay_clip(
-            tweet.lead_symbol,
-            day,
-            args.site_url,
-            clip_out,
-        )
+        if card.ok:
+            media.png_path = card.png_path
+            _apply_card_levels(featured, card.levels)
+    fire.card_png = card.png_path
 
-    _write_manifest_and_text(
-        artifact_dir,
-        tweet,
-        media,
-        args.mode,
-        day,
-        bulletins,
-        state="dry_run",
+    headlines, news_problem = _fetch_fresh_headlines()
+    problems = _data_problems(featured, card, news_problem)
+    card_png = media.png_path.read_bytes() if media.png_path else None
+    tweet, draft_problems = _write_and_review(
+        args.mode, day, bulletins, featured, headlines, card_png, args.site_url
     )
+    problems += draft_problems
+    if effective_post and not problems:
+        late = _deadline_problem(args.mode, day)
+        if late:
+            problems.append(late)
 
-    # Persist the "latest" record the /admin review page reads (best-effort,
-    # never fatal).  Overwrites the previous fire for this (timing, symbol) so
-    # the page always shows the last auto-generated post.
-    _featured = next(
-        (b for b in bulletins if b.symbol == tweet.featured_symbol),
-        next((b for b in bulletins if b.symbol == tweet.lead_symbol), None),
-    )
-    write_latest_record(
-        build_latest_record(
-            mode=args.mode,
-            day=day,
-            tweet=tweet,
-            featured=_featured,
-            headlines=headlines,
-            media=media,
-            generated_at=datetime.now(tz=ET).isoformat(),
-        )
-    )
-
-    bearer = os.environ.get("X_BOT_BEARER_TOKEN", "").strip()
-
-    # Autopilot: BULLETIN_TWEET_AUTOPILOT=1 in .env silently upgrades
-    # --stage to --post at runtime, so switching to full autopost is a
-    # one-line env-var flip — no systemd surgery required.  Explicit
-    # --post on the CLI always wins regardless.
-    autopilot = os.environ.get("BULLETIN_TWEET_AUTOPILOT", "").strip() in ("1", "true", "yes")
-    effective_post = bool(args.post) or (bool(args.stage) and autopilot)
-    effective_stage = bool(args.stage) and not effective_post
-
-    # A real scheduled fire (--stage) or an autopilot post emails the operator a
-    # "<Timing> X-Post Ready" notice linking to the /admin/x-post review page.
-    # Manual dry-run previews don't email.  Best-effort — never fatal.
-    if effective_stage or effective_post:
-        _send_xpost_ready_email(args.mode)
+    fire.tweet, fire.media, fire.bulletins = tweet, media, bulletins
+    fire.featured, fire.headlines = featured, headlines
+    if problems:
+        return fire.hold(problems, symbol=featured.symbol)
 
     if effective_stage:
-        _write_manifest_and_text(
-            artifact_dir,
-            tweet,
-            media,
-            args.mode,
-            day,
-            bulletins,
-            state="pending",
-        )
-        _log_approval_required(args.mode, artifact_dir, tweet)
-        _call_notify_hook(args.mode, artifact_dir, tweet, media)
+        fire.record("pending", status="ready")
+        _log_approval_required(args.mode, fire.artifact_dir, tweet)
+        _call_notify_hook(args.mode, fire.artifact_dir, tweet, media)
+        _send_xpost_ready_email(args.mode, png_path=media.png_path)
         return 0
 
-    if not effective_post or not bearer:
-        reason = "no --post flag" if not effective_post else "X_BOT_BEARER_TOKEN unset"
+    if not effective_post:
+        fire.record("dry_run", status="dry_run")
         logger.info(
-            "bulletin_tweet[%s]: DRY RUN (%s) — artifacts at %s\n----\n%s\n----",
+            "bulletin_tweet[%s]: DRY RUN (passed review; no --post flag) — artifacts at %s\n"
+            "----\n%s\n----",
             args.mode,
-            reason,
-            artifact_dir,
+            fire.artifact_dir,
             tweet.text,
         )
         return 0
 
-    post_result = post_bulletin(
-        tweet=tweet,
-        media=media,
-        bearer=bearer,
-        long=args.long,
-        mode_label=args.mode,
+    result = post_bulletin(tweet=tweet, media=media, long=args.long, mode_label=args.mode)
+    if not result.ok:
+        return fire.hold([result.error or "X rejected the post."], state="post_failed")
+    fire.record(
+        "posted",
+        status="posted",
+        posted_id=result.tweet_id,
+        reply_id=result.reply_id,
+        tweet_url=result.tweet_url,
+        problems=[result.reply_error] if result.reply_error else None,
     )
-    if post_result:
-        _write_manifest_and_text(
-            artifact_dir,
-            tweet,
-            media,
-            args.mode,
-            day,
-            bulletins,
-            state="posted",
-            posted_id=post_result.get("id"),
-            reply_id=post_result.get("reply_id"),
-        )
+    _send_xpost_sent_email(args.mode, featured.symbol, result)
     return 0
+
+
+@dataclass
+class _Fire:
+    """What one run has produced so far, so any exit path can record it,
+    hold it, and tell the operator.  Filled in as the run goes."""
+
+    mode: str
+    day: date
+    artifact_dir: Path
+    notify: bool  # a scheduled fire (--stage / --post), not a manual preview
+    posting: bool
+    tweet: TweetBody | None = None
+    media: MediaArtifacts = field(default_factory=MediaArtifacts)
+    bulletins: list[SymbolBulletin] = field(default_factory=list)
+    featured: SymbolBulletin | None = None
+    headlines: list = field(default_factory=list)
+    card_png: Path | None = None
+
+    def record(
+        self,
+        state: str,
+        status: str,
+        problems: list[str] | None = None,
+        posted_id: str | None = None,
+        reply_id: str | None = None,
+        tweet_url: str | None = None,
+        symbol: str | None = None,
+    ) -> None:
+        """Write the manifest + the review page's latest record."""
+        sym = (symbol or (self.featured.symbol if self.featured else "") or "").upper()
+        tweet = self.tweet or TweetBody(text="", fallback="", lead_symbol=sym, featured_symbol=sym)
+        try:
+            _write_manifest_and_text(
+                self.artifact_dir,
+                tweet,
+                self.media,
+                self.mode,
+                self.day,
+                self.bulletins,
+                state=state,
+                posted_id=posted_id,
+                reply_id=reply_id,
+                problems=problems,
+            )
+        except OSError as exc:
+            logger.warning("bulletin_tweet: failed to write the manifest (%s)", exc)
+        write_latest_record(
+            build_latest_record(
+                mode=self.mode,
+                day=self.day,
+                tweet=tweet,
+                featured=self.featured,
+                headlines=self.headlines,
+                media=self.media,
+                generated_at=datetime.now(tz=ET).isoformat(),
+                status=status,
+                problems=problems,
+                tweet_url=tweet_url,
+            )
+        )
+
+    def hold(
+        self,
+        problems: list[str],
+        symbol: str | None = None,
+        bulletins: list[SymbolBulletin] | None = None,
+        state: str = "blocked",
+    ) -> int:
+        """Don't post: record why, tell the operator, and fail the run."""
+        if bulletins is not None:
+            self.bulletins = bulletins
+        sym = (symbol or (self.featured.symbol if self.featured else "") or "").upper()
+        self.record(state, status=state, problems=problems, symbol=sym)
+        logger.error(
+            "bulletin_tweet[%s]: NOT POSTED — %d problem(s):\n%s",
+            self.mode,
+            len(problems),
+            "\n".join(f"  - {p}" for p in problems),
+        )
+        if self.notify:
+            _send_xpost_held_email(
+                self.mode,
+                sym,
+                problems,
+                self.tweet,
+                self.card_png,
+                posting=self.posting,
+            )
+        return 1
+
+
+@dataclass
+class PostResult:
+    """What happened when the post went to X."""
+
+    ok: bool
+    tweet_id: str | None = None
+    reply_id: str | None = None
+    error: str | None = None
+    reply_error: str | None = None
+
+    @property
+    def tweet_url(self) -> str | None:
+        return f"https://x.com/i/web/status/{self.tweet_id}" if self.tweet_id else None
 
 
 def post_bulletin(
     tweet: TweetBody,
     media: MediaArtifacts,
-    bearer: str,
-    long: bool,
-    mode_label: str,
-) -> dict[str, Any] | None:
-    """Upload media, POST to X, return {"id": tweet_id} on success.
+    long: bool = True,
+    mode_label: str = "",
+) -> PostResult:
+    """Upload the live bulletin image, post the text with it, then thread
+    the link reply under it.
 
     Shared between the direct-post path (``bulletin_tweet --post``) and
-    the approve-a-staged-draft path (``bulletin_approve``) so both use
-    identical upload + fallback + retry logic.  Returns None on failure
-    so the caller can update the manifest state accordingly.
+    the approve-a-staged-draft path (``bulletin_approve``).  Nothing goes
+    out without the image: a missing picture or a failed upload stops here,
+    and there is no text-only retry and no swap to the short body.  Every
+    call is signed with the four OAuth1 keys (see
+    :mod:`src.jobs.x_media_client`).  A failed reply doesn't undo the main
+    post; it's reported in ``reply_error``."""
+    from src.jobs import x_media_client  # local import — optional dep path
 
-    After the main tweet lands, posts ``tweet.reply_text`` (the
-    ``Free delayed … zerogex.io`` link comment) as a threaded reply.  A
-    failed reply is logged but never fails the call — the main post is
-    already out, and the link is a nice-to-have, not load-bearing."""
-    media_ids = _upload_media_files(media)
-
-    text_to_post = tweet.text if long else tweet.fallback
-    if len(text_to_post) > LONG_TWEET_MAX_LEN:
-        logger.warning(
-            "bulletin_tweet[%s]: text length %d > %d — falling back to short body",
-            mode_label,
-            len(text_to_post),
-            LONG_TWEET_MAX_LEN,
-        )
-        text_to_post = tweet.fallback
-
-    resp: dict[str, Any] | None = None
     try:
-        resp = post_tweet_via_x_api(text_to_post, bearer, media_ids=media_ids or None)
-    except (HTTPError, URLError) as exc:
-        logger.warning("bulletin_tweet[%s]: X API call failed (%s)", mode_label, exc)
-        # If a long-form post failed with 403, try again with the fallback
-        # (classic 280-char body) in case the bot handle isn't Premium.
-        if long and text_to_post != tweet.fallback:
-            logger.info("bulletin_tweet[%s]: retrying with short fallback body", mode_label)
-            try:
-                resp = post_tweet_via_x_api(tweet.fallback, bearer, media_ids=media_ids or None)
-            except Exception as exc2:  # noqa: BLE001
-                logger.warning(
-                    "bulletin_tweet[%s]: fallback retry also failed (%s)",
-                    mode_label,
-                    exc2,
-                )
-                return None
-        else:
-            return None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet[%s]: unexpected X API error (%s)", mode_label, exc)
-        return None
+        creds = x_media_client.load_credentials_from_env()
+    except x_media_client.MissingCredentialsError as exc:
+        return PostResult(ok=False, error=f"{exc}. Nothing was posted.")
+    if media.png_path is None or not media.png_path.exists():
+        return PostResult(
+            ok=False, error="There's no live bulletin image to attach, so nothing was posted."
+        )
+    text = tweet.text if long else tweet.fallback
+    if not text.strip():
+        return PostResult(ok=False, error="The post text is empty, so nothing was posted.")
+    if len(text) > LONG_TWEET_MAX_LEN:
+        return PostResult(
+            ok=False,
+            error=f"The post is {len(text):,} characters, over X's {LONG_TWEET_MAX_LEN:,} limit.",
+        )
 
-    if resp is None:
-        return None
+    try:
+        media_id = x_media_client.upload_image(media.png_path, creds)
+    except x_media_client.XApiError as exc:
+        logger.warning("bulletin_tweet[%s]: image upload failed (%s)", mode_label, exc)
+        return PostResult(
+            ok=False, error=f"X rejected the image upload, so nothing was posted ({exc})."
+        )
+    try:
+        tweet_id = x_media_client.post_tweet(text, creds, media_ids=[media_id])
+    except x_media_client.XApiError as exc:
+        logger.warning("bulletin_tweet[%s]: X rejected the post (%s)", mode_label, exc)
+        return PostResult(ok=False, error=f"X rejected the post ({exc}).")
+    logger.info("bulletin_tweet[%s]: posted tweet id=%s with the image", mode_label, tweet_id)
 
-    tweet_id = (resp.get("data") or {}).get("id")
-    logger.info(
-        "bulletin_tweet[%s]: posted tweet id=%s (media=%d)",
-        mode_label,
-        tweet_id,
-        len(media_ids),
-    )
-
-    result: dict[str, Any] = {"id": tweet_id, "response": resp}
-    reply_id = _post_link_reply(tweet, tweet_id, bearer, mode_label)
-    if reply_id is not None:
-        result["reply_id"] = reply_id
+    result = PostResult(ok=True, tweet_id=tweet_id)
+    if tweet.reply_text:
+        try:
+            result.reply_id = x_media_client.post_tweet(tweet.reply_text, creds, reply_to=tweet_id)
+            logger.info(
+                "bulletin_tweet[%s]: posted link reply id=%s under %s",
+                mode_label,
+                result.reply_id,
+                tweet_id,
+            )
+        except x_media_client.XApiError as exc:
+            logger.warning("bulletin_tweet[%s]: link reply failed (%s)", mode_label, exc)
+            result.reply_error = f"The post went out, but the threaded link reply failed ({exc})."
     return result
-
-
-def _post_link_reply(
-    tweet: TweetBody,
-    parent_id: str | None,
-    bearer: str,
-    mode_label: str,
-) -> str | None:
-    """Post the link comment as a threaded reply to ``parent_id``.
-
-    Best-effort: any failure (or a missing parent id / empty reply text)
-    logs and returns None without disturbing the already-posted main
-    tweet."""
-    if not parent_id or not tweet.reply_text:
-        return None
-    try:
-        reply_resp = post_tweet_via_x_api(
-            tweet.reply_text,
-            bearer,
-            reply_to=parent_id,
-        )
-    except Exception as exc:  # noqa: BLE001 — reply is non-load-bearing
-        logger.warning(
-            "bulletin_tweet[%s]: link reply failed (%s) — main tweet still posted",
-            mode_label,
-            exc,
-        )
-        return None
-    reply_id = (reply_resp.get("data") or {}).get("id")
-    logger.info(
-        "bulletin_tweet[%s]: posted link reply id=%s under %s",
-        mode_label,
-        reply_id,
-        parent_id,
-    )
-    return reply_id
 
 
 def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> None:
@@ -2210,59 +2452,59 @@ def _xpost_admin_url() -> str:
     return f"{site}/admin/x-post"
 
 
-def _send_xpost_ready_email(mode: str) -> bool:
-    """Email a "<Timing> X-Post Ready" notice with a link to /admin/x-post.
-
-    Built into the job (not a shell hook) so the scheduled fire notifies the
-    operator with no extra wiring — reuses the same RESEND_API_KEY /
-    RESEND_FROM_EMAIL / BULLETIN_TWEET_EMAIL_TO the frontend already uses.
-    Disable with BULLETIN_TWEET_ADMIN_EMAIL_ENABLED=0.  Best-effort: returns
-    False (and logs) on any missing config or send error — never fatal.
-
-    This REPLACES the old "approval needed" email — remove the deprecated
-    BULLETIN_TWEET_NOTIFY_HOOK from .env so the old one stops (a warning is
-    logged if both are active)."""
-    if os.environ.get("BULLETIN_TWEET_ADMIN_EMAIL_ENABLED", "1").strip().lower() in (
+def _emails_enabled() -> bool:
+    return os.environ.get("BULLETIN_TWEET_ADMIN_EMAIL_ENABLED", "1").strip().lower() not in (
         "0",
         "false",
         "no",
         "off",
-    ):
-        return False
+    )
+
+
+def _png_attachments(png_path: Path | None) -> list[dict[str, str]]:
+    """The bulletin image as a Resend attachment, when there is one."""
+    if png_path is None:
+        return []
+    try:
+        data = png_path.read_bytes()
+    except OSError:
+        return []
+    return [{"filename": png_path.name, "content": base64.b64encode(data).decode("ascii")}]
+
+
+def _send_operator_email(
+    subject: str,
+    html_body: str,
+    text_body: str,
+    attachments: list[dict[str, str]] | None = None,
+) -> bool:
+    """Email the operator through Resend.  Best-effort: False (logged) on any
+    missing config or send error, never raises.
+
+    Reuses the same RESEND_API_KEY / RESEND_FROM_EMAIL / BULLETIN_TWEET_EMAIL_TO
+    the frontend already uses."""
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_email = os.environ.get("RESEND_FROM_EMAIL", "").strip()
     to_email = os.environ.get("BULLETIN_TWEET_EMAIL_TO", "").strip()
     if not (api_key and from_email and to_email):
         logger.info(
-            "bulletin_tweet: X-Post-Ready email skipped — RESEND_API_KEY / "
-            "RESEND_FROM_EMAIL / BULLETIN_TWEET_EMAIL_TO not all set",
+            "bulletin_tweet: email %r skipped — RESEND_API_KEY / RESEND_FROM_EMAIL / "
+            "BULLETIN_TWEET_EMAIL_TO not all set",
+            subject,
         )
         return False
-
-    timing = _TIMING_WORD.get(mode, mode)
-    url = _xpost_admin_url()
-    html = (
-        f"<h2>{timing} X-Post Ready</h2>"
-        f"<p>The {timing.lower()} X-post has been generated.</p>"
-        f'<p><a href="{url}" style="display:inline-block;padding:10px 18px;'
-        f"background:#111;color:#fff;border-radius:8px;text-decoration:none;"
-        f'font-weight:600">Review &amp; copy the post &rarr;</a></p>'
-        f'<p style="color:#666;font-size:13px">Or open: <a href="{url}">{url}</a>'
-        f"<br>You'll need to be signed in to your Admin account to view it.</p>"
-    )
-    text = f"{timing} X-Post Ready\n\nReview & copy the post: {url}\n" f"(Admin sign-in required.)"
-    body = json.dumps(
-        {
-            "from": from_email,
-            "to": [to_email],
-            "subject": f"{timing} X-Post Ready",
-            "html": html,
-            "text": text,
-        }
-    ).encode("utf-8")
+    payload: dict[str, Any] = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+        "text": text_body,
+    }
+    if attachments:
+        payload["attachments"] = attachments
     req = Request(
         "https://api.resend.com/emails",
-        data=body,
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -2279,22 +2521,131 @@ def _send_xpost_ready_email(mode: str) -> bool:
         with urlopen(req, timeout=15) as resp:
             resp.read()
     except (HTTPError, URLError) as exc:
-        logger.warning("bulletin_tweet: X-Post-Ready email failed (%s)", exc)
+        logger.warning("bulletin_tweet: email %r failed (%s)", subject, exc)
         return False
     except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet: X-Post-Ready email error (%s)", exc)
+        logger.warning("bulletin_tweet: email %r error (%s)", subject, exc)
         return False
+    logger.info("bulletin_tweet: email %r sent to %s", subject, to_email)
+    return True
 
-    logger.info("bulletin_tweet: X-Post-Ready email sent to %s (%s)", to_email, timing)
+
+def _review_link_html(url: str, label: str) -> str:
+    return (
+        f'<p><a href="{url}" style="display:inline-block;padding:10px 18px;'
+        f"background:#111;color:#fff;border-radius:8px;text-decoration:none;"
+        f'font-weight:600">{label} &rarr;</a></p>'
+        f'<p style="color:#666;font-size:13px">Or open: <a href="{url}">{url}</a>'
+        f"<br>You'll need to be signed in to your Admin account to view it.</p>"
+    )
+
+
+def _send_xpost_ready_email(mode: str, png_path: Path | None = None) -> bool:
+    """Email a "<Timing> X-Post Ready" notice with a link to /admin/x-post.
+
+    Sent when a staged (not autopilot) post passed review.  The live
+    bulletin image rides along as an attachment, ready to add to the post.
+    Disable with BULLETIN_TWEET_ADMIN_EMAIL_ENABLED=0.
+
+    This REPLACES the old "approval needed" email — remove the deprecated
+    BULLETIN_TWEET_NOTIFY_HOOK from .env so the old one stops (a warning is
+    logged if both are active)."""
+    if not _emails_enabled():
+        return False
+    timing = _TIMING_WORD.get(mode, mode)
+    url = _xpost_admin_url()
+    image_note = " The live bulletin image is attached; add it to the post." if png_path else ""
+    html_body = (
+        f"<h2>{timing} X-Post Ready</h2>"
+        f"<p>The {timing.lower()} X-post has been generated and passed review.{image_note}</p>"
+        + _review_link_html(url, "Review &amp; copy the post")
+    )
+    text_body = (
+        f"{timing} X-Post Ready\n\nPassed review.{image_note}\n\n"
+        f"Review & copy the post: {url}\n(Admin sign-in required.)"
+    )
+    sent = _send_operator_email(
+        f"{timing} X-Post Ready", html_body, text_body, _png_attachments(png_path)
+    )
     # Nudge if the deprecated approval hook is ALSO set — that's the old
     # "approval needed" email; they'll get both until it's removed.
-    if os.environ.get("BULLETIN_TWEET_NOTIFY_HOOK", "").strip():
+    if sent and os.environ.get("BULLETIN_TWEET_NOTIFY_HOOK", "").strip():
         logger.warning(
             "bulletin_tweet: BULLETIN_TWEET_NOTIFY_HOOK is set alongside the "
-            "built-in X-Post-Ready email — remove it from .env to stop the old "
+            "built-in X-Post Ready email — remove it from .env to stop the old "
             "'approval needed' email.",
         )
-    return True
+    return sent
+
+
+def _send_xpost_sent_email(mode: str, symbol: str, result: PostResult) -> bool:
+    """Email a "<Timing> X-Post Sent" notice with the link to the post.
+
+    Disable with BULLETIN_TWEET_ADMIN_EMAIL_ENABLED=0; a failed link reply is
+    reported here either way."""
+    if not _emails_enabled() and not result.reply_error:
+        return False
+    timing = _TIMING_WORD.get(mode, mode)
+    link = result.tweet_url or ""
+    reply_html = (
+        f"<p><strong>{html.escape(result.reply_error)}</strong></p>" if result.reply_error else ""
+    )
+    reply_text = f"\n\n{result.reply_error}" if result.reply_error else ""
+    html_body = (
+        f"<h2>{timing} X-Post Sent</h2>"
+        f"<p>The ${html.escape(symbol)} {timing.lower()} post passed review and went out "
+        f"with the live bulletin image attached.</p>"
+        f'<p><a href="{link}">{link}</a></p>{reply_html}'
+    )
+    text_body = (
+        f"{timing} X-Post Sent\n\n${symbol}, with the live bulletin image: {link}{reply_text}"
+    )
+    subject = f"{timing} X-Post Sent" + (" (link reply failed)" if result.reply_error else "")
+    return _send_operator_email(subject, html_body, text_body)
+
+
+def _send_xpost_held_email(
+    mode: str,
+    symbol: str,
+    problems: list[str],
+    tweet: TweetBody | None,
+    png_path: Path | None,
+    posting: bool,
+) -> bool:
+    """Email the operator that the post was held back, with every reason, the
+    draft, and the image when one rendered.
+
+    Always attempted when Resend is configured, whatever
+    BULLETIN_TWEET_ADMIN_EMAIL_ENABLED says: this is the notice the operator
+    can't do without."""
+    timing = _TIMING_WORD.get(mode, mode)
+    url = _xpost_admin_url()
+    where = "posted to X" if posting else "sent for review"
+    items_html = "".join(f"<li>{html.escape(p)}</li>" for p in problems)
+    items_text = "\n".join(f"- {p}" for p in problems)
+    draft_html = ""
+    draft_text = ""
+    if tweet is not None and tweet.text.strip():
+        draft = f"{tweet.text}\n\n--- reply ---\n{tweet.reply_text}"
+        draft_html = (
+            "<p>The draft, as it stood:</p>"
+            f'<pre style="white-space:pre-wrap;font-family:inherit;background:#f5f5f5;'
+            f'padding:12px;border-radius:8px">{html.escape(draft)}</pre>'
+        )
+        draft_text = f"\n\nThe draft, as it stood:\n\n{draft}"
+    image_note = " The live bulletin image that rendered is attached." if png_path else ""
+    html_body = (
+        f"<h2>{timing} X-Post NOT {'sent' if posting else 'ready'}</h2>"
+        f"<p>Nothing was {where}. Here's what went wrong:</p><ul>{items_html}</ul>"
+        f"<p>{image_note.strip()}</p>{draft_html}" + _review_link_html(url, "Open the review page")
+    )
+    text_body = (
+        f"{timing} X-Post NOT {'sent' if posting else 'ready'}\n\n"
+        f"Nothing was {where}. Here's what went wrong:\n{items_text}\n{image_note.strip()}"
+        f"{draft_text}\n\nReview page: {url}\n(Admin sign-in required.)"
+    )
+    subject = f"{timing} X-Post NOT {'sent' if posting else 'ready'}: ${symbol}"
+    return _send_operator_email(subject, html_body, text_body, _png_attachments(png_path))
 
 
 def _call_notify_hook(
@@ -2383,17 +2734,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--symbols",
         default=os.environ.get("BULLETIN_TWEET_SYMBOLS", ",".join(DEFAULT_SYMBOLS)),
-        help=(
-            "Comma-separated symbols to render (default: $BULLETIN_TWEET_SYMBOLS or "
-            "SPY,SPX,QQQ)."
-        ),
+        help=("Comma-separated symbols to fetch (default: $BULLETIN_TWEET_SYMBOLS or SPY)."),
     )
     parser.add_argument(
         "--lead-symbol",
         default=os.environ.get("BULLETIN_TWEET_LEAD_SYMBOL", DEFAULT_LEAD_SYMBOL),
         help=(
-            "Symbol whose Live Bulletin card is attached as the PNG (and whose "
-            "replay drives the video). Default: $BULLETIN_TWEET_LEAD_SYMBOL or SPX."
+            "The symbol the post is about; its Live Bulletin card is attached. "
+            "Default: $BULLETIN_TWEET_LEAD_SYMBOL or SPY."
         ),
     )
     parser.add_argument("--date", help="Target date (YYYY-MM-DD). Default: today ET.")
@@ -2401,8 +2749,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--post",
         action="store_true",
         help=(
-            "Actually post to X. Without this flag the job dry-runs even when "
-            "X_BOT_BEARER_TOKEN is set — safe by default."
+            "Actually post to X (once the review passes). Without this flag the "
+            "job dry-runs even when the X keys are set — safe by default."
         ),
     )
     parser.add_argument(
@@ -2410,8 +2758,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Stage the draft for human approval instead of posting.  Writes "
-            "the full artifact set (text + PNG + clip + manifest with "
-            "state=pending) and calls $BULLETIN_TWEET_NOTIFY_HOOK if set.  "
+            "the full artifact set (text + PNG + manifest with state=pending, "
+            "or state=blocked when the review fails) and emails the operator.  "
             "Operator approves with ``bin/bulletin-approve.sh <mode>``.  "
             "Set BULLETIN_TWEET_AUTOPILOT=1 in .env to upgrade --stage to "
             "--post at runtime — the one-line switch to full autopilot."
@@ -2422,9 +2770,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         default=True,
         help=(
-            "Post the full multi-paragraph body (requires X-Premium on the bot "
-            "handle). Default on; the job falls back to a 280-char summary if the "
-            "long-form post is rejected."
+            "Post the full multi-paragraph body (requires X Premium on the bot "
+            "handle). Default on.  If X rejects it, nothing is posted."
         ),
     )
     parser.add_argument(
@@ -2437,15 +2784,15 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--no-media",
         action="store_true",
         help=(
-            "Skip PNG + video rendering. Useful for a fast text-only manual "
-            "invocation while debugging tweet copy."
+            "Skip the live bulletin screenshot.  Useful for a fast preview of the "
+            "copy; a run without the image can never post."
         ),
     )
     parser.add_argument(
         "--artifact-dir",
         default=None,
         help=(
-            "Override the directory dry-run artifacts (text + PNG + clip) are "
+            "Override the directory dry-run artifacts (text + PNG + manifest) are "
             "written to. Default: $BULLETIN_TWEET_ARTIFACT_DIR or "
             "/var/lib/zerogex-oa/bulletin-tweets."
         ),
@@ -2469,7 +2816,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     args = _parse_args(argv)
-    return asyncio.run(_run(args))
+    try:
+        return asyncio.run(_run(args))
+    except Exception as exc:  # noqa: BLE001 — a crash still has to reach the operator
+        logger.exception("bulletin_tweet[%s]: crashed", args.mode)
+        if args.stage or args.post:
+            _send_xpost_held_email(
+                args.mode,
+                args.lead_symbol.upper(),
+                [
+                    f"The job crashed before it finished ({exc!r}). "
+                    "The details are in the journal: make bulletin-tweet-status."
+                ],
+                None,
+                None,
+                posting=_will_post(args),
+            )
+        return 1
 
 
 if __name__ == "__main__":

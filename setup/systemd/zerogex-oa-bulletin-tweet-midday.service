@@ -3,6 +3,9 @@ Description=ZeroGEX Live-Bulletin mid-session X post (12:30 ET)
 Documentation=https://github.com/zerogex/options/zerogex-oa
 After=network-online.target postgresql.service
 Wants=network-online.target
+# A held-back post exits 1; the job has already emailed the reasons, and this
+# alert is the backup for when that email couldn't go out.
+OnFailure=zerogex-alert@%n.service
 
 [Service]
 Type=oneshot
@@ -19,7 +22,9 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 # EnvironmentFile to auto-post without approval.
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode midday --stage
 
-TimeoutStartSec=240
+# Screenshot + writing + an independent fact-check (and one rewrite when it
+# finds something) takes a few minutes; this is the ceiling, not the norm.
+TimeoutStartSec=1200
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

@@ -603,10 +603,9 @@ class LevelHistory:
             else:
                 d["post_close_roll_off"] = (
                     "The chain re-priced after the 16:00 bell as the day's 0DTE expiries "
-                    "rolled off. Each 'after_the_bell_reset' says which way that level "
-                    "moved for TOMORROW. It was never in play during the session, and "
-                    "its new value is printed on its own line for you: never write a "
-                    "number for it."
+                    "rolled off. The top-level put_wall, call_wall and gamma_flip are that "
+                    "new map, for the next session; each 'after_the_bell_reset' says which "
+                    "way the level moved. The session never traded against the new values."
                 )
         return d
 

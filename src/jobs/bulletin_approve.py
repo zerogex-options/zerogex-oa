@@ -22,10 +22,12 @@ Design rules mirror :mod:`bulletin_tweet`:
   * Idempotent: if the manifest already says ``state=posted`` the
     script exits early with the previous tweet id.  You can't
     accidentally double-post.
-  * Copy-paste fallback: if ``X_BOT_BEARER_TOKEN`` isn't configured
-    (X developer application still pending), ``--print`` dumps the
-    tweet text + media paths to stdout so the operator can paste into
-    the X web UI manually.
+  * Only reviewed drafts post: ``state=blocked`` (the review found a
+    problem) is refused, and so is a draft without its live bulletin
+    image.  ``post_failed`` (reviewed, but X said no) can be retried.
+  * Copy-paste fallback: if the four X OAuth1 keys aren't configured,
+    ``--print`` dumps the tweet text + the image path to stdout so the
+    operator can paste into the X web UI manually.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from src.jobs import x_media_client
 from src.jobs.bulletin_tweet import (
     MediaArtifacts,
     TweetBody,
@@ -116,14 +119,12 @@ def _print_for_manual_posting(
     tweet pipeline still generates real content; the operator posts it
     manually until the API side is unblocked."""
     print(f"\n{'=' * 64}")
-    print(f"MANUAL POSTING MODE — no X_BOT_BEARER_TOKEN configured")
+    print("MANUAL POSTING MODE — X keys not configured, or --print")
     print(f"{'=' * 64}")
     print(f"Mode:         {mode}")
     print(f"Artifacts:    {artifact_dir}")
     if media.png_path:
-        print(f"PNG:          {media.png_path}")
-    if media.clip_path:
-        print(f"Clip:         {media.clip_path}")
+        print(f"PNG:          {media.png_path}  (attach this to the post)")
     print(f"Text length:  {len(tweet.text)} (needs X Premium)")
     print(f"Fallback:     {len(tweet.fallback)} chars (fits classic 280)")
     print(f"{'-' * 64}")
@@ -136,6 +137,7 @@ def _update_manifest_state(
     state: str,
     posted_id: str | None = None,
     reply_id: str | None = None,
+    tweet_url: str | None = None,
 ) -> None:
     """Rewrite manifest.json with the new state, preserving other fields.
 
@@ -149,6 +151,8 @@ def _update_manifest_state(
         manifest["posted_id"] = posted_id
     if reply_id is not None:
         manifest["reply_id"] = reply_id
+    if tweet_url is not None:
+        manifest["tweet_url"] = tweet_url
     manifest["approved_ts"] = datetime.now(tz=ET).isoformat()
     manifest_path.write_text(
         json.dumps(manifest, indent=2, default=str) + "\n", encoding="utf-8",
@@ -179,7 +183,15 @@ def _run(args: argparse.Namespace) -> int:
             "bulletin_approve[%s]: draft was discarded — nothing to do.", args.mode,
         )
         return 0
-    if state not in ("pending", "dry_run"):
+    if state == "blocked" and not (args.discard or args.print_only):
+        logger.warning(
+            "bulletin_approve[%s]: this draft failed review, so it can't be posted "
+            "from here. Problems: %s. Use --print to see it, or --discard.",
+            args.mode,
+            "; ".join(manifest.get("problems") or []) or "(not recorded)",
+        )
+        return 1
+    if state not in ("pending", "dry_run", "post_failed", "blocked"):
         logger.warning(
             "bulletin_approve[%s]: manifest state=%r is not eligible for approval.",
             args.mode, state,
@@ -198,8 +210,12 @@ def _run(args: argparse.Namespace) -> int:
         )
         return 0
 
-    bearer = os.environ.get("X_BOT_BEARER_TOKEN", "").strip()
-    if not bearer or args.print_only:
+    try:
+        x_media_client.load_credentials_from_env()
+        keys_configured = True
+    except x_media_client.MissingCredentialsError:
+        keys_configured = False
+    if not keys_configured or args.print_only:
         # Copy-paste path.  Especially useful while the X developer
         # application is still pending review.
         _print_for_manual_posting(args.mode, artifact_dir, tweet, media)
@@ -216,24 +232,33 @@ def _run(args: argparse.Namespace) -> int:
     post_result = post_bulletin(
         tweet=tweet,
         media=media,
-        bearer=bearer,
         long=args.long,
         mode_label=args.mode,
     )
-    if not post_result:
+    if not post_result.ok:
         logger.warning(
-            "bulletin_approve[%s]: post failed — draft remains pending, retry with the same command.",
+            "bulletin_approve[%s]: not posted (%s) — the draft is unchanged, retry "
+            "with the same command.",
             args.mode,
+            post_result.error,
         )
         return 1
 
     _update_manifest_state(
-        artifact_dir, state="posted", posted_id=post_result.get("id"),
-        reply_id=post_result.get("reply_id"),
+        artifact_dir,
+        state="posted",
+        posted_id=post_result.tweet_id,
+        reply_id=post_result.reply_id,
+        tweet_url=post_result.tweet_url,
     )
+    if post_result.reply_error:
+        logger.warning("bulletin_approve[%s]: %s", args.mode, post_result.reply_error)
     logger.info(
-        "bulletin_approve[%s]: posted tweet id=%s (reply=%s, artifacts=%s)",
-        args.mode, post_result.get("id"), post_result.get("reply_id"), artifact_dir,
+        "bulletin_approve[%s]: posted %s (reply=%s, artifacts=%s)",
+        args.mode,
+        post_result.tweet_url,
+        post_result.reply_id,
+        artifact_dir,
     )
     return 0
 
