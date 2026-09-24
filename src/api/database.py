@@ -3412,7 +3412,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         re-price to the next session, and a 16:05 fire reading the plain
         "latest" row would quote that reset as if the tape had traded against
         it. :func:`src.jobs.level_history.build_level_history` splits the two
-        apart on the same 16:00 ET boundary used here.
+        apart at 16:00 ET, and puts the 16:00 frame itself on the post-bell
+        side: the day's 0DTE has no time, and so no gamma, left in it.
 
         ``end_ts`` clamps the window (a backfilled run reproducing what a fire
         would have seen at a given moment). Unlike
