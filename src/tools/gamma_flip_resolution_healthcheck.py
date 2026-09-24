@@ -60,6 +60,7 @@ import argparse
 import json
 import logging
 import os
+import statistics
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -118,6 +119,10 @@ class SessionResolution:
     #: session written before gamma_flip_reason existed, which is why the
     #: report prints "-" rather than inventing a cause.
     reasons: Sequence[Tuple[str, int]] = ()
+    #: Median |gamma_flip_raw - spot| / spot over the blank rows that carried a
+    #: raw crossing, as a percentage.  ``None`` when none did, or when the
+    #: session has no stored spot.
+    raw_distance_pct: Optional[float] = None
 
     @property
     def unresolved_pct(self) -> float:
@@ -131,6 +136,29 @@ class SessionResolution:
     def dominant_reason(self) -> Optional[str]:
         """The reason behind most of this session's blank rows."""
         return self.reasons[0][0] if self.reasons else None
+
+    def is_distant(self, beyond_pct: Optional[float]) -> bool:
+        """Did the ungated crossing sit too far from spot to be ours to fix?
+
+        ``gamma_flip_raw`` is the same cycle's crossing with no DTE ramp and no
+        gates, so it answers the only question that matters for paging: was
+        there an actionable crossing that OUR pipeline refused, or was there no
+        actionable crossing at all?
+
+        On 2026-09-17 raw sat 2.8% from spot while the published flip was NULL,
+        and that was a real bug in our DTE weighting that took five weeks and a
+        customer to find.  On 2026-09-21..23 raw sat 27-37% away, and the NULL
+        was the correct reading of a book that was long gamma across the whole
+        band.  The reason code says BEYOND_MAX_DISTANCE for both, which is why
+        it cannot be the thing that decides.
+
+        Measured, never assumed: a session with no raw on any blank row, or no
+        stored spot, is NOT excused.  An absence is not evidence that the
+        market did it.
+        """
+        if beyond_pct is None or self.raw_distance_pct is None:
+            return False
+        return self.raw_distance_pct > beyond_pct
 
     def is_ignored(self, ignore: Sequence[str]) -> bool:
         """Is every blank row in this session one the operator asked to ignore?
@@ -154,6 +182,9 @@ class SessionResolution:
             "longest_blank_minutes": round(self.longest_blank_minutes, 1),
             "reasons": {reason: rows for reason, rows in self.reasons},
             "dominant_reason": self.dominant_reason,
+            "raw_distance_pct": (
+                round(self.raw_distance_pct, 1) if self.raw_distance_pct is not None else None
+            ),
         }
         if self.longest is not None:
             out["longest_blank_start"] = self.longest.start.astimezone(ET).isoformat()
@@ -203,17 +234,29 @@ def summarize_session(
     symbol: str,
     session_date: date,
     rows: Sequence[Sequence[Any]],
+    spot: Optional[float] = None,
 ) -> Optional[SessionResolution]:
     """Classify one session's rows.  ``None`` when the session stored none.
 
-    ``rows`` is chronological ``(timestamp, gamma_flip_point, gamma_flip_reason)``.
-    The reason is tolerated as absent so a caller holding two-column rows (and
-    every session written before that column existed) still summarizes.
+    ``rows`` is chronological
+    ``(timestamp, gamma_flip_point, gamma_flip_reason, gamma_flip_raw)``.  The
+    trailing columns are tolerated as absent so a caller holding two- or
+    three-column rows (and every session written before those columns existed)
+    still summarizes.
     """
     if not rows:
         return None
     unresolved = sum(1 for row in rows if row[1] is None)
     tally: Counter = Counter(row[2] for row in rows if row[1] is None and len(row) > 2 and row[2])
+    # Distance of the UNGATED crossing from spot, over the blank rows that had
+    # one.  Median rather than mean: a couple of odd cycles mid-session should
+    # not move a number the pager keys on.
+    distances = [
+        abs(float(row[3]) - spot) / spot * 100.0
+        for row in rows
+        if row[1] is None and len(row) > 3 and row[3] is not None and spot and spot > 0
+    ]
+    raw_distance_pct = float(statistics.median(distances)) if distances else None
     runs = blank_runs([(row[0], row[1]) for row in rows])
     longest = max(runs, key=lambda r: r.minutes) if runs else None
     return SessionResolution(
@@ -224,6 +267,7 @@ def summarize_session(
         unresolved=unresolved,
         longest=longest,
         reasons=tuple(tally.most_common()),
+        raw_distance_pct=raw_distance_pct,
     )
 
 
@@ -249,7 +293,7 @@ def check_session(cursor, symbol: str, session_date: date) -> Optional[SessionRe
     start, end = session_window(session_date)
     cursor.execute(
         """
-        SELECT timestamp, gamma_flip_point, gamma_flip_reason
+        SELECT timestamp, gamma_flip_point, gamma_flip_reason, gamma_flip_raw
         FROM gex_summary
         WHERE underlying = %(symbol)s
           AND timestamp >= %(start)s
@@ -258,7 +302,31 @@ def check_session(cursor, symbol: str, session_date: date) -> Optional[SessionRe
         """,
         {"symbol": symbol, "start": start, "end": end},
     )
-    return summarize_session(symbol, session_date, list(cursor.fetchall()))
+    rows = list(cursor.fetchall())
+    return summarize_session(symbol, session_date, rows, session_spot(cursor, symbol, session_date))
+
+
+def session_spot(cursor, symbol: str, session_date: date) -> Optional[float]:
+    """One representative spot for the session.
+
+    An average over the session rather than a per-row join.  The test this
+    feeds separates "a few percent from spot" from "a third of the way down the
+    chart", and a session in which spot moved far enough to blur that
+    distinction has larger problems than this query.
+    """
+    start, end = session_window(session_date)
+    cursor.execute(
+        """
+        SELECT AVG(close)
+        FROM underlying_quotes
+        WHERE symbol = %(symbol)s
+          AND timestamp >= %(start)s
+          AND timestamp <= %(end)s
+        """,
+        {"symbol": symbol, "start": start, "end": end},
+    )
+    row = cursor.fetchone()
+    return float(row[0]) if row and row[0] is not None else None
 
 
 def configured_symbols() -> List[str]:
@@ -292,7 +360,7 @@ def format_report(
 
     lines = [
         f"{'symbol':<8} {'session':<12} {'rows':>6} {'blank':>7} {'blank%':>7} "
-        f"{'longest':>9}  {'reason':<21} window",
+        f"{'longest':>9}  {'reason':<21} {'raw@':>6}  window",
     ]
     ordered = (
         sorted(results, key=lambda r: (r.symbol, r.session_date))
@@ -314,10 +382,13 @@ def format_report(
         reason = r.dominant_reason or "-"
         if len(r.reasons) > 1:
             reason += f" +{len(r.reasons) - 1}"
+        # How far the ungated crossing sat from spot. Small means our pipeline
+        # refused something actionable; large means there was nothing to refuse.
+        raw_at = f"{r.raw_distance_pct:.0f}%" if r.raw_distance_pct is not None else "-"
         lines.append(
             f"{r.symbol:<8} {r.session_date.isoformat():<12} {r.rows:>6} "
             f"{r.unresolved:>7} {r.unresolved_pct:>6.1f}% "
-            f"{r.longest_blank_minutes:>8.1f}m  {reason:<21} {window}{flag}"
+            f"{r.longest_blank_minutes:>8.1f}m  {reason:<21} {raw_at:>6}  {window}{flag}"
         )
     return lines
 
@@ -364,6 +435,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "anyone hourly for days; leave it unset when reading history."
         ),
     )
+    parser.add_argument(
+        "--ignore-raw-beyond",
+        type=float,
+        default=None,
+        help=(
+            "Do not breach when the ungated crossing (gamma_flip_raw) sat more "
+            "than this percent from spot. That is the market having moved the "
+            "flip out of reach rather than our pipeline refusing one that was "
+            "in reach, and it is the only test that tells those apart -- the "
+            "reason code reads BEYOND_MAX_DISTANCE for both. Set it to the "
+            "actionable-distance ceiling (GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT, "
+            "8 by default). A session with no raw on any blank row is never "
+            "excused by this."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -394,7 +480,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ignore = [str(code).strip().upper() for code in (args.ignore_reasons or [])]
     over = [r for r in results if r.longest_blank_minutes > args.max_blank_minutes]
-    excused = [r for r in over if r.is_ignored(ignore)]
+    excused = [r for r in over if r.is_ignored(ignore) or r.is_distant(args.ignore_raw_beyond)]
     breaches = [r for r in over if r not in excused]
 
     if args.json:
@@ -403,6 +489,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 {
                     "max_blank_minutes": args.max_blank_minutes,
                     "ignore_reasons": ignore,
+                    "ignore_raw_beyond": args.ignore_raw_beyond,
                     "sessions": [r.as_dict() for r in results],
                     "breaches": [r.as_dict() for r in breaches],
                     "excused": [r.as_dict() for r in excused],
@@ -417,10 +504,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Printed, never silent. An excused session is still a session
             # nobody saw a flip in, and the operator decides whether the
             # excuse was the right call -- the tool only declines to page.
+            why = []
+            if ignore:
+                why.append(f"--ignore-reasons {' '.join(ignore)}")
+            if args.ignore_raw_beyond is not None:
+                why.append(f"--ignore-raw-beyond {args.ignore_raw_beyond:g}")
             print(
                 f"\n{len(excused)} session(s) over threshold but excused by "
-                f"--ignore-reasons {' '.join(ignore)}: "
-                + ", ".join(f"{r.symbol} {r.session_date}" for r in excused)
+                f"{' / '.join(why)}: " + ", ".join(f"{r.symbol} {r.session_date}" for r in excused)
             )
         if breaches:
             print(

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
+import pytest
 import pytz
 
 from src.tools import gamma_flip_resolution_healthcheck as tool
@@ -147,21 +148,31 @@ def test_as_dict_is_json_safe_and_carries_the_window():
 class FakeCursor:
     """Dispatches on the SQL it is handed and records the bind parameters."""
 
-    def __init__(self, rows, dates=(SESSION,)):
+    def __init__(self, rows, dates=(SESSION,), spot=29000.0):
         self.rows = rows
         self.dates = dates
+        self.spot = spot
         self.executed = []
         self._result = []
+        self._one = None
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
+        self._one = None
         if "SELECT DISTINCT" in sql:
             self._result = [(d,) for d in self.dates]
+        elif "underlying_quotes" in sql:
+            # The session spot, for the raw-distance test.
+            self._one = (self.spot,)
+            self._result = []
         else:
             self._result = list(self.rows)
 
     def fetchall(self):
         return self._result
+
+    def fetchone(self):
+        return self._one
 
 
 def test_check_session_binds_the_cash_session_window():
@@ -169,11 +180,20 @@ def test_check_session_binds_the_cash_session_window():
     result = tool.check_session(cursor, "NDX", SESSION)
 
     assert result.rows == 4
-    _sql, params = cursor.executed[-1]
+    # The gex_summary read, not the spot lookup that now follows it.
+    summary_sql, params = next((sql, p) for sql, p in cursor.executed if "gex_summary" in sql)
     assert params["symbol"] == "NDX"
     assert params["start"], params["end"] == tool.session_window(SESSION)
-    assert "gex_summary" in _sql
-    assert "gamma_flip_point" in _sql
+    assert "gex_summary" in summary_sql
+    assert "gamma_flip_raw" in summary_sql, "the raw-distance test needs it selected"
+
+    # ...and the spot lookup binds the same window.
+    spot_sql, spot_params = next(
+        (sql, p) for sql, p in cursor.executed if "underlying_quotes" in sql
+    )
+    assert "AVG(close)" in spot_sql
+    assert (spot_params["start"], spot_params["end"]) == tool.session_window(SESSION)
+    assert "gamma_flip_point" in summary_sql
 
 
 def test_session_dates_come_back_oldest_first():
@@ -291,3 +311,88 @@ def test_the_json_payload_carries_the_reasons():
     payload = result.as_dict()
     assert payload["reasons"] == {"EDGE_ONLY": 2}
     assert payload["dominant_reason"] == "EDGE_ONLY"
+
+
+# --- the raw-distance discriminator ----------------------------------------
+#
+# The reason code cannot decide whether to page. BEYOND_MAX_DISTANCE was the
+# verdict on 2026-09-17, when our own DTE ramp was hiding a crossing 2.8% from
+# spot (a real bug, five weeks and a customer to find), and it was ALSO the
+# verdict on 2026-09-21..23, when the crossing genuinely sat 27-37% away in a
+# book that was long gamma across the whole band. Same code, opposite calls.
+#
+# gamma_flip_raw is what separates them: it is the same cycle's crossing with
+# no ramp and no gates, so a raw sitting close to spot while the published flip
+# is NULL means our pipeline refused something actionable. These use the real
+# numbers from both days.
+
+SPOT_SEP17 = 29_424.0
+SPOT_SEP23 = 30_500.0
+
+
+def _raw_rows(pattern, raw_price, reason="BEYOND_MAX_DISTANCE", cadence_seconds=30):
+    out = []
+    for i, ch in enumerate(pattern):
+        ts = OPEN + timedelta(seconds=cadence_seconds * i)
+        if ch == "B":
+            out.append((ts, None, reason, raw_price))
+        else:
+            out.append((ts, 29_000.0 + i, None, raw_price))
+    return out
+
+
+def test_a_near_spot_raw_is_ours_and_still_breaches():
+    """2026-09-17: raw 28,612 against spot 29,424. Our ramp hid it."""
+    result = tool.summarize_session("NDX", SESSION, _raw_rows("BBBB", 28_612.0), SPOT_SEP17)
+    assert result.raw_distance_pct == pytest.approx(2.76, abs=0.05)
+    assert not result.is_distant(8.0), "a 2.8% crossing is one we refused, page for it"
+
+
+def test_a_far_raw_is_the_market_and_is_excused():
+    """2026-09-23: raw 19,442 against spot ~30,500. Nothing to refuse."""
+    result = tool.summarize_session("NDX", SESSION, _raw_rows("BBBB", 19_442.0), SPOT_SEP23)
+    assert result.raw_distance_pct == pytest.approx(36.3, abs=0.2)
+    assert result.is_distant(8.0)
+
+
+def test_the_threshold_is_the_one_being_asked_about():
+    result = tool.summarize_session("NDX", SESSION, _raw_rows("BBBB", 19_442.0), SPOT_SEP23)
+    assert result.is_distant(8.0)
+    assert not result.is_distant(40.0)
+    assert not result.is_distant(None), "unset means excuse nothing"
+
+
+def test_a_session_with_no_raw_on_its_blank_rows_is_never_excused():
+    """An absence is not evidence that the market did it."""
+    rows = [(ts, flip, "ONE_SIDED", None) for ts, flip in _rows("BBBB")]
+    result = tool.summarize_session("NDX", SESSION, rows, SPOT_SEP23)
+    assert result.raw_distance_pct is None
+    assert not result.is_distant(8.0)
+
+
+def test_no_stored_spot_means_no_excuse():
+    result = tool.summarize_session("NDX", SESSION, _raw_rows("BBBB", 19_442.0), None)
+    assert result.raw_distance_pct is None
+    assert not result.is_distant(8.0)
+
+
+def test_only_the_blank_rows_count_toward_the_distance():
+    """A resolved row's raw says nothing about why the blank ones were blank."""
+    rows = _raw_rows("RRRB", 19_442.0)
+    near = tool.summarize_session("NDX", SESSION, rows, SPOT_SEP23)
+    assert near.raw_distance_pct == pytest.approx(36.3, abs=0.2)
+
+
+def test_the_median_survives_a_couple_of_odd_cycles():
+    """One wild raw should not flip a call the pager keys on."""
+    rows = _raw_rows("BBBB", 19_442.0) + _raw_rows("B", 29_900.0)
+    result = tool.summarize_session("NDX", SESSION, rows, SPOT_SEP23)
+    assert result.is_distant(8.0)
+
+
+def test_the_distance_is_reported_so_an_operator_can_see_the_call():
+    far = tool.summarize_session("NDX", SESSION, _raw_rows("BB", 19_442.0), SPOT_SEP23)
+    body = "\n".join(tool.format_report([far], max_blank_minutes=0.0))
+    assert "36%" in body
+    unknown = tool.summarize_session("NDX", SESSION, _raw_rows("BB", 19_442.0), None)
+    assert "-" in "\n".join(tool.format_report([unknown], max_blank_minutes=0.0))
