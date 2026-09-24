@@ -18,6 +18,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+# (closes, lows, highs), oldest -> newest, as get_recent_underlying_bars returns.
+_BARS = ([678.1, 678.3, 678.4], [678.0, 678.2, 678.3], [678.2, 678.4, 678.5])
+
+
 def _build_app(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("API_KEY", raising=False)
     monkeypatch.setenv("ENVIRONMENT", "development")
@@ -46,6 +50,10 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     # live UI can deep-link to /cards/{id}.
     dbmod.DatabaseManager.insert_action_card = AsyncMock(return_value=4221)
     dbmod.DatabaseManager.get_recent_action_cards = AsyncMock(return_value=[])
+    # The newest bar's close is the Card's price (678.40, a touch above the
+    # 677.80 VWAP the confluence signal reports). Three bars keep call_wall_fade's
+    # realized-vol read at zero, as before.
+    dbmod.DatabaseManager.get_recent_underlying_bars = AsyncMock(return_value=_BARS)
     from src.api.main import app  # noqa: E402
 
     return app, dbmod
@@ -115,7 +123,6 @@ def _gvc_signal_row(call_wall=678.0, max_pain=675.0, gamma_flip=676.5, vwap=677.
             "gamma_flip": gamma_flip,
             "vwap": vwap,
             "max_gamma": call_wall,  # near the wall
-            "close": 678.4,
         },
     }
 
@@ -193,38 +200,41 @@ def test_action_endpoint_returns_stand_down_when_triggers_unmet(
     assert "near_misses" in body
 
 
+async def _cwf_adv(symbol, name):
+    """Advanced signals for a board where call_wall_fade triggers."""
+    if name == "trap_detection":
+        return _trap_signal_row()
+    if name == "gamma_vwap_confluence":
+        return _gvc_signal_row()
+    if name == "range_break_imminence":
+        return {
+            "clamped_score": 0.10,
+            "score": 10.0,
+            "context_values": {"label": "Range Fade"},
+        }
+    return None
+
+
+async def _cwf_basic(symbol, name):
+    """Basic signals for a board where call_wall_fade triggers."""
+    if name == "tape_flow_bias":
+        return _tape_signal_row(-50.0)
+    if name == "positioning_trap":
+        return {"clamped_score": -0.30, "score": -30.0, "context_values": {}}
+    if name == "vanna_charm_flow":
+        return {"clamped_score": -0.20, "score": -20.0, "context_values": {}}
+    if name == "dealer_delta_pressure":
+        return {"clamped_score": -0.10, "score": -10.0, "context_values": {}}
+    return None
+
+
 def test_action_endpoint_returns_trade_card_when_call_wall_fade_triggers(
     monkeypatch: pytest.MonkeyPatch,
 ):
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
-
-    async def _adv(symbol, name):
-        if name == "trap_detection":
-            return _trap_signal_row()
-        if name == "gamma_vwap_confluence":
-            return _gvc_signal_row()
-        if name == "range_break_imminence":
-            return {
-                "clamped_score": 0.10,
-                "score": 10.0,
-                "context_values": {"label": "Range Fade"},
-            }
-        return None
-
-    async def _basic(symbol, name):
-        if name == "tape_flow_bias":
-            return _tape_signal_row(-50.0)
-        if name == "positioning_trap":
-            return {"clamped_score": -0.30, "score": -30.0, "context_values": {}}
-        if name == "vanna_charm_flow":
-            return {"clamped_score": -0.20, "score": -20.0, "context_values": {}}
-        if name == "dealer_delta_pressure":
-            return {"clamped_score": -0.10, "score": -10.0, "context_values": {}}
-        return None
-
     dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
-        side_effect=_bulk_stub(adv=_adv, basic=_basic)
+        side_effect=_bulk_stub(adv=_cwf_adv, basic=_cwf_basic)
     )
 
     with TestClient(app) as client:
@@ -249,6 +259,41 @@ def test_action_endpoint_returns_trade_card_when_call_wall_fade_triggers(
     # must be attached to the response payload as ``id`` so the live UI
     # can render a /cards/{id} deep-link.
     assert body["id"] == 4221
+
+
+def test_action_card_prices_off_the_latest_bar_not_vwap(monkeypatch: pytest.MonkeyPatch):
+    """Card #11418: this path quoted the $768.99 VWAP as SPY's price.
+
+    The confluence signal reports VWAP 677.80 and publishes no close; the
+    newest bar closed at 678.40. The Card must carry 678.40.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_cwf_adv, basic=_cwf_basic)
+    )
+
+    with TestClient(app) as client:
+        body = client.get("/api/signals/action?underlying=SPY").json()
+    assert body["pattern"] == "call_wall_fade"
+    assert body["entry"]["ref_price"] == 678.4
+    # The bars end at the Card's timestamp, not whenever the request arrived.
+    bars_call = dbmod.DatabaseManager.get_recent_underlying_bars.call_args
+    assert bars_call.kwargs["as_of"] == datetime(2026, 5, 1, 18, 30, tzinfo=timezone.utc)
+
+
+def test_no_bars_means_no_trade_card(monkeypatch: pytest.MonkeyPatch):
+    """Without a real price there is no Card. VWAP is never a stand-in."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_cwf_adv, basic=_cwf_basic)
+    )
+    dbmod.DatabaseManager.get_recent_underlying_bars = AsyncMock(return_value=([], [], []))
+
+    with TestClient(app) as client:
+        body = client.get("/api/signals/action?underlying=SPY").json()
+    assert body["action"] == "STAND_DOWN"
 
 
 # --------------------------------------------------------------------------

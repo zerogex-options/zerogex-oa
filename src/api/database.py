@@ -3757,7 +3757,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return []
 
     async def get_recent_underlying_bars(
-        self, symbol: str, limit: int = 120
+        self, symbol: str, limit: int = 120, as_of: Optional[datetime] = None
     ) -> Tuple[List[float], List[float], List[float]]:
         """Return trailing ``(closes, lows, highs)`` for ``symbol`` from
         ``underlying_quotes``, oldest → newest.
@@ -3767,17 +3767,33 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         instead of empty lists. low/high fall back to close on pre-backfill
         rows so the three lists stay aligned. Returns empty lists on any error —
         callers treat missing bars as a graceful pattern fallback.
+
+        ``as_of`` keeps only bars stamped at or before it, so the newest close
+        is the price at that moment rather than whenever the request arrived.
+        The playbook path passes the Card's timestamp.
         """
-        query = """
-            SELECT low, high, close
-            FROM underlying_quotes
-            WHERE symbol = $1
-            ORDER BY timestamp DESC
-            LIMIT $2
-        """
+        if as_of is None:
+            query = """
+                SELECT low, high, close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT $2
+            """
+            args: Tuple[Any, ...] = (symbol, limit)
+        else:
+            query = """
+                SELECT low, high, close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp <= $3
+                ORDER BY timestamp DESC
+                LIMIT $2
+            """
+            args = (symbol, limit, as_of)
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, *args)
         except Exception as e:
             logger.warning(f"get_recent_underlying_bars({symbol}) failed: {e}")
             return [], [], []

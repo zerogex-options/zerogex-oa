@@ -59,3 +59,39 @@ async def test_get_recent_underlying_bars_fails_closed(monkeypatch):
     monkeypatch.setattr(db, "_acquire_connection", _boom)
     # Errors degrade to empty lists (= prior empty-bar fallback), never raise.
     assert await db.get_recent_underlying_bars("SPY") == ([], [], [])
+
+
+@pytest.mark.asyncio
+async def test_as_of_bounds_the_bars_at_the_card_time(monkeypatch):
+    """The playbook passes the Card's timestamp so the newest close is the
+    price at that minute, not whenever the API request arrived."""
+    from datetime import datetime, timezone
+
+    db = DatabaseManager()
+    calls = []
+
+    class _Conn:
+        async def fetch(self, *args):
+            calls.append(args)
+            return [{"low": 767.75, "high": 767.99, "close": 767.99}]
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(db, "_acquire_connection", lambda: _Acquire())
+    as_of = datetime(2026, 9, 23, 19, 47, tzinfo=timezone.utc)
+
+    closes, _, _ = await db.get_recent_underlying_bars("SPY", as_of=as_of)
+    sql, *params = calls[-1]
+    assert "timestamp <= $3" in sql
+    assert params == ["SPY", 120, as_of]
+    assert closes == [767.99]
+
+    await db.get_recent_underlying_bars("SPY")
+    sql, *params = calls[-1]
+    assert "timestamp <=" not in sql, "no as_of keeps the unbounded read"
+    assert params == ["SPY", 120]

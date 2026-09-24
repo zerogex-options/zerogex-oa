@@ -249,3 +249,44 @@ def test_emitted_card_serializes_to_full_dict():
     assert d["context"]["drift_direction"] in ("bullish", "bearish")
     assert d["context"]["eod_pressure_score"] == 40.0
     assert d["context"]["minutes_to_close"] > 0
+
+
+# ----------------------------------------------------------------------
+# VWAP side: price must already be on the drift side of VWAP
+# ----------------------------------------------------------------------
+
+
+def test_price_at_vwap_does_not_fire():
+    """Card #11418: entry, stop and target all printed at one price.
+
+    Stop = VWAP and target = 1.5*close - 0.5*VWAP, so close == VWAP collapses
+    all three into the same number.
+    """
+    ctx = _ctx(eod_score=50.0, close=768.99, vwap=768.99, call_wall=None, put_wall=None)
+    assert EOD_DRIFT.match(ctx) is None
+    assert any("not above VWAP" in m for m in EOD_DRIFT.explain_miss(ctx))
+
+
+def test_bullish_drift_below_vwap_does_not_fire():
+    """SPY's real 15:47 print was 767.99 against a 768.99 VWAP: a call there
+    would target 767.49, below its own entry, with the stop above it."""
+    ctx = _ctx(eod_score=50.0, close=767.99, vwap=768.99, call_wall=None, put_wall=None)
+    assert EOD_DRIFT.match(ctx) is None
+
+
+def test_bearish_drift_above_vwap_does_not_fire():
+    ctx = _ctx(eod_score=-40.0, close=678.5, vwap=678.0, last_close_delta=-0.05)
+    assert EOD_DRIFT.match(ctx) is None
+    assert any("not below VWAP" in m for m in EOD_DRIFT.explain_miss(ctx))
+
+
+def test_levels_straddle_the_entry_in_both_directions():
+    bull = EOD_DRIFT.match(_ctx(eod_score=40.0, close=680.0, vwap=678.0, call_wall=685.0))
+    assert bull is not None
+    assert bull.stop.ref_price < bull.entry.ref_price < bull.target.ref_price
+
+    bear = EOD_DRIFT.match(
+        _ctx(eod_score=-40.0, close=676.0, vwap=678.0, put_wall=670.0, last_close_delta=-0.05)
+    )
+    assert bear is not None
+    assert bear.target.ref_price < bear.entry.ref_price < bear.stop.ref_price

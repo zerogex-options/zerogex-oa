@@ -230,10 +230,15 @@ def _build_market_context(
     vwap = gvc_vals.get("vwap")
     max_pain = gvc_vals.get("max_pain")
 
-    # `close` doesn't appear directly on the score row — patterns that
-    # need it should also consult `levels`.  We fall back to vwap as a
-    # proxy when no explicit close is available.
-    close = float(gvc_vals.get("close") or vwap or 0.0)
+    # The price is the newest 1-minute bar at or before the Card's timestamp
+    # (the caller bounds ``recent_closes`` to it): the same bar the live cycle
+    # reads. It is never VWAP. This used to read a ``close`` from the
+    # gamma_vwap_confluence context and fall back to VWAP, but that signal has
+    # never published a close, so every Card built here quoted VWAP as the
+    # price. Card #11418 (SPY, 15:47 ET 2026-09-23) printed entry, stop and
+    # target all at $768.99 while that minute's bar traded 767.75-767.99. No
+    # bar means 0.0, which every pattern treats as "close price unavailable".
+    close = float(recent_closes[-1]) if recent_closes else 0.0
 
     extra: dict[str, Any] = {}
     if vix is not None:
@@ -350,9 +355,12 @@ async def build_playbook_context(
         snap.score_history = _normalize_history(rows)
 
     # Recent underlying bars (~2h of 1-min OHLC) so bar-history patterns fire
-    # on the async API path. Fails closed to empty lists (= prior behavior).
+    # on the async API path, ending at the Card's timestamp: the newest one is
+    # the Card's price. Fails closed to empty lists, and so to no trade Card.
     try:
-        recent_closes, recent_lows, recent_highs = await db.get_recent_underlying_bars(underlying)
+        recent_closes, recent_lows, recent_highs = await db.get_recent_underlying_bars(
+            underlying, as_of=timestamp
+        )
     except Exception as exc:
         logger.warning("get_recent_underlying_bars(%s) failed: %s", underlying, exc)
         recent_closes, recent_lows, recent_highs = [], [], []

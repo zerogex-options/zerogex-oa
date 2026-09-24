@@ -193,6 +193,24 @@ class EodPressureDriftPattern(PatternBase):
                         f"(last move {last_move:+.4f}, expected sign {int(drift_sign)})"
                     )
 
+        # VWAP side: the trade is anchored to VWAP. The stop is a VWAP cross
+        # against the position and the target extends the distance from VWAP,
+        # so price must already sit on the drift side of it. At VWAP the three
+        # levels collapse into one price; past it the target lands behind the
+        # entry and the stop in front of it (a call targeting a lower price).
+        if (
+            eod is not None
+            and eod.triggered
+            and abs(eod.score) >= _EOD_SCORE_MIN
+            and close > 0
+            and vwap is not None
+            and vwap > 0
+        ):
+            if eod.score > 0 and close <= vwap:
+                missing.append(f"price ${close:.2f} not above VWAP ${vwap:.2f} for a bullish drift")
+            elif eod.score < 0 and close >= vwap:
+                missing.append(f"price ${close:.2f} not below VWAP ${vwap:.2f} for a bearish drift")
+
         # Opposing wall blocker: a wall too close in the drift direction
         # would absorb the move before VWAP-extension can hit.  Only
         # check when eod is valid (drift is defined).
