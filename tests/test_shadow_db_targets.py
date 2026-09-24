@@ -229,30 +229,50 @@ def test_a_recipe_cannot_guard_itself_with_exit_0():
                 )
 
 
-def test_shadow_run_reads_underlyings_from_env_as_text_not_through_make():
-    """`-include .env` parses that file AS A MAKEFILE.
+def test_shadow_run_reloads_the_whole_env_in_the_shell():
+    """`-include .env` parses that file AS A MAKEFILE, so every `$` in it is a
+    variable reference.
 
-    "SPY,QQQ,$SPXW.X,$NDXP.X" therefore has `$S` and `$N` expanded as empty
-    make variables and arrives as "SPY,QQQ,PXW.X,DXP.X" -- two symbols that
-    do not exist. The 2026-09-24 rehearsal ran an hour on those. systemd
-    reads .env directly and is unaffected, which is why production never saw
-    it and why this target must not route the value through make.
+    `SYMBOL_ALIASES=SPX=$SPXW.X,NDX=$NDXP.X` becomes `SPX=PXW.X,NDX=DXP.X`,
+    because `$S` and `$N` are empty make variables, and `export` pushes that
+    into every child. The 2026-09-24 rehearsal ran engines for "PXW.X" and
+    "DXP.X", which are not symbols -- and, having lost the `$`, they also
+    stopped looking like indices, so they were sent to the stock endpoint.
+
+    Fixing one variable is not enough: the first attempt read
+    INGEST_UNDERLYINGS as text and the run STILL came up with PXW.X, because
+    on this deployment the `$` lives in SYMBOL_ALIASES one step later. So the
+    recipe reloads all of .env rather than naming variables one at a time.
     """
     body = _recipe("shadow-run")
-    assert "$(INGEST_UNDERLYINGS)" not in body, (
-        "the underlying list must not come through make -- $S and $N are "
-        "eaten as empty variables and the index symbols are silently mangled"
-    )
-    assert "$(INGEST_UNDERLYING)" not in body
-    assert re.search(
-        r"sed -n[^\n]*INGEST_UNDERLYINGS=[^\n]*\.env", body
-    ), "read it out of .env as literal text"
-    assert "--underlyings" in body, "and pass it explicitly on the command line"
+    assert "< .env" in body, "the recipe must re-read .env itself, in the shell"
+    assert 'export "$$key=$$val"' in body, "and export each value literally"
+    for var in (
+        "INGEST_UNDERLYINGS",
+        "INGEST_UNDERLYING",
+        "SYMBOL_ALIASES",
+        "INGEST_MONTHLY_UNDERLYING_ALIASES",
+        "OPTION_ROOT_ALIASES",
+    ):
+        assert f"$({var})" not in body, (
+            f"{var} must not come through make -- any $ in its value is eaten "
+            "as an empty make variable"
+        )
+
+
+def test_shadow_run_sets_the_shadow_database_after_loading_env():
+    """.env sets DB_NAME to PRODUCTION, so the override must come after it.
+
+    Loaded first, the rehearsal would write into the live tables.
+    """
+    body = _recipe("shadow-run")
+    assert body.index("< .env") < body.index("DB_NAME=$(SHADOW_DB)")
+    assert body.index("< .env") < body.index("MARKET_DATA_PROVIDER=$(SHADOW_PROVIDER)")
 
 
 def test_shadow_run_refuses_to_start_with_no_underlyings():
     """An empty list silently becomes the engine's SPY default, which would
     look like a successful rehearsal covering one quarter of production."""
     body = _recipe("shadow-run")
-    assert '-z "$$UL"' in body
+    assert '-z "$$INGEST_UNDERLYINGS"' in body
     assert "exit 1" in body

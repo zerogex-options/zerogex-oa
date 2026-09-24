@@ -3412,13 +3412,24 @@ shadow-create: shadow-guard ## Create the cutover-rehearsal database and apply s
 	}
 	@$(MAKE) --no-print-directory schema-apply DB_NAME=$(SHADOW_DB)
 
-# Reads INGEST_UNDERLYINGS out of .env as TEXT, with sed, and passes it on the
-# command line. It must NOT come through make: `-include .env` parses that file
-# AS A MAKEFILE, so `$$S` and `$$N` in "SPY,QQQ,$$SPXW.X,$$NDXP.X" are expanded as
-# (empty) make variables and the value becomes "SPY,QQQ,PXW.X,DXP.X" -- two
-# symbols that do not exist. Observed 2026-09-24: the rehearsal ran for an hour
-# on mangled index symbols. systemd reads .env directly and is unaffected, which
-# is why production never saw this.
+# Re-reads the WHOLE of .env in the shell, literally, and exports it over
+# whatever make inherited.
+#
+# `-include .env` parses that file AS A MAKEFILE, so every `$$` in it is a
+# variable reference: `SYMBOL_ALIASES=SPX=$$SPXW.X,NDX=$$NDXP.X` becomes
+# `SPX=PXW.X,NDX=DXP.X`, because `$$S` and `$$N` are (empty) make variables.
+# Then `export` pushes those mangled values into every child.
+#
+# Fixing one variable is not enough -- the first attempt read INGEST_UNDERLYINGS
+# as text and the run still came up with PXW.X, because on this deployment the
+# `$$` symbols live in SYMBOL_ALIASES, one resolution step later. Anything in
+# .env carrying a `$$` is affected, so this loads all of it rather than naming
+# variables one at a time.
+#
+# Deliberately a shell loop and not `load_dotenv()`: systemd's EnvironmentFile
+# sets these literally, python-dotenv interpolates `$${VAR}`, and the rehearsal
+# has to behave like production rather than like a second loader. Production
+# never saw any of this, because systemd does no expansion.
 .PHONY: shadow-run
 shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate feed. Ctrl-C to stop. Vars: SHADOW_PROVIDER, DEBUG=1
 	@echo "$(BLUE)================================================================================$(NC)"
@@ -3430,16 +3441,25 @@ shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate
 	@echo "Leave it running for a full session, then run: make shadow-compare"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo ""
-	@UL="$$(sed -n 's/^INGEST_UNDERLYINGS=//p' .env | tail -1 | tr -d '\042\047')"; \
-	if [ -z "$$UL" ]; then \
-		echo "$(RED)❌ INGEST_UNDERLYINGS is not set in .env$(NC)"; \
-		exit 1; \
+	@test -f .env || { echo "$(RED)❌ .env not found$(NC)"; exit 1; }
+	@set -e; \
+	while IFS= read -r line || [ -n "$$line" ]; do \
+		case "$$line" in ""|"#"*) continue ;; esac; \
+		line=$${line#export }; \
+		case "$$line" in *=*) ;; *) continue ;; esac; \
+		key=$${line%%=*}; \
+		val=$$(printf '%s' "$${line#*=}" | sed -e 's/^"\(.*\)"$$/\1/' -e "s/^'\(.*\)'$$/\1/"); \
+		export "$$key=$$val"; \
+	done < .env; \
+	if [ -z "$$INGEST_UNDERLYINGS" ]; then \
+		echo "$(RED)❌ INGEST_UNDERLYINGS is not set in .env$(NC)"; exit 1; \
 	fi; \
-	echo "Underlyings (read from .env as text): $$UL"; \
+	echo "Underlyings:    $$INGEST_UNDERLYINGS"; \
+	echo "Symbol aliases: $$SYMBOL_ALIASES"; \
+	echo "$(YELLOW)Both lines must show the \$$ on index symbols. Missing means mangled.$(NC)"; \
 	echo ""; \
 	DB_NAME=$(SHADOW_DB) MARKET_DATA_PROVIDER=$(SHADOW_PROVIDER) \
-		$(VENV_PYTHON) -m src.ingestion.main_engine \
-		--underlyings "$$UL" $(if $(DEBUG),--debug)
+		$(VENV_PYTHON) -m src.ingestion.main_engine $(if $(DEBUG),--debug)
 
 .PHONY: shadow-compare
 shadow-compare: shadow-guard ## Side-by-side coverage for today's ET session: production vs rehearsal DB (gate G2 evidence)
