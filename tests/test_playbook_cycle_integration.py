@@ -296,3 +296,31 @@ def test_evaluate_and_persist_works_without_conn():
         conn=None,
     )
     assert card.pattern == "call_wall_fade"
+
+
+def test_evaluate_and_persist_writes_nothing_after_the_close():
+    """The flow that fires call_wall_fade at 14:30 ET must not fire at 17:30.
+
+    call_wall_fade has a 10:00 ET floor and no ceiling, so before the session
+    gate an after-hours print could issue (and persist) a 0DTE Card nobody
+    could trade.
+    """
+    from dataclasses import replace
+
+    from src.signals.playbook.patterns.call_wall_fade import PATTERN as CWF
+
+    conn = _FakeConn()
+    after_close = replace(
+        _market_ctx(), timestamp=datetime(2026, 5, 1, 21, 30, tzinfo=timezone.utc)
+    )  # 17:30 EDT
+    card = evaluate_and_persist(
+        engine=PlaybookEngine(patterns=[CWF]),
+        market_context=after_close,
+        score=_empty_score(),
+        advanced_results=_bearish_flow_advanced(),
+        basic_results=_bearish_flow_basic(),
+        conn=conn,
+    )
+    assert card.action == ActionEnum.STAND_DOWN
+    assert card.rationale.startswith("Market closed")
+    assert _inserts_into_action_cards(conn) == []

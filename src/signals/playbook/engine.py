@@ -3,7 +3,8 @@
 Responsibilities (per ``docs/playbook_catalog.md`` §4):
 
   1. Discover registered patterns (built-in + custom dir).
-  2. Call ``match()`` on each pattern with the PlaybookContext.
+  2. Call ``match()`` on each pattern with the PlaybookContext, but only in
+     the regular session; outside it, emit a STAND_DOWN without running any.
   3. Apply gates: regime, position-state, confidence floor, hysteresis.
   4. Resolve conflicts: highest confidence wins, tier-priority tiebreak.
   5. Surface losing candidates as ``alternatives_considered``.
@@ -130,6 +131,17 @@ class PlaybookEngine:
 
     def evaluate(self, ctx: PlaybookContext) -> ActionCard:
         """Run patterns through all gates and return one ActionCard."""
+        # Step 0: session gate. A Card is an instruction to trade options at
+        # the prices printed on it, and those options trade only in the
+        # regular session. The signal cycle runs 24x5, so without this gate
+        # patterns fired on pre-market and after-hours prints: Card #11270
+        # (QQQ, 2026-09-23) was a 0DTE put issued off the 04:00 ET print whose
+        # 120-minute hold ended before the options opened. Returning before
+        # any pattern runs also keeps such a cycle out of the table, since a
+        # STAND_DOWN is never persisted.
+        if not ctx.is_regular_session:
+            return self._market_closed(ctx)
+
         # Step 1: collect raw candidates.
         candidates: list[tuple[PatternBase, ActionCard]] = []
         miss_diagnostics: list[NearMiss] = []
@@ -285,6 +297,31 @@ class PlaybookEngine:
         "hold window",
         "regime",
     )
+
+    def _market_closed(self, ctx: PlaybookContext) -> ActionCard:
+        """STAND_DOWN for a cycle outside the regular session.
+
+        No near-misses: no pattern ran, so none of them came close.
+        """
+        return ActionCard(
+            underlying=ctx.underlying,
+            timestamp=ctx.timestamp,
+            action=ActionEnum.STAND_DOWN,
+            pattern="stand_down",
+            tier="n/a",
+            direction="non_directional",
+            confidence=0.0,
+            rationale=(
+                "Market closed: Cards are issued only in the regular session, "
+                "09:30 ET to the close."
+            ),
+            near_misses=[],
+            context={
+                "msi": ctx.msi_score,
+                "regime": ctx.msi_regime,
+                "session": "closed",
+            },
+        )
 
     def _stand_down(self, ctx: PlaybookContext, miss_diagnostics: list[NearMiss]) -> ActionCard:
         # Sort gate-blocked misses (almost-matched) ahead of trigger-failure

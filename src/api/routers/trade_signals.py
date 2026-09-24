@@ -382,6 +382,11 @@ async def get_action_card(
     with a `near_misses[]` list naming the closest patterns and the
     specific trigger conditions they failed.
 
+    Outside the regular session (09:30 ET to the close) the answer is always
+    `STAND_DOWN` with rationale "Market closed", empty `near_misses`, and
+    `context.session = "closed"`: no pattern is evaluated on a pre-market or
+    after-hours print.
+
     **Params:** `underlying` (default `SPY`).
     Returns 404 when no signal_score row exists for the symbol yet.
 

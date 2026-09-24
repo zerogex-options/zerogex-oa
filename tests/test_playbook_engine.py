@@ -247,3 +247,85 @@ def test_stand_down_card_serializes_without_trade_fields():
     assert "legs" not in d
     assert "near_misses" in d
     assert d["near_misses"][0]["pattern"] == "cwf"
+
+
+# ----------------------------------------------------------------------
+# Session gate: no Cards while the options market is closed
+# ----------------------------------------------------------------------
+
+
+class _CountingPattern(_StubPattern):
+    """A pattern that would always fire, and counts how often it was asked."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.calls = 0
+
+    def match(self, ctx: PlaybookContext) -> Optional[ActionCard]:
+        self.calls += 1
+        return super().match(ctx)
+
+
+def _utc(*args) -> datetime:
+    return datetime(*args, tzinfo=timezone.utc)
+
+
+def test_pre_market_print_yields_market_closed_stand_down():
+    """Card #11270: a 0DTE put issued off QQQ's 04:00 ET print."""
+    pat = _CountingPattern(id="max_pain_gravitation")
+    engine = PlaybookEngine(patterns=[pat])
+    card = engine.evaluate(_ctx(timestamp=_utc(2026, 9, 23, 8, 0)))  # 04:00 EDT
+    assert card.action == ActionEnum.STAND_DOWN
+    assert card.rationale.startswith("Market closed")
+    assert card.near_misses == []
+    assert card.context["session"] == "closed"
+    assert pat.calls == 0, "no pattern may run outside the session"
+
+
+def test_session_edges_follow_the_bar_stamp():
+    """Bars are stamped at the start of their minute: 09:30 is the first
+    regular-session bar and 16:00 the first after-hours one."""
+    engine = PlaybookEngine(patterns=[_CountingPattern(id="p")])
+
+    def action_at(ts: datetime) -> ActionEnum:
+        return engine.evaluate(_ctx(timestamp=ts)).action
+
+    # 2026-09-23 is EDT (UTC-4).
+    assert action_at(_utc(2026, 9, 23, 13, 29)) == ActionEnum.STAND_DOWN  # 09:29
+    assert action_at(_utc(2026, 9, 23, 13, 30)) == ActionEnum.BUY_PUT_DEBIT  # 09:30
+    assert action_at(_utc(2026, 9, 23, 19, 59)) == ActionEnum.BUY_PUT_DEBIT  # 15:59
+    assert action_at(_utc(2026, 9, 23, 20, 0)) == ActionEnum.STAND_DOWN  # 16:00
+    assert action_at(_utc(2026, 9, 24, 0, 30)) == ActionEnum.STAND_DOWN  # 20:30
+
+
+def test_session_gate_follows_standard_time():
+    """In January the open is 14:30 UTC, not 13:30."""
+    engine = PlaybookEngine(patterns=[_CountingPattern(id="p")])
+    early = engine.evaluate(_ctx(timestamp=_utc(2026, 1, 13, 13, 30)))  # 08:30 EST
+    open_ = engine.evaluate(_ctx(timestamp=_utc(2026, 1, 13, 14, 30)))  # 09:30 EST
+    assert early.action == ActionEnum.STAND_DOWN
+    assert open_.action == ActionEnum.BUY_PUT_DEBIT
+
+
+def test_weekend_and_holiday_are_closed(monkeypatch):
+    from src import market_calendar
+
+    engine = PlaybookEngine(patterns=[_CountingPattern(id="p")])
+    saturday = _utc(2026, 9, 26, 15, 0)  # 11:00 EDT
+    assert engine.evaluate(_ctx(timestamp=saturday)).action == ActionEnum.STAND_DOWN
+
+    thanksgiving = _utc(2026, 11, 26, 16, 0)  # 11:00 EST, a Thursday
+    monkeypatch.setattr(market_calendar, "NYSE_HOLIDAYS", {thanksgiving.date()})
+    assert engine.evaluate(_ctx(timestamp=thanksgiving)).action == ActionEnum.STAND_DOWN
+
+
+def test_early_close_day_ends_at_one_pm(monkeypatch):
+    from src import market_calendar
+
+    half_day = _utc(2026, 11, 27, 17, 59).date()  # the Friday after Thanksgiving
+    monkeypatch.setattr(market_calendar, "NYSE_HALF_DAYS", {half_day})
+    engine = PlaybookEngine(patterns=[_CountingPattern(id="p")])
+    before = engine.evaluate(_ctx(timestamp=_utc(2026, 11, 27, 17, 59)))  # 12:59 EST
+    at_close = engine.evaluate(_ctx(timestamp=_utc(2026, 11, 27, 18, 0)))  # 13:00 EST
+    assert before.action == ActionEnum.BUY_PUT_DEBIT
+    assert at_close.action == ActionEnum.STAND_DOWN

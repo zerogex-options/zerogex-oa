@@ -162,6 +162,8 @@ class PatternBase:
 
 On every scoring cycle, for each underlying in `SIGNALS_UNDERLYINGS`:
 
+Outside the regular session (09:30 ET to the close, 13:00 on an early-close day) none of the steps below run: the engine emits a `STAND_DOWN` with rationale "Market closed". The cycle runs 24x5, and a Card issued off a pre-market or after-hours print can't be traded. See §6.
+
 1. Build `PlaybookContext`.
 2. Collect candidate Cards by calling `match()` on every registered pattern (built-in + custom).
 3. **Regime gate**: drop Cards whose pattern's `valid_regimes` doesn't include the current MSI regime.
@@ -219,6 +221,8 @@ How well the current MSI regime matches the pattern's preferred regime.
 - Zero patterns produced a surviving Card, OR
 - All surviving Cards have `confidence < 0.25`, AND
 - There is no open position requiring management.
+
+It is also emitted, without evaluating any pattern, whenever the cycle falls outside the regular session (09:30 ET to the close). That Card's rationale reads "Market closed", its `near_misses` is empty, and its `context.session` is `"closed"`.
 
 The Card carries a structured rationale:
 

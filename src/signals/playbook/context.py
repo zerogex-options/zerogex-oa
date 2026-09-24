@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 import pytz
 
+from src.market_calendar import in_regular_session
 from src.signals.components.base import MarketContext
 
 _ET = pytz.timezone("America/New_York")
@@ -165,6 +166,12 @@ class PlaybookContext:
     @property
     def day_of_week(self) -> str:
         return self._et_dt().strftime("%a")  # "Mon", "Tue", ...
+
+    @property
+    def is_regular_session(self) -> bool:
+        """True from 09:30 ET to the close (13:00 on an early-close day) on a
+        trading day: the only hours a Card's options can be traded."""
+        return in_regular_session(self.timestamp)
 
     @property
     def is_first_30min(self) -> bool:

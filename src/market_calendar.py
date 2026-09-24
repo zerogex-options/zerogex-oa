@@ -444,6 +444,29 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
     return "closed"
 
 
+def regular_session_close(day: date) -> time:
+    """ET close of the regular session on ``day``: 13:00 on an early-close
+    day (``NYSE_HALF_DAYS``), 16:00 otherwise."""
+    return NYSE_HALF_DAY_CLOSE if day in NYSE_HALF_DAYS else NYSE_REGULAR_CLOSE
+
+
+def in_regular_session(dt: Optional[datetime] = None) -> bool:
+    """True when ``dt`` (default: now) is inside the regular session.
+
+    The window is ``[09:30, close)`` ET on a trading day, with the close at
+    13:00 on an early-close day. Half-open because ``underlying_quotes`` stamps
+    each bar at the START of the minute it covers: the 09:30 bar is the
+    session's first and the 16:00 bar is the first after-hours one.
+
+    Unlike ``is_market_hours`` (inclusive of 16:00, no early closes), this is
+    the window an options instruction can actually be acted on in.
+    """
+    dt = _to_et(dt)
+    if not is_trading_session(dt.date()):
+        return False
+    return time(9, 30) <= dt.time() < regular_session_close(dt.date())
+
+
 def _feed_session_window(session_template: Optional[str]) -> tuple[time, time]:
     """ET window the TradeStation bar feed delivers data in for a given
     session template. Unknown/custom templates fail safe to the widest
