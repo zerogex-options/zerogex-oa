@@ -352,6 +352,101 @@ def configured_symbols() -> List[str]:
     return [get_canonical_symbol(symbol) for symbol in parse_underlyings(raw)]
 
 
+#: A session in which the flip was dark for longer than the threshold, versus
+#: one in which it was not.  Deliberately the SAME threshold the level-based
+#: check uses, so the two views cannot disagree about what a bad session is.
+STATE_DARK = "dark"
+STATE_PUBLISHING = "publishing"
+
+
+@dataclass(frozen=True)
+class Transition:
+    """A symbol changing state between two consecutive stored sessions."""
+
+    symbol: str
+    previous: "SessionResolution"
+    current: "SessionResolution"
+    to_state: str
+
+    @property
+    def went_dark(self) -> bool:
+        return self.to_state == STATE_DARK
+
+    def as_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "previous_session": self.previous.session_date.isoformat(),
+            "session": self.current.session_date.isoformat(),
+            "to_state": self.to_state,
+            "previous_blank_minutes": round(self.previous.longest_blank_minutes, 1),
+            "blank_minutes": round(self.current.longest_blank_minutes, 1),
+        }
+
+
+def session_state(result: "SessionResolution", max_blank_minutes: float) -> str:
+    return STATE_DARK if result.longest_blank_minutes > max_blank_minutes else STATE_PUBLISHING
+
+
+def transitions(
+    results: Sequence["SessionResolution"], max_blank_minutes: float
+) -> List[Transition]:
+    """Where each symbol CHANGED state between consecutive stored sessions.
+
+    The level-based check asks "is the flip dark today", which is the right
+    question once and the wrong question three hundred times.  Across
+    2026-08-03..09-23 it had two answers worth sending -- a bug started, and
+    much later a regime started -- and it would have sent roughly two hundred
+    emails to deliver them.
+
+    This asks "did it CHANGE today", which needs no theory about WHY it is
+    dark.  That matters because the why turned out to be undecidable from the
+    stored row: the reason code reads BEYOND_MAX_DISTANCE for both a bug in our
+    own DTE weighting and a book that is genuinely long gamma everywhere, and
+    the distance of the ungated crossing from spot overlaps between them
+    (0-21% when it was ours, 27-35% when it was the market).
+
+    A session with no predecessor in the loaded window yields no transition.
+    Its state is known but its CHANGE is not, and the difference is the whole
+    point.
+    """
+    by_symbol: dict = {}
+    for r in sorted(results, key=lambda r: (r.symbol, r.session_date)):
+        by_symbol.setdefault(r.symbol, []).append(r)
+
+    out: List[Transition] = []
+    for symbol, rows in by_symbol.items():
+        for previous, current in zip(rows, rows[1:]):
+            before = session_state(previous, max_blank_minutes)
+            after = session_state(current, max_blank_minutes)
+            if before != after:
+                out.append(
+                    Transition(
+                        symbol=symbol, previous=previous, current=current, to_state=after
+                    )
+                )
+    return out
+
+
+def format_transitions(edges: Sequence[Transition], results_count: int) -> List[str]:
+    """Every state change in the window, which is every alert this would send."""
+    if not edges:
+        return [f"no state changes across {results_count} session(s) -- nothing to send"]
+    lines = [f"{'symbol':<8} {'session':<12} {'change':<24} blank was -> is"]
+    for t in edges:
+        change = f"{'WENT DARK' if t.went_dark else 'recovered'}"
+        lines.append(
+            f"{t.symbol:<8} {t.current.session_date.isoformat():<12} {change:<24} "
+            f"{t.previous.longest_blank_minutes:.0f}m -> {t.current.longest_blank_minutes:.0f}m "
+            f"(prev session {t.previous.session_date.isoformat()})"
+        )
+    lines.append("")
+    lines.append(
+        f"{sum(1 for t in edges if t.went_dark)} alert(s) would have been sent "
+        f"across {results_count} session(s); recoveries are reported, never paged."
+    )
+    return lines
+
+
 def format_report(
     results: Sequence[SessionResolution],
     max_blank_minutes: float,
@@ -448,6 +543,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--edges",
+        action="store_true",
+        help=(
+            "Report state CHANGES instead of state, and breach only when a "
+            "symbol newly went dark. Needs at least two sessions to compare. "
+            "Run it over a long window first to see every alert it would have "
+            "sent: --edges --since 2026-08-03 --sessions 40."
+        ),
+    )
+    parser.add_argument(
         "--ignore-raw-beyond",
         type=float,
         default=None,
@@ -491,9 +596,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     ignore = [str(code).strip().upper() for code in (args.ignore_reasons or [])]
-    over = [r for r in results if r.longest_blank_minutes > args.max_blank_minutes]
-    excused = [r for r in over if r.is_ignored(ignore) or r.is_distant(args.ignore_raw_beyond)]
-    breaches = [r for r in over if r not in excused]
+    edges = transitions(results, args.max_blank_minutes) if args.edges else []
+
+    if args.edges:
+        # Only a change pages. A symbol that has been dark for a month is not
+        # news every hour, and a symbol that has been dark since before the
+        # window started has no established change at all.
+        excused = []
+        breaches = [t.current for t in edges if t.went_dark]
+    else:
+        over = [r for r in results if r.longest_blank_minutes > args.max_blank_minutes]
+        excused = [r for r in over if r.is_ignored(ignore) or r.is_distant(args.ignore_raw_beyond)]
+        breaches = [r for r in over if r not in excused]
 
     if args.json:
         print(
@@ -502,6 +616,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "max_blank_minutes": args.max_blank_minutes,
                     "ignore_reasons": ignore,
                     "ignore_raw_beyond": args.ignore_raw_beyond,
+                    "edges": [t.as_dict() for t in edges],
                     "sessions": [r.as_dict() for r in results],
                     "breaches": [r.as_dict() for r in breaches],
                     "excused": [r.as_dict() for r in excused],
@@ -512,6 +627,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         for line in format_report(results, args.max_blank_minutes, by_date=args.by_date):
             print(line)
+        if args.edges:
+            print("")
+            for line in format_transitions(edges, len(results)):
+                print(line)
         if excused:
             # Printed, never silent. An excused session is still a session
             # nobody saw a flip in, and the operator decides whether the
@@ -525,7 +644,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"\n{len(excused)} session(s) over threshold but excused by "
                 f"{' / '.join(why)}: " + ", ".join(f"{r.symbol} {r.session_date}" for r in excused)
             )
-        if breaches:
+        if breaches and args.edges:
+            print(
+                f"\n{len(breaches)} symbol-session(s) NEWLY went dark. That is the "
+                "alert; a symbol already dark yesterday is not re-reported."
+            )
+        elif breaches:
             print(
                 f"\n{len(breaches)} session(s) left the flip blank for more than "
                 f"{args.max_blank_minutes:g} minutes. For WHY, run "
