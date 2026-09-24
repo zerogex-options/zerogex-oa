@@ -162,7 +162,7 @@ class PatternBase:
 
 On every scoring cycle, for each underlying in `SIGNALS_UNDERLYINGS`:
 
-Outside the regular session (09:30 ET to the close, 13:00 on an early-close day) none of the steps below run: the engine emits a `STAND_DOWN` with rationale "Market closed". The cycle runs 24x5, and a Card issued off a pre-market or after-hours print can't be traded. See §6.
+Outside the regular session (09:30 ET to the close, 13:00 on an early-close day) none of the steps below run: the engine emits a `STAND_DOWN` with rationale "Market closed". The cycle runs 24x5, and a Card issued off a pre-market or after-hours print can't be traded. A cash index (SPX, NDX) also skips its 09:30 bar, whose prints are a stale value near the prior close until its stocks open; its Cards start at 09:31 (`context.session = "index_open"`). See §6.
 
 1. Build `PlaybookContext`.
 2. Collect candidate Cards by calling `match()` on every registered pattern (built-in + custom).

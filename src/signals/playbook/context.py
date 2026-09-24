@@ -22,6 +22,7 @@ import pytz
 
 from src.market_calendar import in_regular_session
 from src.signals.components.base import MarketContext
+from src.symbols import is_cash_index
 
 _ET = pytz.timezone("America/New_York")
 
@@ -172,6 +173,14 @@ class PlaybookContext:
         """True from 09:30 ET to the close (13:00 on an early-close day) on a
         trading day: the only hours a Card's options can be traded."""
         return in_regular_session(self.timestamp)
+
+    @property
+    def is_index_opening_bar(self) -> bool:
+        """True on a cash index's 09:30 ET bar. At 09:30:00 almost none of its
+        constituents have opened, so the index prints a stale value near the
+        prior close for its first seconds (see src/tools/cash_index_open_repair).
+        That is not a price anyone can trade at. By 09:31 the prints are real."""
+        return is_cash_index(self.underlying) and self.et_time < time(9, 31)
 
     @property
     def is_first_30min(self) -> bool:

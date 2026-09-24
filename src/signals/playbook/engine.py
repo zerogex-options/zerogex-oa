@@ -140,7 +140,22 @@ class PlaybookEngine:
         # any pattern runs also keeps such a cycle out of the table, since a
         # STAND_DOWN is never persisted.
         if not ctx.is_regular_session:
-            return self._market_closed(ctx)
+            return self._outside_session(
+                ctx,
+                "Market closed: Cards are issued only in the regular session, "
+                "09:30 ET to the close.",
+                session="closed",
+            )
+        # A cash index's 09:30 bar is its stale opening print, near the prior
+        # close, not a level anyone traded. NDX and SPX Cards fired off it at the
+        # open quoted yesterday's price.
+        if ctx.is_index_opening_bar:
+            return self._outside_session(
+                ctx,
+                "Index opening print: a cash index's 09:30 prints are stale until "
+                "its stocks open, so Cards start at 09:31 ET.",
+                session="index_open",
+            )
 
         # Step 1: collect raw candidates.
         candidates: list[tuple[PatternBase, ActionCard]] = []
@@ -298,8 +313,8 @@ class PlaybookEngine:
         "regime",
     )
 
-    def _market_closed(self, ctx: PlaybookContext) -> ActionCard:
-        """STAND_DOWN for a cycle outside the regular session.
+    def _outside_session(self, ctx: PlaybookContext, rationale: str, *, session: str) -> ActionCard:
+        """STAND_DOWN for a cycle no Card may be issued in.
 
         No near-misses: no pattern ran, so none of them came close.
         """
@@ -311,15 +326,12 @@ class PlaybookEngine:
             tier="n/a",
             direction="non_directional",
             confidence=0.0,
-            rationale=(
-                "Market closed: Cards are issued only in the regular session, "
-                "09:30 ET to the close."
-            ),
+            rationale=rationale,
             near_misses=[],
             context={
                 "msi": ctx.msi_score,
                 "regime": ctx.msi_regime,
-                "session": "closed",
+                "session": session,
             },
         )
 

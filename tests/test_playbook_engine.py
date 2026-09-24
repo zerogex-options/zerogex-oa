@@ -79,6 +79,7 @@ class _StubPattern(PatternBase):
 def _ctx(
     *,
     timestamp: Optional[datetime] = None,
+    underlying: str = "SPY",
     regime: str = "high_risk_reversal",
     open_position_for: Optional[str] = None,
     recently_emitted: Optional[dict[str, datetime]] = None,
@@ -86,7 +87,7 @@ def _ctx(
     ts = timestamp or datetime(2026, 5, 1, 18, 30, tzinfo=timezone.utc)  # 2:30 PM ET
     market = MarketContext(
         timestamp=ts,
-        underlying="SPY",
+        underlying=underlying,
         close=678.4,
         net_gex=7.1e9,
         gamma_flip=676.5,
@@ -329,3 +330,26 @@ def test_early_close_day_ends_at_one_pm(monkeypatch):
     at_close = engine.evaluate(_ctx(timestamp=_utc(2026, 11, 27, 18, 0)))  # 13:00 EST
     assert before.action == ActionEnum.BUY_PUT_DEBIT
     assert at_close.action == ActionEnum.STAND_DOWN
+
+
+def test_cash_index_opening_bar_is_skipped():
+    """NDX and SPX print a stale value near the prior close in their 09:30
+    bar; Cards fired off it at the open quoted yesterday's price."""
+    pat = _CountingPattern(id="max_pain_gravitation")
+    engine = PlaybookEngine(patterns=[pat])
+    at_open = _utc(2026, 9, 24, 13, 30)  # 09:30 EDT
+
+    for index in ("NDX", "SPX"):
+        card = engine.evaluate(_ctx(timestamp=at_open, underlying=index))
+        assert card.action == ActionEnum.STAND_DOWN
+        assert card.context["session"] == "index_open"
+    assert pat.calls == 0
+
+    one_minute_in = _utc(2026, 9, 24, 13, 31)  # 09:31 EDT
+    assert engine.evaluate(_ctx(timestamp=one_minute_in, underlying="NDX")).action == (
+        ActionEnum.BUY_PUT_DEBIT
+    )
+    # An ETF's 09:30 prints are real trades.
+    assert engine.evaluate(_ctx(timestamp=at_open, underlying="SPY")).action == (
+        ActionEnum.BUY_PUT_DEBIT
+    )
