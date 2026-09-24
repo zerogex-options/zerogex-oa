@@ -396,3 +396,96 @@ def test_the_distance_is_reported_so_an_operator_can_see_the_call():
     assert "36%" in body
     unknown = tool.summarize_session("NDX", SESSION, _raw_rows("BB", 19_442.0), None)
     assert "-" in "\n".join(tool.format_report([unknown], max_blank_minutes=0.0))
+
+
+# --- edges rather than levels ----------------------------------------------
+#
+# Two attempts to decide WHY the flip was dark both failed. The reason code
+# reads BEYOND_MAX_DISTANCE for a bug in our own DTE weighting and for a book
+# that is genuinely long gamma everywhere. The ungated crossing's distance from
+# spot overlaps too: 0-21% when it was ours, 27-35% when it was the market.
+#
+# So stop asking why. "Is it dark" is the right question once and the wrong
+# question three hundred times; "did it change" needs no theory at all.
+
+
+def _session(day, blank_minutes, symbol="NDX"):
+    """A session whose only relevant property is how long the flip was dark."""
+    start = ET.localize(datetime(2026, 9, day, 10, 0))
+    run = tool.BlankRun(
+        start=start,
+        end=start + timedelta(minutes=blank_minutes),
+        rows=int(blank_minutes * 2),
+        open_at_session_end=False,
+    )
+    return tool.SessionResolution(
+        symbol=symbol,
+        session_date=date(2026, 9, day),
+        rows=390,
+        resolved=390 - run.rows,
+        unresolved=run.rows,
+        longest=run if blank_minutes else None,
+    )
+
+
+def test_going_dark_is_the_alert():
+    edges = tool.transitions([_session(18, 0), _session(21, 389)], 30.0)
+    assert len(edges) == 1
+    assert edges[0].went_dark
+    assert edges[0].current.session_date == date(2026, 9, 21)
+
+
+def test_staying_dark_is_not_an_alert():
+    """The 2026-08-04..09-09 case: dark every session, worth saying once."""
+    days = [_session(d, 389) for d in (21, 22, 23)]
+    assert tool.transitions(days, 30.0) == []
+
+
+def test_recovering_is_reported_but_never_paged():
+    edges = tool.transitions([_session(21, 389), _session(22, 0)], 30.0)
+    assert len(edges) == 1
+    assert not edges[0].went_dark
+
+
+def test_the_first_session_in_the_window_has_no_change_to_report():
+    """Its state is known. Whether it CHANGED is not, and that is the point."""
+    assert tool.transitions([_session(21, 389)], 30.0) == []
+
+
+def test_a_session_under_the_threshold_is_not_dark():
+    """2026-09-17 was 121 blank rows but never 30 unbroken minutes."""
+    assert tool.transitions([_session(16, 0), _session(17, 23)], 30.0) == []
+
+
+def test_symbols_do_not_leak_into_each_other():
+    rows = [
+        _session(18, 0, "NDX"),
+        _session(21, 389, "NDX"),
+        _session(18, 389, "SPX"),
+        _session(21, 389, "SPX"),
+    ]
+    edges = tool.transitions(rows, 30.0)
+    assert [t.symbol for t in edges] == ["NDX"]
+
+
+def test_sessions_are_compared_in_date_order_however_they_arrive():
+    edges = tool.transitions([_session(21, 389), _session(18, 0)], 30.0)
+    assert len(edges) == 1 and edges[0].went_dark
+
+
+def test_the_replay_prints_every_alert_it_would_have_sent():
+    rows = [
+        _session(16, 0),
+        _session(17, 23),
+        _session(18, 0),
+        _session(21, 389),
+        _session(22, 389),
+    ]
+    body = "\n".join(tool.format_transitions(tool.transitions(rows, 30.0), len(rows)))
+    assert "WENT DARK" in body
+    assert "1 alert(s) would have been sent across 5 session(s)" in body
+
+
+def test_a_quiet_window_says_so_rather_than_printing_nothing():
+    body = "\n".join(tool.format_transitions([], 30))
+    assert "no state changes" in body
