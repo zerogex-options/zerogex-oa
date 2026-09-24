@@ -97,7 +97,15 @@ def _record_posted(mode: str, symbol: str, day: date, tweet_id: Optional[str]) -
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 — best-effort; don't fail the run
-        logger.debug("forecast_tweet: could not record post marker %s (%s)", path, exc)
+        # WARNING, not DEBUG.  The write failing means the duplicate-post guard
+        # is off for this (mode, symbol, day) — _already_posted can only return
+        # None without a marker — and with Persistent=true on the timer that is
+        # exactly when a catch-up run would repost.  It stayed invisible for
+        # months at DEBUG under a default level of INFO.
+        logger.warning(
+            "forecast_tweet: could not record post marker %s (%s) — duplicate "
+            "protection is OFF for this post", path, exc,
+        )
 
 
 def _today_et() -> date:

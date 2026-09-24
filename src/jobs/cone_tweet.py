@@ -143,7 +143,12 @@ def _record_posted(day: date, tweet_id: Optional[str]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 - best effort
-        logger.debug("cone_tweet: could not record post marker %s (%s)", path, exc)
+        # WARNING for the same reason forecast_tweet's is: a marker that did
+        # not persist means the guard against a duplicate post is silently off.
+        logger.warning(
+            "cone_tweet: could not record post marker %s (%s) — duplicate "
+            "protection is OFF for this post", path, exc,
+        )
 
 
 def _today_et() -> date:

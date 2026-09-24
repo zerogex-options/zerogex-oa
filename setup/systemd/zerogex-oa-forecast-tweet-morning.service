@@ -25,6 +25,15 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/ubuntu/zerogex-oa
+# The posted-marker files live in /var/lib/zerogex-oa/forecast-tweets, which
+# ProtectSystem=strict makes read-only unless it is granted here.  Without
+# this the marker write fails, the guard fails OPEN by design, and
+# _already_posted can never return anything — so a Persistent=true catch-up
+# after downtime reposts a tweet that already went out.  StateDirectory
+# rather than ReadWritePaths because it also CREATES the directory with the
+# right ownership; ReadWritePaths on a path that does not exist refuses to
+# start the unit.
+StateDirectory=zerogex-oa
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=zerogex-oa-forecast-tweet-morning
