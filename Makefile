@@ -1120,6 +1120,8 @@ help: ## Show this help message
 	@echo "  make shadow-pgpass      - One-time: copy the ~/.pgpass line onto $(SHADOW_DB)"
 	@echo "  make shadow-create      - Create $(SHADOW_DB) and apply the schema to it"
 	@echo "  make shadow-run         - Run ingestion into it on SHADOW_PROVIDER (Ctrl-C to stop)"
+	@echo "  make shadow-status      - Is it running? log size, initialized count, errors"
+	@echo "  make shadow-log         - Follow today's rehearsal log"
 	@echo "  make shadow-compare     - Production vs rehearsal coverage for today's ET session"
 	@echo "  make shadow-psql        - Interactive psql against the rehearsal database"
 	@echo "  make shadow-drop        - Drop it (dry run; pass CONFIRM=yes)"
@@ -3454,12 +3456,55 @@ shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate
 	if [ -z "$$INGEST_UNDERLYINGS" ]; then \
 		echo "$(RED)❌ INGEST_UNDERLYINGS is not set in .env$(NC)"; exit 1; \
 	fi; \
+	LOG=$${SHADOW_LOG:-$$HOME/shadow-run-$$(date +%F).log}; \
 	echo "Underlyings:    $$INGEST_UNDERLYINGS"; \
 	echo "Symbol aliases: $$SYMBOL_ALIASES"; \
 	echo "$(YELLOW)Both lines must show the \$$ on index symbols. Missing means mangled.$(NC)"; \
+	echo "Logging to:     $$LOG"; \
 	echo ""; \
+	{ \
+		echo "=== shadow-run $$(date -Is) feed=$(SHADOW_PROVIDER) db=$(SHADOW_DB) ==="; \
+		echo "Underlyings:    $$INGEST_UNDERLYINGS"; \
+		echo "Symbol aliases: $$SYMBOL_ALIASES"; \
+	} >> "$$LOG"; \
 	DB_NAME=$(SHADOW_DB) MARKET_DATA_PROVIDER=$(SHADOW_PROVIDER) \
-		$(VENV_PYTHON) -m src.ingestion.main_engine $(if $(DEBUG),--debug)
+		$(VENV_PYTHON) -m src.ingestion.main_engine $(if $(DEBUG),--debug) \
+		2>&1 | tee -a "$$LOG"
+
+.PHONY: shadow-log
+shadow-log: shadow-guard ## Follow today's rehearsal log (Ctrl-C stops following, not the run)
+	@LOG=$${SHADOW_LOG:-$$HOME/shadow-run-$$(date +%F).log}; \
+	if [ ! -f "$$LOG" ]; then \
+		echo "$(YELLOW)No log yet at $$LOG$(NC)"; exit 1; \
+	fi; \
+	echo "$(BLUE)=== $$LOG ($$(wc -l < "$$LOG") lines) -- Ctrl-C stops FOLLOWING, not the run ===$(NC)"; \
+	tail -f "$$LOG"
+
+.PHONY: shadow-status
+shadow-status: shadow-guard ## One-screen answer to "is the rehearsal healthy right now?"
+	@LOG=$${SHADOW_LOG:-$$HOME/shadow-run-$$(date +%F).log}; \
+	echo "$(BLUE)=== rehearsal status ===$(NC)"; \
+	if tmux has-session -t shadow 2>/dev/null; then \
+		echo "$(GREEN)✓ tmux session 'shadow' exists$(NC)"; \
+	else \
+		echo "$(YELLOW)• no tmux session named 'shadow'$(NC)"; \
+	fi; \
+	N=0; \
+	for p in $$(pgrep -f 'src\.ingestion\.main_engine' 2>/dev/null); do \
+		if tr '\0' '\n' < /proc/$$p/environ 2>/dev/null | grep -qx 'DB_NAME=$(SHADOW_DB)'; then \
+			N=$$((N+1)); \
+		fi; \
+	done; \
+	echo "  rehearsal processes: $$N"; \
+	if [ -f "$$LOG" ]; then \
+		echo "  log: $$LOG ($$(du -h "$$LOG" | cut -f1), $$(wc -l < "$$LOG") lines)"; \
+		echo "  initialized: $$(grep -c 'Streaming initialized' "$$LOG" 2>/dev/null)"; \
+		echo "  errors:      $$(grep -c ' - ERROR - ' "$$LOG" 2>/dev/null)"; \
+		echo "$(BLUE)--- last 3 lines ---$(NC)"; \
+		tail -3 "$$LOG"; \
+	else \
+		echo "$(YELLOW)  no log at $$LOG$(NC)"; \
+	fi
 
 .PHONY: shadow-compare
 shadow-compare: shadow-guard ## Side-by-side coverage for today's ET session: production vs rehearsal DB (gate G2 evidence)

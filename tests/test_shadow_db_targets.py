@@ -276,3 +276,33 @@ def test_shadow_run_refuses_to_start_with_no_underlyings():
     body = _recipe("shadow-run")
     assert '-z "$$INGEST_UNDERLYINGS"' in body
     assert "exit 1" in body
+
+
+def test_shadow_run_writes_a_log_that_outlives_the_terminal():
+    """Output has to survive the tmux session going away.
+
+    It did not, twice on 2026-09-24: the run was inspected only in the pane,
+    the pane was killed, and every line of evidence went with it. The G2 gate
+    also reads this log at the close -- "no circuit-breaker trips, no
+    sustained reconnects" has to be read from somewhere, and tmux scrollback
+    overflows during a full session.
+    """
+    body = _recipe("shadow-run")
+    assert "tee -a" in body, "the engine's output must be appended to a file"
+    assert "2>&1" in body, "stderr carries the logging -- it must be captured too"
+    assert re.search(r"date \+%F", body), (
+        "the log name must be computed in the SHELL; a make $(shell date) is "
+        "evaluated once at parse time and would name a stale file"
+    )
+
+
+def test_shadow_run_announces_where_it_is_logging():
+    body = _recipe("shadow-run")
+    assert "Logging to:" in body
+
+
+def test_shadow_status_never_kills_anything():
+    """It is the target you reach for when unsure, so it must be read-only."""
+    body = _recipe("shadow-status")
+    for danger in ("kill", "DROP", "DELETE", "rm "):
+        assert danger not in body, f"shadow-status must not {danger.strip()}"
