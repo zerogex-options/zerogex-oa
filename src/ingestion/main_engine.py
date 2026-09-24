@@ -265,6 +265,9 @@ class IngestionEngine:
             self.monthly_underlying = resolve_monthly_underlying(self.db_symbol)
 
         self.running = False
+        # Consecutive initialize() failures, for the retry backoff in
+        # run_streaming(). See the comment there.
+        self._initialize_failures = 0
 
         # Buffering for options only (underlying writes every update)
         self.underlying_buffer: List[Dict[str, Any]] = []
@@ -2202,9 +2205,31 @@ class IngestionEngine:
         window_closed = False
         try:
             if not stream_manager.initialize():
-                logger.error("Failed to initialize streaming")
+                # run() retries this immediately -- self.running is still
+                # True, so the while loop comes straight back round. With no
+                # delay a persistent failure (a feed outage, a symbol the
+                # vendor does not serve, a provider wired to a client that
+                # does not exist) spins as fast as the CPU allows. An
+                # observed run wrote 73 million log lines and 7 GB in seven
+                # minutes, which is a disk-exhaustion risk on a box that
+                # also runs the live service.
+                #
+                # Same policy as a dead worker, deliberately: both are "the
+                # thing failed and we are about to try it again", and one
+                # tuned backoff is better than two that drift apart.
+                self._initialize_failures += 1
+                delay = _worker_restart_delay(self._initialize_failures)
+                logger.error(
+                    "Failed to initialize streaming for %s (consecutive "
+                    "failures: %d); retrying in %.0fs",
+                    self.underlying,
+                    self._initialize_failures,
+                    delay,
+                )
+                time.sleep(delay)
                 return
 
+            self._initialize_failures = 0
             logger.info("✅ Streaming initialized")
             logger.info("Press Ctrl+C to stop\n")
 

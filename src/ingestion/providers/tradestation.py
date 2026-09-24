@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 import requests as _requests
@@ -54,13 +54,14 @@ from src.ingestion.providers.base import (
     ProviderCapabilities,
 )
 from src.ingestion.stream_manager import (
+    ET,
     OptionStreamAccumulator,
     UnderlyingBarAccumulator,
     _stream_reconnect_delay,
 )
 from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
-from src.validation import safe_datetime, safe_float, safe_int
+from src.validation import safe_datetime, safe_float, safe_int, validate_bar_data
 
 logger = get_logger(__name__)
 
@@ -690,6 +691,47 @@ class TradeStationProvider(MarketDataProvider):
                 targets[:3],
             )
         return out
+
+    def snapshot_underlying_bar(self, symbol: str) -> Optional[Bar]:
+        """One REST bar, the shape ``StreamManager._fetch_underlying_bar``
+        used to build inline before this call went through the interface.
+
+        ``barsback=1`` with ``warn_if_closed=False``: the caller asks for
+        this outside market hours too (engine start, day rollover), where a
+        stale last bar is the right answer and a warning is noise.
+        """
+        self._CAPABILITIES.require("underlying_bars")
+        raw = self._client.get_stream_bars(
+            symbol=symbol,
+            interval=1,
+            unit="Minute",
+            barsback=1,
+            sessiontemplate=SESSION_TEMPLATE,
+            warn_if_closed=False,
+        )
+        bars = raw.get("Bars", []) if isinstance(raw, dict) else []
+        if not bars:
+            logger.debug("No bar data returned for %s", symbol)
+            return None
+        bar = bars[0]
+        if not validate_bar_data(bar):
+            logger.warning("Invalid bar data for %s, skipping", symbol)
+            return None
+        timestamp = safe_datetime(bar.get("TimeStamp", ""), field_name="TimeStamp")
+        return Bar(
+            symbol=symbol,
+            timestamp=timestamp or datetime.now(ET),
+            open=safe_float(bar.get("Open"), field_name="Open"),
+            high=safe_float(bar.get("High"), field_name="High"),
+            low=safe_float(bar.get("Low"), field_name="Low"),
+            close=safe_float(bar.get("Close"), field_name="Close"),
+            volume=safe_int(bar.get("TotalVolume"), field_name="TotalVolume"),
+            up_volume=safe_int(bar.get("UpVolume"), field_name="UpVolume"),
+            down_volume=safe_int(bar.get("DownVolume"), field_name="DownVolume"),
+        )
+
+    def invalidate_strikes_cache(self) -> None:
+        self._client.invalidate_strikes_cache()
 
     def build_option_symbol(
         self,

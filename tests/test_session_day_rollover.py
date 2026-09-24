@@ -22,6 +22,12 @@ ET = pytz.timezone("US/Eastern")
 def _bare_stream_manager() -> StreamManager:
     sm = StreamManager.__new__(StreamManager)
     sm.client = MagicMock()
+    # The rollover hook asks the PROVIDER to drop its strike cache, not the
+    # TradeStation client: main_engine builds no client for any other feed,
+    # so a client call here is TradeStation-only by construction. The
+    # provider->client delegation is pinned separately, in
+    # test_market_data_providers.py.
+    sm.provider = MagicMock()
     sm.tracked_option_symbols = []
     sm._session_volume_symbols = set()
     sm._session_volume_date = None
@@ -33,7 +39,7 @@ def test_first_observation_invalidates_cache_as_baseline():
     sm = _bare_stream_manager()
     now = ET.localize(datetime(2026, 6, 15, 10, 0, 0))
     sm._update_session_volume_coverage(changed_state={}, tracked_total=0, now_et=now)
-    sm.client.invalidate_strikes_cache.assert_called_once()
+    sm.provider.invalidate_strikes_cache.assert_called_once()
     assert sm._session_volume_date == date(2026, 6, 15)
 
 
@@ -42,11 +48,11 @@ def test_same_day_does_not_reinvalidate():
     sm = _bare_stream_manager()
     now = ET.localize(datetime(2026, 6, 15, 10, 0, 0))
     sm._update_session_volume_coverage(changed_state={}, tracked_total=0, now_et=now)
-    sm.client.invalidate_strikes_cache.reset_mock()
+    sm.provider.invalidate_strikes_cache.reset_mock()
 
     later_same_day = ET.localize(datetime(2026, 6, 15, 15, 30, 0))
     sm._update_session_volume_coverage(changed_state={}, tracked_total=0, now_et=later_same_day)
-    sm.client.invalidate_strikes_cache.assert_not_called()
+    sm.provider.invalidate_strikes_cache.assert_not_called()
 
 
 def test_day_rollover_invalidates_cache():
@@ -58,21 +64,21 @@ def test_day_rollover_invalidates_cache():
         tracked_total=0,
         now_et=ET.localize(datetime(2026, 6, 15, 23, 59, 0)),
     )
-    sm.client.invalidate_strikes_cache.reset_mock()
+    sm.provider.invalidate_strikes_cache.reset_mock()
     # Day 2 (just after midnight ET)
     sm._update_session_volume_coverage(
         changed_state={},
         tracked_total=0,
         now_et=ET.localize(datetime(2026, 6, 16, 0, 1, 0)),
     )
-    sm.client.invalidate_strikes_cache.assert_called_once()
+    sm.provider.invalidate_strikes_cache.assert_called_once()
     assert sm._session_volume_date == date(2026, 6, 16)
 
 
 def test_invalidate_failure_does_not_crash_loop():
     """A cache-invalidation exception must NOT propagate out of the stream loop."""
     sm = _bare_stream_manager()
-    sm.client.invalidate_strikes_cache.side_effect = RuntimeError("boom")
+    sm.provider.invalidate_strikes_cache.side_effect = RuntimeError("boom")
     # Should not raise.
     sm._update_session_volume_coverage(
         changed_state={},
