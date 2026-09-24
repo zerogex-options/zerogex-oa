@@ -85,8 +85,13 @@ def test_a_non_tradestation_feed_needs_no_tradestation_credentials():
     from src.ingestion import main_engine
 
     src = inspect.getsource(main_engine)
-    anchor = src.index('provider_name = (os.getenv("MARKET_DATA_PROVIDER"')
-    block = src[anchor : anchor + 1200]
-    guard = block.index('if provider_name == "tradestation":')
-    creds = block.index("TRADESTATION_CLIENT_ID")
-    assert guard < creds, "the client is constructed outside the TradeStation guard"
+    # Anchored on the guard nearest the credentials rather than on the line
+    # that reads MARKET_DATA_PROVIDER: that read now lives in
+    # configured_provider_name() and is called from more than one place, so
+    # "the first occurrence" stopped meaning this one.
+    creds = src.index("TRADESTATION_CLIENT_ID")
+    guard = src.rindex('if provider_name == "tradestation":', 0, creds)
+    assert creds - guard < 400, (
+        "the TradeStation client is constructed too far from the guard to be "
+        "inside it -- a non-TradeStation feed would need its credentials"
+    )

@@ -229,30 +229,72 @@ _OCC_RE = re.compile(
 
 
 #: One ThetaClient per terminal connection, shared by every provider that
-#: points at it.
+#: points at it -- and, since 2026-09-24, one per PROCESS as well.
 #:
-#: Each ThetaClient authenticates on construction and the terminal keeps ONE
-#: session: a second client invalidates the first, and every subsequent call
-#: fails with "Invalid session ID. This can occur if more than one terminal
-#: is running." Two providers on one terminal -- exactly what a realtime vs
-#: Market Value comparison is -- therefore cannot each hold their own client.
-#: Verified against a live terminal 2026-09-15, where the comparison died on
+#: Each ThetaClient authenticates on construction and ThetaData keeps ONE
+#: connection per account to a given MDDS server: a second one kicks the
+#: first, and every subsequent call on it fails with "Invalid session ID.
+#: This can occur if more than one terminal is running." Their own docs say
+#: so -- "You are unable to connect to the same MDDS or FPSS server, as
+#: doing so will kick any existing connection from the server"
+#: (Performance-And-Tuning/Multiple-Terminals). Verified against a live
+#: terminal 2026-09-15, where a realtime vs Market Value comparison died on
 #: its first sample.
 #:
 #: Sharing is safe because the Market Value selection for snapshots is
 #: per-CALL (the *_market_value endpoints), not per-connection, so one client
 #: serves both stages.
-_CLIENTS: Dict[Tuple[Any, ...], Any] = {}
+#:
+#: WHY THE PID. This dict plus a threading.Lock shares a client between
+#: THREADS. main_engine runs one multiprocessing.Process per underlying, and
+#: a fork copies this dict wholesale -- so every worker inherited a client
+#: whose gRPC channel does not survive fork, and building a fresh one per
+#: worker meant four logins racing to invalidate each other. Ingestion never
+#: got past initialize() on any symbol (2026-09-24).
+#:
+#: So the entry records the PID that built it. A process that finds another
+#: process's client ADOPTS it instead of authenticating: ThetaClient takes an
+#: ``existing_authorized_client``, copies its session token, skips the login
+#: POST entirely and still builds its own gRPC channel. That is ThetaData's
+#: documented mechanism (Python-Library/Getting-Started), not a workaround.
+_CLIENTS: Dict[Tuple[Any, ...], Tuple[int, Any]] = {}
 _CLIENTS_LOCK = threading.Lock()
 
 
-def shared_client(factory: Any, key: Tuple[Any, ...]) -> Any:
-    """The client for ``key``, constructing it once via ``factory``."""
+def shared_client(factory: Any, key: Tuple[Any, ...], adopt: Any = None) -> Any:
+    """The client for ``key`` in THIS process.
+
+    ``factory()`` builds one from credentials, authenticating. ``adopt(other)``
+    builds one from a client this process inherited across a fork, reusing its
+    session rather than logging in again -- without it, an inherited entry is
+    rebuilt from credentials and the parent's session dies.
+    """
+    pid = os.getpid()
     with _CLIENTS_LOCK:
-        client = _CLIENTS.get(key)
-        if client is None:
-            client = factory()
-            _CLIENTS[key] = client
+        entry = _CLIENTS.get(key)
+        if entry is not None:
+            owner_pid, client = entry
+            if owner_pid == pid:
+                return client
+            if adopt is not None:
+                # Inherited across a fork. Reuse the session; build a new
+                # channel. Never authenticate here -- that is the kick.
+                logger.info(
+                    "Adopting the parent's ThetaData session (pid %d -> %d); "
+                    "a second login would invalidate it",
+                    owner_pid,
+                    pid,
+                )
+                client = adopt(client)
+                _CLIENTS[key] = (pid, client)
+                return client
+            logger.warning(
+                "Inherited a ThetaData client from pid %d with no adopt(); "
+                "authenticating again, which will kick that session",
+                owner_pid,
+            )
+        client = factory()
+        _CLIENTS[key] = (pid, client)
         return client
 
 
@@ -994,6 +1036,15 @@ class ThetaDataProvider(MarketDataProvider):
                 dataframe_type="pandas",
             ),
             key=(host, port),
+            # Reached only in a forked worker, where the parent already holds
+            # the account's one session. No credentials: this path must not
+            # be able to authenticate even if the environment would let it.
+            adopt=lambda parent: ThetaClient(
+                existing_authorized_client=parent,
+                mdds_host=host,
+                mdds_port=port,
+                dataframe_type="pandas",
+            ),
         )
         is_mv = is_market_value_stage(resolved_stage)
         return cls(

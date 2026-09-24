@@ -19,6 +19,7 @@ import threading
 import time
 import time as _time
 from dataclasses import dataclass
+import multiprocessing
 from multiprocessing import Process
 from datetime import datetime, date as _date, timedelta
 from typing import Dict, Any, List, Optional
@@ -192,6 +193,79 @@ WORKER_RESTART_BACKOFF_MAX_SECONDS = _getenv_float(
 # Mirrors the stream watchdog's slow re-attempt
 # (UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS in stream_manager).
 WORKER_ABANDON_RETRY_SECONDS = _getenv_int("INGEST_WORKER_ABANDON_RETRY_SECONDS", 900)
+
+
+def configured_provider_name() -> str:
+    """The feed MARKET_DATA_PROVIDER names, normalised. Defaults to TradeStation.
+
+    One reader, because two copies of this drift. Today's date-format bug was
+    exactly that shape -- feed_compare and StreamManager each formatted an
+    expiration their own way and only one of them matched the vendor.
+    """
+    return (os.getenv("MARKET_DATA_PROVIDER", "").strip() or "tradestation").lower()
+
+
+def _authenticate_shared_feed_session() -> None:
+    """Log the feed in ONCE, in the supervisor, before any worker is forked.
+
+    ThetaData permits one connection per account to a given MDDS server and
+    kicks the previous one when a second arrives ("You are unable to connect
+    to the same MDDS or FPSS server, as doing so will kick any existing
+    connection" -- Performance-And-Tuning/Multiple-Terminals). A ThetaClient
+    authenticates on construction, and every worker below is a separate
+    process building its own provider, so N underlyings meant N logins
+    racing to invalidate each other. On 2026-09-24 ingestion never got past
+    initialize() for any symbol: every call returned "Invalid session ID".
+
+    Authenticating here puts the client in the module-level cache BEFORE the
+    fork. Each worker then finds an entry owned by another PID and adopts
+    its session instead of logging in again -- see ``shared_client`` in
+    providers/thetadata.py.
+
+    A no-op for TradeStation, which has no such constraint and whose client
+    is deliberately not built outside the worker that needs it.
+    """
+    provider_name = configured_provider_name()
+    if not provider_name.startswith("thetadata"):
+        return
+
+    # Adoption rides on fork inheriting the parent's memory. Under "spawn" or
+    # "forkserver" the child starts from a bare interpreter, finds an empty
+    # cache and authenticates -- back to the stampede, silently. Say so
+    # rather than letting it look like it worked.
+    start_method = multiprocessing.get_start_method(allow_none=False)
+    if start_method != "fork":
+        logger.error(
+            "multiprocessing start method is %r, not 'fork'. Workers cannot "
+            "inherit the supervisor's %s session and will each authenticate, "
+            "invalidating one another. Set the start method to 'fork' or run "
+            "a single underlying per process.",
+            start_method,
+            provider_name,
+        )
+        return
+
+    from src.ingestion.providers import get_provider
+
+    try:
+        get_provider()
+    except Exception as e:  # noqa: BLE001 - a feed outage at boot must not
+        # stop the supervisor; the workers' initialize() backoff bounds the
+        # retries, and this line names why they are all authenticating.
+        logger.error(
+            "Could not establish the shared %s session in the supervisor: %s. "
+            "Each worker will now authenticate on its own, and they will kick "
+            "each other off.",
+            provider_name,
+            e,
+        )
+        return
+
+    logger.info(
+        "%s session established in the supervisor; workers will adopt it "
+        "rather than logging in separately",
+        provider_name,
+    )
 
 
 def _worker_restart_delay(consecutive_deaths: int) -> float:
@@ -2575,7 +2649,7 @@ def main():
         # cutover that reports success while still reading the old feed.
         from src.ingestion.providers import get_provider
 
-        provider_name = (os.getenv("MARKET_DATA_PROVIDER", "").strip() or "tradestation").lower()
+        provider_name = configured_provider_name()
         client = None
         if provider_name == "tradestation":
             client = TradeStationClient(
@@ -2684,6 +2758,10 @@ def main():
         proc.start()
         processes[name] = proc
         return proc
+
+    # One login for the whole unit, before any fork. See the docstring --
+    # without this each worker authenticates and they kick each other off.
+    _authenticate_shared_feed_session()
 
     # NB: the loop variable must NOT be called `args`. run_for_symbol and the
     # other worker targets are closures over main()'s locals, where `args` is
