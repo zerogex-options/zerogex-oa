@@ -216,15 +216,26 @@ The fix needs no code. `DB_NAME` is a plain environment variable read at connect
 **second ingestion process pointed at a scratch database** runs the real engine, the real provider
 and the real write path while touching nothing a customer reads.
 
-Run it through the Makefile. The hand-rolled commands this section used to carry were both wrong:
-one omitted the port from the psql connection string (`~/.pgpass` keys on `host:port:database:user`,
-so it matched nothing and prompted for a password), and the other set `DB_NAME` in the environment
-for `make`, which this Makefile ignores — it does `-include .env`, and an included makefile's
-assignment beats the environment, so `DB_NAME=zerogex_shadow make schema-apply` silently applies the
-schema to **production**.
+Run it through the Makefile. The hand-rolled commands this section used to carry were both wrong,
+and both failed in the direction of production:
+
+* **The password prompt.** `~/.pgpass` matches **per line** on `host:port:database:user`. A
+  rehearsal database is a second database on the same instance with the same host, port and user,
+  so the production line does not cover it — only the database field differs, and that is enough
+  to miss. psql then falls back to an interactive prompt. Verified directly: with a single
+  `.pgpass` line naming the production database, connecting to it needs no password and connecting
+  to any other database on the same server fails with `fe_sendauth: no password supplied`.
+  `make shadow-pgpass` copies the line across; `SHADOW_PSQL` passes `-w` so a missing line errors
+  instead of hanging.
+
+* **The silent production write.** `DB_NAME=zerogex_shadow make schema-apply` sets `DB_NAME` in the
+  environment, which this Makefile ignores — it does `-include .env`, and an included makefile's
+  assignment beats the environment. The schema went to **production**. Only
+  `make schema-apply DB_NAME=...`, a command-line argument, overrides it.
 
 ```bash
 # once, on the EC2 box
+make shadow-pgpass               # copy the ~/.pgpass line onto zerogex_shadow (no password printed)
 make shadow-create               # CREATE DATABASE zerogex_shadow + schema-apply against it
 
 # the rehearsal — start before 09:30 ET, leave it for the session
@@ -235,7 +246,8 @@ make shadow-compare              # production vs rehearsal, side by side, today'
 ```
 
 Underlyings come from `INGEST_UNDERLYINGS` in `.env`, so the rehearsal covers exactly what
-production covers. `make shadow-drop CONFIRM=yes` cleans up afterwards.
+production covers. `make shadow-drop` is a dry run; `make shadow-drop CONFIRM=yes` cleans up
+afterwards, terminating any connection still held open on the rehearsal database.
 
 Rollback is `Ctrl-C`. Production never sees it. One caveat: the VIX, VXN and futures ingesters run
 inside the same process and still call TradeStation directly, so the rehearsal consumes TradeStation

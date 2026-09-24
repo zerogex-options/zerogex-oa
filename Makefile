@@ -1115,6 +1115,7 @@ help: ## Show this help message
 	@echo "  make schema-backup      - Backup current schema to file"
 	@echo ""
 	@echo "$(GREEN)Cutover Rehearsal (shadow database):$(NC)"
+	@echo "  make shadow-pgpass      - One-time: copy the ~/.pgpass line onto $(SHADOW_DB)"
 	@echo "  make shadow-create      - Create $(SHADOW_DB) and apply the schema to it"
 	@echo "  make shadow-run         - Run ingestion into it on SHADOW_PROVIDER (Ctrl-C to stop)"
 	@echo "  make shadow-compare     - Production vs rehearsal coverage for today's ET session"
@@ -3319,10 +3320,14 @@ schema-backup: ## Backup current schema to file
 # These targets exist to remove two footguns that both bit during the
 # ThetaData rehearsal:
 #
-#   1. Connection details must come from .env like every other target here.
-#      ~/.pgpass matches on host:port:database:user, so a hand-rolled psql
-#      string that leaves out the port matches nothing and falls through to
-#      a password prompt.
+#   1. ~/.pgpass matches PER LINE on host:port:database:user. A rehearsal
+#      database is a second database on the same instance with the same host,
+#      port and user, so the production line does not cover it -- only the
+#      database field differs, and that is enough to miss. psql then falls
+#      back to an interactive prompt, which hangs a scripted target. Hence -w
+#      on SHADOW_PSQL, a connection check in shadow-create, and shadow-pgpass
+#      to copy the line across. (Connection details still come from .env like
+#      every other target here, so the port is always present.)
 #
 #   2. DB_NAME must be passed as a MAKE ARGUMENT, never as an environment
 #      variable. This Makefile does `-include .env`, and a variable set in an
@@ -3335,9 +3340,19 @@ schema-backup: ## Backup current schema to file
 SHADOW_DB ?= zerogex_shadow
 SHADOW_PROVIDER ?= thetadata_mv
 
-# Same string as PSQL above, pointed at the rehearsal database. Keep the two
-# in sync -- especially the port, which is what makes ~/.pgpass match.
-SHADOW_PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) dbname=$(SHADOW_DB) keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
+# Same string as PSQL above, pointed at the rehearsal database.
+#
+# -w is deliberate. ~/.pgpass matches per line on host:port:database:user, so
+# the production line does NOT cover a second database on the same instance --
+# only the database field differs, and that is enough to miss. Without -w psql
+# silently falls back to an interactive prompt, which hangs a scripted target
+# and reads as "the credentials are broken" rather than "add one .pgpass line".
+# With -w it fails at once and shadow-create says to run shadow-pgpass.
+SHADOW_PSQL = PGPASSFILE=~/.pgpass psql -w "sslmode=require host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) dbname=$(SHADOW_DB) keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
+
+# DB_HOST inside a regex: dots are metacharacters, so escape them before the
+# grep/sed below match a ~/.pgpass line against it.
+SHADOW_HOST_RE = $(subst .,\.,$(DB_HOST))
 
 # Midnight of today's ET session expressed in UTC (same convention as the
 # flow-coverage queries above).
@@ -3352,6 +3367,29 @@ shadow-guard:
 		exit 1; \
 	fi
 
+.PHONY: shadow-pgpass
+shadow-pgpass: shadow-guard ## Copy the production ~/.pgpass line onto the rehearsal database name (password is never printed)
+	@test -f ~/.pgpass || { \
+		echo "$(RED)❌ ~/.pgpass does not exist.$(NC)"; exit 1; }
+	@if grep -qs "^$(SHADOW_HOST_RE):$(DB_PORT):$(SHADOW_DB):$(DB_USER):" ~/.pgpass; then \
+		echo "$(GREEN)✓ ~/.pgpass already has a line for $(SHADOW_DB)$(NC)"; \
+		exit 0; \
+	fi; \
+	if ! grep -qs "^$(SHADOW_HOST_RE):$(DB_PORT):$(DB_NAME):$(DB_USER):" ~/.pgpass; then \
+		echo "$(RED)❌ No ~/.pgpass line matches $(DB_HOST):$(DB_PORT):$(DB_NAME):$(DB_USER)$(NC)"; \
+		echo "$(YELLOW)Nothing to copy from. Add a line by hand -- the format is$(NC)"; \
+		echo "$(YELLOW)  host:port:database:user:password$(NC)"; \
+		echo "$(YELLOW)  $(DB_HOST):$(DB_PORT):$(SHADOW_DB):$(DB_USER):<password>$(NC)"; \
+		exit 1; \
+	fi; \
+	TMP=$$(mktemp ~/.pgpass.shadowXXXXXX) || exit 1; \
+	sed -n "s|^$(SHADOW_HOST_RE):$(DB_PORT):$(DB_NAME):$(DB_USER):|$(DB_HOST):$(DB_PORT):$(SHADOW_DB):$(DB_USER):|p" \
+		~/.pgpass > "$$TMP" && cat "$$TMP" >> ~/.pgpass; \
+	RC=$$?; rm -f "$$TMP"; \
+	[ $$RC -eq 0 ] || exit $$RC; \
+	chmod 600 ~/.pgpass; \
+	echo "$(GREEN)✅ Added a ~/.pgpass line for $(SHADOW_DB) (password copied, never printed)$(NC)"
+
 .PHONY: shadow-create
 shadow-create: shadow-guard ## Create the cutover-rehearsal database and apply schema.sql to it
 	@echo "$(BLUE)=== Rehearsal database $(SHADOW_DB) on $(DB_HOST) ===$(NC)"
@@ -3362,6 +3400,14 @@ shadow-create: shadow-guard ## Create the cutover-rehearsal database and apply s
 		$(PSQL) -c "CREATE DATABASE $(SHADOW_DB)" || exit 1; \
 		echo "$(GREEN)✅ Created $(SHADOW_DB)$(NC)"; \
 	fi
+	@$(SHADOW_PSQL) -tAc "SELECT 1" >/dev/null 2>&1 || { \
+		echo "$(RED)❌ $(SHADOW_DB) exists but there is no password for it.$(NC)"; \
+		echo "$(YELLOW)~/.pgpass matches per line on host:port:database:user. The line for$(NC)"; \
+		echo "$(YELLOW)$(DB_NAME) does not cover $(SHADOW_DB) -- only the database field differs,$(NC)"; \
+		echo "$(YELLOW)and that is enough to miss. Copy it across, then rerun:$(NC)"; \
+		echo "$(YELLOW)    make shadow-pgpass && make shadow-create$(NC)"; \
+		exit 1; \
+	}
 	@$(MAKE) --no-print-directory schema-apply DB_NAME=$(SHADOW_DB)
 
 .PHONY: shadow-run
@@ -3445,12 +3491,12 @@ shadow-drop: shadow-guard ## Drop the rehearsal database. Pass CONFIRM=yes.
 		echo "$(YELLOW)Dry run. This would: DROP DATABASE $(SHADOW_DB) on $(DB_HOST)$(NC)"; \
 		echo "$(YELLOW)Rerun with: make shadow-drop CONFIRM=yes$(NC)"; \
 		exit 0; \
-	fi
-	@$(PSQL) -c "\
+	fi; \
+	$(PSQL) -c "\
 		SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-		WHERE datname = '$(SHADOW_DB)' AND pid <> pg_backend_pid();" >/dev/null
-	@$(PSQL) -c "DROP DATABASE IF EXISTS $(SHADOW_DB)" || exit 1
-	@echo "$(GREEN)✅ Dropped $(SHADOW_DB)$(NC)"
+		WHERE datname = '$(SHADOW_DB)' AND pid <> pg_backend_pid();" >/dev/null; \
+	$(PSQL) -c "DROP DATABASE IF EXISTS $(SHADOW_DB)" || exit 1; \
+	echo "$(GREEN)✅ Dropped $(SHADOW_DB)$(NC)"
 # Refresh per-symbol normalizer rows so signal saturation tracks real
 # magnitude distributions instead of falling back to env-var defaults.
 # Override SYMBOLS / WINDOW_DAYS to scope the refresh.
