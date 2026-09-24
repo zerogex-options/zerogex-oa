@@ -184,13 +184,16 @@ def _build_market_context(
     recent_closes: Optional[list[float]] = None,
     recent_lows: Optional[list[float]] = None,
     recent_highs: Optional[list[float]] = None,
+    opening_range: Optional[tuple[float, float]] = None,
 ) -> MarketContext:
     """Reconstruct the most useful MarketContext we can from persisted state.
 
     Reads what's on the latest signal_score / signal rows; the caller also
     threads recent underlying bars (closes/lows/highs, oldest → newest) from
     ``underlying_quotes`` so bar-history patterns work on the async API path
-    instead of degrading to the empty-list fallback.
+    instead of degrading to the empty-list fallback, and this session's
+    ``(high, low)`` opening range (see :mod:`src.opening_range`) so the
+    opening-range pattern reads the same range the live cycle does.
     """
     components = (score_row or {}).get("components") or {}
     if not isinstance(components, dict):
@@ -238,6 +241,8 @@ def _build_market_context(
             extra["vix_level"] = float(vix)
         except (TypeError, ValueError):
             pass
+    if opening_range is not None:
+        extra["opening_range_high"], extra["opening_range_low"] = opening_range
     for sig_name, fields in _LEVEL_FIELDS_BY_SIGNAL.items():
         snap = advanced.get(sig_name)
         if not snap:
@@ -352,6 +357,12 @@ async def build_playbook_context(
         logger.warning("get_recent_underlying_bars(%s) failed: %s", underlying, exc)
         recent_closes, recent_lows, recent_highs = [], [], []
 
+    try:
+        opening_range = await db.get_opening_range(underlying, timestamp)
+    except Exception as exc:
+        logger.warning("get_opening_range(%s) failed: %s", underlying, exc)
+        opening_range = None
+
     market = _build_market_context(
         underlying=underlying,
         timestamp=timestamp,
@@ -360,6 +371,7 @@ async def build_playbook_context(
         recent_closes=recent_closes,
         recent_lows=recent_lows,
         recent_highs=recent_highs,
+        opening_range=opening_range,
     )
     levels = _extract_levels(market.extra or {}, advanced)
 

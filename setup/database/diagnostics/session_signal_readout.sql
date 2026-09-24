@@ -16,6 +16,8 @@
 --      (-100 bearish .. +100 bullish).
 --   4. Playbook cards from the prior session's 14:30 ET through
 --      13:00 ET, so a card fired into yesterday's close shows up.
+--      STAND_DOWN cards are never persisted (src/signals/playbook/
+--      cycle.py), so a stretch with no rows means no pattern matched.
 --
 -- A blank cell means no row within 15 minutes of that time.  A blank
 -- flip is the resolver declining to publish -- "GF NA" on the ladder.
@@ -143,7 +145,7 @@ LEFT JOIN LATERAL (
 ) c ON TRUE
 ORDER BY m.sym, m.t;
 
-\echo '== 4. Playbook trade cards, prior session 14:30 ET through 13:00 ET (stand-downs counted, not listed) =='
+\echo '== 4. Playbook trade cards, prior session 14:30 ET through 13:00 ET (no rows = no pattern matched) =='
 -- Prior weekday; a market holiday just makes the window a day longer.
 WITH win AS (
     SELECT ((:'d'::date - CASE extract(isodow FROM :'d'::date)::int
@@ -161,17 +163,3 @@ WHERE c.underlying IN ('SPY', 'SPX')
   AND c.action <> 'STAND_DOWN'
   AND c.timestamp >= win.t0 AND c.timestamp < win.t1
 ORDER BY c.timestamp, c.underlying;
-
-WITH win AS (
-    SELECT ((:'d'::date - CASE extract(isodow FROM :'d'::date)::int
-                              WHEN 1 THEN 3 WHEN 7 THEN 2 ELSE 1 END)
-            + time '14:30') AT TIME ZONE 'America/New_York' AS t0,
-           (:'d'::date + time '13:00') AT TIME ZONE 'America/New_York' AS t1
-)
-SELECT c.underlying AS sym, count(*) AS stand_down_cards
-FROM signal_action_cards c, win
-WHERE c.underlying IN ('SPY', 'SPX')
-  AND c.action = 'STAND_DOWN'
-  AND c.timestamp >= win.t0 AND c.timestamp < win.t1
-GROUP BY c.underlying
-ORDER BY c.underlying;

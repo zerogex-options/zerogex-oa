@@ -11,6 +11,13 @@ Inputs are on the same ``-100..+100`` scale the front end feeds:
 ``netGEX`` collapsed to ``±50`` on the sign of net GEX, and ``msi`` as the
 0-100 composite score.
 
+``msi`` is regime strength, not direction, so both trend states treat it
+identically: it adds to a trend call's confidence and never gates it. It
+used to gate them as if it ran -100..+100 (``msi >= -10`` for TREND_UP,
+``msi <= 10`` for TREND_DOWN). On the real 0-100 scale the first always
+passed and the second needed the gauge at 10 or below, so TREND_UP fired
+freely and TREND_DOWN almost never did.
+
 Later phases (see the package docstring) extend this with a fused
 price-action/flow/tape/momentum layer and a graded override; the vote
 thresholds are exposed as env-overridable module constants so that calibration
@@ -29,7 +36,6 @@ from typing import Optional
 STRONG = float(os.getenv("TRADE_BIAS_STRONG", "25"))
 MODERATE = float(os.getenv("TRADE_BIAS_MODERATE", "12"))
 DOMINANT = float(os.getenv("TRADE_BIAS_DOMINANT", "65"))
-MSI_TOLERANCE = float(os.getenv("TRADE_BIAS_MSI_TOLERANCE", "10"))
 MAX_CONFIDENCE = 10.0
 
 # Front-end signal keys used for the CHOP "watching" chips.
@@ -179,9 +185,9 @@ def compute_bias(inp: BiasInput) -> BiasResult:
         market_state = "TRAP_REVERSAL"
     elif is_short_gamma and bearish_flow and bullish_structure:
         market_state = "TRAP_SQUEEZE"
-    elif is_long_gamma and bullish_flow and (msi is None or msi >= -MSI_TOLERANCE):
+    elif is_long_gamma and bullish_flow:
         market_state = "TREND_UP"
-    elif is_long_gamma and bearish_flow and (msi is None or msi <= MSI_TOLERANCE):
+    elif is_long_gamma and bearish_flow:
         market_state = "TREND_DOWN"
     elif available >= 4:
         market_state = "CHOP"
@@ -259,7 +265,7 @@ def compute_bias(inp: BiasInput) -> BiasResult:
         bias = "BUY_DIPS"
         bias_label = "Buy Dips"
         regime_label = "Trend Up Regime"
-        regime_desc = "Long gamma + aligned bullish flow + positive MSI."
+        regime_desc = "Long gamma + aligned bullish flow."
         setup = "Trend Continuation (Up)"
         playbook = [
             "Buy dips toward VWAP / gamma support",
@@ -284,7 +290,7 @@ def compute_bias(inp: BiasInput) -> BiasResult:
         bias = "SELL_RIPS"
         bias_label = "Sell Rips"
         regime_label = "Trend Down Regime"
-        regime_desc = "Long gamma + aligned bearish flow + negative MSI."
+        regime_desc = "Long gamma + aligned bearish flow."
         setup = "Trend Continuation (Down)"
         playbook = [
             "Short rips into VWAP / resistance",
@@ -302,8 +308,9 @@ def compute_bias(inp: BiasInput) -> BiasResult:
         push(positioningTrap, -1)
         push(trapDetection, -1)
         push(gammaVWAP, -1)
+        # Regime strength, like netGEX: pushed the same way as in TREND_UP.
         push(netGEX, 1)
-        push(msi, -1)
+        push(msi, 1)
     elif market_state == "CHOP":
         trend = "neutral"
         bias = "RANGE_FADE"

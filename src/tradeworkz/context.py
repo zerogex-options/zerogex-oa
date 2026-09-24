@@ -20,6 +20,7 @@ from datetime import date, datetime, time, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
+from src.opening_range import OPENING_RANGE_SQL, opening_range_from_row, opening_range_window
 from src.tradeworkz.flow_context import (
     fetch_forced_flow,
     fetch_hedge_impulse,
@@ -79,6 +80,11 @@ class MarketSnapshot:
     session_high: Optional[float] = None
     session_low: Optional[float] = None
     open_price: Optional[float] = None
+    # This session's 09:30-10:00 ET range (see src/opening_range.py); None
+    # before 10:00 ET or when the feed left too few bars in the window.
+    # session_high/session_low above span the trailing 24 hours instead.
+    opening_range_high: Optional[float] = None
+    opening_range_low: Optional[float] = None
 
     # Volatility regime.
     vix: Optional[float] = None
@@ -604,6 +610,38 @@ def _fetch_trade_bias(
     return (row[0], trend, conf)
 
 
+def _fetch_opening_range(
+    conn: Any, underlying: str, ts: Any
+) -> tuple[Optional[float], Optional[float]]:
+    """This session's 09:30-10:00 ET ``(high, low)`` — best-effort.
+
+    ``(None, None)`` before 10:00 ET, outside the session's own day, when too
+    few bars made it into the window, or on error (see
+    :mod:`src.opening_range`). ``ts`` is the snapshot's own bar, and every bar
+    read closed before 10:00 ET, so a backtest rebuilding a past instant never
+    sees a future row. Isolated in a SAVEPOINT like :func:`_fetch_trade_bias`.
+    """
+    if not isinstance(ts, datetime):
+        return (None, None)
+    window = opening_range_window(ts)
+    if window is None:
+        return (None, None)
+    cur = conn.cursor()
+    try:
+        cur.execute("SAVEPOINT tw_opening_range")
+        cur.execute(OPENING_RANGE_SQL, (underlying, *window))
+        row = cur.fetchone()
+        cur.execute("RELEASE SAVEPOINT tw_opening_range")
+    except Exception:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT tw_opening_range")
+        except Exception:
+            pass
+        return (None, None)
+    opening_range = opening_range_from_row(row)
+    return opening_range if opening_range is not None else (None, None)
+
+
 def build_snapshot(
     conn: Any, underlying: str, as_of: Optional[datetime] = None
 ) -> Optional[MarketSnapshot]:
@@ -667,6 +705,7 @@ def build_snapshot(
     sess_lo = session_row[0] if session_row else None
     sess_hi = session_row[1] if session_row else None
     sess_open = session_row[2] if session_row else None
+    or_high, or_low = _fetch_opening_range(conn, underlying, ts)
 
     # gex_summary columns:
     #   * net_gex_at_spot   — DTE-horizon-occupancy-weighted gamma sampled
@@ -866,6 +905,8 @@ def build_snapshot(
         session_high=_maybe_float(sess_hi),
         session_low=_maybe_float(sess_lo),
         open_price=_maybe_float(sess_open),
+        opening_range_high=or_high,
+        opening_range_low=or_low,
         vwap=vwap_value,
         vwap_deviation_pct=vwap_deviation,
         vix=vix,

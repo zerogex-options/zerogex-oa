@@ -37,6 +37,11 @@ from src.hedging_flow_sql import (
     SCOPE_ALL,
 )
 from src.market_calendar import NYSE_HOLIDAYS
+from src.opening_range import (
+    OPENING_RANGE_SQL_ASYNC,
+    opening_range_from_row,
+    opening_range_window,
+)
 from src.symbols import is_cash_index
 from src.underlying_volume_sql import total_volume as _total_volume
 from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
@@ -3782,6 +3787,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         lows = [float(r["low"]) if r["low"] is not None else float(r["close"]) for r in bars]
         highs = [float(r["high"]) if r["high"] is not None else float(r["close"]) for r in bars]
         return closes, lows, highs
+
+    async def get_opening_range(
+        self, symbol: str, as_of: datetime
+    ) -> Optional[Tuple[float, float]]:
+        """This session's 09:30-10:00 ET ``(high, low)`` as of ``as_of``, or ``None``.
+
+        Same window and bar floor as the live signal cycle (see
+        :mod:`src.opening_range`), so the ``/api/signals/action`` card and the
+        cycle's card agree on when the range broke. ``None`` before 10:00 ET,
+        outside the session's day, when too few bars exist, or on any error.
+        """
+        window = opening_range_window(as_of)
+        if window is None:
+            return None
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(OPENING_RANGE_SQL_ASYNC, symbol, *window)
+        except Exception as e:
+            logger.warning(f"get_opening_range({symbol}) failed: {e}")
+            return None
+        return opening_range_from_row(row)
 
     # Ticker → bars-table allowlist for the generic volatility-index read.
     # The whitelist keeps the table-name SQL interpolation safe.
