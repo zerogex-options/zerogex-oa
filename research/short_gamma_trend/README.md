@@ -97,6 +97,37 @@ is strong evidence, not proof.
 * **Direction and travel, not option P&L.** A state that is right on direction can
   still lose money on premium.
 
+## Result: the 2026-09-23 run
+
+47 sessions (2026-07-17 to 2026-09-23), SPY and SPX, 36,647 cash-session minutes. The
+stored inputs reproduced the stored market state on 100.00% of minutes, so the replay
+judged exactly what the panel showed.
+
+**Verdict: NO EVIDENCE. The candidate does not ship.**
+
+| `flow`, SPY + SPX pooled | 15m | 30m | 60m | rest of session |
+|---|---|---|---|---|
+| excess over drift, bps, 95% | -0.1 [-0.8, +0.5] | **-1.1 [-2.4, +0.1]** | -2.0 [-4.0, -0.2] | -0.6 [-4.3, +3.4] |
+
+* The evidence leans the wrong way. At 30 minutes both symbols come out negative (SPY
+  -0.6, SPX -1.8), the pooled 60-minute interval sits below zero, and the hit rate is
+  45.5% [40.9%, 49.4%]. If these minutes lean anywhere, they lean toward snapping back,
+  which is what "Range-Bound" already says.
+* The flow votes add nothing to price momentum alone (30-minute difference -0.4
+  [-2.3, +1.3]), and momentum alone also leans toward reversal at 60 minutes (-2.8
+  [-4.6, -1.2]) and to the close (-3.5 [-5.2, -1.7]).
+* Those minutes do move more: their 30-minute range is 1.29x [1.14, 1.42] that of all
+  minutes. Short gamma with directional flow says how much price moves, not which way,
+  the same split `docs/design/msi-regime-excursion.md` found for the MSI.
+* It would have doubled how often the panel changes its label, from 24.7 to 50.0 per
+  symbol per session, with a median episode of 2 minutes.
+
+Context, outside the verdict: production's own directional states show no detectable
+edge over the same sessions either. Long-gamma Trend Up/Down scores +0.4 bps [-1.4, +1.7]
+at 30 minutes (hit rate 52.8% [46.2%, 58.1%]); Trap Squeeze/Reversal +0.7 [-2.9, +3.9].
+The panel already changes its label 24.7 times per symbol per session, and its
+directional states last a median of 2 minutes.
+
 ## How to run it
 
 From the repository root, with the service's environment (the `.env` the services
