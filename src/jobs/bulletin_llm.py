@@ -639,7 +639,7 @@ def _input_prices(s: SymbolInput) -> list[float]:
 def _price_band(s: SymbolInput) -> tuple[float, float] | None:
     """The range where a number would read as a price for ``s``.
 
-    Anchored on spot when we have it, else the centre of the provided levels.
+    Anchored on spot when we have it, else the center of the provided levels.
     ±15% is wide enough to cover the walls / flip / session range and tight
     enough to exclude typical macro news figures."""
     if s.spot:

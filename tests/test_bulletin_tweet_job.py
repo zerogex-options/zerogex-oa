@@ -932,7 +932,7 @@ def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
     # The Key levels block is still the deterministic Python-composed one,
     # with the LLM's short notes in parentheses.
     assert "Key levels:" in body.text
-    assert "• 740 → Put Wall (held)" in body.text
+    assert f"• 740 → Put Wall ({mod._wall_scope_label()} · held)" in body.text
     assert "• 744.51 → Gamma Flip (the pivot)" in body.text
     # No hashtag row / link in the main post; the link rides in the reply.
     assert "#Gamma" not in body.text
@@ -1328,11 +1328,32 @@ def test_key_levels_block_orders_and_formats():
     )
     block = mod._key_levels_block(b, {"put_wall": "now the level to watch"})
     lines = block.splitlines()
-    # Order: Put Wall, Call Wall, Gamma Flip.
-    assert lines[0] == "• 740 → Put Wall (now the level to watch)"
-    assert lines[1] == "• 745 → Call Wall"
+    scope = mod._wall_scope_label()
+    # Order: Put Wall, Call Wall, Gamma Flip.  The walls carry their
+    # expiration scope; the flip doesn't have one.
+    assert lines[0] == f"• 740 → Put Wall ({scope} · now the level to watch)"
+    assert lines[1] == f"• 745 → Call Wall ({scope})"
     # Whole-dollar walls print without decimals; the flip keeps two.
     assert lines[2] == "• 747.29 → Gamma Flip"
+
+
+@pytest.mark.parametrize("expirations, label", [(3, "0–2DTE"), (5, "0–4DTE"), (1, "0DTE")])
+def test_walls_carry_the_expiration_scope_they_were_ranked_over(monkeypatch, expirations, label):
+    """The walls are ranked across every ingested expiration, not today's
+    alone.  On 2026-09-21 that put SPY's call wall at 780 while a 0DTE chart
+    showed 773-775, and the post read like a level that never existed."""
+    mod = _reload_module()
+    monkeypatch.setattr(mod, "INGEST_EXPIRATIONS", expirations)
+    assert mod._wall_scope_label() == label
+    b = mod._shape_bulletin(
+        _summary_row("SPY", spot=773.4, gamma_flip=766.2, call_wall=780.0, put_wall=770.0),
+        "SPY",
+    )
+    lines = mod._key_levels_block(b, {"call_wall": "first resistance"}).splitlines()
+    assert lines[0] == f"• 770 → Put Wall ({label})"
+    assert lines[1] == f"• 780 → Call Wall ({label} · first resistance)"
+    assert lines[2] == "• 766.20 → Gamma Flip"
+    assert f"CW 780.00 / PW 770.00 ({label})" in mod._build_fallback_tweet(b, "Midday Read")
 
 
 def test_derive_regime_prefers_net_gex_sign():
@@ -2096,8 +2117,11 @@ async def test_key_levels_block_reports_the_session_path_over_the_llm_note():
     await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
     block = mod._key_levels_block(b, {"put_wall": "never tested"})
     lines = block.splitlines()
-    assert lines[0] == "• 775 → Put Wall (moved 777 → 776 → 775; both broke, 775 tested and held)"
-    assert lines[1] == "• 780 → Call Wall (tested and held)"
+    scope = mod._wall_scope_label()
+    assert lines[0] == (
+        f"• 775 → Put Wall ({scope} · moved 777 → 776 → 775; both broke, 775 tested and held)"
+    )
+    assert lines[1] == f"• 780 → Call Wall ({scope} · tested and held)"
     assert lines[2] == "• 769.75 → Gamma Flip (spot held above all session)"
     assert "never tested" not in block
 
@@ -2112,7 +2136,10 @@ async def test_close_post_carries_the_after_the_bell_line():
     )
     await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
     text = mod._build_static_post("close", b)
-    assert "• 775 → Put Wall (moved 777 → 776 → 775; both broke, 775 tested and held)" in text
+    assert (
+        f"• 775 → Put Wall ({mod._wall_scope_label()} · moved 777 → 776 → 775; "
+        "both broke, 775 tested and held)"
+    ) in text
     assert "After the bell: today's 0DTE rolled off and Put Wall resets to 765." in text
     # ...and it lands between the levels block and the takeaway.
     assert text.index("Key levels:") < text.index("After the bell:") < text.index("Bottom line:")
