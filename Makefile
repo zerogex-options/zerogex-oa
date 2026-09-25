@@ -5139,7 +5139,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)the range by ~12% and biased vol_ratio low.$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per session x symbol ---$(NC)"; \
-	$(PSQL) -c "WITH c AS ( \
+	$(PSQL) -P pager=off -c "WITH c AS ( \
 		SELECT session_date, symbol, \
 		       COUNT(*) AS claims, \
 		       COUNT(*) FILTER (WHERE held) AS held_n, \
@@ -5191,7 +5191,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)with skill near zero is a calibrated model that has told you nothing,$(NC)"; \
 	echo "$(YELLOW)and it is the state a published hold probability must not be in --$(NC)"; \
 	echo "$(YELLOW)which is why cone_tweet gates on skill and not on gap_pts.$(NC)"; \
-	$(PSQL) -c "WITH s AS ( \
+	$(PSQL) -P pager=off -c "WITH s AS ( \
 		SELECT symbol, COUNT(*) AS claims, \
 		       COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) AS h, \
 		       AVG(hold_prob) AS pred, \
@@ -5217,7 +5217,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)makes a stale cohort look like a regression. 'pre-anchor' marks rows$(NC)"; \
 	echo "$(YELLOW)written before the vol anchor existed -- re-backfill those sessions$(NC)"; \
 	echo "$(YELLOW)before drawing any conclusion from them.$(NC)"; \
-	$(PSQL) -c "SELECT model_version, \
+	$(PSQL) -P pager=off -c "SELECT model_version, \
 		       CASE WHEN vol_ratio_source IS NULL THEN 'pre-anchor' ELSE 'current' END AS cohort, \
 		       horizon_min, COUNT(*) AS claims, \
 		       ROUND(100.0 * COUNT(*) FILTER (WHERE held) / COUNT(*), 1) AS hold_pct, \
