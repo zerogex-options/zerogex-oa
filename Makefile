@@ -3547,6 +3547,37 @@ shadow-compare: shadow-guard ## Side-by-side coverage for today's ET session: pr
 		FROM option_chains WHERE timestamp >= $(SHADOW_DAY_START) \
 		GROUP BY underlying ORDER BY underlying;"
 	@echo ""
+	@echo "$(BLUE)=== option VOLUME — today's ET session ===$(NC)"
+	@echo "$(YELLOW)traded_pct counts CONTRACTS that traded; option_volume is the$(NC)"
+	@echo "$(YELLOW)contracts weighted by size. A shortfall in the first that does$(NC)"
+	@echo "$(YELLOW)not show in the second is thin strikes, and does not move flow.$(NC)"
+	@echo "$(GREEN)PRODUCTION ($(DB_NAME)):$(NC)"
+	@$(PSQL) -c "\
+		WITH latest AS ( \
+		  SELECT DISTINCT ON (option_symbol) underlying, option_symbol, volume \
+		  FROM option_chains WHERE timestamp >= $(SHADOW_DAY_START) \
+		  ORDER BY option_symbol, timestamp DESC \
+		) \
+		SELECT underlying, COUNT(*) AS contracts, \
+		       COUNT(*) FILTER (WHERE volume > 0) AS traded, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE volume > 0) \
+		             / NULLIF(COUNT(*), 0), 1) AS traded_pct, \
+		       SUM(volume) AS option_volume \
+		FROM latest GROUP BY underlying ORDER BY underlying;"
+	@echo "$(GREEN)REHEARSAL ($(SHADOW_DB)):$(NC)"
+	@$(SHADOW_PSQL) -c "\
+		WITH latest AS ( \
+		  SELECT DISTINCT ON (option_symbol) underlying, option_symbol, volume \
+		  FROM option_chains WHERE timestamp >= $(SHADOW_DAY_START) \
+		  ORDER BY option_symbol, timestamp DESC \
+		) \
+		SELECT underlying, COUNT(*) AS contracts, \
+		       COUNT(*) FILTER (WHERE volume > 0) AS traded, \
+		       ROUND(100.0 * COUNT(*) FILTER (WHERE volume > 0) \
+		             / NULLIF(COUNT(*), 0), 1) AS traded_pct, \
+		       SUM(volume) AS option_volume \
+		FROM latest GROUP BY underlying ORDER BY underlying;"
+	@echo ""
 	@echo "$(BLUE)=== underlying_quotes — today's ET session ===$(NC)"
 	@echo "$(GREEN)PRODUCTION ($(DB_NAME)):$(NC)"
 	@$(PSQL) -c "\

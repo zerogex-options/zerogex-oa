@@ -333,3 +333,40 @@ def test_shadow_status_counts_only_the_current_run():
                 f"the {pattern!r} count reads the whole file; earlier runs in "
                 "the same log would be counted as this run's"
             )
+
+
+def test_option_volume_is_summed_per_contract_not_per_row():
+    """option_chains is a TIME SERIES and `volume` is session-cumulative.
+
+    A plain SUM(volume) over the rows multiplies every contract by its
+    snapshot count -- at a 5s poll that is hundreds of times its real
+    volume, and it would look plausible rather than obviously wrong.
+    Verified against PostgreSQL with a contract seeded at 10 -> 50 -> 120:
+    the query returns 120, not 180.
+    """
+    body = _recipe("shadow-compare")
+    assert (
+        "DISTINCT ON (option_symbol)" in body
+    ), "option volume must be taken from the latest row per contract"
+    assert (
+        "ORDER BY option_symbol, timestamp DESC" in body
+    ), "DISTINCT ON without that ORDER BY picks an arbitrary row, not the latest"
+    # No SUM(volume) may read option_chains directly, outside the CTE.
+    for match in re.finditer(r"SUM\(volume\)", body):
+        window = body[max(0, match.start() - 600) : match.start()]
+        assert (
+            "DISTINCT ON (option_symbol)" in window
+        ), "a SUM(volume) is reading option_chains rows directly"
+
+
+def test_shadow_compare_reports_both_contract_count_and_volume():
+    """The percentage alone cannot answer whether a gap matters.
+
+    NDX on 2026-09-25 showed 39.1% of contracts traded on TradeStation
+    against 26.1% on ThetaData. Whether that moves the published flow
+    numbers depends entirely on whether the missing contracts carried any
+    size, which only the volume figure says.
+    """
+    body = _recipe("shadow-compare")
+    assert "traded_pct" in body, "the share of contracts that traded"
+    assert "option_volume" in body, "and the volume behind them"
