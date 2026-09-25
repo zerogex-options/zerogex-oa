@@ -180,6 +180,32 @@ Outside the regular session (09:30 ET to the close, 13:00 on an early-close day)
    - Final tie: alphabetical pattern ID for determinism.
 8. Surface losing candidates in `alternatives_considered[]` with a one-line reason each.
 
+### Exit sizing (`reach.py`)
+
+A Card's target and stop must be reachable before its hold runs out. In the
+graded record through 2026-09-24, three in four `max_pain_gravitation` and
+`vwap_reversion` Cards, and most `call_wall_fade`, `put_wall_bounce` and
+`gamma_flip_bounce` Cards, timed out: they aimed at a level at whatever
+distance it sat, with a fixed-percent stop, in pinned markets where price
+barely moves. Those five patterns now size both exits to the expected move
+over the Card's usable hold (close × 1-minute σ × √minutes; a 0DTE hold ends at
+the close):
+
+- **Target:** the pattern's level (max pain, VWAP, a wall, max gamma) when it
+  is within 0.75 expected moves (`PLAYBOOK_REACH_TARGET_MULT`); otherwise that
+  far toward it (`level_name` `toward_<level>`), or `expected_move` when there
+  is no level on that side.
+- **Stop:** 0.75 expected moves the other way (`PLAYBOOK_REACH_STOP_MULT`),
+  or the catalog's structural stop when closer, and always on the far side of
+  the wall or flip it protects.
+- **No Card** when the target within reach would be under 0.10% of price
+  (`PLAYBOOK_REACH_MIN_MOVE_PCT`); the Stand Down lists it as "too quiet".
+- With fewer than 21 one-minute bars of history the catalog exits below stand.
+
+On driftless simulated prices this cuts time-outs from about two in three to
+about one in ten, with the rest splitting evenly between target and stop, so
+a pattern's real edge shows up plainly in its graded record.
+
 ---
 
 ## 5. Confidence rubric
