@@ -5198,6 +5198,15 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)windows: those start at 10:15 and so miss the opening 45 minutes,$(NC)"; \
 	echo "$(YELLOW)which carry 23% of the day's variance -- measuring there understated$(NC)"; \
 	echo "$(YELLOW)the range by ~12% and biased vol_ratio low.$(NC)"; \
+	echo "$(YELLOW)chop = how far price actually TRAVELLED over the range it covered.$(NC)"; \
+	echo "$(YELLOW)A one-way trend day is near 1; a day that sawtooths through the same$(NC)"; \
+	echo "$(YELLOW)range is many times that. It is here because the cone grades PATH$(NC)"; \
+	echo "$(YELLOW)containment -- price must never leave the band at any point -- while$(NC)"; \
+	echo "$(YELLOW)vol_ratio only knows high minus low. Two days with the same range and$(NC)"; \
+	echo "$(YELLOW)very different chop break very different numbers of bands, and$(NC)"; \
+	echo "$(YELLOW)vol_ratio cannot tell them apart. A normal vol_ratio sitting next to a$(NC)"; \
+	echo "$(YELLOW)high chop and a large negative gap means the day was JAGGED, not big --$(NC)"; \
+	echo "$(YELLOW)which is a different problem from the vol basis being wrong.$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per session x symbol ---$(NC)"; \
 	$(PSQL) -P pager=off -c "WITH c AS ( \
@@ -5215,17 +5224,23 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
 		GROUP BY session_date, symbol), \
 		tape AS ( \
-		SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d, symbol, \
-		       MAX(high) - MIN(low) AS rng \
-		FROM underlying_quotes \
-		WHERE timestamp >= ((CURRENT_DATE - ($${SESSIONS} * 2))::timestamp \
-		                    AT TIME ZONE 'America/New_York') \
-		  AND symbol IN (SELECT symbol FROM c) \
-		  AND (timestamp AT TIME ZONE 'America/New_York')::time \
-		      BETWEEN TIME '09:30' AND TIME '16:00' \
-		GROUP BY 1, 2), \
+		SELECT d, symbol, MAX(high) - MIN(low) AS rng, SUM(ABS(dc)) AS path \
+		FROM ( \
+		  SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d, \
+		         symbol, high, low, \
+		         close - LAG(close) OVER (PARTITION BY symbol, \
+		             (timestamp AT TIME ZONE 'America/New_York')::date \
+		             ORDER BY timestamp) AS dc \
+		  FROM underlying_quotes \
+		  WHERE timestamp >= ((CURRENT_DATE - ($${SESSIONS} * 2))::timestamp \
+		                      AT TIME ZONE 'America/New_York') \
+		    AND symbol = ANY(ARRAY(SELECT DISTINCT symbol FROM c)) \
+		    AND (timestamp AT TIME ZONE 'America/New_York')::time \
+		        BETWEEN TIME '09:30' AND TIME '16:00' \
+		) b GROUP BY 1, 2), \
 		s AS ( \
-		SELECT c.*, t.rng / NULLIF(c.spot,0) AS realized_frac \
+		SELECT c.*, t.rng / NULLIF(c.spot,0) AS realized_frac, \
+		       t.path / NULLIF(t.rng, 0) AS chop \
 		FROM c LEFT JOIN tape t \
 		  ON t.d = c.session_date AND t.symbol = c.symbol) \
 		SELECT session_date, symbol, claims, \
@@ -5237,7 +5252,8 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       model_ver, \
 		       ROUND(100.0 * sigma_frac, 3)      AS model_sigma_pct, \
 		       ROUND(100.0 * realized_frac, 3)   AS realized_range_pct, \
-		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio \
+		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio, \
+		       ROUND(chop::numeric, 1)           AS chop \
 		FROM s ORDER BY session_date DESC, symbol;" || echo "$(YELLOW)(the per-session query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per SYMBOL (current cohort only) ---$(NC)"; \
