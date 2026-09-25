@@ -1,0 +1,40 @@
+[Unit]
+Description=ZeroGEX intraday cone receipt tweet (16:15 ET, after the day's cones are graded)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service zerogex-oa-forecast-cone-receipt.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# NOTE THE ABSENT --post.  This unit ships in DRY-RUN mode on purpose: it
+# assembles the tweet, runs the publication gate, logs both to the journal,
+# and posts nothing.  That makes the timer safe to install and watch for as
+# many sessions as it takes to trust the copy, and it makes going live a
+# deliberate, visible, reviewable one-word edit rather than a default nobody
+# chose.  Add --post here (then `systemctl daemon-reload`) to publish.
+#
+# Even with --post the job still refuses to publish a record that does not
+# clear the Brier-skill floor — see publication_gate in src/jobs/cone_tweet.py.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.cone_tweet --mode receipt
+
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+# Creates and owns /var/lib/zerogex-oa, which is where the posted-marker files
+# live.  Without this, ProtectSystem=strict makes that path read-only and the
+# idempotency guard silently never persists a marker — it fails open by design,
+# so the symptom would be a duplicate tweet after a catch-up run, not an error.
+StateDirectory=zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-cone-tweet

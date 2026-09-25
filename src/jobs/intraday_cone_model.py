@@ -1057,3 +1057,56 @@ def base_rate_brier(predictions: Sequence[tuple[float, bool]]) -> Optional[float
         return None
     base = sum(outcomes) / len(outcomes)
     return round(sum((base - o) ** 2 for o in outcomes) / len(outcomes), 6)
+
+
+#: Minimum Brier skill score before the cone counts as having beaten the
+#: base-rate strawman.
+#:
+#: A bare ``brier < baseline`` is not good enough, for a reason the live data
+#: makes concrete rather than theoretical.  Over the 20-session window ending
+#: 2026-09-24 the four symbols score: SPY 0.1474 vs baseline 0.1600 (skill
+#: +7.9%), QQQ 0.1460 vs 0.1514 (+3.6%), SPX 0.1551 vs 0.1551 (+0.02%), NDX
+#: 0.1552 vs 0.1551 (-0.04%).  SPY and QQQ carry real information.  SPX and NDX
+#: are dead heats, separated from their own baseline in the fourth decimal
+#: place — closer than sampling noise, and in an earlier revision of this
+#: comparison closer than FLOATING-POINT noise, because rounding one side and
+#: not the other made ``0.15999999999999998 < 0.16`` read as a win.
+#:
+#: 1% of the strawman's own error is a deliberately low bar.  It is not a claim
+#: that the cone is good, only that the comparison landed outside the noise.
+MIN_BRIER_SKILL = 0.01
+
+
+def brier_skill(predictions: Sequence[tuple[float, bool]]) -> Optional[float]:
+    """``1 - brier/baseline`` — how much of the strawman's error the cone removes.
+
+    Positive means the per-claim confidence carried information; zero means the
+    cone discovered only what the base rate already said.  Both sides are
+    computed unrounded here, so the margin is a real one and not an artifact of
+    two different rounding points.
+
+    None when there is nothing to beat: if every claim resolved the same way
+    the strawman is already perfect and skill is undefined.
+    """
+    pairs = [(float(p), bool(h)) for p, h in predictions]
+    n = len(pairs)
+    if n == 0:
+        return None
+    outcomes = [1.0 if h else 0.0 for _, h in pairs]
+    base = sum(outcomes) / n
+    baseline = sum((base - o) ** 2 for o in outcomes) / n
+    if baseline <= 0:
+        return None
+    brier = sum((p - o) ** 2 for (p, _), o in zip(pairs, outcomes)) / n
+    return round(1.0 - (brier / baseline), 6)
+
+
+def beats_base_rate(predictions: Sequence[tuple[float, bool]]) -> Optional[bool]:
+    """Did the cone beat the strawman by a margin worth the word 'beat'?
+
+    The single verdict both the published /reliability endpoint and the auto
+    tweet consult, so the page and the tweet can never disagree about whether
+    a symbol has earned its track record.
+    """
+    skill = brier_skill(predictions)
+    return None if skill is None else bool(skill >= MIN_BRIER_SKILL)

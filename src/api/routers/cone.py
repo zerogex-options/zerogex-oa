@@ -34,7 +34,10 @@ from zoneinfo import ZoneInfo
 
 from src.jobs.intraday_cone_model import (
     CONE_HORIZONS_MIN,
+    MIN_BRIER_SKILL,
     base_rate_brier,
+    beats_base_rate,
+    brier_skill,
     calibration_error,
     reliability_table,
 )
@@ -196,6 +199,12 @@ def _score_block(pairs: list[tuple[float, bool]]) -> dict[str, Any]:
     predict the base rate" has demonstrated nothing about the market, only
     about the base rate, and saying so is the entire point of publishing a
     receipt rather than a testimonial.
+
+    The verdict is a skill MARGIN rather than a bare inequality, because on
+    live data two of the four symbols sit within a ten-thousandth of their own
+    baseline — close enough that which side of it they land on is decided by
+    rounding.  ``brier_skill`` is published alongside so a reader can see how
+    much room there was, not just which way it fell.  See MIN_BRIER_SKILL.
     """
     n = len(pairs)
     if n == 0:
@@ -213,10 +222,11 @@ def _score_block(pairs: list[tuple[float, bool]]) -> dict[str, Any]:
         "brier": brier,
         "baseline_brier": baseline,
         # Lower Brier is better, so the cone wins by scoring BELOW the
-        # baseline.  Withheld entirely until the sample can support it.
-        "beats_baseline": (
-            None if not enough or baseline is None else bool(brier < baseline)
-        ),
+        # baseline — but by a stated margin, not by any amount.  Withheld
+        # entirely until the sample can support it.
+        "brier_skill": brier_skill(pairs),
+        "min_brier_skill": MIN_BRIER_SKILL,
+        "beats_baseline": None if not enough else beats_base_rate(pairs),
         "calibration_error": calibration_error(pairs, buckets=RELIABILITY_BUCKETS),
         "reliability": reliability_table(pairs, buckets=RELIABILITY_BUCKETS),
         "sufficient_sample": enough,
