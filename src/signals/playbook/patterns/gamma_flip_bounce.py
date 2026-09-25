@@ -23,6 +23,12 @@ on the other side of the flip — if the flip fails to hold, the setup is
 invalidated.  Targets walk to the nearest structural level in the bounce
 direction (call_wall / put_wall / max_gamma_strike).
 
+Both exits are sized to the move price typically makes over the hold
+(``reach.py``): the target is that level when within reach, otherwise a point
+partway toward it, and the stop stays past the flip but no further than the
+same typical move. Most of this pattern's Cards used to time out aiming at a
+wall far away. No Card when the market is too quiet.
+
 Time gate: 9:35 ET — earlier than the 10:00 ET gate on flip-related
 break/bounce patterns because flip-defense in the first 30 minutes is a
 highest-conviction setup, not noise.
@@ -35,6 +41,7 @@ import os
 from datetime import time
 from typing import Literal, Optional
 
+from src.signals.playbook import reach
 from src.signals.playbook.base import PatternBase
 from src.signals.playbook.context import PlaybookContext
 from src.signals.playbook.types import (
@@ -240,6 +247,15 @@ class GammaFlipBouncePattern(PatternBase):
             put_wall=ctx.level("put_wall"),
             max_gamma=ctx.level("max_gamma_strike"),
         )
+        target_kind = "level" if target_level_name else "premium_pct"
+
+        # Size both to the move price typically makes over the hold. With too
+        # little bar history the catalog exits above stand.
+        sizing = self._sizing(ctx, bounce)
+        hold, exits = sizing.hold, sizing.exits
+        if exits is not None:
+            target_ref, target_level_name, target_kind = exits.target, exits.target_name, "level"
+            stop_ref = exits.stop
 
         confidence = self.compute_confidence(ctx, bias=bounce)
         rationale = self._compose_rationale(
@@ -249,6 +265,11 @@ class GammaFlipBouncePattern(PatternBase):
             sigma=sigma,
             target_name=target_level_name,
         )
+        if exits is not None:
+            rationale += (
+                f" Target ${target_ref:.2f}, stop ${stop_ref:.2f}: sized to the "
+                f"{exits.move_pct(close):.2f}% price typically moves in {hold}m."
+            )
 
         return ActionCard(
             underlying=ctx.underlying,
@@ -259,12 +280,12 @@ class GammaFlipBouncePattern(PatternBase):
             direction=bounce,
             confidence=confidence,
             size_multiplier=0.75,
-            max_hold_minutes=_MAX_HOLD_MIN,
+            max_hold_minutes=hold if exits is not None else _MAX_HOLD_MIN,
             legs=legs,
             entry=Entry(ref_price=entry_ref, trigger="at_touch"),
             target=Target(
                 ref_price=target_ref,
-                kind="level" if target_level_name else "premium_pct",
+                kind=target_kind,
                 level_name=target_level_name,
             ),
             stop=Stop(
@@ -283,6 +304,9 @@ class GammaFlipBouncePattern(PatternBase):
                 "put_wall": ctx.level("put_wall"),
                 "max_gamma_strike": ctx.level("max_gamma_strike"),
                 "realized_sigma_30min": round(sigma, 6),
+                "expected_move_pct": (
+                    round(exits.move_pct(close), 4) if exits is not None else None
+                ),
                 "advanced_signals_aligned": [
                     name
                     for name in (
@@ -294,6 +318,31 @@ class GammaFlipBouncePattern(PatternBase):
                     and (snap.clamped_score * (1.0 if bounce == "bullish" else -1.0)) > 0
                 ],
             },
+        )
+
+    def _sizing(self, ctx: PlaybookContext, bounce: "BounceDirection") -> reach.Sizing:
+        """Exits sized to the typical move from the flip entry; see ``reach.plan``."""
+        flip = float(ctx.market.gamma_flip)  # type: ignore[arg-type]
+        sign = 1.0 if bounce == "bullish" else -1.0
+        level, level_name = self._pick_target(
+            bounce=bounce,
+            close=ctx.close,
+            call_wall=ctx.level("call_wall"),
+            put_wall=ctx.level("put_wall"),
+            max_gamma=ctx.level("max_gamma_strike"),
+        )
+        return reach.plan(
+            ts=ctx.timestamp,
+            close=ctx.close,
+            closes=ctx.market.recent_closes,
+            hold_minutes=_MAX_HOLD_MIN,
+            tier=self.tier,
+            direction=bounce,
+            entry=flip * (1.0 + sign * _REJECT_BUFFER_PCT),
+            level=level,
+            level_name=level_name,
+            structural_stop=flip * (1.0 - sign * _STOP_PCT),
+            beyond=flip,
         )
 
     # ------------------------------------------------------------------
@@ -372,6 +421,11 @@ class GammaFlipBouncePattern(PatternBase):
                         f"tape_flow_bias={tape.score if tape else None}, "
                         f"order_flow_imbalance={ofi.score if ofi else None}"
                     )
+
+            if not missing and bounce is not None:
+                sizing = self._sizing(ctx, bounce)
+                if sizing.too_quiet:
+                    missing.append(reach.too_quiet_reason(close, sizing.move, sizing.hold))
 
         return missing
 

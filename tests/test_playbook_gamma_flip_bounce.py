@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 from typing import Optional
 
+import pytest
+
 from src.signals.components.base import MarketContext
 from src.signals.playbook.context import PlaybookContext, SignalSnapshot
 from src.signals.playbook.patterns.gamma_flip_bounce import (
@@ -188,9 +190,15 @@ def test_matches_bullish_bounce_at_945_et():
     assert card.entry.ref_price > 736.0
     # Stop below flip (failure invalidates setup).
     assert card.stop.ref_price < 736.0
-    # Target sits above close in the bounce direction.
-    assert card.target.level_name in ("call_wall", "max_gamma_strike")
-    assert card.target.ref_price > card.legs[0].strike or card.target.ref_price > 736.0
+    # Target sits above entry, toward the nearest level (max_gamma 740 here),
+    # sized to the move price can make in the hold rather than all the way.
+    assert card.target.level_name in (
+        "call_wall",
+        "max_gamma_strike",
+        "toward_call_wall",
+        "toward_max_gamma_strike",
+    )
+    assert card.entry.ref_price < card.target.ref_price <= 740.0
     # Confidence should be elevated (pattern_base=0.65 + controlled_trend preferred).
     assert card.confidence >= 0.65
 
@@ -206,7 +214,13 @@ def test_matches_bearish_bounce():
     assert card.entry.ref_price < 736.0
     # Stop above flip.
     assert card.stop.ref_price > 736.0
-    assert card.target.level_name in ("put_wall", "max_gamma_strike")
+    assert card.target.level_name in (
+        "put_wall",
+        "max_gamma_strike",
+        "toward_put_wall",
+        "toward_max_gamma_strike",
+    )
+    assert 730.0 <= card.target.ref_price < card.entry.ref_price
 
 
 def test_clean_cross_through_does_not_match():
@@ -259,11 +273,23 @@ def test_blocks_entry_before_935_et():
 
 
 def test_target_falls_back_when_no_levels_above():
-    """If no call_wall/max_gamma above close, target is None (premium_pct kind)."""
+    """No call_wall/max_gamma above close: the target is the move price can
+    make over the hold, not an open-ended premium target."""
     ctx = _ctx(call_wall=730.0, max_gamma_strike=720.0)  # both below close
     card = GAMMA_FLIP_BOUNCE.match(ctx)
     assert card is not None
-    assert card.target.ref_price is None
+    assert card.target.level_name == "expected_move"
+    assert card.target.kind == "level"
+    assert card.target.ref_price > card.entry.ref_price
+
+
+def test_target_without_bar_history_keeps_the_catalog_exits():
+    """Too few bars to measure volatility: the original exits stand."""
+    closes = _bullish_bounce_closes(n_prior=10)  # 13 closes < reach.MIN_BARS
+    card = GAMMA_FLIP_BOUNCE.match(_ctx(closes=closes, close=closes[-1]))
+    assert card is not None
+    assert card.target.level_name in ("call_wall", "max_gamma_strike")
+    assert card.stop.ref_price == pytest.approx(736.0 * (1 - 0.0030))
 
 
 def test_instrument_switches_with_vol():

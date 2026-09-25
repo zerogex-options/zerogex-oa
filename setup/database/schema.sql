@@ -3065,11 +3065,15 @@ CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep ON backtest_runs(sweep_id, id
 --       between-deploy window the tables came back empty, but the wipe
 --       reset them again on the next schema-apply, so the service
 --       error-logged "relation signal_trades does not exist" ~200x/hour.
--- Fix: don't wipe. The tables persist and accept writes; nothing user-
--- facing reads them (the old /trading-signals page is now TradeWorkz).
--- A one-time truncation, if ever desired, is an operator ad-hoc
--- (`TRUNCATE signal_trades, signal_action_cards, portfolio_snapshots`),
--- not a permanent schema.sql statement.
+-- Fix: don't wipe. The tables persist and accept writes.
+--
+-- NEVER TRUNCATE signal_action_cards. It is customer-facing: every public
+-- /cards/<id> permalink, the daily Scorecard, the customer backtester and the
+-- Playbook's graded record (playbook_card_outcomes, which cascades from it)
+-- all read it. A TRUNCATE on 2026-09-24 wiped the entire card history, and the
+-- only way back was the RDS point-in-time backup. signal_trades and
+-- portfolio_snapshots are internal (the old /trading-signals page is now
+-- TradeWorkz) and can be cleared on their own if ever needed.
 
 -- 9.2 Bot registry — every TradeWorkz bot the engine can run.
 CREATE TABLE IF NOT EXISTS tw_bots (

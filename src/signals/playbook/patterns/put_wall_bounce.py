@@ -3,6 +3,11 @@
 Symmetric mirror of ``call_wall_fade``: long-gamma backdrop + price
 tagging the put wall + bullish flow + a corroborating advanced signal
 = buy the bounce.  Per ``docs/playbook_catalog.md`` §7.1.2.
+
+Exits are sized to the move price typically makes over the hold
+(``reach.py``): the target is max pain or the gamma flip when within reach,
+otherwise a point partway up; the stop is back below the wall, no further
+than that same typical move. No Card when the market is too quiet.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ import os
 from datetime import time
 from typing import Optional
 
+from src.signals.playbook import reach
 from src.signals.playbook.base import PatternBase
 from src.signals.playbook.context import PlaybookContext
 from src.signals.playbook.types import (
@@ -99,7 +105,17 @@ class PutWallBouncePattern(PatternBase):
             ]
 
         target_ref, target_level_name = self._pick_target(close, max_pain, gamma_flip, wall_strike)
+        target_kind = "level" if target_level_name else "premium_pct"
         stop_ref = wall_strike * (1.0 - _STOP_PCT_BELOW_WALL)
+        stop_kind = "premium_pct"
+
+        # Size both to the move price typically makes over the hold. With too
+        # little bar history the catalog exits above stand.
+        sizing = self._sizing(ctx)
+        hold, exits = sizing.hold, sizing.exits
+        if exits is not None:
+            target_ref, target_level_name, target_kind = exits.target, exits.target_name, "level"
+            stop_ref, stop_kind = exits.stop, "level"
 
         confidence = self.compute_confidence(ctx, bias="bullish")
         vix = (ctx.market.extra or {}).get("vix_level")
@@ -125,6 +141,11 @@ class PutWallBouncePattern(PatternBase):
             sigma=sigma,
             action=action,
         )
+        if exits is not None:
+            rationale += (
+                f" Target ${target_ref:.2f}, stop ${stop_ref:.2f}: sized to the "
+                f"{exits.move_pct(close):.2f}% price typically moves in {hold}m."
+            )
 
         return ActionCard(
             underlying=ctx.underlying,
@@ -135,17 +156,17 @@ class PutWallBouncePattern(PatternBase):
             direction=self.direction,
             confidence=confidence,
             size_multiplier=0.6,
-            max_hold_minutes=_MAX_HOLD_MIN,
+            max_hold_minutes=hold if exits is not None else _MAX_HOLD_MIN,
             legs=legs,
             entry=Entry(ref_price=close, trigger="at_touch"),
             target=Target(
                 ref_price=target_ref,
-                kind="level" if target_level_name else "premium_pct",
+                kind=target_kind,
                 level_name=target_level_name,
             ),
             stop=Stop(
                 ref_price=stop_ref,
-                kind="premium_pct",
+                kind=stop_kind,
                 level_name="put_wall_break",
             ),
             rationale=rationale,
@@ -161,7 +182,31 @@ class PutWallBouncePattern(PatternBase):
                 "advanced_signals_aligned": adv_aligned,
                 "basic_signals_aligned": basic_aligned,
                 "vix_level": vix,
+                "expected_move_pct": (
+                    round(exits.move_pct(close), 4) if exits is not None else None
+                ),
             },
+        )
+
+    def _sizing(self, ctx: PlaybookContext) -> reach.Sizing:
+        """Exits sized to the typical move; see ``reach.plan``."""
+        wall_strike = _round_to_strike(ctx.level("put_wall"), 1.0)  # type: ignore[arg-type]
+        max_pain = ctx.level("max_pain") or ctx.market.max_pain
+        level, level_name = self._pick_target(
+            ctx.close, max_pain, ctx.market.gamma_flip, wall_strike
+        )
+        return reach.plan(
+            ts=ctx.timestamp,
+            close=ctx.close,
+            closes=ctx.market.recent_closes,
+            hold_minutes=_MAX_HOLD_MIN,
+            tier=self.tier,
+            direction="bullish",
+            entry=ctx.close,
+            level=level,
+            level_name=level_name,
+            structural_stop=wall_strike * (1.0 - _STOP_PCT_BELOW_WALL),
+            beyond=wall_strike,
         )
 
     # ------------------------------------------------------------------
@@ -216,6 +261,11 @@ class PutWallBouncePattern(PatternBase):
         rbi = ctx.signal("range_break_imminence")
         if rbi and rbi.context_values.get("label") == "Breakout Mode":
             missing.append("range_break_imminence is in 'Breakout Mode' (trend overrides walls)")
+
+        if not missing:
+            sizing = self._sizing(ctx)
+            if sizing.too_quiet:
+                missing.append(reach.too_quiet_reason(ctx.close, sizing.move, sizing.hold))
 
         return missing
 
