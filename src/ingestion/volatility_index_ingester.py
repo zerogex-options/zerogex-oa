@@ -43,7 +43,7 @@ import requests as _requests
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
-from src.config import _getenv_int, _getenv_bool
+from src.config import _getenv_int, _getenv_bool, configured_provider_name
 from src.utils import get_logger
 from src.validation import (
     safe_float,
@@ -73,9 +73,15 @@ _RECONNECT_BACKOFF_SEC = 2
 # Prune at startup and then roughly every this many bar upserts.
 _PRUNE_EVERY_N_UPSERTS = 120
 
+# How often the PROVIDER path drains its bar stream. The stream does its own
+# polling underneath; this only bounds how long a SIGTERM waits, so it is
+# deliberately far shorter than the 5-minute bar it is collecting.
+_PROVIDER_DRAIN_SLEEP_SEC = 1.0
+
 # Allowed bars-table names — guards the SQL string interpolation in
-# _upsert_bars / _prune_old_bars against ever using an attacker-controlled
-# identifier.  Add new tables here when a new volatility index is wired up.
+# _upsert_bars / _accumulate_mark / _prune_old_bars against ever using an
+# attacker-controlled identifier.  Add new tables here when a new volatility
+# index is wired up.
 _ALLOWED_TABLES = frozenset({"vix_bars", "vxn_bars"})
 
 
@@ -92,6 +98,56 @@ def _parse_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "open": safe_float(raw.get("Open"), field_name="Open", default=None),
         "high": safe_float(raw.get("High"), field_name="High", default=None),
         "low": safe_float(raw.get("Low"), field_name="Low", default=None),
+        "close": close,
+    }
+
+
+def _bar_close_timestamp(ts: datetime) -> datetime:
+    """The 5-minute bar a mark observed at ``ts`` belongs to, stamped at its CLOSE.
+
+    TradeStation stamps a bar at the END of its interval -- the 09:30-09:35
+    bar arrives stamped 09:35 -- and every row already in these tables follows
+    that convention, so the provider path has to as well.  Stamping at the
+    bucket's start instead would put each new row one bar earlier than the
+    history sitting beside it, and ``get_vix_z_score_20d`` reads both at once.
+
+    A mark landing exactly on a boundary closes that bar rather than opening
+    the next: the interval is (09:30, 09:35], not [09:30, 09:35).
+    """
+    floored = ts.replace(minute=(ts.minute // 5) * 5, second=0, microsecond=0)
+    return floored if floored == ts else floored + timedelta(minutes=5)
+
+
+def _mark_row(bar: Any) -> Optional[Dict[str, Any]]:
+    """One provider mark as a degenerate bar in its 5-minute bucket.
+
+    ``None`` when there is no usable close or timestamp, mirroring
+    ``_parse_bar``: ``close`` is NOT NULL in both bar tables, so a mark
+    without one would fail its whole write rather than skip its own row.
+
+    Only ``close`` is read.  The Market Value index endpoint answers a mark
+    and nothing else, and the provider's ``_bar_from_row`` fills open/high/low
+    from that same close -- but the realtime endpoint answers a running DAILY bar,
+    whose high and low would otherwise be written into every 5-minute row as
+    if they were the interval's.  Taking the close alone makes the candle a
+    function of the observed sequence under either endpoint, which is what
+    ``_accumulate_mark``'s conflict clause then builds it out of.
+
+    No volume: a cash index is a calculation over its constituents, not
+    something that trades, and these tables have no volume column.
+    """
+    close = safe_float(getattr(bar, "close", None), field_name="close", default=None)
+    if close is None:
+        return None
+    ts = getattr(bar, "timestamp", None)
+    if not isinstance(ts, datetime):
+        return None
+    bucket = _bar_close_timestamp(ts)
+    return {
+        "timestamp": bucket,
+        "open": close,
+        "high": close,
+        "low": close,
         "close": close,
     }
 
@@ -137,8 +193,9 @@ class VolatilityIndexIngester:
 
     def __init__(
         self,
-        client: TradeStationClient,
+        client: Optional[TradeStationClient],
         *,
+        provider: Any = None,
         ticker: str,
         symbol: str,
         table_name: str,
@@ -151,7 +208,22 @@ class VolatilityIndexIngester:
                 f"table_name {table_name!r} not in allowlist {_ALLOWED_TABLES!r}; "
                 "add it explicitly to keep SQL identifier interpolation safe."
             )
+        # EXACTLY ONE of these drives the stream, and which one is decided by
+        # MARKET_DATA_PROVIDER in run_ingester below.
+        #
+        # client is not None -> the original TradeStation reader, byte for
+        # byte. That path is what production has run since this ingester was
+        # written and this change does not touch it; a rewrite would have put
+        # a fresh implementation of a working feed into production with no
+        # way to validate it until the next open.
+        #
+        # client is None -> _read_provider_stream, via the MarketDataProvider
+        # seam. VIX and VXN are Cboe CGIF data, licensed separately from
+        # OPRA, so moving them off TradeStation is the point of this: leaving
+        # them behind would keep the redistribution exposure the migration
+        # exists to remove.
         self.client = client
+        self.provider = provider
         self.ticker = ticker
         self.symbol = symbol
         self.table_name = table_name
@@ -161,6 +233,9 @@ class VolatilityIndexIngester:
         self.running = False
         self._seeded = False
         self._upserts_since_prune = 0
+        #: Bucket of the last mark written by the provider path, so the
+        #: retention counter below counts BARS and not marks.
+        self._last_mark_bucket: Optional[datetime] = None
         self._current_response: Optional[_requests.Response] = None
         self._response_lock = threading.Lock()
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -215,6 +290,54 @@ class VolatilityIndexIngester:
             logger.error("%s bar upsert failed: %s", self.ticker, e, exc_info=True)
             return 0
 
+    def _accumulate_mark(self, row: Dict[str, Any]) -> int:
+        """Fold one mark into its 5-minute bar. Returns rows written (0 or 1).
+
+        Separate from :meth:`_upsert_bars` because the two feeds deliver
+        different things. TradeStation sends a COMPLETE bar, so overwriting
+        all four prices with it is right. The provider path sends a mark
+        several times per bar, and that same overwrite would leave every row
+        with open = high = low = close of whichever mark happened to land
+        last -- candles with no bodies and no wicks, on a customer-facing
+        gauge.
+
+        So take the period-correct aggregate instead: first-seen open,
+        running high and low, last close. The identical conflict clause
+        ``IngestionEngine._upsert_underlying_quote`` uses to build a minute
+        candle out of a sequence of marks.
+
+        ``table_name`` is allowlist-checked in ``__init__``, which is what
+        makes the interpolation below safe.
+        """
+        query = (
+            f"INSERT INTO {self.table_name} (timestamp, open, high, low, close) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (timestamp) DO UPDATE SET "
+            f"    open = COALESCE({self.table_name}.open, EXCLUDED.open), "
+            f"    high = GREATEST({self.table_name}.high, EXCLUDED.high), "
+            f"    low = LEAST({self.table_name}.low, EXCLUDED.low), "
+            "    close = EXCLUDED.close, "
+            "    updated_at = NOW()"
+        )
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    query,
+                    (
+                        row["timestamp"],
+                        row["open"],
+                        row["high"],
+                        row["low"],
+                        row["close"],
+                    ),
+                )
+                conn.commit()
+            return 1
+        except Exception as e:
+            logger.error("%s mark upsert failed: %s", self.ticker, e, exc_info=True)
+            return 0
+
     def _prune_old_bars(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
         try:
@@ -263,10 +386,17 @@ class VolatilityIndexIngester:
             return
 
         parsed = [b for b in (_parse_bar(r) for r in raw_bars) if b is not None]
-        written = self._upsert_bars(parsed)
+        self._record_upsert(self._upsert_bars(parsed))
+
+    def _record_upsert(self, written: int) -> None:
+        """Seed marker and retention bookkeeping after a successful upsert.
+
+        Shared by both readers so the retention policy has one implementation
+        -- two copies of "prune every N upserts" drift, and the one that
+        drifts is the one nobody is watching.
+        """
         if written <= 0:
             return
-
         if not self._seeded:
             self._seeded = True
             logger.info("%s cache seeded with %d bars", self.ticker, written)
@@ -278,6 +408,61 @@ class VolatilityIndexIngester:
             if self._upserts_since_prune >= _PRUNE_EVERY_N_UPSERTS:
                 self._prune_old_bars()
                 self._upserts_since_prune = 0
+
+    def _read_provider_stream(self) -> None:
+        """Collect bars through the MarketDataProvider seam.
+
+        Used for every feed but TradeStation. Raises when the stream dies so
+        run()'s existing reconnect backoff handles it, exactly as the
+        TradeStation reader does -- the two readers differ in where bars come
+        from and in nothing else.
+
+        The provider delivers a MARK several times per bar rather than a
+        finished bar, so each one is folded into its 5-minute bucket and
+        _accumulate_mark builds the candle. Two consequences to know before
+        this runs in production:
+
+        * There is no backfill. TradeStation replays ``poll_barsback`` bars
+          on every reconnect; a mark feed only has now. A restart inside one
+          bucket costs nothing, but an outage spanning several leaves those
+          bars missing rather than late.
+        * The first bucket after a start is partial -- its open is the first
+          mark seen, not the interval's true open.
+        """
+        stream = self.provider.stream_index_bars(
+            self.symbol,
+            db_symbol=self.ticker,
+            interval=VOLATILITY_BAR_INTERVAL,
+            unit=VOLATILITY_BAR_UNIT,
+            initial_barsback=self.initial_barsback,
+            poll_barsback=self.poll_barsback,
+        )
+        stream.start()
+        logger.info(
+            "%s stream: connected via %s",
+            self.ticker,
+            type(self.provider).__name__,
+        )
+        try:
+            while self.running and is_engine_run_window():
+                bar = stream.drain()
+                if bar is None and not stream.is_alive():
+                    raise RuntimeError(f"{self.ticker} index bar stream stopped")
+                row = _mark_row(bar) if bar is not None else None
+                if row is not None and self._accumulate_mark(row) > 0:
+                    # Count BARS, not marks. _PRUNE_EVERY_N_UPSERTS is a bar
+                    # budget; at one mark a second, counting marks would run
+                    # the retention DELETE every two minutes instead of
+                    # every ten hours.
+                    if row["timestamp"] != self._last_mark_bucket:
+                        self._last_mark_bucket = row["timestamp"]
+                        self._record_upsert(1)
+                time.sleep(_PROVIDER_DRAIN_SLEEP_SEC)
+        finally:
+            try:
+                stream.stop()
+            except Exception as e:  # noqa: BLE001 - never mask the real error
+                logger.warning("%s stream stop failed: %s", self.ticker, e)
 
     def _read_stream(self) -> None:
         """Open one stream connection and read bar events until it ends."""
@@ -403,7 +588,10 @@ class VolatilityIndexIngester:
                     continue
 
                 try:
-                    self._read_stream()
+                    if self.client is not None:
+                        self._read_stream()
+                    else:
+                        self._read_provider_stream()
                 except Exception as e:
                     if self.running:
                         logger.warning(
@@ -437,34 +625,52 @@ def run_ingester(
 ) -> None:
     """Shared child-process entry point.
 
-    Loads ``.env``, builds an authenticated TradeStation client, attaches
-    the API-call DB writer, and runs the ingester until shutdown.  The
-    per-ticker modules (``vix_ingester.py`` / ``vxn_ingester.py``) call
-    this with their own config so every index follows the identical
-    spawn → seed → stream → prune lifecycle.
+    Loads ``.env``, builds whichever feed ``MARKET_DATA_PROVIDER`` names, and
+    runs the ingester until shutdown.  The per-ticker modules
+    (``vix_ingester.py`` / ``vxn_ingester.py``) call this with their own
+    config so every index follows the identical spawn → seed → stream →
+    prune lifecycle.
+
+    A TradeStationClient is built ONLY for the TradeStation feed -- the same
+    rule ``main_engine`` follows, and for the same reason: its three
+    credentials stop existing when TradeStation is decommissioned, so
+    constructing one unconditionally would make every other feed depend on
+    the old one's secrets to start at all.
     """
     from dotenv import load_dotenv
 
     load_dotenv()
 
-    client = TradeStationClient(
-        os.getenv("TRADESTATION_CLIENT_ID", ""),
-        os.getenv("TRADESTATION_CLIENT_SECRET", ""),
-        os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
-        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
-    )
+    provider_name = configured_provider_name()
+    client: Optional[TradeStationClient] = None
+    provider: Any = None
 
-    # Wire up the API-calls DB writer so this child process also contributes
-    # its API usage to the tradestation_api_calls table.
-    try:
-        from src.ingestion.api_call_tracker import attach_db_writer
+    if provider_name == "tradestation":
+        client = TradeStationClient(
+            os.getenv("TRADESTATION_CLIENT_ID", ""),
+            os.getenv("TRADESTATION_CLIENT_SECRET", ""),
+            os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
+            sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
+        )
 
-        attach_db_writer(client)
-    except Exception as e:
-        logger.warning("Failed to attach API-call DB writer: %s", e)
+        # Wire up the API-calls DB writer so this child process also
+        # contributes its API usage to the tradestation_api_calls table.
+        try:
+            from src.ingestion.api_call_tracker import attach_db_writer
+
+            attach_db_writer(client)
+        except Exception as e:
+            logger.warning("Failed to attach API-call DB writer: %s", e)
+    else:
+        from src.ingestion.providers import get_provider
+
+        provider = get_provider()
+
+    logger.info("%s feed: %s", ticker, provider_name)
 
     ingester = VolatilityIndexIngester(
         client,
+        provider=provider,
         ticker=ticker,
         symbol=symbol,
         table_name=table_name,

@@ -2203,3 +2203,13 @@ def print_config():
         for key, value in values.items():
             print(f"  {key}: {value}")
     print("=" * 80 + "\n")
+
+
+def configured_provider_name() -> str:
+    """The feed MARKET_DATA_PROVIDER names, normalised. Defaults to TradeStation.
+
+    One reader, because two copies of this drift. Today's date-format bug was
+    exactly that shape -- feed_compare and StreamManager each formatted an
+    expiration their own way and only one of them matched the vendor.
+    """
+    return (os.getenv("MARKET_DATA_PROVIDER", "").strip() or "tradestation").lower()

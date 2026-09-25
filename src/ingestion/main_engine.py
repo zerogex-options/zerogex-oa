@@ -49,6 +49,7 @@ from src.symbols import (
 )
 from src.tools.cash_index_open_repair import repair_one_session_open
 from src.config import (
+    configured_provider_name,
     _getenv_str,
     _getenv_int,
     _getenv_bool,
@@ -193,16 +194,6 @@ WORKER_RESTART_BACKOFF_MAX_SECONDS = _getenv_float(
 # Mirrors the stream watchdog's slow re-attempt
 # (UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS in stream_manager).
 WORKER_ABANDON_RETRY_SECONDS = _getenv_int("INGEST_WORKER_ABANDON_RETRY_SECONDS", 900)
-
-
-def configured_provider_name() -> str:
-    """The feed MARKET_DATA_PROVIDER names, normalised. Defaults to TradeStation.
-
-    One reader, because two copies of this drift. Today's date-format bug was
-    exactly that shape -- feed_compare and StreamManager each formatted an
-    expiration their own way and only one of them matched the vendor.
-    """
-    return (os.getenv("MARKET_DATA_PROVIDER", "").strip() or "tradestation").lower()
 
 
 def _authenticate_shared_feed_session() -> None:
