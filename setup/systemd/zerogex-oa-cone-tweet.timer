@@ -1,0 +1,18 @@
+[Unit]
+Description=Daily trigger for the ZeroGEX intraday cone receipt tweet (16:15 ET Mon-Fri)
+
+[Timer]
+# 16:15 ET — fifteen minutes after the bell, which clears the cone grader's
+# 16:05 fire (the 15:30 anchor's +30m claim matures exactly at 16:00 and needs
+# its closing bar ingested first).  Ten minutes behind the daily forecast
+# receipt tweet at 16:10 so the two never land on top of each other.
+OnCalendar=Mon..Fri *-*-* 16:15:00
+#
+# Host-TZ pinned to America/New_York, same as every other timer here.
+RandomizedDelaySec=60s
+# NOT Persistent.  A receipt tweet is about today; posting yesterday's after
+# a restart tomorrow morning is worse than not posting it at all.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
