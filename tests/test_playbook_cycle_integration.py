@@ -324,3 +324,40 @@ def test_evaluate_and_persist_writes_nothing_after_the_close():
     assert card.action == ActionEnum.STAND_DOWN
     assert card.rationale.startswith("Market closed")
     assert _inserts_into_action_cards(conn) == []
+
+
+def test_evaluate_and_persist_checks_the_wall_clock():
+    """The live cycle passes the clock. Off the 15:59 bar after the close, or
+    off a bar a stalled feed left ten minutes old, nothing is written; off the
+    minute in progress the Card goes out as before."""
+    from dataclasses import replace
+
+    from src.signals.playbook.patterns.call_wall_fade import PATTERN as CWF
+
+    def run(market_context: MarketContext, now: datetime) -> tuple:
+        conn = _FakeConn()
+        card = evaluate_and_persist(
+            engine=PlaybookEngine(patterns=[CWF]),
+            market_context=market_context,
+            score=_empty_score(),
+            advanced_results=_bearish_flow_advanced(),
+            basic_results=_bearish_flow_basic(),
+            conn=conn,
+            now=now,
+        )
+        return card, _inserts_into_action_cards(conn)
+
+    last_bar = replace(
+        _market_ctx(), timestamp=datetime(2026, 5, 1, 19, 59, tzinfo=timezone.utc)
+    )  # 15:59 EDT
+    card, inserts = run(last_bar, datetime(2026, 5, 1, 20, 15, tzinfo=timezone.utc))
+    assert card.rationale.startswith("Market closed")
+    assert inserts == []
+
+    card, inserts = run(_market_ctx(), datetime(2026, 5, 1, 18, 40, tzinfo=timezone.utc))
+    assert card.rationale.startswith("Stale data")
+    assert inserts == []
+
+    card, inserts = run(_market_ctx(), datetime(2026, 5, 1, 18, 30, 40, tzinfo=timezone.utc))
+    assert card.pattern == "call_wall_fade"
+    assert len(inserts) == 1
