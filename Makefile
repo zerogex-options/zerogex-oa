@@ -4898,13 +4898,27 @@ cone-tweet-dry-run: ## Dry-run today's cone receipt tweet (assembles + gates + l
 		$$( [ -n "$${FORECAST_DATE}" ] && echo "--date $${FORECAST_DATE}" ) \
 		$$( [ -n "$${FORECAST_DATE}" ] && echo "--allow-non-trading-day" )
 
+.PHONY: cone-tweet-email
+cone-tweet-email: ## Send yourself one cone draft email right now, to check it renders. Vars: FORECAST_DATE=YYYY-MM-DD
+	@echo "$(BLUE)=== Sending one cone draft email ===$(NC)"
+	@echo "$(YELLOW)Goes to CONE_TWEET_EMAIL_TO, or BULLETIN_TWEET_EMAIL_TO if that$(NC)"
+	@echo "$(YELLOW)is unset. Reuses RESEND_API_KEY and RESEND_FROM_EMAIL from .env.$(NC)"
+	@echo "$(YELLOW)Posts nothing -- there is no --post here and no way to add one.$(NC)"
+	@$(PY) -m src.jobs.cone_tweet --mode receipt --email \
+		$$( [ -n "$${FORECAST_DATE}" ] && echo "--date $${FORECAST_DATE}" ) \
+		$$( [ -n "$${FORECAST_DATE}" ] && echo "--allow-non-trading-day" )
+
 .PHONY: cone-tweet-install
-cone-tweet-install: ## Install the 16:15 ET cone tweet timer IN DRY-RUN MODE (assembles + logs, posts nothing).
-	@echo "$(BLUE)=== Installing Cone Tweet Timer (dry-run) ===$(NC)"
-	@echo "$(YELLOW)The unit ships WITHOUT --post. It will run every weekday at 16:15 ET,$(NC)"
-	@echo "$(YELLOW)build the tweet, run the publication gate, write both to the journal,$(NC)"
-	@echo "$(YELLOW)and post nothing. Watch it for as many sessions as you want before$(NC)"
-	@echo "$(YELLOW)deciding. To go live: add --post to the ExecStart line in$(NC)"
+cone-tweet-install: ## Install the 16:15 ET cone tweet timer IN REVIEW MODE (emails you the draft, posts nothing).
+	@echo "$(BLUE)=== Installing Cone Tweet Timer (review mode) ===$(NC)"
+	@echo "$(YELLOW)The unit ships WITHOUT --post. Every weekday at 16:15 ET it builds$(NC)"
+	@echo "$(YELLOW)the tweet, runs the publication gate, emails you the draft, journals$(NC)"
+	@echo "$(YELLOW)everything -- and posts nothing. The email arrives whether the gate$(NC)"
+	@echo "$(YELLOW)cleared or refused; the refused days are the informative ones, since$(NC)"
+	@echo "$(YELLOW)they show how far the weakest symbol still is from clearing.$(NC)"
+	@echo "$(YELLOW)Needs CONE_TWEET_EMAIL_TO (or BULLETIN_TWEET_EMAIL_TO) in .env.$(NC)"
+	@echo "$(YELLOW)Check it renders first:  make cone-tweet-email$(NC)"
+	@echo "$(YELLOW)To go live LATER: add --post to the ExecStart line in$(NC)"
 	@echo "$(YELLOW)/etc/systemd/system/zerogex-oa-cone-tweet.service, then daemon-reload.$(NC)"
 	@sudo cp setup/systemd/zerogex-oa-cone-tweet.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-cone-tweet.timer /etc/systemd/system/

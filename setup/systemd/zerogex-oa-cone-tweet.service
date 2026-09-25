@@ -13,16 +13,22 @@ WorkingDirectory=/home/ubuntu/zerogex-oa
 Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
-# NOTE THE ABSENT --post.  This unit ships in DRY-RUN mode on purpose: it
-# assembles the tweet, runs the publication gate, logs both to the journal,
-# and posts nothing.  That makes the timer safe to install and watch for as
-# many sessions as it takes to trust the copy, and it makes going live a
-# deliberate, visible, reviewable one-word edit rather than a default nobody
-# chose.  Add --post here (then `systemctl daemon-reload`) to publish.
+# NOTE THE ABSENT --post.  This unit ships in REVIEW mode on purpose: every
+# weekday it assembles the tweet, runs the publication gate, emails the draft
+# for review, logs everything to the journal — and posts nothing.  That makes
+# the timer safe to install and watch for as many sessions as it takes to
+# trust the copy, and it makes going live a deliberate, visible, reviewable
+# one-word edit rather than a default nobody chose.  Add --post here (then
+# `systemctl daemon-reload`) to publish.
+#
+# --email sends on EVERY trading day, including the ones the gate refuses.
+# Those are the informative ones during a trial: they show how far the weakest
+# symbol still is from clearing.  Emailing yourself a draft is not publishing,
+# so the gate does not govern it.
 #
 # Even with --post the job still refuses to publish a record that does not
 # clear the Brier-skill floor — see publication_gate in src/jobs/cone_tweet.py.
-ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.cone_tweet --mode receipt
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.cone_tweet --mode receipt --email
 
 TimeoutStartSec=120
 NoNewPrivileges=true
