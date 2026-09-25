@@ -869,7 +869,7 @@ flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner
 	@echo "$(YELLOW)Production EXPLAIN ANALYZE confirmed the planner picks$(NC)"
 	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts_type for strike-only filters$(NC)"
 	@echo "$(YELLOW)and idx_flow_by_contract_symbol_ts_exp for strike+expiration.$(NC)"
-	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts_strike: 55 MB, ~0.001%% of total scans.$(NC)"
+	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts_strike: 55 MB, ~0.001% of total scans.$(NC)"
 	@echo "$(YELLOW)Re-run 'make flow-explain' afterwards to confirm fallback latency stays acceptable.$(NC)"
 	@if [ "$${CONFIRM}" != "yes" ]; then \
 		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
@@ -4777,8 +4777,8 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)realized_range_pct is the FULL 09:30-16:00 cash session from$(NC)"; \
 	echo "$(YELLOW)underlying_quotes. It deliberately does not reuse the graded$(NC)"; \
 	echo "$(YELLOW)windows: those start at 10:15 and so miss the opening 45 minutes,$(NC)"; \
-	echo "$(YELLOW)which carry 23%% of the day's variance -- measuring there understated$(NC)"; \
-	echo "$(YELLOW)the range by ~12%% and biased vol_ratio low.$(NC)"; \
+	echo "$(YELLOW)which carry 23% of the day's variance -- measuring there understated$(NC)"; \
+	echo "$(YELLOW)the range by ~12% and biased vol_ratio low.$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per session x symbol ---$(NC)"; \
 	$(PSQL) -c "WITH c AS ( \
@@ -4799,10 +4799,11 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d, symbol, \
 		       MAX(high) - MIN(low) AS rng \
 		FROM underlying_quotes \
-		WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		WHERE timestamp >= ((CURRENT_DATE - ($${SESSIONS} * 2))::timestamp \
+		                    AT TIME ZONE 'America/New_York') \
+		  AND symbol IN (SELECT symbol FROM c) \
+		  AND (timestamp AT TIME ZONE 'America/New_York')::time \
 		      BETWEEN TIME '09:30' AND TIME '16:00' \
-		  AND (timestamp AT TIME ZONE 'America/New_York')::date \
-		      >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
 		GROUP BY 1, 2), \
 		s AS ( \
 		SELECT c.*, t.rng / NULLIF(c.spot,0) AS realized_frac \
@@ -4818,7 +4819,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       ROUND(100.0 * sigma_frac, 3)      AS model_sigma_pct, \
 		       ROUND(100.0 * realized_frac, 3)   AS realized_range_pct, \
 		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio \
-		FROM s ORDER BY session_date DESC, symbol;"; \
+		FROM s ORDER BY session_date DESC, symbol;" || echo "$(YELLOW)(the per-session query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per SYMBOL (current cohort only) ---$(NC)"; \
 	echo "$(YELLOW)Read this before the per-horizon table. An aggregate gap near zero$(NC)"; \
@@ -4828,7 +4829,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)baseline is the Brier of the honest strawman: always predict this$(NC)"; \
 	echo "$(YELLOW)symbol's own realized hold rate. skill = 1 - brier/baseline, so it$(NC)"; \
 	echo "$(YELLOW)asks whether the PER-CLAIM confidence carried information or whether$(NC)"; \
-	echo "$(YELLOW)the cone merely discovered that ~80%% of bands hold. gap_pts near zero$(NC)"; \
+	echo "$(YELLOW)the cone merely discovered that ~80% of bands hold. gap_pts near zero$(NC)"; \
 	echo "$(YELLOW)with skill near zero is a calibrated model that has told you nothing,$(NC)"; \
 	echo "$(YELLOW)and it is the state a published hold probability must not be in --$(NC)"; \
 	echo "$(YELLOW)which is why cone_tweet gates on skill and not on gap_pts.$(NC)"; \
@@ -4850,7 +4851,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       ROUND((1 - brier / NULLIF(h * (1 - h), 0))::numeric, 4) AS skill, \
 		       CASE WHEN (1 - brier / NULLIF(h * (1 - h), 0)) >= 0.01 \
 		            THEN 'yes' ELSE 'NO' END AS publishable \
-		FROM s ORDER BY skill DESC NULLS LAST;"; \
+		FROM s ORDER BY skill DESC NULLS LAST;" || echo "$(YELLOW)(the per-symbol query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per horizon, SPLIT BY MODEL ---$(NC)"; \
 	echo "$(YELLOW)Never read across rows here. A session backfilled under an older$(NC)"; \
@@ -4869,7 +4870,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
 		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
 		GROUP BY model_version, cohort, horizon_min \
-		ORDER BY model_version, cohort, horizon_min;"; \
+		ORDER BY model_version, cohort, horizon_min;" || echo "$(YELLOW)(the per-horizon query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
 	echo ""; \
 	echo "$(YELLOW)One session decides nothing -- a quiet day and a wrong vol basis look$(NC)"; \
 	echo "$(YELLOW)identical in a single row. Backfill several sessions, including a$(NC)"; \
