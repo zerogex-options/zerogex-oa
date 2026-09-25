@@ -83,6 +83,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, quote_plus
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -95,6 +96,12 @@ logger = logging.getLogger("zerogex.bulletin_tweet")
 ET = ZoneInfo("America/New_York")
 
 DEFAULT_SITE_URL = "https://zerogex.io"
+# Where the screenshot loads the live bulletin from: the website's own server
+# on this box (pm2 serves it on port 3000; nginx forwards the public domain to
+# it).  Going through the public domain instead means Cloudflare, which can
+# challenge a headless browser.  Override with $BULLETIN_TWEET_RENDER_URL when
+# the website runs somewhere else.
+DEFAULT_RENDER_URL = "http://127.0.0.1:3000"
 # SPY only by default (the operator's spec).  Still configurable to a wider
 # set via $BULLETIN_TWEET_SYMBOLS — the admin review page reads this list to
 # populate its per-symbol regenerate dropdown.
@@ -1647,6 +1654,23 @@ def _locate_frontend_helper(
     return next((p for p in candidates if p.exists()), None)
 
 
+def _scrub_token(text: str, cmd_args: list[str]) -> str:
+    """``text`` with the helper's ``--token`` value masked, raw or URL-encoded.
+
+    The snapshot token is a secret, and Playwright's errors quote the page
+    URL it sits in; this output ends up in the journal and the operator's
+    email."""
+    try:
+        token = cmd_args[cmd_args.index("--token") + 1]
+    except (ValueError, IndexError):
+        return text
+    spellings = {token, quote(token, safe=""), quote_plus(token)}
+    for spelling in sorted(spellings, key=len, reverse=True):
+        if spelling:
+            text = text.replace(spelling, "***")
+    return text
+
+
 def _run_frontend_helper(
     helper: Path,
     cmd_args: list[str],
@@ -1654,7 +1678,8 @@ def _run_frontend_helper(
     label: str,
 ) -> tuple[int | None, str]:
     """Run ``node <helper> <args>``: (exit code, stderr tail), or (None, why)
-    when it couldn't run at all.
+    when it couldn't run at all.  The ``--token`` value never appears in
+    either.
 
     Systemd runs with a stripped PATH — nvm-installed node isn't
     reachable via bare ``node``.  Operators can either symlink node
@@ -1680,14 +1705,39 @@ def _run_frontend_helper(
             "make bulletin-tweet-bootstrap)"
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet: %s helper couldn't start (%s)", label, exc)
-        return None, f"it couldn't start ({exc})"
-    tail = (proc.stderr or "").strip()[-500:]
+        why = _scrub_token(str(exc), cmd_args)
+        logger.warning("bulletin_tweet: %s helper couldn't start (%s)", label, why)
+        return None, f"it couldn't start ({why})"
+    # Scrub before trimming, so a token cut in half at the edge can't survive.
+    tail = _scrub_token(proc.stderr or "", cmd_args).strip()[-2000:]
     if proc.returncode != 0:
         logger.warning(
             "bulletin_tweet: %s helper exited %d, stderr: %s", label, proc.returncode, tail
         )
     return proc.returncode, tail
+
+
+_CARD_HELPER_PREFIX = "render-bulletin-png:"
+_CARD_DEBUG_NOTE = "saved what the browser saw to "
+
+
+def _card_helper_said(stderr_tail: str) -> str:
+    """The screenshot script's own explanation, for the operator's notice.
+
+    That's its last ``render-bulletin-png: …`` line (any stack trace after
+    it says nothing useful in an email), plus where it saved a picture of
+    what the browser saw, when it did."""
+    lines = [line.strip() for line in stderr_tail.splitlines() if line.strip()]
+    own = [
+        line[len(_CARD_HELPER_PREFIX) :].strip()
+        for line in lines
+        if line.startswith(_CARD_HELPER_PREFIX)
+    ]
+    said = own[-1] if own else (lines[-1] if lines else "")
+    debug = [line[len(_CARD_DEBUG_NOTE) :] for line in own if line.startswith(_CARD_DEBUG_NOTE)]
+    if debug and not said.startswith(_CARD_DEBUG_NOTE):
+        said = f"{said} (picture of what the browser saw: {debug[-1]})"
+    return said
 
 
 # What each of render-bulletin-png.mjs's exit codes means, for the notice.
@@ -1703,6 +1753,10 @@ _CARD_EXIT_REASONS = {
     4: "the screenshot came out empty",
     5: "the card never finished loading (its data or logo didn't load)",
     6: "Chromium couldn't start (run make bulletin-tweet-bootstrap in zerogex-oa)",
+    7: (
+        "the website didn't serve the live bulletin page (is it running? pm2 status; "
+        "BULLETIN_TWEET_RENDER_URL says where the job looks for it)"
+    ),
 }
 # A rendered card is ~1280 px wide (640 CSS px at 2x); much smaller isn't one.
 _MIN_CARD_PX = (600, 400)
@@ -1723,7 +1777,7 @@ def _png_dimensions(path: Path) -> tuple[int, int] | None:
 def render_bulletin_card(
     symbol: str,
     mode: str,
-    site_url: str,
+    render_url: str,
     out_path: Path,
     helper_path: str | None = None,
     timeout_seconds: int = 120,
@@ -1735,6 +1789,10 @@ def render_bulletin_card(
     captures the ``[data-bulletin-card]`` element as PNG, and writes the
     card's own levels next to it.  This is the SAME ``<GammaReportCard>``
     the paid /live-bulletin page renders, at the moment the job fires.
+
+    ``render_url`` is the website the page is loaded from: its own server
+    on this box by default (:data:`DEFAULT_RENDER_URL`), not the public
+    domain, so Cloudflare never sees the headless browser.
 
     The snapshot page is token-gated by ``BULLETIN_SNAPSHOT_TOKEN`` on the
     frontend side; we pass the same value from env here so a stranger can't
@@ -1767,7 +1825,7 @@ def render_bulletin_card(
         "--mode",
         mode,
         "--site-url",
-        site_url,
+        render_url,
         "--out",
         str(out_path),
         "--meta-out",
@@ -1782,8 +1840,11 @@ def render_bulletin_card(
         return CardRender(error=f"The live bulletin screenshot failed: {detail}.")
     if rc != 0:
         reason = _CARD_EXIT_REASONS.get(rc, f"the screenshot script failed (exit {rc})")
-        last = detail.splitlines()[-1] if detail else ""
-        return CardRender(error=f"The live bulletin screenshot failed: {reason}. {last}".strip())
+        said = _card_helper_said(detail)
+        return CardRender(
+            error=f"The live bulletin screenshot failed: {reason}."
+            + (f" The script said: {said}" if said else "")
+        )
     dims = _png_dimensions(out_path)
     if dims is None or dims[0] < _MIN_CARD_PX[0] or dims[1] < _MIN_CARD_PX[1]:
         return CardRender(
@@ -2187,7 +2248,7 @@ async def _run(args: argparse.Namespace) -> int:
         card = render_bulletin_card(
             featured.symbol,
             args.mode,
-            args.site_url,
+            args.render_url,
             fire.artifact_dir / f"bulletin-{featured.symbol.lower()}.png",
         )
         if card.ok:
@@ -2801,6 +2862,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--site-url",
         default=os.environ.get("ZEROGEX_SITE_URL", DEFAULT_SITE_URL),
         help="Permalink host (default https://zerogex.io or $ZEROGEX_SITE_URL).",
+    )
+    parser.add_argument(
+        "--render-url",
+        default=os.environ.get("BULLETIN_TWEET_RENDER_URL", "").strip() or DEFAULT_RENDER_URL,
+        help=(
+            "Where the screenshot loads the live bulletin from (default "
+            f"{DEFAULT_RENDER_URL}, the website on this box, or $BULLETIN_TWEET_RENDER_URL)."
+        ),
     )
     parser.add_argument(
         "--allow-non-trading-day",

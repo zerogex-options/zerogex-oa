@@ -173,7 +173,7 @@ def test_render_bulletin_card_reads_back_the_cards_levels(tmp_path, monkeypatch)
     card = bt.render_bulletin_card(
         "spy",
         "midday",
-        "https://zerogex.io",
+        "http://127.0.0.1:3000",
         tmp_path / "bulletin-spy.png",
         helper_path=str(_helper(tmp_path)),
     )
@@ -181,6 +181,7 @@ def test_render_bulletin_card_reads_back_the_cards_levels(tmp_path, monkeypatch)
     assert card.levels["call_wall"] == 745
     assert "--date" not in seen["args"]  # the card keeps its own "as of" label
     assert seen["args"][seen["args"].index("--token") + 1] == "tok"
+    assert seen["args"][seen["args"].index("--site-url") + 1] == "http://127.0.0.1:3000"
 
 
 @pytest.mark.parametrize(
@@ -190,6 +191,7 @@ def test_render_bulletin_card_reads_back_the_cards_levels(tmp_path, monkeypatch)
         (3, "BULLETIN_SNAPSHOT_TOKEN"),
         (5, "never finished loading"),
         (6, "make bulletin-tweet-bootstrap"),
+        (7, "pm2 status"),
         (9, "exit 9"),
     ],
 )
@@ -262,6 +264,94 @@ def test_render_bulletin_card_without_the_helper(tmp_path, monkeypatch):
     monkeypatch.setattr(bt, "_locate_frontend_helper", lambda *a, **k: None)
     card = bt.render_bulletin_card("SPY", "midday", "https://zerogex.io", tmp_path / "b.png")
     assert "ZEROGEX_WEB_DIR" in card.error
+
+
+def test_render_bulletin_card_passes_on_the_scripts_own_reason(tmp_path, monkeypatch):
+    from src.jobs import bulletin_tweet as bt
+
+    said = (
+        "render-bulletin-png: navigating to http://127.0.0.1:3000/live-bulletin/snapshot/SPY\n"
+        "render-bulletin-png: saved what the browser saw to /var/x/bulletin-spy.debug.png\n"
+        "render-bulletin-png: the page returned HTTP 502"
+    )
+    monkeypatch.setattr(bt, "_run_frontend_helper", lambda *a, **k: (7, said))
+    card = bt.render_bulletin_card(
+        "SPY",
+        "midday",
+        "http://127.0.0.1:3000",
+        tmp_path / "b.png",
+        helper_path=str(_helper(tmp_path)),
+    )
+    assert "pm2 status" in card.error
+    assert "The script said: the page returned HTTP 502" in card.error
+    assert "/var/x/bulletin-spy.debug.png" in card.error
+
+    # A crash: the message line, not the stack frame after it.
+    crash = "render-bulletin-png: TypeError: boom\n    at main (render-bulletin-png.mjs:1:1)"
+    monkeypatch.setattr(bt, "_run_frontend_helper", lambda *a, **k: (1, crash))
+    card = bt.render_bulletin_card(
+        "SPY",
+        "midday",
+        "http://127.0.0.1:3000",
+        tmp_path / "b.png",
+        helper_path=str(_helper(tmp_path)),
+    )
+    assert "TypeError: boom" in card.error
+    assert "at main" not in card.error
+
+
+def test_the_screenshot_loads_the_website_on_this_box(monkeypatch):
+    """Not the public domain: Cloudflare can stop a headless browser there."""
+    from src.jobs import bulletin_tweet as bt
+
+    monkeypatch.delenv("BULLETIN_TWEET_RENDER_URL", raising=False)
+    monkeypatch.delenv("ZEROGEX_SITE_URL", raising=False)
+    args = bt._parse_args(["--mode", "midday"])
+    assert args.render_url == "http://127.0.0.1:3000"
+    assert args.site_url == "https://zerogex.io"  # links in the post stay public
+
+    monkeypatch.setenv("BULLETIN_TWEET_RENDER_URL", "http://10.0.0.5:3000")
+    assert bt._parse_args(["--mode", "midday"]).render_url == "http://10.0.0.5:3000"
+
+
+def test_the_snapshot_token_never_reaches_the_log_or_the_email(tmp_path, monkeypatch, caplog):
+    """Playwright quotes the page URL, token and all, in its errors."""
+    import logging
+    import sys
+    from urllib.parse import quote, quote_plus
+
+    from src.jobs import bulletin_tweet as bt
+
+    token = "s3cr3t/+ ~tok"
+    fake_node = tmp_path / "node"
+    # Stands in for node: prints the token raw and URL-encoded, as Playwright would.
+    fake_node.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from urllib.parse import quote, quote_plus\n"
+        "t = sys.argv[sys.argv.index('--token') + 1]\n"
+        "parts = ['render-bulletin-png: page.goto: Timeout at http://h/p?token=',\n"
+        "         quote_plus(t), ' (', quote(t, safe=''), ') raw=', t, '\\n']\n"
+        "sys.stderr.write(''.join(parts))\n"
+        "sys.exit(1)\n"
+    )
+    fake_node.chmod(0o755)
+    monkeypatch.setenv("BULLETIN_TWEET_NODE_BINARY", str(fake_node))
+    monkeypatch.setenv("BULLETIN_SNAPSHOT_TOKEN", token)
+
+    with caplog.at_level(logging.WARNING, logger="zerogex.bulletin_tweet"):
+        card = bt.render_bulletin_card(
+            "SPY",
+            "midday",
+            "http://127.0.0.1:3000",
+            tmp_path / "b.png",
+            helper_path=str(_helper(tmp_path)),
+        )
+    assert not card.ok and "page.goto: Timeout" in card.error
+    for spelling in (token, quote(token, safe=""), quote_plus(token)):
+        assert spelling not in card.error
+        assert spelling not in caplog.text
+    assert "***" in card.error
 
 
 # ---------------------------------------------------------------------------
