@@ -41,8 +41,9 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock
 
 import pytest
@@ -279,3 +280,69 @@ def test_range_still_answers_200_for_a_dark_session(monkeypatch):
         r = client.get("/api/replay/range?symbol=SPY&date=2019-01-02")
     assert r.status_code == 200
     assert r.json()["count"] == 0
+
+
+# --------------------------------------------------------------------------
+# The session ends before the 16:00 frame
+# --------------------------------------------------------------------------
+
+
+def _bound_window(method: str) -> tuple[datetime, datetime, str]:
+    """The ($2, $3) window a replay read binds, plus the SQL it ran first."""
+    db = DatabaseManager()
+    seen: dict = {}
+
+    class _Conn:
+        async def fetch(self, query, *args):
+            seen.setdefault("call", (query, args))
+            return []
+
+    @asynccontextmanager
+    async def _acquire():
+        yield _Conn()
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+    asyncio.run(getattr(db, method)("SPY", SESSION))
+    query, args = seen["call"]
+    return args[1], args[2], query
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "get_gex_frames_for_session",
+        "get_underlying_candles_for_session",
+        "get_gex_expiration_shares_for_session",
+    ],
+)
+def test_replay_session_stops_before_the_16_00_frame(method):
+    """Regression, SPY 2026-09-22: the call wall was 775 through 15:59 and 780
+    only in the 16:00 frame, where the day's 0DTE has no time left and so no
+    gamma.  With 16:00 inside the window the replay's last frame showed the
+    wall jumping at the bell.  All three reads share one half-open window so
+    the frames, the candles and the expiry colours still line up."""
+    et = ZoneInfo("America/New_York")
+    start, end, query = _bound_window(method)
+    assert start == datetime(2026, 8, 20, 9, 30, tzinfo=et)
+    assert end == datetime(2026, 8, 20, 16, 0, tzinfo=et)
+    assert "timestamp < $3" in query
+
+
+def test_replay_date_picker_counts_the_same_390_minutes():
+    db = DatabaseManager()
+    seen: dict = {}
+
+    class _Conn:
+        async def fetch(self, query, *args):
+            seen["query"] = query
+            return []
+
+    @asynccontextmanager
+    async def _acquire():
+        yield _Conn()
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+    asyncio.run(db.get_replay_session_dates("SPY"))
+    assert "::time >= TIME '09:30'" in seen["query"]
+    assert "::time < TIME '16:00'" in seen["query"]
+    assert "BETWEEN TIME '09:30' AND TIME '16:00'" not in seen["query"]

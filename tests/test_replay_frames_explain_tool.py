@@ -64,21 +64,21 @@ def test_script_is_bounded_and_read_only():
 
 
 def test_window_is_the_et_cash_session_converted_to_utc():
-    """09:30-16:01 ET, DST-aware — the same window the method itself builds.
+    """[09:30, 16:00) ET, DST-aware — the same window the method itself builds.
 
     July is EDT (UTC-4), so the session opens 13:30Z. A naive UTC treatment
     would probe the wrong 6.5 hours and quietly EXPLAIN an empty session.
     """
     sql = _script()
     assert "'2026-07-24T13:30:00+00:00'::timestamptz" in sql
-    assert "'2026-07-24T20:01:00+00:00'::timestamptz" in sql
+    assert "'2026-07-24T20:00:00+00:00'::timestamptz" in sql
 
 
 def test_winter_session_shifts_with_est():
     """The same date in January is EST (UTC-5): 14:30Z, not 13:30Z."""
     sql = _script(session=date(2026, 1, 14))
     assert "'2026-01-14T14:30:00+00:00'::timestamptz" in sql
-    assert "'2026-01-14T21:01:00+00:00'::timestamptz" in sql
+    assert "'2026-01-14T21:00:00+00:00'::timestamptz" in sql
 
 
 def test_symbol_is_bound_everywhere_the_query_takes_it():
