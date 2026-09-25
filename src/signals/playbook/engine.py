@@ -23,11 +23,12 @@ import importlib.util
 import logging
 import os
 import sys
-from datetime import time
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Optional
 
 from src import config
+from src.market_calendar import in_regular_session
 from src.signals.playbook import adaptive_gate
 from src.signals.playbook.base import PatternBase
 from src.signals.playbook.context import OpenPosition, PlaybookContext
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 # uses for a pattern with no graded record yet (PLAYBOOK_ADAPTIVE_NEUTRAL_BAR).
 CONFIDENCE_FLOOR = 0.25
 DEFAULT_CUSTOM_DIR = "~/.zerogex/playbook/custom"
+
+_MARKET_CLOSED = (
+    "Market closed: Cards are issued only in the regular session, 09:30 ET to the close."
+)
 
 
 class PlaybookEngine:
@@ -134,13 +139,13 @@ class PlaybookEngine:
     # Evaluation
     # ------------------------------------------------------------------
 
-    def evaluate(self, ctx: PlaybookContext) -> ActionCard:
+    def evaluate(self, ctx: PlaybookContext, *, now: Optional[datetime] = None) -> ActionCard:
         """Run patterns through all gates and return one ActionCard."""
-        card, _held_back = self.evaluate_with_held_back(ctx)
+        card, _held_back = self.evaluate_with_held_back(ctx, now=now)
         return card
 
     def evaluate_with_held_back(
-        self, ctx: PlaybookContext
+        self, ctx: PlaybookContext, *, now: Optional[datetime] = None
     ) -> tuple[ActionCard, list[tuple[ActionCard, str]]]:
         """``evaluate`` plus the ideas the entry bar held back.
 
@@ -148,6 +153,10 @@ class PlaybookEngine:
         under the old flat floor; only its pattern's record on this symbol
         kept it back. The cycle records these so the grader can grade them,
         which is how a paused pattern earns its way back.
+
+        ``now`` is the wall clock. The live callers (the signal cycle and
+        ``/api/signals/action``) pass it; replays and tests that evaluate a
+        fixed moment leave it out and skip the clock check.
         """
         # Step 0: session gate. A Card is an instruction to trade options at
         # the prices printed on it, and those options trade only in the
@@ -161,12 +170,19 @@ class PlaybookEngine:
             return (
                 self._outside_session(
                     ctx,
-                    "Market closed: Cards are issued only in the regular session, "
-                    "09:30 ET to the close.",
+                    _MARKET_CLOSED,
                     session="closed",
                 ),
                 [],
             )
+        # The bar says when the data is from; the clock says when the Card would
+        # go out. After the close a cash index's newest bar stays at 15:59, and a
+        # stalled feed freezes any symbol's, so the bar alone kept the session
+        # "open": an NDX Card stamped 15:59 on 2026-09-24 went out after the close.
+        if now is not None:
+            clock_card = self._clock_gate(ctx, now)
+            if clock_card is not None:
+                return clock_card, []
         # A cash index's 09:30 bar is its stale opening print, near the prior
         # close, not a level anyone traded. NDX and SPX Cards fired off it at the
         # open quoted yesterday's price.
@@ -384,6 +400,30 @@ class PlaybookEngine:
         "track record",
         "paused",
     )
+
+    def _clock_gate(self, ctx: PlaybookContext, now: datetime) -> Optional[ActionCard]:
+        """STAND_DOWN when the wall clock is outside the session or the newest
+        bar is too old to quote; None when a Card may go out."""
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if not in_regular_session(now):
+            return self._outside_session(
+                ctx,
+                _MARKET_CLOSED,
+                session="closed",
+            )
+        bar_ts = ctx.timestamp
+        if bar_ts.tzinfo is None:
+            bar_ts = bar_ts.replace(tzinfo=timezone.utc)
+        age = (now - bar_ts).total_seconds()
+        if age > config.PLAYBOOK_MAX_BAR_AGE_SECONDS:
+            return self._outside_session(
+                ctx,
+                f"Stale data: the newest bar is {age / 60:.0f} min old, "
+                "so no Card is issued off it.",
+                session="stale",
+            )
+        return None
 
     def _outside_session(self, ctx: PlaybookContext, rationale: str, *, session: str) -> ActionCard:
         """STAND_DOWN for a cycle no Card may be issued in.

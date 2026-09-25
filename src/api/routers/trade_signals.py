@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -309,6 +310,12 @@ async def get_latest_score(
 _PLAYBOOK_ENGINE: "PlaybookEngine | None" = None
 
 
+def _now() -> datetime:
+    """The wall clock for the Playbook's session and stale-bar checks. A
+    function so tests can pin it to the moment their fixtures describe."""
+    return datetime.now(timezone.utc)
+
+
 def _get_playbook_engine() -> "PlaybookEngine":
     """Lazily instantiate the engine so pattern discovery only runs once."""
     global _PLAYBOOK_ENGINE
@@ -460,7 +467,7 @@ async def get_action_card(
             detail=f"No signal_score rows found for {sym}; cannot build playbook context",
         )
     engine = _get_playbook_engine()
-    card = engine.evaluate(ctx)
+    card = engine.evaluate(ctx, now=_now())
     payload = card.to_dict()
     # Persist trade Cards (not STAND_DOWNs) so the next cycle can apply
     # hysteresis.  Best-effort — DB failure must not break the response.

@@ -353,3 +353,66 @@ def test_cash_index_opening_bar_is_skipped():
     assert engine.evaluate(_ctx(timestamp=at_open, underlying="SPY")).action == (
         ActionEnum.BUY_PUT_DEBIT
     )
+
+
+# ----------------------------------------------------------------------
+# Clock gate: the live callers pass the wall clock
+# ----------------------------------------------------------------------
+
+
+def test_last_index_bar_after_the_close_issues_no_card():
+    """NDX's newest bar stays at 15:59 after the close. The bar alone kept the
+    session "open", so a Card stamped 15:59 on 2026-09-24 went out after 4 PM."""
+    pat = _CountingPattern(id="max_pain_gravitation")
+    engine = PlaybookEngine(patterns=[pat])
+    last_bar = _ctx(timestamp=_utc(2026, 9, 24, 19, 59), underlying="NDX")  # 15:59 EDT
+
+    card, held_back = engine.evaluate_with_held_back(
+        last_bar, now=_utc(2026, 9, 24, 20, 15)  # 16:15 EDT
+    )
+    assert card.action == ActionEnum.STAND_DOWN
+    assert card.rationale.startswith("Market closed")
+    assert card.context["session"] == "closed"
+    assert held_back == []
+    assert pat.calls == 0
+
+    # A naive clock is read as UTC.
+    naive = engine.evaluate(last_bar, now=datetime(2026, 9, 24, 20, 15))
+    assert naive.context["session"] == "closed"
+    # Replays and tests that leave the clock out judge the bar alone, as before.
+    assert engine.evaluate(last_bar).action == ActionEnum.BUY_PUT_DEBIT
+
+
+def test_stale_bar_mid_session_issues_no_card():
+    """A feed stall freezes the newest bar; its price is no longer the market's."""
+    pat = _CountingPattern(id="p")
+    engine = PlaybookEngine(patterns=[pat])
+    card = engine.evaluate(
+        _ctx(timestamp=_utc(2026, 9, 24, 17, 0)), now=_utc(2026, 9, 24, 17, 5)
+    )  # a 13:00 EDT bar at 13:05
+    assert card.action == ActionEnum.STAND_DOWN
+    assert card.rationale.startswith("Stale data: the newest bar is 5 min old")
+    assert card.context["session"] == "stale"
+    assert pat.calls == 0
+
+
+def test_bar_age_limit_edges():
+    """The minute in progress is 0-60 s old, so two minutes leaves room for lag."""
+    engine = PlaybookEngine(patterns=[_CountingPattern(id="p")])
+    bar = _ctx(timestamp=_utc(2026, 9, 24, 17, 0))
+
+    def action_at(now: datetime) -> ActionEnum:
+        return engine.evaluate(bar, now=now).action
+
+    assert action_at(_utc(2026, 9, 24, 17, 0, 59)) == ActionEnum.BUY_PUT_DEBIT
+    assert action_at(_utc(2026, 9, 24, 17, 2, 0)) == ActionEnum.BUY_PUT_DEBIT  # 120 s
+    assert action_at(_utc(2026, 9, 24, 17, 2, 1)) == ActionEnum.STAND_DOWN  # 121 s
+
+
+def test_bar_age_limit_is_configurable(monkeypatch):
+    from src import config
+
+    monkeypatch.setattr(config, "PLAYBOOK_MAX_BAR_AGE_SECONDS", 600)
+    engine = PlaybookEngine(patterns=[_CountingPattern(id="p")])
+    card = engine.evaluate(_ctx(timestamp=_utc(2026, 9, 24, 17, 0)), now=_utc(2026, 9, 24, 17, 5))
+    assert card.action == ActionEnum.BUY_PUT_DEBIT

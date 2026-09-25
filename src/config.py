@@ -1235,6 +1235,12 @@ SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES = _getenv_int(
     "SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES", 8, min=0
 )
 
+# Oldest bar, in seconds of wall-clock age, the live Playbook will issue a Card
+# off. A cash index's newest bar stays at 15:59 after the close, and a stalled
+# feed freezes any symbol's, so without this the engine kept issuing Cards
+# stamped with a minute that had long passed.
+PLAYBOOK_MAX_BAR_AGE_SECONDS = _getenv_int("PLAYBOOK_MAX_BAR_AGE_SECONDS", 120, min=60)
+
 # ---------------------------------------------------------------------------
 # Playbook learning loop: grade every Action Card after the fact, then set the
 # confidence each pattern needs, per symbol, from that graded record.

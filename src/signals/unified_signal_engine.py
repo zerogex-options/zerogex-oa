@@ -1664,6 +1664,7 @@ class UnifiedSignalEngine:
                     advanced_results=advanced_results,
                     basic_results=basic_results,
                     conn=conn,
+                    now=datetime.now(timezone.utc),
                 )
             # A playbook card is worth a line when it CHANGES. Re-stating the
             # same action/pattern every second buried the transitions -- the

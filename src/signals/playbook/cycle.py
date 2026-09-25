@@ -270,12 +270,15 @@ def evaluate_and_persist(
     advanced_results: Iterable,
     basic_results: Iterable,
     conn=None,
+    now: Optional[datetime] = None,
 ) -> ActionCard:
     """End-to-end cycle integration: build ctx, evaluate, persist.
 
     Returns the ActionCard so the caller can log it.  Persistence is
     best-effort; STAND_DOWN cards are not persisted.  Ideas the entry bar
     held back are recorded (unpublished) so the grader can grade them.
+    ``now`` is the wall clock, which the live cycle passes so no Card goes out
+    after the close or off a stale bar (see ``PlaybookEngine.evaluate``).
     """
     ctx = build_context_from_cycle(
         market_context=market_context,
@@ -285,7 +288,7 @@ def evaluate_and_persist(
         conn=conn,
         underlying=getattr(market_context, "underlying", None),
     )
-    card, held_back = engine.evaluate_with_held_back(ctx)
+    card, held_back = engine.evaluate_with_held_back(ctx, now=now)
     if conn is not None:
         insert_action_card_sync(conn, card.to_dict())
         for idea, reason in held_back:

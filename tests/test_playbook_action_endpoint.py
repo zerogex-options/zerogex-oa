@@ -21,6 +21,9 @@ from fastapi.testclient import TestClient
 # (closes, lows, highs), oldest -> newest, as get_recent_underlying_bars returns.
 _BARS = ([678.1, 678.3, 678.4], [678.0, 678.2, 678.3], [678.2, 678.4, 678.5])
 
+# When the request arrives: 30 seconds into the score row's 14:30 ET bar.
+_NOW = datetime(2026, 5, 1, 18, 30, 30, tzinfo=timezone.utc)
+
 
 def _build_app(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("API_KEY", raising=False)
@@ -58,6 +61,11 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     # realized-vol read at zero, as before.
     dbmod.DatabaseManager.get_recent_underlying_bars = AsyncMock(return_value=_BARS)
     from src.api.main import app  # noqa: E402
+    from src.api.routers import trade_signals  # noqa: E402
+
+    # The route checks the wall clock against the session and the newest bar's
+    # age. Pin it 30 seconds past the fixtures' 14:30 ET bar; tests override it.
+    monkeypatch.setattr(trade_signals, "_now", lambda: _NOW)
 
     return app, dbmod
 
@@ -297,6 +305,52 @@ def test_no_bars_means_no_trade_card(monkeypatch: pytest.MonkeyPatch):
     with TestClient(app) as client:
         body = client.get("/api/signals/action?underlying=SPY").json()
     assert body["action"] == "STAND_DOWN"
+
+
+def test_no_trade_card_off_the_last_bar_after_the_close(monkeypatch: pytest.MonkeyPatch):
+    """A cash index's newest bar stays at 15:59 after the close, so the bar
+    alone said the session was open: an NDX Card stamped 15:59 went out after
+    4 PM. A request at 16:15 ET gets a Stand Down."""
+    app, dbmod = _build_app(monkeypatch)
+    # Imported after _build_app, which reloads the API modules the app runs on.
+    from src.api.routers import trade_signals
+
+    last_bar = {**_score_row(), "timestamp": datetime(2026, 5, 1, 19, 59, tzinfo=timezone.utc)}
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=last_bar)
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_cwf_adv, basic=_cwf_basic)
+    )
+    after_close = datetime(2026, 5, 1, 20, 15, tzinfo=timezone.utc)  # 16:15 EDT
+    monkeypatch.setattr(trade_signals, "_now", lambda: after_close)
+
+    with TestClient(app) as client:
+        body = client.get("/api/signals/action?underlying=SPY").json()
+    assert body["action"] == "STAND_DOWN"
+    assert body["rationale"].startswith("Market closed")
+    # Only the Stand Down reaches the writer, which never stores one.
+    assert dbmod.DatabaseManager.insert_action_card.call_args.args[0]["action"] == "STAND_DOWN"
+
+
+def test_no_trade_card_off_a_stale_bar(monkeypatch: pytest.MonkeyPatch):
+    """Mid-session, a bar ten minutes old means the feed has stalled; its
+    price is no longer the market's."""
+    app, dbmod = _build_app(monkeypatch)
+    # Imported after _build_app, which reloads the API modules the app runs on.
+    from src.api.routers import trade_signals
+
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_component_signals_bulk = AsyncMock(
+        side_effect=_bulk_stub(adv=_cwf_adv, basic=_cwf_basic)
+    )
+    ten_minutes_on = datetime(2026, 5, 1, 18, 40, tzinfo=timezone.utc)  # 14:40 EDT
+    monkeypatch.setattr(trade_signals, "_now", lambda: ten_minutes_on)
+
+    with TestClient(app) as client:
+        body = client.get("/api/signals/action?underlying=SPY").json()
+    assert body["action"] == "STAND_DOWN"
+    assert body["rationale"].startswith("Stale data")
+    # Only the Stand Down reaches the writer, which never stores one.
+    assert dbmod.DatabaseManager.insert_action_card.call_args.args[0]["action"] == "STAND_DOWN"
 
 
 def test_a_live_idea_blocks_a_repeat_card(monkeypatch: pytest.MonkeyPatch):
