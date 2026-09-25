@@ -19,6 +19,7 @@ from datetime import date, timedelta
 import pytest
 
 from src.jobs.cone_tweet import (
+    build_draft_email,
     MIN_BRIER_SKILL,
     MIN_CLAIMS_FOR_PUBLICATION,
     MIN_SESSIONS_FOR_PUBLICATION,
@@ -364,3 +365,75 @@ def test_trimmed_tweet_still_fits_with_its_paragraph_breaks():
     day = summarize(_claims(999, 0.74, 0.73))
     cume = summarize(_claims(999999, 0.82, 0.81, sessions=999))
     assert len(build_receipt_tweet(day, cume)) <= TWEET_MAX_LEN
+
+
+# ---------------------------------------------------------------------------
+# The draft email — the trial that runs before anything is ever posted
+# ---------------------------------------------------------------------------
+
+
+def _draft(gate_ok=False, breakdown=None, tweet="Record: 3,940 committed."):
+    day = summarize(_claims(80, 0.78, 0.76))
+    cume = summarize(_claims(3940, 0.82, 0.81, sessions=12))
+    if breakdown is None:
+        breakdown = per_symbol_breakdown(_mixed_pool())
+    reason = "because SPX and NDX have not cleared" if not gate_ok else "every symbol clears"
+    return build_draft_email(SESSION, day, cume, breakdown, tweet, gate_ok, reason)
+
+
+def test_draft_subject_names_the_symbols_that_blocked_it():
+    """A fortnight of these has to be judgeable from the inbox list alone."""
+    subject, _, _ = _draft(gate_ok=False)
+    assert SESSION.isoformat() in subject
+    assert "STAND DOWN" in subject
+    assert "NDX" in subject
+
+
+def test_draft_subject_says_so_when_the_gate_clears():
+    passing = per_symbol_breakdown(_skillful(n=800, sessions=8))
+    subject, _, _ = _draft(gate_ok=True, breakdown=passing)
+    assert "would POST" in subject
+    assert "STAND DOWN" not in subject
+
+
+def test_draft_carries_the_tweet_verbatim_in_both_parts():
+    tweet = "Intraday bands.\n\nRecord (12 sessions): said 82%, got 81%."
+    _, body_html, body_text = _draft(tweet=tweet)
+    assert tweet in body_text
+    # HTML keeps it inside a <pre>, escaped but recognisable.
+    assert "Record (12 sessions)" in body_html
+
+
+def test_draft_states_the_character_count_against_the_limit():
+    tweet = "x" * 120
+    _, body_html, body_text = _draft(tweet=tweet)
+    assert f"120 of {TWEET_MAX_LEN}" in body_text
+    assert f"120 of {TWEET_MAX_LEN}" in body_html
+
+
+def test_draft_says_plainly_that_nothing_was_posted():
+    _, body_html, body_text = _draft()
+    assert "Nothing was posted" in body_text
+    assert "Nothing was posted" in body_html
+
+
+def test_draft_escapes_html_in_the_tweet_body():
+    """The copy is ours, but an email that renders injected markup is a bug
+    waiting for the day someone puts a symbol or a URL through it."""
+    _, body_html, _ = _draft(tweet="<script>alert(1)</script>")
+    assert "<script>" not in body_html
+    assert "&lt;script&gt;" in body_html
+
+
+def test_draft_lists_every_symbol_with_its_verdict():
+    _, body_html, body_text = _draft()
+    for sym in ("SPY", "NDX"):
+        assert sym in body_html
+        assert sym in body_text
+    assert "no skill" in body_html
+
+
+def test_draft_carries_the_gate_reason():
+    _, body_html, body_text = _draft(gate_ok=False)
+    assert "SPX and NDX have not cleared" in body_text
+    assert "SPX and NDX have not cleared" in body_html

@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
@@ -484,6 +485,161 @@ def render_preview(
 
 
 # ---------------------------------------------------------------------------
+# Draft email - the trial mode that runs before anything is ever posted
+# ---------------------------------------------------------------------------
+#
+# The point of this mode is to watch the job for a couple of weeks and judge
+# the copy against real sessions before a single tweet goes out.  So the email
+# is sent on EVERY trading day, whether the gate passed or stood down, and the
+# stand-down days are the more interesting ones: they are the days that show
+# how far SPX and NDX still are from clearing.  An email that only arrived on
+# the good days would answer the wrong question.
+#
+# Emailing a draft to yourself is not publishing, so the publication gate does
+# not govern it.  The gate governs --post.  The two are deliberately separate:
+# the trial can run for as long as it needs to without ever risking a post.
+
+#: Falls back to the bulletin job's recipient so this works with no new config
+#: at all - RESEND_API_KEY and RESEND_FROM_EMAIL are already set for that job.
+def _email_recipient() -> str:
+    for var in ("CONE_TWEET_EMAIL_TO", "BULLETIN_TWEET_EMAIL_TO"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def build_draft_email(
+    day: date,
+    day_stats: dict[str, Any],
+    cume: dict[str, Any],
+    breakdown: Sequence[dict[str, Any]],
+    tweet_text: str,
+    gate_ok: bool,
+    gate_reason: str,
+) -> tuple[str, str, str]:
+    """``(subject, html, text)`` for one day's draft.
+
+    The subject carries the verdict and, when it stood down, the symbols
+    responsible - so a fortnight of these can be judged from the inbox list
+    without opening any of them.
+    """
+    if gate_ok:
+        verdict = "would POST"
+    else:
+        short = [r["symbol"] for r in breakdown if _symbol_shortfall(r)]
+        verdict = f"would STAND DOWN ({', '.join(short)})" if short else "would STAND DOWN"
+    subject = f"Cone draft {day.isoformat()} - {verdict}"
+
+    rows = "".join(
+        "<tr>"
+        f"<td style=\"padding:4px 10px 4px 0\"><b>{html.escape(r['symbol'])}</b></td>"
+        f"<td style=\"padding:4px 10px 4px 0;text-align:right\">{r['n']:,}</td>"
+        f"<td style=\"padding:4px 10px 4px 0;text-align:right\">"
+        f"{(r['hold_rate'] or 0) * 100:.1f}%</td>"
+        f"<td style=\"padding:4px 10px 4px 0;text-align:right\">"
+        f"{(r['mean_predicted'] or 0) * 100:.1f}%</td>"
+        f"<td style=\"padding:4px 10px 4px 0;text-align:right\">"
+        f"{'n/a' if r.get('brier_skill') is None else format(r['brier_skill'], '+.4f')}</td>"
+        f"<td style=\"padding:4px 0;color:{'#137333' if r['beats_baseline'] else '#b3261e'}\">"
+        f"{'clears' if r['beats_baseline'] else 'no skill'}</td>"
+        "</tr>"
+        for r in breakdown
+    )
+
+    body_html = (
+        f"<h2 style=\"margin:0 0 4px\">Cone draft &middot; {day.isoformat()}</h2>"
+        f"<p style=\"margin:0 0 16px;color:{'#137333' if gate_ok else '#b3261e'};"
+        f"font-weight:600\">{html.escape(verdict)}</p>"
+        f"<p style=\"margin:0 0 6px;color:#666;font-size:13px\">Nothing was posted. "
+        f"This is the copy the job would publish, sent for review only.</p>"
+        f"<pre style=\"background:#f6f6f6;border:1px solid #ddd;border-radius:8px;"
+        f"padding:14px;white-space:pre-wrap;font-size:14px;line-height:1.5\">"
+        f"{html.escape(tweet_text)}</pre>"
+        f"<p style=\"margin:0 0 20px;color:#666;font-size:13px\">"
+        f"{len(tweet_text)} of {TWEET_MAX_LEN} characters.</p>"
+        f"<p style=\"margin:0 0 6px\"><b>Gate</b><br>"
+        f"<span style=\"color:#444;font-size:14px\">{html.escape(gate_reason)}</span></p>"
+        f"<table style=\"border-collapse:collapse;font-size:14px;margin:16px 0 0\">"
+        f"<tr style=\"color:#666;font-size:12px;text-align:left\">"
+        f"<th style=\"padding:0 10px 4px 0\">Symbol</th>"
+        f"<th style=\"padding:0 10px 4px 0;text-align:right\">Claims</th>"
+        f"<th style=\"padding:0 10px 4px 0;text-align:right\">Held</th>"
+        f"<th style=\"padding:0 10px 4px 0;text-align:right\">Said</th>"
+        f"<th style=\"padding:0 10px 4px 0;text-align:right\">Skill</th>"
+        f"<th style=\"padding:0 0 4px\">Verdict</th></tr>{rows}</table>"
+    )
+
+    lines = [
+        f"Cone draft - {day.isoformat()}",
+        verdict,
+        "",
+        "Nothing was posted. This is the copy the job would publish.",
+        "",
+        "-" * 60,
+        tweet_text,
+        "-" * 60,
+        f"{len(tweet_text)} of {TWEET_MAX_LEN} characters.",
+        "",
+        f"Gate: {gate_reason}",
+        "",
+        _fmt_stats("TODAY", day_stats),
+        _fmt_stats("RECORD", cume),
+    ]
+    lines.extend(_fmt_stats(r["symbol"], r) for r in breakdown)
+    return subject, body_html, "\n".join(lines)
+
+
+def send_email_via_resend(subject: str, body_html: str, body_text: str) -> bool:
+    """Best-effort send.  Returns False and logs on any missing config or
+    error - a failed email must never fail the job or block tomorrow's run."""
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    from_email = os.environ.get("RESEND_FROM_EMAIL", "").strip()
+    to_email = _email_recipient()
+    if not (api_key and from_email and to_email):
+        logger.warning(
+            "cone_tweet: draft email skipped - need RESEND_API_KEY, "
+            "RESEND_FROM_EMAIL and CONE_TWEET_EMAIL_TO (or "
+            "BULLETIN_TWEET_EMAIL_TO) in the environment",
+        )
+        return False
+
+    req = Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(
+            {
+                "from": from_email,
+                "to": [to_email],
+                "subject": subject,
+                "html": body_html,
+                "text": body_text,
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Resend sits behind Cloudflare, which 403s the default
+            # "Python-urllib/x.y" User-Agent as a bot.  Same UA treatment the
+            # bulletin job needs for the same reason.
+            "User-Agent": "zerogex-cone-tweet/1.0 (+https://zerogex.io)",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            resp.read()
+    except (HTTPError, URLError) as exc:
+        logger.warning("cone_tweet: draft email failed (%s)", exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cone_tweet: draft email error (%s)", exc)
+        return False
+    logger.info("cone_tweet: draft email sent to %s (%s)", to_email, subject)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -536,6 +692,17 @@ async def _run_live(
 
     for row in breakdown:
         logger.info("cone_tweet: %s", _fmt_stats(row["symbol"], row).strip())
+
+    # Before the gate, deliberately.  The trial is watching for the days the
+    # gate refuses as much as the days it clears, and a draft in your own inbox
+    # is not a publication.
+    if args.email:
+        send_email_via_resend(
+            *build_draft_email(
+                day, day_stats, cume_stats, breakdown,
+                tweet_text, gate_ok, gate_reason,
+            )
+        )
 
     if not gate_ok:
         logger.warning(
@@ -630,6 +797,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Render what this job WOULD have tweeted on each of the last N "
              "sessions, with the record computed as of that session's close. "
              "Never posts, never touches the DB for writes.",
+    )
+    parser.add_argument(
+        "--email", action="store_true",
+        help="Email the day's draft to CONE_TWEET_EMAIL_TO (or "
+             "BULLETIN_TWEET_EMAIL_TO) for review. Sends on EVERY trading day, "
+             "whether the gate cleared or stood down, because the refused days "
+             "are what a trial is for. Independent of --post: this never "
+             "publishes anything.",
     )
     parser.add_argument(
         "--post", action="store_true",
