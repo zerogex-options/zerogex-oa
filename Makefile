@@ -3607,6 +3607,67 @@ shadow-compare: shadow-guard ## Side-by-side coverage for today's ET session: pr
 		       MAX(timestamp AT TIME ZONE 'America/New_York') AS last_et \
 		FROM underlying_quotes WHERE timestamp >= $(SHADOW_DAY_START) \
 		GROUP BY symbol ORDER BY symbol;"
+	@echo ""
+	@echo "$(BLUE)=== vix_bars / vxn_bars -- today's ET session ===$(NC)"
+	@echo "$(YELLOW)off_grid is the number that matters. Under TradeStation these are$(NC)"
+	@echo "$(YELLOW)finished 5-minute bars; the provider sends a mark every few seconds$(NC)"
+	@echo "$(YELLOW)and the ingester folds each one into its bucket. Any off_grid row$(NC)"
+	@echo "$(YELLOW)means that folding did not happen, and the table is filling up with$(NC)"
+	@echo "$(YELLOW)one row per poll. flat counts candles with no body or wicks: a few$(NC)"
+	@echo "$(YELLOW)are normal (the first and last bucket of a run are partial), most$(NC)"
+	@echo "$(YELLOW)of them are not. Expect ~78 rth_bars on a full session.$(NC)"
+	@echo "$(GREEN)PRODUCTION ($(DB_NAME)):$(NC)"
+	@$(PSQL) -c "\
+		SELECT 'VIX' AS idx, COUNT(*) AS bars, \
+		       COUNT(*) FILTER (WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              >= TIME '09:30' \
+		                          AND (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              <  TIME '16:00') AS rth_bars, \
+		       COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM timestamp)::bigint % 300 <> 0) \
+		         AS off_grid, \
+		       COUNT(*) FILTER (WHERE open = high AND high = low AND low = close) AS flat, \
+		       ROUND(MIN(close), 2) AS low_close, ROUND(MAX(close), 2) AS high_close, \
+		       MIN(timestamp AT TIME ZONE 'America/New_York') AS first_et, \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') AS last_et \
+		FROM vix_bars WHERE timestamp >= $(SHADOW_DAY_START) \
+		UNION ALL \
+		SELECT 'VXN', COUNT(*), \
+		       COUNT(*) FILTER (WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              >= TIME '09:30' \
+		                          AND (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              <  TIME '16:00'), \
+		       COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM timestamp)::bigint % 300 <> 0), \
+		       COUNT(*) FILTER (WHERE open = high AND high = low AND low = close), \
+		       ROUND(MIN(close), 2), ROUND(MAX(close), 2), \
+		       MIN(timestamp AT TIME ZONE 'America/New_York'), \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') \
+		FROM vxn_bars WHERE timestamp >= $(SHADOW_DAY_START) ORDER BY 1;"
+	@echo "$(GREEN)REHEARSAL ($(SHADOW_DB)):$(NC)"
+	@$(SHADOW_PSQL) -c "\
+		SELECT 'VIX' AS idx, COUNT(*) AS bars, \
+		       COUNT(*) FILTER (WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              >= TIME '09:30' \
+		                          AND (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              <  TIME '16:00') AS rth_bars, \
+		       COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM timestamp)::bigint % 300 <> 0) \
+		         AS off_grid, \
+		       COUNT(*) FILTER (WHERE open = high AND high = low AND low = close) AS flat, \
+		       ROUND(MIN(close), 2) AS low_close, ROUND(MAX(close), 2) AS high_close, \
+		       MIN(timestamp AT TIME ZONE 'America/New_York') AS first_et, \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') AS last_et \
+		FROM vix_bars WHERE timestamp >= $(SHADOW_DAY_START) \
+		UNION ALL \
+		SELECT 'VXN', COUNT(*), \
+		       COUNT(*) FILTER (WHERE (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              >= TIME '09:30' \
+		                          AND (timestamp AT TIME ZONE 'America/New_York')::time \
+		                              <  TIME '16:00'), \
+		       COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM timestamp)::bigint % 300 <> 0), \
+		       COUNT(*) FILTER (WHERE open = high AND high = low AND low = close), \
+		       ROUND(MIN(close), 2), ROUND(MAX(close), 2), \
+		       MIN(timestamp AT TIME ZONE 'America/New_York'), \
+		       MAX(timestamp AT TIME ZONE 'America/New_York') \
+		FROM vxn_bars WHERE timestamp >= $(SHADOW_DAY_START) ORDER BY 1;"
 
 .PHONY: shadow-psql
 shadow-psql: shadow-guard ## Open an interactive psql session against the rehearsal database

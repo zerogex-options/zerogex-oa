@@ -370,3 +370,52 @@ def test_shadow_compare_reports_both_contract_count_and_volume():
     body = _recipe("shadow-compare")
     assert "traded_pct" in body, "the share of contracts that traded"
     assert "option_volume" in body, "and the volume behind them"
+
+
+def test_shadow_compare_checks_the_volatility_bars_land_on_the_grid():
+    """``off_grid`` is the whole reason this block exists.
+
+    ``vix_bars`` and ``vxn_bars`` hold one row per 5-minute bar. TradeStation
+    delivers finished bars; the provider seam delivers a MARK every few
+    seconds, which the ingester folds into its bucket. If that folding ever
+    stops, the tables fill at the poll rate instead -- ~23,000 rows a session
+    against 78 -- and nothing about the numbers looks wrong until the gauge's
+    "last ten bars" quietly becomes the last ten seconds.
+
+    Epoch seconds modulo 300 is the check: the epoch is aligned to midnight
+    UTC and ET is a whole-hour offset, so a 5-minute boundary in either zone
+    is a multiple of 300. Verified against PostgreSQL with one deliberately
+    off-grid row seeded at 09:42:17 -- the query returned off_grid = 1.
+    """
+    body = _recipe("shadow-compare")
+    block = body[body.index("=== vix_bars / vxn_bars") :]
+    # Asserted on the FROM clause and the column alias, not on the table names
+    # loose in the text: the block's own explanatory echo lines mention both
+    # "vxn_bars" and "off_grid", so a looser check passes on the prose alone
+    # after the query has stopped reading either.
+    assert block.count("FROM vix_bars WHERE") == 2, "vix_bars is not read from both databases"
+    assert block.count("FROM vxn_bars WHERE") == 2, "vxn_bars is not read from both databases"
+    assert block.count("AS off_grid") == 2, "no off-grid column in the output"
+    grid = "EXTRACT(EPOCH FROM timestamp)::bigint % 300 <> 0"
+    assert grid in block, "the grid check must count rows OFF the boundary, not merely on it"
+    assert "$(PSQL) -c" in block and "$(SHADOW_PSQL) -c" in block, (
+        "the check must run against BOTH databases -- a rehearsal figure with "
+        "nothing to compare it to answers nothing"
+    )
+    # Two databases, two tables each.
+    assert block.count(grid) == 4, f"grid check appears {block.count(grid)} times, expected 4"
+
+
+def test_shadow_compare_counts_flat_volatility_candles():
+    """A candle with no body and no wicks means the marks never accumulated.
+
+    The conflict clause takes first-seen open, running high and low, last
+    close. Overwrite all four instead -- which is what the TradeStation
+    upsert does, correctly, for a finished bar -- and every row becomes four
+    copies of whichever mark landed last. The close stays right, so the
+    gauge's level is right and only its candles are wrong.
+    """
+    body = _recipe("shadow-compare")
+    assert (
+        "COUNT(*) FILTER (WHERE open = high AND high = low AND low = close) AS flat" in body
+    ), "nothing counts flat candles, so a flattened accumulation reads as healthy"
