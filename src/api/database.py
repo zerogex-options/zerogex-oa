@@ -50,6 +50,14 @@ logger = logging.getLogger(__name__)
 
 
 _ET = ZoneInfo("America/New_York")
+# End of the replay's cash session, and deliberately EXCLUSIVE: the session is
+# the 390 one-minute bars stamped 09:30 through 15:59 ET.  Bars carry the START
+# of their minute, so the 16:00 candle is the closing auction plus a minute of
+# after-hours trading, and the 16:00 GEX frame is computed once the day's 0DTE
+# has no time left (zero time, zero gamma) -- its walls and flip are tomorrow's.
+# SPY on 2026-09-22 had a call wall of 775 through 15:59 and 780 only in the
+# 16:00 frame, which the replay drew as the wall jumping at the bell.
+REPLAY_SESSION_END = time(16, 0)
 # "No value yet" marker for streaming row folds, where ``None`` is a legitimate
 # value and so cannot double as the marker.
 _UNSET: Any = object()
@@ -3084,7 +3092,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         strike_band_pct: float = 0.04,
         expirations: Optional[List[date]] = None,
     ) -> List[Dict[str, Any]]:
-        """Every per-minute GEX frame for one cash-session date (09:30-16:00 ET).
+        """Every per-minute GEX frame for one cash-session date (09:30-15:59 ET).
 
         Powers /api/replay/range for a specific historical day. Anchors on
         the requested date's session window (converted to UTC via ET
@@ -3129,8 +3137,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         et = ZoneInfo("America/New_York")
         utc = ZoneInfo("UTC")
         start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
-        # +1 minute so the 16:00 bar itself is included.
-        end_et = datetime.combine(session_date, time(16, 1), tzinfo=et)
+        # Half-open at 16:00: the 16:00 frame is post-expiry (REPLAY_SESSION_END).
+        end_et = datetime.combine(session_date, REPLAY_SESSION_END, tzinfo=et)
         start_utc = start_et.astimezone(utc)
         end_utc = end_et.astimezone(utc)
 
@@ -3509,7 +3517,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         et = ZoneInfo("America/New_York")
         utc = ZoneInfo("UTC")
         start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
-        end_et = datetime.combine(session_date, time(16, 1), tzinfo=et)
+        # The frames' window exactly (REPLAY_SESSION_END), so every share row
+        # has a frame to colour.
+        end_et = datetime.combine(session_date, REPLAY_SESSION_END, tzinfo=et)
         start_utc = start_et.astimezone(utc)
         end_utc = end_et.astimezone(utc)
 
@@ -3648,8 +3658,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                    MAX(timestamp) AS last_ts
             FROM gex_summary
             WHERE underlying = $1
-              AND (timestamp AT TIME ZONE 'America/New_York')::time
-                  BETWEEN TIME '09:30' AND TIME '16:00'
+              -- The replay's own window (REPLAY_SESSION_END): 390 bars is a
+              -- full session.
+              AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+              AND (timestamp AT TIME ZONE 'America/New_York')::time < TIME '16:00'
               AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
             GROUP BY (timestamp AT TIME ZONE 'America/New_York')::date
             ORDER BY session_date DESC
@@ -3677,8 +3689,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Powers the price-action chart the Replay scrubber renders alongside
         the strike profile so a trader can read "where was the tape when
         this GEX frame was published?" without leaving the tool. Anchors
-        on the same 09:30-16:00 ET window as ``get_gex_frames_for_session``
-        so the two series line up minute-for-minute.
+        on the same 09:30-15:59 ET window as ``get_gex_frames_for_session``
+        so the two series line up minute-for-minute.  The bulletin's level
+        tracking reads the same bars and ends its session at the same bell.
 
         Returns chronological ``{timestamp, open, high, low, close, volume}``
         rows; missing volume columns fall back to zero. ``[]`` on any
@@ -3687,9 +3700,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         et = ZoneInfo("America/New_York")
         utc = ZoneInfo("UTC")
         start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
-        # +1 minute so the 16:00 bar is included; matches the GEX frames
-        # window so cursor alignment is exact.
-        end_et = datetime.combine(session_date, time(16, 1), tzinfo=et)
+        # Half-open at 16:00, the GEX frames' window exactly, so cursor
+        # alignment is exact and no candle sits past the last frame
+        # (REPLAY_SESSION_END).
+        end_et = datetime.combine(session_date, REPLAY_SESSION_END, tzinfo=et)
         start_utc = start_et.astimezone(utc)
         end_utc = end_et.astimezone(utc)
 

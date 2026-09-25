@@ -228,8 +228,8 @@ async def list_replay_sessions(
     """Recent trading days with replayable GEX data for the symbol.
 
     Used by the /replay date picker. Bar-count is the number of
-    ``gex_summary`` rows in the cash session (09:30–16:00 ET) — a full
-    session is ~390 minutes; partial sessions surface as such.
+    ``gex_summary`` rows in the cash session (09:30–15:59 ET) — a full
+    session is 390 minutes; partial sessions surface as such.
     """
     rows = await db.get_replay_session_dates(symbol.upper(), limit=limit)
     return {

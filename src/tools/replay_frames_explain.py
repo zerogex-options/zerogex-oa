@@ -83,9 +83,11 @@ def _echo(text: str) -> str:
 
 
 def _session_bounds(session_date: date_cls) -> tuple[datetime, datetime]:
-    """09:30-16:01 ET as UTC — mirrors the method's own window exactly."""
+    """[09:30, 16:00) ET as UTC — mirrors the method's own window exactly
+    (``REPLAY_SESSION_END`` in src/api/database.py, not imported so this tool
+    stays free of the API's dependencies)."""
     start_et = datetime.combine(session_date, time(9, 30), tzinfo=_ET)
-    end_et = datetime.combine(session_date, time(16, 1), tzinfo=_ET)
+    end_et = datetime.combine(session_date, time(16, 0), tzinfo=_ET)
     return start_et.astimezone(_UTC), end_et.astimezone(_UTC)
 
 
