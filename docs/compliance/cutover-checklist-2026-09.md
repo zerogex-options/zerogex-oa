@@ -249,9 +249,22 @@ Underlyings come from `INGEST_UNDERLYINGS` in `.env`, so the rehearsal covers ex
 production covers. `make shadow-drop` is a dry run; `make shadow-drop CONFIRM=yes` cleans up
 afterwards, terminating any connection still held open on the rehearsal database.
 
-Rollback is `Ctrl-C`. Production never sees it. One caveat: the VIX, VXN and futures ingesters run
-inside the same process and still call TradeStation directly, so the rehearsal consumes TradeStation
-quota and does not exercise those three paths on the candidate feed.
+Rollback is `Ctrl-C`. Production never sees it. One caveat, now narrowed to one ingester: the
+futures ingester runs inside the same process and still calls TradeStation directly, so the
+rehearsal consumes TradeStation quota for ES/NQ and does not exercise that path on the candidate
+feed. That is deliberate — ThetaData sells no CME product, and ES/NQ stay on TradeStation past
+cutover by decision, not by omission.
+
+VIX and VXN no longer do. They follow the rehearsal feed like everything else, and
+`make shadow-compare` reports `vix_bars` and `vxn_bars` alongside the option tables. The column
+that matters there is `off_grid`, which must read 0: the candidate feed sends a mark every few
+seconds rather than a finished 5-minute bar, and the ingester folds those into buckets. Any
+off-grid row means the folding stopped and the table is filling at the poll rate.
+
+They can also be held back independently of the cutover. `VOLATILITY_INDEX_PROVIDER` in `.env`
+pins them to one vendor while `MARKET_DATA_PROVIDER` moves the options, so a problem with the
+index feed — extended hours being the open question — costs those two rows on the site rather
+than the whole migration.
 
 **Read at the close. `make shadow-compare` prints both sides of every row but the last:**
 

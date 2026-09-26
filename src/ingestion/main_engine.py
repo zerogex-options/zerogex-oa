@@ -50,6 +50,7 @@ from src.symbols import (
 from src.tools.cash_index_open_repair import repair_one_session_open
 from src.config import (
     configured_provider_name,
+    VOLATILITY_INDEX_PROVIDER_ENV,
     _getenv_str,
     _getenv_int,
     _getenv_bool,
@@ -215,9 +216,23 @@ def _authenticate_shared_feed_session() -> None:
 
     A no-op for TradeStation, which has no such constraint and whose client
     is deliberately not built outside the worker that needs it.
+
+    Every feed this unit's workers will use gets a login here, not just the
+    deployment-wide one. The VIX and VXN children resolve their feed through
+    VOLATILITY_INDEX_PROVIDER, so a box whose options are on TradeStation and
+    whose indices are pinned to ThetaData has two children wanting a session
+    the supervisor never opened -- and they would kick each other off exactly
+    as the four underlyings did. Feeds that share a host and port share one
+    cached client anyway, so the repeated case costs nothing.
     """
-    provider_name = configured_provider_name()
-    if not provider_name.startswith("thetadata"):
+    feed_names: List[str] = []
+    for name in (
+        configured_provider_name(),
+        configured_provider_name(VOLATILITY_INDEX_PROVIDER_ENV),
+    ):
+        if name.startswith("thetadata") and name not in feed_names:
+            feed_names.append(name)
+    if not feed_names:
         return
 
     # Adoption rides on fork inheriting the parent's memory. Under "spawn" or
@@ -232,31 +247,35 @@ def _authenticate_shared_feed_session() -> None:
             "invalidating one another. Set the start method to 'fork' or run "
             "a single underlying per process.",
             start_method,
-            provider_name,
+            ", ".join(feed_names),
         )
         return
 
     from src.ingestion.providers import get_provider
 
-    try:
-        get_provider()
-    except Exception as e:  # noqa: BLE001 - a feed outage at boot must not
-        # stop the supervisor; the workers' initialize() backoff bounds the
-        # retries, and this line names why they are all authenticating.
-        logger.error(
-            "Could not establish the shared %s session in the supervisor: %s. "
-            "Each worker will now authenticate on its own, and they will kick "
-            "each other off.",
-            provider_name,
-            e,
-        )
-        return
+    for provider_name in feed_names:
+        try:
+            # BY NAME: get_provider() with no argument reads
+            # MARKET_DATA_PROVIDER, which would log the pinned feed in and
+            # leave the deployment feed's workers to stampede.
+            get_provider(name=provider_name)
+        except Exception as e:  # noqa: BLE001 - a feed outage at boot must not
+            # stop the supervisor; the workers' initialize() backoff bounds the
+            # retries, and this line names why they are all authenticating.
+            logger.error(
+                "Could not establish the shared %s session in the supervisor: "
+                "%s. Each worker on that feed will now authenticate on its "
+                "own, and they will kick each other off.",
+                provider_name,
+                e,
+            )
+            continue
 
-    logger.info(
-        "%s session established in the supervisor; workers will adopt it "
-        "rather than logging in separately",
-        provider_name,
-    )
+        logger.info(
+            "%s session established in the supervisor; workers will adopt it "
+            "rather than logging in separately",
+            provider_name,
+        )
 
 
 def _worker_restart_delay(consecutive_deaths: int) -> float:

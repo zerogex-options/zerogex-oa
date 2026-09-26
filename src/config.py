@@ -2211,11 +2211,41 @@ def print_config():
     print("=" * 80 + "\n")
 
 
-def configured_provider_name() -> str:
+#: Per-feed override for the volatility indices (VIX, VXN). Set it to pin
+#: those two to one vendor while the rest of the deployment uses another.
+#:
+#: They exist because VIX and VXN are Cboe CGIF index values, a different
+#: licensed product from the option tape, and a vendor can carry one well and
+#: the other badly or not at all -- extended hours in particular, where Cboe
+#: publishes VIX but not every vendor's endpoint serves it. Without this the
+#: two flip vendors at the same instant as the options and there is no way
+#: back short of reverting the whole cutover.
+#:
+#: Unset is the normal state: everything follows MARKET_DATA_PROVIDER.
+VOLATILITY_INDEX_PROVIDER_ENV = "VOLATILITY_INDEX_PROVIDER"
+
+
+def configured_provider_name(override_env: Optional[str] = None) -> str:
     """The feed MARKET_DATA_PROVIDER names, normalised. Defaults to TradeStation.
 
     One reader, because two copies of this drift. Today's date-format bug was
     exactly that shape -- feed_compare and StreamManager each formatted an
     expiration their own way and only one of them matched the vendor.
+
+    ``override_env`` names a per-feed variable that wins when it is set to
+    something non-empty, so one class of data can be pinned to a vendor while
+    the rest of the deployment moves (see
+    :data:`VOLATILITY_INDEX_PROVIDER_ENV`). Unset or empty falls through to
+    the deployment-wide setting, which is what makes an override a no-op on a
+    running box until somebody deliberately sets it.
+
+    A caller that resolves a name through an override MUST pass that name on
+    to ``get_provider(name)``. ``get_provider()`` with no argument reads
+    MARKET_DATA_PROVIDER for itself and would hand back the deployment feed --
+    the override would appear in the logs and change nothing.
     """
+    if override_env:
+        override = os.getenv(override_env, "").strip()
+        if override:
+            return override.lower()
     return (os.getenv("MARKET_DATA_PROVIDER", "").strip() or "tradestation").lower()

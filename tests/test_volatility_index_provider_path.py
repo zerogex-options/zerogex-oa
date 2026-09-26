@@ -597,3 +597,131 @@ def test_conflict_clause_builds_a_real_candle_in_postgres():
         cur.execute("DROP TABLE vix_bars_conflict_check")
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. The per-feed override
+# ---------------------------------------------------------------------------
+
+
+def _run_ingester_with(monkeypatch, deployment: Optional[str], pinned: Optional[str]):
+    """Run run_ingester under a given pair of settings; report what it built.
+
+    Returns ``(client_cls, get_provider_mock, ingester_kwargs)``.
+    """
+    if deployment is None:
+        monkeypatch.delenv("MARKET_DATA_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("MARKET_DATA_PROVIDER", deployment)
+    if pinned is None:
+        monkeypatch.delenv("VOLATILITY_INDEX_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("VOLATILITY_INDEX_PROVIDER", pinned)
+
+    with (
+        patch.object(vix_mod, "TradeStationClient") as client_cls,
+        patch.object(vix_mod, "VolatilityIndexIngester") as ingester_cls,
+        patch("dotenv.load_dotenv"),
+        patch("src.ingestion.providers.get_provider") as get_provider,
+    ):
+        run_ingester(
+            ticker="VIX",
+            symbol="$VIX.X",
+            table_name="vix_bars",
+            initial_barsback=160,
+            poll_barsback=3,
+            retention_days=7,
+        )
+        args, kwargs = ingester_cls.call_args
+    return client_cls, get_provider, {"client": args[0], **kwargs}
+
+
+def test_the_override_keeps_the_indices_on_tradestation(monkeypatch):
+    """The configuration this override exists for.
+
+    Options move to ThetaData at cutover; VIX and VXN hold on TradeStation
+    until their extended-hours behaviour is proven. Without this the two flip
+    at the same instant as everything else and the only way back is reverting
+    the whole cutover.
+    """
+    client_cls, get_provider, built = _run_ingester_with(
+        monkeypatch, deployment="thetadata_mv", pinned="tradestation"
+    )
+    assert client_cls.called, "the pinned feed is TradeStation but no client was built"
+    assert not get_provider.called, "built a provider for a TradeStation-pinned index"
+    assert built["client"] is client_cls.return_value
+    assert built["provider"] is None
+
+
+def test_the_override_can_move_the_indices_ahead_of_the_deployment(monkeypatch):
+    """And the other direction, which is how they get validated first."""
+    client_cls, get_provider, built = _run_ingester_with(
+        monkeypatch, deployment="tradestation", pinned="thetadata_mv"
+    )
+    assert not client_cls.called, "built a TradeStation client for a ThetaData-pinned index"
+    assert get_provider.called
+    assert built["client"] is None
+    assert built["provider"] is get_provider.return_value
+
+
+def test_the_resolved_name_is_passed_to_get_provider(monkeypatch):
+    """The failure that would look exactly like success.
+
+    ``get_provider()`` with no argument reads MARKET_DATA_PROVIDER for
+    itself. Call it bare under an override and the log line announces the
+    pinned feed while the deployment feed is what actually gets built -- an
+    override that reads as applied, in a process whose whole job is to be on
+    a different feed from everything around it.
+    """
+    _, get_provider, _ = _run_ingester_with(
+        monkeypatch, deployment="tradestation", pinned="thetadata_mv"
+    )
+    _, kwargs = get_provider.call_args
+    assert kwargs.get("name") == "thetadata_mv", (
+        "get_provider was not told which feed to build, so it will read "
+        "MARKET_DATA_PROVIDER and silently ignore the override"
+    )
+
+
+@pytest.mark.parametrize("pinned", [None, "", "   "])
+def test_an_unset_or_blank_override_follows_the_deployment(monkeypatch, pinned):
+    """Unset is the normal state, and blank must not mean "no vendor".
+
+    This is what makes shipping the override to a running box a no-op: it
+    changes nothing until somebody deliberately sets it.
+    """
+    client_cls, get_provider, built = _run_ingester_with(
+        monkeypatch, deployment="thetadata_mv", pinned=pinned
+    )
+    assert not client_cls.called
+    assert get_provider.call_args[1].get("name") == "thetadata_mv"
+    assert built["provider"] is get_provider.return_value
+
+
+def test_the_override_is_case_insensitive_like_the_deployment_setting(monkeypatch):
+    """`TradeStation` in a .env must not read as an unknown vendor."""
+    client_cls, get_provider, _ = _run_ingester_with(
+        monkeypatch, deployment="thetadata_mv", pinned="TradeStation"
+    )
+    assert client_cls.called and not get_provider.called
+
+
+def test_configured_provider_name_override_semantics(monkeypatch):
+    """The resolution rule itself, without a process around it."""
+    from src.config import VOLATILITY_INDEX_PROVIDER_ENV, configured_provider_name
+
+    monkeypatch.setenv("MARKET_DATA_PROVIDER", "thetadata_mv")
+    monkeypatch.delenv("VOLATILITY_INDEX_PROVIDER", raising=False)
+    assert configured_provider_name() == "thetadata_mv"
+    assert configured_provider_name(VOLATILITY_INDEX_PROVIDER_ENV) == "thetadata_mv"
+
+    monkeypatch.setenv("VOLATILITY_INDEX_PROVIDER", "tradestation")
+    assert configured_provider_name(VOLATILITY_INDEX_PROVIDER_ENV) == "tradestation"
+    assert configured_provider_name() == "thetadata_mv", (
+        "the override leaked into the deployment-wide reader; every other "
+        "worker would follow the indices"
+    )
+
+    monkeypatch.delenv("MARKET_DATA_PROVIDER", raising=False)
+    monkeypatch.delenv("VOLATILITY_INDEX_PROVIDER", raising=False)
+    assert configured_provider_name(VOLATILITY_INDEX_PROVIDER_ENV) == "tradestation"

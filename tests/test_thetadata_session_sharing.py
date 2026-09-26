@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
-from typing import Any, List
+from typing import Any, List, Optional
 
 import pytest
 
@@ -178,20 +178,35 @@ def test_the_child_takes_ownership_so_it_adopts_only_once():
 # ---------------------------------------------------------------------------
 
 
-def _calls_to_get_provider(monkeypatch, provider: str, start_method: str = "fork"):
+def _calls_to_get_provider(
+    monkeypatch,
+    provider: str,
+    start_method: str = "fork",
+    index_provider: Optional[str] = None,
+) -> List[Optional[str]]:
+    """The feed NAMES the supervisor logged in, in order.
+
+    Records the name rather than a bare count: the supervisor now resolves
+    more than one feed, and "it called get_provider twice" does not say it
+    called it for the right two.
+    """
     from src.ingestion import main_engine as me
     from src.ingestion import providers as providers_mod
 
-    calls: List[int] = []
+    calls: List[Optional[str]] = []
     monkeypatch.setenv("MARKET_DATA_PROVIDER", provider)
+    if index_provider is None:
+        monkeypatch.delenv("VOLATILITY_INDEX_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("VOLATILITY_INDEX_PROVIDER", index_provider)
     monkeypatch.setattr(me.multiprocessing, "get_start_method", lambda **kw: start_method)
-    monkeypatch.setattr(providers_mod, "get_provider", lambda **kw: calls.append(1))
+    monkeypatch.setattr(providers_mod, "get_provider", lambda name=None, **kw: calls.append(name))
     me._authenticate_shared_feed_session()
     return calls
 
 
 def test_the_supervisor_logs_in_for_thetadata(monkeypatch):
-    assert _calls_to_get_provider(monkeypatch, "thetadata_mv") == [1]
+    assert _calls_to_get_provider(monkeypatch, "thetadata_mv") == ["thetadata_mv"]
 
 
 def test_the_supervisor_does_not_log_in_for_tradestation(monkeypatch):
@@ -206,9 +221,82 @@ def test_the_supervisor_does_not_log_in_when_the_provider_is_unset(monkeypatch):
 
     calls: List[int] = []
     monkeypatch.delenv("MARKET_DATA_PROVIDER", raising=False)
-    monkeypatch.setattr(providers_mod, "get_provider", lambda **kw: calls.append(1))
+    monkeypatch.delenv("VOLATILITY_INDEX_PROVIDER", raising=False)
+    monkeypatch.setattr(providers_mod, "get_provider", lambda *a, **kw: calls.append(1))
     me._authenticate_shared_feed_session()
     assert calls == [], "unset means TradeStation, which needs no shared session"
+
+
+# ---------------------------------------------------------------------------
+# ... for every feed the unit's workers will use, not just the main one
+# ---------------------------------------------------------------------------
+
+
+def test_a_pinned_index_feed_is_logged_in_too(monkeypatch):
+    """The case the override creates: options on TradeStation, indices not.
+
+    Nothing in the deployment-wide setting says ThetaData, so before this the
+    supervisor opened no session at all -- and the VIX and VXN children each
+    authenticated on their own, which is precisely the stampede that left
+    every symbol on "Invalid session ID" on 2026-09-24. Two children is
+    enough; the constraint is one connection per account, not four.
+    """
+    calls = _calls_to_get_provider(monkeypatch, "tradestation", index_provider="thetadata_mv")
+    assert calls == ["thetadata_mv"], (
+        "the pinned index feed needs its session opened before the fork like " "any other"
+    )
+
+
+def test_both_feeds_are_logged_in_when_they_differ(monkeypatch):
+    """Each distinct ThetaData feed, once."""
+    calls = _calls_to_get_provider(monkeypatch, "thetadata_mv", index_provider="thetadata")
+    assert calls == ["thetadata_mv", "thetadata"]
+
+
+def test_the_same_feed_twice_is_one_login(monkeypatch):
+    """An override set to the deployment feed must not double the logins.
+
+    Harmless today, because feeds sharing a host and port share one cached
+    client -- but only today, and a second authentication is the one thing
+    this whole mechanism exists to prevent.
+    """
+    calls = _calls_to_get_provider(monkeypatch, "thetadata_mv", index_provider="thetadata_mv")
+    assert calls == ["thetadata_mv"]
+
+
+def test_a_tradestation_override_does_not_suppress_the_main_feed(monkeypatch):
+    """The configuration Michael will actually run at cutover.
+
+    Options on ThetaData, VIX and VXN held back on TradeStation. The option
+    workers still need the shared session; pinning the indices away from
+    ThetaData must not take it with them.
+    """
+    calls = _calls_to_get_provider(monkeypatch, "thetadata_mv", index_provider="tradestation")
+    assert calls == ["thetadata_mv"]
+
+
+def test_one_feed_failing_to_log_in_does_not_skip_the_other(monkeypatch, caplog):
+    """A dead terminal on one feed must not cost the other its shared session."""
+    from src.ingestion import main_engine as me
+    from src.ingestion import providers as providers_mod
+
+    seen: List[Optional[str]] = []
+
+    def _get(name=None, **kw):
+        seen.append(name)
+        if name == "thetadata_mv":
+            raise RuntimeError("terminal not up yet")
+
+    monkeypatch.setenv("MARKET_DATA_PROVIDER", "thetadata_mv")
+    monkeypatch.setenv("VOLATILITY_INDEX_PROVIDER", "thetadata")
+    monkeypatch.setattr(me.multiprocessing, "get_start_method", lambda **kw: "fork")
+    monkeypatch.setattr(providers_mod, "get_provider", _get)
+
+    with caplog.at_level("ERROR"):
+        me._authenticate_shared_feed_session()
+
+    assert seen == ["thetadata_mv", "thetadata"], "gave up after the first failure"
+    assert "terminal not up yet" in caplog.text
 
 
 @pytest.mark.parametrize("start_method", ["spawn", "forkserver"])

@@ -43,7 +43,12 @@ import requests as _requests
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
-from src.config import _getenv_int, _getenv_bool, configured_provider_name
+from src.config import (
+    _getenv_int,
+    _getenv_bool,
+    configured_provider_name,
+    VOLATILITY_INDEX_PROVIDER_ENV,
+)
 from src.utils import get_logger
 from src.validation import (
     safe_float,
@@ -641,7 +646,10 @@ def run_ingester(
 
     load_dotenv()
 
-    provider_name = configured_provider_name()
+    # Through the override, so VIX and VXN can be pinned to one vendor while
+    # the options move to another.
+    provider_name = configured_provider_name(VOLATILITY_INDEX_PROVIDER_ENV)
+    deployment_name = configured_provider_name()
     client: Optional[TradeStationClient] = None
     provider: Any = None
 
@@ -664,9 +672,22 @@ def run_ingester(
     else:
         from src.ingestion.providers import get_provider
 
-        provider = get_provider()
+        # BY NAME. get_provider() with no argument reads MARKET_DATA_PROVIDER
+        # for itself, so under an override it would hand back the deployment
+        # feed while the log line below announced the pinned one -- an
+        # override that reads as applied and is not.
+        provider = get_provider(name=provider_name)
 
-    logger.info("%s feed: %s", ticker, provider_name)
+    if provider_name == deployment_name:
+        logger.info("%s feed: %s", ticker, provider_name)
+    else:
+        logger.info(
+            "%s feed: %s (pinned by %s; the deployment feed is %s)",
+            ticker,
+            provider_name,
+            VOLATILITY_INDEX_PROVIDER_ENV,
+            deployment_name,
+        )
 
     ingester = VolatilityIndexIngester(
         client,
