@@ -5217,12 +5217,12 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       AVG(daily_sigma / NULLIF(anchor_spot,0)) AS sigma_frac, \
 		       AVG(vol_ratio_applied) AS vol_anchor, \
 		       MIN(vol_ratio_source) AS anchor_src, \
-		       MIN(model_version) AS model_ver, \
+		       model_version AS model_ver, \
 		       AVG(anchor_spot) AS spot \
 		FROM intraday_forecast \
 		WHERE held IS NOT NULL $${SYMBOL_FILTER} \
 		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
-		GROUP BY session_date, symbol), \
+		GROUP BY session_date, symbol, model_version), \
 		tape AS ( \
 		SELECT d, symbol, MAX(high) - MIN(low) AS rng, SUM(ABS(dc)) AS path \
 		FROM ( \
@@ -5254,7 +5254,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       ROUND(100.0 * realized_frac, 3)   AS realized_range_pct, \
 		       ROUND((realized_frac / NULLIF(1.5958 * sigma_frac, 0))::numeric, 2) AS vol_ratio, \
 		       ROUND(chop::numeric, 1)           AS chop \
-		FROM s ORDER BY session_date DESC, symbol;" || echo "$(YELLOW)(the per-session query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
+		FROM s ORDER BY session_date DESC, symbol, model_ver;" || echo "$(YELLOW)(the per-session query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per SYMBOL (current cohort only) ---$(NC)"; \
 	echo "$(YELLOW)Read this before the per-horizon table. An aggregate gap near zero$(NC)"; \
@@ -5268,16 +5268,21 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 	echo "$(YELLOW)with skill near zero is a calibrated model that has told you nothing,$(NC)"; \
 	echo "$(YELLOW)and it is the state a published hold probability must not be in --$(NC)"; \
 	echo "$(YELLOW)which is why cone_tweet gates on skill and not on gap_pts.$(NC)"; \
+	echo "$(YELLOW)SPLIT BY MODEL, for the same reason the per-horizon table is. This$(NC)"; \
+	echo "$(YELLOW)table pooled versions until 2026-09-27 and reported one publishable$(NC)"; \
+	echo "$(YELLOW)verdict per symbol over a mix of two models, which is not a verdict$(NC)"; \
+	echo "$(YELLOW)about either of them. Compare a version only against itself, and only$(NC)"; \
+	echo "$(YELLOW)over sessions both versions actually cover.$(NC)"; \
 	$(PSQL) -P pager=off -c "WITH s AS ( \
-		SELECT symbol, COUNT(*) AS claims, \
+		SELECT symbol, model_version, COUNT(*) AS claims, \
 		       COUNT(*) FILTER (WHERE held)::numeric / COUNT(*) AS h, \
 		       AVG(hold_prob) AS pred, \
 		       AVG(brier)     AS brier \
 		FROM intraday_forecast \
 		WHERE held IS NOT NULL AND vol_ratio_source IS NOT NULL $${SYMBOL_FILTER} \
 		  AND session_date >= (CURRENT_DATE - ($${SESSIONS} * 2)) \
-		GROUP BY symbol) \
-		SELECT symbol, claims, \
+		GROUP BY symbol, model_version) \
+		SELECT model_version, symbol, claims, \
 		       ROUND(100.0 * h, 1)            AS hold_pct, \
 		       ROUND(100.0 * pred, 1)         AS pred_pct, \
 		       ROUND(100.0 * (h - pred), 1)   AS gap_pts, \
@@ -5286,7 +5291,7 @@ cone-calibration: ## Per-session cone report: predicted vs realized hold, and mo
 		       ROUND((1 - brier / NULLIF(h * (1 - h), 0))::numeric, 4) AS skill, \
 		       CASE WHEN (1 - brier / NULLIF(h * (1 - h), 0)) >= 0.01 \
 		            THEN 'yes' ELSE 'NO' END AS publishable \
-		FROM s ORDER BY skill DESC NULLS LAST;" || echo "$(YELLOW)(the per-symbol query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
+		FROM s ORDER BY model_version DESC, skill DESC NULLS LAST;" || echo "$(YELLOW)(the per-symbol query FAILED -- its error is above. The other sections are unaffected.)$(NC)"; \
 	echo ""; \
 	echo "$(BLUE)--- Per horizon, SPLIT BY MODEL ---$(NC)"; \
 	echo "$(YELLOW)Never read across rows here. A session backfilled under an older$(NC)"; \

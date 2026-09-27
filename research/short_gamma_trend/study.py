@@ -47,6 +47,7 @@ from research.short_gamma_trend.rule import (
     legacy_state,
 )
 from research.short_gamma_trend.sources import Reading
+from src.signals.trade_bias.bias import BiasInput
 
 ALL_HORIZONS: tuple[Horizon, ...] = (*HORIZONS, REST)
 
@@ -117,6 +118,8 @@ class Row:
     states: dict[str, str]
     stored: Optional[str]
     out: Outcome
+    #: The persisted inputs every state above was replayed from.
+    inputs: Optional[BiasInput] = None
 
 
 @dataclass
@@ -171,7 +174,17 @@ def build_rows(
             else:
                 key = f"{reading.stored_state} -> {expected}"
                 counts.mismatches[key] = counts.mismatches.get(key, 0) + 1
-        rows.append(Row(symbol, reading.timestamp, session, states, reading.stored_state, out))
+        rows.append(
+            Row(
+                symbol,
+                reading.timestamp,
+                session,
+                states,
+                reading.stored_state,
+                out,
+                reading.inputs,
+            )
+        )
     counts.rows = len(rows)
     return rows, counts
 
@@ -285,16 +298,35 @@ class Frame:
 
     def blocks(self, label: Label, horizon: Horizon) -> np.ndarray:
         """``(dates, symbols, 10)`` sufficient statistics."""
-        key = (label.key, horizon)
-        if key not in self._blocks:
-            self._blocks[key] = self._build_blocks(label, horizon)
-        return self._blocks[key]
+        return self.blocks_for(label.key, self.dirs(label), horizon)
 
-    def _build_blocks(self, label: Label, horizon: Horizon) -> np.ndarray:
+    def blocks_for(
+        self,
+        key: str,
+        dirs: np.ndarray,
+        horizon: Horizon,
+        pool: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Sufficient statistics for any +1 / -1 / 0 call array over ``rows``.
+
+        ``key`` names the calls in the cache, so it must be unique to ``dirs``
+        and ``pool``. ``pool`` restricts the minutes the drift is taken over,
+        and the calls with them; by default it is every scored minute.
+        """
+        cache_key = (key, horizon)
+        if cache_key not in self._blocks:
+            self._blocks[cache_key] = self._build_blocks(dirs, horizon, pool)
+        return self._blocks[cache_key]
+
+    def _build_blocks(
+        self, dirs: np.ndarray, horizon: Horizon, pool: Optional[np.ndarray]
+    ) -> np.ndarray:
         size = self.n_dates * self.n_syms
         r, q, g = self.ret[horizon], self.qual[horizon], self.rng[horizon]
         valid = ~(np.isnan(r) | np.isnan(q) | np.isnan(g))
-        d = self.dirs(label).astype(float)
+        if pool is not None:
+            valid &= pool
+        d = dirs.astype(float)
         call = valid & (d != 0)
         idx = self.cell_index
 
@@ -318,8 +350,11 @@ class Frame:
 
     def sessions_with_calls(self, label: Label, horizon: Horizon, sym: Optional[int]) -> int:
         b = self.blocks(label, horizon)
-        n_call = b[:, :, _N_CALL] if sym is None else b[:, sym : sym + 1, _N_CALL]
-        return int(np.count_nonzero(n_call.sum(axis=1) > 0))
+        return _sessions_with_calls(b if sym is None else b[:, sym : sym + 1, :])
+
+
+def _sessions_with_calls(blocks: np.ndarray) -> int:
+    return int(np.count_nonzero(blocks[:, :, _N_CALL].sum(axis=1) > 0))
 
 
 def _column(rows: Sequence[Row], get) -> np.ndarray:
@@ -368,7 +403,13 @@ def _estimate(point: Any, boot: np.ndarray, *, with_p: bool) -> Estimate:
 
 def score(frame: Frame, label: Label, horizon: Horizon, scope: str = "pooled") -> Cell:
     """One label x horizon x scope ("pooled" or a symbol)."""
-    blocks = frame.blocks(label, horizon)
+    return score_blocks(frame, label.key, frame.blocks(label, horizon), horizon, scope)
+
+
+def score_blocks(
+    frame: Frame, key: str, blocks: np.ndarray, horizon: Horizon, scope: str = "pooled"
+) -> Cell:
+    """A :class:`Cell` from any ``Frame.blocks_for`` result."""
     sym = None if scope == "pooled" else frame.symbols.index(scope)
     if sym is not None:
         blocks = blocks[:, sym : sym + 1, :]
@@ -378,11 +419,11 @@ def score(frame: Frame, label: Label, horizon: Horizon, scope: str = "pooled") -
     else:
         boot = {k: np.array([]) for k in point}
     return Cell(
-        label=label.key,
+        label=key,
         horizon=horizon,
         scope=scope,
         n_calls=int(point["n_call"]),
-        n_sessions=frame.sessions_with_calls(label, horizon, sym),
+        n_sessions=_sessions_with_calls(blocks),
         excess_bps=_estimate(point["excess"], boot["excess"], with_p=True),
         quality_bps=_estimate(point["quality"], boot["quality"], with_p=True),
         hit_rate=_estimate(point["hit"], boot["hit"], with_p=False),
@@ -393,7 +434,12 @@ def score(frame: Frame, label: Label, horizon: Horizon, scope: str = "pooled") -
 
 def paired_difference(frame: Frame, a: Label, b: Label, horizon: Horizon) -> Estimate:
     """Pooled directional excess of ``a`` minus ``b``, resample by resample."""
-    ba, bb = frame.blocks(a, horizon), frame.blocks(b, horizon)
+    return paired_difference_blocks(frame, frame.blocks(a, horizon), frame.blocks(b, horizon))
+
+
+def paired_difference_blocks(frame: Frame, ba: np.ndarray, bb: np.ndarray) -> Estimate:
+    """Pooled directional excess of one set of blocks minus another, resample by
+    resample, on the frame's shared draws."""
     point = _stats(ba.sum(axis=0))["excess"] - _stats(bb.sum(axis=0))["excess"]
     if not frame.draws.size:
         return Estimate(_finite(point))

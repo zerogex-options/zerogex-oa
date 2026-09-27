@@ -376,11 +376,30 @@ def test_hold_probability_varies_materially_across_horizons():
     horizon — the first version of this model published one number four times
     and called it a term structure.  The spread must be large enough to carry
     information, not merely non-zero.
+
+    The threshold dropped from 0.05 to 0.015 at v1_7 and the reason is worth
+    stating, because it is a real narrowing and not a loosened test.  Under
+    v1_6's 0.575 exponent, short horizons had their sigma shrunk harder than
+    long ones (the variance fraction is below 1, so the exponent bites most
+    where the fraction is smallest), and that supplied most of the spread.
+    At the committed Brownian 0.5 that source is gone by construction, and
+    CONE_TERM_DECAY is the ONLY thing left holding the term structure apart.
+    It currently measures ~0.023 — two orders of magnitude clear of the
+    identical-to-14-decimals degeneracy this test exists to catch, but not
+    comfortable.
+
+    Worth knowing while reading it: realized hold decays about 5.6 points
+    across the same span (30m 80.5% to 120m 74.9% over 4,576 claims) while the
+    model now predicts about 2.3.  The model under-states its own term
+    structure.  That is the next thing for the tuner to look at now that the
+    dominant error is out of the way; it is recorded rather than fixed here
+    because CONE_TERM_DECAY is band geometry and moving it moves the graded
+    outcome too, which is the trap v1_4 fell into.
     """
     result = compute_cone(_inputs(call_wall=None, put_wall=None, gamma_flip=None))
     holds = [h.hold_prob for h in result.horizons]
     assert holds == sorted(holds, reverse=True)
-    assert holds[0] - holds[-1] > 0.05, "hold must decay meaningfully with horizon"
+    assert holds[0] - holds[-1] > 0.015, "hold must decay meaningfully with horizon"
 
 
 def test_reference_horizon_lands_in_the_informative_band():
