@@ -36,7 +36,14 @@ from src.hedging_flow_sql import (
     SCOPE_0DTE,
     SCOPE_ALL,
 )
-from src.market_calendar import NYSE_HOLIDAYS
+from src.market_calendar import (
+    NYSE_HOLIDAYS,
+    OPTION_CHAIN_CLOSE,
+    in_regular_session,
+    is_trading_session,
+    option_chain_feed_window,
+    regular_session_close,
+)
 from src.opening_range import (
     OPENING_RANGE_SQL_ASYNC,
     opening_range_from_row,
@@ -391,6 +398,65 @@ _STABLE_SNAPSHOT_CTE = f"""
         END AS ts
     )
 """
+
+# The stable CTE answers "is the newest bucket finished?", which is only the
+# same question as "is the newest bucket the whole chain?" while options
+# trade. A bucket holds just the contracts that ticked in its minute, so once
+# the options session ends the newest bucket is whatever few residual quotes
+# arrived last: on 2026-09-25 SPY's 19:59 ET bucket held 54 contracts from one
+# expiration against 854 across seven at 15:59, and /api/market/open-interest
+# served those 54 as the whole book all weekend. Outside the session the
+# open-interest read therefore anchors on the last bucket of the most recent
+# regular session instead -- the final minute every contract ticked into.
+# Open interest settles once a day, so the close's figures are still the
+# current ones; a new day's figures take over at the next open.
+#
+# Caps the calendar walk back to a session and the closing-bucket probes. Real
+# closures span a few days, so 10 only matters if NYSE_HOLIDAYS is misconfigured.
+_OPEN_INTEREST_SESSION_LOOKBACK_DAYS = 10
+
+
+def _open_interest_session_is_live(ts: datetime, underlying: str) -> bool:
+    """True when bucket ``ts`` falls inside ``underlying``'s option session.
+
+    The window is [09:30, 16:15) ET on a trading day, closing at 16:00 for a
+    cash index and at the early close on a half day -- the same
+    ``option_chain_feed_window`` the freshness envelope grades this route on,
+    so the two agree about when a newer bucket is due.
+    """
+    ts_et = ts.astimezone(_ET)
+    if not is_trading_session(ts_et.date()):
+        return False
+    open_t, close_t = option_chain_feed_window(underlying, ts_et.date())
+    return open_t <= ts_et.time() < close_t
+
+
+def _regular_close_at_or_before(ts: datetime) -> Optional[datetime]:
+    """The regular-session close (16:00 ET, 13:00 on a half day) of the most
+    recent session that had closed by ``ts``, or None past the lookback."""
+    ts_et = ts.astimezone(_ET)
+    day = ts_et.date()
+    if is_trading_session(day) and ts_et.time() >= regular_session_close(day):
+        return datetime.combine(day, regular_session_close(day), tzinfo=_ET)
+    for _ in range(_OPEN_INTEREST_SESSION_LOOKBACK_DAYS):
+        day -= timedelta(days=1)
+        if is_trading_session(day):
+            return datetime.combine(day, regular_session_close(day), tzinfo=_ET)
+    return None
+
+
+def _open_interest_min_expiration(now: datetime) -> date:
+    """Serve only contracts expiring AFTER this date.
+
+    Same roll-off as the analytics snapshot's ``min_expiration``
+    (src/analytics/main_engine.py): a contract expiring today stays in the
+    book until the 16:15 ET options close. Without it the closing snapshot
+    would carry Friday's expired 0DTE contracts through the weekend.
+    """
+    now_et = now.astimezone(_ET)
+    if now_et.time() < OPTION_CHAIN_CLOSE:
+        return now_et.date() - timedelta(days=1)
+    return now_et.date()
 
 
 def _expected_flow_series_bars(session_start: datetime, session_end: datetime) -> int:
@@ -8517,15 +8583,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching option quote: {e}", exc_info=True)
             raise
 
-    async def get_open_interest(self, underlying: str) -> Optional[Dict[str, Any]]:
+    async def get_open_interest(
+        self, underlying: str, now: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
         """Get the most recent OI snapshot + per-contract directional dollar exposure.
 
         Uses the stable-snapshot CTE to avoid returning an in-flight minute bucket
         that ingestion is still populating; see STABLE_SNAPSHOT_CTE for details.
-        Returns one row per (strike, expiration, option_type) combination from the
-        chosen snapshot, ordered by expiration then strike then option_type.
+        Outside the option session that bucket is only the last few residual
+        quotes, so the read moves to the final bucket of the most recent regular
+        session instead (see _open_interest_session_is_live). Contracts that have
+        expired by ``now`` are dropped. Returns one row per (strike, expiration,
+        option_type) combination from the chosen snapshot, ordered by expiration
+        then strike then option_type.
         """
         underlying = underlying.upper()
+        min_expiration = _open_interest_min_expiration(now or datetime.now(timezone.utc))
         # exposure_ts: the most recent snapshot at or before the stable
         # `latest_ts` that actually has Greeks populated (gamma IS NOT NULL).
         # The stable CTE picks the absolute latest minute-bucket; over
@@ -8540,7 +8613,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # NULL across *all* of history the COALESCE degrades to the stable
         # `latest_ts` so open interest still renders (exposure 0) — never
         # less than the pre-fix behavior.
-        query = f"""
+        snapshot_query = f"""
             WITH {_STABLE_SNAPSHOT_CTE},
             exposure_ts AS (
                 SELECT COALESCE(
@@ -8556,8 +8629,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ),
                     (SELECT ts FROM latest_ts)
                 ) AS ts
-            ),
-            latest_spot AS (
+            )
+            SELECT ts FROM exposure_ts
+        """
+        # The rows read takes the resolved bucket as a literal ($2) rather
+        # than joining the CTE, so the planner sees an equality on
+        # (underlying, timestamp) and probes idx_option_chains_underlying_timestamp.
+        query = """
+            WITH latest_spot AS (
                 SELECT close::numeric AS spot_price
                 FROM underlying_quotes
                 WHERE symbol = $1
@@ -8583,10 +8662,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )::numeric AS exposure,
                 oc.updated_at
             FROM option_chains oc
-            JOIN exposure_ts et ON oc.timestamp = et.ts
             CROSS JOIN latest_spot ls
             WHERE oc.underlying = $1
+              AND oc.timestamp = $2
               AND oc.open_interest IS NOT NULL
+              AND oc.expiration > $3
             ORDER BY oc.expiration, oc.strike, oc.option_type
         """
         try:
@@ -8603,7 +8683,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )
                 if not spot_row:
                     return None
-                rows = await conn.fetch(query, underlying)
+                snapshot_ts = await conn.fetchval(snapshot_query, underlying)
+                if snapshot_ts is None:
+                    return None
+                if not _open_interest_session_is_live(snapshot_ts, underlying):
+                    closing_ts = await self._open_interest_closing_snapshot(
+                        conn, underlying, snapshot_ts
+                    )
+                    # No regular-session bucket at all: keep the newest one
+                    # rather than return nothing — never less than before.
+                    if closing_ts is not None:
+                        snapshot_ts = closing_ts
+                rows = await conn.fetch(query, underlying, snapshot_ts, min_expiration)
                 if not rows:
                     return None
                 return {
@@ -8614,6 +8705,43 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching open interest for {underlying}: {e}", exc_info=True)
             raise
+
+    # One backward step on idx_option_chains_underlying_ts_gamma (partial,
+    # gamma IS NOT NULL) from a session close: O(1) like exposure_ts above.
+    _OPEN_INTEREST_CLOSING_SNAPSHOT_SQL = """
+        SELECT timestamp
+        FROM option_chains
+        WHERE underlying = $1
+          AND gamma IS NOT NULL
+          AND timestamp < $2
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """
+
+    async def _open_interest_closing_snapshot(
+        self, conn: Any, underlying: str, snapshot_ts: datetime
+    ) -> Optional[datetime]:
+        """The last gamma-bearing bucket inside a regular session, before ``snapshot_ts``.
+
+        Normally one probe: the bucket just before the most recent close. When
+        that session has no gamma-bearing bucket at all (ingestion down all
+        day), the probe lands in an earlier evening's residual ticks instead,
+        so the bound steps back to that day's close and probes again. Each
+        step's bound is strictly earlier than the last, and the loop is capped.
+        """
+        bound = _regular_close_at_or_before(snapshot_ts)
+        for _ in range(_OPEN_INTEREST_SESSION_LOOKBACK_DAYS):
+            if bound is None:
+                return None
+            candidate = await conn.fetchval(
+                self._OPEN_INTEREST_CLOSING_SNAPSHOT_SQL, underlying, bound
+            )
+            if candidate is None:
+                return None
+            if in_regular_session(candidate):
+                return candidate
+            bound = _regular_close_at_or_before(candidate)
+        return None
 
     async def _resolve_option_symbol(
         self,

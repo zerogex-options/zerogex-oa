@@ -2671,7 +2671,10 @@ async def get_open_interest(
     """Get current open interest for each option contract for the underlying.
 
     Returns one record per (strike, expiration, option_type) from the most recent
-    option chain snapshot, ordered by expiration, strike, and option type.
+    option chain snapshot, ordered by expiration, strike, and option type. Outside
+    the options session (evenings, weekends, holidays and pre-market) the snapshot
+    is the final minute of the most recent regular session. Contracts that have
+    expired are omitted.
     """
     data = await _db().get_open_interest(underlying)
     if not data or not data.get("contracts"):

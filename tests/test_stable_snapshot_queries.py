@@ -19,14 +19,19 @@ from src.api.database import DatabaseManager
 class _RecordingConn:
     """Captures queries and returns canned results keyed by query-substring match."""
 
-    def __init__(self, fetchrow_row=None, fetch_rows=None):
+    def __init__(self, fetchrow_row=None, fetch_rows=None, fetchval_value=None):
         self._fetchrow_row = fetchrow_row
         self._fetch_rows = fetch_rows or []
+        self._fetchval_value = fetchval_value
         self.queries = []
 
     async def fetchrow(self, query, *_args):
         self.queries.append(query)
         return self._fetchrow_row
+
+    async def fetchval(self, query, *_args):
+        self.queries.append(query)
+        return self._fetchval_value
 
     async def fetch(self, query, *_args):
         self.queries.append(query)
@@ -66,9 +71,12 @@ def test_get_open_interest_uses_stable_snapshot_cte():
         "exposure": 0,
         "updated_at": ts,
     }
+    # 14:30 UTC is 10:30 ET on a Friday: inside the option session, so the
+    # stable bucket is served as-is and no closing-snapshot probe runs.
     conn = _RecordingConn(
         fetchrow_row={"spot_price": 500.0},
         fetch_rows=[row],
+        fetchval_value=ts,
     )
     _install_conn(db, conn)
 
@@ -77,24 +85,30 @@ def test_get_open_interest_uses_stable_snapshot_cte():
     assert result is not None
     assert result["underlying"] == "SPY"
     assert len(result["contracts"]) == 1
-    # The second query (fetch) should be the open-interest query with the CTE.
-    oi_query = conn.queries[1]
-    assert "recent_ts AS" in oi_query
-    assert "snapshot_stats AS" in oi_query
-    assert "latest_ts AS" in oi_query
+    # Spot, then the snapshot resolution (fetchval), then the rows read.
+    assert len(conn.queries) == 3
+    snapshot_query = conn.queries[1]
+    assert "recent_ts AS" in snapshot_query
+    assert "snapshot_stats AS" in snapshot_query
+    assert "latest_ts AS" in snapshot_query
     # Must not fall back to the sparse-prone `MAX(timestamp)` pattern.
-    assert "MAX(timestamp)" not in oi_query
+    assert "MAX(timestamp)" not in snapshot_query
     # Weekend/after-hours fallback: exposure must be anchored on the most
     # recent snapshot whose Greeks are populated, not the terminal bucket
     # whose gamma is NULL (which would zero every contract's exposure).
-    assert "exposure_ts AS" in oi_query
-    assert "oc.gamma IS NOT NULL" in oi_query
-    assert "JOIN exposure_ts et ON oc.timestamp = et.ts" in oi_query
+    assert "exposure_ts AS" in snapshot_query
+    assert "oc.gamma IS NOT NULL" in snapshot_query
     # Safety net: if gamma is NULL across all of history the fallback must
     # degrade to the stable latest_ts (OI still renders, exposure 0) rather
     # than returning nothing — never less than the pre-fix behavior.
-    assert "COALESCE(" in oi_query
-    assert "SELECT ts FROM latest_ts" in oi_query
+    assert "COALESCE(" in snapshot_query
+    assert "SELECT ts FROM latest_ts" in snapshot_query
+    # The rows read is pinned to the resolved bucket and drops expired
+    # contracts.
+    oi_query = conn.queries[2]
+    assert "oc.timestamp = $2" in oi_query
+    assert "oc.expiration > $3" in oi_query
+    assert "oc.open_interest IS NOT NULL" in oi_query
 
 
 def test_get_vol_surface_data_uses_stable_snapshot_cte():
