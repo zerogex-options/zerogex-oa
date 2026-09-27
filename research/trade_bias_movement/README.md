@@ -157,6 +157,44 @@ comparisons, so about one interval in twenty excludes 1.00 by chance alone.
   of its time.
 * **Intraday only**, 15 minutes to the close.
 
+## Result: the 2026-09-25 run
+
+49 sessions (2026-07-17 to 2026-09-25), SPY and SPX, 38,207 cash-session minutes. The
+stored inputs reproduced the stored market state on 100.00% of minutes.
+
+**Verdict: NOTHING DETECTABLE for all three states the panel shows. Awaiting
+confluence never appeared.** No state is followed by more or less travel than the
+panel's other states, and none comes close (the smallest p is 0.40).
+
+| State | Copy says | Minutes (days) | Same symbol | + same time of day | + same recent movement: the verdict |
+|---|---|---|---|---|---|
+| Trend Up / Down | no claim | 5,123 (35) | 0.92 [0.80, 1.07] | 0.92 [0.81, 1.06] | **0.97 [0.92, 1.04]** NOTHING DETECTABLE |
+| Trap Squeeze / Reversal | more | 1,004 (29) | 1.11 [0.91, 1.31] | 1.16 [0.97, 1.36] | **1.04 [0.95, 1.12]** NOTHING DETECTABLE |
+| Chop (Range-Bound) | less | 29,140 (49) | 1.05 [0.93, 1.19] | 1.04 [0.92, 1.17] | **1.02 [0.96, 1.07]** NOTHING DETECTABLE |
+| Awaiting confluence | less | 0 | | | TOO RARE: never on the panel in the cash session |
+
+* **"Range-Bound" does not mark quieter markets.** Chop is on the panel for 84% (SPY)
+  and 81% (SPX) of cash-session minutes, and those minutes travel as far as the rest,
+  before any adjustment (1.05) and after (1.02). It is the panel's default state, not a
+  read on movement.
+* **"Short-gamma expansion" is not detectable either.** Trap minutes travel 1.04x as far
+  as comparable minutes. They lean further over longer windows (1.12 at 60 minutes, 1.16
+  to the close), but neither is clearly above 1 (the intervals reach down to 0.99 and
+  1.00), and the Trap states are on the panel only 1.6% (SPY) and 4.3% (SPX) of the time.
+* **Nothing clear at any horizon, for any single state, or for either symbol.**
+* **The clock and the tape carry the movement information.** The first half hour travels
+  1.76x as far as the rest of the day. After the busiest fifth of recent movement, price
+  travels 1.61x as far as after the other fifths at the same half hour; after the
+  quietest fifth, 0.75x.
+* **One lead, outside the verdicts: the panel's gamma regime.** Short gamma, by
+  production's definition, travels 1.26x [1.08, 1.45] as far as the other minutes, and
+  1.08x [1.03, 1.13] after the clock and the tape; the zone where net GEX and the gradient
+  disagree ("neither", 23% of minutes) 0.92x [0.88, 0.97]. This is uncorrected context
+  and under the 10% bar, but it runs the way the textbook predicts and matches
+  `research/short_gamma_trend` (1.29x raw in short gamma with one-sided flow). The states
+  hide it: Chop, most of the day, mixes short and long gamma. Confirming it needs
+  sessions this run has not seen.
+
 ## How to run it
 
 From the repository root, with the service's environment (the `.env` the services
