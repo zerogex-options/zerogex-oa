@@ -5,12 +5,13 @@ Why this is urgent rather than optional
 The Analytics Engine writes only the CURRENT session's snapshot rows each
 cycle, so on the day the table ships it holds one day. Everything before that
 exists solely in ``flow_contract_facts``, which ``make db-prune`` deletes at
-``DATA_RETENTION_DAYS`` (90) — and once a day falls out of that window it is
+``DATA_RETENTION_DAYS`` (90 by default, 60 on the production deployment) — and
+once a day falls out of that window it is
 unrecoverable, because the snapshot is the only thing that would have
 outlived it.
 
-So this is a one-way door with a clock on it: run it once, soon, and ~90 days
-of Hedging Flow history exists permanently. Don't, and that history ages out a
+So this is a one-way door with a clock on it: run it once, soon, and whatever
+``flow_contract_facts`` still holds exists permanently. Don't, and that history ages out a
 day at a time while the feature that needs it is being built.
 
 The sibling tool ``flow_series_5min_backfill`` deliberately covers only
@@ -38,7 +39,7 @@ rows — the IS DISTINCT FROM guard suppresses it.
 
 Usage:
     python -m src.tools.hedging_flow_5min_backfill --symbols SPY
-    python -m src.tools.hedging_flow_5min_backfill --symbols SPY,QQQ --days 90
+    python -m src.tools.hedging_flow_5min_backfill --symbols SPY,QQQ --days 0
     python -m src.tools.hedging_flow_5min_backfill --symbols SPY --date 2026-06-12
     python -m src.tools.hedging_flow_5min_backfill --symbols SPY --dry-run
 """

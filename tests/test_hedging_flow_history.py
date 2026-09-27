@@ -5,7 +5,8 @@ What these pin, and why each one is worth a test
 The feature is "a permalink for a past session", and every way it can fail is
 quiet. A dated read that silently resolves to today serves the wrong chart
 under the right URL. A dated read that reaches for ``flow_contract_facts``
-works for 90 days and then returns an empty session that looks exactly like a
+works for the retention window and then returns an empty session that looks
+exactly like a
 quiet day. A dated page that 404s on a blank response costs the permalink its
 place in the search index. None of those throw.
 
@@ -217,7 +218,7 @@ def test_dated_0dte_read_serves_the_0dte_scope():
 def test_dated_read_with_an_unstored_filter_falls_back_to_the_cte():
     """Two materialised scopes is a closed set; anything else runs live.
 
-    That inherits the 90-day horizon, which is the same tradeoff
+    That inherits the retention horizon, which is the same tradeoff
     flow_series_5min makes for filtered reads — documented rather than hidden.
     """
     conn = _CannedConn(fetchval_sequence=[1], fetch_rows=[])

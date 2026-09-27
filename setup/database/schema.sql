@@ -1154,8 +1154,9 @@ END $$;
 -- per-bucket deltas, and it is the cheap one.
 --
 -- It exists for RETENTION. flow_contract_facts is in DB_MAINTAIN_TABLES, so
--- `make db-prune` deletes it at DATA_RETENTION_DAYS (90). A past session
--- recomputed from it therefore answers for a quarter and then comes back
+-- `make db-prune` deletes it at DATA_RETENTION_DAYS (90 by default, 60 on the
+-- production deployment). A past session
+-- recomputed from it therefore answers for that window and then comes back
 -- empty, which on a chart is indistinguishable from a genuinely quiet day --
 -- the worst available failure. Storing the finished bars lets a session
 -- outlive the trades that produced it, the same move made for gex_summary and
