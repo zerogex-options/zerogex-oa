@@ -204,20 +204,48 @@ def _underlyings() -> list[str]:
 
 
 def _data_window(conn) -> dict:
-    """Earliest/latest option_chains timestamps available to a backtest."""
-    earliest = latest = None
+    """Earliest/latest days a backtest can price option legs for.
+
+    The engine prices legs from ``option_chains`` and falls back to
+    ``option_chains_archive`` for anything the hot table has already pruned
+    (``engine._LEG_QUOTE_TABLES``), so the window spans both. Reading only the
+    hot table reported a window that started ~DATA_RETENTION_DAYS ago, and the
+    Backtesting page clamps its date pickers to it, which hid every archived
+    session from the backtests the archive exists for.
+
+    The archive is indexed on (underlying, timestamp) only, so its bounds are
+    read per underlying: a bare MIN(timestamp) there would scan the whole
+    table on every page load.
+    """
+    from src.backtesting.engine import _archive_available
+
+    starts: list = []
+    ends: list = []
     try:
         cur = conn.cursor()
         cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM option_chains")
         row = cur.fetchone()
         if row:
-            earliest = row[0].date().isoformat() if row[0] else None
-            latest = row[1].date().isoformat() if row[1] else None
+            starts.append(row[0])
+            ends.append(row[1])
+        if _archive_available(conn):
+            for underlying in _underlyings():
+                cur.execute(
+                    "SELECT MIN(timestamp), MAX(timestamp) FROM option_chains_archive"
+                    " WHERE underlying = %s",
+                    (underlying,),
+                )
+                row = cur.fetchone()
+                if row:
+                    starts.append(row[0])
+                    ends.append(row[1])
     except Exception:  # pragma: no cover
         logger.warning("backtest meta: data window query failed", exc_info=True)
+    starts = [t for t in starts if t is not None]
+    ends = [t for t in ends if t is not None]
     return {
-        "earliest": earliest,
-        "latest": latest,
+        "earliest": min(starts).date().isoformat() if starts else None,
+        "latest": max(ends).date().isoformat() if ends else None,
         "retention_days": DATA_RETENTION_DAYS,
     }
 
