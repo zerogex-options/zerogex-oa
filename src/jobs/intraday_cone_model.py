@@ -134,30 +134,41 @@ DIURNAL_CLOSE_DECAY = 0.09   # ≈35 min e-folding
 # ---------------------------------------------------------------------------
 # Known limitation: the anchor cannot see a regime change coming
 # ---------------------------------------------------------------------------
-# Over ten graded sessions the cone calibrates well in aggregate — per symbol
-# NDX -4.1, SPX -0.3, SPY -0.1, QQQ +2.3 points, roughly 824 claims each. That
-# average is carried by the quiet majority, and the error is concentrated
-# exactly where it would be expected to be.
+# Read this next to the vol_ratio split under CONE_PATH_EXPONENT, because the
+# two failures were entangled for three weeks and separating them mattered.
 #
 # The vol anchor is the median of prior sessions' GRADED realized ratios. It
-# is by construction backward-looking, so on a day that breaks out of its
+# is backward-looking by construction, so on a day that breaks out of its
 # trailing range it is too low, the bands are too tight, and the published
-# probability is too high. Both such sessions in the history say the same
-# thing:
+# probability is too high. That is real and it is not tunable: no setting of a
+# trailing median anticipates a breakout. Closing it needs something that
+# reacts WITHIN the session — a larger realized weight once the tape diverges
+# from the anchor, or explicit widening when it does.
+#
+# What hid behind it was a second, ordinary problem: the geometry was simply
+# too narrow for every day, not just the violent ones. That stayed invisible
+# while the tape kept running quieter than the basis, because a band that is
+# too narrow costs nothing on a day that never reaches it. The tell was that
+# the gap tracked vol_ratio rather than tracking volatility: sessions where
+# the tape merely MET the model's own assumption were already 15 points
+# overconfident, which a breakout cannot explain. v1_7 fixes that half.
+#
+# What remains is genuinely the anchor, and it still shows on the days that
+# most deserve a correct number:
 #
 #   2026-09-16   vol_ratio 2.03-2.75   SPY -24.5   SPX -13.1   QQQ -22.9
 #   2026-09-21   vol_ratio 1.39-1.41   SPY -25.8   SPX -26.0   QQQ  -2.4
 #
 # Overconfidence is the dangerous direction — it says a level will hold when
-# it will not — and it lands on the days a reader is most likely to be acting.
-# It is not a bug to be fixed by tuning: no setting of a trailing median
-# anticipates a breakout. Closing it needs something that reacts WITHIN the
-# session, either a larger realized weight once the tape diverges from the
-# anchor, or explicit widening when it does.
+# it will not — and it lands on the days a reader is most likely to act on.
+# Recorded here so it reads as a known limitation rather than a discovery, and
+# so the reliability table is understood to be reporting it rather than
+# hiding it.
 #
-# Deliberately not attempted on ten sessions with two active ones. Recorded
-# here so it is a known limitation rather than a discovery, and so the
-# reliability table is read as reporting it rather than hiding it.
+# The general lesson, which cost three weeks: an aggregate that looks
+# calibrated is evidence about the days in the sample, not about the model.
+# Always ask what the easy days are paying for. `make cone-calibration` now
+# prints vol_ratio and chop per session so the question can be asked directly.
 
 #: Half-width of the raw cone in horizon sigmas before gamma conditioning.
 #:
@@ -295,48 +306,60 @@ MAX_HALF_FRACTION = 0.0250
 #: graded, so band geometry can never close a gap that lives in the process
 #: assumption.
 #:
-#: 0.575 is fitted and holdout-validated. A modest correction, which is
-#: reassuring — a large one would have implicated the vol basis rather than
-#: the process assumption.
-CONE_PATH_EXPONENT = 0.575
+#: 0.50 — plain Brownian — is where this lands, and how it got back here is
+#: worth recording, because the wrong answer was arrived at honestly.
+#:
+#: v1_6 shipped 0.575, fitted and holdout-validated over nine graded sessions.
+#: That was a real fit on real data. It was also fitted entirely inside a
+#: stretch where the tape kept coming in QUIETER than the model's own vol
+#: basis, and a band that is too narrow costs nothing on a day that never
+#: tests it. Splitting all 56 graded session-symbols on whether the tape met
+#: that basis makes the flattery visible:
+#:
+#:   vol_ratio  < 0.99  (tape quieter than assumed)   mean gap   +2.9 pts  n=31
+#:   vol_ratio >= 0.99  (tape met it or beat it)      mean gap  -15.0 pts  n=25
+#:
+#: At vol_ratio 1 the tape delivered exactly what the basis expected, so a
+#: correct geometry reads near zero there. It read -15. The bands were too
+#: narrow the entire time; the quiet was paying the bill.
+#:
+#: Returning the exponent to 0.5 beats 0.575 out of sample on every symbol
+#: that ran it, on BOTH metrics, holdout split by session:
+#:
+#:   SPY   mean |gap| 16.6 -> 7.0     Brier 0.2334 -> 0.2117
+#:   SPX              23.6 -> 15.7          0.2779 -> 0.2475
+#:   QQQ              13.6 -> 4.9           0.2101 -> 0.1929
+#:
+#: Prefer 0.5 on ties from here on. It is the theoretical value rather than a
+#: fitted one, so sitting on it means there is no free parameter here for the
+#: next quiet stretch to overfit.
+CONE_PATH_EXPONENT = 0.50
 
-#: Per-symbol overrides, because one instrument genuinely differs.
+#: Per-symbol overrides.  Empty, and why it is empty is the useful part.
 #:
-#: NDX ran 13 points OVERCONFIDENT under the shared 0.575 while QQQ, SPX and
-#: SPY sat near +2 — and NDX and QQQ track the same index, so that spread was
-#: never volatility. Fitted alone, NDX wants plain Brownian: held-out mean
-#: |gap| 11.9 -> 4.4 pts, Brier 0.1806 -> 0.1699, with leave-one-out showing
-#: the exponent accounts for essentially all of it.
+#: v1_6 carried {"NDX": 0.50} against a shared 0.575, because NDX ran 13
+#: points overconfident while the others sat near +2. It was documented as a
+#: one-off whose cause was unidentified — the microstructural story first
+#: offered for it (a cash index of many constituents versus a single liquid
+#: ETF) had already been falsified by SPX, which wanted 0.575 at the time and
+#: lost nine points of calibration when forced to 0.5.
 #:
-#: The observation is solid: NDX and QQQ agree on DAILY range almost exactly
-#: (0.937 vs 0.924, 0.643 vs 0.659, and so on across nine sessions) and on the
-#: vol basis, yet NDX's path covers that range with more sub-daily motion, so
-#: it earns no containment bonus over a driftless walk.
+#: The resolution is that NDX was never special. 0.575 was wrong for every
+#: symbol, and NDX was simply the one that got fitted to the right value for
+#: the wrong reason. Once the shared exponent moved to 0.5 the override became
+#: a no-op, and it is deleted rather than left sitting there looking like a
+#: finding. NDX was also the best performer on the very held-out sessions that
+#: broke the other three (-6.0 pts against -13.6, -16.6 and -23.6), which is
+#: what being on the right value looks like from the outside.
 #:
-#: The EXPLANATION first offered for it was wrong, and the record should say
-#: so. The guess was microstructural — a cash index computed from a hundred
-#: constituents against a single liquid ETF. SPX was then fitted as the test
-#: of that story, being a cash index built from five hundred, and it went the
-#: other way: on held-out sessions its leave-one-out reads
-#:
-#:   committed (0.575)            mean |gap| 0.9 pts    Brier 0.1631
-#:   path_exp -> 0.5 (Brownian)   mean |gap| 9.8 pts    Brier 0.1772
-#:
-#: Forcing NDX's value onto SPX costs nine points of calibration. So "cash
-#: index" is not the mechanism, and this is a one-off rather than the first
-#: instance of a rule. Whatever distinguishes NDX — index concentration, the
-#: strike grid, the quality of its bar data — remains unidentified. The
-#: override is justified by its own holdout, not by a story.
-#:
-#: Two controls now. QQQ's own fit FAILED its holdout (4.8 -> 8.6), and SPX's
-#: sweep landed back on the shared 0.575 with nothing in the grid beating it.
-#: Per-symbol fitting is therefore not finding noise wherever it looks, which
-#: is what makes this an override rather than a licence to fit every symbol
-#: separately. Add a symbol here only when its own holdout beats the shared
-#: value.
-CONE_PATH_EXPONENT_BY_SYMBOL: dict[str, float] = {
-    "NDX": 0.50,
-}
+#: The mechanism stays, because it costs nothing and the discipline around it
+#: was sound: a symbol belongs here only when its OWN holdout beats the shared
+#: value. What that discipline cannot catch is a shared value that is wrong
+#: for everyone — per-symbol fitting will happily reproduce a common bias four
+#: times over. Catching that took the vol_ratio split above, which asks a
+#: different question: not "is this symbol different" but "is the model only
+#: being tested on easy days".
+CONE_PATH_EXPONENT_BY_SYMBOL: dict[str, float] = {}
 
 
 def path_exponent_for(symbol: Optional[str]) -> float:
@@ -379,7 +402,11 @@ _IMAGE_TERMS = 6
 #:         one: holdout mean |gap| 12.5 -> 3.1 pts, Brier 0.206 -> 0.158
 #:   v1_6  per-symbol path exponent; NDX to 0.50 on its own holdout
 #:         (|gap| 11.9 -> 4.4). QQQ tested as a control and left alone.
-MODEL_VERSION = "cone_v1_6"
+#:   v1_7  path exponent back to 0.50 for everyone, NDX override deleted as
+#:         redundant. v1_5/v1_6 fitted 0.575 during a stretch where the tape
+#:         ran quieter than the vol basis; once it stopped, 0.575 failed out
+#:         of sample on all three symbols carrying it, on gap and Brier both.
+MODEL_VERSION = "cone_v1_7"
 
 
 # ---------------------------------------------------------------------------
