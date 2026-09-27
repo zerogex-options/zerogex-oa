@@ -437,3 +437,57 @@ def test_draft_carries_the_gate_reason():
     _, body_html, body_text = _draft(gate_ok=False)
     assert "SPX and NDX have not cleared" in body_text
     assert "SPX and NDX have not cleared" in body_html
+
+
+# ---------------------------------------------------------------------------
+# The record is one model's, never a mixture
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDB:
+    """Captures what fetch_claims asks the database for."""
+
+    def __init__(self, rows=()):
+        self.calls: list[dict] = []
+        self._rows = list(rows)
+
+    async def get_graded_cone_history(self, symbol, since, **kw):
+        self.calls.append({"symbol": symbol, "since": since, **kw})
+        return [dict(r) for r in self._rows]
+
+
+def test_fetch_claims_scopes_the_record_to_the_running_model():
+    """A backfill under a new version can cover a session the live writer
+    already published. Pooling them would count that session twice and build a
+    public record partly out of numbers computed after the fact."""
+    import asyncio
+
+    from src.jobs.cone_tweet import MODEL_VERSION, fetch_claims
+
+    db = _RecordingDB()
+    asyncio.run(fetch_claims(db, ["SPY", "QQQ"], SESSION))
+
+    assert len(db.calls) == 2
+    for call in db.calls:
+        assert call.get("model_version") == MODEL_VERSION, (
+            "fetch_claims must scope to the running model, or the tweet "
+            "reports a record mixing two of them"
+        )
+
+
+def test_fetch_claims_survives_a_symbol_whose_read_fails():
+    """One bad symbol must not cost the whole record."""
+    import asyncio
+
+    from src.jobs.cone_tweet import fetch_claims
+
+    class _Flaky(_RecordingDB):
+        async def get_graded_cone_history(self, symbol, since, **kw):
+            if symbol == "SPX":
+                raise RuntimeError("connection reset")
+            return await super().get_graded_cone_history(symbol, since, **kw)
+
+    db = _Flaky([{"session_date": SESSION, "horizon_min": 30,
+                  "hold_prob": 0.8, "held": True, "brier": 0.04}])
+    claims = asyncio.run(fetch_claims(db, ["SPY", "SPX", "QQQ"], SESSION))
+    assert {c["symbol"] for c in claims} == {"SPY", "QQQ"}

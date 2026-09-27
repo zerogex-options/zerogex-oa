@@ -2864,7 +2864,11 @@ class SignalsQueriesMixin:
             return []
 
     async def get_graded_cone_history(
-        self, symbol: str, since: date, horizon_min: Optional[int] = None
+        self,
+        symbol: str,
+        since: date,
+        horizon_min: Optional[int] = None,
+        model_version: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Graded claims since ``since`` — the reliability table's input.
 
@@ -2872,18 +2876,29 @@ class SignalsQueriesMixin:
         outcome, the horizon and the session) rather than whole rows, because
         a 30-session window across four horizons is ~2,400 rows per symbol and
         the page recomputes the table on every request.
+
+        ``model_version`` scopes the result to ONE model, and every caller that
+        publishes a number should pass it. Two cohorts can cover the same
+        session — a live claim and a later backfill under a new version — and
+        pooling them double-counts that session while averaging two different
+        models, which is the thing the calibration report has warned against
+        since v1_5. It also carries ``model_version`` on each row so a caller
+        that deliberately wants the mixture can still tell the rows apart.
         """
         try:
             params: List[Any] = [symbol, since]
             clause = ""
             if horizon_min is not None:
                 params.append(horizon_min)
-                clause = " AND horizon_min = $3"
+                clause += f" AND horizon_min = ${len(params)}"
+            if model_version is not None:
+                params.append(model_version)
+                clause += f" AND model_version = ${len(params)}"
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(
                     f"""
                     SELECT session_date, forecast_ts, horizon_min,
-                           hold_prob, held, brier
+                           hold_prob, held, brier, model_version
                     FROM intraday_forecast
                     WHERE symbol = $1
                       AND session_date >= $2
