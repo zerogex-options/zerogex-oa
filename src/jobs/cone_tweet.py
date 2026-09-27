@@ -74,6 +74,7 @@ from zoneinfo import ZoneInfo
 from src.api.database import DatabaseManager
 from src.jobs.intraday_cone_model import (
     MIN_BRIER_SKILL,
+    MODEL_VERSION,
     base_rate_brier,
     beats_base_rate,
     brier_skill,
@@ -387,11 +388,22 @@ async def fetch_claims(
 
     One query per symbol because that is the shape the reliability endpoint
     already uses; the volume is a few thousand rows once a day.
+
+    Scoped to the RUNNING model, which matters more here than anywhere else.
+    Two cohorts can cover the same session: the claim the live writer published
+    at the time, and a later backfill under a new version. Pooling them would
+    make the tweet count those sessions twice and, worse, claim a record partly
+    built from numbers that were computed after the fact and shown to nobody.
+    A receipt that quietly includes hindsight is not a receipt. So the record
+    restarts at a version bump, and the publication gate's session floor is
+    what stops a freshly-bumped model from tweeting a three-day history.
     """
     out: list[dict[str, Any]] = []
     for symbol in symbols:
         try:
-            rows = await db.get_graded_cone_history(symbol, since)
+            rows = await db.get_graded_cone_history(
+                symbol, since, model_version=MODEL_VERSION
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "cone_tweet: get_graded_cone_history(%s) failed (%s) — skipping",

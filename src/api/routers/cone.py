@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 from src.jobs.intraday_cone_model import (
     CONE_HORIZONS_MIN,
     MIN_BRIER_SKILL,
+    MODEL_VERSION,
     base_rate_brier,
     beats_base_rate,
     brier_skill,
@@ -254,7 +255,12 @@ async def get_reliability(
     """
     sym = symbol.upper()
     since = datetime.now(tz=ET).date() - timedelta(days=window * 2)
-    rows = await db.get_graded_cone_history(sym, since)
+    # Scoped to the running model, not every claim ever graded. Two cohorts can
+    # cover the same session — the live claim and a later backfill under a new
+    # version — so pooling them would double-count those sessions AND average
+    # two models into one reliability table. A version bump restarts the sample
+    # on purpose: that is what the bump means.
+    rows = await db.get_graded_cone_history(sym, since, model_version=MODEL_VERSION)
 
     # The DB window is in calendar days; trim to the requested number of
     # SESSIONS so a long weekend or a holiday cannot shorten the sample.
@@ -277,6 +283,9 @@ async def get_reliability(
 
     return {
         "symbol": sym,
+        # Stated so a reader knows which model the table describes, and so a
+        # sample that looks short after a version bump explains itself.
+        "model_version": MODEL_VERSION,
         "window_sessions": window,
         "sessions_covered": len(sessions),
         "first_session": sessions[0].isoformat() if sessions else None,
