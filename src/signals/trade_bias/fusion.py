@@ -7,8 +7,8 @@ price action, order flow, tape, momentum — then either:
   * confirms it (agrees) → keep the bias, raise confidence;
   * diverges (leans against it, but not decisively) → keep the bias, cut
     confidence, flag caution; or
-  * overrides it (loud AND broad enough) → flip the bias and swap to a
-    reversal/squeeze playbook.
+  * overrides it (loud AND broad enough) → flip the bias and swap to the
+    live-read copy below.
 
 Override is the "we bounced off the low and price action, flow, tape and
 momentum are all screaming buy" behavior: it can overrule a negative-gamma
@@ -26,7 +26,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from src.signals.trade_bias.bias import BiasResult
+from src.signals.trade_bias.bias import NOT_A_FORECAST, BiasResult
 
 # Tactical pillar weights. Price action + momentum carry a reversal; flow + tape
 # corroborate. Renormalized over whichever pillars are available each cycle.
@@ -277,36 +277,35 @@ class FusedBias:
     overruled_posture: Optional[str]
 
 
+# Like the structural copy in bias.py, this describes the read; it gives no
+# trade instruction and makes no forecast. The codes stay: TradeWorkz and the
+# API key off them.
 _OVERRIDE_LONG = {
     "bias_code": "REVERSAL_LONG",
-    "bias_label": "Reversal Long",
-    "setup": "Bounce / Reversal (Long)",
+    "bias_label": "Live Read Bullish",
+    "setup": "Live Read Override",
     "playbook": [
-        "Confirm the low held — higher low or reclaim of the level",
-        "Enter longs on the reclaim, risk defined under the low",
-        "Target VWAP / prior resistance",
-        "Trail as flow, tape and momentum keep pushing up",
+        "The live read weakening or losing breadth",
+        "Structure and flow coming back into line",
     ],
     "expected_behavior": [
-        "Sharp rejection of the lows",
-        "Flow, tape and momentum flipping up together",
-        "Short-covering / squeeze potential",
+        "Price action, order flow, tape and momentum lean bullish together",
+        "Strong and broad enough to outweigh the structural read",
+        NOT_A_FORECAST,
     ],
 }
 _OVERRIDE_SHORT = {
     "bias_code": "REVERSAL_SHORT",
-    "bias_label": "Reversal Short",
-    "setup": "Rejection / Reversal (Short)",
+    "bias_label": "Live Read Bearish",
+    "setup": "Live Read Override",
     "playbook": [
-        "Confirm the high rejected — lower high or failed breakout",
-        "Enter shorts on the failure, risk defined above the high",
-        "Target VWAP / prior support",
-        "Trail as flow, tape and momentum keep pushing down",
+        "The live read weakening or losing breadth",
+        "Structure and flow coming back into line",
     ],
     "expected_behavior": [
-        "Sharp rejection of the highs",
-        "Flow, tape and momentum flipping down together",
-        "Long liquidation potential",
+        "Price action, order flow, tape and momentum lean bearish together",
+        "Strong and broad enough to outweigh the structural read",
+        NOT_A_FORECAST,
     ],
 }
 
@@ -355,14 +354,16 @@ def fuse(
     # baseline or drives a directional call out of a flat one.
     if gate and tact_sign != 0 and (struct_sign == 0 or tact_sign != struct_sign):
         tmpl = _OVERRIDE_LONG if tact_sign > 0 else _OVERRIDE_SHORT
-        regime = structural.regimeLabel.lower()
         if struct_sign != 0:
             reason = (
-                f"Live read (price action, flow, tape, momentum) overruled the "
-                f"{regime} — {structural.biasLabel.lower()} bias."
+                "The live read (price action, flow, tape, momentum) outweighed the "
+                f"structural read ({structural.regimeLabel})."
             )
         else:
-            reason = f"Live read drove a directional call out of the {regime}."
+            reason = (
+                "The live read (price action, flow, tape, momentum) set the lean; the "
+                f"structural read ({structural.regimeLabel}) had none."
+            )
         confidence = tactical.conviction * 100.0 * (0.6 + 0.4 * aligned_frac)
         return FusedBias(
             state="override",

@@ -7,9 +7,11 @@ dashboard's. Keep the two suites in lockstep.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from src.signals.trade_bias.bias import BiasInput, compute_bias
+from src.signals.trade_bias.bias import NOT_A_FORECAST, BiasInput, compute_bias
 
 
 def _bias(**kwargs):
@@ -252,3 +254,168 @@ def test_strongly_contradicting_gradient_blocks_long_gamma():
 def test_mildly_contradicting_gradient_does_not_block_long_gamma():
     r = _bias(netGEX=50, gexGradient=-10, tapeFlow=80, vannaCharm=60, odtePositioning=60, msi=30)
     assert r.marketState == "TREND_UP"
+
+
+# ---------------------------------------------------------------------------
+# The copy describes where positioning and flow stand; it gives no trade
+# instruction and makes no forecast (see the note in bias.py). The same table
+# is pinned against the dashboard's port in frontend/tests/tradeBias.test.ts,
+# so the two copies cannot drift apart without a test failing on one side.
+# ---------------------------------------------------------------------------
+
+_STATE_INPUTS = {
+    "TREND_UP": dict(
+        netGEX=50, gexGradient=60, tapeFlow=80, vannaCharm=60, odtePositioning=60, msi=50
+    ),
+    "TREND_DOWN": dict(
+        netGEX=50, gexGradient=60, tapeFlow=-80, vannaCharm=-60, odtePositioning=-60, msi=50
+    ),
+    "TRAP_REVERSAL": dict(
+        netGEX=-50, gexGradient=-60, tapeFlow=80, vannaCharm=60, odtePositioning=60,
+        positioningTrap=-40, trapDetection=-60, gammaVWAP=-40,
+    ),
+    "TRAP_SQUEEZE": dict(
+        netGEX=-50, gexGradient=-60, tapeFlow=-80, vannaCharm=-60, odtePositioning=-60,
+        positioningTrap=40, trapDetection=60, gammaVWAP=40,
+    ),
+    "CHOP": dict(netGEX=50, gexGradient=0, tapeFlow=0, vannaCharm=0, odtePositioning=0, msi=50),
+    "UNKNOWN": dict(netGEX=50, tapeFlow=0, msi=50),
+}
+
+_STATE_COPY = {
+    "TREND_UP": {
+        "code": "BUY_DIPS",
+        "regime": "Long Gamma \u00b7 Bullish Flow",
+        "desc": "Dealers are net long gamma, and most flow signals lean bullish.",
+        "lean": "Flow Bullish",
+        "state": "Aligned Flow",
+        "shows": [
+            "Net GEX positive: dealers net long gamma",
+            "Tape, vanna/charm and 0DTE flow: majority bullish",
+            NOT_A_FORECAST,
+        ],
+        "changes": [
+            "Flow losing its bullish majority",
+            "Net GEX turning negative, or the gradient strongly against it",
+        ],
+    },
+    "TREND_DOWN": {
+        "code": "SELL_RIPS",
+        "regime": "Long Gamma \u00b7 Bearish Flow",
+        "desc": "Dealers are net long gamma, and most flow signals lean bearish.",
+        "lean": "Flow Bearish",
+        "state": "Aligned Flow",
+        "shows": [
+            "Net GEX positive: dealers net long gamma",
+            "Tape, vanna/charm and 0DTE flow: majority bearish",
+            NOT_A_FORECAST,
+        ],
+        "changes": [
+            "Flow losing its bearish majority",
+            "Net GEX turning negative, or the gradient strongly against it",
+        ],
+    },
+    "TRAP_REVERSAL": {
+        "code": "FADE_STRENGTH",
+        "regime": "Short Gamma \u00b7 Flow vs. Structure",
+        "desc": (
+            "Dealers are net short gamma. Flow leans bullish while the structure signals lean "
+            "bearish."
+        ),
+        "lean": "Structure Bearish",
+        "state": "Flow/Structure Split",
+        "shows": [
+            "Net GEX negative: dealers net short gamma",
+            "Flow majority bullish; structure majority bearish",
+            NOT_A_FORECAST,
+        ],
+        "changes": [
+            "Flow or structure losing its majority",
+            "Net GEX turning positive, or the gradient strongly against it",
+        ],
+    },
+    "TRAP_SQUEEZE": {
+        "code": "FADE_WEAKNESS",
+        "regime": "Short Gamma \u00b7 Flow vs. Structure",
+        "desc": (
+            "Dealers are net short gamma. Flow leans bearish while the structure signals lean "
+            "bullish."
+        ),
+        "lean": "Structure Bullish",
+        "state": "Flow/Structure Split",
+        "shows": [
+            "Net GEX negative: dealers net short gamma",
+            "Flow majority bearish; structure majority bullish",
+            NOT_A_FORECAST,
+        ],
+        "changes": [
+            "Flow or structure losing its majority",
+            "Net GEX turning positive, or the gradient strongly against it",
+        ],
+    },
+    "CHOP": {
+        "code": "RANGE_FADE",
+        "regime": "Mixed Signals",
+        "desc": "The gamma regime, flow and structure signals do not line up into a defined state.",
+        "lean": "Mixed",
+        "state": "No Defined State",
+        "shows": [
+            "No flow majority in long gamma, and no flow/structure split in short gamma",
+            "Most minutes read this way; it does not mean the market is quiet",
+            NOT_A_FORECAST,
+        ],
+        "changes": [
+            "Flow forming a majority while dealers are long gamma",
+            "Flow and structure splitting while dealers are short gamma",
+        ],
+    },
+    "UNKNOWN": {
+        "code": "WAIT",
+        "regime": "Not Enough Data",
+        "desc": "Fewer than four of the nine inputs are reporting.",
+        "lean": "No Read",
+        "state": "No Defined State",
+        "shows": ["Waiting on more inputs to report", NOT_A_FORECAST],
+        "changes": ["More of the nine inputs reporting"],
+    },
+}
+
+#: Trade instructions and movement promises the copy used to make.
+_INSTRUCTION = re.compile(
+    r"\b(buy|sell|enter|entry|target|trail|stops?|fade|favor|avoid|dips|rips|longs|shorts|"
+    r"puts|calls|theta|expansion|squeeze|reversal|grind|drift|pin|magnet|chop|range-bound|"
+    r"breakout)\b",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.parametrize("state", sorted(_STATE_COPY))
+def test_state_copy_describes_and_does_not_instruct(state):
+    r = _bias(**_STATE_INPUTS[state])
+    assert r.marketState == state
+    expected = _STATE_COPY[state]
+    assert r.bias == expected["code"]  # TradeWorkz and the API key off the codes
+    assert (r.regimeLabel, r.regimeDesc, r.biasLabel, r.setup) == (
+        expected["regime"],
+        expected["desc"],
+        expected["lean"],
+        expected["state"],
+    )
+    assert r.expectedBehavior == expected["shows"]
+    assert r.playbook == expected["changes"]
+    copy = (r.regimeLabel, r.regimeDesc, r.biasLabel, r.setup, *r.playbook, *r.expectedBehavior)
+    for line in copy:
+        assert not _INSTRUCTION.search(line), (state, line)
+
+
+def test_override_copy_describes_and_does_not_instruct():
+    from src.signals.trade_bias.fusion import _OVERRIDE_LONG, _OVERRIDE_SHORT
+
+    assert (_OVERRIDE_LONG["bias_code"], _OVERRIDE_SHORT["bias_code"]) == (
+        "REVERSAL_LONG",
+        "REVERSAL_SHORT",
+    )
+    for tmpl in (_OVERRIDE_LONG, _OVERRIDE_SHORT):
+        lines = [tmpl["bias_label"], tmpl["setup"], *tmpl["playbook"], *tmpl["expected_behavior"]]
+        for line in lines:
+            assert not _INSTRUCTION.search(str(line)), line

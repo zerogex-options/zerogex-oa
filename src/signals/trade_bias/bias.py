@@ -38,6 +38,14 @@ MODERATE = float(os.getenv("TRADE_BIAS_MODERATE", "12"))
 DOMINANT = float(os.getenv("TRADE_BIAS_DOMINANT", "65"))
 MAX_CONFIDENCE = 10.0
 
+#: The copy below describes where positioning and flow stand; it gives no trade
+#: instruction and makes no forecast. ZeroGEX's own replays of every minute
+#: since 2026-07-17 (research/short_gamma_trend, research/trade_bias_inputs,
+#: research/trade_bias_movement) found that no state predicted the direction
+#: or the size of the next move, and no input predicted its direction.
+#: ``frontend/core/tradeBias.ts`` carries the same strings; keep them in step.
+NOT_A_FORECAST = "A description of the current read, not a forecast"
+
 # Front-end signal keys used for the CHOP "watching" chips.
 SIGNAL_LABELS = {
     "tapeFlow": "Tape Flow",
@@ -199,32 +207,36 @@ def compute_bias(inp: BiasInput) -> BiasResult:
             return
         bias_scores.append(max(0.0, (v * expected_sign) / 100.0))
 
+    # Defaults are the UNKNOWN state's copy: fewer than four inputs reporting.
     trend = "neutral"
-    bias_label = "Neutral"
+    bias_label = "No Read"
     bias = "WAIT"
-    regime_label = "Awaiting confluence"
-    regime_desc = "Signals mixed. Wait for alignment."
-    setup = "No defined setup"
-    playbook = ["Wait for signal alignment", "Avoid premium decay exposure", "Re-assess every 15m"]
-    expected_behavior = ["Range-bound / choppy", "Low directional conviction"]
+    regime_label = "Not Enough Data"
+    regime_desc = "Fewer than four of the nine inputs are reporting."
+    setup = "No Defined State"
+    # ``playbook`` is what would move the panel out of its current state;
+    # ``expected_behavior`` is what the inputs show. Field names are the API's.
+    playbook = ["More of the nine inputs reporting"]
+    expected_behavior = ["Waiting on more inputs to report", NOT_A_FORECAST]
 
     if market_state == "TRAP_REVERSAL":
         trend = "bearish"
         bias = "FADE_STRENGTH"
-        bias_label = "Sell Strength"
-        regime_label = "Trap / Reversal Regime"
-        regime_desc = "Short gamma + bullish flow + crowded structure = reversal setup."
-        setup = "Trap / Reversal"
+        bias_label = "Structure Bearish"
+        regime_label = "Short Gamma \u00b7 Flow vs. Structure"
+        regime_desc = (
+            "Dealers are net short gamma. Flow leans bullish while the structure signals lean "
+            "bearish."
+        )
+        setup = "Flow/Structure Split"
         playbook = [
-            "Wait for upside push to stall",
-            "Watch for rejection at resistance / VWAP",
-            "Enter puts on failure confirmation",
-            "Target liquidity sweep / downside expansion",
+            "Flow or structure losing its majority",
+            "Net GEX turning positive, or the gradient strongly against it",
         ]
         expected_behavior = [
-            "Early strength fails",
-            "Choppy rejection at resistance",
-            "Short-gamma expansion lower",
+            "Net GEX negative: dealers net short gamma",
+            "Flow majority bullish; structure majority bearish",
+            NOT_A_FORECAST,
         ]
         push(tapeFlow, 1)
         push(vannaCharm, 1)
@@ -237,20 +249,21 @@ def compute_bias(inp: BiasInput) -> BiasResult:
     elif market_state == "TRAP_SQUEEZE":
         trend = "bullish"
         bias = "FADE_WEAKNESS"
-        bias_label = "Buy Weakness"
-        regime_label = "Trap / Squeeze Regime"
-        regime_desc = "Short gamma + bearish flow + trapped shorts = squeeze setup."
-        setup = "Trap / Squeeze"
+        bias_label = "Structure Bullish"
+        regime_label = "Short Gamma \u00b7 Flow vs. Structure"
+        regime_desc = (
+            "Dealers are net short gamma. Flow leans bearish while the structure signals lean "
+            "bullish."
+        )
+        setup = "Flow/Structure Split"
         playbook = [
-            "Wait for downside flush to stall",
-            "Watch for reclaim of VWAP / support",
-            "Enter calls on reversal confirmation",
-            "Target short-cover squeeze / upside expansion",
+            "Flow or structure losing its majority",
+            "Net GEX turning positive, or the gradient strongly against it",
         ]
         expected_behavior = [
-            "Early weakness fails",
-            "Flush reclaims support",
-            "Short-gamma expansion higher",
+            "Net GEX negative: dealers net short gamma",
+            "Flow majority bearish; structure majority bullish",
+            NOT_A_FORECAST,
         ]
         push(tapeFlow, -1)
         push(vannaCharm, -1)
@@ -263,19 +276,18 @@ def compute_bias(inp: BiasInput) -> BiasResult:
     elif market_state == "TREND_UP":
         trend = "bullish"
         bias = "BUY_DIPS"
-        bias_label = "Buy Dips"
-        regime_label = "Trend Up Regime"
-        regime_desc = "Long gamma + aligned bullish flow."
-        setup = "Trend Continuation (Up)"
+        bias_label = "Flow Bullish"
+        regime_label = "Long Gamma \u00b7 Bullish Flow"
+        regime_desc = "Dealers are net long gamma, and most flow signals lean bullish."
+        setup = "Aligned Flow"
         playbook = [
-            "Buy dips toward VWAP / gamma support",
-            "Target prior highs & call-wall magnet",
-            "Trail stops under rising support",
+            "Flow losing its bullish majority",
+            "Net GEX turning negative, or the gradient strongly against it",
         ]
         expected_behavior = [
-            "Steady grind higher",
-            "Shallow pullbacks bought",
-            "Call-wall pin effect",
+            "Net GEX positive: dealers net long gamma",
+            "Tape, vanna/charm and 0DTE flow: majority bullish",
+            NOT_A_FORECAST,
         ]
         push(tapeFlow, 1)
         push(vannaCharm, 1)
@@ -288,19 +300,18 @@ def compute_bias(inp: BiasInput) -> BiasResult:
     elif market_state == "TREND_DOWN":
         trend = "bearish"
         bias = "SELL_RIPS"
-        bias_label = "Sell Rips"
-        regime_label = "Trend Down Regime"
-        regime_desc = "Long gamma + aligned bearish flow."
-        setup = "Trend Continuation (Down)"
+        bias_label = "Flow Bearish"
+        regime_label = "Long Gamma \u00b7 Bearish Flow"
+        regime_desc = "Dealers are net long gamma, and most flow signals lean bearish."
+        setup = "Aligned Flow"
         playbook = [
-            "Short rips into VWAP / resistance",
-            "Target prior lows & put-wall magnet",
-            "Trail stops above declining resistance",
+            "Flow losing its bearish majority",
+            "Net GEX turning negative, or the gradient strongly against it",
         ]
         expected_behavior = [
-            "Steady drift lower",
-            "Shallow bounces sold",
-            "Put-wall pin effect",
+            "Net GEX positive: dealers net long gamma",
+            "Tape, vanna/charm and 0DTE flow: majority bearish",
+            NOT_A_FORECAST,
         ]
         push(tapeFlow, -1)
         push(vannaCharm, -1)
@@ -314,19 +325,20 @@ def compute_bias(inp: BiasInput) -> BiasResult:
     elif market_state == "CHOP":
         trend = "neutral"
         bias = "RANGE_FADE"
-        bias_label = "Range-Bound"
-        regime_label = "Chop / Range Regime"
-        regime_desc = "Mixed signals — no dominant directional thesis."
-        setup = "Mean Reversion"
+        bias_label = "Mixed"
+        regime_label = "Mixed Signals"
+        regime_desc = (
+            "The gamma regime, flow and structure signals do not line up into a defined state."
+        )
+        setup = "No Defined State"
         playbook = [
-            "Fade extremes of the session range",
-            "Avoid premium breakout trades",
-            "Favor theta / defined-risk structures",
+            "Flow forming a majority while dealers are long gamma",
+            "Flow and structure splitting while dealers are short gamma",
         ]
         expected_behavior = [
-            "Two-way chop",
-            "VWAP magnetism",
-            "Failed breakout attempts",
+            "No flow majority in long gamma, and no flow/structure split in short gamma",
+            "Most minutes read this way; it does not mean the market is quiet",
+            NOT_A_FORECAST,
         ]
 
         # Chop confidence rises as directional signals sit near zero; extreme
