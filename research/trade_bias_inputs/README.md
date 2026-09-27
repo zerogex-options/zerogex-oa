@@ -130,6 +130,66 @@ comparisons, so about one interval in twenty excludes zero by chance alone.
 * **Direction, not option P&L.** A reading that is right on direction can still lose
   money on premium.
 
+## Result: the 2026-09-25 run
+
+49 sessions (2026-07-17 to 2026-09-25), SPY and SPX, 38,207 cash-session minutes. The
+stored inputs reproduced the stored market state on 100.00% of minutes, so every call
+below is the reading the panel actually saw.
+
+**Verdict: NOTHING DETECTABLE for all nine.** No input predicts 30-minute direction on
+its own, and none comes close: the smallest p is 0.059 (Trap Detection, leaning the
+wrong way), ten times Holm's bar of 0.0056 for the first test.
+
+| Input | Calls (days) | 30m excess over drift, bps, 95% | Hit rate | Verdict |
+|---|---|---|---|---|
+| Tape Flow | 19,301 (49) | -0.2 [-0.7, +0.2] | 49.6% | NOTHING DETECTABLE |
+| Vanna/Charm | 27,840 (49) | -0.4 [-1.3, +0.5] | 47.8% | NOTHING DETECTABLE |
+| 0DTE Positioning | 14,711 (49) | -0.3 [-1.6, +1.0] | 49.3% | NOTHING DETECTABLE |
+| Positioning Trap | 27,681 (49) | +0.3 [-0.5, +1.0] | 49.8% | NOTHING DETECTABLE |
+| Trap Detection | 3,117 (36) | -1.1 [-2.2, +0.1] | 46.6% | NOTHING DETECTABLE |
+| Gamma/VWAP | 17,082 (43) | -0.0 [-0.8, +0.8] | 49.0% | NOTHING DETECTABLE |
+| GEX Gradient | 21,529 (49) | +0.6 [-0.3, +1.6] | 51.7% | NOTHING DETECTABLE |
+| Net GEX (gamma sign) | 35,267 (49) | +0.1 [-0.9, +1.2] | 50.5% | NOTHING DETECTABLE |
+| MSI | 24,056 (49) | -0.7 [-1.8, +0.4] | 47.9% | NOTHING DETECTABLE |
+| *price momentum alone (reference)* | 19,977 (49) | +0.1 [-0.9, +1.2] | 49.7% | |
+
+* **A real null, not a blind spot.** The intervals are narrow: every one lies between
+  -2.2 and +1.6 bps, so an edge in the direction an input points, if one hides in
+  there, is at most 1.6 bps over half an hour. The hit rates run from 46.6% to 51.7%,
+  none reliably better than a coin flip. Price momentum alone does no better.
+* **It explains the short-gamma result.** The panel's directional states showed no edge
+  because none of their ingredients has one. Re-weighting or re-thresholding the vote
+  cannot make direction out of inputs that carry none.
+* **Nothing at any horizon.** None of the 40 intervals across 15 minutes, 30 minutes,
+  60 minutes and the rest of the session excludes zero, for any input or for momentum.
+* **No pattern anywhere else either.** No input gets more right toward its extremes;
+  the MSI's own regime bands, from high-risk reversal to trend expansion, all sit within
+  1 bp of zero. SPY and SPX, one index read through two option chains, disagree in sign
+  on five of the nine. Of the 152 uncorrected intervals in the context tables (hit rates
+  aside), 7 exclude zero, about what chance alone produces (7 or 8 at 5%), and three of
+  those rest on 85 minutes or fewer. The rest (0DTE Positioning -1.3 in short gamma,
+  Positioning Trap +0.8 in short gamma, Trap Detection -2.5 when it disagrees with the
+  prior move) are what 152 comparisons produce by luck, and none is worth chasing
+  without fresh data.
+
+Two wiring facts the tables surfaced. Neither changes a verdict.
+
+* **Trap Detection never fires when net GEX is negative.** That is by design: its score
+  is multiplied by a long-gamma factor that is zero there
+  (`src/signals/advanced/trap_detection.py`), and the data agrees, with 0 calls in short
+  gamma in 49 sessions. But the panel's two Trap states exist only in short gamma, so
+  Trap Detection, one of their three structure votes, can never count toward them, and
+  the checklist the dashboard shows with the panel (`frontend/core/tradeBias.ts`) can
+  never tick both "Short-gamma regime" and "Trap detection triggered".
+* **0DTE Positioning never went past +/-65** in 49 sessions, so production's two-vote
+  `DOMINANT` boost has never applied to it.
+
+What this does not touch: **movement**. The same inputs do carry information about how
+far price travels. Short-gamma minutes with one-sided flow saw 30-minute ranges 1.29x
+the average (`research/short_gamma_trend`), and the MSI's gamma and volatility
+components track forward excursion (`docs/design/msi-regime-excursion.md`). Direction
+and distance are separate questions; this study answers only the first.
+
 ## How to run it
 
 From the repository root, with the service's environment (the `.env` the services

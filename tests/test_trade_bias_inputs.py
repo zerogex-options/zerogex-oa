@@ -316,3 +316,13 @@ def test_cli_run_end_to_end_on_a_faked_database(monkeypatch, capsys, tmp_path):
     payload = json.loads(out_json.read_text())
     assert [i["key"] for i in payload["inputs"]] == [r.key for r in INPUTS]
     assert payload["counts"]["rows"] == 2 * 16 * 390
+
+
+def test_a_context_cell_on_too_few_days_prints_no_interval():
+    from research.trade_bias_inputs.report import _cell_n
+
+    few = _cell(22.2, n=1, days=1)
+    assert _cell_n(few) == "+22.2 (1 min, 1 day)"
+    assert _cell_n(_cell(-1.5, n=801, days=9)) == "-1.5 (801 min, 9 days)"
+    enough = _cell(1.0, n=900, days=MIN_SESSIONS)
+    assert _cell_n(enough) == "+1.0 [+0.0,+2.0] (900)"

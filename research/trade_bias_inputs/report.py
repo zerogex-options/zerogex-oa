@@ -11,6 +11,7 @@ from research.short_gamma_trend.study import ALL_HORIZONS, BuildCounts, Cell, Es
 from research.trade_bias_inputs.study import (
     ALPHA,
     ITERATIONS,
+    MIN_SESSIONS,
     PRIMARY_HORIZON,
     PRIOR_MOVE_SPLITS,
     REGIMES,
@@ -33,6 +34,15 @@ def _ci(e: Estimate, fmt: str = "+.1f") -> str:
 
 
 def _cell_n(c: Cell) -> str:
+    """A context cell: its interval and minutes, or, when its minutes span
+    fewer sessions than a verdict needs, only the value and the day count --
+    a date-block resample of a handful of days measures almost nothing, and
+    its interval would look precise."""
+    if c.n_sessions < MIN_SESSIONS:
+        v = c.excess_bps.value
+        value = "n/a" if v is None else f"{v:+.1f}"
+        days = f"{c.n_sessions} day" + ("" if c.n_sessions == 1 else "s")
+        return f"{value} ({c.n_calls:,} min, {days})"
     return f"{_ci(c.excess_bps)} ({c.n_calls:,})"
 
 
@@ -104,7 +114,8 @@ def render(
         "Everything below explains a verdict and moves none. None of it is corrected for "
         "multiple comparisons:"
     )
-    add("about 1 interval in 20 excludes zero by chance alone.")
+    add("about 1 interval in 20 excludes zero by chance alone. A cell whose minutes span fewer")
+    add(f"than {MIN_SESSIONS} sessions shows its day count instead of an interval.")
     add("")
     add("Every horizon: excess over drift, bps, 95% interval (pooled)")
     add(f"  {'':<{width}}  " + "".join(f"{_h(h):<20}" for h in ALL_HORIZONS))
