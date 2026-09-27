@@ -333,6 +333,32 @@ MAX_HALF_FRACTION = 0.0250
 #: Prefer 0.5 on ties from here on. It is the theoretical value rather than a
 #: fitted one, so sitting on it means there is no free parameter here for the
 #: next quiet stretch to overfit.
+#:
+#: Confirmed in production with an accidental control. The v1_7 backfill landed
+#: alongside the live v1_6 claims on 2026-09-21..25, so both cohorts cover the
+#: same five sessions. NDX was ALREADY on 0.50 under v1_6, so v1_7 changed
+#: nothing for it - which makes it a placebo arm, and its cohort-to-cohort
+#: difference measures live-claim versus backfilled-claim noise rather than any
+#: model effect:
+#:
+#:              gap              brier            skill
+#:   SPY    -16.6 -> -5.7    0.2334 -> 0.2129   -0.078 -> -0.000
+#:   QQQ    -13.6 -> -4.0    0.2101 -> 0.1990   -0.065 -> -0.029
+#:   SPX    -23.6 -> -12.7   0.2779 -> 0.2335   -0.234 -> -0.079
+#:   NDX     -6.0 -> -6.6    0.1783 -> 0.1869   -0.034 -> -0.060   placebo
+#:
+#: The placebo moved 0.6 gap points and 0.0086 Brier. The three symbols that
+#: actually changed moved 9.6 to 10.9 gap points - 16 to 18 times that floor.
+#:
+#: Read the two metrics separately, because they say different things. The gap
+#: improvement is enormous and the Brier improvement is modest (1.3x the noise
+#: floor on QQQ, 5.2x on SPX). That is the expected shape: widening the band
+#: fixes CALIBRATION, which is what was broken. It adds little
+#: DISCRIMINATION, and discrimination is what Brier skill measures. So skill
+#: is still negative on all four symbols over these five sessions - every one
+#: of which is a hard session, by construction, since they are the only ones
+#: both cohorts cover. That is not a verdict on v1_7; it is a reminder that a
+#: sample of five bad days cannot produce one.
 CONE_PATH_EXPONENT = 0.50
 
 #: Per-symbol overrides.  Empty, and why it is empty is the useful part.
