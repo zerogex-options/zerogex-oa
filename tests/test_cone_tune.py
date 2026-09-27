@@ -106,12 +106,22 @@ def test_the_path_exponent_moves_only_the_prediction():
         assert b["pred"] > a["pred"], "less sub-daily motion must predict more holding"
 
 
-def test_the_baseline_follows_a_symbol_that_overrides_the_exponent():
-    """NDX ships a different path exponent from everything else. A tuner with
-    one literal baseline would score it against a config it does not run —
-    which is exactly the bug that made an earlier ablation meaningless."""
+def test_the_baseline_follows_a_symbol_that_overrides_the_exponent(monkeypatch):
+    """A tuner with one literal baseline would score an overriding symbol
+    against a config it does not run — exactly the bug that made an earlier
+    ablation meaningless.
+
+    v1_7 empties CONE_PATH_EXPONENT_BY_SYMBOL, so there is no live override to
+    test against and the assertion now installs one. That is deliberate: the
+    override MECHANISM still ships, and the day someone adds a symbol back is
+    the day this bug could return. Testing against whatever happens to be
+    committed would silently stop testing anything the moment the dict
+    emptied — which is precisely what happened here.
+    """
+    import src.jobs.intraday_cone_model as model
     from src.jobs.intraday_cone_model import path_exponent_for
 
+    monkeypatch.setitem(model.CONE_PATH_EXPONENT_BY_SYMBOL, "NDX", 0.62)
     assert path_exponent_for("NDX") != path_exponent_for("QQQ")
     for sym in ("NDX", "QQQ"):
         c = _claims_from(_inputs(symbol=sym))[0]
