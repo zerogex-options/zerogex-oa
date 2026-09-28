@@ -69,6 +69,13 @@ def _endpoint_key(sym):
     )
 
 
+def _stub_book(monkeypatch):
+    # The build prices from the shared book, which would otherwise load a real
+    # snapshot. Any dict stands in -- the stubbed builds below never read it.
+    ff._book_cache.clear()
+    monkeypatch.setattr(ff, "_load", lambda symbol, expiry=None: {"spot": 1.0})
+
+
 def test_warm_one_caches_under_the_exact_endpoint_key(monkeypatch):
     # The whole point of the warmer is that on-demand GETs hit its cache -- so the
     # key _warm_one writes MUST equal the one get_session_surface reads. Stub the
@@ -77,12 +84,14 @@ def test_warm_one_caches_under_the_exact_endpoint_key(monkeypatch):
 
     ff._cache.clear()
     ff._inflight_tasks.clear()
+    _stub_book(monkeypatch)
     fake = {"symbol": "SPY", "z": [[1.0]], "now_index": 0}
     monkeypatch.setattr(ff, "_session_surface_sync", lambda *a, **k: fake)
     asyncio.run(ff._warm_one("SPY"))
     assert ff._cache_get(_endpoint_key("SPY")) is fake
     ff._cache.clear()
     ff._inflight_tasks.clear()
+    ff._book_cache.clear()
 
 
 def test_warm_one_skips_cache_when_rebuild_returns_none(monkeypatch):
@@ -91,11 +100,13 @@ def test_warm_one_skips_cache_when_rebuild_returns_none(monkeypatch):
 
     ff._cache.clear()
     ff._inflight_tasks.clear()
+    _stub_book(monkeypatch)
     monkeypatch.setattr(ff, "_session_surface_sync", lambda *a, **k: None)
     asyncio.run(ff._warm_one("SPY"))
     assert ff._cache_get(_endpoint_key("SPY")) is None
     ff._cache.clear()
     ff._inflight_tasks.clear()
+    ff._book_cache.clear()
 
 
 def test_warm_loop_is_a_noop_when_disabled(monkeypatch):
@@ -117,12 +128,13 @@ def test_session_surface_async_coalesces_concurrent_builds(monkeypatch):
 
     ff._cache.clear()
     ff._inflight_tasks.clear()
+    _stub_book(monkeypatch)
     builds = []
 
-    def slow_build(*args, **kwargs):
-        builds.append(args[0])
+    def slow_build(book, sym, *args, **kwargs):
+        builds.append(sym)
         _t.sleep(0.2)  # hold the build (in its worker thread) so callers pile up
-        return {"symbol": args[0], "z": [[1.0]], "now_index": 0}
+        return {"symbol": sym, "z": [[1.0]], "now_index": 0}
 
     monkeypatch.setattr(ff, "_session_surface_sync", slow_build)
 
@@ -136,3 +148,4 @@ def test_session_surface_async_coalesces_concurrent_builds(monkeypatch):
     assert len(results) == 5 and all(r is not None and r["z"] == [[1.0]] for r in results)
     ff._cache.clear()
     ff._inflight_tasks.clear()
+    ff._book_cache.clear()

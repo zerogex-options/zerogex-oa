@@ -14,8 +14,10 @@ all derived from the one ``dealer_hedge_flow`` primitive:
 
 Each response carries the snapshot ``timestamp`` and the ``spot`` it was computed
 against. Results are recomputed on demand from the latest chain (fresh, always
-current) using the same on-demand engine tuning the gamma-flip endpoints use,
-and cached for 30s. The gamma flip on /levels is the EXISTING persisted value
+current) using the same on-demand engine tuning the gamma-flip endpoints use.
+Every view prices from one shared copy of that chain per symbol (see
+``_shared_book``), and a response is cached until the chain it was priced from
+turns 30s old. The gamma flip on /levels is the EXISTING persisted value
 (``gex_summary``) -- it is not recomputed here (spec 6.4). Additive: no existing
 GEX endpoint is touched.
 """
@@ -49,6 +51,7 @@ from src.analytics.forced_flow import (
 from src.analytics.main_engine import ET, AnalyticsEngine
 from src.config import _getenv_float, _getenv_str
 from src.database import db_connection
+from src.market_calendar import is_trading_session
 from src.symbols import get_canonical_symbol
 
 from ..database import DatabaseManager
@@ -140,6 +143,29 @@ _SESSION_GRID_QUANTUM_PCT = 0.001
 # waiters and starve other endpoints. Keyed by the response-cache key.
 _inflight_tasks: Dict[tuple, "asyncio.Task"] = {}
 
+# Shared option book. Every forced-flow view reprices the SAME thing -- the latest
+# option book for a symbol -- and loading it is the expensive part: a fresh
+# engine, the snapshot queries (latest-per-contract over >= 4h), and one leg per
+# contract. The page asks for six views of one symbol every 15s, and each view
+# used to load its own copy on every response-cache miss. Misses were the norm:
+# each API worker keeps its own 30s response cache and one viewer's polls
+# alternate between the two workers, so a worker rarely saw the same view twice
+# inside 30s (2026-09-28: 1,350 of 1,419 /curve requests took over 250 ms). And
+# the load was the cost: a /scenario miss (one what-if, milliseconds of math) took
+# as long as a /curve miss (dozens of repricings), about a second each.
+#
+# So the book is loaded once per (symbol, expiry) per worker, and every view --
+# and the session-surface warmer -- prices from that one copy until it turns
+# _BOOK_TTL_SECONDS old. Concurrent misses await one shared load, the same
+# single-flight pattern as the session surface and for the same reason: waiters
+# hold no thread. The views only READ the legs, so sharing them is safe.
+_BOOK_TTL_SECONDS = _RESPONSE_CACHE_TTL_SECONDS
+# A handful of symbols in practice; bounded because ``expiry`` is caller-supplied.
+_BOOK_CACHE_MAX = 32
+_book_cache: Dict[tuple, Dict[str, Any]] = {}
+_book_cache_lock = threading.Lock()
+_book_tasks: Dict[tuple, "asyncio.Task"] = {}
+
 
 def _quantize_band(p_lo: float, p_hi: float, spot: float) -> Tuple[float, float]:
     """Snap ``[p_lo, p_hi]`` out to a coarse grid (~0.1% of spot) so tiny intraday
@@ -191,14 +217,19 @@ def _cache_get(key: tuple) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _cache_put(key: tuple, data: Dict[str, Any]) -> None:
+def _cache_put(key: tuple, data: Dict[str, Any], as_of: Optional[float] = None) -> None:
     now = time.monotonic()
+    # Aged from ``as_of`` when given -- the monotonic time the data behind the
+    # response was loaded (a shared book's ``loaded_at``). Aging from the write
+    # instead would let a view priced from a 29s-old book be served for another
+    # 30s, doubling how stale a cached number can get.
+    ts = now if as_of is None else min(as_of, now)
     with _cache_lock:
         # Pop before re-inserting so position tracks the most recent WRITE:
         # a plain overwrite would keep the key at its original insertion slot
         # and let eviction take the entry the warmer is actively refreshing.
         _cache.pop(key, None)
-        _cache[key] = {"ts": now, "data": data}
+        _cache[key] = {"ts": ts, "data": data}
         if len(_cache) > _RESPONSE_CACHE_MAX:
             # Expired entries are free to drop, so sweep those first; only
             # then fall back to evicting the least-recently-written.
@@ -256,6 +287,73 @@ def _load(symbol: str, expiry: Optional[str] = None) -> Optional[Dict[str, Any]]
         "q": engine.dividend_yield,
         "session_days": engine._session_days_remaining(snapshot["timestamp"]),
     }
+
+
+def _book_get(key: tuple) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with _book_cache_lock:
+        book = _book_cache.get(key)
+    if book is not None and now - book["loaded_at"] < _BOOK_TTL_SECONDS:
+        return book
+    return None
+
+
+def _book_put(key: tuple, book: Dict[str, Any]) -> None:
+    now = time.monotonic()
+    with _book_cache_lock:
+        _book_cache.pop(key, None)
+        _book_cache[key] = book
+        if len(_book_cache) > _BOOK_CACHE_MAX:
+            for k in [
+                k
+                for k, b in _book_cache.items()
+                if k != key and now - b["loaded_at"] >= _BOOK_TTL_SECONDS
+            ]:
+                _book_cache.pop(k, None)
+            while len(_book_cache) > _BOOK_CACHE_MAX:
+                oldest = next(iter(_book_cache))
+                if oldest == key:
+                    break
+                _book_cache.pop(oldest, None)
+
+
+async def _shared_book(symbol: str, expiry: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The shared option book for ``symbol`` (see ``_BOOK_TTL_SECONDS``): at most
+    one ``_load`` per window per worker, however many views ask for it.
+
+    ``loaded_at`` on the result is the monotonic time its load FINISHED. A view
+    priced from it is cached only until the book turns stale (see
+    ``_cache_put``), never a fresh 30s of its own, so no number is served longer
+    than the old per-response cache allowed. Finished rather than began: a load
+    that ran past the TTL under a struggling database would otherwise arrive
+    already expired, cache nothing, and send every request into another load.
+    A degraded snapshot (None) is not cached; the next caller retries, as before.
+
+    Race-free without a lock for the same reason as ``_session_surface_async``:
+    nothing awaits between the registry lookup and ``create_task``.
+    """
+    key = (symbol.upper(), expiry)
+    book = _book_get(key)
+    if book is not None:
+        return book
+    task = _book_tasks.get(key)
+    if task is None:
+
+        async def _fetch() -> Optional[Dict[str, Any]]:
+            try:
+                fresh = await asyncio.to_thread(_load, symbol, expiry)
+                if fresh is not None:
+                    fresh["loaded_at"] = time.monotonic()
+                    _book_put(key, fresh)
+                return fresh
+            finally:
+                _book_tasks.pop(key, None)
+
+        task = asyncio.create_task(_fetch())
+        _book_tasks[key] = task
+    # Shielded: one waiter's request being cancelled must not cancel the load the
+    # other waiters are sharing.
+    return await asyncio.shield(task)
 
 
 def _load_asof(sym: str, at_ts: datetime) -> Optional[Dict[str, Any]]:
@@ -454,21 +552,29 @@ def _linspace(lo: float, hi: float, n: int) -> List[float]:
     return [lo + step * i for i in range(n)]
 
 
-async def _run(key: tuple, fn: Callable[..., Optional[Dict[str, Any]]], *args) -> Dict[str, Any]:
-    """Cache-or-compute: returns cached data, else runs ``fn`` in a worker thread
-    (snapshot fetch + reprice are sync psycopg2/numpy), caches, and returns it.
-    404 on a degraded snapshot, 500 on unexpected failure."""
+async def _run(
+    key: tuple,
+    fn: Callable[..., Optional[Dict[str, Any]]],
+    sym: str,
+    expiry: Optional[str],
+    *args,
+) -> Dict[str, Any]:
+    """Cache-or-compute: returns cached data, else prices ``fn(book, sym, *args)``
+    from the shared book in a worker thread (the reprice is sync pure Python),
+    caches it for as long as that book stays fresh, and returns it. 404 on a
+    degraded snapshot, 500 on unexpected failure."""
     cached = _cache_get(key)
     if cached is not None:
         return cached
     try:
-        result = await asyncio.to_thread(fn, *args)
+        book = await _shared_book(sym, expiry)
+        result = await asyncio.to_thread(fn, book, sym, *args) if book is not None else None
     except Exception as e:  # pragma: no cover - defensive
         logger.error("forced-flow compute failed for %s: %s", key, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
-    if result is None:
+    if book is None or result is None:
         raise HTTPException(status_code=404, detail="No forced-flow data available")
-    _cache_put(key, result)
+    _cache_put(key, result, as_of=book.get("loaded_at"))
     return result
 
 
@@ -654,10 +760,7 @@ async def get_curve(
     return CurveResponse(**data)
 
 
-def _curve_sync(sym, expiry, spot_range_pct, vol_change_pts, horizon_days):
-    ctx = _load(sym, expiry)
-    if ctx is None:
-        return None
+def _curve_sync(ctx, sym, spot_range_pct, vol_change_pts, horizon_days):
     session = ctx["session_days"] if horizon_days is None else horizon_days
     curve = forced_flow_curve(
         ctx["legs"],
@@ -714,10 +817,7 @@ async def get_charm_decay(
     return CharmDecayResponse(**data)
 
 
-def _charm_decay_sync(sym, expiry, steps):
-    ctx = _load(sym, expiry)
-    if ctx is None:
-        return None
+def _charm_decay_sync(ctx, sym, steps):
     pts = charm_into_close(
         ctx["legs"], ctx["spot"], ctx["session_days"], ctx["r"], ctx["q"], steps=steps
     )
@@ -747,10 +847,7 @@ async def get_vanna_ladder(
     return VannaLadderResponse(**data)
 
 
-def _vanna_ladder_sync(sym, expiry, lo_pts, hi_pts, step_pts):
-    ctx = _load(sym, expiry)
-    if ctx is None:
-        return None
+def _vanna_ladder_sync(ctx, sym, lo_pts, hi_pts, step_pts):
     ladder = vanna_ladder(
         ctx["legs"],
         ctx["spot"],
@@ -784,10 +881,7 @@ async def get_surface(
     return SurfaceResponse(**data)
 
 
-def _surface_sync(sym, expiry, spot_range_pct, time_steps):
-    ctx = _load(sym, expiry)
-    if ctx is None:
-        return None
+def _surface_sync(ctx, sym, spot_range_pct, time_steps):
     spots = spot_grid(ctx["spot"], spot_range_pct, _SURFACE_STEP_PCT)
     times = [ctx["session_days"] * i / time_steps for i in range(time_steps + 1)]
     z = [
@@ -848,10 +942,7 @@ async def get_session_surface(
     return SessionSurfaceResponse(**data)
 
 
-def _session_surface_sync(sym, span, past_steps, future_steps, expiry):
-    ctx = _load(sym, expiry)
-    if ctx is None:
-        return None
+def _session_surface_sync(ctx, sym, span, past_steps, future_steps):
     now_ts = ctx["timestamp"]
     spot = ctx["spot"]
     r, q = ctx["r"], ctx["q"]
@@ -1045,11 +1136,14 @@ async def _session_surface_async(sym, span, past_steps, future_steps, expiry):
 
         async def _build():
             try:
+                book = await _shared_book(sym, expiry)
+                if book is None:
+                    return None
                 data = await asyncio.to_thread(
-                    _session_surface_sync, sym, span, past_steps, future_steps, expiry
+                    _session_surface_sync, book, sym, span, past_steps, future_steps
                 )
                 if data is not None:
-                    _cache_put(key, data)
+                    _cache_put(key, data, as_of=book.get("loaded_at"))
                 return data
             finally:
                 _inflight_tasks.pop(key, None)
@@ -1073,6 +1167,21 @@ _WARM_SYMBOLS = [
     for s in _getenv_str("SESSION_SURFACE_WARM_SYMBOLS", "SPY,SPX,QQQ,NDX").split(",")
     if s.strip()
 ]
+# Only while there is a session to warm: the cash open through the 16:15 ET option
+# close, on trading days. The field's time axis ends at the 16:00 close, so an
+# off-hours rebuild re-renders a finished day -- and the loop did that every 30s
+# for four symbols in both workers, nights and weekends included, work no request
+# log ever shows. A request outside the window still builds on demand.
+_WARM_WINDOW_START = dt_time(9, 30)
+_WARM_WINDOW_END = dt_time(16, 15)
+
+
+def _warm_window_open(now: Optional[datetime] = None) -> bool:
+    now_et = (now or datetime.now(ET)).astimezone(ET)
+    return (
+        is_trading_session(now_et.date())
+        and _WARM_WINDOW_START <= now_et.time() <= _WARM_WINDOW_END
+    )
 
 
 async def _warm_one(sym: str) -> None:
@@ -1098,8 +1207,9 @@ async def _warm_one(sym: str) -> None:
 async def session_surface_warm_loop() -> None:
     """Keep the session-field cache hot in the background (started per worker).
 
-    The costly part is the cold full-day rebuild; running it here on startup and
-    every ``_WARM_INTERVAL_SECONDS`` moves it entirely off the user's first view.
+    The costly part is the cold full-day rebuild; running it here every
+    ``_WARM_INTERVAL_SECONDS`` while the session is open (``_warm_window_open``)
+    moves it entirely off the user's first view.
     The per-column cache makes every warm after the first cheap -- only the live
     now + projection columns and any newly-past bucket are repriced. The
     synchronous reprice is dispatched through ``asyncio.to_thread`` so it never
@@ -1109,19 +1219,29 @@ async def session_surface_warm_loop() -> None:
         logger.info("session-surface warmer disabled")
         return
     logger.info(
-        "session-surface warmer: %s every %.0fs",
+        "session-surface warmer: %s every %.0fs, %s-%s ET on trading days",
         ",".join(_WARM_SYMBOLS),
         _WARM_INTERVAL_SECONDS,
+        _WARM_WINDOW_START.strftime("%H:%M"),
+        _WARM_WINDOW_END.strftime("%H:%M"),
     )
     while True:
-        for sym in _WARM_SYMBOLS:
-            try:
-                await _warm_one(sym)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # pragma: no cover - defensive
-                logger.debug("session-surface warm cycle error for %s: %s", sym, e)
+        await _warm_cycle()
         await asyncio.sleep(_WARM_INTERVAL_SECONDS)
+
+
+async def _warm_cycle(now: Optional[datetime] = None) -> int:
+    """One warmer pass. Returns how many symbols it warmed: 0 outside the window."""
+    if not _warm_window_open(now):
+        return 0
+    for sym in _WARM_SYMBOLS:
+        try:
+            await _warm_one(sym)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("session-surface warm cycle error for %s: %s", sym, e)
+    return len(_WARM_SYMBOLS)
 
 
 @router.get("/scenario", response_model=ScenarioResponse)
@@ -1140,10 +1260,7 @@ async def get_scenario(
     return ScenarioResponse(**data)
 
 
-def _scenario_sync(sym, expiry, spot_move_pct, days, vol_change_pts):
-    ctx = _load(sym, expiry)
-    if ctx is None:
-        return None
+def _scenario_sync(ctx, sym, spot_move_pct, days, vol_change_pts):
     ff = dealer_hedge_flow(
         ctx["legs"],
         ctx["spot"],
@@ -1182,11 +1299,12 @@ async def get_levels(
         return LevelsResponse(**cached)
 
     try:
-        data = await asyncio.to_thread(_levels_sync, sym)
+        book = await _shared_book(sym)
+        data = await asyncio.to_thread(_levels_sync, book, sym) if book is not None else None
     except Exception as e:  # pragma: no cover - defensive
         logger.error("forced-flow levels failed for %s: %s", sym, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
-    if data is None:
+    if book is None or data is None:
         raise HTTPException(status_code=404, detail="No forced-flow data available")
 
     # Gamma flip is the EXISTING persisted value -- read it, do not recompute.
@@ -1200,14 +1318,11 @@ async def get_levels(
         logger.warning("gamma flip lookup failed for %s: %s", sym, e)
     data["gamma_flip"] = gamma_flip
 
-    _cache_put(key, data)
+    _cache_put(key, data, as_of=book.get("loaded_at"))
     return LevelsResponse(**data)
 
 
-def _levels_sync(sym):
-    ctx = _load(sym)
-    if ctx is None:
-        return None
+def _levels_sync(ctx, sym):
     return {
         "symbol": sym,
         "spot": ctx["spot"],
