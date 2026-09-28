@@ -6325,6 +6325,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self,
         symbol: str = "SPY",
         limit: int = 60,
+        before: Optional[date] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Trading days that have stored hedging-flow bars, newest first.
 
@@ -6337,11 +6338,33 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         tables -- so the list and the pages it links to agree about which
         sessions exist for as long as the snapshots are kept.
 
+        ``before`` is an exclusive cursor: an ET trading date, returning only
+        sessions strictly older than it. Unlike every other session list in
+        this API, this one needs paging at all -- the others read tables
+        ``db-prune`` empties at DATA_RETENTION_DAYS, so one page holds their
+        whole contents permanently, whereas these rows are retention-exempt and
+        accrue a session per trading day forever. Without a cursor the oldest
+        sessions fall off the end of the list while their permalinks keep
+        working, which is the quiet kind of wrong: nothing errors, the history
+        is simply unreachable by browsing.
+
         Returns ``None`` for an unknown symbol (404) and ``[]`` for a known
-        symbol with nothing stored yet.
+        symbol with nothing stored yet -- or for a cursor older than anything
+        stored, which is how the caller learns it has reached the end.
         """
         symbol = symbol.upper()
-        cache_key = f"hedging_flow_sessions:{symbol}:{limit}"
+        # ET midnight on the cursor date. Bounding the raw timestamp keeps the
+        # scan on the primary key; see HEDGING_FLOW_SESSIONS_ASYNCPG for why a
+        # predicate on the derived session_date could not.
+        before_utc: Optional[datetime] = None
+        if before is not None:
+            before_utc = datetime(
+                before.year, before.month, before.day, tzinfo=_ET
+            ).astimezone(timezone.utc)
+        # The cursor is part of the identity of the answer. Left out, page two
+        # would be served whatever page one cached under the same key.
+        cursor_key = before.isoformat() if before else "latest"
+        cache_key = f"hedging_flow_sessions:{symbol}:{limit}:{cursor_key}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -6364,6 +6387,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         HEDGING_FLOW_SESSIONS_ASYNCPG,
                         symbol,
                         limit,
+                        before_utc,
                         timeout=10.0,
                     ),
                     timeout=10.0,
