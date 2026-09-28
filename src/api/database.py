@@ -6795,6 +6795,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
+        # The day's volume is summed from this symbol's own bars over the
+        # quote's ET calendar day, a range the (symbol, timestamp) index can
+        # seek. This used to join the underlying_daily_volume view, and
+        # Postgres cannot push a join condition into a GROUP BY view: every
+        # cache miss aggregated the WHOLE table -- every symbol, every day, in
+        # a parallel seq scan -- to read one row of it. On a 3M-row copy that
+        # was ~580 ms per miss against ~7 ms this way, and it made this the
+        # costliest endpoint on the API (2026-09-25, 14:26-16:00 ET: about 20 s
+        # of request time per trading minute). Same sum, same day boundary:
+        # DATE(ts AT TIME ZONE ET) = d is exactly d 00:00 ET <= ts < d+1 00:00 ET.
         query = """
             WITH latest_quote AS (
                 SELECT
@@ -6819,9 +6829,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 COALESCE(udv.cumulative_daily_volume, 0)::bigint AS cumulative_daily_volume,
                 s.asset_type
             FROM latest_quote lq
-            LEFT JOIN underlying_daily_volume udv
-              ON udv.symbol = lq.symbol
-             AND udv.trade_date_et = (lq.timestamp AT TIME ZONE 'America/New_York')::date
+            LEFT JOIN LATERAL (
+                SELECT SUM(COALESCE(v.up_volume, 0) + COALESCE(v.down_volume, 0))::bigint
+                           AS cumulative_daily_volume
+                FROM underlying_quotes v
+                WHERE v.symbol = lq.symbol
+                  AND v.timestamp >= (
+                      (lq.timestamp AT TIME ZONE 'America/New_York')::date::timestamp
+                      AT TIME ZONE 'America/New_York'
+                  )
+                  AND v.timestamp < (
+                      ((lq.timestamp AT TIME ZONE 'America/New_York')::date + 1)::timestamp
+                      AT TIME ZONE 'America/New_York'
+                  )
+            ) udv ON TRUE
             LEFT JOIN symbols s ON s.symbol = lq.symbol
         """
 
