@@ -867,7 +867,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # force-refetches on the session-label flip to surface the new close
         # promptly, and this server cache would blunt that by up to its TTL, so
         # it is kept short — just enough to absorb concurrent/burst reads
-        # without meaningfully delaying the 16:00 boundary.
+        # without meaningfully delaying the 16:00 boundary. Each API worker
+        # keeps its own copy, so a long TTL rolls at a different moment per
+        # worker: production's 600 served Thursday's SPX/NDX close for ~5
+        # minutes after Friday's bell (2026-09-25), with two widgets on one
+        # page disagreeing depending on which worker answered them.
         self._session_closes_cache_ttl_seconds: float = _getenv_float(
             "SESSION_CLOSES_CACHE_TTL_SECONDS", 15.0
         )
