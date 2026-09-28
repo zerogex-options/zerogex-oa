@@ -3828,6 +3828,20 @@ hedging-flow-backfill: ## Seed hedging_flow_5min history from retained flow fact
 	@$(PY) -m src.tools.hedging_flow_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS) \
 		$(if $(DAYS),--days $(DAYS),) $(if $(DRY_RUN),--dry-run,)
 
+# Same mandate as the target above and the same clock, on the other half of
+# the Gamma Weather header. gamma_regime_5min is built from gex_by_strike,
+# which db-prune deletes at DATA_RETENTION_DAYS; the retention-exempt archive
+# carries no open interest, so a session that ages out cannot be rebuilt from
+# anything. Heavy on the database (~82 chain reads per symbol-session), so
+# prefer outside market hours; --sleep spaces the sessions out.
+.PHONY: gamma-regime-backfill
+gamma-regime-backfill: ## Seed gamma_regime_5min history from retained per-strike chains (run once, soon — same DATA_RETENTION_DAYS clock)
+	@echo "$(BLUE)=== Backfilling gamma_regime_5min ===$(NC)"
+	@$(PY) -m src.tools.gamma_regime_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS) \
+		$(if $(DAYS),--days $(DAYS),) $(if $(START),--start $(START),) \
+		$(if $(END),--end $(END),) $(if $(SLEEP),--sleep $(SLEEP),) \
+		$(if $(DRY_RUN),--dry-run,)
+
 # Verification gate for phase-1 -> phase-2: diff the snapshot against the
 # live CTE row-for-row. DSN is auto-derived from the same DB_* vars
 # schema-apply uses (.env), authenticating via ~/.pgpass exactly like the
