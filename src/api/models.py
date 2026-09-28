@@ -559,11 +559,23 @@ class HedgingFlowSession(BaseModel):
 
 
 class HedgingFlowSessionList(BaseModel):
-    """The index behind the dated Hedging Flow permalinks, newest first."""
+    """The index behind the dated Hedging Flow permalinks, newest first.
+
+    Paged, unlike the other session lists. Those read tables ``db-prune``
+    empties at DATA_RETENTION_DAYS, so one page holds everything they will ever
+    hold; ``hedging_flow_5min`` is retention-exempt and gains a session every
+    trading day, so this list outgrows any fixed page.
+
+    ``has_more`` is authoritative: it is answered from a row the server fetched
+    and discarded, not inferred from ``count``. Feed ``next_before`` back as
+    ``before`` to walk backwards; it is null on the last page.
+    """
 
     symbol: str
     count: int
     sessions: List[HedgingFlowSession]
+    has_more: bool = False
+    next_before: Optional[str] = None
 
 
 class GammaRegimeBar(BaseModel):

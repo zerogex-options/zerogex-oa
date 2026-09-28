@@ -335,6 +335,20 @@ WHERE
 #: summary for a session card to say something about the day rather than only
 #: name it. ``had_0dte`` is read off the presence of ``0dte`` rows, which is
 #: exactly what the toggle needs to know before it is offered.
+#:
+#: ``$3`` is an exclusive upper bound on ``bar_start``, or NULL for the newest
+#: page. It is what makes the index pageable, and this table is the one that
+#: needs it: the other session lists read tables ``db-prune`` empties at
+#: DATA_RETENTION_DAYS, so their whole contents fit in one page forever, while
+#: this one is retention-exempt and grows by a session a day without end.
+#:
+#: The bound is on ``bar_start`` rather than on the derived ``session_date``
+#: deliberately. ``session_date`` is a function of the column, so a predicate
+#: on it cannot use an index and every page would re-scan the symbol's entire
+#: history -- which is the same growth this cursor exists to survive. Bounding
+#: the raw column keeps each page on the ``(symbol, scope, bar_start)`` primary
+#: key. The caller passes the instant of ET midnight on the cursor date, so
+#: "before 2026-08-03" means every bar whose ET date is 2026-08-02 or earlier.
 HEDGING_FLOW_SESSIONS_ASYNCPG = """
     WITH days AS (
         SELECT
@@ -345,6 +359,7 @@ HEDGING_FLOW_SESSIONS_ASYNCPG = """
             is_synthetic
         FROM hedging_flow_5min
         WHERE symbol = $1
+          AND ($3::timestamptz IS NULL OR bar_start < $3::timestamptz)
     )
     SELECT
         session_date,
