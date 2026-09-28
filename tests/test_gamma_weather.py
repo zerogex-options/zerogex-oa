@@ -211,6 +211,13 @@ def test_transition_threshold_is_scale_free():
     assert classify_cushion("THIN", 10.0, -3.0) == CUSHION_TRANSITION_RISK
 
 
+def test_a_cushion_of_zero_is_a_transition_risk_not_plain_narrowing():
+    """Spot sitting ON the flip is the thinnest a cushion gets. A truthiness
+    check read 0.0 as "no cushion" and let it fall through to NARROWING."""
+    assert classify_cushion("CROSSING", 0.0, -1.0) == CUSHION_TRANSITION_RISK
+    assert classify_cushion("CROSSING", 0.0, 0.0) == CUSHION_STEADY
+
+
 def test_widening_and_steady_and_absent_cushions():
     assert classify_cushion("SECURE", 40.0, 3.0) == CUSHION_WIDENING
     assert classify_cushion("SECURE", 40.0, 0.0) == CUSHION_STEADY
@@ -895,6 +902,24 @@ def test_reversed_has_display_wording_like_every_other_rung():
     from src.analytics.gamma_weather import PERSISTENCE_LABELS, PERSISTENCE_REVERSED
 
     assert PERSISTENCE_LABELS[PERSISTENCE_REVERSED] == "Reversed"
+
+
+def test_a_reversal_is_reported_in_the_trail():
+    """Reversed arrived after the trail and was never given a line, so the one
+    bar a reversal confirmed on dropped out of the history entirely."""
+    rows = [_inputs(pressure_bar=v, pressure_avg=v) for v in [BIG] * 4 + [-BIG] * 3]
+
+    steps = [c.text for c in _trail(rows, field="pressure") if c.kind == "PERSISTENCE"]
+
+    assert steps[-2:] == ["Pressure reversed", "Pressure persistent"]
+
+
+def test_every_persistence_rung_has_a_trail_line():
+    """The guard on the cause rather than the symptom: the next rung added to
+    the ladder fails here instead of vanishing from the trail."""
+    from src.analytics.gamma_weather import _PERSISTENCE_TEXT
+
+    assert set(_PERSISTENCE_TEXT) == set(PERSISTENCE_LABELS)
 
 
 def test_a_session_that_never_establishes_never_reverses():

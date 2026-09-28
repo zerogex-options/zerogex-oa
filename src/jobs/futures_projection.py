@@ -244,6 +244,18 @@ PRICE_FIELDS: frozenset[str] = frozenset(
         "distance_from_spot",  # strike - spot
         "difference",  # max_pain - underlying_price
         "difference_from_underlying",
+        # The spot-to-flip cushion on /api/gex/regime-series and
+        # /api/gex/weather, and the typical move it is graded against. All are
+        # point distances, and the spot and gamma_flip beside them both
+        # project, so they carry by the same ratio or the cushion stops
+        # matching the gap drawn between those two levels. The prose
+        # ``cushion_summary`` is not rewritten (its numbers carry no $), so on
+        # ES/NQ it still quotes index points, off by the basis (about 1%).
+        "flip_distance_pts",  # spot - flip, signed
+        "cushion_pts",  # |spot - flip|
+        "cushion_step_pts",  # change in cushion over one bar
+        "cushion_rate_pts",  # change in cushion over the rate window
+        "typical_move_30m",  # median 30-minute high-low range, a width in points
     }
 )
 
@@ -270,6 +282,17 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         "call_notional",
         "put_notional",
         "total_notional",
+        # Gamma Shift scores (/api/gex/regime-series): proximity-weighted
+        # dollar GEX, however price-like "lean" and "stability" sound.
+        "anchored_lean",
+        "anchored_stability",
+        "anchored_net_shift",
+        "anchored_gross_shift",
+        "rolling_lean",
+        "rolling_stability",
+        "rolling_net_shift",
+        "rolling_gross_shift",
+        "near_spot_stock",
         # ALREADY on the futures axis — the overnight display swap puts the
         # future's own price in these. Projecting them would apply the basis
         # a second time.
@@ -293,6 +316,8 @@ NEVER_PROJECT: frozenset[str] = frozenset(
         # dimensionless ratios / fractions
         "flip_distance",
         "distance_to_flip",
+        "flip_distance_frac",  # (spot - flip) / spot
+        "cushion_move_ratio",  # cushion_pts / typical_move_30m: both ends scale
         "put_call_ratio",
         "pin_score",
         "pin_confidence",

@@ -245,8 +245,9 @@ HEDGING_FLOW_CTE_PSYCOPG2 = _render_psycopg2(_HEDGING_FLOW_CTE_TEMPLATE)
 # reason ``gex_summary`` and ``underlying_quotes`` were made retention-exempt
 # in 2026-08 for the TradeWorkz screen.
 #
-# It is also tiny: 78 bars per symbol per session, two scopes, which is
-# smaller than either of those two tables at ~1 row/min/symbol.
+# It is also tiny: 82 bars per symbol per session (09:30 through the 16:15
+# bar), two scopes, which is smaller than either of those two tables at
+# ~1 row/min/symbol.
 #
 # Why the rows can be written once and trusted
 # --------------------------------------------

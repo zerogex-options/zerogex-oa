@@ -472,8 +472,10 @@ class HedgingFlowBar(BaseModel):
 
     ``net_flow_ma_usd`` is the trailing SMA of ``net_flow_usd`` and is null
     until the smoothing window fills. ``classified_ratio`` is the share of the
-    bar's volume that carried an aggressor classification -- a low value means
-    a thin sample behind that bar's reading.
+    bar's volume in contract-minutes with ANY aggressor-classified print --
+    coverage, not the classified share of prints, and rounding can put it
+    slightly above 1. A low value means a thin sample behind that bar's
+    reading; a high one does not mean most prints were classified.
     """
 
     timestamp: str
@@ -529,6 +531,10 @@ class HedgingFlowResponse(BaseModel):
     basis: str
     disclosure: str
     smoothing_bars: int
+    #: Half-width of the flat band around zero the flips were detected with,
+    #: as a multiple of the session's own typical rate. A flip has to establish
+    #: outside it, not merely touch the far side; 0 means no band.
+    flat_band_ratio: float
     bars: List[HedgingFlowBar]
     flips: List[HedgingFlowFlip]
 
@@ -631,8 +637,10 @@ class GammaRegimeBar(BaseModel):
     #: Only meaningful while narrowing; null otherwise, since "not
     #: accelerating" and "not narrowing at all" are different statements.
     cushion_accelerating: Optional[bool] = None
-    #: SECURE / THIN / CROSSING / NO_FLIP. Classified on the FRACTION, never
-    #: on points, so the label means the same thing on SPX and SPY.
+    #: SECURE / NORMAL / THIN / CROSSING / NO_FLIP. Never classified on raw
+    #: points, so the label means the same thing on SPX and SPY: graded
+    #: against the typical 30-minute move, or against a fraction of spot
+    #: (no NORMAL band) where no move was stored. ``cushion_basis`` says which.
     cushion_state: Optional[str] = None
     #: Cushion as a multiple of a typical 30-minute realized move, which is
     #: the yardstick the state is classified against.
@@ -733,7 +741,11 @@ class GammaWeatherResponse(BaseModel):
 
 
 class GammaWeatherBar(BaseModel):
-    """One bar of the session's Gamma Weather, as the panel read it at the time."""
+    """One bar of the session's Gamma Weather, classified causally.
+
+    Reclassified on every read from the bars as stored now, so a bar the
+    panel read while it was still filling can differ from what it showed live.
+    """
 
     bar_start: str
     state: str

@@ -63,10 +63,11 @@ HEDGING FLOW. It is never "observed dealer flow", "dealer positioning", or
 
 Two further honesties, both surfaced in the payload rather than buried:
 
-* the buy/sell split is EXTRAPOLATED (``flow_contract_facts`` redistributes
-  mid-classified volume across buy/sell pro-rata), so a bucket whose volume
-  was entirely mid-classified contributes nothing rather than something
-  wrong -- :attr:`HedgingFlowBar.classified_ratio` reports that coverage;
+* the buy/sell split is EXTRAPOLATED (``flow_contract_facts`` spreads each
+  contract-minute's unclassified volume across buy/sell pro-rata), so a
+  contract-minute with no bid- or ask-classified print contributes nothing
+  rather than something wrong -- :attr:`HedgingFlowBar.classified_ratio`
+  reports that coverage;
 * ``delta`` is the contract's delta at the bucket timestamp, not at the
   instant of each print inside it.
 
@@ -156,11 +157,15 @@ class HedgingFlowBar:
     activity bearish by construction would be wrong on exactly the days it
     matters.
 
-    ``classified_ratio`` is the share of the bar's traded volume that carried
-    an aggressor classification (bid/ask), in [0, 1]. Mid-classified volume is
-    redistributed pro-rata upstream, but a bar with NO classified volume
-    contributes zero flow; a low ratio means this bar's reading rests on a
-    thin sample and should be read as such.
+    ``classified_ratio`` is the share of the bar's traded volume that sits in
+    contract-minutes with ANY bid- or ask-classified print. That is coverage,
+    not the classified share of prints: upstream extrapolates a minute's
+    buy/sell split over its whole volume once any of it classified, so one
+    classified print covers the minute, and rounding that split can put the
+    ratio slightly above 1. A contract-minute with NO classified volume
+    contributes zero flow, so a low ratio means this bar's reading rests on a
+    thin sample and should be read as such; a high one does not mean most
+    prints were classified.
     """
 
     bar_start: datetime

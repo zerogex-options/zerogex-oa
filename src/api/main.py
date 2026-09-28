@@ -1261,7 +1261,8 @@ async def get_flow_series(
         le=390,
         description=(
             "If provided, return only the last N 5-minute bars (tail window) "
-            "for cheap incremental polling. A full regular session is 81 bars."
+            "for cheap incremental polling. A full regular session is 82 bars "
+            "(09:30 through 16:15 ET, both ends included)."
         ),
     ),
 ):
@@ -1778,15 +1779,17 @@ async def get_gamma_regime_series(
     in Aug 2026 — so a miss returns empty rather than falling back to compute.
 
     Each bar also carries the spot-to-flip cushion: how much room price has
-    before the gamma regime itself changes. Only the flip level is stored;
-    distance, direction, the rolling rate and the SECURE / THIN / CROSSING
-    label are derived here, so retuning a threshold reclassifies history
-    instead of leaving old bars labelled by a rule that is no longer live.
-    The label is computed from the distance as a FRACTION of spot, never from
-    points, because ten points is a crossing risk on SPX and a comfortable
-    cushion on SPY. ``cushion_state`` of ``NO_FLIP`` means the gamma profile
-    had no zero crossing at all, which is a different statement from a distant
-    one.
+    before the gamma regime itself changes. The flip level and the typical
+    30-minute move are stored; distance, direction, the rolling rate and the
+    SECURE / NORMAL / THIN / CROSSING label are derived here, so retuning a
+    threshold reclassifies history instead of leaving old bars labelled by a
+    rule that is no longer live. The label is never computed from raw points,
+    because ten points is a crossing risk on SPX and a comfortable cushion on
+    SPY: it grades the cushion against the typical 30-minute realized move
+    (``cushion_basis='move_30m'``), and falls back to a fraction of spot, which
+    has no NORMAL band, only where no move was stored (``'spot_fraction'``).
+    ``cushion_state`` of ``NO_FLIP`` means the gamma profile had no zero
+    crossing at all, which is a different statement from a distant one.
 
     Same session resolution as ``/api/flow/hedging``, so the two cover
     identical bars. Rows newest → oldest. Unknown symbols 404; a session with
@@ -2039,8 +2042,10 @@ async def get_gamma_weather_series(
     ``changes`` is not one entry per bar. An entry exists only where a label
     actually moved, so a quiet afternoon in one state produces a single line
     instead of fifty identical ones, and the trail stays readable at a glance.
-    Every label was computed causally when the bar printed, so what is rendered
-    now is what the panel showed at the time rather than a hindsight summary.
+    Every label is classified causally, from its bar and the ones before it,
+    so the trail is not a hindsight summary. It is not a recording either: the
+    session is reclassified on every read, so a bar the panel read while it
+    was still filling can show a label here that the panel did not.
 
     Same 400 / 404 / 409 semantics as the current-state endpoint.
     """

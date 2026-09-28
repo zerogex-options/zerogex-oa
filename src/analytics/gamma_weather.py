@@ -73,10 +73,10 @@ PRESSURE_FLOOR_USD = 25_000_000.0
 #: "pinning", so the reading is never overstated.
 STABILITY_FLAT_BAND_USD = 50_000_000.0
 
-#: Pressure persistence ladder, in completed 5-minute bars. One bar is a
-#: pulse; two of the last three plus an aligned average is building; three is
-#: persistent enough to lean on. A pulse is not nothing -- it is the first
-#: evidence -- but it is not yet a condition.
+#: Pressure persistence ladder, in 5-minute bars (see CONFIRM_BARS on the bar
+#: still filling). One bar is a pulse; two of the last three plus an aligned
+#: average is building; three is persistent enough to lean on. A pulse is not
+#: nothing -- it is the first evidence -- but it is not yet a condition.
 PERSISTENCE_WINDOW_BARS = 3
 PERSISTENCE_BUILDING_BARS = 2
 PERSISTENCE_PERSISTENT_BARS = 3
@@ -100,7 +100,12 @@ AGE_ESTABLISHED_MIN = 15
 AGE_CONFIRMED_MIN = 30
 AGE_MATURE_MIN = 60
 
-#: Completed bars a NEW state must repeat before it takes the header.
+#: Bars a NEW state must repeat before it takes the header.
+#:
+#: Not only completed bars. Confirmation, the persistence ladder and the age
+#: clock count every bar the two series share, and on a live read the newest
+#: of those is still filling. A state can confirm on a bar that has not
+#: closed, and that bar can read differently once it has.
 #:
 #: Not cosmetic. Measured over seven sessions, the unconfirmed classifier
 #: changed state roughly every 8 minutes: 347 runs with a median life of one
@@ -254,7 +259,8 @@ class Weather:
     #: immediately as unconfirmed, upgrade it when it holds.
     pending_state: Optional[str] = None
     pending_label: Optional[str] = None
-    #: Completed bars the candidate has held, 1 .. CONFIRM_BARS - 1.
+    #: Bars the candidate has held, 1 .. CONFIRM_BARS - 1. Live, the newest
+    #: may still be filling (see CONFIRM_BARS).
     pending_bars: int = 0
     #: Opposite bars banked toward a reversal, 1 .. REVERSAL_CONFIRM_BARS - 1,
     #: and 0 whenever no reversal is pending. Drives the "Pressure reversing"
@@ -326,7 +332,10 @@ def classify_cushion(
 
     narrowing = rate_pts < 0
     if narrowing and cushion_state in (STATE_THIN, STATE_CROSSING):
-        if cushion_pts and abs(rate_pts) >= TRANSITION_RATE_SHARE * cushion_pts:
+        # `is not None`, not truthiness: a cushion of exactly 0 is spot sitting
+        # ON the flip, the thinnest a cushion gets, and it must not fall
+        # through to plain narrowing.
+        if cushion_pts is not None and abs(rate_pts) >= TRANSITION_RATE_SHARE * cushion_pts:
             return CUSHION_TRANSITION_RISK
     if narrowing:
         return CUSHION_NARROWING
@@ -819,7 +828,7 @@ def pair_series(
 # --------------------------------------------------------------------------- #
 #
 # A panel read at 15:40 answers "what is it now". Someone who looked away at
-# 11:00 needs "what happened while I was gone", and re-reading 78 sentences is
+# 11:00 needs "what happened while I was gone", and re-reading 82 sentences is
 # not an answer either. So this reduces a classified session to the moments a
 # label actually changed.
 #
@@ -827,8 +836,10 @@ def pair_series(
 # end: an event exists only where a tracked label differs from the bar before,
 # so a session that sits in one state all afternoon produces one line, not 50
 # identical ones. Nothing here re-derives anything. Every label was already
-# computed by classify_series, causally, which is what lets a trail rendered
-# now match what the panel showed at the time.
+# computed by classify_series, causally, so a trail rendered now carries no
+# hindsight. It is not a recording, though: the session is reclassified on
+# every read, so a bar the panel read while it was still filling, or a session
+# read after a threshold was retuned, can show a label the panel did not.
 
 CHANGE_STATE = "state"
 CHANGE_PRESSURE = "pressure"
@@ -876,6 +887,10 @@ _PERSISTENCE_TEXT = {
     PERSISTENCE_PULSE: "Pressure back to a pulse",
     PERSISTENCE_BUILDING: "Pressure building",
     PERSISTENCE_PERSISTENT: "Pressure persistent",
+    # Without a line here the one bar a reversal confirms mapped to None and
+    # dropped out of the trail, so the rarest event on the ladder was the one
+    # the history never showed.
+    PERSISTENCE_REVERSED: "Pressure reversed",
 }
 
 _LEAN_TEXT = {

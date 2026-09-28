@@ -514,6 +514,50 @@ def test_pin_migration_projects_as_a_price_delta():
     )
 
 
+@pytest.mark.parametrize("shape", ["regime_series", "weather"])
+def test_the_flip_cushion_moves_with_the_levels_it_is_measured_between(shape):
+    """The cushion is the gap between spot and the flip, so it scales with them.
+
+    /api/gex/regime-series nests spot and gamma_flip in each bar and
+    /api/gex/weather nests them in ``components``; both project. Before the
+    cushion fields were classified they passed through in index points, so an
+    ES cushion no longer matched the gap between the two levels beside it.
+    Ratio forms and dollar-GEX scores are the same number on either axis.
+    """
+    basis = _basis()
+    bar = {
+        "spot": 6612.0,
+        "gamma_flip": 6600.0,
+        "flip_distance_pts": 12.0,
+        "cushion_pts": 12.0,
+        "cushion_step_pts": -2.0,
+        "cushion_rate_pts": -5.0,
+        "typical_move_30m": 16.0,
+        "flip_distance_frac": 12.0 / 6612.0,
+        "cushion_move_ratio": 0.75,
+        "rolling_stability": -9.0e7,
+        "anchored_lean": 4.0e7,
+        "near_spot_stock": 2.5e9,
+    }
+    payload = {"bars": [dict(bar)]} if shape == "regime_series" else {"components": dict(bar)}
+
+    projected = project_payload(payload, basis)  # no tick: exact arithmetic
+    out = projected["bars"][0] if shape == "regime_series" else projected["components"]
+
+    assert out["flip_distance_pts"] == pytest.approx(out["spot"] - out["gamma_flip"])
+    assert out["cushion_pts"] == pytest.approx(abs(out["spot"] - out["gamma_flip"]))
+    for field in ("cushion_step_pts", "cushion_rate_pts", "typical_move_30m"):
+        assert out[field] == pytest.approx(bar[field] * basis.ratio)
+    for field in (
+        "flip_distance_frac",
+        "cushion_move_ratio",
+        "rolling_stability",
+        "anchored_lean",
+        "near_spot_stock",
+    ):
+        assert out[field] == bar[field], f"{field} was rescaled"
+
+
 def test_pin_stability_counters_are_never_projected():
     """Minutes observed and strikes occupied are counts, not prices."""
     payload = {

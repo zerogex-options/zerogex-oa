@@ -6044,8 +6044,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         session_start_utc = session_start_et.astimezone(timezone.utc)
         session_close_utc = session_start_utc + timedelta(hours=6, minutes=45)
         # Floor now() to the 5-minute bucket boundary so generate_series
-        # lands on clean bar_start values (and stops before any
-        # partially-populated bucket on the client's clock).
+        # lands on clean bar_start values. The floor is the START of the
+        # bucket now() sits in, and generate_series includes its end point,
+        # so the window does include that still-filling bucket: the newest
+        # bar is partial until its five minutes are up.
         now_utc = datetime.now(timezone.utc)
         now_floor_epoch = int(now_utc.timestamp() // 300) * 300
         now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)

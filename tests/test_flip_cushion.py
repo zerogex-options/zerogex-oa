@@ -1,9 +1,10 @@
 """Flip cushion -- spot-to-flip distance, its direction, rate and state label.
 
-The thing worth pinning hardest is that the state label is computed from the
-FRACTION and never from points. A threshold in points silently means something
-different on every symbol, and the failure is invisible: the panel keeps
-rendering a confident label that is simply wrong for that instrument.
+The thing worth pinning hardest is that the state label is computed from a
+SCALE and never from raw points: a typical 30-minute move, or a fraction of
+spot for bars stored before that existed. A threshold in points silently means
+something different on every symbol, and the failure is invisible: the panel
+keeps rendering a confident label that is simply wrong for that instrument.
 """
 
 from __future__ import annotations
@@ -230,6 +231,25 @@ def test_describe_matches_the_spec_shape():
 def test_describe_says_so_when_there_is_no_flip():
     series = build_series(_bars([(700.0, None)]))
     assert "no gamma flip" in describe(series[0])
+
+
+def test_describe_keeps_a_sub_point_cushion_on_its_side_of_the_flip():
+    """Half-to-even printed a 0.5-point cushion as "0 pts", which reads as
+    price sitting on the flip while it is still on one side of it. On SPY and
+    QQQ the whole cushion is often a point or two, so below 10 points the read
+    keeps a decimal."""
+    series = build_series(_bars([(700.5, 700.0), (702.4, 700.0)]))
+
+    assert "Flip cushion: 0.5 pts above" in describe(series[0])
+    assert "5m: widening 1.9 pts" in describe(series[1])
+
+
+def test_describe_rounds_halves_up_and_keeps_whole_numbers_whole():
+    series = build_series(_bars([(712.5, 700.0), (709.0, 700.0)]))
+
+    assert "Flip cushion: 13 pts above" in describe(series[0])
+    assert "Flip cushion: 9 pts above" in describe(series[1])
+    assert "5m: narrowing 3.5 pts" in describe(series[1])
 
 
 # --------------------------------------------------------------------------- #

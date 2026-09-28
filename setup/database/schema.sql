@@ -1237,10 +1237,12 @@ CREATE TABLE IF NOT EXISTS hedging_flow_5min (
     cum_call_usd      NUMERIC,
     cum_put_usd       NUMERIC,
     cum_net_usd       NUMERIC,
-    -- Share of the bar's traded volume that carried an aggressor
-    -- classification, in [0, 1]. NULL when the bar traded nothing. A low
-    -- ratio means the reading rests on a thin sample; stored rather than
-    -- derived so a historical bar keeps the coverage it actually had.
+    -- Share of the bar's traded volume in contract-minutes with ANY
+    -- aggressor-classified print: coverage, not the classified share of
+    -- prints, and rounding can put it slightly above 1. NULL when the bar
+    -- traded nothing. A low ratio means the reading rests on a thin sample;
+    -- stored rather than derived so a historical bar keeps the coverage it
+    -- actually had.
     classified_ratio  DOUBLE PRECISION,
     -- Mirrors underlying_quotes.close on the 5-minute grid, unfiltered, so
     -- this series and /api/flow/series land on the same price at the same

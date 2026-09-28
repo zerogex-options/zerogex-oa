@@ -168,6 +168,14 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "age_seconds",  # /api/v1/levels freshness, not a price
         "tod_bucket",
         "tod_bucket_used",
+        # Gamma Weather / Gamma Shift bookkeeping: bar counts and a duration.
+        "age_bars",
+        "age_minutes",
+        "confirm_bars",
+        "pending_bars",
+        "pressure_reversing_bars",
+        "rolling_bars",
+        "strike_count",
     }
 )
 
@@ -310,6 +318,12 @@ def test_acknowledged_list_does_not_shadow_a_real_decision():
         "spots",
         "distance_from_spot",
         "difference_from_underlying",
+        # The flip cushion, which shipped in index points under an ES label.
+        "flip_distance_pts",
+        "cushion_pts",
+        "cushion_step_pts",
+        "cushion_rate_pts",
+        "typical_move_30m",
     ],
 )
 def test_known_price_levels_are_projected(field):
@@ -331,6 +345,9 @@ def test_known_price_levels_are_projected(field):
         "put_iv",
         "atm_iv",
         "skew",
+        # The cushion's ratio forms, beside the point forms that do project.
+        "flip_distance_frac",
+        "cushion_move_ratio",
     ],
 )
 def test_look_alikes_are_denied(field):

@@ -13,7 +13,7 @@ Four readings, per the Phase 1 spec:
 * a 15-minute rolling rate, which separates a sustained convergence from an
   ordinary wobble. Note that the 15-minute view is NOT a slower feed: it is a
   rolling window recomputed on every 5-minute bar;
-* a state label: secure, thin, or crossing risk.
+* a state label: secure, normal, thin, or crossing risk.
 
 What the cushion is measured against
 ------------------------------------
@@ -60,8 +60,10 @@ two look identical -- so it is made once, where the bar is written.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import List, Optional, Sequence
 
 # The calibrated "near the flip" span, as a fraction of spot. Imported rather
@@ -308,6 +310,24 @@ def build_series(
     return out
 
 
+def _points(value: float) -> str:
+    """A distance in points for the one-line read, unsigned.
+
+    Halves round UP. Python's format rounds half to even, which printed a
+    0.5-point cushion as "0 pts": a reader sees price sitting on the flip
+    while it is still on one side of it. Below 10 points one decimal is kept,
+    because on SPY or QQQ the whole cushion is often a point or two and whole
+    points would round it away. A whole number still prints whole ("9 pts",
+    not "9.0 pts").
+    """
+    magnitude = abs(value)
+    if not math.isfinite(magnitude):
+        return str(magnitude)
+    step = Decimal("0.1") if magnitude < 10 else Decimal("1")
+    text = f"{Decimal(str(magnitude)).quantize(step, rounding=ROUND_HALF_UP):f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def describe(bar: CushionBar, rate_bars: int = DEFAULT_RATE_BARS) -> str:
     """The one-line read, in the shape the spec asks for.
 
@@ -317,11 +337,11 @@ def describe(bar: CushionBar, rate_bars: int = DEFAULT_RATE_BARS) -> str:
     if bar.state == STATE_NO_FLIP or bar.cushion_pts is None:
         return "Flip cushion: no gamma flip in the profile"
 
-    parts = [f"Flip cushion: {bar.cushion_pts:.0f} pts {bar.side}, {bar.state}"]
+    parts = [f"Flip cushion: {_points(bar.cushion_pts)} pts {bar.side}, {bar.state}"]
 
     if bar.step_pts is not None and bar.step_pts != 0:
         word = "widening" if bar.step_pts > 0 else "narrowing"
-        parts.append(f"5m: {word} {abs(bar.step_pts):.0f} pts")
+        parts.append(f"5m: {word} {_points(bar.step_pts)} pts")
 
     if bar.rate_pts is not None and bar.rate_pts != 0:
         word = "widening" if bar.rate_pts > 0 else "narrowing"
@@ -335,6 +355,6 @@ def describe(bar: CushionBar, rate_bars: int = DEFAULT_RATE_BARS) -> str:
             tail = ", stable"
         else:
             tail = ", accelerating" if bar.accelerating else ""
-        parts.append(f"{window}: {word} {abs(bar.rate_pts):.0f} pts{tail}")
+        parts.append(f"{window}: {word} {_points(bar.rate_pts)} pts{tail}")
 
     return " | ".join(parts)
