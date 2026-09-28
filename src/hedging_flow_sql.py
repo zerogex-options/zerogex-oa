@@ -237,8 +237,9 @@ HEDGING_FLOW_CTE_PSYCOPG2 = _render_psycopg2(_HEDGING_FLOW_CTE_TEMPLATE)
 # Why a snapshot at all, when the live CTE is cheap
 # -------------------------------------------------
 # Not for speed. ``flow_contract_facts`` is in ``DB_MAINTAIN_TABLES``, so
-# ``make db-prune`` deletes it at ``DATA_RETENTION_DAYS`` (90). Recomputing a
-# past session from it therefore answers for a quarter and then returns an
+# ``make db-prune`` deletes it at ``DATA_RETENTION_DAYS`` (90 by default, 60 on
+# the production deployment). Recomputing a
+# past session from it therefore answers for that window and then returns an
 # empty session -- indistinguishable, to a reader, from a genuinely quiet day.
 # The snapshot exists so a session survives its source data, which is the same
 # reason ``gex_summary`` and ``underlying_quotes`` were made retention-exempt

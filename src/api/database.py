@@ -5960,7 +5960,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         * the window for a named date is known by construction — the flag
           exists for ``prior``, where the window itself has to be discovered;
         * the probe it would otherwise do is against ``flow_by_contract``,
-          which ``make db-prune`` empties at 90 days. A dated read is served
+          which ``make db-prune`` empties at DATA_RETENTION_DAYS. A dated read is served
           from the retention-exempt snapshots precisely because its source
           data is gone, so asking the pruned table whether the day existed
           would report "no such session" for every session old enough to need
@@ -6236,14 +6236,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         the tape the page is watching.
 
         A DATED read serves ``hedging_flow_5min`` instead, and not for speed:
-        ``flow_contract_facts`` is pruned at ``DATA_RETENTION_DAYS`` (90), so
+        ``flow_contract_facts`` is pruned at ``DATA_RETENTION_DAYS`` (60 here), so
         recomputing a session older than that returns an empty series that a
         reader cannot distinguish from a quiet day. The snapshot is written
         once per cycle from the same canonical SQL and kept forever, which is
         the only reason a permalink from last spring still draws a chart.
 
         A dated read whose filter neither stored scope covers falls back to
-        the CTE and inherits its 90-day horizon -- the same tradeoff
+        the CTE and inherits its retention horizon -- the same tradeoff
         ``flow_series_5min`` makes for filtered reads.
         """
         symbol = symbol.upper()

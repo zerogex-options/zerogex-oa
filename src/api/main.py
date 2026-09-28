@@ -1388,7 +1388,8 @@ async def get_hedging_flow(
         description=(
             "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
             "Served from the retention-exempt hedging_flow_5min snapshot, so "
-            "it reaches back past the 90-day prune window that bounds the "
+            "it reaches back past the DATA_RETENTION_DAYS prune window that "
+            "bounds the "
             "live pipeline. A day with nothing stored returns 200 with an "
             "empty `bars` list -- never 404."
         ),
@@ -1640,7 +1641,7 @@ async def get_hedging_flow_sessions(
     equivalent are both shaped this way.
 
     Read from ``hedging_flow_5min`` and nothing else. Listing from the live
-    tables instead would advertise exactly the 90 days the prune window keeps
+    tables instead would advertise exactly the days the prune window keeps
     and hide every older session that is still perfectly readable -- the list
     and the permalinks have to agree about which days exist.
 

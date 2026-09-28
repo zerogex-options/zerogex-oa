@@ -3823,7 +3823,7 @@ flow-series-backfill: ## Backfill flow_series_5min (current + prior session) bef
 # is only a repair tool: the engine keeps the table current by itself.
 # Idempotent; DAYS=<n> to narrow, DRY_RUN=1 to list the sessions first.
 .PHONY: hedging-flow-backfill
-hedging-flow-backfill: ## Seed hedging_flow_5min history from retained flow facts (run once, soon — the source is on a 90-day clock)
+hedging-flow-backfill: ## Seed hedging_flow_5min history from retained flow facts (run once, soon — the source is on a DATA_RETENTION_DAYS clock)
 	@echo "$(BLUE)=== Backfilling hedging_flow_5min ===$(NC)"
 	@$(PY) -m src.tools.hedging_flow_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS) \
 		$(if $(DAYS),--days $(DAYS),) $(if $(DRY_RUN),--dry-run,)
