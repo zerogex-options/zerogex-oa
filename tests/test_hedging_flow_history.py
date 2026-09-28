@@ -392,4 +392,153 @@ def test_sessions_endpoint_empty_list_is_not_an_error(monkeypatch: pytest.Monkey
         response = client.get("/api/flow/hedging/sessions?symbol=SPY")
 
     assert response.status_code == 200
-    assert response.json() == {"symbol": "SPY", "count": 0, "sessions": []}
+    assert response.json() == {
+        "symbol": "SPY",
+        "count": 0,
+        "sessions": [],
+        "has_more": False,
+        "next_before": None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Paging the session index
+#
+# This list is the only one in the API that needs paging. /replay and
+# /scorecard read tables db-prune empties at DATA_RETENTION_DAYS, so their
+# whole contents fit one page forever; hedging_flow_5min is retention-exempt
+# and gains a session per trading day, so a fixed page silently stops showing
+# the oldest sessions while their permalinks keep working. Nothing errors when
+# that happens, which is why it needs pinning rather than noticing.
+# --------------------------------------------------------------------------- #
+def _sessions(dates: List[date]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "session_date": d,
+            "bar_count": 82,
+            "real_bar_count": 80,
+            "had_0dte": True,
+            "cum_net_usd": 1.0,
+            "first_bar": None,
+            "last_bar": None,
+        }
+        for d in dates
+    ]
+
+
+def test_sessions_endpoint_asks_for_one_row_more_than_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The extra row is what makes `has_more` a fact instead of a guess."""
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, "get_hedging_flow_sessions", _sessions([date(2026, 6, 12)]))
+        client.get("/api/flow/hedging/sessions?symbol=SPY&limit=30")
+        call = mainmod.db_manager.get_hedging_flow_sessions.await_args
+
+    assert call.kwargs["limit"] == 31
+
+
+def test_sessions_endpoint_has_more_is_not_inferred_from_count(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A full page is not the same fact as "there is another page".
+
+    Inferring it from ``count == limit`` is wrong exactly when the total is a
+    multiple of the page size, and the reader is then offered a next page that
+    renders as an empty archive. The probe row settles it, and must not itself
+    appear in the payload.
+    """
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    # Three asked for, four available.
+    rows = _sessions([date(2026, 6, 12), date(2026, 6, 11), date(2026, 6, 10), date(2026, 6, 9)])
+
+    with TestClient(app) as client:
+        _attach(mainmod, "get_hedging_flow_sessions", rows)
+        body = client.get("/api/flow/hedging/sessions?symbol=SPY&limit=3").json()
+
+    assert body["count"] == 3
+    assert body["has_more"] is True
+    # The cursor is the OLDEST date on this page, and `before` is exclusive, so
+    # the next page resumes at 2026-06-09 without repeating it.
+    assert body["next_before"] == "2026-06-10"
+    assert [s["date"] for s in body["sessions"]] == ["2026-06-12", "2026-06-11", "2026-06-10"]
+
+
+def test_sessions_endpoint_last_page_offers_no_cursor(monkeypatch: pytest.MonkeyPatch):
+    """Exactly a page's worth and no probe row means this is the end."""
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    rows = _sessions([date(2026, 6, 12), date(2026, 6, 11), date(2026, 6, 10)])
+
+    with TestClient(app) as client:
+        _attach(mainmod, "get_hedging_flow_sessions", rows)
+        body = client.get("/api/flow/hedging/sessions?symbol=SPY&limit=3").json()
+
+    assert body["count"] == 3
+    assert body["has_more"] is False
+    assert body["next_before"] is None
+
+
+def test_sessions_endpoint_threads_the_cursor_to_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, "get_hedging_flow_sessions", [])
+        client.get("/api/flow/hedging/sessions?symbol=SPY&before=2026-06-12")
+        call = mainmod.db_manager.get_hedging_flow_sessions.await_args
+
+    assert call.kwargs["before"] == date(2026, 6, 12)
+
+
+def test_sessions_endpoint_rejects_a_malformed_cursor(monkeypatch: pytest.MonkeyPatch):
+    """Same strictness as ?date=, and for the same reason.
+
+    Ignoring an unparseable cursor would serve the NEWEST page under a URL that
+    asked for an old one — a reader paging backwards would silently loop.
+    """
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, "get_hedging_flow_sessions", [])
+        response = client.get("/api/flow/hedging/sessions?symbol=SPY&before=last-june")
+
+    assert response.status_code == 400
+    # Named for the parameter the caller actually sent, not for ?date=.
+    assert "before" in response.json()["detail"]
+
+
+def test_sessions_cursor_is_part_of_the_cache_key():
+    """Otherwise page two is served whatever page one cached.
+
+    Both pages ask the same symbol for the same limit, so a key built from
+    those alone collides — and the reader pages backwards and lands on the
+    sessions they just read.
+    """
+    # _attach patches get_hedging_flow_sessions onto the DatabaseManager CLASS
+    # and never restores it, so by the time this runs the real method may be a
+    # mock and the connection would never be touched. Drop the modules so
+    # _make_db imports a clean class; this is the same purge
+    # _build_app_with_mock_db does, for the same reason.
+    for mod in list(sys.modules):
+        if mod.startswith("src.api"):
+            sys.modules.pop(mod, None)
+
+    # One truthy value per call: each one re-probes whether the symbol exists.
+    conn = _CannedConn(fetchval_sequence=[1, 1], fetch_rows=[])
+    db = _make_db(conn)
+    db._flow_series_endpoint_cache_ttl_seconds = 60.0
+
+    asyncio.run(db.get_hedging_flow_sessions(symbol="SPY", limit=3))
+    asyncio.run(db.get_hedging_flow_sessions(symbol="SPY", limit=3, before=date(2026, 6, 10)))
+
+    # Two distinct queries reached the connection rather than one plus a cache
+    # hit, and the cursor page carried its bound.
+    assert len(conn.fetch_calls) == 2
+    assert conn.fetch_calls[0][1][2] is None
+    cursor_arg = conn.fetch_calls[1][1][2]
+    assert cursor_arg is not None
+    # ET midnight on the cursor date: 2026-06-10 00:00 EDT == 04:00Z.
+    assert cursor_arg.astimezone(UTC) == datetime(2026, 6, 10, 4, 0, tzinfo=UTC)

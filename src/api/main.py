@@ -1107,7 +1107,7 @@ def _parse_flow_expirations(raw: Optional[str]) -> Optional[List[date_type]]:
     return parsed
 
 
-def _parse_session_date(raw: Optional[str]) -> Optional[date_type]:
+def _parse_session_date(raw: Optional[str], field: str = "date") -> Optional[date_type]:
     """Parse the ?date= parameter into an ET trading date.
 
     Strict where ``expirations`` is lenient, and for the opposite reason: a
@@ -1121,6 +1121,11 @@ def _parse_session_date(raw: Optional[str]) -> Optional[date_type]:
     on a day that merely turned out to be quiet, and it must not 404 because
     the API blinked: ``notFound()`` during a crawl costs the URL its place in
     the index.
+
+    ``field`` only names the parameter in the 400s. Every date-shaped query
+    param on these endpoints routes through this one parser so they cannot
+    drift apart on what counts as well-formed; the name keeps the message
+    about the parameter the caller actually sent.
     """
     if raw is None:
         return None
@@ -1128,11 +1133,11 @@ def _parse_session_date(raw: Optional[str]) -> Optional[date_type]:
     if not trimmed:
         return None
     if not _FLOW_EXPIRATION_PATTERN.match(trimmed):
-        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+        raise HTTPException(status_code=400, detail=f"{field} must be YYYY-MM-DD")
     try:
         return date_type.fromisoformat(trimmed)
     except ValueError:
-        raise HTTPException(status_code=400, detail="date must be a real calendar date")
+        raise HTTPException(status_code=400, detail=f"{field} must be a real calendar date")
 
 
 def _format_flow_series_row(row: dict) -> dict:
@@ -1631,6 +1636,18 @@ def _format_gamma_regime_row(row: dict, cushion=None) -> dict:
 async def get_hedging_flow_sessions(
     symbol: str = Query(..., min_length=1, max_length=10),
     limit: int = Query(default=60, ge=1, le=250),
+    before: Optional[str] = Query(
+        default=None,
+        description=(
+            "Page backwards: an ET trading day, YYYY-MM-DD, returning only "
+            "sessions strictly OLDER than it. Pass the previous response's "
+            "`next_before`; omit for the newest page. This is the one session "
+            "list that needs paging at all -- hedging_flow_5min is "
+            "retention-exempt, so it grows by a session a day without end, and "
+            "a caller that never pages eventually stops seeing the oldest "
+            "sessions even though their permalinks still work."
+        ),
+    ),
 ):
     """Trading days that have a stored Hedging Flow session, newest first.
 
@@ -1649,6 +1666,12 @@ async def get_hedging_flow_sessions(
     bars the day has, how many of those were real rather than carried
     forward, whether a 0DTE scope exists for it, and where the session's
     cumulative lean finished.
+
+    ``has_more`` comes from asking the database for one row more than the
+    caller wanted and then dropping it. That extra row is what lets the answer
+    be certain instead of inferred: a caller comparing ``count`` to ``limit``
+    is wrong exactly when the total is a multiple of the page size, and it
+    offers the reader a next page that renders as an empty archive.
     """
     normalized = symbol.strip().upper()
     if not _FLOW_SYMBOL_PATTERN.match(normalized):
@@ -1657,9 +1680,16 @@ async def get_hedging_flow_sessions(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    rows = await _db().get_hedging_flow_sessions(symbol=normalized, limit=limit)
+    before_date = _parse_session_date(before, field="before")
+
+    rows = await _db().get_hedging_flow_sessions(
+        symbol=normalized, limit=limit + 1, before=before_date
+    )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
 
     def _iso(value) -> Optional[str]:
         if value is None:
@@ -1680,7 +1710,15 @@ async def get_hedging_flow_sessions(
         for r in rows
     ]
     return JSONResponse(
-        content={"symbol": normalized, "count": len(sessions), "sessions": sessions}
+        content={
+            "symbol": normalized,
+            "count": len(sessions),
+            "sessions": sessions,
+            "has_more": has_more,
+            # The cursor for the next page: the oldest date on this one, which
+            # the `before` bound excludes, so paging cannot repeat a session.
+            "next_before": sessions[-1]["date"] if (has_more and sessions) else None,
+        }
     )
 
 
