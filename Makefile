@@ -3842,6 +3842,19 @@ gamma-regime-backfill: ## Seed gamma_regime_5min history from retained per-strik
 		$(if $(END),--end $(END),) $(if $(SLEEP),--sleep $(SLEEP),) \
 		$(if $(DRY_RUN),--dry-run,)
 
+# The engine stamps typical_move_30m once per refresh call, with until =
+# session_end. Live that is the newest bar, so it is causal. The backfill
+# writes a whole past session in one call, so every bar on a backfilled day
+# carries a median that includes that day's afternoon. This recomputes it per
+# bar, which is the correct value for a live-written bar too, so the default
+# range is the whole table and a second run changes nothing.
+.PHONY: gamma-regime-fix-typical-move
+gamma-regime-fix-typical-move: ## Recompute gamma_regime_5min.typical_move_30m causally, one bar at a time
+	@echo "$(BLUE)=== Recomputing typical_move_30m causally ===$(NC)"
+	@$(PY) -m src.tools.gamma_regime_typical_move_repair \
+		$(if $(SYMBOLS),--symbols $(SYMBOLS),) $(if $(START),--start $(START),) \
+		$(if $(END),--end $(END),) $(if $(DRY_RUN),--dry-run,)
+
 # Verification gate for phase-1 -> phase-2: diff the snapshot against the
 # live CTE row-for-row. DSN is auto-derived from the same DB_* vars
 # schema-apply uses (.env), authenticating via ~/.pgpass exactly like the
