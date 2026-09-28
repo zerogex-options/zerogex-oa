@@ -1949,6 +1949,19 @@ feed-probe: ## Measure ONE fetch from a provider before a real run (PROVIDER, UN
 		$(if $(STRIKE_COUNT_MAX),--strike-count-max '$(STRIKE_COUNT_MAX)') \
 		$(if $(JSON),--json)
 
+.PHONY: crossed-capture
+crossed-capture: ## Capture crossed Market Value option quotes to CSV for the vendor bug report (UNDERLYING, MINUTES, OUT)
+	@echo "$(BLUE)=== Crossed Market Value quotes (read-only; no DB writes) ===$(NC)"
+	@echo "$(YELLOW)Samples option_snapshot_market_value only. Does NOT read the$(NC)"
+	@echo "$(YELLOW)realtime quote endpoint -- whether we may read raw NBBO is an$(NC)"
+	@echo "$(YELLOW)open licensing question and a diagnostic must not prejudge it.$(NC)"
+	@$(VENV_PYTHON) -m src.tools.crossed_quote_capture \
+		--underlying "$${UNDERLYING:-SPY}" \
+		$(if $(PROVIDER),--provider '$(PROVIDER)') \
+		$(if $(MINUTES),--duration-minutes '$(MINUTES)') \
+		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)') \
+		$(if $(OUT),--out '$(OUT)')
+
 .PHONY: chain-depth-sweep
 chain-depth-sweep: ## Does the gamma flip converge as the chain deepens? (UNDERLYING, PROVIDER, DEPTHS, ROUNDS)
 	@echo "$(BLUE)=== Chain depth sweep (read-only; no DB writes) ===$(NC)"
