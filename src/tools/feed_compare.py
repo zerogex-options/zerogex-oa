@@ -631,6 +631,16 @@ def sample_provider(
         )
 
 
+def _contract_key(meta: Dict[str, Any]) -> Tuple[Any, float, str]:
+    """The vendor-neutral identity of one contract.
+
+    Expiration, strike and right -- the three facts that make two symbols
+    the same option no matter which vendor spelled them. ``_resolve_chain``
+    records all three itself, so this never depends on a symbology.
+    """
+    return (meta["expiration"], round(float(meta["strike"]), 4), meta["option_type"])
+
+
 def compare_flow_classification(
     incumbent: "FeedSample",
     candidate: "FeedSample",
@@ -688,6 +698,27 @@ def compare_flow_classification(
     volume_disagreed = 0
     shifts: Dict[str, int] = {}
     no_trade = 0
+    unmatched = 0
+
+    # Join on the CONTRACT, never on the vendor's symbol string.
+    #
+    # Each feed resolves its own chain through its own build_option_symbol,
+    # so the incumbent keys its quotes "SPY 260928C763" and the candidate
+    # keys the identical contract "SPY   260928C00763000". A dict lookup
+    # across the two therefore misses every single time -- and the miss was
+    # silent: the loop skipped to the next symbol before reaching the
+    # no_trade counter, so a run in which nothing matched printed as a run
+    # in which nothing traded. Thirty samples of live SPY 0DTE, every
+    # contract carrying six-figure volume, reported "no contract traded".
+    #
+    # metadata is built by _resolve_chain, not by either vendor, so strike,
+    # expiration and right are directly comparable. Strike is rounded
+    # because the two ladders arrive as separate floats.
+    candidate_by_contract = {
+        _contract_key(meta): candidate.quotes[symbol]
+        for symbol, meta in candidate.metadata.items()
+        if symbol in candidate.quotes
+    }
     # The disagreement RATE is not the thing that reaches a customer. What
     # reaches a customer is the net imbalance -- ask volume minus bid volume
     # -- which is what order_flow_imbalance and tape_flow_bias are built on.
@@ -700,8 +731,14 @@ def compare_flow_classification(
     crossed_inc = 0
 
     for symbol, inc_q in incumbent.quotes.items():
-        cand_q = candidate.quotes.get(symbol)
+        meta = incumbent.metadata.get(symbol)
+        cand_q = candidate_by_contract.get(_contract_key(meta)) if meta else None
         if cand_q is None:
+            # Counted, and reported. A contract the candidate did not answer
+            # for is a coverage fact worth seeing; a run where that is EVERY
+            # contract is a broken harness, and must never again read as a
+            # quiet market.
+            unmatched += 1
             continue
         # The trade is the same trade on both sides: same endpoint, same
         # row. A contract that has not traded has nothing to classify.
@@ -759,6 +796,8 @@ def compare_flow_classification(
         ),
         "shifts": dict(sorted(shifts.items(), key=lambda kv: -kv[1])),
         "contracts_without_a_trade": no_trade,
+        "contracts_unmatched": unmatched,
+        "contracts_offered": len(incumbent.quotes),
         "band_pct": FLOW_CLASSIFY_MID_BAND_PCT,
         # The published quantity, both ways, and how far apart they land.
         "net_imbalance_incumbent": net_inc,
@@ -775,9 +814,37 @@ def compare_flow_classification(
 def _print_flow_classification(flow: Dict[str, Any]) -> None:
     compared = flow.get("contracts_compared") or 0
     if not compared:
-        print("\nFLOW CLASSIFICATION  no contract traded in this sample -- nothing to compare")
+        # Say WHICH of the three reasons it was. The first version printed
+        # "no contract traded" for all of them, and a total join failure
+        # read for five days as an illiquid market.
+        offered = flow.get("contracts_offered") or 0
+        unmatched = flow.get("contracts_unmatched") or 0
+        no_trade = flow.get("contracts_without_a_trade") or 0
+        if offered and unmatched >= offered:
+            print(
+                "\nFLOW CLASSIFICATION  NOT MEASURED -- the candidate answered "
+                f"for none of the {offered} contracts the incumbent quoted.\n"
+                "                     That is a harness or coverage failure, "
+                "not a quiet market."
+            )
+        elif no_trade:
+            print(
+                f"\nFLOW CLASSIFICATION  no contract traded in this sample "
+                f"({no_trade} quoted, none with volume) -- nothing to compare"
+            )
+        else:
+            print(
+                "\nFLOW CLASSIFICATION  nothing to compare "
+                f"(offered {offered}, unmatched {unmatched}, untraded {no_trade})"
+            )
         return
     print("\nFLOW CLASSIFICATION (same trade, two quotes)")
+    if flow.get("contracts_unmatched"):
+        print(
+            f"  unmatched   {flow['contracts_unmatched']} of "
+            f"{flow.get('contracts_offered', 0)} -- the candidate had no quote "
+            "for these, so they are outside the comparison"
+        )
     print(
         f"  contracts   {flow['contracts_disagreed']}/{compared} differ "
         f"({flow['contract_disagreement_pct']:.2f}%)"

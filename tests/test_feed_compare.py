@@ -1252,3 +1252,173 @@ def test_the_unresolved_diagnostic_reports_what_it_threw_away(caplog):
     assert f"usable={len(rows) - no_iv - no_oi}/{len(rows)}" in message
     assert f"dropped {no_iv} no-IV" in message
     assert f"{no_oi} no-OI" in message
+
+
+# ---------------------------------------------------------------------------
+# Flow classification: the join, which silently matched nothing for five days
+# ---------------------------------------------------------------------------
+
+
+_FLOW_EXPIRATIONS = (date(2026, 9, 28), date(2026, 9, 29))
+
+
+def _ts_symbol(expiration: date, strike: float, right: str) -> str:
+    """TradeStation's spelling: 'SPY 260928C763'."""
+    return f"SPY {expiration:%y%m%d}{right}{strike:g}"
+
+
+def _occ_symbol(expiration: date, strike: float, right: str) -> str:
+    """ThetaData's spelling: the 21-character OCC symbol."""
+    return f"{'SPY':<6}{expiration:%y%m%d}{right}{int(round(strike * 1000)):08d}"
+
+
+def _flow_quote(symbol: str, *, bid: float, ask: float, last: float, volume: int) -> OptionQuote:
+    return OptionQuote(
+        option_symbol=symbol,
+        timestamp=datetime.now(timezone.utc),
+        bid=bid,
+        ask=ask,
+        last=last,
+        volume=volume,
+        open_interest=1000,
+    )
+
+
+def _flow_price(expiration: date, strike: float, right: str) -> float:
+    """A price unique to this contract.
+
+    Load-bearing. If every contract carries the same quote, a join key that
+    collapsed calls onto puts -- or every strike onto one -- would still
+    pair each incumbent contract with SOME candidate quote that classifies
+    identically, and the test would pass on a key that matches the wrong
+    option. Distinct prices make a mispairing show up as a disagreement.
+    """
+    return round(
+        strike / 100.0
+        + (0.50 if right == "P" else 0.0)
+        + (0.25 if expiration == _FLOW_EXPIRATIONS[1] else 0.0),
+        2,
+    )
+
+
+def _two_feeds(*, cand_offset: float = 0.0):
+    """The same contracts, spelled each vendor's way.
+
+    This is the configuration the harness actually runs in: each feed
+    resolves its own chain through its own build_option_symbol, so the two
+    quote dicts share no key at all.
+
+    Two expirations x three strikes x both rights, so the join key is
+    exercised on every component it carries. With one expiration and calls
+    alone, a key that dropped the expiration or the right would still match
+    everything.
+
+    ``last`` sits at the incumbent's bid, so every contract classifies
+    seller-initiated. ``cand_offset`` shifts the candidate's quote by that
+    many dollars: at -0.01 the same print lands on the candidate's ask and
+    every contract reverses, which is exactly the effect the Market Value
+    penny was suspected of having.
+    """
+    inc_quotes, inc_meta, cand_quotes, cand_meta = {}, {}, {}, {}
+    for expiration in _FLOW_EXPIRATIONS:
+        for strike in (763.0, 764.0, 765.0):
+            for right in ("C", "P"):
+                base = _flow_price(expiration, strike, right)
+                ts = _ts_symbol(expiration, strike, right)
+                occ = _occ_symbol(expiration, strike, right)
+                inc_quotes[ts] = _flow_quote(
+                    ts, bid=base, ask=round(base + 0.01, 2), last=base, volume=113_439
+                )
+                cand_quotes[occ] = _flow_quote(
+                    occ,
+                    bid=round(base + cand_offset, 2),
+                    ask=round(base + 0.01 + cand_offset, 2),
+                    last=base,
+                    volume=113_439,
+                )
+                meta = {"strike": strike, "expiration": expiration, "option_type": right}
+                inc_meta[ts] = dict(meta)
+                cand_meta[occ] = dict(meta)
+    return (
+        _sample("tradestation", inc_quotes, inc_meta),
+        _sample("thetadata_mv", cand_quotes, cand_meta),
+    )
+
+
+def test_flow_join_survives_two_different_symbologies():
+    """The bug: 'SPY 260928C763' never equals 'SPY   260928C00763000'.
+
+    Both feeds quoted every contract, every contract carried six-figure
+    volume and a last -- and the comparison matched zero of them, because
+    it looked the candidate up by the incumbent's vendor symbol. Thirty
+    live samples of SPY 0DTE reported 'no contract traded'.
+    """
+    incumbent, candidate = _two_feeds()
+    flow = feed_compare.compare_flow_classification(incumbent, candidate)
+    assert (
+        flow["contracts_compared"] == 12
+    ), "the join matched nothing; it is keying on the vendor symbol again"
+    assert flow["contracts_unmatched"] == 0
+
+
+def test_identical_quotes_never_disagree():
+    """A control: same quote both sides must classify the same way."""
+    incumbent, candidate = _two_feeds()
+    flow = feed_compare.compare_flow_classification(incumbent, candidate)
+    assert flow["contracts_disagreed"] == 0
+    assert flow["net_imbalance_incumbent"] == flow["net_imbalance_candidate"]
+
+
+def test_a_penny_of_adjustment_shows_up_as_disagreement():
+    """And the measurement itself still works once the join does.
+
+    The incumbent quotes 1.35/1.36 with a 1.35 print -- at the bid, so
+    seller-initiated. Move the candidate's quote down a penny and the same
+    print sits at its ask: buyer-initiated. That reversal is exactly what
+    the Market Value randomisation was suspected of doing, and it is what
+    this harness exists to count.
+    """
+    incumbent, candidate = _two_feeds(cand_offset=-0.01)
+    flow = feed_compare.compare_flow_classification(incumbent, candidate)
+    assert flow["contracts_compared"] == 12
+    assert flow["contracts_disagreed"] == 12
+    assert flow["net_imbalance_incumbent"] != flow["net_imbalance_candidate"]
+
+
+def test_an_unmatched_contract_is_counted_not_skipped():
+    """A candidate that cannot answer is a coverage fact, not a silence."""
+    incumbent, candidate = _two_feeds()
+    candidate.quotes.clear()
+    flow = feed_compare.compare_flow_classification(incumbent, candidate)
+    assert flow["contracts_compared"] == 0
+    assert flow["contracts_unmatched"] == 12
+    assert flow["contracts_offered"] == 12
+
+
+def test_a_total_join_failure_does_not_print_as_a_quiet_market(capsys):
+    """The reporting half of the same bug.
+
+    'no contract traded in this sample' is what a broken join printed, and
+    it is indistinguishable from a genuinely illiquid sample. It cost five
+    days and a cutover decision.
+    """
+    incumbent, candidate = _two_feeds()
+    candidate.quotes.clear()
+    flow = feed_compare.compare_flow_classification(incumbent, candidate)
+    feed_compare._print_flow_classification(flow)
+    out = capsys.readouterr().out
+    assert "NOT MEASURED" in out
+    assert "harness or coverage failure" in out
+    assert "no contract traded" not in out
+
+
+def test_a_genuinely_untraded_sample_still_says_so(capsys):
+    """And the real quiet-market case keeps its own, different message."""
+    incumbent, candidate = _two_feeds()
+    for q in list(incumbent.quotes):
+        incumbent.quotes[q] = _flow_quote(q, bid=1.35, ask=1.36, last=0.0, volume=0)
+    flow = feed_compare.compare_flow_classification(incumbent, candidate)
+    feed_compare._print_flow_classification(flow)
+    out = capsys.readouterr().out
+    assert "no contract traded" in out
+    assert "NOT MEASURED" not in out

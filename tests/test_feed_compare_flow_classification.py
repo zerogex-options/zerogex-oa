@@ -12,7 +12,7 @@ of that decision, and nothing in the evidence base had tested it.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -22,13 +22,32 @@ from src.tools.feed_compare import FeedSample, compare_flow_classification
 NOW = datetime(2026, 9, 23, 14, 0, tzinfo=timezone.utc)
 
 
+def _contract_meta(symbol: str) -> dict:
+    """A stable contract identity derived from the symbol.
+
+    The harness joins the two feeds on (expiration, strike, right), because
+    each vendor spells the same option differently -- "SPY 260928C763"
+    against "SPY   260928C00763000". These tests originally gave BOTH
+    samples the same made-up key and no metadata at all, so the join
+    matched by symbol equality and a join that could never match two real
+    feeds passed every one of them. Deriving the identity from the symbol
+    keeps each test's contracts distinct while running them through the
+    real join.
+    """
+    return {
+        "strike": float(sum(ord(c) for c in symbol)),
+        "expiration": date(2026, 9, 25),
+        "option_type": "C",
+    }
+
+
 def _sample(provider: str, quotes: dict) -> FeedSample:
     return FeedSample(
         provider=provider,
         captured_at=NOW,
         spot=660.0,
         quotes=quotes,
-        metadata={},
+        metadata={s: _contract_meta(s) for s in quotes},
     )
 
 
