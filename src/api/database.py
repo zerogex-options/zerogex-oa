@@ -2006,8 +2006,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # GEX Queries
     # ========================================================================
 
-    async def get_latest_gex_summary(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+    async def get_latest_gex_summary(
+        self, symbol: str = "SPY", as_of: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
         """Get latest GEX summary.
+
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        the newest snapshot, and the newest spot, at or before it.  A delayed
+        read skips the cache, the newest-row probe and the served high-water
+        mark described below, because all three describe the LIVE row.
 
         Cached per process for ``LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS``, but a
         cached body is served only while its ``timestamp`` and ``computed_at``
@@ -2055,7 +2062,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # before the column backfill; the fallback CTE recomputes them via the
         # same canonical formula straight from ``gex_by_strike`` so historical
         # latest-summary lookups never lose the wall.
-        query = """
+        #
+        # A delayed read caps both "latest" lookups at ``as_of`` ($3); a live
+        # read gets the query exactly as it was, with nothing interpolated.
+        summary_ceiling = "" if as_of is None else " AND gs.timestamp <= $3"
+        quote_ceiling = "" if as_of is None else " AND uq.timestamp <= $3"
+        query = f"""
             WITH latest_summary AS (
                 SELECT
                     gs.timestamp,
@@ -2083,14 +2095,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.pin_confidence,
                     gs.pin_strike_reason
                 FROM gex_summary gs
-                WHERE gs.underlying = $1
+                WHERE gs.underlying = $1{summary_ceiling}
                 ORDER BY gs.timestamp DESC
                 LIMIT 1
             ),
             latest_quote AS (
                 SELECT COALESCE(uq.close, 0)::numeric AS spot_price
                 FROM underlying_quotes uq
-                WHERE uq.symbol = $1
+                WHERE uq.symbol = $1{quote_ceiling}
                 ORDER BY uq.timestamp DESC
                 LIMIT 1
             ),
@@ -2238,6 +2250,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             JOIN call_wall_ladder cwl ON TRUE
             JOIN put_wall_ladder  pwl ON TRUE
         """
+
+        if as_of is not None:
+            try:
+                async with self._acquire_connection() as conn:
+                    row = await conn.fetchrow(query, symbol, DEFAULT_WALL_LADDER_DEPTH, as_of)
+            except Exception as e:
+                logger.error(f"Error fetching delayed GEX summary: {e}", exc_info=True)
+                raise
+            delayed = dict(row) if row else None
+            if delayed is not None:
+                self._attach_wall_ladders(delayed)
+            return delayed
 
         try:
             async with self._acquire_connection() as conn:
@@ -3965,6 +3989,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     async def get_latest_gex_profile(
         self,
         symbol: str = "SPY",
+        as_of: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
         """Fetch the latest spot-shift dealer dollar-gamma profile.
 
@@ -3976,16 +4001,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         price) — so the curve, the flip line, and the headline summary
         are all read off the SAME underlying construction.
 
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        the newest profile at or before it, never cached.
+
         Returns ``None`` when no profile has been persisted yet (fresh
         deployment / degraded snapshot).
         """
         symbol = symbol.upper()
         cache_key = f"gex_profile:{symbol}"
-        cached = self._cache_get(cache_key)
+        cached = self._cache_get(cache_key) if as_of is None else None
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
-        query = """
+        ceiling = "" if as_of is None else " AND gp.timestamp <= $2"
+        params: List[Any] = [symbol] if as_of is None else [symbol, as_of]
+        query = f"""
             SELECT
                 gp.underlying AS symbol,
                 gp.timestamp,
@@ -4000,13 +4030,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             LEFT JOIN gex_summary gs
               ON gs.underlying = gp.underlying
              AND gs.timestamp = gp.timestamp
-            WHERE gp.underlying = $1
+            WHERE gp.underlying = $1{ceiling}
             ORDER BY gp.timestamp DESC
             LIMIT 1
         """
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
+                row = await conn.fetchrow(query, *params)
                 if row is None:
                     return None
                 # asyncpg returns JSONB as a string by default; decode here so
@@ -4025,7 +4055,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "call_wall": row["call_wall"],
                     "put_wall": row["put_wall"],
                 }
-                self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+                if as_of is None:
+                    self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
                 return payload
         except Exception as e:
             logger.error(f"Error fetching GEX profile: {e}", exc_info=True)
@@ -4454,12 +4485,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         timeframe: str = "1min",
         window_units: int = 78,
         expirations: Optional[List[date]] = None,
+        as_of: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Cache- and stampede-guarded entry point for the rewind-chart read.
 
         The read itself is :meth:`_get_strike_profile_timeseries_uncached`;
         this wrapper exists so that at most ONE of them runs per cache key at
         a time.
+
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        the window ends at the newest bucket at or before it.  It goes straight
+        to the uncached read, because every cache and flight here is keyed on
+        the live window.  The website's delayed callers ask for a few buckets,
+        so there is no stampede to guard against.
 
         The rewind chart polls at ~1 Hz and the frontend fans out over symbols
         and expiration filters, so a cold key is asked for many times before
@@ -4486,6 +4524,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             1, min(window_units, self._strike_profile_timeseries_max_window_units, 480)
         )
         exp_filter = sorted(set(expirations)) if expirations else None
+        if as_of is not None:
+            return await self._get_strike_profile_timeseries_uncached(
+                symbol=symbol,
+                timeframe=timeframe,
+                window_units=window_units,
+                expirations=exp_filter,
+                as_of=as_of,
+            )
         cache_key = _strike_profile_ts_cache_key(symbol, timeframe, window_units, exp_filter)
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -4736,6 +4782,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         window_units: int = 78,
         expirations: Optional[List[date]] = None,
         bucket_subset: Optional[List[Any]] = None,
+        as_of: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
 
@@ -4825,7 +4872,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # (see ``_fetch_strike_profile_chunked``).  Its result is a slice, not
         # the window, so it must neither be served from nor written to the
         # window's cache entry — the chunk driver caches the assembled whole.
-        if bucket_subset is None:
+        # A delayed read (``as_of``) is not the window that key names either.
+        cacheable = bucket_subset is None and as_of is None
+        if cacheable:
             cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached  # type: ignore[no-any-return]
@@ -4870,6 +4919,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 f"\n                    AND {bucket} = ANY(${len(params)}::timestamptz[])"
             )
 
+        # Delayed read: cap the ``latest`` anchor at ``as_of``.  Everything
+        # downstream (the bucket floor, ``bounds``, the reps, the OHLC and the
+        # strike probe) is bounded by that anchor, so this one predicate is
+        # the whole ceiling.
+        ceiling_filter = ""
+        if as_of is not None:
+            params.append(as_of)
+            ceiling_filter = f"\n                  AND timestamp <= ${len(params)}::timestamptz"
+
         # Bucket-aware window floor — see get_historical_quotes for the
         # rationale.  Cash indices inherit the same session predicate the
         # ``latest`` anchor uses so the bucket count agrees with what the
@@ -4897,7 +4955,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             WITH latest AS (
                 SELECT timestamp AS max_ts
                 FROM gex_summary
-                WHERE underlying = $1{session_filter_latest}
+                WHERE underlying = $1{session_filter_latest}{ceiling_filter}
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -5309,7 +5367,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # the window where rows and the finished payload are both live
                 # from spanning the cache write.
                 del rows, pending_inputs
-                if bucket_subset is None:
+                if cacheable:
                     self._cache_set(
                         cache_key, result, self._strike_profile_timeseries_cache_ttl_seconds
                     )
@@ -6797,7 +6855,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # Trade Signal Queries
     # ========================================================================
 
-    async def get_latest_quote(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+    async def get_latest_quote(
+        self, symbol: str = "SPY", as_of: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
         """Get latest underlying quote — the live tick, regardless of session.
 
         Returns the most recent ``underlying_quotes`` bar by timestamp with
@@ -6806,6 +6866,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         trading at right now" surface needs — the header's extended-hours
         row, the GEX live spot, the strike-profile spot line, the chart
         tip-close merge.
+
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        the newest bar at or before it, with the day's volume summed only up
+        to that bar.  Never cached.
 
         For the canonical 16:00 ET cash close used as the headline price
         anchor during AH / pre-market / closed / weekend sessions, callers
@@ -6817,9 +6881,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         symbol = symbol.upper()
         cache_key = f"latest_quote:{symbol}"
-        cached = self._cache_get(cache_key)
+        cached = self._cache_get(cache_key) if as_of is None else None
         if cached is not None:
             return cached  # type: ignore[no-any-return]
+
+        # A delayed read caps the bar at ``as_of`` ($2), and the volume at that
+        # bar: the live read's latest bar is the day's last one, so its sum
+        # needs no upper bound, but a delayed bar has live bars after it.
+        quote_ceiling = "" if as_of is None else " AND uq.timestamp <= $2"
+        volume_ceiling = (
+            "" if as_of is None else "\n                  AND v.timestamp <= lq.timestamp"
+        )
+        params: List[Any] = [symbol] if as_of is None else [symbol, as_of]
 
         # The day's volume is summed from this symbol's own bars over the
         # quote's ET calendar day, a range the (symbol, timestamp) index can
@@ -6831,7 +6904,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # costliest endpoint on the API (2026-09-25, 14:26-16:00 ET: about 20 s
         # of request time per trading minute). Same sum, same day boundary:
         # DATE(ts AT TIME ZONE ET) = d is exactly d 00:00 ET <= ts < d+1 00:00 ET.
-        query = """
+        query = f"""
             WITH latest_quote AS (
                 SELECT
                     uq.timestamp,
@@ -6841,7 +6914,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     uq.low,
                     uq.close
                 FROM underlying_quotes uq
-                WHERE uq.symbol = $1
+                WHERE uq.symbol = $1{quote_ceiling}
                 ORDER BY uq.timestamp DESC
                 LIMIT 1
             )
@@ -6867,20 +6940,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   AND v.timestamp < (
                       ((lq.timestamp AT TIME ZONE 'America/New_York')::date + 1)::timestamp
                       AT TIME ZONE 'America/New_York'
-                  )
+                  ){volume_ceiling}
             ) udv ON TRUE
             LEFT JOIN symbols s ON s.symbol = lq.symbol
         """
 
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
+                row = await conn.fetchrow(query, *params)
                 payload = dict(row) if row else None
-                self._cache_set(
-                    cache_key,
-                    payload,
-                    self._latest_quote_cache_ttl_seconds,
-                )
+                if as_of is None:
+                    self._cache_set(
+                        cache_key,
+                        payload,
+                        self._latest_quote_cache_ttl_seconds,
+                    )
                 return payload
         except Exception as e:
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
@@ -6929,7 +7003,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         return dict(row)
 
     async def get_latest_future_quote(
-        self, index_symbol: str, session_start: Optional[datetime] = None
+        self,
+        index_symbol: str,
+        session_start: Optional[datetime] = None,
+        as_of: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
         """Latest ``futures_quotes`` bar for a cash index (DISPLAY-only swap).
 
@@ -6945,6 +7022,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         futures bar at/after 16:00 — so the overnight change is measured
         futures-vs-futures (no cash-index basis mixed in).  When None, the
         earliest available bar's open is used.
+
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        both bars, the latest and the reference, are taken at or before it,
+        so the reference cannot be a 16:00 print the delayed bar predates.
+        Never cached.
         """
         index_symbol = index_symbol.upper()
         # session_start belongs in the key: it selects ``reference_close``,
@@ -6956,15 +7038,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             f"latest_future_quote:{index_symbol}:"
             f"{session_start.isoformat() if session_start else 'none'}"
         )
-        cached = self._cache_get(cache_key)
+        cached = self._cache_get(cache_key) if as_of is None else None
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
-        query = """
+        ceiling = "" if as_of is None else " AND timestamp <= $3"
+        params: List[Any] = [index_symbol, session_start]
+        if as_of is not None:
+            params.append(as_of)
+        query = f"""
             WITH latest AS (
                 SELECT *
                 FROM futures_quotes
-                WHERE index_symbol = $1
+                WHERE index_symbol = $1{ceiling}
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -6972,7 +7058,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT open AS ref_open
                 FROM futures_quotes
                 WHERE index_symbol = $1
-                  AND ($2::timestamptz IS NULL OR timestamp >= $2::timestamptz)
+                  AND ($2::timestamptz IS NULL OR timestamp >= $2::timestamptz){ceiling}
                 ORDER BY timestamp ASC
                 LIMIT 1
             )
@@ -6995,20 +7081,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, index_symbol, session_start)
+                row = await conn.fetchrow(query, *params)
                 payload = dict(row) if row else None
-                self._cache_set(
-                    cache_key,
-                    payload,
-                    self._latest_quote_cache_ttl_seconds,
-                )
+                if as_of is None:
+                    self._cache_set(
+                        cache_key,
+                        payload,
+                        self._latest_quote_cache_ttl_seconds,
+                    )
                 return payload
         except Exception as e:
             logger.error(f"Error fetching latest future quote: {e!r}", exc_info=True)
             raise
 
-    async def get_futures_session_closes(self, index_symbol: str) -> Optional[Dict[str, Any]]:
+    async def get_futures_session_closes(
+        self, index_symbol: str, as_of: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
         """The future's two most recent cash-session (16:00 ET) closes.
+
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        the closes as they stood at that instant, which leaves out a session
+        that had not yet closed by then.  Never cached.
 
         The daily-change denominator for ES / NQ has to be the FUTURE's own
         prior close.  Using the cash index's would put the headline percentage
@@ -7038,11 +7131,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         index_symbol = (index_symbol or "").upper()
         cache_key = f"futures_session_closes:{index_symbol}"
-        cached = self._cache_get(cache_key)
+        cached = self._cache_get(cache_key) if as_of is None else None
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
-        query = """
+        # "Now" is the delayed instant ($2) for a delayed read, and NOW()
+        # itself, exactly as before, for a live one.
+        now = "NOW()" if as_of is None else "$2::timestamptz"
+        params: List[Any] = [index_symbol] if as_of is None else [index_symbol, as_of]
+        query = f"""
             WITH marks AS (
                 SELECT
                     (timestamp AT TIME ZONE 'America/New_York')::date AS et_date,
@@ -7061,7 +7158,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ) AS rn
                 FROM futures_quotes
                 WHERE index_symbol = $1
-                  AND timestamp <= NOW()
+                  AND timestamp <= {now}
                   -- Sargable lower bound, as in get_session_closes: without
                   -- it this TZ-converts, partitions and sorts the index's
                   -- ENTIRE futures history for a 2-row result. The backfill
@@ -7069,7 +7166,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   -- every minute of every session inside DATA_RETENTION_DAYS.
                   -- Two sessions is all this needs; 30 days covers any
                   -- weekend, holiday or ingestion gap.
-                  AND timestamp >= NOW() - INTERVAL '30 days'
+                  AND timestamp >= {now} - INTERVAL '30 days'
                   AND (timestamp AT TIME ZONE 'America/New_York')::time
                         BETWEEN TIME '09:30' AND TIME '16:00'
                   -- Exclude the session still in progress. Without this the
@@ -7078,8 +7175,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   -- few minutes old and ES/NQ reads ~0.00% all session.
                   AND (
                       (timestamp AT TIME ZONE 'America/New_York')::date
-                          < (NOW() AT TIME ZONE 'America/New_York')::date
-                      OR (NOW() AT TIME ZONE 'America/New_York')::time >= TIME '16:00'
+                          < ({now} AT TIME ZONE 'America/New_York')::date
+                      OR ({now} AT TIME ZONE 'America/New_York')::time >= TIME '16:00'
                   )
             )
             SELECT et_date, timestamp, close
@@ -7090,7 +7187,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, index_symbol)
+                rows = await conn.fetch(query, *params)
             if not rows:
                 return None
             payload: Dict[str, Any] = {
@@ -7105,7 +7202,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     rows[1]["timestamp"] if len(rows) > 1 else rows[0]["timestamp"]
                 ),
             }
-            self._cache_set(cache_key, payload, self._session_closes_cache_ttl_seconds)
+            if as_of is None:
+                self._cache_set(cache_key, payload, self._session_closes_cache_ttl_seconds)
             return payload
         except Exception as e:
             logger.error(f"Error fetching futures session closes: {e!r}", exc_info=True)
@@ -7302,7 +7400,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching previous close: {e}", exc_info=True)
             raise
 
-    async def get_session_closes(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+    async def get_session_closes(
+        self, symbol: str = "SPY", as_of: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Get the two most recently completed regular session closes.
 
@@ -7310,6 +7410,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
           (last bar <= 16:00 ET on the most recent day whose session has ended).
           Today's session is only included if the current time is at/after 16:00 ET.
         prior_session_close = the session close immediately before current.
+
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        "the current time" above becomes ``as_of``, so a session that closed
+        after it is not yet a close, and the fallback price is capped there
+        too.  Never cached.
 
         This endpoint is the canonical owner of the "asset-type-aware cash
         close" rule, consumed by Header.tsx via ``current_session_close``
@@ -7347,11 +7452,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         symbol = symbol.upper()
         cache_key = f"session_closes:{symbol}"
-        cached = self._cache_get(cache_key)
+        cached = self._cache_get(cache_key) if as_of is None else None
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
-        query = """
+        # "Now" is the delayed instant ($2) for a delayed read, and NOW()
+        # itself, exactly as before, for a live one.
+        now = "NOW()" if as_of is None else "$2::timestamptz"
+        fallback_ceiling = "" if as_of is None else " AND timestamp <= $2"
+        params: List[Any] = [symbol] if as_of is None else [symbol, as_of]
+        query = f"""
             WITH session_closes AS (
                 SELECT DISTINCT ON ((uq.timestamp AT TIME ZONE 'America/New_York')::date)
                     uq.timestamp,
@@ -7374,15 +7484,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     -- weekend / holiday / ingestion-gap, and if data really is
                     -- staler than that the latest-quote fallback below still
                     -- returns a price. Every predicate below is preserved.
-                    AND uq.timestamp >= NOW() - INTERVAL '30 days'
+                    AND uq.timestamp >= {now} - INTERVAL '30 days'
                     AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
                     AND (uq.timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
-                    AND uq.timestamp <= NOW()
+                    AND uq.timestamp <= {now}
                     -- Exclude today's date if the session hasn't closed yet (before 16:00 ET)
                     AND (
                         (uq.timestamp AT TIME ZONE 'America/New_York')::date
-                        < (NOW() AT TIME ZONE 'America/New_York')::date
-                        OR (NOW() AT TIME ZONE 'America/New_York')::time >= '16:00'
+                        < ({now} AT TIME ZONE 'America/New_York')::date
+                        OR ({now} AT TIME ZONE 'America/New_York')::time >= '16:00'
                     )
                 ORDER BY (uq.timestamp AT TIME ZONE 'America/New_York')::date DESC, uq.timestamp DESC
                 LIMIT 2
@@ -7404,7 +7514,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
+                row = await conn.fetchrow(query, *params)
 
                 current_close = row["current_session_close"] if row else None
                 current_ts = row["current_session_close_ts"] if row else None
@@ -7414,14 +7524,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # Fall back to the most recent quote price if a session close is missing
                 if current_close is None or prior_close is None:
                     fallback = await conn.fetchrow(
-                        """
+                        f"""
                         SELECT close, timestamp
                         FROM underlying_quotes
-                        WHERE symbol = $1
+                        WHERE symbol = $1{fallback_ceiling}
                         ORDER BY timestamp DESC
                         LIMIT 1
                         """,
-                        symbol,
+                        *params,
                     )
                     fallback_price = fallback["close"] if fallback else None
                     fallback_ts = fallback["timestamp"] if fallback else None
@@ -7444,7 +7554,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "prior_session_close": prior_close,
                     "prior_session_close_ts": prior_ts,
                 }
-                self._cache_set(cache_key, result, self._session_closes_cache_ttl_seconds)
+                if as_of is None:
+                    self._cache_set(cache_key, result, self._session_closes_cache_ttl_seconds)
                 return result
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}", exc_info=True)

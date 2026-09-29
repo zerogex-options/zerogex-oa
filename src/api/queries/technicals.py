@@ -927,7 +927,7 @@ class TechnicalsQueriesMixin:
             raise
 
     async def get_technicals_timeseries(
-        self, symbol: str, intervals: Optional[int] = None
+        self, symbol: str, intervals: Optional[int] = None, as_of: Optional[datetime] = None
     ) -> Optional[Dict[str, Any]]:
         """Per 5-minute bar timeseries combining VWAP deviation,
         opening-range breakout, unusual volume spikes (all classes),
@@ -972,14 +972,23 @@ class TechnicalsQueriesMixin:
         Returns ``None`` when ``symbol`` isn't in the symbols table; an
         empty ``bars`` list when the symbol exists but has no data for
         the most recent session.
+
+        ``as_of`` makes this a delayed read (see :mod:`src.api.delayed_read`):
+        the session is the one the newest bar at or before ``as_of`` belongs
+        to, and no 1-minute bar after ``as_of`` reaches a bucket, the VWAP or
+        the opening range.  Never cached.
         """
         if intervals is not None:
             intervals = max(1, min(int(intervals), 192))
 
         cache_key = f"technicals_ts:{symbol}:{intervals}"
-        cached = self._cache_get(cache_key)
+        cached = self._cache_get(cache_key) if as_of is None else None
         if cached is not None:
             return cached  # type: ignore[no-any-return]
+
+        # Every read below is capped at ``as_of`` ($2) on a delayed read.
+        ceiling = "" if as_of is None else " AND timestamp <= $2"
+        capped: List[Any] = [] if as_of is None else [as_of]
 
         async with self._acquire_connection() as conn:
             row = await conn.fetchrow(
@@ -991,8 +1000,9 @@ class TechnicalsQueriesMixin:
             asset_type = row["asset_type"]
 
             latest_ts = await conn.fetchval(
-                "SELECT MAX(timestamp) FROM underlying_quotes WHERE symbol = $1",
+                f"SELECT MAX(timestamp) FROM underlying_quotes WHERE symbol = $1{ceiling}",
                 symbol,
+                *capped,
             )
             if latest_ts is None:
                 empty = {
@@ -1004,7 +1014,8 @@ class TechnicalsQueriesMixin:
                     "volume_proxy": resolve_volume_proxy(symbol),
                     "bars": [],
                 }
-                self._cache_set(cache_key, empty, self._analytics_cache_ttl_seconds)
+                if as_of is None:
+                    self._cache_set(cache_key, empty, self._analytics_cache_ttl_seconds)
                 return empty
 
             session_date = latest_ts.astimezone(_ET).date()
@@ -1026,13 +1037,14 @@ class TechnicalsQueriesMixin:
             # actually has data. INDEX symbols never carry pre-market data
             # so orb_date == session_date for them.
             orb_date = await conn.fetchval(
-                """
+                f"""
                 SELECT (MAX(timestamp) AT TIME ZONE 'America/New_York')::date
                 FROM underlying_quotes
                 WHERE symbol = $1
-                  AND (timestamp AT TIME ZONE 'America/New_York')::time >= '09:30'
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time >= '09:30'{ceiling}
                 """,
                 symbol,
+                *capped,
             )
             if orb_date is None:
                 # Symbol exists but has never had cash-session data.
@@ -1041,6 +1053,13 @@ class TechnicalsQueriesMixin:
                 orb_date = session_date
             orb_start = datetime.combine(orb_date, time(9, 30), tzinfo=_ET)
             orb_end = datetime.combine(orb_date, time(9, 59, 59), tzinfo=_ET)
+            # The query's upper bound on every 1-minute bar it reads ($5), and
+            # the opening range's ($7): a delayed read stops both at ``as_of``,
+            # which can fall inside the session or inside the 09:30-09:59
+            # window itself.  ``session_end`` still reports the session.
+            bars_end = session_end if as_of is None else min(session_end, as_of)
+            if as_of is not None:
+                orb_end = min(orb_end, as_of)
 
             # Bar window: full session by default, or the trailing
             # ``intervals`` 5-minute buckets when the caller asks for a
@@ -1304,7 +1323,7 @@ class TechnicalsQueriesMixin:
                     volume_source,
                     lookback_start,
                     bar_window_start,
-                    session_end,
+                    bars_end,
                     orb_start,
                     orb_end,
                 )
@@ -1325,7 +1344,8 @@ class TechnicalsQueriesMixin:
             "volume_proxy": proxy,
             "bars": bars,
         }
-        self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+        if as_of is None:
+            self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
         return payload
 
 

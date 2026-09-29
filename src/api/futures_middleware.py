@@ -44,6 +44,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode
 from zoneinfo import ZoneInfo
 
+from src.api.delayed_read import MAX_DELAY_MINUTES, delayed_ceiling
 from src.jobs.futures_projection import (
     SPOT_FIELDS,
     project_payload,
@@ -292,6 +293,26 @@ def _request_asof(scope: dict) -> Optional[datetime]:
     return None
 
 
+def _request_delay_ceiling(scope: dict) -> Optional[datetime]:
+    """The ceiling of a delayed read (``delay_minutes``), or None for a live one.
+
+    Read like the route reads it (the last value wins) and only when the route
+    would accept it: anything it would reject is left for its own validation
+    to answer, so this never applies a delay the handler does not.
+    """
+    raw: Optional[str] = None
+    for key, value in _scope_query(scope):
+        if key == "delay_minutes":
+            raw = value
+    if raw is None:
+        return None
+    try:
+        minutes = int(raw)
+    except ValueError:
+        return None
+    return delayed_ceiling(minutes) if minutes <= MAX_DELAY_MINUTES else None
+
+
 def _futures_target(scope: dict) -> Optional[tuple[str, str]]:
     """Return ``(futures_symbol, index_symbol)`` this request asks for.
 
@@ -355,6 +376,17 @@ async def _live_futures_spot(index_symbol: str) -> Optional[float]:
     Passes the same cash-close anchor the quote endpoint uses so both callers
     hit the same cache entry with the same meaning.
     """
+    return await _observed_futures_spot(index_symbol, None)
+
+
+async def _delayed_futures_spot(index_symbol: str, ceiling: datetime) -> Optional[float]:
+    """The OBSERVED futures close a delayed read may show: the newest bar at or
+    before ``ceiling`` (see :mod:`src.api.delayed_read`), never the live one."""
+    return await _observed_futures_spot(index_symbol, ceiling)
+
+
+async def _observed_futures_spot(index_symbol: str, ceiling: Optional[datetime]) -> Optional[float]:
+    """The newest observed futures close at or before ``ceiling`` (None: the latest)."""
     try:
         from src.api.main import db_manager
         from src.market_calendar import current_cash_close_reference
@@ -362,12 +394,14 @@ async def _live_futures_spot(index_symbol: str) -> Optional[float]:
         if db_manager is None:
             return None
         quote = await db_manager.get_latest_future_quote(
-            index_symbol, current_cash_close_reference()
+            index_symbol,
+            current_cash_close_reference(ceiling),
+            **({} if ceiling is None else {"as_of": ceiling}),
         )
         if quote and quote.get("close") is not None:
             return float(quote["close"])
     except Exception as e:
-        logger.debug("live futures spot unavailable for %s: %s", index_symbol, e)
+        logger.debug("observed futures spot unavailable for %s: %s", index_symbol, e)
     return None
 
 
@@ -478,10 +512,11 @@ class FuturesProjectionMiddleware:
         # Read the as-of BEFORE the rewrite, while the scope still holds the
         # query exactly as the caller sent it.
         asof = _request_asof(scope)
+        delayed_at = _request_delay_ceiling(scope)
 
         _rewrite_scope(scope, futures_symbol, index_symbol)
         await self._project_response(
-            scope, receive, send, futures_symbol, index_symbol, asof
+            scope, receive, send, futures_symbol, index_symbol, asof, delayed_at
         )
 
     async def _reject(self, send, futures_symbol: str, index_symbol: str, path: str) -> None:
@@ -517,6 +552,7 @@ class FuturesProjectionMiddleware:
         futures_symbol: str,
         index_symbol: str,
         asof: Optional[datetime] = None,
+        delayed_at: Optional[datetime] = None,
     ) -> None:
         status: Optional[int] = None
         headers: list = []
@@ -561,7 +597,7 @@ class FuturesProjectionMiddleware:
 
             try:
                 projected = await self._transform(
-                    payload, futures_symbol, index_symbol, asof
+                    payload, futures_symbol, index_symbol, asof, delayed_at
                 )
                 out = json.dumps(projected).encode("utf-8")
             except Exception as e:
@@ -648,6 +684,7 @@ class FuturesProjectionMiddleware:
         futures_symbol: str,
         index_symbol: str,
         asof: Optional[datetime] = None,
+        delayed_at: Optional[datetime] = None,
     ) -> Any:
         # A v2 response is {"data": <the v1 body>, "freshness": {...}}. Project
         # INSIDE `data` and leave the envelope alone, for three reasons:
@@ -663,9 +700,14 @@ class FuturesProjectionMiddleware:
         if _is_v2_envelope(payload):
             out = dict(payload)
             out["data"] = await self._transform(
-                payload["data"], futures_symbol, index_symbol, asof
+                payload["data"], futures_symbol, index_symbol, asof, delayed_at
             )
             return out
+
+        # A delayed read (``delay_minutes``, see src/api/delayed_read.py) is
+        # anchored at its ceiling like any past instant. It differs only in the
+        # spot substitution at the end.
+        anchor = asof if asof is not None else delayed_at
 
         # A bare list of timestamped rows is a SERIES, and one ratio cannot
         # describe it: /api/gex/historical can span months, over which basis
@@ -674,9 +716,9 @@ class FuturesProjectionMiddleware:
         # and a backtest reading those levels has no way to see it. Project
         # each row on the basis that stood in its own session instead.
         if isinstance(payload, list) and any(_row_anchor(row) is not None for row in payload):
-            return await self._transform_series(payload, futures_symbol, index_symbol, asof)
+            return await self._transform_series(payload, futures_symbol, index_symbol, anchor)
 
-        basis = await resolve_basis(_db_manager(), futures_symbol, at=asof)
+        basis = await resolve_basis(_db_manager(), futures_symbol, at=anchor)
         if basis is None:
             return payload
 
@@ -713,19 +755,27 @@ class FuturesProjectionMiddleware:
         # live bug: the substitution keys on payload shape, and the next
         # historical endpoint that happens to expose one would inherit today's
         # price silently.
+        #
+        # A delayed read does take a substitution, but of the print at its
+        # ceiling: the live print would hand a delayed surface the one number
+        # it is delayed to withhold.
         if (
             asof is None
             and isinstance(projected, dict)
             and any(k in projected for k in SPOT_FIELDS)
         ):
-            live = await _live_futures_spot(index_symbol)
-            if live is not None:
+            observed = (
+                await _live_futures_spot(index_symbol)
+                if delayed_at is None
+                else await _delayed_futures_spot(index_symbol, delayed_at)
+            )
+            if observed is not None:
                 for spot_key in SPOT_FIELDS:
                     if spot_key in projected and projected[spot_key] is not None:
                         projected[spot_key] = (
-                            str(live) if isinstance(projected[spot_key], str) else live
+                            str(observed) if isinstance(projected[spot_key], str) else observed
                         )
-                _reconcile_spot_derived(projected, live)
+                _reconcile_spot_derived(projected, observed)
 
         if isinstance(projected, dict):
             meta = projection_metadata(basis)

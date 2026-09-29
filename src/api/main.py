@@ -16,10 +16,11 @@ from enum import IntEnum
 import os
 from src.config import _getenv_str
 import re
-from typing import Any, Dict, List, Optional, Literal
+from typing import Annotated, Any, Dict, List, Optional, Literal
 import pytz
 
 from .database import DatabaseManager
+from .delayed_read import MAX_DELAY_MINUTES, delayed_ceiling
 from .errors import handle_api_errors
 from .futures_middleware import FuturesProjectionMiddleware
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
@@ -718,15 +719,50 @@ async def health_check(response: Response):
 
 
 # ============================================================================
+# Delayed reads
+# ============================================================================
+
+# ``delay_minutes`` on the reads behind the website's free, no-login surfaces
+# (gamma-levels pages, embed widget, llms.txt, /mcp, the public /chart). Those
+# surfaces are labeled delayed, and this is what makes them so: the read
+# answers with the newest data at least this old. See src/api/delayed_read.py.
+_DelayMinutes = Annotated[
+    int,
+    Query(
+        ge=0,
+        le=MAX_DELAY_MINUTES,
+        description=(
+            "Serve the newest data that is at least this many minutes old instead "
+            "of the latest. 0, the default, is the live read."
+        ),
+    ),
+]
+
+
+def _as_of_kwargs(as_of: Optional[datetime]) -> Dict[str, datetime]:
+    """``{"as_of": ...}`` for a delayed read, ``{}`` for a live one.
+
+    Spread into the database call, so a live request makes exactly the call
+    it made before delayed reads existed.
+    """
+    return {} if as_of is None else {"as_of": as_of}
+
+
+# ============================================================================
 # GEX Endpoints
 # ============================================================================
 
 
 @app.get("/api/gex/summary", response_model=GEXSummary, tags=["GEX"], dependencies=[_scope_gex])
 @handle_api_errors("GET /api/gex/summary")
-async def get_gex_summary(symbol: str = Query(default="SPY")):
-    """Get latest GEX summary"""
-    data = await _db().get_latest_gex_summary(symbol)
+async def get_gex_summary(symbol: str = Query(default="SPY"), delay_minutes: _DelayMinutes = 0):
+    """Get latest GEX summary.
+
+    ``delay_minutes`` serves the newest snapshot at least that old instead
+    (see src/api/delayed_read.py).
+    """
+    as_of = delayed_ceiling(delay_minutes)
+    data = await _db().get_latest_gex_summary(symbol, **_as_of_kwargs(as_of))
     if not data:
         raise HTTPException(status_code=404, detail="No GEX data available")
     return GEXSummary(**data)
@@ -785,7 +821,7 @@ async def get_gex_by_strike(
 
 @app.get("/api/gex/profile", response_model=GEXProfile, tags=["GEX"], dependencies=[_scope_gex])
 @handle_api_errors("GET /api/gex/profile")
-async def get_gex_profile(symbol: str = Query(default="SPY")):
+async def get_gex_profile(symbol: str = Query(default="SPY"), delay_minutes: _DelayMinutes = 0):
     """Latest spot-shift dealer dollar-gamma curve for ``symbol``.
 
     Returns the curve persisted by the Analytics Engine on the most
@@ -794,8 +830,13 @@ async def get_gex_profile(symbol: str = Query(default="SPY")):
     is ``net_gex_at_spot``.  Designed for the GEX-Profile overlay on
     the per-strike chart; the same dataset that drives the headline
     flip / net-at-spot figures already in /api/gex/summary.
+
+    ``delay_minutes`` serves the newest curve at least that old instead
+    (see src/api/delayed_read.py).
     """
-    data = await _db().get_latest_gex_profile(symbol)
+    data = await _db().get_latest_gex_profile(
+        symbol, **_as_of_kwargs(delayed_ceiling(delay_minutes))
+    )
     if not data:
         raise HTTPException(status_code=404, detail="No GEX profile data available")
     return GEXProfile(**data)
@@ -916,6 +957,7 @@ async def get_strike_profile_timeseries(
             "payload to that set (summed across the set)."
         ),
     ),
+    delay_minutes: _DelayMinutes = 0,
 ):
     """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
 
@@ -956,6 +998,9 @@ async def get_strike_profile_timeseries(
     ``put_gamma`` / ``net_gamma``) but the values are the dollar-GEX
     quantities, not raw gamma — see the per-row docstring on
     ``StrikeProfileStrike``.  Any unparseable entry is a 400.
+
+    ``delay_minutes`` ends the window at the newest bucket at least that old
+    (see src/api/delayed_read.py).
     """
     expiration_dates: Optional[List[date_type]] = None
     raw = (expirations or "all").strip()
@@ -993,7 +1038,11 @@ async def get_strike_profile_timeseries(
     # precision and nulls. The model's json_encoders still run: they apply to
     # the field FastAPI validates into, not to the object the endpoint returns.
     return await _db().get_strike_profile_timeseries(
-        symbol, timeframe, window_units, expiration_dates
+        symbol,
+        timeframe,
+        window_units,
+        expiration_dates,
+        **_as_of_kwargs(delayed_ceiling(delay_minutes)),
     )
 
 
@@ -2202,14 +2251,17 @@ def _index_futures_display_enabled() -> bool:
     return _getenv_bool("INDEX_FUTURES_DISPLAY_ENABLED", False)
 
 
-async def _native_futures_session_closes(futures_symbol: str, index_symbol: str) -> SessionCloses:
+async def _native_futures_session_closes(
+    futures_symbol: str, index_symbol: str, as_of: Optional[datetime] = None
+) -> SessionCloses:
     """The future's own two most recent 16:00 ET closes.
 
     Mirrors :func:`_native_futures_quote`: the daily-change denominator has to
     be the future's own prior close, not the cash index's, or the headline
-    percentage is wrong by the whole basis.
+    percentage is wrong by the whole basis.  ``as_of`` is a delayed read's
+    ceiling (see :mod:`src.api.delayed_read`).
     """
-    data = await _db().get_futures_session_closes(index_symbol)
+    data = await _db().get_futures_session_closes(index_symbol, **_as_of_kwargs(as_of))
     if not data or data.get("current_session_close") is None:
         raise HTTPException(
             status_code=404, detail=f"No {futures_symbol} session close data available"
@@ -2223,7 +2275,9 @@ async def _native_futures_session_closes(futures_symbol: str, index_symbol: str)
 _FUTURES_QUOTE_STALE_MINUTES = _getenv_float("FUTURES_QUOTE_STALE_MINUTES", 5.0)
 
 
-async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> UnderlyingQuote:
+async def _native_futures_quote(
+    futures_symbol: str, index_symbol: str, as_of: Optional[datetime] = None
+) -> UnderlyingQuote:
     """Latest observed bar for a first-class future (ES / NQ).
 
     ES and NQ take their PRICE from their own feed rather than from a
@@ -2231,8 +2285,14 @@ async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> Under
     close, so a projected price would report where ES stood at the bell
     instead of where it is trading now.  (Their dealer LEVELS are still
     SPX/NDX-derived and projected — see ``src/api/futures_middleware.py``.)
+
+    ``as_of`` is a delayed read's ceiling (see :mod:`src.api.delayed_read`):
+    the bar, the session and the staleness verdict are all as of that
+    instant, while ``data_age_seconds`` stays the bar's true age.
     """
-    fut = await _db().get_latest_future_quote(index_symbol, current_cash_close_reference())
+    fut = await _db().get_latest_future_quote(
+        index_symbol, current_cash_close_reference(as_of), **_as_of_kwargs(as_of)
+    )
     if not fut or fut.get("close") is None:
         raise HTTPException(status_code=404, detail=f"No {futures_symbol} quote data available")
     payload = {
@@ -2260,13 +2320,21 @@ async def _native_futures_quote(futures_symbol: str, index_symbol: str) -> Under
     # A late observed print is always closer to the truth than a three-day-old
     # one. Serve it, label the session honestly, and describe the staleness
     # separately so each consumer can make its own decision.
+    #
+    # A delayed bar is old by design, so its staleness is measured from the
+    # instant it was read as of (how far the feed trailed THAT moment), not
+    # from now, or every delayed quote would read stale.
     bar_ts = payload.get("timestamp")
     age_seconds: Optional[int] = None
+    lag_seconds: Optional[int] = None
     if bar_ts is not None:
         age_seconds = max(0, int((datetime.now(timezone.utc) - bar_ts).total_seconds()))
-    payload["session"] = "open" if is_futures_session_open() else "closed"
+        lag_seconds = (
+            age_seconds if as_of is None else max(0, int((as_of - bar_ts).total_seconds()))
+        )
+    payload["session"] = "open" if is_futures_session_open(as_of) else "closed"
     payload["data_age_seconds"] = age_seconds
-    payload["stale"] = age_seconds is not None and age_seconds > _FUTURES_QUOTE_STALE_MINUTES * 60.0
+    payload["stale"] = lag_seconds is not None and lag_seconds > _FUTURES_QUOTE_STALE_MINUTES * 60.0
     return UnderlyingQuote(**payload)
 
 
@@ -2338,8 +2406,12 @@ def get_market_session(
     asset_type: Optional[str],
     price_is_stable: bool = False,
     close_data_available: bool = True,
+    now: Optional[datetime] = None,
 ) -> str:
     """Return the current US equity market session label.
+
+    ``now`` labels another instant instead of the current one: a delayed
+    quote describes the market as it stood at its ceiling.
 
     Session boundaries (all times US/Eastern, exact to the second):
 
@@ -2371,7 +2443,7 @@ def get_market_session(
     session label only advances once the close has been observed.  See
     ``DatabaseClient.has_todays_close_landed`` for the signal definition.
     """
-    now_et = datetime.now(_ET)
+    now_et = datetime.now(_ET) if now is None else now.astimezone(_ET)
     today = now_et.date()
 
     if today.weekday() >= 5 or today in _NYSE_HOLIDAYS:
@@ -2443,7 +2515,7 @@ def get_market_session(
     response_model_exclude_none=True,
     tags=["Market Data"],
 )
-async def get_current_quote(symbol: str = Query(default="SPY")):
+async def get_current_quote(symbol: str = Query(default="SPY"), delay_minutes: _DelayMinutes = 0):
     """Get current underlying quote.
 
     Returns the live tick (the latest ``underlying_quotes`` bar of any
@@ -2458,14 +2530,19 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     Do NOT collapse this endpoint into the cash-close path — that
     freezes the extended-hours ticker at the cash close on every
     surface that reads ``quoteData.close``.
+
+    ``delay_minutes`` serves the newest bar at least that old instead, with
+    ``session`` describing the market at that instant (see
+    :mod:`src.api.delayed_read`).
     """
     try:
+        as_of = delayed_ceiling(delay_minutes)
         # ES / NQ are first-class symbols served from their own bars.
         futures_index = resolve_futures_index(symbol)
         if futures_index:
-            return await _native_futures_quote(symbol.strip().upper(), futures_index)
+            return await _native_futures_quote(symbol.strip().upper(), futures_index, as_of)
 
-        data = await _db().get_latest_quote(symbol)
+        data = await _db().get_latest_quote(symbol, **_as_of_kwargs(as_of))
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
 
@@ -2474,19 +2551,31 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         if "cumulative_daily_volume" in data:
             data["volume"] = data.pop("cumulative_daily_volume")
 
-        # Update per-symbol soft-close tracker and evaluate stability
-        # Evict oldest entries if tracker dict grows too large
-        if (
-            symbol not in _soft_close_trackers
-            and len(_soft_close_trackers) >= _SOFT_CLOSE_TRACKER_MAX
-        ):
-            oldest_key = next(iter(_soft_close_trackers))
-            del _soft_close_trackers[oldest_key]
-        tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
-        tracker.record(data.get("close"))
+        if as_of is not None:
+            # Delayed: label the market as it stood at the ceiling. The
+            # soft-close tracker and the close-landed gate both watch the LIVE
+            # tape around the close; a quarter of an hour on, the close has
+            # landed and the price has settled, so neither has anything to add,
+            # and a delayed price must not be recorded into the live tracker.
+            data["session"] = get_market_session(
+                asset_type, price_is_stable=True, close_data_available=True, now=as_of
+            )
+        else:
+            # Update per-symbol soft-close tracker and evaluate stability
+            # Evict oldest entries if tracker dict grows too large
+            if (
+                symbol not in _soft_close_trackers
+                and len(_soft_close_trackers) >= _SOFT_CLOSE_TRACKER_MAX
+            ):
+                oldest_key = next(iter(_soft_close_trackers))
+                del _soft_close_trackers[oldest_key]
+            tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
+            tracker.record(data.get("close"))
 
-        close_data_available = await _db().has_todays_close_landed(symbol, asset_type)
-        data["session"] = get_market_session(asset_type, tracker.is_stable(), close_data_available)
+            close_data_available = await _db().has_todays_close_landed(symbol, asset_type)
+            data["session"] = get_market_session(
+                asset_type, tracker.is_stable(), close_data_available
+            )
 
         # Index→future DISPLAY swap (ADDITIVE): during the overnight futures
         # window, attach the future's price as *separate* fields. The base
@@ -2495,8 +2584,10 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         # calculator, heatmap — is untouched. Only the header quote, the quote
         # card, and the candlestick chart read the futures_* fields. Silently
         # omitted if the futures ingester has no rows yet.
-        if _index_futures_display_enabled() and should_display_future(symbol):
-            fut = await _db().get_latest_future_quote(symbol, current_cash_close_reference())
+        if _index_futures_display_enabled() and should_display_future(symbol, as_of):
+            fut = await _db().get_latest_future_quote(
+                symbol, current_cash_close_reference(as_of), **_as_of_kwargs(as_of)
+            )
             if fut and fut.get("close") is not None:
                 data["display_source"] = "futures"
                 data["data_symbol"] = _future_display_label(fut.get("future_symbol"))
@@ -2519,22 +2610,26 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     dependencies=[_scope_market_reference],
 )
 @handle_api_errors("GET /api/market/session-closes")
-async def get_session_closes(symbol: str = Query(default="SPY")):
+async def get_session_closes(symbol: str = Query(default="SPY"), delay_minutes: _DelayMinutes = 0):
     """
     Get the two most recently completed regular session closes.
 
     - current_session_close: the most recent cash session close (last bar <= 16:00 ET
       on the most recent completed trading day).
     - prior_session_close: the session close immediately before current.
+
+    ``delay_minutes`` answers as of that many minutes ago, so a session that
+    closed inside the delay is not yet a close (see src/api/delayed_read.py).
     """
+    as_of = delayed_ceiling(delay_minutes)
     # ES / NQ close against their OWN 16:00 prints. Projecting SPX's cash
     # closes here would put the headline daily change on the wrong basis —
     # the number a futures trader checks first.
     futures_index = resolve_futures_index(symbol)
     if futures_index:
-        return await _native_futures_session_closes(symbol.strip().upper(), futures_index)
+        return await _native_futures_session_closes(symbol.strip().upper(), futures_index, as_of)
 
-    data = await _db().get_session_closes(symbol)
+    data = await _db().get_session_closes(symbol, **_as_of_kwargs(as_of))
     if not data:
         raise HTTPException(status_code=404, detail="No session close data available")
     return SessionCloses(**data)
@@ -2601,12 +2696,24 @@ async def get_historical_quotes(
             "series stays the index."
         ),
     ),
+    delay_minutes: _DelayMinutes = 0,
 ):
-    """Get historical quotes"""
+    """Get historical quotes.
+
+    ``delay_minutes`` ends the window at the newest bar at least that old,
+    however late ``end_date`` asks for (see src/api/delayed_read.py).
+    """
     try:
         # Parse dates if provided
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
+        as_of = delayed_ceiling(delay_minutes)
+        if as_of is not None:
+            # Every reader below already ends its window at ``end_date``, so
+            # capping it is the whole delayed read. A naive end_date reads as UTC.
+            end_utc = end_dt.replace(tzinfo=end_dt.tzinfo or timezone.utc) if end_dt else None
+            if end_utc is None or end_utc > as_of:
+                end_dt = as_of
 
         # ES / NQ: their own bar series, always — not gated on allow_futures
         # or the overnight display window, because for a first-class future
@@ -2633,7 +2740,11 @@ async def get_historical_quotes(
         # caller opts in via allow_futures (the candle chart). Read-only from
         # futures_quotes; falls through to the index series if the ingester
         # has no rows for the requested window.
-        if allow_futures and _index_futures_display_enabled() and should_display_future(symbol):
+        if (
+            allow_futures
+            and _index_futures_display_enabled()
+            and should_display_future(symbol, as_of)
+        ):
             fut_rows = await _db().get_historical_futures(
                 symbol, start_dt, end_dt, window_units, timeframe
             )
@@ -2796,6 +2907,7 @@ async def get_technicals(
             "cheap incremental polling."
         ),
     ),
+    delay_minutes: _DelayMinutes = 0,
 ):
     """Combined per 5-minute bar timeseries of VWAP deviation,
     opening-range breakout, unusual volume spikes (all classes), and
@@ -2849,6 +2961,9 @@ async def get_technicals(
     Dealer hedging is intentionally excluded — its underlying view is
     a point-in-time snapshot, not a timeseries. Use
     ``/api/technicals/dealer-hedging`` for the current-state read.
+
+    ``delay_minutes`` builds every bar from 1-minute bars at least that old
+    (see src/api/delayed_read.py).
     """
     normalized = symbol.strip().upper()
     if not _TECHNICALS_SYMBOL_PATTERN.match(normalized):
@@ -2857,7 +2972,9 @@ async def get_technicals(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    result = await _db().get_technicals_timeseries(normalized, intervals=intervals)
+    result = await _db().get_technicals_timeseries(
+        normalized, intervals=intervals, **_as_of_kwargs(delayed_ceiling(delay_minutes))
+    )
     if result is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     return result
