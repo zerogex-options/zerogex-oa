@@ -4264,7 +4264,7 @@ spread-snapshot-audit: ## Is the daily spread rollup representative of its sessi
 		-f setup/database/diagnostics/spread_snapshot_audit.sql
 
 .PHONY: daily-zero-bid-repair
-daily-zero-bid-repair: ## Rewrite daily_spread_stats.zero_bid_pct as a session mean. Dry-run by default; CONFIRM=yes to apply. SYMBOLS=SPX,NDX START=YYYY-MM-DD END=YYYY-MM-DD
+daily-zero-bid-repair: ## Rewrite daily_spread_stats.zero_bid_pct as a session mean. Dry-run by default; CONFIRM=yes to apply. SYMBOLS=SPX,NDX START= END= DROP_UNCOVERED=yes
 	@echo "$(BLUE)=== Daily no-bid repair ===$(NC)"
 	@echo "$(YELLOW)The no-bid share climbs through every afternoon, so the one$(NC)"
 	@echo "$(YELLOW)sample the daily writer used to take near 16:00 recorded the$(NC)"
@@ -4277,6 +4277,7 @@ daily-zero-bid-repair: ## Rewrite daily_spread_stats.zero_bid_pct as a session m
 		$(if $(SYMBOLS),--symbols "$(SYMBOLS)",) \
 		$(if $(START),--start $(START),) \
 		$(if $(END),--end $(END),) \
+		$(if $(filter yes,$(DROP_UNCOVERED)),--drop-uncovered,) \
 		$(if $(filter yes,$(CONFIRM)),--execute,)
 
 .PHONY: tradeworkz-check

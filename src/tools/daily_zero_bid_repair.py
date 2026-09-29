@@ -60,6 +60,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.analytics.surface_store import SESSION_ZERO_BID_SQL  # noqa: F401  (documented source)
+from src.config import SPREAD_SURFACE_MIN_SESSIONS
 from src.database.connection import db_connection
 
 logger = logging.getLogger(__name__)
@@ -116,12 +117,13 @@ UPDATE daily_spread_stats
  WHERE underlying = %s AND trading_date = %s AND option_type = %s
 """
 
-#: Rows the repair could not reach, so the report can name the gap rather
-#: than let a short repaired window pass for a complete one.
-_UNCOVERED_SQL = """
-SELECT COUNT(*), MIN(trading_date), MAX(trading_date)
-  FROM daily_spread_stats d
- WHERE d.underlying = ANY(%(symbols)s)
+#: One row is "uncovered" when its own session and scope have no surface
+#: buckets to rebuild from.  Spelled once, because the report, the guard and
+#: the delete must agree on exactly which rows they are talking about -- a
+#: delete whose predicate drifted from the one that was printed for approval
+#: is the failure mode that matters here.
+_UNCOVERED_PREDICATE = """
+       d.underlying = ANY(%(symbols)s)
    AND (%(start)s::date IS NULL OR d.trading_date >= %(start)s::date)
    AND (%(end)s::date   IS NULL OR d.trading_date <= %(end)s::date)
    AND NOT EXISTS (
@@ -134,14 +136,62 @@ SELECT COUNT(*), MIN(trading_date), MAX(trading_date)
    )
 """
 
+#: Rows the repair could not reach, so the report can name the gap rather
+#: than let a short repaired window pass for a complete one.
+_UNCOVERED_SQL = f"""
+SELECT COUNT(*), MIN(trading_date), MAX(trading_date)
+  FROM daily_spread_stats d
+ WHERE {_UNCOVERED_PREDICATE}
+"""
+
+#: The same rows by primary key.  --drop-uncovered deletes BY KEY rather than
+#: by re-running the predicate, so what is deleted is exactly what was listed
+#: in the dry run the operator approved, with no room for the two to disagree.
+_UNCOVERED_KEYS_SQL = f"""
+SELECT d.underlying, d.trading_date, d.option_type
+  FROM daily_spread_stats d
+ WHERE {_UNCOVERED_PREDICATE}
+ ORDER BY d.underlying, d.trading_date, d.option_type
+"""
+
+#: Sessions that would SURVIVE the drop, per symbol.  Counted from the rows
+#: themselves rather than by subtracting, so a symbol whose every row is
+#: uncovered reports zero rather than going missing from the result.
+_SURVIVING_SESSIONS_SQL = f"""
+SELECT d.underlying, COUNT(DISTINCT d.trading_date)
+  FROM daily_spread_stats d
+ WHERE NOT ({_UNCOVERED_PREDICATE})
+ GROUP BY d.underlying
+"""
+
+_DELETE_SQL = """
+DELETE FROM daily_spread_stats
+ WHERE underlying = %s AND trading_date = %s AND option_type = %s
+"""
+
 
 def repair(
     symbols: List[str],
     start: Optional[date],
     end: Optional[date],
     dry_run: bool = True,
+    drop_uncovered: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Return the per-row changes, and a summary of what could not be reached."""
+    """Return the per-row changes, and a summary of what could not be reached.
+
+    With ``drop_uncovered`` the rows that cannot be rebuilt are DELETED rather
+    than left in place.  That is the only way to get them out of the window:
+    ``zero_bid_pct`` is NOT NULL, so there is no way to mark a row as
+    unmeasurable short of a schema change, and a row carrying the old
+    statistic is a row the percentile ranks against.
+
+    It is not free, and the caller is told so rather than discovering it: the
+    row also carries that session's widths, which have nothing wrong with
+    them, so dropping 14 sessions of contaminated no-bid also drops 14
+    sessions of good width history.  Whether that trade is worth making
+    depends on how much of the window is contaminated, which is why the
+    report prints both numbers before anything is deleted.
+    """
     params = {"symbols": symbols, "start": start, "end": end}
     changes: List[Dict[str, Any]] = []
     with db_connection() as conn:
@@ -173,9 +223,37 @@ def repair(
                         row["option_type"],
                     ),
                 )
+
+        doomed: List[Tuple[Any, Any, Any]] = []
+        surviving: Dict[str, int] = {}
+        refused: Dict[str, int] = {}
+        if drop_uncovered:
+            cur.execute(_UNCOVERED_KEYS_SQL, params)
+            doomed = list(cur.fetchall())
+
+            cur.execute(_SURVIVING_SESSIONS_SQL, params)
+            surviving = {sym: int(n) for sym, n in cur.fetchall()}
+
+            # A symbol whose surface history does not reach back far enough
+            # would have its whole rollup deleted here -- the tool would read
+            # as "cleaned up" and leave the page with no history to rank
+            # against at all.  Refuse per symbol rather than globally, so one
+            # under-backfilled symbol does not block the others, and name the
+            # number so the operator can see it is a floor and not a failure.
+            for symbol in {row[0] for row in doomed}:
+                if surviving.get(symbol, 0) < SPREAD_SURFACE_MIN_SESSIONS:
+                    refused[symbol] = surviving.get(symbol, 0)
+            doomed = [row for row in doomed if row[0] not in refused]
+
+            if not dry_run:
+                for key in doomed:
+                    cur.execute(_DELETE_SQL, key)
+
+        if not dry_run and (changes or doomed):
             conn.commit()
 
     covered = [c["trading_date"] for c in changes]
+    dropped_dates = [row[1] for row in doomed]
     summary = {
         "rows": len(changes),
         "applied": 0 if dry_run else len(changes),
@@ -184,6 +262,13 @@ def repair(
         "uncovered_rows": int(uncovered_count or 0),
         "uncovered_from": uncovered_from.isoformat() if uncovered_from else None,
         "uncovered_to": uncovered_to.isoformat() if uncovered_to else None,
+        "dropped_rows": len(doomed),
+        "dropped_applied": 0 if dry_run else len(doomed),
+        "dropped_sessions": len({d for d in dropped_dates}),
+        "dropped_from": min(dropped_dates).isoformat() if dropped_dates else None,
+        "dropped_to": max(dropped_dates).isoformat() if dropped_dates else None,
+        "surviving_sessions": surviving,
+        "refused_symbols": refused,
     }
     return changes, summary
 
@@ -219,16 +304,45 @@ def _report(
                 len(thin),
             )
 
-    if summary["uncovered_rows"]:
+    if summary["uncovered_rows"] and not summary["dropped_rows"]:
         logger.warning(
             "%d rows have NO surface coverage and are left untouched (%s to %s). "
-            "Those sessions keep their old single-sample value. If that range "
-            "overlaps the percentile window the page reads, it is still ranking "
-            "two different statistics against each other — run the surface "
-            "backfill over it first.",
+            "Those sessions keep their old single-sample value. The page's "
+            "window is the last 60 STORED SESSIONS, not 60 calendar days, so "
+            "it reaches further back than a date range suggests — if these "
+            "sessions are inside it, it is still ranking two statistics "
+            "against each other. Run the surface backfill over them, or "
+            "--drop-uncovered if the data no longer exists to rebuild from.",
             summary["uncovered_rows"],
             summary["uncovered_from"],
             summary["uncovered_to"],
+        )
+
+    if summary["dropped_rows"]:
+        logger.warning(
+            "DROPPING %d rows across %d sessions (%s to %s). They cannot be "
+            "rebuilt, and zero_bid_pct is NOT NULL so there is no way to mark "
+            "them unmeasurable — deleting is the only way to get the old "
+            "statistic out of the window. This also discards those sessions' "
+            "WIDTH history, which has nothing wrong with it.",
+            summary["dropped_rows"],
+            summary["dropped_sessions"],
+            summary["dropped_from"],
+            summary["dropped_to"],
+        )
+        for symbol, sessions in sorted(summary["surviving_sessions"].items()):
+            note = "" if sessions >= 60 else "  <-- shorter than the 60-session window"
+            logger.info("  %s keeps %d sessions%s", symbol, sessions, note)
+
+    for symbol, sessions in sorted(summary["refused_symbols"].items()):
+        logger.error(
+            "%s NOT dropped: only %d covered sessions would remain, below the "
+            "%d floor. Deleting them would leave the page with no history to "
+            "rank against at all. Back-fill the surface for %s first.",
+            symbol,
+            sessions,
+            SPREAD_SURFACE_MIN_SESSIONS,
+            symbol,
         )
 
     if dry_run:
@@ -255,6 +369,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Apply the UPDATE. Without this the tool is read-only (dry-run).",
     )
+    parser.add_argument(
+        "--drop-uncovered",
+        action="store_true",
+        help=(
+            "DELETE the rows that have no surface coverage instead of leaving "
+            "them. Use only when the raw chains they would be rebuilt from are "
+            "gone, since this also discards those sessions' width history. "
+            "Refuses per symbol if fewer than "
+            f"{SPREAD_SURFACE_MIN_SESSIONS} covered sessions would remain."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit a JSON summary instead of text.")
     args = parser.parse_args(argv)
 
@@ -272,7 +397,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     try:
-        changes, summary = repair(symbols, start, end, dry_run=not args.execute)
+        changes, summary = repair(
+            symbols,
+            start,
+            end,
+            dry_run=not args.execute,
+            drop_uncovered=args.drop_uncovered,
+        )
     except Exception:
         logger.error("Repair failed", exc_info=True)
         return 1
