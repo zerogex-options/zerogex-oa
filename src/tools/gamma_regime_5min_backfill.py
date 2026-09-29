@@ -146,12 +146,73 @@ def written_bars(cursor, db_symbol: str, day: date) -> int:
     return int(cursor.fetchone()[0])
 
 
+def session_state(cursor, db_symbol: str, day: date) -> tuple:
+    """(bars, bars carrying a flip, flips upstream, chain rows) for one session.
+
+    The third number is what makes the second one interpretable. A session with
+    no flip on any bar is either a day the profile never crossed zero, which is
+    a real market condition and nothing to fix, or a day the flip was sitting
+    in gex_summary and never reached the bars. Only the second is a hole.
+    """
+    cursor.execute(
+        """
+        SELECT COUNT(*), COUNT(gamma_flip) FROM gamma_regime_5min
+        WHERE symbol = %s
+          AND (bar_start AT TIME ZONE 'America/New_York')::date = %s
+        """,
+        (db_symbol, day),
+    )
+    bars, with_flip = (int(v) for v in cursor.fetchone())
+    cursor.execute(
+        """
+        SELECT COUNT(gamma_flip_point) FROM gex_summary
+        WHERE underlying = %s
+          AND (timestamp AT TIME ZONE 'America/New_York')::date = %s
+        """,
+        (db_symbol, day),
+    )
+    upstream = int(cursor.fetchone()[0])
+    # Whether the session can be rebuilt at all. A rebuild deletes first, so
+    # without this a day whose chains have since been pruned would lose the
+    # bars it had and get nothing back.
+    cursor.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM gex_by_strike
+            WHERE underlying = %s
+              AND (timestamp AT TIME ZONE 'America/New_York')::date = %s
+        )
+        """,
+        (db_symbol, day),
+    )
+    return bars, with_flip, upstream, bool(cursor.fetchone()[0])
+
+
+def needs_build(bars: int, with_flip: int, upstream_flips: int) -> bool:
+    """Whether a session is worth (re)building.
+
+    "Has 82 rows" was the first definition of done here and it was the wrong
+    one. Four sessions written live before the gamma_flip column existed had a
+    full set of bars carrying no flip at all, so the backfill called them
+    complete and never looked at whether the bars were any good.
+
+    A session is done when it has its bars AND either those bars carry a flip
+    or there was no flip upstream to carry. That last clause is what stops a
+    genuinely flip-less day from being rebuilt on every run forever, which is
+    what a plain "any NULL means rebuild" rule would do.
+    """
+    if bars < SESSION_BARS:
+        return True
+    return with_flip == 0 and upstream_flips > 0
+
+
 def backfill_symbol(
     symbol: str,
     start: date,
     end: date,
     dry_run: bool = False,
     sleep: float = DEFAULT_SLEEP,
+    force: bool = False,
 ) -> dict:
     """Write every missing structure bar for one symbol over [start, end]."""
     engine = AnalyticsEngine(underlying=symbol)
@@ -189,17 +250,57 @@ def backfill_symbol(
 
     for day in days:
         with db_connection() as conn:
-            before = written_bars(conn.cursor(), db_symbol, day)
-        if before >= SESSION_BARS:
+            before, with_flip, upstream, has_chain = session_state(conn.cursor(), db_symbol, day)
+        if not force and not needs_build(before, with_flip, upstream):
             counts["already"] += 1
             continue
 
+        # A session with its bars already but no flip on them is a repair, not
+        # a build, and saying so is the difference between a run that looks
+        # like it did nothing and one that says what it fixed.
+        stale_flip = before >= SESSION_BARS and with_flip == 0 and upstream > 0
+        rebuild = stale_flip or (force and before > 0)
+        if rebuild and not has_chain:
+            # Deleting here would cost the day its bars and put nothing back,
+            # because the chains it would be rebuilt from are gone.
+            logger.warning(
+                "%s %s: %d bar(s) stored but the per-strike chain has been pruned, "
+                "leaving them alone",
+                symbol,
+                day,
+                before,
+            )
+            counts["already"] += 1
+            continue
         if dry_run:
-            logger.info("%s %s: would build (%d/%d bars stored)", symbol, day, before, SESSION_BARS)
+            logger.info(
+                "%s %s: would %s (%d/%d bars stored, %d with a flip, %d upstream)",
+                symbol,
+                day,
+                "rebuild" if stale_flip else "build",
+                before,
+                SESSION_BARS,
+                with_flip,
+                upstream,
+            )
             counts["days"] += 1
             continue
 
         try:
+            if rebuild:
+                # The engine writes only the bars it finds missing, so a full
+                # set of bad rows would be skipped by its own todo list. Clear
+                # the day first and let it rebuild from the chains.
+                with db_connection() as conn:
+                    conn.cursor().execute(
+                        """
+                        DELETE FROM gamma_regime_5min
+                        WHERE symbol = %s
+                          AND (bar_start AT TIME ZONE 'America/New_York')::date = %s
+                        """,
+                        (db_symbol, day),
+                    )
+                before = 0
             engine._refresh_gamma_regime_snapshot(_session_noon(day))
         except Exception as exc:
             # One bad session must not cost the rest of the window. The method
@@ -250,6 +351,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=DEFAULT_SLEEP,
         help=f"Seconds between sessions (default {DEFAULT_SLEEP})",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild every session in the window, even ones that look complete. "
+        "Deletes the day's bars first, so the engine rewrites them from the chains.",
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -285,7 +392,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     totals = {"days": 0, "written": 0, "already": 0, "empty": 0}
     for sym in symbols:
         try:
-            counts = backfill_symbol(sym, start, end, args.dry_run, args.sleep)
+            counts = backfill_symbol(sym, start, end, args.dry_run, args.sleep, args.force)
         except Exception as exc:
             logger.error("%s: backfill failed, continuing: %s", sym, exc)
             continue

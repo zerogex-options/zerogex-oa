@@ -15,6 +15,7 @@ from src.tools.gamma_regime_5min_backfill import (
     SESSION_BARS,
     _session_noon,
     main,
+    needs_build,
     trading_days,
 )
 
@@ -96,7 +97,7 @@ def test_default_window_stops_before_today(monkeypatch):
     """
     seen = {}
 
-    def fake(symbol, start, end, dry_run=False, sleep=0.0):
+    def fake(symbol, start, end, dry_run=False, sleep=0.0, force=False):
         seen["start"], seen["end"] = start, end
         return {"symbol": symbol, "days": 0, "written": 0, "already": 0, "empty": 0}
 
@@ -109,7 +110,7 @@ def test_default_window_stops_before_today(monkeypatch):
 def test_explicit_end_is_honored(monkeypatch):
     seen = {}
 
-    def fake(symbol, start, end, dry_run=False, sleep=0.0):
+    def fake(symbol, start, end, dry_run=False, sleep=0.0, force=False):
         seen["start"], seen["end"], seen["dry"] = start, end, dry_run
         return {"symbol": symbol, "days": 0, "written": 0, "already": 0, "empty": 0}
 
@@ -124,7 +125,7 @@ def test_explicit_end_is_honored(monkeypatch):
 def test_one_symbol_failing_does_not_abort_the_others(monkeypatch):
     seen = []
 
-    def fake(symbol, start, end, dry_run=False, sleep=0.0):
+    def fake(symbol, start, end, dry_run=False, sleep=0.0, force=False):
         seen.append(symbol)
         if symbol == "SPY":
             raise RuntimeError("slow query")
@@ -133,3 +134,51 @@ def test_one_symbol_failing_does_not_abort_the_others(monkeypatch):
     monkeypatch.setattr("src.tools.gamma_regime_5min_backfill.backfill_symbol", fake)
     assert main(["--symbols", "SPY,QQQ", "--start", "2026-08-01", "--end", "2026-08-02"]) == 0
     assert seen == ["SPY", "QQQ"]
+
+
+def test_a_full_session_of_flipless_bars_is_not_done():
+    """ "Has 82 rows" was the first definition of done and it was wrong.
+
+    Four sessions written live before the gamma_flip column existed carried a
+    complete set of bars with no flip on any of them, so the backfill called
+    them complete and never looked at whether the bars were any good. The flip
+    was in gex_summary the whole time.
+    """
+    assert needs_build(SESSION_BARS, 0, 783) is True
+
+
+def test_a_genuinely_flipless_day_is_left_alone():
+    """The market really does have days the profile never crosses zero.
+
+    Rebuilding on any NULL would put those days in an endless loop: nothing
+    upstream to carry, so every run would find them incomplete and redo them.
+    """
+    assert needs_build(SESSION_BARS, 0, 0) is False
+
+
+def test_a_complete_session_is_skipped_and_a_short_one_is_not():
+    assert needs_build(SESSION_BARS, SESSION_BARS, 783) is False
+    assert needs_build(SESSION_BARS - 1, SESSION_BARS - 1, 783) is True
+    assert needs_build(0, 0, 0) is True
+
+
+def test_a_partly_flipped_session_counts_as_done():
+    # Some bars carrying a flip means the writer was working; a hole inside the
+    # session is the data's, not the pipeline's, and rebuilding cannot fill it.
+    assert needs_build(SESSION_BARS, 3, 783) is False
+
+
+def test_force_is_threaded_through_to_the_symbol_pass(monkeypatch):
+    seen = {}
+
+    def fake(symbol, start, end, dry_run=False, sleep=0.0, force=False):
+        seen["force"] = force
+        return {"symbol": symbol, "days": 0, "written": 0, "already": 0, "empty": 0}
+
+    monkeypatch.setattr("src.tools.gamma_regime_5min_backfill.backfill_symbol", fake)
+    assert main(["--symbols", "SPY", "--start", "2026-09-09", "--end", "2026-09-14"]) == 0
+    assert seen["force"] is False
+    assert (
+        main(["--symbols", "SPY", "--start", "2026-09-09", "--end", "2026-09-14", "--force"]) == 0
+    )
+    assert seen["force"] is True
