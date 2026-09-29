@@ -3,10 +3,21 @@
 **Runbook step:** 14, "Check the numbers actually match".
 **Question:** would a subscriber see a different number if we served ThetaData's Market Value
 feed instead of TradeStation's realtime feed?
-**Answer:** no, on every level they read. The one metric that moves is explained below and moves
-less than the incumbent feed already moves against itself.
-**Status:** step 14's *evidence* bar is met; its *calendar* bar is not. See "Where this falls
-short" — that gap is deliberate and recorded, not overlooked.
+**Answer, chain levels:** no. Spot, both walls, max pain, the gamma flip and net GEX are settled;
+the one metric that moves moves less than the incumbent feed already moves against itself.
+**Answer, flow: yes, and materially.** Buy/sell classification was never measured at all until
+2026-09-28, because the harness meant to measure it was broken and said so in language that read
+like a quiet market. Once fixed, the published net imbalance came back with the **opposite sign in
+12 of 30 paired samples**. The cause is a defect in ThetaData's Market Value calculation, which
+they have since reproduced and acknowledged. See F9.
+**Status:** step 14's evidence bar is **met for chain metrics and failed for flow**. Cutover is
+deferred with no date, pending F9. The *calendar* bar was never met either — see "Where this falls
+short"; that gap is deliberate and recorded, not overlooked.
+
+**Amended 2026-09-29.** Everything above the F9 section was written 2026-09-22 and stands as
+written; the verdict below was always a verdict on the chain metrics, which is all the harness
+could measure at the time. Nothing in it has been retracted. What changed is that a class of
+output it never covered turned out to be affected.
 
 Not legal advice. Engineering findings, written so the question "are the differences written down
 and explained" can be answered from this file instead of from a chat transcript.
@@ -34,6 +45,9 @@ reverse-engineered, reconstructed or substantially recovered."
 ---
 
 ## Verdict
+
+**Scope.** This verdict covers the CHAIN metrics and nothing else. Flow classification is not in
+the table below and was not measured until 2026-09-28; see F9.
 
 **116 paired samples** across three underlyings, four sessions. Every sample compares Market Value
 against realtime on the *same terminal*, over the *same contract list*, pushed through the *same*
@@ -265,6 +279,127 @@ and GIDS, both real-time).
 
 ---
 
+## F9 — the Market Value calculation returns crossed quotes, and Lee-Ready cannot survive them
+
+*Added 2026-09-29. This is the finding that deferred the cutover.*
+
+### What was measured
+
+`option_snapshot_market_value` returns quotes with the **bid above the ask** on penny-wide
+spreads. Two windows on 2026-09-28, SPY, 240 contracts per sample (three nearest expirations,
+strikes within 3% of spot), one sample a minute:
+
+| Window (ET) | Samples | Contract-quotes | Crossed | Per sample | Share |
+|---|---|---|---|---|---|
+| 11:25:50–11:56:46 | 30 | 7,200 | 1,640 | 38–67 | 15.8%–27.9%, mean 22.8% |
+| 15:02:31–15:32:59 | 31 | 7,440 | 1,493 | 33–63 | 13.8%–26.3%, mean 20.1% |
+
+Two different tools, so the provenance is worth stating. The morning row is `feed-compare`'s
+`crossed_candidate` counter, which counts among *compared* contracts; compared was 240 in every
+sample, so the base is the same 240. The afternoon row is `crossed-capture`, which counts among
+all quoted contracts and writes one CSV row per crossed contract per sample.
+
+In the afternoon window 112 distinct contracts crossed at some point, so it moves around the chain
+rather than sticking to the same few. **Every one of the 1,493 was crossed by exactly one cent.**
+No exceptions — that uniformity is the finding, not the count.
+
+The incumbent returned **zero** crossed quotes, on the identical contract list, sampled 0.3–0.8s
+either side of each Market Value call, in all 30 morning samples.
+
+### Mechanism
+
+Consistent with the penny adjustment being applied **independently to each side** of a penny-wide
+spread. A bid moved up one cent and an ask moved down one cent on a one-cent spread lands crossed
+by exactly one cent, which is what all 1,493 observations show and why none of them are wider.
+
+ThetaData reproduced it on 2026-09-29 (Anthony, support), saw ~18% on their own sample, pulled the
+raw NBBO for the same contracts at the same timestamps and found **none of those crossed** —
+placing the defect in the Market Value calculation rather than in the underlying OPRA quote. Raised
+with their team; no fix date given.
+
+This **contradicts their statement of 2026-09-14** that the adjustment does not introduce crossed
+quotes, which is recorded in `thetadata.py`'s `_endpoint()` docstring and was relied on.
+
+### Why it blocks the cutover
+
+`_classify_volume_chunk` decides buyer- from seller-initiated by where the trade price sits
+relative to the prevailing quote (Lee-Ready, band 0.70 × half-spread). Against a crossed quote
+that decision is arbitrary — there is no coherent bid/ask relationship to grade against.
+
+Measured on the same trades, same instant, over 30 paired samples on 2026-09-28:
+
+| | Result |
+|---|---|
+| contracts classified differently | 44.6%–55.8% |
+| volume classified differently | 55.5%–92.5% |
+| **net imbalance sign reversed** | **12 of 30 samples** |
+| crossed quotes introduced | +38 to +67 per sample, incumbent always 0 |
+
+The net imbalance is what reaches a subscriber: it is the input to `order_flow_imbalance` and
+`tape_flow_bias`. A figure that reverses sign 40% of the time cannot ship unexplained. Note the
+chain metrics in the same 30 samples were as clean as ever — spot, both walls and max pain
+identical, net GEX 2.25% apart against 11.17% incumbent self-variance. The defect is confined to
+flow, but flow and GEX come off the same chain and cannot be sourced separately.
+
+### The harness was broken, and said nothing
+
+`compare_flow_classification` looked the candidate's quote up **by the incumbent's vendor symbol
+string**. Each feed resolves its own chain through its own `build_option_symbol`, so the incumbent
+keys a contract `SPY 260928C763` and the candidate keys the identical contract
+`SPY   260928C00763000`. The lookup missed on every contract of every sample.
+
+The miss was silent: the loop skipped ahead before reaching the no-trade counter, and the report
+keys off `contracts_compared` alone, so a run in which nothing *matched* printed as a run in which
+nothing *traded*. Thirty samples of live SPY 0DTE carrying six-figure volume per contract reported
+`no contract traded in this sample`.
+
+Fixed 2026-09-28 (`90b84a4`): the join is on `(expiration, strike, right)` from the harness's own
+metadata, unmatched contracts are counted and reported, and an empty result now names which of the
+three reasons it hit. The existing tests had given both feeds the *same* made-up symbol keys and no
+metadata, so symbol equality always matched and a join that could never work against two real
+feeds passed all ten of them; their fixture now derives a contract identity per symbol.
+
+**Consequence for this record: no flow number produced before 2026-09-28 is evidence.** Any such
+figure quoted in a chat transcript or an earlier draft should be disregarded.
+
+### The vendor's interim workaround, and why it is not yet adopted
+
+ThetaData suggested classifying against the raw NBBO from `option/snapshot/quote` instead, noting
+it is "on the same Standard subscription".
+
+That answers **access tier**, not **fee treatment**, and the two are not the same question. Per F4
+above, `option_snapshot_market_value` is the only quote endpoint in Exhibit A, and Exhibit A's
+options line was amended to read "This adjusted bid and ask value is derived from…" — the derived
+characterisation attaches to the **adjusted** quote. Raw NBBO sits outside that language, and
+consuming it would reinstate precisely the OPRA exposure this migration exists to remove.
+
+`thetadata.py`'s `_endpoint()` already refuses to fall back to the realtime endpoint on a Market
+Value stage, deliberately, for exactly this reason. It has not been weakened and should not be.
+
+Asked in writing 2026-09-28: does consuming raw NBBO purely as a classification input — never
+displayed, never redistributed — carry OPRA exchange fees or redistribution obligations we do not
+have today? **Unanswered as of 2026-09-29.** This is the open question the cutover waits on.
+
+### Paths
+
+| If | Then |
+|---|---|
+| ThetaData fixes the crossing | re-measure with `make feed-compare`; the problem may largely evaporate |
+| raw NBBO is fee-clean for us | small change — `option_snapshot_quote` is already wired as the non-MV path |
+| raw NBBO is fee-bearing | tick test: grade against the PREVIOUS TRADE PRICE, needs no quote at all, and **shrinks** the OPRA surface relative to both alternatives |
+
+Whichever lands, the published flow numbers change, and that has to be a deliberate and understood
+change rather than a side effect of a cutover.
+
+### Also open
+
+The auth response carries `isProfessional: true` **and** `isRetail: true` simultaneously.
+ThetaData is confirming which governs entitlements and billing. They note professional status
+follows registration (FINRA, SEC, a state agency, an exchange or a futures market) and does not
+change accessible data tiers. Billing and OPRA fee treatment are the reason it matters.
+
+---
+
 ## Findings that turned out not to be about the feed
 
 Recorded because each cost investigation time and each looked like a vendor problem first.
@@ -357,7 +492,16 @@ afterwards and append the result here rather than holding the cutover for it.
   failed IV solve against a 0.20 fallback without writing it back, so the contract carries a gamma
   into `_calculate_gex_by_strike` while `_gamma_exposure_profile` skips it on `sigma <= 0`.
   `net_gex` and `gamma_flip` are therefore not always computed over the same chain.
-- **VIX / VXN CGIF coverage** — unconfirmed (F5).
+- **F9's licensing question** — whether raw NBBO may be consumed as a classification input is
+  unanswered, and the cutover waits on it. Do not write code against `option_snapshot_quote`, and
+  do not weaken `_endpoint()`'s refusal, until it is answered in writing.
+- **F9's crossed quotes** — acknowledged by the vendor, no fix date. `make crossed-capture`
+  reproduces the evidence on demand; a capture returning nothing is the signal that it is fixed.
+- **VIX / VXN CGIF coverage** — resolved 2026-09-28 for the operational question, not the
+  contractual one. A pre-open probe returned a live VIX at 08:44:46 ET agreeing with the incumbent
+  to within a penny while VIX was moving, so extended hours are served and no per-feed override is
+  needed. Whether VIX and VXN sit inside the existing CGIF coverage contractually is still
+  unanswered (F5).
 - **F4's Exhibit A gap** — accepted; correspondence is the record.
 - **Signal components whose gates the ingested chain cannot reach.** Two turned up by accident
   during this comparison, so all six basic signals, all six registered MSI components and the three
@@ -379,6 +523,9 @@ UNDERLYING='$SPXW.X' INCUMBENT=thetadata CANDIDATE=thetadata_mv make feed-compar
 
 # one fetch, sizing and coverage only
 PROVIDER=thetadata_mv UNDERLYING='$NDXP.X' make feed-probe
+
+# F9: capture crossed Market Value quotes to CSV (read-only, no DB writes)
+make crossed-capture MINUTES=30 OUT=~/crossed-quotes.csv
 
 # does the flip converge as the chain deepens (read-only)
 UNDERLYING=QQQ PROVIDER=thetadata_mv DEPTHS=3,6,9,12 ROUNDS=6 make chain-depth-sweep
