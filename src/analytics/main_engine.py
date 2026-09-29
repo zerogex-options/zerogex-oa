@@ -3919,6 +3919,14 @@ class AnalyticsEngine:
         meaningful if every day in the window measured the same contracts, so
         the scope has to travel with the reading.
 
+        Every column here is a snapshot of one analytics cycle EXCEPT
+        ``zero_bid_pct``, which is a mean over the session's surface buckets.
+        The no-bid share ramps monotonically into the close, so a single
+        sample taken near 16:00 measures the time of day as much as the
+        session; the widths do not behave that way and are left as read.
+        :func:`~src.analytics.surface_store.session_zero_bid_means` carries
+        the full reasoning.
+
         Same cash-session gate as :meth:`_store_daily_atm_iv`, and for a
         sharper version of the same reason.  Once the 16:00 ET close passes,
         market makers stop quoting competitively and the chain goes wide by
@@ -4002,6 +4010,38 @@ class AnalyticsEngine:
                 ("A", by_type["all"]),
             ]
 
+            # Everything else in this row is a snapshot of this cycle, and
+            # for a median over hundreds of contracts that is fine.  The
+            # no-bid share is different in kind: it is near zero all morning
+            # and ramps into the close, so one sample taken at 15:5x lands on
+            # the steepest part of the curve and swings with the minute the
+            # cycle fired.  It is read back from the surface table's ~13
+            # half-hour buckets instead.  See surface_store.
+            #
+            # This makes the row deliberately mixed — widths from this
+            # instant, no-bid across the session — and that is the honest
+            # pairing rather than an oversight.  Both columns say so in
+            # their schema comments.
+            #
+            # Read only when there is a row to write.  An empty chain writes
+            # nothing at all (see the contract_count guard in the loop), and
+            # querying the surface table on the way to writing nothing would
+            # be a pointless round trip on every cycle outside the session.
+            session_zb: Dict[str, float] = {}
+            if any(agg.contract_count for _, agg in rows):
+                session_zb, zb_buckets = surface_store.session_zero_bid_means(
+                    cursor, underlying, today_et, int(SPREAD_STATS_DTE_MAX), band
+                )
+                if not zb_buckets:
+                    # No surface rows for this scope yet.  Fall back to this
+                    # cycle's own reading: noisier, but a real measurement.
+                    logger.debug(
+                        "daily_spread_stats %s: no surface buckets for %s; "
+                        "falling back to this cycle's no-bid share",
+                        underlying,
+                        today_et,
+                    )
+
             for option_type, agg in rows:
                 # A type with no contracts in scope (an expiration listing
                 # only calls, say) writes nothing rather than a zeroed row
@@ -4055,7 +4095,7 @@ class AnalyticsEngine:
                         agg.contract_count,
                         agg.tradable_count,
                         agg.two_sided_pct,
-                        agg.zero_bid_pct,
+                        session_zb.get(option_type, agg.zero_bid_pct),
                         agg.crossed_or_locked_pct,
                         agg.median_spread,
                         agg.median_relative_spread_pct,
@@ -4219,8 +4259,12 @@ class AnalyticsEngine:
                 self._store_gex_profile(summary, cursor)
                 if options is not None:
                     self._store_daily_atm_iv(options, summary, cursor)
-                    self._store_daily_spread_stats(options, summary, cursor)
+                    # Surface BEFORE daily, and the order is load-bearing:
+                    # the daily row's no-bid share is a mean over the
+                    # session's surface buckets, so this cycle's own bucket
+                    # has to be in the table before it is read back.
                     self._store_spread_surface(options, summary, cursor)
+                    self._store_daily_spread_stats(options, summary, cursor)
                 # db_connection() commits on a clean __exit__; the explicit
                 # commit makes the single-transaction boundary unambiguous
                 # and is a harmless no-op when the CM commits again.

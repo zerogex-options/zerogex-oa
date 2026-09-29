@@ -37,6 +37,8 @@ __all__ = [
     "SURFACE_UPSERT_SQL",
     "surface_param_rows",
     "store_surface_scopes",
+    "SESSION_ZERO_BID_SQL",
+    "session_zero_bid_means",
 ]
 
 #: Cash-session bounds in minutes past ET midnight — 09:30 and 16:00.
@@ -193,3 +195,94 @@ def store_surface_scopes(
             cursor.execute(SURFACE_UPSERT_SQL, row)
         written += len(rows)
     return written
+
+
+# ---------------------------------------------------------------------------
+# Reading the session back out, for the daily rollup's no-bid share
+# ---------------------------------------------------------------------------
+#
+# ``daily_spread_stats`` stores one row per session, written by whichever
+# analytics cycle ran last before the 16:00 ET close.  For a median over
+# hundreds of contracts that is a defensible sample.  For ``zero_bid_pct`` it
+# is not, because the no-bid share is not flat across the session: it is near
+# zero all morning and climbs steadily into the close, 5-8% in the last half
+# hour on SPX and NDX alike.  The daily writer's one sample lands on the
+# steepest part of that ramp, so the stored figure swings with the minute the
+# cycle happened to fire — session to session it alternated between exactly
+# 0.0 and 7-9% while every one of those sessions was internally mixed.
+# Measured against the session mean it carried 2.5x to 11x the variance.
+#
+# The surface table already holds the session as ~13 half-hour readings, it
+# is written by the same engine at the same funnel, and it survives a restart
+# in a way an in-memory accumulator would not.  So the daily row's no-bid
+# share is read back from here rather than sampled.
+#
+# Buckets are averaged unweighted: each half hour is one observation of how
+# much of the chain had no market, and weighting by contract count would let
+# the fuller buckets speak for the thinner ones.  Within a bucket the two
+# option types ARE contract-weighted into the blended figure, because there
+# the shares describe one population split in two.
+
+SESSION_ZERO_BID_SQL = """
+WITH per_bucket AS (
+    SELECT bucket_start_min,
+           SUM(zero_bid_pct * contract_count) FILTER (WHERE option_type = 'C')
+               / NULLIF(SUM(contract_count) FILTER (WHERE option_type = 'C'), 0)
+               AS c,
+           SUM(zero_bid_pct * contract_count) FILTER (WHERE option_type = 'P')
+               / NULLIF(SUM(contract_count) FILTER (WHERE option_type = 'P'), 0)
+               AS p,
+           SUM(zero_bid_pct * contract_count)
+               / NULLIF(SUM(contract_count), 0) AS a
+      FROM spread_surface_stats
+     WHERE underlying = %s
+       AND trading_date = %s
+       AND dte_scope = %s
+       AND band_pct = %s::real
+       AND money_bucket = %s
+     GROUP BY bucket_start_min
+)
+SELECT AVG(c), AVG(p), AVG(a), COUNT(*) FROM per_bucket
+"""
+
+
+def session_zero_bid_means(
+    cursor,
+    underlying: str,
+    trading_date: dt.date,
+    dte_max: int,
+    band_pct: float,
+) -> Tuple[Dict[str, float], int]:
+    """Mean no-bid share across a session's half-hour buckets, by option type.
+
+    Returns ``({"C": .., "P": .., "A": ..}, bucket_count)``.  The scope is
+    the daily rollup's own — the caller passes its pinned ``dte_max`` and
+    band, and they are translated to this table's key names here so the two
+    cannot describe different populations.
+
+    An empty mapping and a count of zero mean the session has no surface
+    rows in that scope yet: early in the day, after a surface write failure,
+    or when ``SPREAD_STATS_DTE_MAX`` is set to a value
+    :data:`~src.analytics.spread_stats.DTE_UNIVERSES` does not carry.  The
+    caller is expected to fall back to its own snapshot rather than write a
+    zero, which would read later as a session when nothing went unquotable.
+    """
+    cursor.execute(
+        SESSION_ZERO_BID_SQL,
+        (
+            underlying,
+            trading_date,
+            spread_stats_mod.dte_universe_key(dte_max),
+            float(band_pct),
+            spread_stats_mod.BAND_WIDE,
+        ),
+    )
+    row = cursor.fetchone()
+    if not row or not row[3]:
+        return {}, 0
+    means = {
+        key: float(value)
+        for key, value in (("C", row[0]), ("P", row[1]), ("A", row[2]))
+        if value is not None
+    }
+    return means, int(row[3])

@@ -2860,7 +2860,7 @@ COMMENT ON COLUMN daily_spread_stats.median_spread_bps_underlying IS
 COMMENT ON COLUMN daily_spread_stats.contract_count IS
     'Contracts in scope for the row. Load-bearing, not diagnostic: a session below SPREAD_STATS_MIN_CONTRACTS is an ingestion outage rather than a quiet market, and both the writers and the trailing-percentile read exclude it -- a median over 21 contracts must not stand beside one over 684 in the distribution today is ranked against.';
 COMMENT ON COLUMN daily_spread_stats.zero_bid_pct IS
-    'Share of contracts quoted with an offer but no bid. These have NO width by construction and are excluded from every median here; the count is the liquidity failure a width statistic cannot express.';
+    'Share of contracts quoted with an offer but no bid. These have NO width by construction and are excluded from every median here; the count is the liquidity failure a width statistic cannot express. UNLIKE every other column in this table it is a MEAN ACROSS THE SESSION, read back from spread_surface_stats, not a snapshot of the cycle that wrote the row: the no-bid share is near zero all morning and climbs into the close, so a single late sample recorded the time of day as much as the session and carried 2.5x-11x the session mean variance. See src/analytics/surface_store.session_zero_bid_means.';
 
 -- =============================================================================
 -- BACKTESTING PLATFORM (see docs/design/backtesting-platform.md)

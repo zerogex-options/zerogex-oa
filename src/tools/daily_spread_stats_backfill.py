@@ -50,6 +50,7 @@ from src.config import (
     SPREAD_STATS_MONEYNESS_BAND_PCT,
 )
 from src.database.connection import db_connection
+from src.analytics import surface_store
 from src.market_calendar import is_settled_am_contract
 
 logger = logging.getLogger(__name__)
@@ -292,6 +293,18 @@ def _backfill_symbol(
                 by_type = spread_stats_mod.aggregate_by_option_type(
                     spread_stats_mod.contract_spreads(rows, spot)
                 )
+
+                # The live writer reads this column back out of the surface
+                # table rather than sampling it, because the no-bid share
+                # ramps into the close and one anchor sample measures the
+                # time of day as much as the session.  The backfill has to
+                # agree or the seeded rows are a different statistic wearing
+                # the same column name, and the percentile that ranks them
+                # together ranks the definitions.
+                session_zb, _ = surface_store.session_zero_bid_means(
+                    cur, symbol, day, dte_max, band
+                )
+
                 day_written = 0
                 for option_type, agg in (
                     ("C", by_type["calls"]),
@@ -312,7 +325,7 @@ def _backfill_symbol(
                             agg.contract_count,
                             agg.tradable_count,
                             agg.two_sided_pct,
-                            agg.zero_bid_pct,
+                            session_zb.get(option_type, agg.zero_bid_pct),
                             agg.crossed_or_locked_pct,
                             agg.median_spread,
                             agg.median_relative_spread_pct,

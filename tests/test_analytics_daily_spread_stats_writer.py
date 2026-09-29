@@ -78,8 +78,18 @@ def _floor_off(monkeypatch):
 
 
 def _params(cur: MagicMock) -> list[tuple]:
-    """The parameter tuple of every UPSERT the writer issued."""
-    return [call.args[1] for call in cur.execute.call_args_list]
+    """The parameter tuple of every UPSERT the writer issued.
+
+    The writer also READS on this cursor now -- it pulls the session's
+    no-bid share back out of spread_surface_stats rather than sampling it
+    -- so the UPSERTs have to be picked out by statement rather than taken
+    as "everything that touched the cursor".
+    """
+    return [
+        call.args[1]
+        for call in cur.execute.call_args_list
+        if "INSERT INTO daily_spread_stats" in call.args[0]
+    ]
 
 
 def _option_types(cur: MagicMock) -> list[str]:
@@ -154,9 +164,28 @@ def test_puts_row_carries_the_wider_median_than_the_calls_row():
     assert by_type["P"][12] > by_type["C"][12]
 
 
-def test_no_bid_contract_is_counted_but_not_measured():
-    """The put wing with no bid lifts zero_bid_pct without moving the median."""
+def _cur_without_surface() -> MagicMock:
+    """A cursor whose surface read comes back empty.
+
+    ``zero_bid_pct`` is no longer this cycle's own count -- it is a mean over
+    the session's spread_surface_stats buckets, because the no-bid share
+    ramps into the close and a single late sample measures the time of day as
+    much as the session.  A bare MagicMock would answer that read with a mock
+    and the snapshot would never be exercised, so the tests that are about
+    THIS cycle's arithmetic say explicitly that the session is unavailable.
+    """
     cur = MagicMock()
+    cur.fetchone.return_value = (None, None, None, 0)
+    return cur
+
+
+def test_no_bid_contract_is_counted_but_not_measured():
+    """The put wing with no bid lifts zero_bid_pct without moving the median.
+
+    With no surface coverage the writer falls back to this cycle's own
+    count, which is what this fixture is measuring.
+    """
+    cur = _cur_without_surface()
     _engine()._store_daily_spread_stats(_options(), _summary(_et(12, 0)), cur)
     puts = {p[2]: p for p in _params(cur)}["P"]
     contract_count, tradable_count = puts[6], puts[7]
@@ -281,3 +310,56 @@ def test_naive_timestamp_is_treated_as_utc():
     naive = _et(12, 0).replace(tzinfo=None)
     _engine()._store_daily_spread_stats(_options(), _summary(naive), cur)
     assert cur.execute.called
+
+
+# ---------------------------------------------------------------------------
+# The no-bid share is a session mean, not this cycle's count
+# ---------------------------------------------------------------------------
+
+
+def test_the_session_mean_replaces_this_cycle_s_no_bid_count():
+    """The whole point of the change, stated as a write.
+
+    This cycle sees 50% of the puts with no bid -- a 15:5x reading on the
+    steep part of the afternoon ramp. The session averaged 8%. The row has
+    to carry 8, or the percentile that ranks it is ranking what time the
+    cycle fired.
+    """
+    cur = MagicMock()
+    cur.fetchone.return_value = (2.0, 8.0, 5.0, 13)
+    _engine()._store_daily_spread_stats(_options(), _summary(_et(12, 0)), cur)
+
+    by_type = {p[2]: p for p in _params(cur)}
+    assert by_type["P"][9] == 8.0
+    assert by_type["C"][9] == 2.0
+    assert by_type["A"][9] == 5.0
+    # ...and nothing else moved to the session: the widths are still this
+    # instant's, which is what makes the row's mixed basis deliberate.
+    assert by_type["P"][7] == 1  # tradable_count, from this cycle
+
+
+def test_an_empty_session_falls_back_to_this_cycle_rather_than_writing_zero():
+    """A fabricated 0.0 would read later as a session when nothing went
+    untradeable -- the single most misleading value this column can hold."""
+    cur = _cur_without_surface()
+    _engine()._store_daily_spread_stats(_options(), _summary(_et(12, 0)), cur)
+
+    assert {p[2]: p for p in _params(cur)}["P"][9] == 50.0
+
+
+def test_an_empty_chain_does_not_query_the_surface_table():
+    """Nothing to write, so nothing to look up."""
+    options = [
+        {
+            "strike": 300.0,
+            "option_type": "P",
+            "expiration": TRADE_DAY,
+            "bid": 0.05,
+            "ask": 0.60,
+            "open_interest": 10,
+            "volume": 0,
+        },
+    ]
+    cur = MagicMock()
+    _engine()._store_daily_spread_stats(options, _summary(_et(12, 0)), cur)
+    assert not cur.execute.called

@@ -1166,6 +1166,7 @@ help: ## Show this help message
 	@echo "$(GREEN)Liquidity / Spreads:$(NC)"
 	@echo "  make spread-report      - Have index put spreads widened lately? (SYMBOLS=SPX,NDX DAYS=60 SKIP_TODAY=yes)"
 	@echo "  make spread-snapshot-audit - Is the daily spread rollup a measurement or a coin flip? (SYMBOLS=SPX,NDX CUT=2026-09-10)"
+	@echo "  make daily-zero-bid-repair - Rewrite stored no-bid shares as session means (CONFIRM=yes to apply)"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
@@ -4261,6 +4262,22 @@ spread-snapshot-audit: ## Is the daily spread rollup representative of its sessi
 		-v cut=$(or $(CUT),2026-09-10) \
 		-v min_contracts=$(or $(MIN_CONTRACTS),100) \
 		-f setup/database/diagnostics/spread_snapshot_audit.sql
+
+.PHONY: daily-zero-bid-repair
+daily-zero-bid-repair: ## Rewrite daily_spread_stats.zero_bid_pct as a session mean. Dry-run by default; CONFIRM=yes to apply. SYMBOLS=SPX,NDX START=YYYY-MM-DD END=YYYY-MM-DD
+	@echo "$(BLUE)=== Daily no-bid repair ===$(NC)"
+	@echo "$(YELLOW)The no-bid share climbs through every afternoon, so the one$(NC)"
+	@echo "$(YELLOW)sample the daily writer used to take near 16:00 recorded the$(NC)"
+	@echo "$(YELLOW)time of day as much as the session. This replaces it with a$(NC)"
+	@echo "$(YELLOW)mean over the session's surface buckets -- the same statistic$(NC)"
+	@echo "$(YELLOW)the writer now stores, so the percentile window stops mixing$(NC)"
+	@echo "$(YELLOW)two definitions. RUN THIS WITH THE DEPLOY, not after it.$(NC)"
+	@echo ""
+	@$(PY) -m src.tools.daily_zero_bid_repair \
+		$(if $(SYMBOLS),--symbols "$(SYMBOLS)",) \
+		$(if $(START),--start $(START),) \
+		$(if $(END),--end $(END),) \
+		$(if $(filter yes,$(CONFIRM)),--execute,)
 
 .PHONY: tradeworkz-check
 tradeworkz-check: ## Run TradeWorkz accounting invariants (on-demand DB audit)
