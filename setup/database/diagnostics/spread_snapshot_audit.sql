@@ -191,3 +191,112 @@ SELECT underlying AS sym,
  ORDER BY underlying, option_type, era DESC;
 
 \echo ''
+\echo ''
+\echo '================================================================'
+\echo ' 4. IS A MOVE IN RELATIVE WIDTH REAL, OR JUST CHEAPER PREMIUM?'
+\echo '================================================================'
+\echo 'rel_w is 100 * (ask - bid) / mid -- premium sits in the denominator,'
+\echo 'so it rises when vol falls even if the dollar spread never moved.'
+\echo 'bps_w is 10,000 * (ask - bid) / spot: the same dollar spread with'
+\echo 'the index, not the premium, underneath it. If rel_w moved and bps_w'
+\echo 'did not, nothing happened to the market -- options just got cheaper.'
+\echo ''
+\echo 'Core hours only (10:00-15:00 ET). The open and the close have their'
+\echo 'own structure -- see §2 -- and including them compares bucket mixes'
+\echo 'rather than sessions. Each session contributes one value, so a'
+\echo 'session with a missing bucket cannot outvote one without.'
+\echo ''
+
+WITH core AS (
+    SELECT underlying,
+           option_type,
+           trading_date,
+           AVG(median_relative_spread_pct) AS rel_w,
+           AVG(10000.0 * median_spread / NULLIF(spot_price, 0)) AS bps_w,
+           AVG(zero_bid_pct) AS zb,
+           AVG(contract_count) AS contracts
+      FROM spread_surface_stats
+     WHERE underlying = ANY (string_to_array(:'symbols', ','))
+       AND dte_scope = :'dte_scope'
+       AND band_pct = :band::real
+       AND money_bucket = 'all'
+       AND contract_count >= :min_contracts
+       AND trading_date >= CURRENT_DATE - :days::int
+       AND bucket_start_min BETWEEN 600 AND 900
+     GROUP BY underlying, option_type, trading_date
+)
+SELECT underlying AS sym,
+       option_type AS side,
+       CASE WHEN trading_date < :'cut'::date THEN 'before ' || :'cut'
+            ELSE 'from ' || :'cut' END AS era,
+       COUNT(*) AS sessions,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rel_w)::numeric, 3)
+           AS rel_w,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bps_w)::numeric, 2)
+           AS bps_w,
+       -- Whether a gap between the eras is bigger than the session-to-session
+       -- scatter inside them. A shift well under one sd is not a finding.
+       ROUND(STDDEV_SAMP(bps_w)::numeric, 2) AS bps_sd,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY zb)::numeric, 2)
+           AS zb,
+       ROUND(AVG(contracts)) AS contracts
+  FROM core
+ GROUP BY underlying, option_type,
+          CASE WHEN trading_date < :'cut'::date THEN 'before ' || :'cut'
+               ELSE 'from ' || :'cut' END
+ ORDER BY underlying, option_type, era DESC;
+
+\echo ''
+\echo '================================================================'
+\echo ' 5. THE WEEK-BY-WEEK PATH, CORE HOURS, IN BOTH MEASURES'
+\echo '================================================================'
+\echo 'An era split hides whether a move was a step, a drift, or a spike'
+\echo 'that already reverted -- and a thing that reverted two weeks ago is'
+\echo 'not news anyone can trade. Read bps_w down the column: that is the'
+\echo 'one that is not distorted by the price of the options.'
+\echo ''
+
+WITH core AS (
+    SELECT underlying,
+           option_type,
+           DATE_TRUNC('week', trading_date)::date AS week_of,
+           trading_date,
+           AVG(median_relative_spread_pct) AS rel_w,
+           AVG(10000.0 * median_spread / NULLIF(spot_price, 0)) AS bps_w,
+           AVG(zero_bid_pct) AS zb
+      FROM spread_surface_stats
+     WHERE underlying = ANY (string_to_array(:'symbols', ','))
+       AND dte_scope = :'dte_scope'
+       AND band_pct = :band::real
+       AND money_bucket = 'all'
+       AND contract_count >= :min_contracts
+       AND trading_date >= CURRENT_DATE - :days::int
+       AND bucket_start_min BETWEEN 600 AND 900
+     GROUP BY underlying, option_type, trading_date
+)
+SELECT week_of,
+       COUNT(*) FILTER (WHERE underlying = 'SPX' AND option_type = 'P')
+           AS spx_sess,
+       ROUND(AVG(bps_w) FILTER
+             (WHERE underlying = 'SPX' AND option_type = 'P')::numeric, 2)
+           AS spx_p_bps,
+       ROUND(AVG(bps_w) FILTER
+             (WHERE underlying = 'SPX' AND option_type = 'C')::numeric, 2)
+           AS spx_c_bps,
+       ROUND(AVG(bps_w) FILTER
+             (WHERE underlying = 'NDX' AND option_type = 'P')::numeric, 2)
+           AS ndx_p_bps,
+       ROUND(AVG(bps_w) FILTER
+             (WHERE underlying = 'NDX' AND option_type = 'C')::numeric, 2)
+           AS ndx_c_bps,
+       ROUND(AVG(rel_w) FILTER
+             (WHERE underlying = 'SPX' AND option_type = 'P')::numeric, 2)
+           AS spx_p_rel,
+       ROUND(AVG(rel_w) FILTER
+             (WHERE underlying = 'NDX' AND option_type = 'P')::numeric, 2)
+           AS ndx_p_rel
+  FROM core
+ GROUP BY week_of
+ ORDER BY week_of;
+
+\echo ''
