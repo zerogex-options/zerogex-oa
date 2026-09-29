@@ -73,6 +73,13 @@
 --
 -- Variables: symbols, dte_max, band, days, recent, min_contracts,
 -- min_sessions, option_type, skip_today.
+--
+-- SECTIONS 1-6 are a snapshot with a rank on it; SECTION 7 is the path,
+-- weekly, across all four ticker/side combinations at once. Reach for §7
+-- when the question is whether something CHANGED rather than what it is,
+-- and when the answer has to survive being read weeks later — a single
+-- session has reversed three times in a day here, and a weekly median of
+-- five sessions does not.
 
 \set ON_ERROR_STOP on
 -- Never page. §1 is the widest table here (~180 columns of output) and on a
@@ -502,6 +509,133 @@ SELECT d.underlying                                 AS sym,
    AND d.trading_date > CURRENT_DATE - (:days || ' days')::interval
  GROUP BY d.underlying
  ORDER BY sym;
+
+\echo ''
+\echo '================================================================'
+\echo ' 7. THE PATH, WEEK BY WEEK  (all four ticker/side combinations)'
+\echo '================================================================'
+\echo 'Sections 1-6 answer "what is it now". This answers "what has it'
+\echo 'been doing", which is the only form in which a claim about a'
+\echo 'REGIME can be checked — and the only thing worth putting in front'
+\echo 'of someone weeks after they asked. One median per calendar week'
+\echo 'per combination, so a single wild session cannot carry a column.'
+\echo ''
+\echo 'Read the put/call columns for "is it the PUTS specifically". Above'
+\echo '1 means the downside is the expensive side that week; the Spread'
+\echo 'Monitor calls 1.25 the line worth remarking on.'
+\echo ''
+\echo 'sess is how many sessions that week holds. A short FIRST or LAST'
+\echo 'row is a partial week — the window edge or a week still running —'
+\echo 'not a change in the market. Unlike §1 and §3 this section does not'
+\echo 'drop the unfrozen session: a weekly median of five absorbs it, and'
+\echo 'dropping it would silently shorten the newest week instead.'
+\echo ''
+
+WITH scoped AS (
+    SELECT underlying,
+           option_type,
+           trading_date,
+           median_relative_spread_pct,
+           p90_relative_spread_pct,
+           median_spread_bps_underlying,
+           zero_bid_pct + crossed_or_locked_pct AS dead_pct
+      FROM daily_spread_stats
+     WHERE underlying = ANY (string_to_array(:'symbols', ','))
+       AND option_type IN ('P', 'C')
+       AND dte_max = :dte_max
+       AND moneyness_band_pct = :band
+       AND contract_count >= :min_contracts
+       AND median_relative_spread_pct IS NOT NULL
+       AND trading_date > CURRENT_DATE - (:days || ' days')::interval
+),
+weekly AS (
+    SELECT DATE_TRUNC('week', trading_date)::date AS week_of,
+           underlying,
+           option_type,
+           COUNT(*)                                            AS sessions,
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY median_relative_spread_pct)             AS width_pct,
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY p90_relative_spread_pct)                AS p90_pct,
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY median_spread_bps_underlying)           AS bps,
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY dead_pct)                               AS no_market
+      FROM scoped
+     GROUP BY 1, 2, 3
+)
+SELECT week_of,
+       MAX(sessions)                                            AS sess,
+       ROUND((MAX(width_pct) FILTER (WHERE underlying = 'SPX' AND option_type = 'P'))::numeric, 2)
+                                                                AS spx_put,
+       ROUND((MAX(width_pct) FILTER (WHERE underlying = 'SPX' AND option_type = 'C'))::numeric, 2)
+                                                                AS spx_call,
+       ROUND((MAX(width_pct) FILTER (WHERE underlying = 'SPX' AND option_type = 'P')
+              / NULLIF(MAX(width_pct) FILTER (WHERE underlying = 'SPX' AND option_type = 'C'), 0))::numeric, 2)
+                                                                AS spx_pc_x,
+       ROUND((MAX(width_pct) FILTER (WHERE underlying = 'NDX' AND option_type = 'P'))::numeric, 2)
+                                                                AS ndx_put,
+       ROUND((MAX(width_pct) FILTER (WHERE underlying = 'NDX' AND option_type = 'C'))::numeric, 2)
+                                                                AS ndx_call,
+       ROUND((MAX(width_pct) FILTER (WHERE underlying = 'NDX' AND option_type = 'P')
+              / NULLIF(MAX(width_pct) FILTER (WHERE underlying = 'NDX' AND option_type = 'C'), 0))::numeric, 2)
+                                                                AS ndx_pc_x
+  FROM weekly
+ GROUP BY week_of
+ ORDER BY week_of;
+
+\echo ''
+\echo 'The same weeks in BASIS POINTS OF THE INDEX — the only width that'
+\echo 'compares SPX against NDX — with the share of the chain carrying no'
+\echo 'market at all beside it. A chain can tighten on the columns above'
+\echo 'while more of it goes unsellable, and only no_market says so.'
+\echo ''
+
+WITH scoped AS (
+    SELECT underlying,
+           option_type,
+           trading_date,
+           median_spread_bps_underlying,
+           zero_bid_pct + crossed_or_locked_pct AS dead_pct
+      FROM daily_spread_stats
+     WHERE underlying = ANY (string_to_array(:'symbols', ','))
+       AND option_type IN ('P', 'C')
+       AND dte_max = :dte_max
+       AND moneyness_band_pct = :band
+       AND contract_count >= :min_contracts
+       AND median_spread_bps_underlying IS NOT NULL
+       AND trading_date > CURRENT_DATE - (:days || ' days')::interval
+),
+weekly AS (
+    SELECT DATE_TRUNC('week', trading_date)::date AS week_of,
+           underlying,
+           option_type,
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY median_spread_bps_underlying)           AS bps,
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY dead_pct)                               AS no_market
+      FROM scoped
+     GROUP BY 1, 2, 3
+)
+SELECT week_of,
+       ROUND((MAX(bps) FILTER (WHERE underlying = 'SPX' AND option_type = 'P'))::numeric, 2)
+                                                                AS spx_put_bps,
+       ROUND((MAX(bps) FILTER (WHERE underlying = 'NDX' AND option_type = 'P'))::numeric, 2)
+                                                                AS ndx_put_bps,
+       ROUND((MAX(bps) FILTER (WHERE underlying = 'NDX' AND option_type = 'P')
+              / NULLIF(MAX(bps) FILTER (WHERE underlying = 'SPX' AND option_type = 'P'), 0))::numeric, 1)
+                                                                AS ndx_over_spx_x,
+       ROUND((MAX(no_market) FILTER (WHERE underlying = 'SPX' AND option_type = 'P'))::numeric, 1)
+                                                                AS spx_put_no_mkt,
+       ROUND((MAX(no_market) FILTER (WHERE underlying = 'SPX' AND option_type = 'C'))::numeric, 1)
+                                                                AS spx_call_no_mkt,
+       ROUND((MAX(no_market) FILTER (WHERE underlying = 'NDX' AND option_type = 'P'))::numeric, 1)
+                                                                AS ndx_put_no_mkt,
+       ROUND((MAX(no_market) FILTER (WHERE underlying = 'NDX' AND option_type = 'C'))::numeric, 1)
+                                                                AS ndx_call_no_mkt
+  FROM weekly
+ GROUP BY week_of
+ ORDER BY week_of;
 
 \echo ''
 \echo 'Reminder for anything quoted publicly: these are QUOTED (NBBO)'
