@@ -590,6 +590,14 @@ SELECT week_of,
 \echo 'market at all beside it. A chain can tighten on the columns above'
 \echo 'while more of it goes unsellable, and only no_market says so.'
 \echo ''
+\echo 'zero_sess counts the sessions that week whose no-market share was'
+\echo 'EXACTLY zero. Read it against sess in the table above before'
+\echo 'trusting the no_mkt medians: a week of five sessions where three'
+\echo 'read exactly 0.0 and two read 8% is not a market that improved,'
+\echo 'it is two different measurements alternating, and the median will'
+\echo 'report whichever won. A chain of four hundred contracts does not'
+\echo 'land on exactly zero by chance.'
+\echo ''
 
 WITH scoped AS (
     SELECT underlying,
@@ -613,7 +621,11 @@ weekly AS (
            percentile_cont(0.5) WITHIN GROUP (
                ORDER BY median_spread_bps_underlying)           AS bps,
            percentile_cont(0.5) WITHIN GROUP (
-               ORDER BY dead_pct)                               AS no_market
+               ORDER BY dead_pct)                               AS no_market,
+           -- Exactly zero, not rounded to zero. The distinction is the
+           -- whole point: a real chain thins to 0.2% or 1.4%, never to a
+           -- clean 0.0 across four hundred contracts.
+           COUNT(*) FILTER (WHERE dead_pct = 0)                 AS zero_sessions
       FROM scoped
      GROUP BY 1, 2, 3
 )
@@ -632,7 +644,11 @@ SELECT week_of,
        ROUND((MAX(no_market) FILTER (WHERE underlying = 'NDX' AND option_type = 'P'))::numeric, 1)
                                                                 AS ndx_put_no_mkt,
        ROUND((MAX(no_market) FILTER (WHERE underlying = 'NDX' AND option_type = 'C'))::numeric, 1)
-                                                                AS ndx_call_no_mkt
+                                                                AS ndx_call_no_mkt,
+       MAX(zero_sessions) FILTER (WHERE underlying = 'SPX' AND option_type = 'P')
+                                                                AS spx_p_zero_sess,
+       MAX(zero_sessions) FILTER (WHERE underlying = 'NDX' AND option_type = 'P')
+                                                                AS ndx_p_zero_sess
   FROM weekly
  GROUP BY week_of
  ORDER BY week_of;
