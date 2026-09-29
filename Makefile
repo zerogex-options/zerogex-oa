@@ -1165,6 +1165,7 @@ help: ## Show this help message
 	@echo ""
 	@echo "$(GREEN)Liquidity / Spreads:$(NC)"
 	@echo "  make spread-report      - Have index put spreads widened lately? (SYMBOLS=SPX,NDX DAYS=60 SKIP_TODAY=yes)"
+	@echo "  make spread-snapshot-audit - Is the daily spread rollup a measurement or a coin flip? (SYMBOLS=SPX,NDX CUT=2026-09-10)"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
@@ -4215,6 +4216,10 @@ futures-feed-logs: ## Futures ingester journal around a reported delay (reconnec
 # `$(or ...)` would be read as four arguments and collapse to `SPX`.
 SPREAD_REPORT_SYMBOLS := SPX,NDX,SPY,QQQ
 
+# The snapshot audit prints 13 half-hour rows per (symbol, side); four
+# symbols would be 104 rows of §2. Keep it to the two index products.
+SPREAD_AUDIT_SYMBOLS := SPX,NDX
+
 .PHONY: spread-report
 spread-report: ## Have index put spreads actually widened lately? Read-only rollup report. SYMBOLS=SPX,NDX DAYS=60 RECENT=10 BAND=5 DTE=7 SIDE=P SKIP_TODAY=yes
 	@echo "$(BLUE)=== Spread regime report ===$(NC)"
@@ -4238,6 +4243,24 @@ spread-report: ## Have index put spreads actually widened lately? Read-only roll
 		-v option_type=$(or $(SIDE),P) \
 		-v skip_today=$(or $(SKIP_TODAY),no) \
 		-f setup/database/diagnostics/spread_regime_report.sql
+
+.PHONY: spread-snapshot-audit
+spread-snapshot-audit: ## Is the daily spread rollup representative of its session, or a single noisy draw? SYMBOLS=SPX,NDX DAYS=60 CUT=2026-09-10 DTE=7 BAND=5
+	@echo "$(BLUE)=== Spread snapshot audit ===$(NC)"
+	@echo "$(YELLOW)daily_spread_stats stores ONE analytics cycle per session --$(NC)"
+	@echo "$(YELLOW)the last one before the 16:00 ET close. Every percentile on$(NC)"
+	@echo "$(YELLOW)the Spread Monitor's header cards ranks that single draw.$(NC)"
+	@echo "$(YELLOW)This checks the draw against the whole session, using the$(NC)"
+	@echo "$(YELLOW)intraday surface table as ground truth. Read-only.$(NC)"
+	@echo ""
+	@$(PSQL) \
+		-v symbols=$(or $(SYMBOLS),$(SPREAD_AUDIT_SYMBOLS)) \
+		-v dte_max=$(or $(DTE),7) \
+		-v band=$(or $(BAND),5) \
+		-v days=$(or $(DAYS),60) \
+		-v cut=$(or $(CUT),2026-09-10) \
+		-v min_contracts=$(or $(MIN_CONTRACTS),100) \
+		-f setup/database/diagnostics/spread_snapshot_audit.sql
 
 .PHONY: tradeworkz-check
 tradeworkz-check: ## Run TradeWorkz accounting invariants (on-demand DB audit)
