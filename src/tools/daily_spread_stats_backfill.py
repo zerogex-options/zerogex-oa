@@ -50,7 +50,7 @@ from src.config import (
     SPREAD_STATS_MONEYNESS_BAND_PCT,
 )
 from src.database.connection import db_connection
-from src.market_calendar import is_am_settled_contract
+from src.market_calendar import is_settled_am_contract
 
 logger = logging.getLogger(__name__)
 
@@ -112,22 +112,30 @@ _UPSERT_SQL = """
 """
 
 
-def _keep_contract(symbol: str, option_symbol: Any, expiration: Any, day: Any) -> bool:
-    """Drop same-day AM-settled index contracts, as the live snapshot does.
+def _keep_contract(symbol: str, option_symbol: Any, expiration: Any, as_of: Any) -> bool:
+    """Drop AM-settled index contracts already settled at ``as_of``.
 
-    Their SOQ happened at ~09:30 ET, so by the late-session anchor they are
-    hours dead — quoted, if at all, at whatever wide marks the feed last
-    carried.  The analytics engine filters them out of the snapshot the live
-    writer measures, so the backfill has to as well, or the seeded history
-    would carry a monthly-expiry blowout the live series never records.
+    Their SOQ happens at ~09:30 ET, so by this backfill's late-session
+    anchor they are hours dead — quoted, if at all, at whatever wide marks
+    the feed last carried.  The analytics engine filters them out of the
+    snapshot the live writer measures, so the backfill has to as well, or
+    the seeded history would carry a monthly-expiry blowout the live series
+    never records.
+
+    ``as_of`` is the snapshot's timestamp, not the session date.  This used
+    to take the date alone, which is harmless for the daily anchor — always
+    15:30-16:00, always past the SOQ — and wrong for the surface backfill,
+    which shares this function and walks the whole session from 09:30.
+    Taking a timestamp means the same rule is right for both, and matches
+    the clock gate the live engine has always applied.
 
     Covers SPX and NDX; the PM-settled series sharing each underlying
-    (SPXW, NDXP) is kept.  ``is_am_settled_contract`` owns that rule, so
+    (SPXW, NDXP) is kept.  ``is_settled_am_contract`` owns that rule, so
     this and the live path cannot drift apart.
     """
-    if expiration != day:
+    if expiration is None:
         return True
-    return not is_am_settled_contract(symbol, option_symbol, expiration)
+    return not is_settled_am_contract(symbol, option_symbol, expiration, as_of)
 
 
 def _backfill_symbol(
@@ -261,7 +269,7 @@ def _backfill_symbol(
                 rows = [
                     r
                     for r in rows
-                    if _keep_contract(symbol, r["option_symbol"], r["expiration"], day)
+                    if _keep_contract(symbol, r["option_symbol"], r["expiration"], anchor_ts)
                 ]
 
                 if len(rows) < max(1, SPREAD_STATS_MIN_CONTRACTS):

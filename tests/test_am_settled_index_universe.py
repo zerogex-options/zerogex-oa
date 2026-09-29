@@ -21,13 +21,17 @@ AM series are untouched.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+
+import pytest
 
 from src.market_calendar import (
+    ET,
     canonical_index_symbol,
     expiration_close_time_et,
     is_am_settled_contract,
     is_am_settled_index_expiration,
+    is_settled_am_contract,
     pm_settled_root_for,
     settlement_close_time_for_contract,
 )
@@ -137,3 +141,86 @@ def test_per_contract_close_time_without_an_underlying_is_pm():
     assert settlement_close_time_for_contract(None, "SPX 260918C6800", SEP_THIRD_FRIDAY) == (
         "16:00:00"
     )
+
+
+# ---------------------------------------------------------------------------
+# The clock, which is the half of the rule three of the four callers lacked
+# ---------------------------------------------------------------------------
+#
+# ``is_am_settled_contract`` answers a property of the contract: does this
+# thing settle at the opening auction.  Every chain filter wants a different
+# question — is it dead RIGHT NOW — and the difference between them is a
+# tradable morning.  The analytics snapshot gated its drop on 09:30 ET; the
+# Spread Monitor's reduction and both spread backfills compared the
+# expiration against the session date and nothing else, so before the bell on
+# a third Friday they discarded the expiring monthlies while those were still
+# quoting.  Each of the three said in its docstring that it could not drift
+# from the live path.
+
+SPX_MONTHLY = "SPX  260918C05000000"
+SPXW_WEEKLY = "SPXW 260918C05000000"
+NDX_MONTHLY = "NDX  260918C24000000"
+
+
+def _et(hour: int, minute: int, day: date = SEP_THIRD_FRIDAY) -> datetime:
+    return ET.localize(datetime(day.year, day.month, day.day, hour, minute))
+
+
+def test_the_monthly_is_live_until_the_bell():
+    """The regression. At 08:00 on expiration Friday it is still trading."""
+    assert is_settled_am_contract("SPX", SPX_MONTHLY, SEP_THIRD_FRIDAY, _et(8, 0)) is False
+    assert is_settled_am_contract("SPX", SPX_MONTHLY, SEP_THIRD_FRIDAY, _et(9, 29)) is False
+    assert is_settled_am_contract("NDX", NDX_MONTHLY, SEP_THIRD_FRIDAY, _et(9, 29)) is False
+
+
+def test_the_soq_minute_itself_counts_as_settled():
+    """09:30 is the boundary, and it belongs to the settled side."""
+    assert is_settled_am_contract("SPX", SPX_MONTHLY, SEP_THIRD_FRIDAY, _et(9, 30)) is True
+    assert is_settled_am_contract("SPX", SPX_MONTHLY, SEP_THIRD_FRIDAY, _et(15, 59)) is True
+    assert is_settled_am_contract("NDX", NDX_MONTHLY, SEP_THIRD_FRIDAY, _et(15, 59)) is True
+
+
+def test_the_pm_sibling_is_never_settled_by_the_soq():
+    """Not at any hour: SPXW and NDXP settle at 16:00 like everything else."""
+    for hour in (8, 9, 10, 15):
+        assert (
+            is_settled_am_contract("SPX", SPXW_WEEKLY, SEP_THIRD_FRIDAY, _et(hour, 30))
+            is False
+        )
+
+
+def test_a_weekly_friday_has_no_soq_to_be_past():
+    assert (
+        is_settled_am_contract(
+            "SPX", "SPXW 260925C05000000", SEP_WEEKLY_FRIDAY, _et(15, 0, SEP_WEEKLY_FRIDAY)
+        )
+        is False
+    )
+
+
+def test_the_timestamp_is_converted_to_eastern_not_read_as_wall_clock():
+    """The backfills hand over a UTC timestamptz straight from Postgres.
+
+    Read as wall clock, 13:00 UTC is past 09:30 and the contract looks dead
+    four and a half hours early — on the one morning it is still trading.
+    """
+    naive_utc_0900_et = datetime(2026, 9, 18, 13, 0)
+    naive_utc_1000_et = datetime(2026, 9, 18, 14, 0)
+    assert is_settled_am_contract("SPX", SPX_MONTHLY, SEP_THIRD_FRIDAY, naive_utc_0900_et) is False
+    assert is_settled_am_contract("SPX", SPX_MONTHLY, SEP_THIRD_FRIDAY, naive_utc_1000_et) is True
+
+
+def test_other_days_do_not_depend_on_the_clock():
+    """Before its expiration a monthly is live; after it, the row is dead."""
+    october = date(2026, 10, 16)
+    assert (
+        is_settled_am_contract("SPX", "SPX  261016C05000000", october, _et(15, 0)) is False
+    )
+    june = date(2026, 6, 19)
+    assert is_settled_am_contract("SPX", "SPX  260619C05000000", june, _et(8, 0)) is True
+
+
+def test_a_bare_date_is_refused_rather_than_read_as_end_of_day():
+    """Accepting one would silently restore the bug this function fixes."""
+    with pytest.raises(TypeError, match="timestamp, not a"):
+        is_settled_am_contract("SPX", SPX_MONTHLY, SEP_THIRD_FRIDAY, SEP_THIRD_FRIDAY)

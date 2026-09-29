@@ -100,7 +100,7 @@ from src.config import (
     SPREAD_SURFACE_HISTORY_DAYS,
     SPREAD_SURFACE_MIN_SESSIONS,
 )
-from src.market_calendar import is_am_settled_contract, trading_dte_map
+from src.market_calendar import is_settled_am_contract, trading_dte_map
 from zoneinfo import ZoneInfo
 
 from ..database import DatabaseManager
@@ -336,26 +336,32 @@ def get_db() -> DatabaseManager:
 # ---------------------------------------------------------------------------
 
 
-def _keep_contract(symbol: str, row: Dict[str, Any], session_date: date) -> bool:
-    """Drop same-day AM-settled index contracts from the measured chain.
+def _keep_contract(symbol: str, row: Dict[str, Any], as_of: datetime) -> bool:
+    """Drop AM-settled index contracts whose SOQ has already happened.
 
-    Their SOQ happens at ~09:30 ET, so for the rest of the session they are
-    dead instruments whose rows linger with whatever marks the feed last
-    carried — reliably no-bid or absurdly wide.  Counting them would report
-    a chain-wide liquidity event every third Friday, on the one day of the
+    After ~09:30 ET on its expiration day an AM-settled monthly is a dead
+    instrument whose rows linger with whatever marks the feed last carried —
+    reliably no-bid or absurdly wide.  Counting those would report a
+    chain-wide liquidity event every third Friday, on the one day of the
     month a reader is most likely to be checking whether the market has
     gone untradeable.
 
+    Before the bell it is the opposite mistake.  This used to compare the
+    expiration against ``session_date`` alone, with no clock, so a read at
+    08:00 on a third Friday discarded the expiring monthlies while they were
+    still live — understating the chain on exactly the morning someone is
+    most likely to be looking at it, and measuring a different set of
+    instruments than the analytics snapshot, which did gate on 09:30.
+    ``is_settled_am_contract`` carries the clock now, so the two agree by
+    construction rather than by matching comments.
+
     Covers SPX and NDX; the PM-settled series that shares each underlying
-    (SPXW, NDXP) is kept.  ``is_am_settled_contract`` owns both halves of
-    that rule, and the analytics snapshot applies the same function, which
-    is what keeps the live reading and the rollup measuring the same
-    instruments.
+    (SPXW, NDXP) is kept.
     """
     expiration = row.get("expiration")
-    if expiration != session_date:
+    if expiration is None:
         return True
-    return not is_am_settled_contract(symbol, row.get("option_symbol"), expiration)
+    return not is_settled_am_contract(symbol, row.get("option_symbol"), expiration, as_of)
 
 
 def _ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
@@ -405,7 +411,10 @@ async def _reduce_chain(
         return None
 
     session_date = data["session_date"]
-    rows = [r for r in data["rows"] if _keep_contract(symbol, r, session_date)]
+    # The snapshot's own timestamp, not "now": a reduction of a 09:05 chain
+    # has to measure the instruments that were live at 09:05, whichever
+    # minute the request for it happens to arrive.
+    rows = [r for r in data["rows"] if _keep_contract(symbol, r, data["snapshot_ts"])]
     if not rows:
         return None
 

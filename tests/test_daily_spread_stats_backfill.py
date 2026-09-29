@@ -33,6 +33,7 @@ from unittest.mock import patch
 
 import pytest
 
+from src.market_calendar import ET
 from src.tools import daily_spread_stats_backfill as backfill
 
 
@@ -276,15 +277,39 @@ def test_no_trading_days_is_a_clean_no_op():
 # ---------------------------------------------------------------------------
 
 
+def _anchor_ts(hour: int, minute: int) -> dt.datetime:
+    """A snapshot timestamp in ET, as the backfill reads it from Postgres."""
+    return ET.localize(dt.datetime(2026, 9, 18, hour, minute))
+
+
 def test_same_day_spx_monthly_is_dropped_but_spxw_is_kept():
     """A third-Friday SPX contract settled at the 09:30 SOQ is hours dead by
     the late-session anchor; counting it would report a chain-wide liquidity
     event every monthly expiry."""
     third_friday = dt.date(2026, 9, 18)
-    assert not backfill._keep_contract("SPX", "SPX  260918C05000000", third_friday, third_friday)
-    assert backfill._keep_contract("SPX", "SPXW 260918C05000000", third_friday, third_friday)
-    assert backfill._keep_contract("SPY", "SPY   260918C00600000", third_friday, third_friday)
+    anchor = _anchor_ts(15, 55)
+    assert not backfill._keep_contract("SPX", "SPX  260918C05000000", third_friday, anchor)
+    assert backfill._keep_contract("SPX", "SPXW 260918C05000000", third_friday, anchor)
+    assert backfill._keep_contract("SPY", "SPY   260918C00600000", third_friday, anchor)
     # A future expiration is never filtered, whatever its series.
     assert backfill._keep_contract(
-        "SPX", "SPX  260919C05000000", dt.date(2026, 9, 19), third_friday
+        "SPX", "SPX  260919C05000000", dt.date(2026, 9, 19), anchor
+    )
+
+
+def test_the_monthly_survives_a_pre_open_anchor():
+    """This filter is shared with the surface backfill, which walks the whole
+    session rather than anchoring at 15:5x.
+
+    Taking the session date alone meant the same call dropped the expiring
+    monthlies out of a 09:30 bucket, where they were still quoting, and
+    seeded a history the live writer never recorded — the live engine has
+    always gated its own drop on the clock.
+    """
+    third_friday = dt.date(2026, 9, 18)
+    assert backfill._keep_contract(
+        "SPX", "SPX  260918C05000000", third_friday, _anchor_ts(9, 0)
+    )
+    assert not backfill._keep_contract(
+        "SPX", "SPX  260918C05000000", third_friday, _anchor_ts(9, 30)
     )

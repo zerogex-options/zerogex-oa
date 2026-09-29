@@ -185,7 +185,7 @@ def _backfill_symbol(
                     raw = [
                         r
                         for r in raw
-                        if _keep_contract(symbol, r["option_symbol"], r["expiration"], day)
+                        if _keep_contract(symbol, r["option_symbol"], r["expiration"], anchor_ts)
                     ]
                     if not raw:
                         skipped += 1

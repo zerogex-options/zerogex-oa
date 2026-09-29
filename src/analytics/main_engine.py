@@ -83,7 +83,7 @@ from src.market_calendar import (
     calculate_time_to_expiration,
     expiration_close_time_et,
     is_engine_run_window,
-    is_am_settled_contract,
+    is_settled_am_contract,
     is_underlying_active_session,
     seconds_until_engine_run_window,
     settlement_close_time_for_contract,
@@ -1163,28 +1163,31 @@ class AnalyticsEngine:
                     for row in rows
                 ]
 
-                # Drop AM-settled SPX expirations whose 09:30 ET SOQ has
+                # Drop AM-settled index expirations whose 09:30 ET SOQ has
                 # already happened.  Their option_chains rows can linger
                 # for hours after settlement, but Greeks against an
                 # unsettled-but-actually-expired strike are nonsense.
                 # The PM-settled series (SPXW, NDXP) shares its underlying
                 # with the AM-settled monthly and must NOT be filtered, so
                 # the rule branches on the option symbol when available.
-                # is_am_settled_contract holds both halves — this used to
-                # spell out the SPXW prefix here, which is how NDX went
-                # unfiltered through every third Friday.
-                today_et = ts_et.date()
+                # is_settled_am_contract holds all three parts — product,
+                # series and clock.  This used to spell out the SPXW prefix
+                # here, which is how NDX went unfiltered through every third
+                # Friday, and it used to carry its own 09:30 gate, which is
+                # the half the other three chain filters never had.
                 am_dropped = 0
-                if ts_et.time() >= dt_time(9, 30):
-                    filtered: List[Dict[str, Any]] = []
-                    for opt in options:
-                        if opt["expiration"] == today_et and is_am_settled_contract(
-                            self.db_symbol, opt["option_symbol"], opt["expiration"]
-                        ):
-                            am_dropped += 1
-                            continue
-                        filtered.append(opt)
-                    options = filtered
+                filtered: List[Dict[str, Any]] = []
+                for opt in options:
+                    if is_settled_am_contract(
+                        self.db_symbol,
+                        opt["option_symbol"],
+                        opt["expiration"],
+                        ts_et,
+                    ):
+                        am_dropped += 1
+                        continue
+                    filtered.append(opt)
+                options = filtered
 
                 logger.info(
                     "Fetched %d options with Greeks "

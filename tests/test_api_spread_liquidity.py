@@ -26,6 +26,13 @@ from src.config import SPREAD_STATS_DTE_MAX, SPREAD_STATS_MONEYNESS_BAND_PCT
 
 SESSION_DATE = date(2026, 9, 10)
 SNAPSHOT_TS = datetime(2026, 9, 10, 18, 0, tzinfo=timezone.utc)
+#: A third-Friday chain has to be stamped on the third Friday.  The fixture
+#: below used to carry SNAPSHOT_TS, eight days before the expirations it
+#: listed — invisible while the AM-settled rule compared dates and nothing
+#: else, and wrong the moment it started reading the clock.
+AM_SESSION_DATE = date(2026, 9, 18)
+AM_SNAPSHOT_TS = datetime(2026, 9, 18, 18, 0, tzinfo=timezone.utc)  # 14:00 ET
+AM_PRE_OPEN_TS = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)  # 08:00 ET
 SPOT = 6800.0
 
 
@@ -217,7 +224,7 @@ def test_empty_chain_is_404_not_a_zeroed_reading(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _am_settled_chain(symbol, dte_max, band):
+def _am_settled_chain(symbol, dte_max, band, snapshot_ts=AM_SNAPSHOT_TS):
     """A third-Friday chain: settled monthlies beside live PM weeklies.
 
     The monthly rows carry the marks a dead instrument accumulates after its
@@ -244,17 +251,22 @@ def _am_settled_chain(symbol, dte_max, band):
                 "ask": ask,
                 "open_interest": 100,
                 "volume": 10,
-                "snapshot_ts": SNAPSHOT_TS,
+                "snapshot_ts": snapshot_ts,
                 "session_date": third_friday,
             }
         )
     return {
         "spot_price": spot,
-        "spot_timestamp": SNAPSHOT_TS,
-        "snapshot_ts": SNAPSHOT_TS,
+        "spot_timestamp": snapshot_ts,
+        "snapshot_ts": snapshot_ts,
         "session_date": third_friday,
         "rows": rows,
     }
+
+
+def _am_settled_chain_pre_open(symbol, dte_max, band):
+    """The same chain, read before the bell instead of after it."""
+    return _am_settled_chain(symbol, dte_max, band, snapshot_ts=AM_PRE_OPEN_TS)
 
 
 def test_ndx_am_settled_monthlies_are_dropped_from_the_chain(monkeypatch):
@@ -283,6 +295,22 @@ def test_the_pm_settled_weeklies_are_not_dropped_with_them(monkeypatch):
     assert body["puts"]["contract_count"] == 2
     assert body["calls"]["contract_count"] == 1
     assert body["all"]["two_sided_pct"] == 100.0
+
+
+def test_the_monthlies_are_kept_when_the_chain_predates_the_soq(monkeypatch):
+    """Before 09:30 the monthly has not settled and is still quoting.
+
+    This filter used to compare the expiration against the session date with
+    no clock at all, so a pre-open read on expiration Friday discarded the
+    expiring monthlies while they were live — understating the chain on the
+    morning of the month someone is most likely to be looking at it, and
+    measuring a different set of instruments than the analytics snapshot,
+    which has always gated its own drop on 09:30 ET.
+    """
+    client = _client(monkeypatch, chain=_am_settled_chain_pre_open)
+    body = client.get("/api/market/spreads?symbol=NDX").json()
+
+    assert body["scope"]["contract_count"] == 5
 
 
 # ---------------------------------------------------------------------------

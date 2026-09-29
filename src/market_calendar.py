@@ -294,6 +294,59 @@ def is_am_settled_contract(
     return is_am_settled_index_expiration(underlying_symbol or "", expiration)
 
 
+#: Wall-clock ET at which an AM-settled index monthly stops being a tradable
+#: instrument.  The Special Opening Quotation is struck from the opening
+#: prints of the index components, so the contract is live right up to the
+#: bell and dead immediately after it.
+AM_SETTLEMENT_TIME_ET: time = time(9, 30)
+
+
+def is_settled_am_contract(
+    underlying_symbol: Optional[str],
+    option_symbol: Optional[str],
+    expiration: date,
+    as_of: Optional[datetime] = None,
+) -> bool:
+    """Has this contract's AM settlement ALREADY happened as of ``as_of``?
+
+    :func:`is_am_settled_contract` answers a property of the contract: does
+    this thing settle at the opening auction.  That is not the question any
+    of the chain filters actually want.  They want to know whether the
+    contract is dead *right now*, which is the same question plus a clock,
+    because an AM-settled monthly is a perfectly live instrument until
+    09:30 ET on its expiration day and a stale row for the rest of it.
+
+    The clock is the half of the rule that kept getting dropped.  The
+    analytics snapshot gated its same-day drop on ``ts_et >= 09:30``; the
+    Spread Monitor's reduction and both spread backfills did not, so a
+    pre-open read on a third Friday discarded the expiring monthlies while
+    they were still trading, and each of those three docstrings claimed it
+    could not drift from the live path.  Folding the clock in here is what
+    makes that claim true: there is no longer a version of the rule a caller
+    can apply without it.
+
+    ``as_of`` defaults to now, and is converted to ET before comparison, so
+    a caller may hand over a naive UTC timestamp, an aware one from the
+    database, or an ET datetime it already built.
+    """
+    if not is_am_settled_contract(underlying_symbol, option_symbol, expiration):
+        return False
+    if as_of is not None and not isinstance(as_of, datetime):
+        # A bare date would silently mean "end of day", which is the exact
+        # assumption that let three callers drop live contracts before the
+        # bell.  Make the clock mandatory rather than defaultable.
+        raise TypeError(
+            "is_settled_am_contract needs the snapshot's timestamp, not a "
+            f"date: got {type(as_of).__name__}"
+        )
+    as_of_et = _to_et(as_of)
+    if as_of_et.date() != expiration:
+        # A row still carrying a past expiration is dead whatever the clock
+        # says; one for a future expiration has not settled yet.
+        return as_of_et.date() > expiration
+    return as_of_et.time() >= AM_SETTLEMENT_TIME_ET
+
+
 def expiration_close_time_et(symbol: str, expiration_date: date) -> str:
     """Wall-clock time in ET at which the contract settles.
 
