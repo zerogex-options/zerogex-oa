@@ -30,8 +30,27 @@ BAR = datetime(2026, 8, 20, 14, 0, tzinfo=timezone.utc)
 #   call wall  -> 605 (largest call_gamma at-or-above spot 600)
 #   put wall   -> 595 (largest put_gamma at-or-below spot)
 #   flip       -> cumulative call-put ascending crosses between 600 and 605:
-#                 595: -800, 600: -700, 605: +50  =>  600 + 5*700/750 = 604.666…
+#                 -750 -> +750  =>  600 + 5*750/1500 = 602.5
+#
+# Five strikes, and the crossing sits mid-ladder on purpose.
+# ``compute_gamma_flip_from_strikes`` applies the canonical resolver's interior
+# gate, refusing any crossing in the outer ``GAMMA_PROFILE_INTERIOR_MARGIN``
+# (10%) of the strike range -- on a real book an edge crossing is the deep-OTM
+# noise tail, not a flip. A 3-strike ladder is too narrow to clear that gate at
+# all: 10% of its width swallows most of the span between the top two strikes,
+# so such a fixture can only ever assert ``None``. The old 3-strike ladder is
+# kept below as exactly that negative case.
 _LADDER = [
+    (590.0, 50.0, 100.0),
+    (595.0, 100.0, 900.0),
+    (600.0, 500.0, 400.0),
+    (605.0, 1550.0, 50.0),
+    (610.0, 200.0, 100.0),
+]
+
+#: The pre-widening ladder: its crossing lands at 604.67 on a [595, 605] range,
+#: inside the top 10%, so the interior gate declines it.
+_EDGE_CROSSING_LADDER = [
     (595.0, 100.0, 900.0),
     (600.0, 500.0, 400.0),
     (605.0, 800.0, 50.0),
@@ -163,7 +182,28 @@ def test_scoped_frame_rederives_walls_and_flip_from_the_scoped_ladder():
     frame = frames[0]
     assert frame["call_wall"] == pytest.approx(605.0)
     assert frame["put_wall"] == pytest.approx(595.0)
-    assert frame["gamma_flip"] == pytest.approx(604.6666667)
+    assert frame["gamma_flip"] == pytest.approx(602.5)
+
+
+def test_a_scoped_flip_at_the_ladder_edge_is_refused_not_drawn():
+    """An edge crossing is the deep-OTM tail, not a flip.
+
+    The re-derivation runs the canonical gates, so a crossing inside the outer
+    ``GAMMA_PROFILE_INTERIOR_MARGIN`` of the strike range comes back
+    unresolved. The frame then carries NO flip rather than falling back to the
+    stored whole-chain one -- drawing a whole-chain level over subset bars is
+    the contradiction this whole read exists to prevent, and a level the gates
+    refused is not a level.
+    """
+    frames, _q, _a = _run(
+        _rows(ladder=_EDGE_CROSSING_LADDER, max_pain_by_expiration=MAX_PAIN_BY_EXP),
+        expirations=[SESSION],
+    )
+    assert frames[0]["gamma_flip"] is None
+    # The rest of the frame is unaffected: one refused level does not blank the
+    # others, which is what a caller drawing four lines depends on.
+    assert frames[0]["call_wall"] == pytest.approx(605.0)
+    assert frames[0]["put_wall"] == pytest.approx(595.0)
 
 
 def test_scoped_frame_quotes_the_scopes_own_max_pain():
