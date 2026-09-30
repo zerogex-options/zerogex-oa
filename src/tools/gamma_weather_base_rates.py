@@ -56,6 +56,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import pytz
 
 from src.analytics import base_rates as br
+from src.analytics import disagreement as dg
 from src.analytics import gamma_weather as gw
 from src.analytics.flip_cushion import BASIS_MOVE, BASIS_NONE
 from src.database.connection import db_connection
@@ -237,6 +238,45 @@ class LoadedSession:
     #: they are resolved once at load and reused at every setting.
     cushion_states: List[str]
     cushion_bases: List[str]
+    #: Spot and the typical-move yardstick per bar, for the disagreement study.
+    #: Both come off the same PairedBar the classifier read, so the study can
+    #: never be measuring one bar's structure against another bar's price.
+    spots: List[Optional[float]]
+    typical_moves: List[Optional[float]]
+    #: Negative is narrowing. The second cut needs the direction, not just the
+    #: band, because a thin cushion that is widening is not the case in question.
+    cushion_rates: List[Optional[float]]
+
+    def disagreement_bars(self, confirm_bars: int) -> List[dg.DisagreementBar]:
+        """The same classified session, reduced to the study's inputs.
+
+        Off the SAME classify_series call the rest of the report uses, so the
+        disagreement arm cannot end up describing a different rule than the
+        durability tables printed two sections above it.
+        """
+        weather = gw.classify_series(
+            self.inputs,
+            bar_minutes=float(BAR_MINUTES),
+            confirm_bars=confirm_bars,
+        )
+        out: List[dg.DisagreementBar] = []
+        for w, spot, move, rate, state in zip(
+            weather, self.spots, self.typical_moves, self.cushion_rates, self.cushion_states
+        ):
+            pressure = dg.confirmed_pressure(w.pressure, w.persistence)
+            out.append(
+                dg.DisagreementBar(
+                    pressure=pressure,
+                    structure=dg.structure_stance(
+                        w.lean_side, w.structure, w.gamma_trend, pressure
+                    ),
+                    spot=spot,
+                    typical_move=move,
+                    cushion_state=state,
+                    cushion_rate=rate,
+                )
+            )
+        return out
 
     def classify(self, warmup_bars: int, confirm_bars: int) -> br.Session:
         weather = gw.classify_series(
@@ -322,6 +362,9 @@ def load_session(
         inputs=[bar.inputs for bar in paired],
         cushion_states=[bar.cushion.state for bar in paired],
         cushion_bases=[bar.cushion.basis for bar in paired],
+        spots=[bar.cushion.spot for bar in paired],
+        typical_moves=[bar.cushion.move_30m for bar in paired],
+        cushion_rates=[bar.cushion.rate_pts for bar in paired],
     )
 
 
@@ -402,16 +445,26 @@ def _lift_rows(
     survivals -- so the headers are arguments. A column labelled "held" over a
     count of transitions would invert the report's meaning.
     """
+    # Sized to the longest label rather than fixed at 16. A group name that
+    # overruns pushes every column on its row right, and a table that is
+    # aligned for four rows and ragged for the fifth is harder to read than one
+    # that is simply wider. Floors at the old width so the short tables above
+    # look exactly as they did.
+    labels = [_label(row.group) for row in table]
+    width = max([16, *(len(label) + 2 for label in labels)]) if labels else 16
+    # One wider than the longest header, so "extended" cannot run into "n".
+    outcome_w = max(9, len(outcome_header) + 1)
+
     lines = [
-        f"   {group_header:<16}{'n':>5}{outcome_header:>8}{'others':>8}"
+        f"   {group_header:<{width}}{'n':>5}{outcome_header:>{outcome_w}}{'others':>8}"
         f"{'lift':>8}{'p':>8}  verdict",
-        f"   {'-' * 14:<16}{'-' * 4:>5}{'-' * 6:>8}{'-' * 6:>8}"
+        f"   {'-' * (width - 2):<{width}}{'-' * 4:>5}{'-' * 6:>{outcome_w}}{'-' * 6:>8}"
         f"{'-' * 6:>8}{'-' * 6:>8}  {'-' * 12}",
     ]
-    for row in table:
+    for row, label in zip(table, labels):
         lines.append(
-            f"   {_label(row.group):<16}{row.group_p.n:>5}"
-            f"{_pct(row.group_p.rate):>8}{_pct(row.other_p.rate):>8}"
+            f"   {label:<{width}}{row.group_p.n:>5}"
+            f"{_pct(row.group_p.rate):>{outcome_w}}{_pct(row.other_p.rate):>8}"
             f"{_lift_str(row.lift):>8}{_p_str(row.p_value):>8}  {row.verdict}"
         )
     return lines
@@ -464,6 +517,56 @@ def _confirmation_whatif(
                 [br.held(s.states, a, horizon_bars) for s in sessions for a in br.onset_anchors(s)]
             ).as_dict(),
         },
+    }
+
+
+def disagreement_tables(
+    loaded: Sequence[LoadedSession],
+    confirm_bars: int,
+    extension: float = dg.DEFAULT_EXTENSION,
+) -> Dict[str, Any]:
+    """Does pressure win when structure says contain?
+
+    Onsets only and no p-values. Even onsets overlap when two disagreements
+    start twenty minutes apart in one session, so every verdict here is
+    DESCRIPTIVE by construction and the read is the size of the gap, never its
+    significance.
+
+    The sweep across thresholds is not decoration. A lift that only exists at
+    one definition of "extended" is an artifact of where the bar was set, and
+    the cheapest way to see that is to move the bar.
+    """
+    horizon_bars = _minutes_to_bars(dg.HORIZON_MINUTES)
+    sessions = [entry.disagreement_bars(confirm_bars) for entry in loaded]
+
+    main = br.lift_table(
+        dg.trials(sessions, horizon_bars, extension),
+        independent=False,
+        order=(dg.DISAGREE, dg.AGREE),
+    )
+    by_cushion = br.lift_table(
+        dg.trials_by_cushion(sessions, horizon_bars, extension),
+        independent=False,
+    )
+
+    sweep = []
+    for level in dg.EXTENSION_SWEEP:
+        outcomes = dg.trials(sessions, horizon_bars, level)
+        sweep.append(
+            {
+                "extension": level,
+                "disagree": br.tally(outcomes[dg.DISAGREE]),
+                "agree": br.tally(outcomes[dg.AGREE]),
+            }
+        )
+
+    return {
+        "extension": extension,
+        "horizon_minutes": dg.HORIZON_MINUTES,
+        "sessions": len(sessions),
+        "main": main,
+        "by_cushion": by_cushion,
+        "sweep": sweep,
     }
 
 
@@ -763,6 +866,48 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
             )
         lines.append("")
 
+    study = report.get("disagreement")
+    if study:
+        lines.append(
+            f"9. DOES PRESSURE WIN WHEN STRUCTURE SAYS CONTAIN? -- next "
+            f"{int(study['horizon_minutes'])} minutes"
+        )
+        lines.append("   Structure votes contain or extend RELATIVE TO PRESSURE: pinning and")
+        lines.append("   building contain, accelerative and thinning extend, and lean contains")
+        lines.append("   when it opposes pressure. Flat abstains, majority wins, needs two.")
+        lines.append("   DISAGREE is contain with confirmed pressure pushing anyway. AGREE is")
+        lines.append("   the control: without it a 40% win rate means nothing.")
+        lines.append(f"   A win is {study['extension']}x the session's typical 30-minute move on")
+        lines.append("   pressure's side, measured from the bar AFTER the signal, which is the")
+        lines.append("   first price anyone could have acted on. Onsets only, so a disagreement")
+        lines.append("   that holds an hour counts once. Even those overlap within a session, so")
+        lines.append("   no p-value is offered anywhere here: read the gap, not its significance.")
+        lines.extend(_lift_rows(study["main"], group_header="stance", outcome_header="extended"))
+        lines.append("")
+
+        lines.append("   Same anchors, moving the bar for what counts as extended:")
+        lines.append(f"   {'x typical move':<16}{'disagree':>18}{'agree':>18}")
+        lines.append(f"   {'-' * 14:<16}{'-' * 16:>18}{'-' * 16:>18}")
+        for row in study["sweep"]:
+            dis, agr = row["disagree"], row["agree"]
+            lines.append(
+                f"   {row['extension']:<16.1f}"
+                f"{f'{_pct(dis.rate)} of {dis.n}':>18}"
+                f"{f'{_pct(agr.rate)} of {agr.n}':>18}"
+            )
+        lines.append("")
+
+        lines.append("   Split by cushion, which is the question behind the question:")
+        lines.append("   a win that only happens while the cushion is already collapsing is not")
+        lines.append("   pressure beating structure, it is the boundary giving way. Bars that are")
+        lines.append("   neither secure nor thin-and-narrowing are left out rather than forced.")
+        lines.extend(
+            _lift_rows(
+                study["by_cushion"], group_header="stance / cushion", outcome_header="extended"
+            )
+        )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -794,6 +939,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help=(
             "Bars a new state must repeat before it takes the header. Defaults to the "
             "value the panel runs; pass 1 to see the classifier without confirmation."
+        ),
+    )
+    parser.add_argument(
+        "--extension",
+        type=float,
+        default=dg.DEFAULT_EXTENSION,
+        help=(
+            "Section 9: how far price must travel on pressure's side to count as "
+            "extended, in typical 30-minute moves (default: 1.0). The report sweeps "
+            f"{dg.EXTENSION_SWEEP} regardless, so a result that only exists at one "
+            "setting is visible as one."
         ),
     )
     parser.add_argument("--json", dest="json_path", default=None, help="Also write JSON here.")
@@ -836,6 +992,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         confirm_bars=args.confirm_bars,
         raw_sessions=raw_sessions,
     )
+    # Built from the loaded sessions rather than the classified ones: the study
+    # needs spot and the yardstick per bar, which a br.Session does not carry.
+    report["disagreement"] = disagreement_tables(loaded, args.confirm_bars, args.extension)
     print(format_report(symbol, report, skipped))
 
     if args.json_path:
