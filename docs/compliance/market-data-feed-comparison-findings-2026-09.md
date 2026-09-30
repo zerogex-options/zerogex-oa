@@ -378,8 +378,13 @@ Value stage, deliberately, for exactly this reason. It has not been weakened and
 
 Asked in writing 2026-09-28: does consuming raw NBBO purely as a classification input — never
 displayed, never redistributed — carry OPRA exchange fees or redistribution obligations we do not
-have today? **Unanswered as of 2026-09-30.** This is the open question the cutover waits on. The
-technical half of the same thread moved within hours; only the licensing half is slow.
+have today? **Unanswered as of 2026-09-30.** The technical half of the same thread moved within
+hours; only the licensing half is slow, most likely because it needs someone other than support.
+
+This is the precondition for the WORKAROUND, not the blocker itself. The blocker is the defect:
+fix the crossing and the workaround, this question and the tick test all become unnecessary. Kept
+straight here because it is easy to mistake the thing we can act on ourselves for the thing that
+actually resolves the problem.
 
 ### Paths
 
