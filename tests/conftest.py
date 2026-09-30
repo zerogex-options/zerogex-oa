@@ -55,6 +55,10 @@ _PINNED_DEFAULTS = {
     # cache-path tests opt in via engine.use_latest_cache on the instance.
     "ANALYTICS_USE_LATEST_CACHE": "false",
     "ANALYTICS_SPOT_ANCHORED_EXTENDED_HOURS": "false",
+    # src/analytics/main_engine.py: AnalyticsEngine.__init__. The settled-
+    # bucket tests place a live minute's late write at 90s and after-hours
+    # writes at hours, both against this 120s default.
+    "ANALYTICS_BUCKET_SETTLE_SECONDS": "120",
     # src/config.py default (also .env.example). The in-session close-stamp
     # re-anchor in _get_snapshot keys both its staleness threshold and its
     # forward-bar search window (2 x bucket) off this. Its regression test

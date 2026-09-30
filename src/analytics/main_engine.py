@@ -363,6 +363,19 @@ class AnalyticsEngine:
         # same bucket with fresher rows is recomputed and the same bucket
         # with the same rows is not.
         self._last_processed_data_updated_at: Optional[datetime] = None
+        # How long after its minute begins a bucket's chain rows may still be
+        # written as that minute's own quotes. Rows written later than this
+        # are after-hours writes, and a bucket whose summary row exists is
+        # then final (see _bucket_is_settled). In session a bucket's rows are
+        # written inside its own minute, so the default leaves a minute of
+        # slack over the ~67s p95 production showed for a row's final write.
+        self._bucket_settle_seconds: int = _getenv_int(
+            "ANALYTICS_BUCKET_SETTLE_SECONDS", 120, min=60
+        )
+        # The settled bucket whose stored row this process has already
+        # confirmed, so the database is asked once per bucket rather than on
+        # every after-hours write.
+        self._settled_bucket_ts: Optional[datetime] = None
         # Latch for the "snapshot has no Greek-bearing options" state.
         # A weekday night is inside the 24x5 run window, so the engine
         # keeps cycling after the close; once the underlying feed stops
@@ -5167,6 +5180,49 @@ class AnalyticsEngine:
         except Exception as e:
             logger.error(f"Error refreshing flow_series_5min snapshot: {e}", exc_info=True)
 
+    def _bucket_is_settled(
+        self, bucket_ts: Optional[datetime], data_updated_at: Optional[datetime]
+    ) -> bool:
+        """True when the chain rows behind ``bucket_ts`` were last written
+        more than ``ANALYTICS_BUCKET_SETTLE_SECONDS`` after its minute began.
+
+        Measured from the snapshot's own write clock rather than wall-clock
+        time, so a snapshot that carries no clock (fakes, older shapes, a
+        failed probe) is never treated as settled and behaves as before.
+        """
+        if bucket_ts is None or data_updated_at is None:
+            return False
+        try:
+            written_after = (data_updated_at - bucket_ts).total_seconds()
+        except TypeError:
+            # Naive against aware: not comparable, so not provably settled.
+            return False
+        # getattr: tests build bare engines without __init__.
+        return written_after > getattr(self, "_bucket_settle_seconds", 120)
+
+    def _gex_summary_row_exists(self, bucket_ts: datetime) -> bool:
+        """Whether ``gex_summary`` already holds this bucket's row.
+
+        A failed read answers False, so the bucket is recomputed exactly as
+        it was before the settled-bucket guard existed: a lookup that cannot
+        confirm the row must never be the thing that stops a publish.
+        """
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT 1 FROM gex_summary WHERE underlying = %s AND timestamp = %s",
+                    (self.db_symbol, bucket_ts),
+                )
+                return cursor.fetchone() is not None
+        except Exception:
+            logger.warning(
+                "Could not check for a stored gex_summary row at %s; recomputing it",
+                bucket_ts,
+                exc_info=True,
+            )
+            return False
+
     def run_calculation(self) -> bool:
         """
         Run one complete analytics calculation cycle
@@ -5296,6 +5352,40 @@ class AnalyticsEngine:
             # Greek-bearing data is back — clear the closed-market latch so
             # the next genuine empty period logs once again.
             self._empty_snapshot_state = False
+
+            # A closed minute is final. After the close the snapshot stays on
+            # the session's last bucket until the next session, while
+            # ingestion keeps writing -- overnight and the next morning --
+            # into rows that still carry that bucket's timestamps. Each write
+            # moves the write clock, so the guard above recomputed the closed
+            # minute from after-hours data and overwrote the row the session
+            # had published: production showed it on 14 of the 15 sessions
+            # from 2026-09-08, the rewrites landing anywhere from 16:21 that
+            # evening to 30 hours later. Replay, backtests and every reader of
+            # a day's closing levels then saw data from after the close.
+            #
+            # Both halves of the test matter. A live minute is never settled,
+            # because its rows are written inside that minute. And a settled
+            # bucket with no stored row is still computed, so quotes stamped
+            # late can cost a minute its refinements, never its first publish.
+            settled_ts = getattr(self, "_settled_bucket_ts", None)
+            if self._bucket_is_settled(latest_timestamp, data_updated_at) and (
+                latest_timestamp == settled_ts or self._gex_summary_row_exists(latest_timestamp)
+            ):
+                if latest_timestamp != settled_ts:
+                    logger.info(
+                        "Snapshot %s is settled (chain rows last written %s) and "
+                        "its gex_summary row exists; keeping the published row "
+                        "rather than recomputing it from later writes.",
+                        latest_timestamp,
+                        data_updated_at,
+                    )
+                    self._settled_bucket_ts = latest_timestamp
+                else:
+                    logger.debug("Snapshot %s still settled; not recomputing.", latest_timestamp)
+                self._last_processed_snapshot_ts = latest_timestamp
+                self._last_processed_data_updated_at = data_updated_at
+                return True
 
             # Calculate GEX by strike
             logger.debug("Calculating GEX by strike...")
