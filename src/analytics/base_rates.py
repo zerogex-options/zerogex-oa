@@ -694,27 +694,47 @@ def component_churn(sessions: Sequence[Session], name: str) -> Churn:
     )
 
 
-def change_attribution(sessions: Sequence[Session], names: Sequence[str]) -> Dict[str, int]:
-    """For every state change, which components moved on the same bar.
+def change_attribution(
+    sessions: Sequence[Session],
+    names: Sequence[str],
+    lookback: int = 0,
+) -> Dict[str, int]:
+    """For every state change, which components moved to produce it.
 
     Keyed by the set of components that changed, joined with ``+``. A state
     change with no component change is impossible if ``names`` covers the
     classifier's inputs, so a non-zero ``(none)`` count means the decomposition
     is incomplete and the report says so rather than quietly attributing the
     remainder to nothing.
+
+    ``lookback`` exists because of the confirmation window. The components on a
+    Session are the RAW per-bar reads while the state is the CONFIRMED
+    headline, so an input that flips at bar t only moves the header at t+k.
+    Compared on the same bar it finds nothing for almost every change: the live
+    report attributed 86.6% of them to "(none)" and told the reader an input was
+    missing, when what was missing was the offset. Callers pass the
+    confirmation window minus one; zero is right only where the header moves
+    the instant the inputs do.
     """
     out: Dict[str, int] = {}
+    span = max(0, lookback)
     for session in sessions:
         if not session.components:
             continue
         anchors = every_bar_anchors(session)
+        floor = anchors[0] if anchors else 0
         for previous, current in zip(anchors, anchors[1:]):
             if session.states[current] == session.states[previous]:
                 continue
+            # Back to the far side of the confirmation window, but never past
+            # the previous state change: an input that moved to cause THAT one
+            # would otherwise be credited with causing this one too.
+            baseline = max(previous - span, floor)
+            floor = current
             moved = [
                 name
                 for name in names
-                if session.components[current].get(name) != session.components[previous].get(name)
+                if session.components[current].get(name) != session.components[baseline].get(name)
             ]
             key = " + ".join(moved) if moved else "(none)"
             out[key] = out.get(key, 0) + 1

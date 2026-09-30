@@ -644,7 +644,9 @@ def build_report(
         br.component_churn(covered if name in CUSHION_COMPONENTS else sessions, name)
         for name in CHURN_COMPONENTS
     ]
-    attribution = br.change_attribution(sessions, STATE_INPUTS)
+    # Minus one: the header moves `confirm_bars` after the input that caused
+    # it, and the components carried here are the raw per-bar reads.
+    attribution = br.change_attribution(sessions, STATE_INPUTS, lookback=confirm_bars - 1)
     confirmation = _confirmation_whatif(sessions, raw_sessions, horizon_bars, confirm_bars)
 
     return {

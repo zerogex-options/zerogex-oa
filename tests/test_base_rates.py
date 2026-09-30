@@ -526,3 +526,47 @@ def test_a_series_that_never_settles_reports_no_lag():
     confirmed = ["A"] * len(raw)
 
     assert confirmation_lag(raw, confirmed) == []
+
+
+def test_attribution_looks_back_across_the_confirmation_window():
+    """The bug the live report surfaced: 86.6% of changes attributed to nothing.
+
+    Components on a Session are the RAW per-bar reads while the state is the
+    CONFIRMED headline, so an input that flips at bar 3 only moves the header at
+    bar 5. Compared on the same bar it finds nothing, and the report then blames
+    a missing input when what is missing is the offset.
+    """
+    from src.analytics import base_rates as br
+
+    states = ["A", "A", "A", "A", "B", "B"]
+    pressures = ["up", "up", "up", "down", "down", "down"]
+    session = br.Session(
+        label="d",
+        bar_starts=list(range(len(states))),
+        states=states,
+        warnings=[False] * len(states),
+        ages=[],
+        warmup=0,
+        components=[{"pressure": p} for p in pressures],
+    )
+
+    assert br.change_attribution([session], ("pressure",)) == {"(none)": 1}
+    assert br.change_attribution([session], ("pressure",), lookback=1) == {"pressure": 1}
+
+
+def test_attribution_never_reaches_past_the_previous_change():
+    """Or a change is credited to an input that moved for the state before it."""
+    from src.analytics import base_rates as br
+
+    session = br.Session(
+        label="d",
+        bar_starts=list(range(3)),
+        states=["A", "B", "C"],
+        warnings=[False] * 3,
+        ages=[],
+        warmup=0,
+        components=[{"pressure": "up"}, {"pressure": "down"}, {"pressure": "down"}],
+    )
+    out = br.change_attribution([session], ("pressure",), lookback=10)
+    assert out.get("pressure") == 1
+    assert out.get("(none)") == 1
