@@ -312,7 +312,7 @@ Consistent with the penny adjustment being applied **independently to each side*
 spread. A bid moved up one cent and an ask moved down one cent on a one-cent spread lands crossed
 by exactly one cent, which is what all 1,493 observations show and why none of them are wider.
 
-ThetaData reproduced it on 2026-09-29 (Anthony, support), saw ~18% on their own sample, pulled the
+ThetaData reproduced it on 2026-09-28 (Anthony, support), saw ~18% on their own sample, pulled the
 raw NBBO for the same contracts at the same timestamps and found **none of those crossed** —
 placing the defect in the Market Value calculation rather than in the underlying OPRA quote. Raised
 with their team; no fix date given.
@@ -378,7 +378,8 @@ Value stage, deliberately, for exactly this reason. It has not been weakened and
 
 Asked in writing 2026-09-28: does consuming raw NBBO purely as a classification input — never
 displayed, never redistributed — carry OPRA exchange fees or redistribution obligations we do not
-have today? **Unanswered as of 2026-09-29.** This is the open question the cutover waits on.
+have today? **Unanswered as of 2026-09-30.** This is the open question the cutover waits on. The
+technical half of the same thread moved within hours; only the licensing half is slow.
 
 ### Paths
 
