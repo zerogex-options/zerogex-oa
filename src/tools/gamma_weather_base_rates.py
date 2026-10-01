@@ -437,6 +437,7 @@ def _lift_rows(
     table: Sequence[br.Comparison],
     group_header: str = "state",
     outcome_header: str = "held",
+    show_dropped: bool = False,
 ) -> List[str]:
     """One lift table, with the outcome column named for what it counts.
 
@@ -444,6 +445,14 @@ def _lift_rows(
     groups by age rather than by state, and one counts changes rather than
     survivals -- so the headers are arguments. A column labelled "held" over a
     count of transitions would invert the report's meaning.
+
+    ``show_dropped`` adds the censored count, and only the age table asks for
+    it. Near the close a break still resolves as a failure while survival
+    cannot be confirmed, so a band drawn from late bars collects failures and
+    drops successes. Age bands are exactly where that bites: a state cannot be
+    an hour old before an hour has passed, so the oldest band sits latest in
+    the session. Without the column the reader cannot tell a short-lived state
+    from a band that ran out of session, and the two have opposite meanings.
     """
     # Sized to the longest label rather than fixed at 16. A group name that
     # overruns pushes every column on its row right, and a table that is
@@ -455,15 +464,19 @@ def _lift_rows(
     # One wider than the longest header, so "extended" cannot run into "n".
     outcome_w = max(9, len(outcome_header) + 1)
 
+    dropped_head = f"{'dropped':>9}" if show_dropped else ""
+    dropped_rule = f"{'-' * 7:>9}" if show_dropped else ""
+
     lines = [
-        f"   {group_header:<{width}}{'n':>5}{outcome_header:>{outcome_w}}{'others':>8}"
-        f"{'lift':>8}{'p':>8}  verdict",
-        f"   {'-' * (width - 2):<{width}}{'-' * 4:>5}{'-' * 6:>{outcome_w}}{'-' * 6:>8}"
-        f"{'-' * 6:>8}{'-' * 6:>8}  {'-' * 12}",
+        f"   {group_header:<{width}}{'n':>5}{dropped_head}{outcome_header:>{outcome_w}}"
+        f"{'others':>8}{'lift':>8}{'p':>8}  verdict",
+        f"   {'-' * (width - 2):<{width}}{'-' * 4:>5}{dropped_rule}{'-' * 6:>{outcome_w}}"
+        f"{'-' * 6:>8}{'-' * 6:>8}{'-' * 6:>8}  {'-' * 12}",
     ]
     for row, label in zip(table, labels):
+        dropped = f"{row.group_p.unresolved:>9}" if show_dropped else ""
         lines.append(
-            f"   {label:<{width}}{row.group_p.n:>5}"
+            f"   {label:<{width}}{row.group_p.n:>5}{dropped}"
             f"{_pct(row.group_p.rate):>{outcome_w}}{_pct(row.other_p.rate):>8}"
             f"{_lift_str(row.lift):>8}{_p_str(row.p_value):>8}  {row.verdict}"
         )
@@ -788,7 +801,17 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
     lines.append("   If these bands are flat, the state-age clock is describing elapsed time")
     lines.append("   and nothing else. Every bar anchors here, so the samples overlap and")
     lines.append("   no p-value is offered: read the direction across bands, not each row.")
-    lines.extend(_lift_rows(tables["age"], group_header="state age", outcome_header="held"))
+    lines.extend(
+        _lift_rows(
+            tables["age"],
+            group_header="state age",
+            outcome_header="held",
+            show_dropped=True,
+        )
+    )
+    lines.append("   dropped = ran out of session before the horizon closed. A band whose")
+    lines.append("   dropped share runs high sits late in the day, where a break still")
+    lines.append("   counts and survival cannot, so read its rate as a floor.")
     lines.append("")
 
     lines.append(f"6. DID TRANSITION WARNINGS PRECEDE CHANGES? -- change within {horizon} minutes")

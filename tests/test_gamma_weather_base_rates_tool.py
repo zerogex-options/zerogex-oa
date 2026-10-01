@@ -615,3 +615,26 @@ def test_more_unattributed_changes_than_sessions_still_reads_as_a_bug():
     assert "missing a classifier input" in text
     assert "not just the" in text
     assert "At most one per session" not in text
+
+
+def test_the_age_table_shows_what_it_dropped_and_the_others_do_not():
+    """Age bands are where running out of session biases the rate downward.
+
+    A break resolves as a failure even inside a truncated window while
+    survival needs the whole horizon, so a band drawn from late bars collects
+    failures and drops successes. The oldest band is necessarily the latest one
+    -- a state cannot be an hour old before an hour has passed -- so without
+    the censored count the reader cannot tell a fragile state from a band that
+    ran out of day. The other tables are left exactly as they were.
+    """
+    session = _session(["A"] * 20 + ["B"] * 4 + ["A"] * 3 + ["C"] * 5 + ["A"] * 8)
+    text = tool.format_report("SPY", tool.build_report([session], horizon_bars=6), skipped=[])
+
+    age_header = next(line for line in text.splitlines() if "state age" in line)
+    assert "dropped" in age_header
+    assert "read its rate as a floor" in text
+
+    onset_header = next(
+        line for line in text.splitlines() if line.strip().startswith("state") and "held" in line
+    )
+    assert "dropped" not in onset_header
