@@ -23,6 +23,8 @@ pinning the process-wide default here does not constrain them.
 import os
 import tempfile
 
+import pytest
+
 # Isolate the bulletin-tweet artifact + "latest" review-record store to a
 # throwaway dir so `make test` on a configured server (where .env sets
 # BULLETIN_TWEET_ARTIFACT_DIR=/var/lib/zerogex-oa/bulletin-tweets and the
@@ -56,8 +58,8 @@ _PINNED_DEFAULTS = {
     "ANALYTICS_USE_LATEST_CACHE": "false",
     "ANALYTICS_SPOT_ANCHORED_EXTENDED_HOURS": "false",
     # src/analytics/main_engine.py: AnalyticsEngine.__init__. The settled-
-    # bucket tests place a live minute's late write at 90s and after-hours
-    # writes at hours, both against this 120s default.
+    # bucket tests set the clock 95s past a live minute and hours past a
+    # closed one, both against this 120s default.
     "ANALYTICS_BUCKET_SETTLE_SECONDS": "120",
     # src/config.py default (also .env.example). The in-session close-stamp
     # re-anchor in _get_snapshot keys both its staleness threshold and its
@@ -104,3 +106,18 @@ _BLANKED_CREDENTIALS = (
 )
 for _cred in _BLANKED_CREDENTIALS:
     os.environ[_cred] = ""
+
+
+# The analytics engine asks gex_summary whether a settled bucket's row already
+# exists before it skips recomputing it, and a bucket is settled by the WALL
+# CLOCK. Every engine test that feeds a snapshot from a fixed past date is
+# therefore settled, and without this stub each one would open a real database
+# connection -- on a configured server, where the Makefile exports .env, that
+# is the production database. Answer "no stored row" instead: the engine then
+# recomputes exactly as it did before the guard existed. The settled-bucket
+# tests replace the lookup on their own engine instances.
+@pytest.fixture(autouse=True)
+def _no_gex_summary_lookup(monkeypatch):
+    from src.analytics.main_engine import AnalyticsEngine
+
+    monkeypatch.setattr(AnalyticsEngine, "_gex_summary_row_exists", lambda self, bucket_ts: False)
