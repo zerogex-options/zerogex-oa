@@ -829,9 +829,20 @@ def format_report(symbol: str, report: Dict[str, Any], skipped: Sequence[str]) -
         lines.append(f"   Of {total_changes} state changes, the input that moved with them:")
         for key, count in sorted(attribution.items(), key=lambda kv: -kv[1]):
             lines.append(f"     {key:<28}{count:>6}  {count / total_changes * 100:5.1f}%")
-        if attribution.get("(none)"):
-            lines.append("     (none) should be zero -- a state changed with no input change, so")
-            lines.append("     the decomposition above is missing one of the classifier's inputs.")
+        unresolved = attribution.get("(none)", 0)
+        if unresolved:
+            # One per session is the ceiling and it is the warmup edge, not a
+            # gap in the decomposition. See change_attribution's docstring.
+            if unresolved <= cover["sessions"]:
+                lines.append("     (none) is the warmup edge: the first change of a session has no")
+                lines.append(
+                    "     bar before the window to compare against. At most one per session."
+                )
+            else:
+                lines.append(
+                    f"     (none) exceeds the {cover['sessions']} session(s), so it is not just the"
+                )
+                lines.append("     warmup edge -- the decomposition is missing a classifier input.")
         lines.append("")
 
     confirmation = tables["confirmation"]

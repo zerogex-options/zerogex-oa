@@ -570,3 +570,59 @@ def test_attribution_never_reaches_past_the_previous_change():
     out = br.change_attribution([session], ("pressure",), lookback=10)
     assert out.get("pressure") == 1
     assert out.get("(none)") == 1
+
+
+def test_the_only_unattributed_change_is_the_warmup_edge():
+    """Why section 7's ``(none)`` is bounded by the session count, not a bug.
+
+    The header is a pure function of pressure and structure, so a change
+    between two bars requires one of them to differ. The one place the
+    comparison cannot see that is a change too close to the warmup edge for
+    the baseline to clear it, which caps ``(none)`` at one per session.
+
+    Brute-forced against the real confirmation machine over random series,
+    because the property is what the report's wording promises and the
+    arithmetic behind it moves with ``confirm_bars``: the baseline sits at
+    ``current - confirm_bars``, so the clamp reaches as far as
+    ``confirm_bars - 1`` bars past warmup, not just the first bar.
+    """
+    import random
+
+    from src.analytics import base_rates as br
+    from src.analytics import gamma_weather as gw
+
+    raw_states = ["A", "B", "C", "D", "E"]
+
+    for confirm in (2, 3, 4):
+        for warmup in (0, 6):
+            for seed in range(120):
+                rnd = random.Random((confirm, warmup, seed).__hash__())
+                raw = [rnd.choice(raw_states) for _ in range(90)]
+                confirmation = gw._Confirmation(confirm)
+                states = [confirmation.push(value)[0] for value in raw]
+                session = br.Session(
+                    label="d",
+                    bar_starts=list(range(90)),
+                    states=states,
+                    warnings=[False] * 90,
+                    ages=[],
+                    warmup=warmup,
+                    components=[{"s": value} for value in raw],
+                )
+
+                out = br.change_attribution([session], ("s",), lookback=confirm - 1)
+                anchors = list(range(warmup, 90))
+                changes = [c for p, c in zip(anchors, anchors[1:]) if states[c] != states[p]]
+
+                # Never more than one per session, whatever the window.
+                assert out.get("(none)", 0) <= 1, (confirm, warmup, seed)
+
+                # And when there is one, the first change was inside the clamp.
+                if out.get("(none)"):
+                    assert changes and changes[0] - confirm < warmup, (confirm, warmup, seed)
+
+                # The ceiling rests on this: two header changes are never closer
+                # together than the confirmation window, so past the first one
+                # the clamp can no longer reach.
+                for earlier, later in zip(changes, changes[1:]):
+                    assert later - earlier >= confirm, (confirm, warmup, seed)

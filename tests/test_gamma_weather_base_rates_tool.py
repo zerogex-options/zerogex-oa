@@ -562,3 +562,56 @@ def test_warnings_are_measured_only_where_the_yardstick_is_comparable():
     total = sum(row["observed"]["n"] for row in report["transition_warnings"])
 
     assert total <= 40
+
+
+def _attribution_session(states, components, warmup=0):
+    from src.analytics import base_rates as br
+
+    return br.Session(
+        label="2026-09-17",
+        bar_starts=_bars(len(states)),
+        states=states,
+        warnings=[False] * len(states),
+        ages=[],
+        warmup=warmup,
+        components=components,
+    )
+
+
+def test_an_unattributed_change_at_the_warmup_edge_is_not_called_a_bug():
+    """It read as one for a while, and the reader believed it.
+
+    The header is a pure function of pressure and structure, so the only
+    change the comparison cannot explain is the first one inside the anchor
+    range, whose baseline is clamped at ``warmup``. The report has to say that
+    rather than send the reader looking for a missing input.
+    """
+    warmup = 6
+    raw = ["A"] * warmup + ["B"] * 6
+    states = ["A"] * (warmup + 1) + ["B"] * 5  # the header moves at warmup + 1
+    components = [{"pressure": "up" if value == "A" else "dn"} for value in raw]
+    session = _attribution_session(states, components, warmup=warmup)
+
+    text = tool.format_report(
+        "SPY", tool.build_report([session], horizon_bars=1, confirm_bars=2), skipped=[]
+    )
+
+    assert "(none)" in text
+    assert "warmup edge" in text
+    assert "missing a classifier input" not in text
+
+
+def test_more_unattributed_changes_than_sessions_still_reads_as_a_bug():
+    """The warmup edge is one per session. Past that the decomposition is
+    genuinely short an input, and the old warning is the right one."""
+    states = list("AABBCC")
+    components = [{"pressure": "up"}] * 6  # nothing ever moves
+    session = _attribution_session(states, components)
+
+    text = tool.format_report(
+        "SPY", tool.build_report([session], horizon_bars=1, confirm_bars=2), skipped=[]
+    )
+
+    assert "missing a classifier input" in text
+    assert "not just the" in text
+    assert "At most one per session" not in text

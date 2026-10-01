@@ -701,11 +701,17 @@ def change_attribution(
 ) -> Dict[str, int]:
     """For every state change, which components moved to produce it.
 
-    Keyed by the set of components that changed, joined with ``+``. A state
-    change with no component change is impossible if ``names`` covers the
-    classifier's inputs, so a non-zero ``(none)`` count means the decomposition
-    is incomplete and the report says so rather than quietly attributing the
-    remainder to nothing.
+    Keyed by the set of components that changed, joined with ``+``.
+
+    ``(none)`` has exactly one legitimate cause, and it is worth stating
+    because the alternative reading is "the report has a bug". Where the state
+    is a pure function of ``names`` -- as the Gamma Weather header is of
+    pressure and structure -- a change between two bars REQUIRES one of them to
+    differ, by arithmetic rather than by inference. So ``(none)`` can only
+    appear where the baseline cannot reach far enough back: the first change
+    inside the anchor range, whose window is clamped at ``warmup``. That is at
+    most one per session. A count above the session count is the real
+    incomplete-decomposition signal, and the report distinguishes the two.
 
     ``lookback`` exists because of the confirmation window. The components on a
     Session are the RAW per-bar reads while the state is the CONFIRMED
