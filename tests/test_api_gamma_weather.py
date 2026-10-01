@@ -210,7 +210,7 @@ def test_http_emits_both_ladders_as_code_and_label(monkeypatch: pytest.MonkeyPat
     raw value and puts PERSISTENT in front of a user."""
     app, mainmod = _build_app(monkeypatch)
     # 15 bars, not 12: the first two read MIXED until the three-bar average
-    # fills, so the run that reaches MATURE starts at bar 2.
+    # fills, so the run that reaches the oldest rung starts at bar 2.
     flow, regime = _series(15, 5.0e8)
 
     with TestClient(app) as client:
@@ -219,8 +219,8 @@ def test_http_emits_both_ladders_as_code_and_label(monkeypatch: pytest.MonkeyPat
 
     assert payload["persistence"] == "PERSISTENT"
     assert payload["persistence_label"] == "Persistent"
-    assert payload["age"] == "MATURE"
-    assert payload["age_label"] == "Mature"
+    assert payload["age"] == "LONG_RUNNING"
+    assert payload["age_label"] == "Long-running"
 
 
 def test_http_keeps_the_two_ladders_distinguishable(monkeypatch: pytest.MonkeyPatch):

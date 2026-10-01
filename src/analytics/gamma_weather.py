@@ -93,12 +93,15 @@ REVERSAL_CONFIRM_BARS = 2
 #: rare instead of firing on every later opposite print.
 REVERSAL_STALE_QUIET_BARS = 3
 
-#: State-age thresholds, in minutes. Duration is the thing being studied here:
-#: not whether gamma calls direction, but whether a condition that exists is
-#: healthy enough to persist.
-AGE_ESTABLISHED_MIN = 15
-AGE_CONFIRMED_MIN = 30
-AGE_MATURE_MIN = 60
+#: State-age thresholds, in minutes. Barrie's bands, and the measurement left
+#: them alone -- it was the words on top of them that had to go. Over 42
+#: sessions survival of the next 30 minutes runs 29.9% / 23.8% / 20.3% / 11.1%
+#: across these four rungs, so age buys nothing and the oldest band is the
+#: least likely to last. The ladder is elapsed time. It is not confirmation,
+#: and nothing here should imply it is.
+AGE_RUNNING_MIN = 15
+AGE_AGING_MIN = 30
+AGE_LONG_RUNNING_MIN = 60
 
 #: Bars a NEW state must repeat before it takes the header.
 #:
@@ -142,10 +145,10 @@ PERSISTENCE_PERSISTENT = "PERSISTENT"
 #: the flip confirms and the new side carries on from there.
 PERSISTENCE_REVERSED = "REVERSED"
 
-AGE_NEW = "NEW"
-AGE_ESTABLISHED = "ESTABLISHED"
-AGE_CONFIRMED = "CONFIRMED"
-AGE_MATURE = "MATURE"
+AGE_FRESH = "FRESH"
+AGE_RUNNING = "RUNNING"
+AGE_AGING = "AGING"
+AGE_LONG_RUNNING = "LONG_RUNNING"
 
 PRESSURE_BUYING = "BUYING"
 PRESSURE_SELLING = "SELLING"
@@ -188,10 +191,10 @@ PERSISTENCE_LABELS = {
 }
 
 AGE_LABELS = {
-    AGE_NEW: "New",
-    AGE_ESTABLISHED: "Established",
-    AGE_CONFIRMED: "Confirmed",
-    AGE_MATURE: "Mature",
+    AGE_FRESH: "Fresh",
+    AGE_RUNNING: "Running",
+    AGE_AGING: "Aging",
+    AGE_LONG_RUNNING: "Long-running",
 }
 
 
@@ -476,20 +479,34 @@ class _PressurePhase:
 def classify_age(minutes: Optional[float]) -> Optional[str]:
     """How long the current state has held, as a word.
 
-    Bands are Barrie's. New covers everything below the established line,
-    which absorbs the gap between his "under 10 minutes is provisional" and
-    "15 minutes is established" -- a state at 12 minutes is not yet
-    established, and calling it anything else would overstate it.
+    Bands are Barrie's and the thresholds are unchanged. The words are not his
+    original ones, because the base-rate report measured the ladder they named
+    and found it running backwards: survival of the next 30 minutes falls
+    29.9% -> 23.8% -> 20.3% -> 11.1% across the four rungs, monotonically, on
+    3065 resolved anchors with nothing censored out of the oldest band.
+    "Established", "Confirmed" and "Mature" each promised more durability than
+    the band below it and each delivered less.
+
+    Section 7 of that report says why, and the cause is upstream of this
+    function: the header is 60-88% a pressure readout, pressure's mean run is
+    eight minutes, and confirmation is what stretches that to a 20-30 minute
+    median. An hour is deep in the tail, so the oldest band is the overdue one.
+
+    So these are elapsed-time words that claim nothing about durability, which
+    is also what the rest of this module already does -- see ``_sentence``:
+    conditions, never outcomes. Fixing the timescale rather than the wording
+    would mean slowing the pressure read, which reclassifies every stored
+    session on read and is a different decision entirely.
     """
     if minutes is None:
         return None
-    if minutes >= AGE_MATURE_MIN:
-        return AGE_MATURE
-    if minutes >= AGE_CONFIRMED_MIN:
-        return AGE_CONFIRMED
-    if minutes >= AGE_ESTABLISHED_MIN:
-        return AGE_ESTABLISHED
-    return AGE_NEW
+    if minutes >= AGE_LONG_RUNNING_MIN:
+        return AGE_LONG_RUNNING
+    if minutes >= AGE_AGING_MIN:
+        return AGE_AGING
+    if minutes >= AGE_RUNNING_MIN:
+        return AGE_RUNNING
+    return AGE_FRESH
 
 
 def state_age_bars(states: Sequence[str]) -> int:

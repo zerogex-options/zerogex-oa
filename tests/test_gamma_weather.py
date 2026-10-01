@@ -11,12 +11,12 @@ from __future__ import annotations
 import itertools
 
 from src.analytics.gamma_weather import (
-    AGE_CONFIRMED,
+    AGE_AGING,
     CONFIRM_BARS,
-    AGE_ESTABLISHED,
+    AGE_RUNNING,
     AGE_LABELS,
-    AGE_MATURE,
-    AGE_NEW,
+    AGE_LONG_RUNNING,
+    AGE_FRESH,
     PERSISTENCE_BUILDING,
     PERSISTENCE_LABELS,
     PERSISTENCE_PERSISTENT,
@@ -334,17 +334,17 @@ def test_only_the_trailing_window_counts():
 # State age
 # --------------------------------------------------------------------------- #
 def test_age_bands():
-    assert classify_age(5) == AGE_NEW
-    assert classify_age(18) == AGE_ESTABLISHED
-    assert classify_age(41) == AGE_CONFIRMED
-    assert classify_age(75) == AGE_MATURE
+    assert classify_age(5) == AGE_FRESH
+    assert classify_age(18) == AGE_RUNNING
+    assert classify_age(41) == AGE_AGING
+    assert classify_age(75) == AGE_LONG_RUNNING
 
 
 def test_the_gap_between_provisional_and_established_is_not_overstated():
     """Twelve minutes is past 'under ten' but short of the established line.
     It reads as developing, because calling it established would claim more
     than the clock supports."""
-    assert classify_age(12) == AGE_NEW
+    assert classify_age(12) == AGE_FRESH
 
 
 def test_age_counts_backward_from_the_newest_state():
@@ -500,21 +500,44 @@ def test_every_rung_has_display_wording():
     in front of a user."""
     for code in (PERSISTENCE_PULSE, PERSISTENCE_BUILDING, PERSISTENCE_PERSISTENT):
         assert PERSISTENCE_LABELS[code]
-    for code in (AGE_NEW, AGE_ESTABLISHED, AGE_CONFIRMED, AGE_MATURE):
+    for code in (AGE_FRESH, AGE_RUNNING, AGE_AGING, AGE_LONG_RUNNING):
         assert AGE_LABELS[code]
 
 
 def test_the_ladders_are_barries_wording():
-    """Pinned because these are his words, agreed in writing, and a later
+    """Pinned because these are shared words, agreed in writing, and a later
     tidy-up that renamed them would be a change to a shared vocabulary rather
-    than to an internal detail."""
+    than to an internal detail.
+
+    The persistence rungs are Barrie's and unchanged. The age rungs are no
+    longer his original New / Established / Confirmed / Mature: the base-rate
+    report measured that ladder and found survival falling monotonically along
+    it, 29.9% -> 23.8% -> 20.3% -> 11.1%, so each word promised more
+    durability than the one below it and delivered less. His thresholds
+    (15 / 30 / 60) survived the measurement and are untouched; only the
+    adjectives moved, to elapsed-time words that claim nothing.
+
+    This test failing is the correct outcome of any further rename. The words
+    are shared with a partner, so the next change to them is a conversation
+    first and a commit second.
+    """
     assert list(PERSISTENCE_LABELS.values()) == [
         "Pulse",
         "Building",
         "Persistent",
         "Reversed",
     ]
-    assert list(AGE_LABELS.values()) == ["New", "Established", "Confirmed", "Mature"]
+    assert list(AGE_LABELS.values()) == ["Fresh", "Running", "Aging", "Long-running"]
+
+    # The retired words must not come back by accident: each one asserted a
+    # durability the measurement reversed.
+    retired = {"New", "Established", "Confirmed", "Mature"}
+    assert retired.isdisjoint(AGE_LABELS.values())
+
+    # And the two ladders still share no words, which is why the age codes
+    # were renamed alongside the labels -- CONFIRMED as an age read against
+    # the confirmation window the header already runs.
+    assert set(PERSISTENCE_LABELS.values()).isdisjoint(AGE_LABELS.values())
 
 
 def test_code_and_label_stay_in_lockstep():
@@ -530,10 +553,10 @@ def test_the_age_clock_climbs_barries_rungs():
     rows = [_inputs() for _ in range(13)]
     series = classify_series(rows)
 
-    assert (series[1].age_minutes, series[1].age) == (10, AGE_NEW)
-    assert (series[2].age_minutes, series[2].age) == (15, AGE_ESTABLISHED)
-    assert (series[5].age_minutes, series[5].age) == (30, AGE_CONFIRMED)
-    assert (series[11].age_minutes, series[11].age) == (60, AGE_MATURE)
+    assert (series[1].age_minutes, series[1].age) == (10, AGE_FRESH)
+    assert (series[2].age_minutes, series[2].age) == (15, AGE_RUNNING)
+    assert (series[5].age_minutes, series[5].age) == (30, AGE_AGING)
+    assert (series[11].age_minutes, series[11].age) == (60, AGE_LONG_RUNNING)
 
 
 # --------------------------------------------------------------------------- #
@@ -635,7 +658,7 @@ def test_age_is_measured_on_the_confirmed_state():
     series = classify_series(rows)
 
     assert series[-1].age_minutes == 55
-    assert series[-1].age == AGE_CONFIRMED
+    assert series[-1].age == AGE_AGING
 
 
 # --------------------------------------------------------------------------- #

@@ -476,10 +476,18 @@ def age_band_trials(
     """Survival grouped by how long the state had ALREADY held.
 
     The sharpest test of the age ladder, and the one that can embarrass it: if
-    "confirmed" is worth more than "developing", a state that has already run
-    30 minutes must survive the next half hour more often than one that has
-    run five. If the bands come back flat, the clock on the panel is
+    an older rung is worth more than a younger one, a state that has already
+    run 30 minutes must survive the next half hour more often than one that
+    has run five. If the bands come back flat, the clock on the panel is
     decoration and should be labelled as such rather than quoted.
+
+    It did embarrass it. Over 42 sessions the bands came back 29.9% / 23.8% /
+    20.3% / 11.1% -- not flat but monotonically DOWN, so the ladder ran
+    backwards against its own wording and the panel's age labels were renamed
+    to elapsed-time words that claim nothing. The thresholds were fine; the
+    adjectives were the error. Read the ``dropped`` column before re-reading
+    this: censoring can only fire where a state survives to the close, so it
+    falls with age rather than rising, and the oldest band had none at all.
 
     ``bands`` are ``(label, min_bars, max_bars_exclusive)``; ``None`` for the
     upper bound means open-ended. Anchors are every usable bar, so the result

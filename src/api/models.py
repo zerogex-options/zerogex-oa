@@ -708,10 +708,12 @@ class GammaWeatherResponse(BaseModel):
     #: Opposite bars banked toward a reversal, 0 when none is pending. Only a
     #: genuine reversal counts, never a fresh pulse on the other side.
     pressure_reversing_bars: int = 0
-    #: How long the current state has held. NEW / ESTABLISHED / CONFIRMED /
-    #: MATURE, with the raw bars and minutes alongside. Duration is the point:
-    #: the question is not whether gamma calls direction, but whether a
-    #: condition that exists is healthy enough to persist.
+    #: How long the current state has held. FRESH / RUNNING / AGING /
+    #: LONG_RUNNING, with the raw bars and minutes alongside. Elapsed time and
+    #: nothing more: measured over 42 sessions the oldest band is the LEAST
+    #: likely to survive the next 30 minutes, so a client must not read this
+    #: ladder as rising confidence. It used to say exactly that, in words
+    #: (ESTABLISHED / CONFIRMED / MATURE) the measurement contradicted.
     #:
     #: The two ladders deliberately share no words. They used to both run
     #: DEVELOPING -> ESTABLISHED, which left "established" ambiguous in a

@@ -30,10 +30,16 @@ Do not put decisions, questions or new information after these sections.
 
 - Develop on the branch the session names. Michael merges to `release` himself
   and deploys from the EC2 box.
-- **The test suite has ~135 pre-existing failures on `release`.** Pass/fail is
-  meaningless here. Always diff the failure SET against a baseline from a clean
-  checkout, and build the filter from the test files that IMPORT what changed,
-  not from module-name keywords.
+- **The test suite has 15 pre-existing failures on `release`** (measured
+  2026-10-01: 15 failed, 6201 passed, 6 skipped, `-m "not integration"`). They
+  are 10 in `test_ingestion_oi_coverage_session.py`, 4 in
+  `test_ingestion_volume_coverage_session.py`, 1 in
+  `test_api_v2_freshness_envelope.py`, and 1 order-dependent failure in
+  `test_signal_engine_log_volume.py` that passes when that file runs alone.
+  Still diff the failure SET against a baseline from a clean checkout rather
+  than reading pass/fail, and build the filter from the test files that IMPORT
+  what changed, not from module-name keywords. A full run takes about 11
+  minutes, so the two can go in parallel.
 - Other sessions land work on `release` in parallel. Re-merge `release` into the
   working branch before pushing, or a stale base silently reverts someone's fix.
 - `black` at the pinned version reformats 123 files that are already committed.

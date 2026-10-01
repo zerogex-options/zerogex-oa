@@ -608,9 +608,9 @@ def build_report(
     comparable_bars = sum(bars for label, bars, _ in coverage if label == CUSHION_CURRENT)
 
     ladder_bars = [
-        (gw.AGE_ESTABLISHED_MIN, _minutes_to_bars(gw.AGE_ESTABLISHED_MIN)),
-        (gw.AGE_CONFIRMED_MIN, _minutes_to_bars(gw.AGE_CONFIRMED_MIN)),
-        (gw.AGE_MATURE_MIN, _minutes_to_bars(gw.AGE_MATURE_MIN)),
+        (gw.AGE_RUNNING_MIN, _minutes_to_bars(gw.AGE_RUNNING_MIN)),
+        (gw.AGE_AGING_MIN, _minutes_to_bars(gw.AGE_AGING_MIN)),
+        (gw.AGE_LONG_RUNNING_MIN, _minutes_to_bars(gw.AGE_LONG_RUNNING_MIN)),
     ]
 
     lengths = br.run_lengths(sessions)
@@ -629,18 +629,18 @@ def build_report(
         independent=True,
     )
     bands = [
-        (f"under {gw.AGE_ESTABLISHED_MIN}m", 1, _minutes_to_bars(gw.AGE_ESTABLISHED_MIN)),
+        (f"under {gw.AGE_RUNNING_MIN}m", 1, _minutes_to_bars(gw.AGE_RUNNING_MIN)),
         (
-            f"{gw.AGE_ESTABLISHED_MIN}-{gw.AGE_CONFIRMED_MIN}m",
-            _minutes_to_bars(gw.AGE_ESTABLISHED_MIN),
-            _minutes_to_bars(gw.AGE_CONFIRMED_MIN),
+            f"{gw.AGE_RUNNING_MIN}-{gw.AGE_AGING_MIN}m",
+            _minutes_to_bars(gw.AGE_RUNNING_MIN),
+            _minutes_to_bars(gw.AGE_AGING_MIN),
         ),
         (
-            f"{gw.AGE_CONFIRMED_MIN}-{gw.AGE_MATURE_MIN}m",
-            _minutes_to_bars(gw.AGE_CONFIRMED_MIN),
-            _minutes_to_bars(gw.AGE_MATURE_MIN),
+            f"{gw.AGE_AGING_MIN}-{gw.AGE_LONG_RUNNING_MIN}m",
+            _minutes_to_bars(gw.AGE_AGING_MIN),
+            _minutes_to_bars(gw.AGE_LONG_RUNNING_MIN),
         ),
-        (f"{gw.AGE_MATURE_MIN}m+", _minutes_to_bars(gw.AGE_MATURE_MIN), None),
+        (f"{gw.AGE_LONG_RUNNING_MIN}m+", _minutes_to_bars(gw.AGE_LONG_RUNNING_MIN), None),
     ]
     age = br.lift_table(
         br.age_band_trials(sessions, horizon_bars, bands),
