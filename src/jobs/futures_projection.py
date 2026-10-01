@@ -520,6 +520,36 @@ def active_contract_code(
     return f"{root}{_MONTH_CODES[expiry.month]}{expiry.year % 100:02d}"
 
 
+def contract_display_fields(
+    future_symbol: Optional[str], at: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """``data_contract`` / ``data_contract_expiry`` for a continuous future.
+
+    The badge ticker is ambiguous by itself: ``@NQ`` is whichever contract the
+    continuous series has rolled to, and for the week between the roll and the
+    old contract's expiry two platforms both labeled "NQ" sit a quarter of
+    carry apart — on the Sep 2026 roll that was ~300 NQ points, which reads as
+    a broken feed rather than as two different contracts. Naming the contract
+    is what makes the number checkable.
+
+    ``at`` matters for a historical series: one spanning a roll genuinely
+    contains two contracts, so each row is labeled with the one in force at
+    its own timestamp rather than with today's. A delayed read passes its
+    ceiling for the same reason.
+
+    The one place these two fields are produced. The quote and historical
+    endpoints call it, and so does the futures middleware for the projected
+    ES / NQ summary and v1 levels, so every surface reads the same roll
+    calendar and none can drift onto a second one.
+    """
+    if not future_symbol:
+        return {}
+    return {
+        "data_contract": active_contract_code(future_symbol, at),
+        "data_contract_expiry": active_contract_expiry(at),
+    }
+
+
 def next_quarterly_expiry(at: Optional[datetime] = None) -> date:
     """Expiry of the front quarterly contract on/after ``at``."""
     today = (at or datetime.now(timezone.utc)).date()

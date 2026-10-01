@@ -16,7 +16,7 @@ from enum import IntEnum
 import os
 from src.config import _getenv_str
 import re
-from typing import Annotated, Any, Dict, List, Optional, Literal
+from typing import Annotated, Dict, List, Optional, Literal
 import pytz
 
 from .database import DatabaseManager
@@ -2237,6 +2237,7 @@ from src.market_calendar import (  # noqa: E402
 )
 from src.config import _getenv_bool, _getenv_float  # noqa: E402
 from src.symbols import resolve_futures_index, resolve_index_future  # noqa: E402
+from src.jobs.futures_projection import contract_display_fields  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 
@@ -2302,7 +2303,10 @@ async def _native_futures_quote(
         in ("timestamp", "open", "high", "low", "close", "up_volume", "down_volume", "volume")
     }
     payload["symbol"] = futures_symbol
-    payload.update(_future_contract_fields(fut.get("future_symbol")))
+    # Labeled as of the instant the bar was read for, like the bar itself: a
+    # delayed read names the contract in force at its ceiling, the same one the
+    # delayed /api/gex/summary beside it on a free page names.
+    payload.update(contract_display_fields(fut.get("future_symbol"), as_of))
 
     # ``session`` describes the MARKET, not the feed.
     #
@@ -2343,32 +2347,6 @@ def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
     if not future_symbol:
         return None
     return future_symbol.lstrip("@").upper() or None
-
-
-def _future_contract_fields(
-    future_symbol: Optional[str], at: Optional[datetime] = None
-) -> Dict[str, Any]:
-    """``data_contract`` / ``data_contract_expiry`` for a continuous future.
-
-    The badge ticker is ambiguous by itself: ``@NQ`` is whichever contract the
-    continuous series has rolled to, and for the week between the roll and the
-    old contract's expiry two platforms both labelled "NQ" sit a quarter of
-    carry apart — on the Sep 2026 roll that was ~300 NQ points, which reads as
-    a broken feed rather than as two different contracts. Naming the contract
-    is what makes the number checkable.
-
-    ``at`` matters for a historical series: one spanning a roll genuinely
-    contains two contracts, so each row is labelled with the one in force at
-    its own timestamp rather than with today's.
-    """
-    from src.jobs.futures_projection import active_contract_code, active_contract_expiry
-
-    if not future_symbol:
-        return {}
-    return {
-        "data_contract": active_contract_code(future_symbol, at),
-        "data_contract_expiry": active_contract_expiry(at),
-    }
 
 
 if not _NYSE_HOLIDAYS:
@@ -2591,7 +2569,7 @@ async def get_current_quote(symbol: str = Query(default="SPY"), delay_minutes: _
             if fut and fut.get("close") is not None:
                 data["display_source"] = "futures"
                 data["data_symbol"] = _future_display_label(fut.get("future_symbol"))
-                data.update(_future_contract_fields(fut.get("future_symbol")))
+                data.update(contract_display_fields(fut.get("future_symbol"), as_of))
                 data["futures_close"] = fut.get("close")
                 data["futures_reference_close"] = fut.get("reference_close")
 
@@ -2730,7 +2708,7 @@ async def get_historical_quotes(
                     **{
                         **row,
                         "symbol": label,
-                        **_future_contract_fields(native_future, row.get("timestamp")),
+                        **contract_display_fields(native_future, row.get("timestamp")),
                     }
                 )
                 for row in fut_rows
@@ -2757,7 +2735,7 @@ async def get_historical_quotes(
                             **row,
                             "display_source": "futures",
                             "data_symbol": label,
-                            **_future_contract_fields(swap_future, row.get("timestamp")),
+                            **contract_display_fields(swap_future, row.get("timestamp")),
                         }
                     )
                     for row in fut_rows

@@ -35,6 +35,7 @@ from src.api import database as dbmod
 from src.api import futures_middleware as fm
 from src.api import main
 from src.api.delayed_read import MAX_DELAY_MINUTES, delayed_ceiling
+from src.jobs import futures_projection as fp
 from src.jobs.futures_projection import FuturesBasis
 
 # 16:03:51 ET on Tuesday 2026-09-29: the minute llms.txt was caught serving a
@@ -410,6 +411,34 @@ def test_a_delayed_futures_quote_is_stale_only_against_its_ceiling():
     assert args[1] == main.current_cash_close_reference(AS_OF)
 
 
+# The last minutes before the calendar moves @ES to December (Fri 2026-09-11
+# 00:00 UTC, seven days before the Sep 18 expiry). Every real "now" this suite
+# runs at is past it, so a September label can only have come from the ceiling.
+PRE_ROLL_CEILING = datetime(2026, 9, 10, 23, 50, tzinfo=timezone.utc)
+
+
+def test_a_delayed_futures_quote_names_the_contract_in_force_at_its_ceiling():
+    """The quote and the summary sit side by side on a free page. Labeled at
+    the same instant, the chart's chip and the levels card can never name two
+    different contracts for the same delayed read."""
+    assert main.contract_display_fields is fp.contract_display_fields
+    bar = {
+        "timestamp": PRE_ROLL_CEILING - timedelta(seconds=30),
+        "future_symbol": "@ES",
+        "open": 6650.0,
+        "high": 6651.0,
+        "low": 6649.0,
+        "close": 6650.5,
+    }
+    with patch.object(main, "_db", lambda: _RecordingDB(bar)):
+        delayed = asyncio.run(main._native_futures_quote("ES", "SPX", PRE_ROLL_CEILING))
+        live = asyncio.run(main._native_futures_quote("ES", "SPX", None))
+    assert delayed.data_contract == "ESU26"
+    assert delayed.data_contract_expiry == date(2026, 9, 18)
+    # A live read still names the contract in force now.
+    assert live.data_contract == fp.active_contract_code("@ES")
+
+
 def test_the_delayed_parameter_is_mirrored_onto_v2():
     schema = main.app.openapi()
     for path in (
@@ -486,6 +515,21 @@ def test_a_live_es_read_still_substitutes_the_live_print(monkeypatch):
     assert seen["live_spot"] is True
     assert "delayed_spot_at" not in seen
     assert body["spot_price"] == 6700.0
+
+
+def test_a_delayed_es_summary_names_the_contract_at_its_ceiling(monkeypatch):
+    """The free ES page reads this summary 15 minutes delayed. Its contract is
+    the one in force at the instant the numbers describe, like its basis and
+    its spot: the ceiling, not now."""
+    seen: dict = {}
+    client = _es_client(monkeypatch, seen)
+    monkeypatch.setattr(
+        fm, "delayed_ceiling", lambda minutes: PRE_ROLL_CEILING if minutes > 0 else None
+    )
+    body = client.get("/api/gex/summary?symbol=ES&delay_minutes=15").json()
+    assert seen["basis_at"] == PRE_ROLL_CEILING
+    assert body["data_contract"] == "ESU26"
+    assert body["data_contract_expiry"] == "2026-09-18"
 
 
 @pytest.mark.parametrize(

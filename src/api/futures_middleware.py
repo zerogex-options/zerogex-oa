@@ -47,12 +47,13 @@ from zoneinfo import ZoneInfo
 from src.api.delayed_read import MAX_DELAY_MINUTES, delayed_ceiling
 from src.jobs.futures_projection import (
     SPOT_FIELDS,
+    contract_display_fields,
     project_payload,
     projection_metadata,
     projection_tick,
     resolve_basis,
 )
-from src.symbols import is_futures_symbol, resolve_futures_index
+from src.symbols import is_futures_symbol, resolve_futures_index, resolve_index_future
 
 logger = logging.getLogger("zerogex.futures_middleware")
 
@@ -176,6 +177,33 @@ _API_VERSION_RE = re.compile(r"^/api/v\d+(?=/|$)")
 _NATIVE_PATHS_CANON = frozenset(_unversioned(p) for p in _NATIVE_PATHS)
 _PROJECTABLE_PREFIXES_CANON = tuple(_unversioned(p) for p in _PROJECTABLE_PREFIXES)
 _UNSUPPORTED_PREFIXES_CANON = tuple(_unversioned(p) for p in _UNSUPPORTED_PREFIXES)
+
+# Projected endpoints whose ES / NQ answer also NAMES the CME contract it is
+# quoted on (``data_contract`` / ``data_contract_expiry``), as the natively
+# served quote and historical endpoints already do.
+#
+# "ES" does not say which ES. When our feed has rolled to the next contract
+# and another platform has not, two numbers both labeled "ES" sit a quarter of
+# carry apart, and the reader concludes ours is broken. These two routes are
+# where an ES / NQ number is read with nothing else beside it to say which
+# contract it is: the summary is what the free gamma-levels pages render, and
+# v1 levels is what the NinjaTrader and Sierra Chart studies draw on a chart
+# that is itself set to one specific contract. Both indicators read v1 levels
+# by searching the body for quoted keys, so two new keys cannot shadow any key
+# they read.
+#
+# Kept to these two rather than every projected route: the label is display
+# metadata, and the logged-in app already takes it from the quote it shows
+# beside its ES / NQ levels. Summary is an exact route; v1 levels is addressed
+# by symbol in its path (``/api/v1/levels/ES``), hence the prefix.
+_CONTRACT_LABELED_PATHS = frozenset({_unversioned("/api/gex/summary")})
+_CONTRACT_LABELED_PREFIXES = (_unversioned("/api/v1/levels/"),)
+
+
+def _labels_contract(canon: str) -> bool:
+    """True when the (version-stripped) path names the contract it is quoted on."""
+    return canon in _CONTRACT_LABELED_PATHS or canon.startswith(_CONTRACT_LABELED_PREFIXES)
+
 
 # Responses larger than this are projected anyway but logged: the walk is
 # O(payload) on the event loop, and a very large one is worth knowing about.
@@ -412,6 +440,39 @@ def _db_manager():
     return db_manager
 
 
+def _label_contract(payload: Any, index_symbol: str, at: Optional[datetime]) -> None:
+    """Name the CME contract a projected response is quoted on, in place.
+
+    The contract comes from :func:`contract_display_fields` — the roll calendar
+    the quote and historical endpoints already label with — so it is never a
+    second opinion about which contract is live. ``at`` is the instant the
+    response describes (a delayed read's ceiling, a pinned request's anchor,
+    None for live): the same anchor its basis was resolved at.
+
+    Only a payload that was actually carried onto the futures axis is labeled.
+    ``projection`` is the mark of one; without it the payload is whatever the
+    index handler returned, and naming a futures contract on it would be false.
+    A v2 envelope is labeled inside ``data``, which keeps ``data`` identical
+    to the v1 body.
+
+    Display only: neither field is ever read back as a key.
+    """
+    if _is_v2_envelope(payload):
+        _label_contract(payload["data"], index_symbol, at)
+        return
+    if not isinstance(payload, dict) or "projection" not in payload:
+        return
+    fields = contract_display_fields(resolve_index_future(index_symbol), at)
+    code = fields.get("data_contract")
+    if not code:
+        return
+    # Both values are ready before either key is written, so a response never
+    # carries half a label.
+    expiry = fields["data_contract_expiry"].isoformat()
+    payload["data_contract"] = code
+    payload["data_contract_expiry"] = expiry
+
+
 # Deltas the analytics engine computed against the CASH spot. Once the observed
 # futures print is substituted for spot they describe the wrong reference, so
 # they are re-derived from the values now in the payload. Each entry is
@@ -516,7 +577,14 @@ class FuturesProjectionMiddleware:
 
         _rewrite_scope(scope, futures_symbol, index_symbol)
         await self._project_response(
-            scope, receive, send, futures_symbol, index_symbol, asof, delayed_at
+            scope,
+            receive,
+            send,
+            futures_symbol,
+            index_symbol,
+            asof,
+            delayed_at,
+            label_contract=_labels_contract(canon),
         )
 
     async def _reject(self, send, futures_symbol: str, index_symbol: str, path: str) -> None:
@@ -553,6 +621,7 @@ class FuturesProjectionMiddleware:
         index_symbol: str,
         asof: Optional[datetime] = None,
         delayed_at: Optional[datetime] = None,
+        label_contract: bool = False,
     ) -> None:
         status: Optional[int] = None
         headers: list = []
@@ -599,6 +668,15 @@ class FuturesProjectionMiddleware:
                 projected = await self._transform(
                     payload, futures_symbol, index_symbol, asof, delayed_at
                 )
+                if label_contract:
+                    try:
+                        _label_contract(
+                            projected, index_symbol, asof if asof is not None else delayed_at
+                        )
+                    except Exception as e:
+                        # The label is display metadata. Losing it must leave
+                        # the levels exactly as they were, never 503 them.
+                        logger.warning("contract label skipped for %s: %s", futures_symbol, e)
                 out = json.dumps(projected).encode("utf-8")
             except Exception as e:
                 # Never ship un-projected cash levels under an ES label: that
