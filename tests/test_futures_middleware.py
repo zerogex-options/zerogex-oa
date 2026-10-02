@@ -20,7 +20,7 @@ independently of any endpoint.
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from starlette.applications import Starlette
@@ -29,6 +29,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from src.api import futures_middleware as fm
+from src.jobs import futures_projection as fp
 from src.jobs.futures_projection import FuturesBasis
 
 BASIS = FuturesBasis(
@@ -622,3 +623,171 @@ def test_a_row_without_a_timestamp_falls_back_to_the_request_anchor(monkeypatch)
     out = asyncio.run(middleware._transform(rows, "ES", "SPX", at))
     assert at in seen
     assert out[1]["call_wall"] == pytest.approx(6100.0 * 1.0067, abs=0.25)
+
+
+# --- naming the contract ---------------------------------------------------
+#
+# "ES" does not say which ES. ES and NQ trade as separate quarterly contracts,
+# and when our feed has rolled and another platform has not, two numbers both
+# labeled "ES" sit a quarter of carry apart. The quote and historical
+# endpoints already name the contract; the summary (what the free gamma-levels
+# pages render) and v1 levels (what the NinjaTrader and Sierra Chart studies
+# draw) name it too, from the same roll calendar and never from a second one.
+
+
+def test_es_summary_names_the_contract_from_the_roll_calendar():
+    body = _client().get("/api/gex/summary?symbol=ES").json()
+    assert body["data_contract"] == fp.active_contract_code("@ES")
+    assert body["data_contract_expiry"] == fp.active_contract_expiry().isoformat()
+    # A label, not a price: every number is what it was without it.
+    assert body["spot_price"] == LIVE_ES
+    assert body["call_wall"] == pytest.approx(6745.0)
+
+
+def test_the_label_comes_from_the_one_shared_helper(monkeypatch):
+    """A second roll implementation would drift from the feed the day the
+    measured offset changed, and the drift would look exactly like the bug."""
+    assert fm.contract_display_fields is fp.contract_display_fields
+    calls = []
+
+    def spy(future_symbol, at=None):
+        calls.append((future_symbol, at))
+        return {"data_contract": "ESZ26", "data_contract_expiry": date(2026, 12, 18)}
+
+    monkeypatch.setattr(fm, "contract_display_fields", spy)
+    body = _client().get("/api/gex/summary?symbol=ES").json()
+    # The feed's continuous series, as the quote and historical endpoints pass
+    # it, and no anchor on a live read: the contract in force now.
+    assert calls == [("@ES", None)]
+    assert body["data_contract"] == "ESZ26"
+    assert body["data_contract_expiry"] == "2026-12-18"
+
+
+def test_v1_levels_names_the_contract_for_the_chart_studies():
+    """The studies draw these on a chart set to one specific contract, and read
+    the body by searching for quoted keys: the label must leave every key they
+    read exactly where it was."""
+    body = _client().get("/api/v1/levels/ES").json()
+    assert body["data_contract"] == fp.active_contract_code("@ES")
+    assert body["data_contract_expiry"] == fp.active_contract_expiry().isoformat()
+    assert body["symbol"] == "ES"
+    assert body["spot"] == LIVE_ES
+
+
+def test_nq_names_an_nq_contract(monkeypatch):
+    nq_basis = FuturesBasis(
+        index_symbol="NDX",
+        futures_symbol="NQ",
+        ratio=1.0071,
+        source="measured",
+        observed_at=datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc),
+        sample_count=5,
+        feed_symbol="@NQ",
+    )
+
+    async def resolve(db, symbol, **kwargs):
+        return nq_basis
+
+    monkeypatch.setattr(fm, "resolve_basis", resolve)
+    body = _client().get("/api/gex/summary?symbol=NQ").json()
+    assert body["symbol"] == "NQ"
+    assert body["data_contract"] == fp.active_contract_code("@NQ")
+    assert body["data_contract"].startswith("NQ")
+
+
+@pytest.mark.parametrize(
+    "route,url",
+    [
+        ("/api/v2/gex/summary", "/api/v2/gex/summary?symbol=ES"),
+        ("/api/v2/levels/{symbol}", "/api/v2/levels/ES"),
+    ],
+)
+def test_a_v2_answer_is_labeled_inside_data_not_beside_it(route, url):
+    """`data` stays byte-for-byte the v1 body, label included."""
+
+    async def envelope(request):
+        return JSONResponse(
+            {
+                "data": {"symbol": "SPX", "spot_price": 6600.0, "call_wall": 6700.0},
+                "freshness": {"evaluated_at": "2026-08-22T20:00:00Z", "age_seconds": 3.0},
+            }
+        )
+
+    app = Starlette(routes=[Route(route, envelope)])
+    body = TestClient(fm.FuturesProjectionMiddleware(app)).get(url).json()
+    assert set(body) == {"data", "freshness"}
+    assert body["data"]["data_contract"] == fp.active_contract_code("@ES")
+    assert "data_contract" not in body["freshness"]
+
+
+@pytest.mark.parametrize("path", ["/api/gex/vol_surface", "/api/signals/action", "/api/forecast"])
+def test_other_projected_routes_carry_no_label(path):
+    """Only the summary and v1 levels name the contract; the rest are unchanged."""
+    body = _client().get(f"{path}?symbol=ES").json()
+    assert "projection" in body
+    assert "data_contract" not in body
+    assert "data_contract_expiry" not in body
+
+
+def test_an_unprojected_answer_is_never_labeled(monkeypatch):
+    """No basis means the payload is the index handler's own: naming a futures
+    contract on it would be false."""
+
+    async def no_basis(db, symbol, **kwargs):
+        return None
+
+    monkeypatch.setattr(fm, "resolve_basis", no_basis)
+    body = _client().get("/api/gex/summary?symbol=ES").json()
+    assert "projection" not in body
+    assert "data_contract" not in body
+    assert "data_contract_expiry" not in body
+
+
+def test_a_failed_label_never_takes_the_levels_down(monkeypatch):
+    """The label is display metadata. Losing it leaves today's answer, not a 503."""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("calendar exploded")
+
+    monkeypatch.setattr(fm, "contract_display_fields", boom)
+    resp = _client().get("/api/gex/summary?symbol=ES")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["call_wall"] == pytest.approx(6745.0)
+    assert body["spot_price"] == LIVE_ES
+    assert "data_contract" not in body
+    assert "data_contract_expiry" not in body
+
+
+@pytest.mark.parametrize("symbol", ["SPX", "SPY", "QQQ", "NDX"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/api/gex/summary?symbol={s}&underlying={s}&delay_minutes=15",
+        "/api/v1/levels/{s}",
+    ],
+)
+def test_a_cash_answer_is_byte_identical_through_the_middleware(symbol, url):
+    """The free gamma-levels view renders the four cash pages too, and none of
+    them may change: a cash answer leaves the middleware exactly as it came."""
+
+    async def summary(request):
+        return JSONResponse(
+            {
+                "symbol": request.query_params.get("symbol"),
+                "spot_price": 6600.0,
+                "call_wall": 6700.0,
+                "timestamp": "2026-09-29T19:47:00+00:00",
+            }
+        )
+
+    async def levels(request):
+        return JSONResponse({"symbol": request.path_params["symbol"], "spot": 6600.0})
+
+    routes = [Route("/api/gex/summary", summary), Route("/api/v1/levels/{symbol}", levels)]
+    path = url.format(s=symbol)
+    bare = TestClient(Starlette(routes=routes)).get(path)
+    wrapped = TestClient(fm.FuturesProjectionMiddleware(Starlette(routes=routes))).get(path)
+    assert wrapped.content == bare.content
+    assert dict(wrapped.headers) == dict(bare.headers)
+    assert b"data_contract" not in wrapped.content

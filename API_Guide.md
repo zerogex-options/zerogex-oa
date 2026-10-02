@@ -537,6 +537,23 @@ Historical responses also keep their **projected** spot rather than taking the
 live futures print — today's price stamped on a past frame would state
 something false about that frame.
 
+**Which contract.** "ES" alone does not say which ES. The quarterly contracts
+trade side by side, and when our feed has rolled to the next one and another
+platform has not, two charts both labeled "ES" sit a quarter of carry apart.
+So ES / NQ answers from `/api/gex/summary` and `/api/v1/levels/{symbol}` (and
+their `/api/v2` mirrors) name the CME contract their futures axis is quoted
+on, as `/api/market/quote` and `/api/market/historical` already do:
+
+- `data_contract` — the contract code, e.g. `"ESZ26"`.
+- `data_contract_expiry` — that contract's expiry date, e.g. `"2026-12-18"`.
+
+Every endpoint takes both from the same roll calendar, and neither is set for
+anything that is not a future. A delayed read names the contract in force at
+its ceiling; a historical series names it per row, so a series spanning a roll
+carries two. They are display labels: never key a cache or a request on them.
+If your chart is set to a different contract than `data_contract`, its prices
+differ from these levels by the carry between the two contracts.
+
 > **Authoritative source.** This guide is the curated derived/charting
 > surface. The live, complete, always-current endpoint list is the
 > OpenAPI schema at `/openapi.json` (rendered at `/docs`); when the two
@@ -652,6 +669,9 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   therefore read lower, and truer, with no change on their side.
 - `as_of` / `age_seconds` describe snapshot freshness — see *Data
   freshness & update cadence* above.
+- For `ES` / `NQ`, `data_contract` and `data_contract_expiry` name the CME
+  contract the levels are quoted on — see *ES / NQ and the basis a response is
+  projected on* above. Absent for every other symbol.
 
 ---
 
