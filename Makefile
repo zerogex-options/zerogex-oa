@@ -59,6 +59,10 @@ LIVENESS_MUTE_SCRIPT = setup/systemd/zerogex-liveness-mute.sh
 SINCE ?= 1 hour ago
 LEVEL ?= both
 
+# `make services-restart` restarts one service at a time by default; pass
+# STOP_ALL_FIRST=1 to stop all four first and then start all four.
+STOP_ALL_FIRST ?=
+
 # Optional filter for db-tail targets (e.g. make db-tail-option-chains UNDERLYING=SPY)
 UNDERLYING ?=
 
@@ -942,7 +946,9 @@ help: ## Show this help message
 	@echo "$(GREEN)All Services (bulk — all 4 at once):$(NC)"
 	@echo "  make services-start     - Start all (ingestion → analytics → signals → api)"
 	@echo "  make services-stop      - Stop all (api → signals → analytics → ingestion)"
-	@echo "  make services-restart   - Restart all (stop reverse, then start in order)"
+	@echo "  make services-restart   - Restart one at a time, health-checking each (halts if one fails)"
+	@echo "  make services-restart STOP_ALL_FIRST=1"
+	@echo "                            - Stop all, then start all, then services-health"
 	@echo "  make services-status    - One-line active/inactive status for all 4"
 	@echo "  make services-health    - Full health check for all 4 + color-coded summary"
 	@echo "  make services-check [SINCE=\"1 hour ago\"] [LEVEL=errors|warnings|both]"
@@ -1572,9 +1578,52 @@ services-stop: ## Stop all 4 services (api → signals → analytics → ingesti
 	done
 	@echo "$(GREEN)All services stopped$(NC)"
 
+# services-restart has two modes:
+#   default           one at a time — each service is stopped, started and
+#                     health-checked before the next is touched, so only one
+#                     is ever down and a bad deploy halts at the first service
+#                     that fails to come back (the rest keep running).
+#   STOP_ALL_FIRST=1  stop all four, then start all four (the original
+#                     behavior), then one services-health at the end.
+# Both end on api-health-assert, the deploy gate.
 .PHONY: services-restart
-services-restart: ## Restart all 4 services (stop api→…→ingestion, then start ingestion→…→api)
-	@echo "$(YELLOW)=== Restarting all services ===$(NC)"
+services-restart: ## Restart all 4 services one at a time, health-checking each (STOP_ALL_FIRST=1: stop all, then start all)
+	@case "$(STOP_ALL_FIRST)" in \
+		""|0|no|false) $(MAKE) --no-print-directory services-restart-one-by-one;; \
+		1|yes|true)    $(MAKE) --no-print-directory services-restart-stop-all-first;; \
+		*) echo "$(RED)Invalid STOP_ALL_FIRST='$(STOP_ALL_FIRST)' — use STOP_ALL_FIRST=1, or leave it off for one at a time$(NC)"; exit 2;; \
+	esac
+
+.PHONY: services-restart-one-by-one
+services-restart-one-by-one: ## Restart each service in turn (ingestion → analytics → signals → api) and health-check it before the next
+	@echo "$(YELLOW)=== Restarting services one at a time ===$(NC)"
+	@# The 5s settle gives a service that dies on startup (bad import, missing
+	@# column) time to fall over before is-active is trusted. The health target
+	@# is <prefix>-health, where the unit is zerogex-oa-<prefix>.
+	@for svc in $(SERVICES_START_ORDER); do \
+		echo ""; \
+		echo "$(YELLOW)→ Stopping $$svc...$(NC)"; \
+		$(LIVENESS_MUTE_SCRIPT) $$svc $(MUTE) 2>/dev/null || true; \
+		sudo systemctl stop $$svc; \
+		echo "$(GREEN)→ Starting $$svc...$(NC)"; \
+		sudo systemctl start $$svc; \
+		sleep 5; \
+		echo ""; \
+		$(MAKE) --no-print-directory $${svc#zerogex-oa-}-health; \
+		if ! systemctl is-active --quiet $$svc; then \
+			echo ""; \
+			echo "$(RED)✖ $$svc did not come back up — stopping here. Services after it were NOT restarted.$(NC)"; \
+			echo "  Inspect: sudo journalctl -u $$svc -n 50 --no-pager"; \
+			exit 1; \
+		fi; \
+	done
+	@echo ""
+	@$(MAKE) --no-print-directory services-status
+	@$(MAKE) --no-print-directory api-health-assert
+
+.PHONY: services-restart-stop-all-first
+services-restart-stop-all-first: ## Stop all 4 services (api → … → ingestion), then start all (ingestion → … → api)
+	@echo "$(YELLOW)=== Restarting all services (stop all, then start all) ===$(NC)"
 	@for svc in $(SERVICES_STOP_ORDER); do \
 		echo "$(YELLOW)→ Stopping $$svc...$(NC)"; \
 		$(LIVENESS_MUTE_SCRIPT) $$svc $(MUTE) 2>/dev/null || true; \
@@ -1586,7 +1635,7 @@ services-restart: ## Restart all 4 services (stop api→…→ingestion, then st
 		sudo systemctl start $$svc; \
 	done
 	@sleep 2
-	@$(MAKE) --no-print-directory services-status
+	@$(MAKE) --no-print-directory services-health
 	@# Deploy/restart gate: fail loudly if the API did not actually come back
 	@# serving. A stop-all→start-all that leaves the API down (the incident
 	@# shape) otherwise exits 0 with only a printed "INACTIVE".
