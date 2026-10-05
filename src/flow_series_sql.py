@@ -1,4 +1,9 @@
-"""Single source of truth for the /api/flow/series 5-minute aggregation.
+"""Single source of truth for the /api/flow/series aggregations.
+
+The default 5-minute series is described below. ``timeframe=1min`` reads a
+separate 1-minute pipeline over flow_contract_facts
+(``FLOW_SERIES_1MIN_CTE_ASYNCPG``) that shares the 5-minute CTE's
+accumulation stages verbatim.
 
 Three call sites execute the *same* pipeline so that ``flow_series_5min``
 rows are byte-identical to the live CTE **by construction**, not by a
@@ -27,6 +32,64 @@ byte-identical for every closed bar regardless of when it was computed.
 """
 
 from __future__ import annotations
+
+# The stages both bar sizes share: carry the price forward, accumulate across
+# the session, emit FLOW_SERIES_COLUMNS. One text, so the 1-minute series below
+# can differ from the 5-minute one only in how a bar is formed.
+_FLOW_SERIES_TAIL = """                    joined AS (
+                        SELECT
+                            t.bar_start,
+                            COALESCE(pb.call_premium_delta, 0) AS call_premium_delta,
+                            COALESCE(pb.put_premium_delta, 0)  AS put_premium_delta,
+                            COALESCE(pb.call_volume_delta, 0)  AS call_volume_delta,
+                            COALESCE(pb.put_volume_delta, 0)   AS put_volume_delta,
+                            COALESCE(pb.net_volume_delta, 0)   AS net_volume_delta,
+                            COALESCE(pb.raw_volume_delta, 0)   AS raw_volume_delta,
+                            COALESCE(pb.call_position_delta, 0) AS call_position_delta,
+                            COALESCE(pb.put_position_delta, 0)  AS put_position_delta,
+                            ub.underlying_price,
+                            COALESCE(pb.contract_count, 0) AS contract_count,
+                            (pb.bar_start IS NULL) AS is_synthetic
+                        FROM timeline t
+                        LEFT JOIN per_bar           pb USING (bar_start)
+                        LEFT JOIN underlying_by_bar ub USING (bar_start)
+                    ),
+                    carry AS (
+                        -- FIRST_VALUE + partition-by-running-count emulates
+                        -- LAST_VALUE(... IGNORE NULLS) portably (Postgres < 16
+                        -- doesn't support IGNORE NULLS in LAST_VALUE).
+                        SELECT
+                            j.*,
+                            COUNT(underlying_price) OVER (ORDER BY bar_start ROWS UNBOUNDED PRECEDING) AS up_grp
+                        FROM joined j
+                    )
+                    SELECT
+                        bar_start,
+                        SUM(call_premium_delta)  OVER w_cum AS call_premium_cum,
+                        SUM(put_premium_delta)   OVER w_cum AS put_premium_cum,
+                        SUM(call_volume_delta)   OVER w_cum AS call_volume_cum,
+                        SUM(put_volume_delta)    OVER w_cum AS put_volume_cum,
+                        SUM(net_volume_delta)    OVER w_cum AS net_volume_cum,
+                        SUM(raw_volume_delta)    OVER w_cum AS raw_volume_cum,
+                        SUM(call_position_delta) OVER w_cum AS call_position_cum,
+                        SUM(put_position_delta)  OVER w_cum AS put_position_cum,
+                        (SUM(call_premium_delta) OVER w_cum
+                         - SUM(put_premium_delta) OVER w_cum) AS net_premium_cum,
+                        CASE
+                            WHEN SUM(call_volume_delta) OVER w_cum > 0
+                            THEN (SUM(put_volume_delta) OVER w_cum)::float8
+                               / (SUM(call_volume_delta) OVER w_cum)::float8
+                            ELSE NULL
+                        END AS put_call_ratio,
+                        FIRST_VALUE(underlying_price) OVER (
+                            PARTITION BY up_grp ORDER BY bar_start
+                        ) AS underlying_price,
+                        contract_count,
+                        is_synthetic
+                    FROM carry
+                    WINDOW w_cum AS (ORDER BY bar_start ROWS UNBOUNDED PRECEDING)
+                    ORDER BY bar_start DESC
+"""
 
 # Canonical CTE. Transcribed verbatim from the original inlined query in
 # get_flow_series; the only change is $N -> :name tokenisation. Comments
@@ -105,60 +168,7 @@ _FLOW_SERIES_CTE_TEMPLATE = """
                         FROM generate_series(:session_start::timestamptz, :session_end::timestamptz, INTERVAL '5 minutes') AS g(bar_start)
                         WHERE EXISTS (SELECT 1 FROM filtered)
                     ),
-                    joined AS (
-                        SELECT
-                            t.bar_start,
-                            COALESCE(pb.call_premium_delta, 0) AS call_premium_delta,
-                            COALESCE(pb.put_premium_delta, 0)  AS put_premium_delta,
-                            COALESCE(pb.call_volume_delta, 0)  AS call_volume_delta,
-                            COALESCE(pb.put_volume_delta, 0)   AS put_volume_delta,
-                            COALESCE(pb.net_volume_delta, 0)   AS net_volume_delta,
-                            COALESCE(pb.raw_volume_delta, 0)   AS raw_volume_delta,
-                            COALESCE(pb.call_position_delta, 0) AS call_position_delta,
-                            COALESCE(pb.put_position_delta, 0)  AS put_position_delta,
-                            ub.underlying_price,
-                            COALESCE(pb.contract_count, 0) AS contract_count,
-                            (pb.bar_start IS NULL) AS is_synthetic
-                        FROM timeline t
-                        LEFT JOIN per_bar           pb USING (bar_start)
-                        LEFT JOIN underlying_by_bar ub USING (bar_start)
-                    ),
-                    carry AS (
-                        -- FIRST_VALUE + partition-by-running-count emulates
-                        -- LAST_VALUE(... IGNORE NULLS) portably (Postgres < 16
-                        -- doesn't support IGNORE NULLS in LAST_VALUE).
-                        SELECT
-                            j.*,
-                            COUNT(underlying_price) OVER (ORDER BY bar_start ROWS UNBOUNDED PRECEDING) AS up_grp
-                        FROM joined j
-                    )
-                    SELECT
-                        bar_start,
-                        SUM(call_premium_delta)  OVER w_cum AS call_premium_cum,
-                        SUM(put_premium_delta)   OVER w_cum AS put_premium_cum,
-                        SUM(call_volume_delta)   OVER w_cum AS call_volume_cum,
-                        SUM(put_volume_delta)    OVER w_cum AS put_volume_cum,
-                        SUM(net_volume_delta)    OVER w_cum AS net_volume_cum,
-                        SUM(raw_volume_delta)    OVER w_cum AS raw_volume_cum,
-                        SUM(call_position_delta) OVER w_cum AS call_position_cum,
-                        SUM(put_position_delta)  OVER w_cum AS put_position_cum,
-                        (SUM(call_premium_delta) OVER w_cum
-                         - SUM(put_premium_delta) OVER w_cum) AS net_premium_cum,
-                        CASE
-                            WHEN SUM(call_volume_delta) OVER w_cum > 0
-                            THEN (SUM(put_volume_delta) OVER w_cum)::float8
-                               / (SUM(call_volume_delta) OVER w_cum)::float8
-                            ELSE NULL
-                        END AS put_call_ratio,
-                        FIRST_VALUE(underlying_price) OVER (
-                            PARTITION BY up_grp ORDER BY bar_start
-                        ) AS underlying_price,
-                        contract_count,
-                        is_synthetic
-                    FROM carry
-                    WINDOW w_cum AS (ORDER BY bar_start ROWS UNBOUNDED PRECEDING)
-                    ORDER BY bar_start DESC
-"""
+""" + _FLOW_SERIES_TAIL
 
 # Ordered (token, asyncpg-positional) mapping. asyncpg has no named
 # parameters, so the canonical query is rendered to $1..$5.
@@ -211,6 +221,75 @@ FLOW_SERIES_CTE_ASYNCPG = _render_asyncpg(_FLOW_SERIES_CTE_TEMPLATE)
 
 # psycopg2 form: Analytics Engine snapshot write + backfill.
 FLOW_SERIES_CTE_PSYCOPG2 = _render_psycopg2(_FLOW_SERIES_CTE_TEMPLATE)
+
+# One-minute bars, for ``/api/flow/series?timeframe=1min``.
+#
+# Read from flow_contract_facts, because flow_by_contract only exists on the
+# 5-minute grid. The facts are already per-minute DELTAS, sparse (a row only
+# where a contract traded), so there is no LAG step: group by minute and let
+# the shared tail accumulate, the same shape as src/hedging_flow_sql.py.
+#
+# The totals agree with the 5-minute bars by construction: flow_by_contract
+# holds, per contract, SUM(facts) from the 09:30 ET open through each bucket's
+# end, so a 5-minute bar's cumulatives equal those of the last minute inside
+# it. Two diagnostics follow the field contract instead of the 5-minute
+# series' shape. ``contract_count`` counts the contracts that traded in that
+# minute (flow_by_contract is dense, so a 5-minute bar counts every contract
+# traded so far), and ``is_synthetic`` marks a minute in which nothing traded.
+#
+# No snapshot table. The endpoint serves only the current and prior sessions,
+# both inside flow_contract_facts' retention, and the API caches the result.
+_FLOW_SERIES_1MIN_CTE_TEMPLATE = """
+                    WITH filtered AS (
+                        SELECT
+                            date_trunc('minute', timestamp) AS bar_start,
+                            option_type,
+                            option_symbol,
+                            volume_delta,
+                            (buy_volume  - sell_volume)  AS net_volume,
+                            (buy_premium - sell_premium) AS net_premium
+                        FROM flow_contract_facts
+                        WHERE symbol = :symbol
+                          AND timestamp >= :session_start
+                          AND timestamp <  :session_end::timestamptz + INTERVAL '1 minute'
+                          AND (:strikes::numeric[] IS NULL OR strike = ANY(:strikes::numeric[]))
+                          AND (:expirations::date[]    IS NULL OR expiration = ANY(:expirations::date[]))
+                    ),
+                    per_bar AS (
+                        SELECT
+                            bar_start,
+                            SUM(CASE WHEN option_type='C' THEN net_premium  ELSE 0 END)::numeric AS call_premium_delta,
+                            SUM(CASE WHEN option_type='P' THEN net_premium  ELSE 0 END)::numeric AS put_premium_delta,
+                            SUM(CASE WHEN option_type='C' THEN volume_delta ELSE 0 END)::bigint  AS call_volume_delta,
+                            SUM(CASE WHEN option_type='P' THEN volume_delta ELSE 0 END)::bigint  AS put_volume_delta,
+                            SUM(CASE WHEN option_type='C' THEN net_volume ELSE -net_volume END)::bigint AS net_volume_delta,
+                            SUM(volume_delta)::bigint                                             AS raw_volume_delta,
+                            SUM(CASE WHEN option_type='C' THEN net_volume   ELSE 0 END)::bigint  AS call_position_delta,
+                            SUM(CASE WHEN option_type='P' THEN net_volume   ELSE 0 END)::bigint  AS put_position_delta,
+                            COUNT(DISTINCT option_symbol)::int AS contract_count
+                        FROM filtered
+                        GROUP BY bar_start
+                    ),
+                    -- The tape's last close in the minute, unfiltered, for the
+                    -- same reasons as the 5-minute underlying_by_bar above.
+                    underlying_by_bar AS (
+                        SELECT
+                            date_trunc('minute', timestamp) AS bar_start,
+                            (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS underlying_price
+                        FROM underlying_quotes
+                        WHERE symbol = :symbol
+                          AND timestamp >= :session_start
+                          AND timestamp <  :session_end::timestamptz + INTERVAL '1 minute'
+                        GROUP BY 1
+                    ),
+                    timeline AS (
+                        SELECT g.bar_start
+                        FROM generate_series(:session_start::timestamptz, :session_end::timestamptz, INTERVAL '1 minute') AS g(bar_start)
+                        WHERE EXISTS (SELECT 1 FROM filtered)
+                    ),
+""" + _FLOW_SERIES_TAIL
+
+FLOW_SERIES_1MIN_CTE_ASYNCPG = _render_asyncpg(_FLOW_SERIES_1MIN_CTE_TEMPLATE)
 
 _COLS_CSV = ",\n    ".join(FLOW_SERIES_COLUMNS)
 

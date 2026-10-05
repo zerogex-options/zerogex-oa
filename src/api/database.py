@@ -28,7 +28,11 @@ from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
-from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
+from src.flow_series_sql import (
+    FLOW_SERIES_1MIN_CTE_ASYNCPG,
+    FLOW_SERIES_CTE_ASYNCPG,
+    SNAPSHOT_SELECT_ASYNCPG,
+)
 from src.hedging_flow_sql import (
     HEDGING_FLOW_CTE_ASYNCPG,
     HEDGING_FLOW_SESSIONS_ASYNCPG,
@@ -809,6 +813,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # <= 0 disables endpoint caching.
         self._flow_series_endpoint_cache_ttl_seconds: float = _getenv_float(
             "FLOW_SERIES_ENDPOINT_CACHE_TTL_SECONDS", 30.0
+        )
+        # /api/flow/series?timeframe=1min. Short, and it covers the intervals=N
+        # tail as well as the full series: the 1-minute read runs its CTE over
+        # flow_contract_facts every time, and the website polls the tail every
+        # few seconds per open chart. See _get_flow_series_1min. <= 0 disables.
+        self._flow_series_1min_cache_ttl_seconds: float = _getenv_float(
+            "FLOW_SERIES_1MIN_CACHE_TTL_SECONDS", 5.0
         )
         # Phase-2 read switch for the flow_series_5min snapshot. When true,
         # unfiltered /api/flow/series reads the pre-aggregated snapshot
@@ -6028,9 +6039,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol: str,
         session: str,
         session_date: Optional[date] = None,
+        bar_seconds: int = 300,
     ) -> Optional[Tuple[datetime, datetime, bool]]:
         """Resolve (session_start_utc, session_end_utc, symbol_has_any_data) for
         the data-driven session model used by /api/flow/series.
+
+        ``bar_seconds`` is the bar the live session end floors to: 300 for the
+        5-minute series, 60 for ``timeframe=1min``.
 
         Returns ``None`` when the symbol has no rows in flow_by_contract at
         all (spec: 404 unknown symbol). Returns ``(_, _, False)`` when the
@@ -6129,13 +6144,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         )
         session_start_utc = session_start_et.astimezone(timezone.utc)
         session_close_utc = session_start_utc + timedelta(hours=6, minutes=45)
-        # Floor now() to the 5-minute bucket boundary so generate_series
-        # lands on clean bar_start values. The floor is the START of the
-        # bucket now() sits in, and generate_series includes its end point,
-        # so the window does include that still-filling bucket: the newest
-        # bar is partial until its five minutes are up.
+        # Floor now() to the bar boundary so generate_series lands on clean
+        # bar_start values. The floor is the START of the bar now() sits
+        # in, and generate_series includes its end point, so the window
+        # does include that still-filling bar: the newest bar is partial
+        # until its time is up.
         now_utc = datetime.now(timezone.utc)
-        now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+        now_floor_epoch = int(now_utc.timestamp() // bar_seconds) * bar_seconds
         now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
         session_end_utc = min(now_floored, session_close_utc)
         if session_end_utc < session_start_utc:
@@ -6151,6 +6166,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         strikes: Optional[List[float]] = None,
         expirations: Optional[List[date]] = None,
         intervals: Optional[int] = None,
+        timeframe: str = "5min",
     ) -> Optional[List[Dict[str, Any]]]:
         """Return pre-accumulated 5-minute flow series rows for a session.
 
@@ -6163,7 +6179,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         Rows are returned newest-first so ``rows[0]`` is the most recent
         bar; ``intervals=N`` returns the leading N rows.
+
+        ``timeframe="1min"`` returns the same rows on a 1-minute grid instead;
+        see :meth:`_get_flow_series_1min`.
         """
+        if timeframe == "1min":
+            return await self._get_flow_series_1min(
+                symbol, session, strikes, expirations, intervals
+            )
         symbol = symbol.upper()
 
         # Cache only full-series fetches. Incremental (intervals=N) polls
@@ -6272,6 +6295,75 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except asyncio.TimeoutError:
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
             return []
+
+    async def _get_flow_series_1min(
+        self,
+        symbol: str,
+        session: str,
+        strikes: Optional[List[float]],
+        expirations: Optional[List[date]],
+        intervals: Optional[int],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One-minute bars for ``get_flow_series(timeframe="1min")``.
+
+        Same session window, filters, columns, ordering and 404/empty
+        semantics as the 5-minute series, built by
+        ``FLOW_SERIES_1MIN_CTE_ASYNCPG`` from flow_contract_facts on a grid
+        floored to the minute. There is no snapshot to read: every call runs
+        the CTE.
+
+        Which is why the cache differs from the 5-minute one. There, an
+        ``intervals=N`` tail bypasses the cache because it reads a cheap
+        snapshot. Here the tail is sliced from one short-lived full-series
+        entry, so the website's tail polls (every few seconds, per open chart)
+        cost one CTE per TTL rather than one each. The facts behind it are
+        rewritten a few times a minute at most, so a 5-second entry hides
+        nothing a reader could see.
+        """
+        symbol = symbol.upper()
+        strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
+        exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
+        cache_key = f"flow_series_1min:{symbol}:{session}:{strikes_key}:{exps_key}"
+        result: Optional[List[Dict[str, Any]]] = self._cache_get(cache_key)
+        if result is None:
+            strikes_arg = [float(s) for s in strikes] if strikes else None
+            expirations_arg = list(expirations) if expirations else None
+            try:
+                async with self._acquire_connection() as conn:
+                    await self._refresh_flow_cache(conn, symbol)
+                    resolved = await self._resolve_flow_series_session(
+                        conn, symbol, session, bar_seconds=60
+                    )
+                    if resolved is None:
+                        return None
+                    session_start, session_end, has_session_data = resolved
+                    if not has_session_data:
+                        result = []
+                    else:
+                        rows = await asyncio.wait_for(
+                            self._fetch_timed(
+                                conn,
+                                FLOW_SERIES_1MIN_CTE_ASYNCPG,
+                                symbol,
+                                session_start,
+                                session_end,
+                                strikes_arg,
+                                expirations_arg,
+                                timeout=15.0,
+                            ),
+                            timeout=15.0,
+                        )
+                        result = [dict(row) for row in rows]
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"1-minute flow series query timed out for {symbol}, returning empty"
+                )
+                return []
+            self._cache_set(cache_key, result, self._flow_series_1min_cache_ttl_seconds)
+        if intervals is not None and intervals > 0 and len(result) > intervals:
+            # Newest-first; the leading N rows are the most recent N minutes.
+            return result[:intervals]
+        return result
 
     @staticmethod
     def _hedging_snapshot_scope(

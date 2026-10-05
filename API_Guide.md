@@ -734,14 +734,17 @@ Per-contract option flow in 5-minute buckets with session-cumulative values.
 - `intervals` (optional): trailing N 5-minute buckets, `1`–`390`; omit for the full session
 
 ### GET /api/flow/series
-Server-accumulated flow series — one row per 5-minute bar (cumulative call/put premium, volume, position, net volume, put/call ratio). Rows are newest→oldest.
+Server-accumulated flow series — one row per 5-minute bar, or per 1-minute bar with `timeframe=1min` (cumulative call/put premium, volume, position, net volume, put/call ratio). Rows are newest→oldest.
 
 **Parameters:**
 - `symbol` (required): `[A-Z.]{1,10}`
 - `session` (optional): `current` | `prior`, default `current`
 - `strikes` (optional): comma-separated strikes to include; omit for all
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
-- `intervals` (optional): trailing N 5-minute bars, `1`–`390`
+- `timeframe` (optional): `5min` | `1min`, default `5min`
+- `intervals` (optional): trailing N bars of the chosen timeframe, `1`–`390`
+
+Both timeframes carry the same session-cumulative fields, so a 1-minute bar reads the same totals as the 5-minute bar it closes: the 10:04 bar matches the 10:00 five-minute bar. `bar_end` is one bar after `bar_start`. On 1-minute bars `contract_count` is the number of contracts that traded in that minute and `is_synthetic` marks a minute with no trades. On 5-minute bars `contract_count` counts every contract traded so far in the session.
 
 ### GET /api/gex/weather
 The combined current-state read (Gamma Weather). Consolidates what is already on the Hedging Flow page into one sentence: whether estimated hedging pressure is persistently buying or selling, whether near-price dealer gamma is building or thinning, which side the book leans, and how much room is left before the gamma regime itself changes.

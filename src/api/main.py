@@ -1189,19 +1189,20 @@ def _parse_session_date(raw: Optional[str], field: str = "date") -> Optional[dat
         raise HTTPException(status_code=400, detail=f"{field} must be a real calendar date")
 
 
-def _format_flow_series_row(row: dict) -> dict:
+def _format_flow_series_row(row: dict, bar_minutes: int = 5) -> dict:
     """Coerce a raw DB row into the JSON shape documented in the spec.
 
     The timestamp fields are emitted as ``...Z`` (trailing-Z UTC) — spec
     requirement. Decimal/Numeric columns are cast to float so JSON callers
     don't have to care about asyncpg's native Decimal output.
+    ``bar_minutes`` is the bar size, which sets ``bar_end``.
     """
     bar_start: datetime = row["bar_start"]
     if bar_start.tzinfo is None:
         bar_start = bar_start.replace(tzinfo=pytz.UTC)
     else:
         bar_start = bar_start.astimezone(pytz.UTC)
-    bar_end = bar_start + timedelta(minutes=5)
+    bar_end = bar_start + timedelta(minutes=bar_minutes)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
 
     def _to_float(v):
@@ -1309,13 +1310,22 @@ async def get_flow_series(
         ge=1,
         le=390,
         description=(
-            "If provided, return only the last N 5-minute bars (tail window) "
-            "for cheap incremental polling. A full regular session is 82 bars "
-            "(09:30 through 16:15 ET, both ends included)."
+            "If provided, return only the last N bars (tail window) for cheap "
+            "incremental polling. A full regular session is 82 five-minute bars "
+            "or 406 one-minute bars (09:30 through 16:15 ET, both ends included)."
+        ),
+    ),
+    timeframe: Literal["5min", "1min"] = Query(
+        default="5min",
+        description=(
+            "Bar size: '5min' (default) or '1min'. Both carry the same "
+            "session-cumulative fields, so a 1-minute bar reads the same totals "
+            "as the 5-minute bar it closes."
         ),
     ),
 ):
-    """Server-accumulated flow series — one row per 5-minute bar.
+    """Server-accumulated flow series — one row per 5-minute bar, or per
+    1-minute bar with ``timeframe=1min``.
 
     Returns cumulative call/put premium, volume, position, net volume, and
     put/call ratio per bar across all contracts matching the optional
@@ -1348,10 +1358,12 @@ async def get_flow_series(
         strikes=strikes_list,
         expirations=expirations_list,
         intervals=intervals,
+        timeframe=timeframe,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
-    return JSONResponse(content=[_format_flow_series_row(r) for r in rows])
+    bar_minutes = 1 if timeframe == "1min" else 5
+    return JSONResponse(content=[_format_flow_series_row(r, bar_minutes) for r in rows])
 
 
 #: Public label for what this series is, carried in every payload. The
