@@ -19,6 +19,7 @@ These tests pin that:
 """
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 
 from src.api.database import DatabaseManager
@@ -111,6 +112,51 @@ def test_historical_walls_computed_live_against_per_bucket_close():
     assert "stored_put_wall" not in sql
     assert "COALESCE(b.stored_call_wall" not in sql
     assert "COALESCE(b.stored_put_wall" not in sql
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Comments name the old shape, so assert on the SQL alone."""
+    return "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+
+
+def test_historical_spot_and_gex_use_each_buckets_own_spot():
+    """Every row's ``spot_price`` and dollar GEX use THAT bucket's price.
+
+    Both used to read the ``spot`` CTE, the newest close in
+    underlying_quotes, so every historical row reported today's price and
+    a net GEX scaled by (today / then)^2. Against a seeded Postgres an
+    SPX frame from 2026-08-04 10:00 ET reported October's 7800.00 rather
+    than its own 7658.25, while the walls beside it, already split on the
+    bucket's close, were right.
+
+    The newest close survives only as the last resort, for a row older
+    than every bar the table holds.
+    """
+    for sym in ("SPY", "SPX"):
+        sql = _strip_sql_comments(_run_historical(sym)["query"])
+
+        # Defined after the closes it prefers and before its first reader.
+        assert (
+            sql.index("bucket_closes AS")
+            < sql.index("bucket_spot AS MATERIALIZED (")
+            < sql.index("strike_agg AS")
+        ), sym
+
+        # The bucket's own close first, then the newest close at or before
+        # its GEX row (an ETF's overnight row has no bar in its bucket),
+        # and the newest close overall last.
+        assert "COALESCE(bc.bucket_close, prior_bar.close, s.spot_price)" in sql, sym
+        assert "uq.timestamp <= b.timestamp" in sql, sym
+
+        # The GEX scaling and the reported spot both read it.
+        assert "bs.spot_price * bs.spot_price" in sql, sym
+        final_select = sql[sql.rindex("\n            SELECT\n") :]
+        assert "bs.spot_price," in final_select, sym
+        assert "JOIN bucket_spot bs ON bs.bucket_ts = b.bucket_ts" in final_select, sym
+        assert "CROSS JOIN spot s" not in final_select, sym
+
+        # Nothing else reads the newest close.
+        assert len(re.findall(r"(?<![a-z_])s\.spot_price", sql)) == 1, sym
 
 
 def test_historical_etf_has_no_session_filter():

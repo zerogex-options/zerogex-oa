@@ -698,7 +698,11 @@ Get GEX breakdown by individual strikes.
 - `limit` (optional): max `200`, default `50`
 
 ### GET /api/gex/historical
-Get historical GEX data.
+Get historical GEX data. Each row is one bar, stamped at the bar's start and
+carrying its last snapshot. `spot_price` is that bar's own last close, or the
+last close before it for a bar with no price of its own (an ETF overnight), and
+`net_gex`, `total_call_gex` and `total_put_gex` are scaled at it. (Before
+October 2026 every row reported the newest price instead.)
 
 **Parameters:**
 - `symbol` (optional): default `SPY`

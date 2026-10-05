@@ -4268,6 +4268,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     COALESCE($3::timestamptz, max_ts) AS end_ts
                 FROM latest
             ),
+            -- The newest close.  Only the last resort in ``bucket_spot``
+            -- below: it used to be every row's spot, so a frame from August
+            -- reported October's price.
             spot AS (
                 SELECT close::numeric AS spot_price
                 FROM underlying_quotes
@@ -4327,6 +4330,31 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ) q
                 GROUP BY bucket_ts
             ),
+            -- Each bucket's own spot, which is both the ``spot_price`` a row
+            -- reports and the S its dollar GEX is scaled at.  Its last close
+            -- first, the price the walls are split on; else the newest close
+            -- at or before its GEX row, since an ETF's overnight row has no
+            -- bar in its bucket.  The newest close overall is the last resort.
+            --
+            -- Both used to read ``spot`` directly, so every historical row
+            -- carried TODAY's price and a GEX scaled by (today / then)^2,
+            -- while the walls beside them were split on the right price.
+            bucket_spot AS MATERIALIZED (
+                SELECT
+                    b.bucket_ts,
+                    COALESCE(bc.bucket_close, prior_bar.close, s.spot_price) AS spot_price
+                FROM base b
+                CROSS JOIN spot s
+                LEFT JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
+                LEFT JOIN LATERAL (
+                    SELECT uq.close::numeric AS close
+                    FROM underlying_quotes uq
+                    WHERE uq.symbol = $1
+                      AND uq.timestamp <= b.timestamp
+                    ORDER BY uq.timestamp DESC
+                    LIMIT 1
+                ) prior_bar ON TRUE
+            ),
             -- Every gex_by_strike read below is a LATERAL correlated on the
             -- bucket representative in ``base``, and that is structural.
             --
@@ -4365,12 +4393,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             strike_agg AS MATERIALIZED (
                 SELECT b.timestamp, agg.total_call_gex, agg.total_put_gex
                 FROM base b
-                CROSS JOIN spot s
+                JOIN bucket_spot bs ON bs.bucket_ts = b.bucket_ts
                 CROSS JOIN LATERAL (
                     SELECT
                         -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
-                        COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_call_gex,
-                        COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_put_gex
+                        COALESCE(SUM(gbs.call_gamma * 100 * bs.spot_price * bs.spot_price * 0.01), 0)::numeric AS total_call_gex,
+                        COALESCE(SUM(-1 * gbs.put_gamma * 100 * bs.spot_price * bs.spot_price * 0.01), 0)::numeric AS total_put_gex
                     FROM gex_by_strike gbs
                     WHERE gbs.underlying = $1
                       AND gbs.timestamp = b.timestamp
@@ -4440,7 +4468,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT
                 b.bucket_ts as timestamp,
                 b.symbol,
-                s.spot_price,
+                bs.spot_price,
                 COALESCE(sa.total_call_gex, 0)::numeric AS total_call_gex,
                 COALESCE(sa.total_put_gex, 0)::numeric AS total_put_gex,
                 -- Re-derive net_gex from strike sums so historical buckets
@@ -4461,7 +4489,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 b.local_gex,
                 b.convexity_risk
             FROM base b
-            CROSS JOIN spot s
+            JOIN bucket_spot bs ON bs.bucket_ts = b.bucket_ts
             LEFT JOIN strike_agg sa ON sa.timestamp = b.timestamp
             LEFT JOIN call_walls cw ON cw.bucket_ts = b.bucket_ts
             LEFT JOIN put_walls  pw ON pw.bucket_ts = b.bucket_ts
