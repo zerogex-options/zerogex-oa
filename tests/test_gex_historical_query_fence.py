@@ -168,8 +168,9 @@ def test_strike_agg_still_zero_fills_rather_than_dropping_a_bucket():
 
     Pre-fix, a timestamp with no gex_by_strike rows produced no strike_agg row
     and the outer COALESCE turned the NULL into 0. Post-fix it produces a row
-    of zeros. Same output either way -- but only because the aggregate keeps its
-    COALESCE, so pin that.
+    of zeros, plus ``strike_rows = 0``, which is what the final SELECT reads to
+    serve that bucket's stored gex_summary figures instead of the zeros (see
+    test_historical_falls_back_to_stored_figures_once_strikes_are_pruned).
     """
     sql = _historical_sql()
     body = _cte(sql, "strike_agg")
@@ -177,6 +178,7 @@ def test_strike_agg_still_zero_fills_rather_than_dropping_a_bucket():
     assert "GROUP BY" not in body, "a GROUP BY here would let a bucket vanish"
     assert "COALESCE(SUM(gbs.call_gamma" in body
     assert "COALESCE(SUM(-1 * gbs.put_gamma" in body
+    assert "COUNT(*) AS strike_rows" in body
 
 
 def test_fence_holds_for_every_timeframe_the_endpoint_accepts():
