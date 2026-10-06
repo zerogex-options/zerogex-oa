@@ -335,7 +335,7 @@ null-valued key, so you can index the envelope unconditionally.
 | `fresh` | `source_timestamp` is within one expected cadence. | No |
 | `aging` | Past one cadence, not yet past `stale_after` — the grace band absorbing normal cycle jitter. Seen routinely when you poll faster than the cadence. | No |
 | `stale` | Past `stale_after` **while an update was due**. The feed behind this endpoint is late. | **Yes** |
-| `session_closed` | A feed-backed endpoint whose feed is not due to produce anything: a weekend, an NYSE holiday, an early-close afternoon, or the overnight gap (ingestion runs 04:00–20:00 ET). The payload is the last good value. | No |
+| `session_closed` | A feed-backed endpoint whose feed is not due to produce anything: a weekend, an NYSE holiday, an early-close afternoon, or the overnight gap (ingestion runs 04:00–20:00 ET; a cash index such as SPX prints only 09:30–16:00). The payload is the last good value. | No |
 | `static` | Not feed-backed at all: completed history, or a result computed from your own inputs. Age carries no health meaning. | No |
 | `unknown` | No source timestamp could be resolved (an empty result set, a pure calculator). Fall back to `evaluated_at` for health; make no claim about data age. | No |
 
@@ -353,12 +353,12 @@ upstream can change.
 
 | Profile | Endpoints | Regular | Extended | Overnight |
 | --- | --- | --- | --- | --- |
-| `realtime_quote` | `/api/market/quote` and the rest of `/api/market/*` | 60 s | 60 s | — |
+| `realtime_quote` | `/api/market/quote` and the rest of `/api/market/*` | 60 s | 60 s (not cash indexes) | — |
 | `option_chain` | `/api/option/*`, `/api/market/open-interest` | 60 s | 60 s (to 16:15 only) | — |
 | `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
-| `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s | — |
+| `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s (not cash indexes) | — |
 | `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
-| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s | — |
+| `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s (not cash indexes) | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
 | `cone_cycle` | `/api/cone/session/*`, `/api/cone/latest` | 15 min (09:45–15:30 ET only) | — | — |
 | `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/cone/reliability`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
@@ -387,23 +387,39 @@ owes you an update. Two narrower cases the calendar also handles: cash-index
 chains (SPX, NDX) stop at 16:00 with the index they price, and every chain
 stops at the early close on a half day.
 
+**Cash indexes owe nothing outside 09:30–16:00 ET.** SPX and NDX print only
+in the regular session (to 13:00 on an early close), so nothing computed from
+one — its quote, its analytics, its signal scores — can change outside it,
+however long the ETF tape beside it runs. For SPX and NDX those endpoints
+report `session_closed` from the close to the next open, and a response read
+before the open is the prior close, carried forward. ES and NQ on projected
+endpoints (`/api/v2/levels/ES`, `/api/v2/gex/*`, `/api/v2/signals/*` and the
+rest of the projected surface) are answered from SPX and NDX, so they carry
+the index's envelope and follow the same window.
+
 Cadence describes how often a new observation can be **stored**, not how
 often ingestion polls, and not how fast the producing engine loops. The quote
 tape is polled every few seconds but written in 60-second buckets, so 60 s is
 the fastest a new value can appear. VIX/VXN and the whole of `/api/flow/*` are
 5-minute bars. The signal engine loops about once a second, but a score is
 stamped with the underlying-quote timestamp it read, so it cannot be fresher
-than that same 60-second bucket.
+than that same 60-second bucket. The analytics engine may also cycle faster
+than once a minute, but each snapshot is filed under its minute bucket, so
+`analytics_cycle` never advertises less than 60 s.
 
 Poll faster than the cadence if you like — it is cheap against the cache — but
 expect `aging` between stores. That band is normal, not a warning.
 
-**ES and NQ are graded on the CME calendar**, not the NYSE one — they trade
-Sunday 18:00 to Friday 17:00 ET. A futures symbol therefore reports
-`market_session_status: regular` (and a real `stale` verdict) through the
-overnight hours when the cash market is shut, so a stalled futures feed is
-visible rather than hidden behind `session_closed`. Cash symbols are
-unaffected.
+**ES and NQ are graded on the CME calendar where they are served from the
+futures feed itself**: `/api/market/quote`, `/api/market/historical`, session
+closes and session levels. Futures trade Sunday 18:00 to Friday 17:00 ET, so
+there a futures symbol reports `market_session_status: regular` (and a real
+`stale` verdict) through the overnight hours when the cash market is shut, and
+a stalled futures feed is visible rather than hidden behind `session_closed`.
+Everywhere else ES and NQ are SPX and NDX projected onto the futures axis (see
+*ES / NQ and the basis a response is projected on*), so their envelope is the
+index's, graded on the index's session: that is when their data can change.
+Cash symbols are unaffected.
 
 `stale_after` is anchored to the later of `source_timestamp` and the instant
 the current feed window opened, so a payload one second into a new window
@@ -417,9 +433,9 @@ Friday's session close is the correct answer all through Monday morning, and
 
 Source of truth: `ENDPOINT_CADENCE` and the `CadenceProfile` definitions in
 `src/api/freshness.py`. Cadence numbers are read from the same config
-constants the engines run on (`ANALYTICS_INTERVAL`,
-`MARKET_HOURS_POLL_INTERVAL`, `AGGREGATION_BUCKET_SECONDS`), so retuning a
-poll interval changes what the envelope advertises.
+constants the engines and stores run on (`AGGREGATION_BUCKET_SECONDS`,
+`ANALYTICS_INTERVAL`, `FLOW_BAR_SECONDS`), so retuning one changes what the
+envelope advertises — but never to less than the bucket a value is stored in.
 
 ### Calendar configuration
 
@@ -657,16 +673,27 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   the numbers are filed under; `computed_at` is when they were *produced*.
   A sub-minute cadence rewrites the same minute row, so `computed_at` is the
   one field that changes on a rewrite. v2 `generated_at` reports it.
-- `data_as_of` is what the numbers are actually *as of*: the newest quote
-  write the engine read for this snapshot (null on rows that predate the
-  column). A minute bucket is already up to a minute old when the cycle reads
-  it, so measuring staleness from `as_of` overstated every snapshot's age by
-  the cycle's phase in the minute — 26–59s measured in production while the
-  quotes inside were under 5s old. **`age_seconds` and the v2
-  `source_timestamp` / `freshness_status` are measured from `data_as_of`
-  when present**, and from `as_of` only on rows that predate it. Consumers
-  that display `age_seconds` (the NinjaTrader and Sierra Chart studies)
-  therefore read lower, and truer, with no change on their side.
+- `data_as_of` is the newest option-quote write the engine read for this
+  snapshot (null on rows that predate the column). In session it is what the
+  numbers are actually *as of*: a minute bucket is already up to a minute old
+  when the cycle reads it, so measuring staleness from `as_of` overstated
+  every snapshot's age by the cycle's phase in the minute — 26–59s measured in
+  production while the quotes inside were under 5s old. `age_seconds` is
+  measured from `data_as_of` when present, and from `as_of` only on rows that
+  predate it, so consumers that display it (the NinjaTrader and Sierra Chart
+  studies) read the age of the option quotes.
+- The v2 `source_timestamp` / `freshness_status` follow the **newer** of
+  `data_as_of` and `as_of`: the newest market observation the snapshot was
+  computed from. In the options session that is `data_as_of`. Outside it the
+  option feed writes little or nothing, so before the open every symbol's
+  positioning is effectively the prior session's. When its option quotes lag
+  its own extended-hours tape, an ETF (SPY, QQQ) is still re-priced each cycle
+  at the newest bar of that tape; `as_of` is that bar, the envelope follows
+  it, and `data_as_of` says how old the quotes underneath are — so
+  `data.age_seconds` reads larger than `freshness.age_seconds` then. A cash
+  index has no extended-hours tape, so nothing re-prices SPX or NDX (or ES /
+  NQ, projected from them) outside the session: both stamps are the prior
+  close, and the envelope reports `session_closed`.
 - `as_of` / `age_seconds` describe snapshot freshness — see *Data
   freshness & update cadence* above.
 - For `ES` / `NQ`, `data_contract` and `data_contract_expiry` name the CME

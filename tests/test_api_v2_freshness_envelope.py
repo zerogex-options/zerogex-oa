@@ -1314,3 +1314,219 @@ def test_data_as_of_is_the_observation_when_a_snapshot_states_it():
     assert f.generated_at == computed
     assert f.source_timestamp == quotes
     assert f.age_seconds == 63.0
+
+
+# ---------------------------------------------------------------------------
+# A cash index prints only in the regular session
+# ---------------------------------------------------------------------------
+
+LEVELS = "/api/v1/levels/{symbol}"
+# Tuesday 2026-10-06, 08:59:02 ET: the pre-market read that found this.
+TUE_PREMARKET = datetime(2026, 10, 6, 12, 59, 2, tzinfo=timezone.utc)
+# What /api/v2/levels/SPX carried at that read: the last cycle of Monday's
+# session. SPX prints nothing before 09:30, so nothing re-priced it overnight.
+SPX_MONDAY_CLOSE = {
+    "symbol": "SPX",
+    "as_of": datetime(2026, 10, 5, 19, 59, tzinfo=timezone.utc),
+    "computed_at": datetime(2026, 10, 5, 20, 0, 5, tzinfo=timezone.utc),
+    "data_as_of": datetime(2026, 10, 5, 19, 59, 58, tzinfo=timezone.utc),
+}
+
+
+@pytest.mark.parametrize("symbol", ["SPX", "NDX"])
+def test_a_cash_index_snapshot_carried_into_the_pre_market_is_not_stale(symbol):
+    """Before the open a cash index's levels ARE the prior close: the index
+    does not print and its chain stopped at 16:00. Graded on the ETF tape's
+    04:00 window they read `stale` -- the one status a consumer pages on --
+    from just after 04:00 until the first cycle after the open, every
+    weekday."""
+    body = {**SPX_MONDAY_CLOSE, "symbol": symbol}
+    f = fr.build_freshness(
+        body, profile=fr.resolve_profile(LEVELS), now=TUE_PREMARKET, symbol=symbol
+    )
+    assert f.freshness_status is fr.FreshnessStatus.SESSION_CLOSED
+    assert f.expected_update_cadence is None
+    assert f.stale_after is None
+    # The session label stays the true NYSE one, and the age is still measured
+    # honestly from the observation. It just is not a fault.
+    assert f.market_session_status == fr.SESSION_PRE_MARKET
+    assert f.source_timestamp == body["data_as_of"]
+    assert f.age_seconds > 16 * 3600
+
+
+@pytest.mark.parametrize(
+    "path",
+    [LEVELS, "/api/gex/summary", "/api/technicals", "/api/signals/score", "/api/market/quote"],
+)
+def test_nothing_an_index_feeds_is_due_between_its_close_and_20_00(path):
+    """The same false page, every evening: the ETF tape runs to 20:00, the
+    index stopped at 16:00, and everything computed from it -- quote,
+    analytics, technicals, signal scores -- has nothing newer to show."""
+    evening = datetime(2026, 10, 5, 21, 30, tzinfo=timezone.utc)  # 17:30 ET
+    f = fr.build_freshness(
+        {"timestamp": datetime(2026, 10, 5, 19, 59, tzinfo=timezone.utc)},
+        profile=fr.resolve_profile(path),
+        now=evening,
+        symbol="SPX",
+    )
+    assert f.freshness_status is fr.FreshnessStatus.SESSION_CLOSED
+    assert f.market_session_status == fr.SESSION_AFTER_HOURS
+
+
+def test_a_cash_index_feed_dead_in_session_is_still_stale():
+    """Narrowing the window must delay nothing inside it."""
+    f = fr.build_freshness(
+        {"timestamp": THU_MIDSESSION - timedelta(hours=1)},
+        profile=fr.resolve_profile(LEVELS),
+        now=THU_MIDSESSION,
+        symbol="SPX",
+    )
+    assert f.freshness_status is fr.FreshnessStatus.STALE
+
+
+def test_a_cash_index_gets_its_grace_period_at_its_own_open():
+    """At 09:30:30 the newest SPX observation is still Monday's close. Anchored
+    at the 04:00 ingestion open it would already be five hours late; anchored
+    at the index's first print it has a full grace period -- and loses it if
+    nothing arrives."""
+    monday_close = datetime(2026, 10, 5, 20, 0, tzinfo=timezone.utc)
+    just_open = datetime(2026, 10, 6, 13, 30, 30, tzinfo=timezone.utc)  # 09:30:30 ET
+    opened = fr.build_freshness(
+        {"timestamp": monday_close},
+        profile=fr.resolve_profile(LEVELS),
+        now=just_open,
+        symbol="SPX",
+    )
+    assert opened.freshness_status is fr.FreshnessStatus.AGING
+    assert opened.stale_after == datetime(2026, 10, 6, 13, 32, 30, tzinfo=timezone.utc)
+
+    never_arrived = fr.build_freshness(
+        {"timestamp": monday_close},
+        profile=fr.resolve_profile(LEVELS),
+        now=just_open + timedelta(minutes=10),
+        symbol="SPX",
+    )
+    assert never_arrived.freshness_status is fr.FreshnessStatus.STALE
+
+
+def test_etf_analytics_are_still_due_in_extended_hours():
+    """SPY and QQQ have a pre-market tape and the engine re-prices them on it,
+    so a dead analytics feed must still read stale there."""
+    f = fr.build_freshness(
+        {"timestamp": TUE_PREMARKET - timedelta(hours=1)},
+        profile=fr.resolve_profile(LEVELS),
+        now=TUE_PREMARKET,
+        symbol="SPY",
+    )
+    assert f.freshness_status is fr.FreshnessStatus.STALE
+
+
+def test_an_etf_snapshot_re_priced_pre_market_is_graded_on_its_newest_input():
+    """Before the open the engine re-prices the SPY surface each cycle at the
+    newest ETF bar (``as_of``) while the option quotes under it hold at their
+    last write (``data_as_of``, minutes older). The envelope grades the newest
+    market observation the snapshot was computed from, which is that bar; the
+    quotes' age stays readable in ``data_as_of``. The guide once said the
+    envelope always follows ``data_as_of``; this pins what it really does."""
+    body = {
+        "symbol": "SPY",
+        "as_of": TUE_PREMARKET - timedelta(seconds=62),
+        "computed_at": TUE_PREMARKET - timedelta(seconds=20),
+        "data_as_of": TUE_PREMARKET - timedelta(minutes=11),
+    }
+    f = fr.build_freshness(
+        body, profile=fr.resolve_profile(LEVELS), now=TUE_PREMARKET, symbol="SPY"
+    )
+    assert f.source_timestamp == body["as_of"]
+    assert f.generated_at == body["computed_at"]
+    assert f.freshness_status is fr.FreshnessStatus.AGING
+
+
+def test_daily_artifacts_for_an_index_still_age_in_sessions():
+    """The cash-index window narrows feeds, not once-a-session artifacts:
+    Monday's SPX close is still the right answer at Tuesday's pre-market."""
+    f = fr.build_freshness(
+        {"timestamp": datetime(2026, 10, 5, 20, 0, tzinfo=timezone.utc)},
+        profile=fr.DAILY_CYCLE,
+        now=TUE_PREMARKET,
+        symbol="SPX",
+    )
+    assert f.freshness_status is fr.FreshnessStatus.FRESH
+
+
+def test_projected_es_levels_are_graded_as_the_index_they_come_from(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """ES has no chain of its own: /api/v2/levels/ES is answered by the SPX
+    handler and carried onto the futures axis. The middleware rewrites the
+    request before the v2 wrapper sees it, so the envelope is SPX's -- and
+    SPX's pre-market levels are Monday's close, which must read
+    session_closed. Driven through the real middleware and mirror, because a
+    unit test of build_freshness cannot see which symbol actually arrives."""
+    from fastapi import FastAPI
+
+    from src.api.futures_middleware import FuturesProjectionMiddleware
+
+    seen: list = []
+    real = v2mod.build_freshness
+
+    def at_premarket(payload, *, profile, now=None, symbol=None):
+        seen.append(symbol)
+        return real(payload, profile=profile, now=TUE_PREMARKET, symbol=symbol)
+
+    monkeypatch.setattr(v2mod, "build_freshness", at_premarket)
+
+    app = FastAPI()
+
+    @app.get("/api/v1/levels/{symbol}")
+    async def levels(symbol: str):
+        return {
+            **{
+                k: v.isoformat() if isinstance(v, datetime) else v
+                for k, v in SPX_MONDAY_CLOSE.items()
+            },
+            "symbol": symbol,
+            "spot": 6700.0,
+            "levels": {"gamma_flip": 6650.0, "call_wall": 6750.0, "put_wall": 6600.0},
+            "profile": [],
+        }
+
+    v2mod.mount_v2(app)
+    app.add_middleware(FuturesProjectionMiddleware)
+    with TestClient(app) as c:
+        resp = c.get("/api/v2/levels/ES")
+
+    assert resp.status_code == 200
+    assert seen == ["SPX"]
+    body = resp.json()
+    assert body["data"]["symbol"] == "ES"
+    assert "projection" in body["data"]
+    assert body["freshness"]["freshness_status"] == "session_closed"
+    assert body["freshness"]["market_session_status"] == fr.SESSION_PRE_MARKET
+    assert resp.headers["X-Freshness-Status"] == "session_closed"
+
+
+def test_analytics_never_advertise_faster_than_the_minute_bucket():
+    """Production runs the analytics engine every 30s, but the snapshot is
+    filed under its minute bucket, and that is the stamp these payloads carry.
+    conftest pins ANALYTICS_INTERVAL to the 60s default, so no in-process test
+    can see the production value; import the module fresh under it instead."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    code = (
+        "from src.api import freshness as fr\n"
+        "p = fr.ANALYTICS_CYCLE\n"
+        "print('CADENCE', p.regular_seconds, p.extended_seconds)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**os.environ, "ANALYTICS_INTERVAL": "30"},
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    line = next(ln for ln in out.stdout.splitlines() if ln.startswith("CADENCE"))
+    assert line.split()[1:] == ["60.0", "60.0"], line

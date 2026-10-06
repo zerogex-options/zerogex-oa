@@ -13,6 +13,12 @@ before production:
   4. Option chains were graded on the underlying's 04:00-20:00 window
      instead of the 09:30-16:15 options session — 9h15m wrong per weekday.
 
+A fifth shipped past this file because it swept SPY only: a cash index
+(SPX, NDX) prints 09:30-16:00, and everything derived from one — quote,
+analytics, signals, and ES / NQ projected from them — read ``stale`` from
+04:00 to the open and from the close to 20:00. The cash-index sweeps at the
+bottom close that gap.
+
 They share only one thing: *when* they were wrong. Every smoke run and every
 ``make api-test`` landed outside market hours, where ``session_closed`` masks
 all four, so a green board meant nothing. This file removes the need to wait
@@ -73,8 +79,12 @@ class Feed:
 #                    60 s         same bucket as the tape
 #   VIX/VXN          04:00-20:00  CBOE index feed
 #                    300 s        VOLATILITY_BAR_INTERVAL, 5-minute bars
-#   analytics        04:00-20:00  engine recomputes off the live tape
-#                    60 s         ANALYTICS_INTERVAL
+#   analytics        04:00-20:00  engine recomputes off the live tape (an ETF;
+#                                 a cash index only prints 09:30-16:00, below)
+#                    60 s         the minute bucket the snapshot is filed
+#                                 under (AGGREGATION_BUCKET_SECONDS), NOT
+#                                 ANALYTICS_INTERVAL: production cycles every
+#                                 30 s, but the stamp cannot outrun its bucket
 #   flow             09:30-16:00  accrued over the cash session only
 #                    300 s        flow_by_contract rows are keyed to 5-minute
 #                                 bucket starts (database.get_flow and
@@ -432,3 +442,124 @@ def test_the_signal_score_cannot_outrun_the_bucket_it_reads():
         "— re-derive the signals granularity before trusting this cadence"
     )
     assert fr.SIGNALS_CYCLE.regular_seconds == float(AGGREGATION_BUCKET_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# The same sweeps for a cash index
+# ---------------------------------------------------------------------------
+
+# SPX and NDX print only in the regular session, 09:30 to the close, so every
+# feed derived from one writes only then: its quote, the analytics computed
+# from its chain and level, the signal scores stamped with its bars. Stated
+# here as a fact about the index, not read back out of
+# cash_index_session_open. ES / NQ on a projected endpoint reach the envelope
+# as SPX / NDX, so this sweep is their sweep too.
+CASH_INDEX_WINDOW = (time(9, 30), time(16, 0))
+
+CASH_INDEX_PATHS = {
+    "/api/market/quote": "realtime_quote",
+    "/api/v1/levels/{symbol}": "analytics_cycle",
+    "/api/gex/summary": "analytics_cycle",
+    "/api/technicals": "analytics_cycle",
+    "/api/signals/score": "signals_cycle",
+    "/api/option/quote": "option_chain",
+    "/api/flow/series": "flow_aggregate",
+}
+
+
+def _index_window_on(day: date) -> tuple[time, time] | None:
+    if day.weekday() > 4:
+        return None
+    if day == HALF_DAY:
+        return CASH_INDEX_WINDOW[0], time(13, 0)
+    return CASH_INDEX_WINDOW
+
+
+@pytest.mark.parametrize("symbol", ["SPX", "NDX"])
+@pytest.mark.parametrize("day", [WEEKDAY, HALF_DAY, WEEKEND], ids=["weekday", "half", "weekend"])
+@pytest.mark.parametrize("path,name", sorted(CASH_INDEX_PATHS.items()))
+def test_a_healthy_index_feed_is_never_stale(path, name, day, symbol):
+    profile = fr.resolve_profile(path)
+    window = _index_window_on(day)
+    granularity = GROUND_TRUTH[name].granularity
+    for now in _sweep(day):
+        et_t = now.astimezone(ET).time()
+        if window is not None and window[0] <= et_t < window[1]:
+            source = now - timedelta(seconds=granularity)
+        else:
+            # Outside its session the newest observation an index can have is
+            # its last print before the close.
+            last_day = day if window is not None and et_t >= window[1] else day - timedelta(days=1)
+            close_t = (_index_window_on(last_day) or CASH_INDEX_WINDOW)[1]
+            source = _et_at(last_day, close_t) - timedelta(seconds=granularity)
+        status = fr.build_freshness(
+            {"timestamp": source}, profile=profile, now=now, symbol=symbol
+        ).freshness_status
+        assert status is not fr.FreshnessStatus.STALE, (
+            f"{path} for {symbol} at {now.astimezone(ET):%a %H:%M ET}: graded stale "
+            f"on a healthy index feed (session {window}, observation "
+            f"{source.astimezone(ET):%a %H:%M ET})"
+        )
+
+
+@pytest.mark.parametrize("day", [WEEKDAY, HALF_DAY, WEEKEND], ids=["weekday", "half", "weekend"])
+@pytest.mark.parametrize("path,name", sorted(CASH_INDEX_PATHS.items()))
+def test_an_index_feed_is_due_exactly_while_the_index_prints(path, name, day):
+    profile = fr.resolve_profile(path)
+    window = _index_window_on(day)
+    for now in _sweep(day):
+        et_t = now.astimezone(ET).time()
+        # The closing instant is not asserted, for the reason given in
+        # test_a_cadence_is_advertised_exactly_while_the_feed_writes.
+        if window is not None and et_t == window[1]:
+            continue
+        due = window is not None and window[0] <= et_t <= window[1]
+        advertised = (
+            fr.build_freshness(
+                {"timestamp": now}, profile=profile, now=now, symbol="SPX"
+            ).expected_update_cadence_seconds
+            is not None
+        )
+        if advertised != due:
+            fault = (
+                "advertises a cadence but the index prints nothing then"
+                if advertised
+                else "expects nothing while the index is printing"
+            )
+            raise AssertionError(
+                f"{path} for SPX at {now.astimezone(ET):%a %H:%M ET}: {fault} "
+                f"(index session {window})"
+            )
+
+
+@pytest.mark.parametrize("path,name", sorted(CASH_INDEX_PATHS.items()))
+def test_an_index_window_does_not_open_straight_into_stale(path, name):
+    """One to two minutes after the open, the newest SPX observation is still
+    the prior close. That is nothing arriving late yet; it is nothing having
+    had time to arrive."""
+    profile = fr.resolve_profile(path)
+    prior_close = _et_at(WEEKDAY - timedelta(days=1), CASH_INDEX_WINDOW[1])
+    for offset in (0, 1, 2):
+        now = _et_at(WEEKDAY, CASH_INDEX_WINDOW[0]) + timedelta(minutes=offset)
+        status = fr.build_freshness(
+            {"timestamp": prior_close}, profile=profile, now=now, symbol="SPX"
+        ).freshness_status
+        assert (
+            status is not fr.FreshnessStatus.STALE
+        ), f"{path} for SPX is stale {offset} min after the open"
+
+
+@pytest.mark.parametrize("path,name", sorted(CASH_INDEX_PATHS.items()))
+def test_a_dead_index_feed_is_still_caught_inside_its_session(path, name):
+    profile = fr.resolve_profile(path)
+    first = (datetime.combine(WEEKDAY, CASH_INDEX_WINDOW[0]) + timedelta(hours=1)).time()
+    for now in _sweep(WEEKDAY):
+        if not (first <= now.astimezone(ET).time() < CASH_INDEX_WINDOW[1]):
+            continue
+        status = fr.build_freshness(
+            {"timestamp": now - timedelta(hours=1)}, profile=profile, now=now, symbol="SPX"
+        ).freshness_status
+        assert status is fr.FreshnessStatus.STALE, (
+            f"{path} for SPX at {now.astimezone(ET):%a %H:%M ET}: a feed silent "
+            f"for an hour inside the index's own session reads {status.value}"
+        )

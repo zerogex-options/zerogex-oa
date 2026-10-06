@@ -302,16 +302,33 @@ VOLATILITY_BAR = CadenceProfile(
     stale_floor_seconds=float(2 * VOLATILITY_BAR_SECONDS),
 )
 
+# The engine may cycle faster than the minute -- production runs
+# ANALYTICS_INTERVAL=30 -- but each cycle rewrites the snapshot filed under its
+# minute bucket, and that bucket is the stamp these payloads carry
+# (/api/gex/summary's `timestamp`, the levels `as_of`). It moves at most once a
+# minute however often the engine loops, so advertising 30s graded a healthy
+# snapshot against a cadence it cannot keep: `aging` for half of every minute,
+# and `stale` whenever the first cycle to see a new minute lands more than 15s
+# into it -- which nothing prevents (the loop-timing probe saw the phase jump
+# 10-30s between minutes). Same floor, for the same reason, as signals_cycle.
+# The levels body's data_as_of does move every cycle in session; grading it
+# against the floor is merely loose.
+#
+# Floored here rather than in the test environment: conftest pins
+# ANALYTICS_INTERVAL to the 60s default, which is exactly why no test saw this.
+ANALYTICS_CADENCE_SECONDS = float(max(ANALYTICS_INTERVAL, AGGREGATION_BUCKET_SECONDS))
+
 ANALYTICS_CYCLE = CadenceProfile(
     name="analytics_cycle",
     description=(
         "Derived dealer-positioning analytics (GEX, walls, gamma flip, max "
         "pain, per-strike profile, vol/premium surfaces). Recomputed on the "
-        "analytics cycle (config.ANALYTICS_INTERVAL=60s; "
-        "ANALYTICS_OFF_HOURS_INTERVAL_SECONDS=300s off-hours)."
+        "analytics cycle (config.ANALYTICS_INTERVAL), and filed under "
+        "config.AGGREGATION_BUCKET_SECONDS=60s buckets, so the advertised "
+        "cadence is never faster than one bucket."
     ),
-    regular_seconds=float(ANALYTICS_INTERVAL),
-    extended_seconds=float(ANALYTICS_INTERVAL),
+    regular_seconds=ANALYTICS_CADENCE_SECONDS,
+    extended_seconds=ANALYTICS_CADENCE_SECONDS,
     # None, not the 300s off-hours cycle: the engine may still tick overnight
     # but option_chains/underlying_quotes stop at 20:00 ET, so every cycle
     # between 20:00 and 04:00 recomputes the SAME 20:00 observation. Claiming
@@ -651,6 +668,48 @@ def option_chain_market_day(now: datetime, symbol: Optional[str] = None) -> bool
         return True
 
 
+def _is_cash_index(symbol: Optional[str]) -> bool:
+    """True when ``symbol`` is a cash index (SPX, NDX, ...)."""
+    if not symbol:
+        return False
+    try:
+        from src.symbols import is_cash_index
+
+        return bool(is_cash_index(symbol))
+    except Exception:  # noqa: BLE001 - never fail a response over symbol lookup
+        return False
+
+
+def cash_index_session_open(now: datetime) -> bool:
+    """Is a cash index printing at ``now``?
+
+    SPX and NDX print only in the regular session, 09:30 to the close (13:00
+    on an early-close day). So nothing derived from one -- its quote, the
+    analytics computed from its chain and its level, the signals scored on its
+    bars -- can produce a new observation outside that window, however long
+    the ETF tape beside it runs. Grading those on the 04:00-20:00 ingestion
+    window called every one of them ``stale`` from 04:00 to the open and from
+    the close to 20:00, every weekday: the false page option chains were
+    cured of, left in place on everything else an index feeds.
+
+    ES / NQ on a projected endpoint reach the envelope as SPX / NDX (the
+    futures middleware rewrites the request before the handler runs), so they
+    are graded here too. That is the right answer, not a leak: their payload
+    IS the index's, carried onto the futures axis, and it cannot move before
+    the index does.
+
+    Fails OPEN like option_chain_market_day: better to grade a feed that may
+    not be due than to hide a real outage behind a broken calendar.
+    """
+    try:
+        from src.market_calendar import in_regular_session
+
+        return in_regular_session(now)
+    except Exception:  # noqa: BLE001
+        logger.warning("freshness: cash-session calendar unavailable", exc_info=True)
+        return True
+
+
 def market_context(now: Optional[datetime] = None) -> Tuple[str, bool]:
     """Return ``(market_session_status, market_day)`` for ``now``.
 
@@ -727,6 +786,10 @@ def feed_window_open(
     open_t = profile.feed_opens_et or (
         _at(9, 30) if profile.extended_seconds is None else _at(4, 0)
     )
+    # A cash index's window opens with its first print, not with ingestion
+    # (see cash_index_session_open). At 04:00 there is nothing to be late.
+    if _is_cash_index(symbol):
+        open_t = max(open_t, _at(9, 30))
     if now_et.time() < open_t:
         return None
     return _ET.localize(
@@ -1149,6 +1212,12 @@ def build_freshness(
     # would put two authorities in front of one question.
     if profile is OPTION_CHAIN:
         market_day = option_chain_market_day(evaluated_at, symbol) and market_day
+    # A cash index owes nothing outside its own session (see
+    # cash_index_session_open). Option chains are left to the chain calendar
+    # above, which already ends cash-index chains at 16:00 -- one authority per
+    # window. Session-scoped artifacts age in trading sessions, not inside one.
+    elif _is_cash_index(symbol) and profile.feed_backed and not profile.session_scoped:
+        market_day = cash_index_session_open(evaluated_at) and market_day
 
     try:
         generated_at, latest_event_at = _scan_timestamps(payload, evaluated_at)
