@@ -4293,7 +4293,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     gs.timestamp,
                     gs.underlying as symbol,
-                    gs.total_net_gex as net_gex,
+                    -- The stored figures, served only for a bucket whose
+                    -- gex_by_strike rows have been pruned (see the final
+                    -- SELECT).
+                    gs.total_net_gex as summary_net_gex,
+                    gs.call_wall as summary_call_wall,
+                    gs.put_wall as summary_put_wall,
                     gs.gamma_flip_point as gamma_flip,
                     gs.gamma_flip_span_used,
                     gs.max_pain,
@@ -4401,15 +4406,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- either way, but it multiplies the read by the bucket count, and
             -- the whole point of the lateral is that the probe count is
             -- exactly the rep count.  Materialised, each runs once.
+            --
+            -- ``strike_rows`` is what tells a pruned bucket from a flat one.
+            -- The aggregate has no GROUP BY, so a timestamp with no
+            -- gex_by_strike rows still yields a row here, of zeros.
             strike_agg AS MATERIALIZED (
-                SELECT b.timestamp, agg.total_call_gex, agg.total_put_gex
+                SELECT b.timestamp, agg.total_call_gex, agg.total_put_gex, agg.strike_rows
                 FROM base b
                 JOIN bucket_spot bs ON bs.bucket_ts = b.bucket_ts
                 CROSS JOIN LATERAL (
                     SELECT
                         -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
                         COALESCE(SUM(gbs.call_gamma * 100 * bs.spot_price * bs.spot_price * 0.01), 0)::numeric AS total_call_gex,
-                        COALESCE(SUM(-1 * gbs.put_gamma * 100 * bs.spot_price * bs.spot_price * 0.01), 0)::numeric AS total_put_gex
+                        COALESCE(SUM(-1 * gbs.put_gamma * 100 * bs.spot_price * bs.spot_price * 0.01), 0)::numeric AS total_put_gex,
+                        COUNT(*) AS strike_rows
                     FROM gex_by_strike gbs
                     WHERE gbs.underlying = $1
                       AND gbs.timestamp = b.timestamp
@@ -4480,18 +4490,33 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 b.bucket_ts as timestamp,
                 b.symbol,
                 bs.spot_price,
-                COALESCE(sa.total_call_gex, 0)::numeric AS total_call_gex,
-                COALESCE(sa.total_put_gex, 0)::numeric AS total_put_gex,
-                -- Re-derive net_gex from strike sums so historical buckets
-                -- always reflect the current formula and stay consistent with
-                -- (total_call_gex + total_put_gex), even for rows persisted
-                -- under an older convention.
-                (COALESCE(sa.total_call_gex, 0) + COALESCE(sa.total_put_gex, 0))::numeric AS net_gex,
+                -- Two sources, chosen per bucket.  gex_by_strike is pruned at
+                -- DATA_RETENTION_DAYS but gex_summary is retention-exempt, so
+                -- most of the history this endpoint reaches has no per-strike
+                -- rows.  Recomputing there returned NULL walls and a dollar GEX
+                -- of 0, a plausible number, so a backtest read "no dealer
+                -- gamma" for every session past the window.
+                --
+                -- While the rows exist, these are re-derived from them as
+                -- before, which keeps the walls in agreement with
+                -- /api/gex/strike-profile-timeseries.  Once they are gone, the
+                -- bucket's own gex_summary row answers: its walls come from
+                -- the same compute_call_put_walls ranking (split on that
+                -- cycle's spot rather than the bucket close, so at most a
+                -- strike apart at the spot boundary), and total_net_gex is the
+                -- same γ × OI × 100 × S² × 0.01 sum.  gex_summary stores no
+                -- call/put split, so those two are NULL rather than a made-up 0.
+                CASE WHEN sa.strike_rows > 0 THEN sa.total_call_gex END AS total_call_gex,
+                CASE WHEN sa.strike_rows > 0 THEN sa.total_put_gex END AS total_put_gex,
+                CASE WHEN sa.strike_rows > 0
+                     THEN (sa.total_call_gex + sa.total_put_gex)::numeric
+                     ELSE b.summary_net_gex::numeric
+                END AS net_gex,
                 b.gamma_flip,
                 b.gamma_flip_span_used,
                 b.max_pain,
-                cw.call_wall,
-                pw.put_wall,
+                CASE WHEN sa.strike_rows > 0 THEN cw.call_wall ELSE b.summary_call_wall END AS call_wall,
+                CASE WHEN sa.strike_rows > 0 THEN pw.put_wall ELSE b.summary_put_wall END AS put_wall,
                 b.total_call_oi,
                 b.total_put_oi,
                 b.put_call_ratio,

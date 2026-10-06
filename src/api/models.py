@@ -41,9 +41,12 @@ class GEXSummary(BaseModel):
     timestamp: datetime
     symbol: str
     spot_price: Decimal
-    total_call_gex: Decimal
-    total_put_gex: Decimal
-    net_gex: Decimal
+    # Nullable for /api/gex/historical: a bucket older than the per-strike
+    # retention window has no call/put split, and its net GEX is the stored
+    # figure, which can itself be NULL.
+    total_call_gex: Optional[Decimal]
+    total_put_gex: Optional[Decimal]
+    net_gex: Optional[Decimal]
     net_gex_at_spot: Optional[Decimal] = None
     gamma_flip: Optional[Decimal] = None
     # Raw nearest zero-crossing on the UN-DTE-weighted gamma profile —

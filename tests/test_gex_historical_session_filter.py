@@ -64,14 +64,16 @@ def test_historical_walls_computed_live_against_per_bucket_close():
     """Walls in /api/gex/historical are computed live from gex_by_strike
     (the same canonical helper every other consumer uses), using each
     bucket's own ``underlying_quotes`` close as the above-/below-spot
-    reference.  The persisted ``gex_summary.call_wall`` / ``put_wall``
-    columns are NOT read — that keeps /api/gex/historical
-    byte-for-byte agreement with /api/gex/strike-profile-timeseries
-    when its ``expirations=all``.
+    reference.  While a bucket has per-strike rows, the persisted
+    ``gex_summary.call_wall`` / ``put_wall`` columns are NOT used — that
+    keeps /api/gex/historical byte-for-byte agreement with
+    /api/gex/strike-profile-timeseries when its ``expirations=all``.
 
     Pinning the SQL shape so future refactors don't silently revert to
-    the persisted-column read (which used the cycle's live spot, not
-    the bucket's close, and could disagree on the boundary).
+    preferring the persisted columns (which used the cycle's live spot,
+    not the bucket's close, and could disagree on the boundary).  They
+    are only the fallback for a bucket whose per-strike rows were pruned;
+    see test_historical_falls_back_to_stored_figures_once_strikes_are_pruned.
     """
     captured = _run_historical("SPY")
     sql = captured["query"]
@@ -104,14 +106,87 @@ def test_historical_walls_computed_live_against_per_bucket_close():
     assert walls_block.count("GROUP BY gbs.strike") == 2
     assert walls_block.count("gbs.timestamp = b.timestamp") == 2
 
-    # The bucketed CTE must NOT read stored_call_wall / stored_put_wall;
-    # they were a basis-disagreement footgun (analytics-cycle spot vs.
-    # bucket close).  Walls now come from cw.call_wall / pw.put_wall
-    # exclusively.
+    # The persisted walls must never be PREFERRED over the live ones; they
+    # were a basis-disagreement footgun (analytics-cycle spot vs. bucket
+    # close).  The old shape was COALESCE(stored, live).
     assert "stored_call_wall" not in sql
     assert "stored_put_wall" not in sql
-    assert "COALESCE(b.stored_call_wall" not in sql
-    assert "COALESCE(b.stored_put_wall" not in sql
+    assert "COALESCE(b.summary_call_wall" not in sql
+    assert "COALESCE(b.summary_put_wall" not in sql
+
+
+def test_historical_falls_back_to_stored_figures_once_strikes_are_pruned():
+    """A bucket past the per-strike window answers from its gex_summary row.
+
+    gex_by_strike is pruned at DATA_RETENTION_DAYS (60 on production) while
+    gex_summary is retention-exempt, so most of the history the endpoint
+    reaches has no per-strike rows.  Recomputing there returned NULL walls
+    and ``net_gex = 0``: a plausible number, which a backtest read as "no
+    dealer gamma" for every session past the window.
+
+    Against a seeded Postgres, a SPY bucket with a gex_summary row
+    (total_net_gex 1.5e9, walls 610/590) and no gex_by_strike rows came
+    back as net_gex 0 and walls NULL before; after, 1.5e9 and 610/590.  A
+    bucket WITH per-strike rows kept its recomputed values byte-for-byte,
+    even with different walls planted in its gex_summary row.
+    """
+    for sym in ("SPY", "SPX"):
+        sql = _strip_sql_comments(_run_historical(sym)["query"])
+        flat = re.sub(r"\s+", " ", sql)
+
+        # The stored figures ride along on the bucket representative.
+        assert "gs.total_net_gex as summary_net_gex" in flat
+        assert "gs.call_wall as summary_call_wall" in flat
+        assert "gs.put_wall as summary_put_wall" in flat
+
+        # strike_agg counts the rows it summed: its no-GROUP-BY aggregate
+        # returns a row of zeros either way, so the count is the only thing
+        # that tells a pruned bucket from a flat one.
+        assert "COUNT(*) AS strike_rows" in flat
+        assert "agg.strike_rows" in flat
+
+        # Live while the per-strike rows exist, stored once they're gone.
+        assert (
+            "CASE WHEN sa.strike_rows > 0 THEN cw.call_wall "
+            "ELSE b.summary_call_wall END AS call_wall" in flat
+        )
+        assert (
+            "CASE WHEN sa.strike_rows > 0 THEN pw.put_wall "
+            "ELSE b.summary_put_wall END AS put_wall" in flat
+        )
+        assert (
+            "CASE WHEN sa.strike_rows > 0 THEN (sa.total_call_gex + sa.total_put_gex)::numeric "
+            "ELSE b.summary_net_gex::numeric END AS net_gex" in flat
+        )
+
+        # No call/put split is stored, so a pruned bucket reports NULL,
+        # never a zero that reads as a measurement.
+        assert "CASE WHEN sa.strike_rows > 0 THEN sa.total_call_gex END AS total_call_gex" in flat
+        assert "CASE WHEN sa.strike_rows > 0 THEN sa.total_put_gex END AS total_put_gex" in flat
+        assert "COALESCE(sa.total_call_gex, 0)" not in flat
+        assert "COALESCE(sa.total_put_gex, 0)" not in flat
+
+
+def test_historical_model_accepts_a_pruned_bucket():
+    """GEXSummary must take the NULLs a pruned bucket produces."""
+    from src.api.models import GEXSummary
+
+    row = GEXSummary(
+        timestamp="2026-07-01T14:00:00Z",
+        symbol="SPY",
+        spot_price=600,
+        total_call_gex=None,
+        total_put_gex=None,
+        net_gex=None,
+        gamma_flip=595,
+        max_pain=598,
+        call_wall=610,
+        put_wall=590,
+    ).model_dump(mode="json")
+    assert row["total_call_gex"] is None
+    assert row["total_put_gex"] is None
+    assert row["net_gex"] is None
+    assert row["call_wall"] == 610.0
 
 
 def _strip_sql_comments(sql: str) -> str:

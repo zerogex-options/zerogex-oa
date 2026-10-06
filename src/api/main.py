@@ -886,7 +886,14 @@ async def get_historical_gex(
     window_units: int = Query(default=90, ge=1, le=90),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
 ):
-    """Get historical GEX data"""
+    """Get historical GEX data.
+
+    Each bucket is the last snapshot inside it, up to ``window_units`` buckets
+    per request (newest first); page further back with ``start_date`` /
+    ``end_date``. Per-strike detail is kept for a shorter window than the
+    summary, so buckets older than it carry the walls and ``net_gex`` stored
+    with the snapshot, and ``total_call_gex`` / ``total_put_gex`` are null.
+    """
     try:
         # Parse dates if provided
         start_dt = datetime.fromisoformat(start_date) if start_date else None
