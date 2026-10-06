@@ -811,6 +811,214 @@ def compare_flow_classification(
     }
 
 
+def new_tick_state() -> Dict[str, Dict[Any, Any]]:
+    """Per-feed, per-contract memory the tick test needs across samples.
+
+    ``{feed: {contract_key: (prev_last, prev_volume_cum, direction)}}``.
+    Owned by the caller and threaded through every sample, because a tick
+    test is meaningless without the previous trade.
+    """
+    return {"inc": {}, "cand": {}}
+
+
+def compare_tick_test(
+    incumbent: "FeedSample",
+    candidate: "FeedSample",
+    state: Dict[str, Dict[Any, Any]],
+) -> Dict[str, Any]:
+    """Two questions the quote test cannot answer, measured together.
+
+    **Would switching method change the published figure?** Lee-Ready
+    against tick, both on the INCUMBENT's own data. The feed is held
+    constant, so the only variable is the classifier. This is the product
+    risk: it is what a subscriber would see change if we swapped methods
+    even with no vendor migration at all.
+
+    **Is the tick test feed-insensitive?** Tick on the incumbent against
+    tick on the candidate. NOT a tautology: the two last-trade sequences
+    come from different vendors' reads of the same tape, so they can
+    disagree on timing even though neither is adjusted. Near-identical is
+    the result we expect and the reason the tick test is a candidate at
+    all -- it reads no quote, so F9's crossed quotes cannot reach it.
+
+    Volume is a DELTA here, differenced from each feed's cumulative
+    figure, not the cumulative itself that
+    :meth:`compare_flow_classification` weights by. That makes the net
+    imbalance a per-interval quantity and the numbers in this block are
+    therefore NOT comparable with that block's -- only within themselves.
+
+    The delta is taken from the INCUMBENT for both classifiers, so a
+    coverage difference cannot masquerade as a classification difference.
+    """
+    from src.config import FLOW_CLASSIFY_MID_BAND_PCT
+    from src.ingestion.main_engine import IngestionEngine
+
+    quote_test = IngestionEngine._classify_volume_chunk
+    tick_test = IngestionEngine._classify_volume_chunk_tick
+    shim = object.__new__(IngestionEngine)
+
+    def _bucket_of(ask_v, mid_v, bid_v) -> Optional[str]:
+        if ask_v:
+            return "ask"
+        if bid_v:
+            return "bid"
+        if mid_v:
+            return "mid"
+        return None
+
+    candidate_by_contract = {
+        _contract_key(meta): candidate.quotes[symbol]
+        for symbol, meta in candidate.metadata.items()
+        if symbol in candidate.quotes
+    }
+
+    compared = 0
+    unmatched = 0
+    no_prior = 0
+    method_contracts = 0
+    method_volume = 0
+    feed_contracts = 0
+    volume_compared = 0
+    net_quote = 0
+    net_tick = 0
+    net_tick_cand = 0
+    shifts: Dict[str, int] = {}
+
+    for symbol, inc_q in incumbent.quotes.items():
+        meta = incumbent.metadata.get(symbol)
+        if meta is None:
+            unmatched += 1
+            continue
+        key = _contract_key(meta)
+        cand_q = candidate_by_contract.get(key)
+        if cand_q is None:
+            unmatched += 1
+            continue
+
+        inc_prev_last, inc_prev_cum, inc_dir = state["inc"].get(key, (None, None, 0))
+        cand_prev_last, _, cand_dir = state["cand"].get(key, (None, None, 0))
+
+        cum = inc_q.volume or 0
+        delta = 0 if inc_prev_cum is None else max(cum - inc_prev_cum, 0)
+
+        # Advance state before any continue, so a skipped sample still
+        # seeds the next one's comparison.
+        state["inc"][key] = (inc_q.last, cum, inc_dir)
+        state["cand"][key] = (cand_q.last, cand_q.volume or 0, cand_dir)
+
+        if delta <= 0 or inc_q.last is None or inc_q.last <= 0:
+            continue
+        if inc_prev_last is None:
+            # First sighting of this contract: nothing to tick against.
+            no_prior += 1
+            continue
+
+        q_bucket = _bucket_of(
+            *quote_test(
+                shim,
+                delta,
+                inc_q.last,
+                inc_q.bid,
+                inc_q.ask,
+                inc_q.mid if inc_q.mid is not None else inc_q.effective_mid(),
+                band_pct=FLOW_CLASSIFY_MID_BAND_PCT,
+            )
+        )
+        t_ask, t_mid, t_bid, t_dir = tick_test(delta, inc_q.last, inc_prev_last, inc_dir)
+        t_bucket = _bucket_of(t_ask, t_mid, t_bid)
+        c_ask, c_mid, c_bid, c_dir = tick_test(delta, cand_q.last, cand_prev_last, cand_dir)
+        c_bucket = _bucket_of(c_ask, c_mid, c_bid)
+
+        state["inc"][key] = (inc_q.last, cum, t_dir)
+        state["cand"][key] = (cand_q.last, cand_q.volume or 0, c_dir)
+
+        if q_bucket is None or t_bucket is None or c_bucket is None:
+            continue
+
+        compared += 1
+        volume_compared += delta
+        net_quote += delta if q_bucket == "ask" else (-delta if q_bucket == "bid" else 0)
+        net_tick += delta if t_bucket == "ask" else (-delta if t_bucket == "bid" else 0)
+        net_tick_cand += delta if c_bucket == "ask" else (-delta if c_bucket == "bid" else 0)
+
+        if q_bucket != t_bucket:
+            method_contracts += 1
+            method_volume += delta
+            move = f"{q_bucket}->{t_bucket}"
+            shifts[move] = shifts.get(move, 0) + 1
+        if t_bucket != c_bucket:
+            feed_contracts += 1
+
+    def _pct(part: int, whole: int) -> Optional[float]:
+        return (100.0 * part / whole) if whole else None
+
+    return {
+        "contracts_compared": compared,
+        "contracts_unmatched": unmatched,
+        "contracts_without_a_prior_trade": no_prior,
+        "volume_compared": volume_compared,
+        # Method change, feed held constant.
+        "method_contracts_differ": method_contracts,
+        "method_contract_pct": _pct(method_contracts, compared),
+        "method_volume_differ": method_volume,
+        "method_volume_pct": _pct(method_volume, volume_compared),
+        "net_quote_test": net_quote,
+        "net_tick_test": net_tick,
+        "net_method_shift_pct": (
+            (100.0 * (net_tick - net_quote) / abs(net_quote)) if net_quote else None
+        ),
+        # Feed sensitivity of the tick test itself.
+        "feed_contracts_differ": feed_contracts,
+        "feed_contract_pct": _pct(feed_contracts, compared),
+        "net_tick_candidate": net_tick_cand,
+        "net_tick_feed_shift_pct": (
+            (100.0 * (net_tick_cand - net_tick) / abs(net_tick)) if net_tick else None
+        ),
+        "shifts": dict(sorted(shifts.items(), key=lambda kv: -kv[1])),
+    }
+
+
+def _print_tick_test(tick: Dict[str, Any]) -> None:
+    compared = tick.get("contracts_compared") or 0
+    if not compared:
+        no_prior = tick.get("contracts_without_a_prior_trade") or 0
+        extra = f", {no_prior} with no prior trade" if no_prior else ""
+        print(
+            "\nTICK TEST  nothing to compare yet -- it needs a PREVIOUS sample "
+            f"to tick against{extra}. The first sample of a run always reads "
+            "this way; if later ones do too, nothing is trading."
+        )
+        return
+    print("\nTICK TEST vs quote test (same feed) and across feeds")
+    print(
+        f"  method      {tick['method_contracts_differ']}/{compared} contracts differ "
+        f"({tick['method_contract_pct']:.2f}%)   <- SWITCHING METHOD does this, "
+        "with no feed change at all"
+    )
+    vp = tick.get("method_volume_pct")
+    if vp is not None:
+        print(
+            f"  method vol  {tick['method_volume_differ']:,}/{tick['volume_compared']:,} "
+            f"({vp:.2f}%)"
+        )
+    shift = tick.get("net_method_shift_pct")
+    print(
+        f"  NET quote {tick['net_quote_test']:+,}   tick {tick['net_tick_test']:+,}   "
+        f"shift {f'{shift:+.1f}%' if shift is not None else 'n/a'}"
+    )
+    fshift = tick.get("net_tick_feed_shift_pct")
+    print(
+        f"  tick ACROSS FEEDS  {tick['feed_contracts_differ']}/{compared} differ "
+        f"({tick['feed_contract_pct']:.2f}%)   "
+        f"net {tick['net_tick_test']:+,} vs {tick['net_tick_candidate']:+,}   "
+        f"shift {f'{fshift:+.1f}%' if fshift is not None else 'n/a'}"
+    )
+    print("     ^ near zero is the point: the tick test reads no quote, so F9 cannot reach it")
+    if tick.get("shifts"):
+        moves = ", ".join(f"{k} x{v}" for k, v in tick["shifts"].items())
+        print(f"  shifts      {moves}")
+
+
 def _print_flow_classification(flow: Dict[str, Any]) -> None:
     compared = flow.get("contracts_compared") or 0
     if not compared:
@@ -1162,8 +1370,14 @@ def run_once(
     price_tolerance_pct: float,
     exposure_tolerance_pct: float,
     keep_vendor_iv: bool = True,
+    tick_state: Optional[Dict[str, Dict[Any, Any]]] = None,
 ) -> Dict[str, Any]:
-    """One paired sample plus its analytics diff."""
+    """One paired sample plus its analytics diff.
+
+    ``tick_state`` is threaded through from the caller so the tick test
+    can see the previous sample's trade prices; without it that block is
+    skipped, since a tick test with no prior trade has nothing to say.
+    """
     incumbent = sample_provider(
         incumbent_provider,
         underlying,
@@ -1244,6 +1458,9 @@ def run_once(
         # metrics below cannot see: they average, and a classifier
         # thresholds. Same trade, two quotes -- see the function.
         "flow_classification": compare_flow_classification(incumbent, candidate),
+        "tick_test": (
+            compare_tick_test(incumbent, candidate, tick_state) if tick_state is not None else None
+        ),
         # How far apart the two chain snapshots actually landed. A live
         # cross-feed difference is the vendor's adjustment PLUS whatever the
         # market did in this many seconds; without it the two are not
@@ -1580,6 +1797,9 @@ def _print_report(result: Dict[str, Any]) -> None:
     flow = result.get("flow_classification")
     if flow:
         _print_flow_classification(flow)
+    tick = result.get("tick_test")
+    if tick:
+        _print_tick_test(tick)
     print(f"\n  verdict: {result['verdict']}\n")
 
 
@@ -1732,6 +1952,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     deadline = time.monotonic() + args.duration_minutes * 60
     exit_code = 0
     collected: List[Dict[str, Any]] = []
+    # One state dict for the whole run: the tick test compares each sample
+    # against the previous one, so it cannot be per-sample.
+    tick_state = new_tick_state()
     try:
         while True:
             result = run_once(
@@ -1745,6 +1968,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 price_tolerance_pct=args.price_tolerance_pct,
                 exposure_tolerance_pct=args.exposure_tolerance_pct,
                 keep_vendor_iv=not args.solve_iv_both,
+                tick_state=tick_state,
             )
             collected.append(result)
             if args.json:

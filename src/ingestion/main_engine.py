@@ -1340,6 +1340,72 @@ class IngestionEngine:
             snap_mid if snap_mid is not None else acc.last_mid,
         )
 
+    @staticmethod
+    def _classify_volume_chunk_tick(
+        volume_delta: int,
+        last: Optional[float],
+        prev_last: Optional[float],
+        prev_direction: int = 0,
+    ) -> tuple:
+        """Classify a volume chunk by the TICK test, not against a quote.
+
+        Returns ``(ask_vol, mid_vol, bid_vol, direction)``, where
+        ``direction`` is +1, -1 or 0 and must be fed back on the next call
+        for the same contract.
+
+        Why this exists. :meth:`_classify_volume_chunk` grades the trade
+        price against the prevailing quote, which is correct and is what
+        production uses. It cannot survive a quote that has been
+        randomised by a penny on a penny-wide spread: ThetaData's Market
+        Value feed crosses the book on roughly 20% of liquid SPY
+        contracts (compliance F9), and against a crossed quote the
+        quote-test's answer is arbitrary. The tick test reads NO quote at
+        all -- only the sequence of trade prices -- so a randomised or
+        crossed quote cannot reach it, and the published figure stops
+        depending on the one part of the feed that is defective.
+
+        That is also why it is cheaper to license: trade prices come from
+        ``option_snapshot_ohlc``, which the chain ingestion already reads,
+        so the classifier needs no quote endpoint of any kind.
+
+        Rules, Lee & Ready 1991:
+
+        * uptick  (``last > prev_last``) -> buyer-initiated
+        * downtick (``last < prev_last``) -> seller-initiated
+        * zero tick (equal) -> carry the last NON-ZERO direction
+
+        A chunk with no prior trade to compare against routes to mid. That
+        is the same convention the quote test uses when it has no quote:
+        "we cannot tell" is recorded as mid rather than invented as a side.
+        Note this is NOT the same claim as "the trade happened at the
+        mid" -- both classifiers overload mid that way, and the figure
+        downstream is the ask-minus-bid imbalance, which is unaffected
+        either way.
+
+        Granularity caveat. A snapshot carries one last price and one
+        cumulative volume, so a whole poll interval's volume is classified
+        by a single price comparison. That is crude, and it is exactly as
+        crude as the quote test already is here -- ``vol_delta`` is the
+        same chunk and gets one quote. The two are therefore directly
+        comparable, which is the point; neither is a trade-by-trade
+        classifier and the sampling rate bounds both.
+        """
+        if volume_delta <= 0:
+            return (0, 0, 0, prev_direction)
+        if last is None or last <= 0:
+            return (0, volume_delta, 0, prev_direction)
+        if prev_last is None or prev_last <= 0:
+            return (0, volume_delta, 0, prev_direction)
+        if last > prev_last:
+            return (volume_delta, 0, 0, 1)
+        if last < prev_last:
+            return (0, 0, volume_delta, -1)
+        if prev_direction > 0:
+            return (volume_delta, 0, 0, prev_direction)
+        if prev_direction < 0:
+            return (0, 0, volume_delta, prev_direction)
+        return (0, volume_delta, 0, 0)
+
     def _classify_volume_chunk(
         self,
         volume_delta: int,
