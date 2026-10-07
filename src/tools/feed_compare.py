@@ -1019,6 +1019,92 @@ def _print_tick_test(tick: Dict[str, Any]) -> None:
         print(f"  shifts      {moves}")
 
 
+def _print_self_variance(result: Dict[str, Any]) -> None:
+    """The incumbent against ITSELF, next to the cross-feed figures.
+
+    WHY THIS EXISTS. The chain table has carried a self-variance column
+    since it was written, and the line it prints -- "the incumbent moved
+    further from ITSELF between samples than the two feeds ever differed"
+    -- is the entire reason those numbers can be believed. Flow had no
+    such column, and on 2026-10-07 that gap stopped the decision: the
+    quote test put the candidate's net imbalance above the incumbent's in
+    26 of 30 samples, by a mean of +1.22M against a signal whose own mean
+    magnitude was 1.04M.
+
+    WHICH TEST NEEDS IT, AND WHICH DOES NOT.
+    ``compare_flow_classification`` takes ``volume`` and ``last`` from the
+    INCUMBENT for both sides and varies only the quote, so the fixed poll
+    order cannot feed the candidate extra tape and that 26-of-30 result is
+    the Market Value quote and nothing else. ``compare_tick_test`` is the
+    opposite: it reads each feed's OWN trade sequence, and the feeds are
+    polled 0.3-0.8s apart, so a print landing between the two polls appears
+    on one side and not the other and flips a tick direction that then
+    carries forward. Its cross-feed number has never had a floor under it.
+
+    Both are reported here anyway. The quote row should sit near zero, and
+    if it ever does not, the quote-test conclusions drawn above it need
+    revisiting too.
+
+    HOW TO READ IT. The self row is the same classifier over two snapshots
+    of the SAME feed, so every disagreement in it is timing, drift and
+    chance -- the candidate cannot have contributed. It is also taken over
+    a longer gap than the cross-feed pair (see ``run_once``), so it is a
+    generous estimate of that floor.
+
+    - cross comfortably above self  -> the candidate is doing something
+    - cross at or below self        -> this harness cannot see the candidate
+      at this sampling gap, and no conclusion about the feed may be drawn
+      from the run, in either direction
+    """
+    flow_self = result.get("flow_self_variance")
+    tick_self = result.get("tick_self_variance")
+    if not flow_self and not tick_self:
+        return
+
+    cross_flow = result.get("flow_classification") or {}
+    cross_tick = result.get("tick_test") or {}
+    gap = result.get("sampling_skew_seconds")
+    self_gap = result.get("self_skew_seconds")
+
+    print("\nSELF-VARIANCE CONTROL (incumbent vs ITSELF -- the floor)")
+    gaps = []
+    if gap is not None:
+        gaps.append(f"cross-feed gap {gap:.2f}s")
+    if self_gap is not None:
+        gaps.append(f"self gap {self_gap:.2f}s")
+    if gaps:
+        print("  " + ", ".join(gaps) + "   <- self is the LONGER gap, deliberately")
+
+    def _row(label: str, self_d: Dict[str, Any], cross_d: Dict[str, Any], key: str) -> None:
+        sv, cv = self_d.get(key), cross_d.get(key)
+        if sv is None or cv is None:
+            return
+        verdict = "CANDIDATE EXCEEDS FLOOR" if cv > sv else "within the floor -- NOT EVIDENCE"
+        print(f"  {label:<26} self {sv:6.2f}%   cross {cv:6.2f}%   <- {verdict}")
+
+    if flow_self:
+        _row("quote test, contracts", flow_self, cross_flow, "contract_disagreement_pct")
+        _row("quote test, volume", flow_self, cross_flow, "volume_disagreement_pct")
+        si = flow_self.get("net_imbalance_incumbent")
+        sc = flow_self.get("net_imbalance_candidate")
+        if si is not None and sc is not None:
+            flipped = "SIGN FLIPPED" if (si > 0) != (sc > 0) else "same sign"
+            print(
+                f"  {'quote test, NET self':<26} {si:+,} vs {sc:+,}   <- {flipped}; "
+                "a flip HERE is the harness, not the feed"
+            )
+    if tick_self:
+        _row("tick test, contracts", tick_self, cross_tick, "feed_contract_pct")
+        si = tick_self.get("net_tick_test")
+        sc = tick_self.get("net_tick_candidate")
+        if si is not None and sc is not None:
+            flipped = "SIGN FLIPPED" if (si > 0) != (sc > 0) else "same sign"
+            print(
+                f"  {'tick test, NET self':<26} {si:+,} vs {sc:+,}   <- {flipped}; "
+                "a flip HERE is the harness, not the feed"
+            )
+
+
 def _print_flow_classification(flow: Dict[str, Any]) -> None:
     compared = flow.get("contracts_compared") or 0
     if not compared:
@@ -1371,12 +1457,19 @@ def run_once(
     exposure_tolerance_pct: float,
     keep_vendor_iv: bool = True,
     tick_state: Optional[Dict[str, Dict[Any, Any]]] = None,
+    self_control: bool = False,
+    self_tick_state: Optional[Dict[str, Dict[Any, Any]]] = None,
 ) -> Dict[str, Any]:
     """One paired sample plus its analytics diff.
 
     ``tick_state`` is threaded through from the caller so the tick test
     can see the previous sample's trade prices; without it that block is
     skipped, since a tick test with no prior trade has nothing to say.
+
+    ``self_control`` takes a THIRD snapshot, of the incumbent again, and
+    runs both classifiers over the two incumbent samples. See
+    ``_print_self_variance`` for why a flow number without it cannot be
+    read, and for the ordering.
     """
     incumbent = sample_provider(
         incumbent_provider,
@@ -1397,6 +1490,23 @@ def run_once(
         strike_pct_range=strike_pct_range,
         spot_hint=incumbent.spot,
     )
+
+    # The self-control, and the reason it is sampled THIRD rather than
+    # second. The cross-feed pair keeps the short gap it has always had, so
+    # today's numbers stay comparable with every run on record, and the
+    # self-control inherits the LONGER gap. That handicap runs the safe way:
+    # it overstates how much of a flow difference is timing, so a candidate
+    # still exceeding it has exceeded a bar set against itself.
+    incumbent_again: Optional[FeedSample] = None
+    if self_control:
+        incumbent_again = sample_provider(
+            incumbent_provider,
+            underlying,
+            num_expirations=num_expirations,
+            strike_count_max=strike_count_max,
+            strike_pct_range=strike_pct_range,
+            spot_hint=incumbent.spot,
+        )
 
     now = datetime.now(timezone.utc)
     analytics: Dict[str, Dict[str, Optional[float]]] = {}
@@ -1451,6 +1561,10 @@ def run_once(
     if incumbent.chain_at and candidate.chain_at:
         skew_seconds = abs((candidate.chain_at - incumbent.chain_at).total_seconds())
 
+    self_skew_seconds: Optional[float] = None
+    if incumbent_again is not None and incumbent.chain_at and incumbent_again.chain_at:
+        self_skew_seconds = abs((incumbent_again.chain_at - incumbent.chain_at).total_seconds())
+
     return {
         "captured_at": candidate.captured_at.isoformat(),
         "underlying": underlying,
@@ -1466,6 +1580,20 @@ def run_once(
         # market did in this many seconds; without it the two are not
         # separable and the difference reads as entirely the candidate's.
         "sampling_skew_seconds": skew_seconds,
+        # The SAME two comparisons, incumbent against itself. Whatever these
+        # report is the floor the cross-feed numbers above have to clear
+        # before any of them can be attributed to the candidate.
+        "flow_self_variance": (
+            compare_flow_classification(incumbent, incumbent_again)
+            if incumbent_again is not None
+            else None
+        ),
+        "tick_self_variance": (
+            compare_tick_test(incumbent, incumbent_again, self_tick_state)
+            if incumbent_again is not None and self_tick_state is not None
+            else None
+        ),
+        "self_skew_seconds": self_skew_seconds,
         "incumbent": {
             "provider": incumbent.provider,
             "contracts": incumbent.contract_count,
@@ -1800,6 +1928,7 @@ def _print_report(result: Dict[str, Any]) -> None:
     tick = result.get("tick_test")
     if tick:
         _print_tick_test(tick)
+    _print_self_variance(result)
     print(f"\n  verdict: {result['verdict']}\n")
 
 
@@ -1833,6 +1962,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="repeat for this long; 0 runs a single comparison",
     )
     parser.add_argument("--interval-seconds", type=float, default=60.0)
+    parser.add_argument(
+        "--self-control",
+        action="store_true",
+        help=(
+            "take a THIRD snapshot of the incumbent each sample and run the flow "
+            "and tick comparisons against it, establishing the noise floor those "
+            "numbers have to clear. Costs one extra chain fetch per sample."
+        ),
+    )
     parser.add_argument(
         "--persist",
         action="store_true",
@@ -1955,6 +2093,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # One state dict for the whole run: the tick test compares each sample
     # against the previous one, so it cannot be per-sample.
     tick_state = new_tick_state()
+    # A SECOND state dict, because the self-control is its own pair of feeds
+    # as far as the tick test is concerned. Sharing one would have each
+    # comparison overwrite the other's previous trade and silently turn both
+    # into nonsense.
+    self_tick_state = new_tick_state() if args.self_control else None
     try:
         while True:
             result = run_once(
@@ -1969,6 +2112,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 exposure_tolerance_pct=args.exposure_tolerance_pct,
                 keep_vendor_iv=not args.solve_iv_both,
                 tick_state=tick_state,
+                self_control=args.self_control,
+                self_tick_state=self_tick_state,
             )
             collected.append(result)
             if args.json:

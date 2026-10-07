@@ -1977,7 +1977,7 @@ run-auth: ## Test TradeStation authentication
 #
 # (In a shell, that second one is typed UNDERLYING='$$SPXW.X'.)
 .PHONY: feed-compare
-feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDIDATE, MINUTES, PERSIST, JSON)
+feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDIDATE, MINUTES, SELF_CONTROL, PERSIST, JSON)
 	@echo "$(BLUE)=== Feed comparison (runbook step 14) ===$(NC)"
 	@$(VENV_PYTHON) -m src.tools.feed_compare \
 		--underlying "$${UNDERLYING:-SPY}" \
@@ -1985,6 +1985,7 @@ feed-compare: ## Diff a candidate feed against the incumbent (UNDERLYING, CANDID
 		$(if $(CANDIDATE),--candidate '$(CANDIDATE)') \
 		$(if $(MINUTES),--duration-minutes '$(MINUTES)') \
 		$(if $(INTERVAL_SECONDS),--interval-seconds '$(INTERVAL_SECONDS)') \
+		$(if $(SELF_CONTROL),--self-control) \
 		$(if $(PERSIST),--persist) \
 		$(if $(SOLVE_IV_BOTH),--solve-iv-both) \
 		$(if $(JSON),--json) \

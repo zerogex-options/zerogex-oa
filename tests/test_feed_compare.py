@@ -1422,3 +1422,237 @@ def test_a_genuinely_untraded_sample_still_says_so(capsys):
     out = capsys.readouterr().out
     assert "no contract traded" in out
     assert "NOT MEASURED" not in out
+
+
+# ---------------------------------------------------------------------------
+# Self-variance control
+#
+# The chain table has carried a self-variance column since it was written,
+# and flow never did. On 2026-10-07 that gap stopped a decision: the quote
+# test put the candidate's net imbalance above the incumbent's in 26 of 30
+# samples, which looks like a biased feed -- and looks identical to a
+# harness that always polls the candidate second while the market trends.
+# These pin the control that separates the two.
+# ---------------------------------------------------------------------------
+
+
+def _self_control_providers(monkeypatch, samples):
+    """Hand ``run_once`` a scripted sequence of snapshots.
+
+    ``samples`` is consumed in call order, which IS the thing under test:
+    the self-control must be the THIRD fetch, not the second, so the
+    cross-feed pair keeps the short gap it has always had.
+    """
+    taken = []
+
+    def fake_sample(provider, underlying, **kwargs):
+        taken.append((provider, kwargs.get("spot_hint")))
+        return samples[len(taken) - 1]
+
+    monkeypatch.setattr(feed_compare, "sample_provider", fake_sample)
+    monkeypatch.setattr(feed_compare, "_compute_analytics", lambda *a, **k: {})
+    monkeypatch.setattr(feed_compare, "_enrich", lambda rows, *a, **k: rows)
+    monkeypatch.setattr(feed_compare, "compare_metrics", lambda *a, **k: [])
+    monkeypatch.setattr(feed_compare, "_verdict", lambda *a, **k: "agree")
+    return taken
+
+
+def _flow_sample(provider: str, *, last: float, volume: int) -> FeedSample:
+    exp, strike, right = _FLOW_EXPIRATIONS[0], 650.0, "C"
+    symbol = f"{provider}:{strike}{right}"
+    return _sample(
+        provider,
+        {symbol: _flow_quote(symbol, bid=1.20, ask=1.21, last=last, volume=volume)},
+        {symbol: {"expiration": exp, "strike": strike, "option_type": right}},
+    )
+
+
+def _run(monkeypatch, samples, **kwargs):
+    taken = _self_control_providers(monkeypatch, samples)
+    result = feed_compare.run_once(
+        object(),
+        object(),
+        "SPY",
+        num_expirations=1,
+        strike_count_max=4,
+        strike_pct_range=3.0,
+        persist=False,
+        price_tolerance_pct=1.0,
+        exposure_tolerance_pct=5.0,
+        **kwargs,
+    )
+    return result, taken
+
+
+def test_self_control_is_off_by_default(monkeypatch):
+    """The default must stay a two-fetch sample.
+
+    Every figure on record was produced without it, and silently adding a
+    third fetch would change the cross-feed sampling gap those numbers were
+    measured at.
+    """
+    result, taken = _run(
+        monkeypatch,
+        [
+            _flow_sample("inc", last=1.21, volume=100),
+            _flow_sample("cand", last=1.21, volume=100),
+        ],
+    )
+
+    assert result["flow_self_variance"] is None
+    assert result["tick_self_variance"] is None
+    assert result["self_skew_seconds"] is None
+    assert len(taken) == 2, "no third fetch without --self-control"
+
+
+def test_the_self_control_is_sampled_THIRD(monkeypatch):
+    """Order is the design, not an accident.
+
+    Third means the cross-feed pair keeps the short gap, and the control
+    inherits the longer one -- a floor that errs toward being too high,
+    which is the direction that cannot manufacture a finding.
+    """
+    taken = _self_control_providers(
+        monkeypatch,
+        [
+            _flow_sample("inc", last=1.21, volume=100),
+            _flow_sample("cand", last=1.21, volume=100),
+            _flow_sample("inc", last=1.21, volume=100),
+        ],
+    )
+    feed_compare.run_once(
+        "INCUMBENT",
+        "CANDIDATE",
+        "SPY",
+        num_expirations=1,
+        strike_count_max=4,
+        strike_pct_range=3.0,
+        persist=False,
+        price_tolerance_pct=1.0,
+        exposure_tolerance_pct=5.0,
+        self_control=True,
+    )
+
+    assert [p for p, _ in taken] == ["INCUMBENT", "CANDIDATE", "INCUMBENT"]
+    assert taken[2][1] == 650.0, "the third fetch must reuse the incumbent's spot"
+
+
+def test_self_control_compares_the_incumbent_with_itself(monkeypatch):
+    """Two identical incumbent snapshots must report a zero floor.
+
+    If this ever reports disagreement on identical input, every
+    'the candidate exceeded the floor' reading built on it is worthless.
+    """
+    result, _ = _run(
+        monkeypatch,
+        [
+            _flow_sample("inc", last=1.21, volume=100),
+            _flow_sample("cand", last=1.21, volume=100),
+            _flow_sample("inc", last=1.21, volume=100),
+        ],
+        self_control=True,
+    )
+
+    floor = result["flow_self_variance"]
+    assert floor is not None
+    assert floor["contracts_compared"] == 1
+    assert floor["contract_disagreement_pct"] == 0.0
+
+
+def test_a_drifting_incumbent_raises_the_floor(monkeypatch):
+    """The case the control exists for.
+
+    Same feed, two instants, a QUOTE that moved in between. Note what has
+    to differ for this to register: ``compare_flow_classification`` takes
+    volume and ``last`` from the incumbent for BOTH sides and varies only
+    the quote, so a self-control whose second snapshot differs only in its
+    trade price would correctly report a zero floor. Quote drift is the
+    thing that reclassifies, and quote drift is what this measures.
+    """
+    # The trade printed at 1.21. Against the first snapshot's 1.20/1.21 book
+    # that is at the ask; against a book that has since moved to 1.30/1.31 the
+    # same print sits well below the mid and reads as seller-initiated. Same
+    # feed, same trade, opposite answer.
+    drifted = _flow_sample("inc", last=1.21, volume=100)
+    only_quote = next(iter(drifted.quotes))
+    drifted.quotes[only_quote] = _flow_quote(only_quote, bid=1.30, ask=1.31, last=1.21, volume=100)
+
+    result, _ = _run(
+        monkeypatch,
+        [
+            _flow_sample("inc", last=1.21, volume=100),
+            _flow_sample("cand", last=1.21, volume=100),
+            drifted,
+        ],
+        self_control=True,
+    )
+
+    floor = result["flow_self_variance"]
+    assert floor["contract_disagreement_pct"] > 0.0, (
+        "a feed that moved against itself must raise the floor, or the floor "
+        "reports zero for a harness that is in fact noisy"
+    )
+
+
+def test_the_tick_control_gets_its_own_state(monkeypatch):
+    """Sharing one state dict would corrupt both comparisons silently.
+
+    The tick test remembers each feed's previous trade. Run two different
+    pairings through one memory and each overwrites the other's history,
+    so both report against a predecessor that was never theirs.
+    """
+    state = feed_compare.new_tick_state()
+    self_state = feed_compare.new_tick_state()
+
+    for last, vol in ((1.20, 100), (1.21, 400)):
+        _run(
+            monkeypatch,
+            [
+                _flow_sample("inc", last=last, volume=vol),
+                _flow_sample("cand", last=last, volume=vol),
+                _flow_sample("inc", last=last, volume=vol),
+            ],
+            self_control=True,
+            tick_state=state,
+            self_tick_state=self_state,
+        )
+
+    assert state is not self_state
+    assert state["inc"], "the cross-feed memory must have advanced"
+    assert self_state["inc"], "the self-control memory must have advanced"
+    # The pairings differ, so the two memories must be distinct objects even
+    # where they happen to hold the same contract key.
+    key = next(iter(state["inc"]))
+    assert state["inc"][key] is not self_state["inc"].get(key)
+
+
+def test_self_variance_printer_names_the_floor(capsys):
+    """An operator must be told which side of the floor the run landed on."""
+    feed_compare._print_self_variance(
+        {
+            "flow_self_variance": {
+                "contract_disagreement_pct": 4.0,
+                "net_imbalance_incumbent": 100,
+                "net_imbalance_candidate": 110,
+            },
+            "flow_classification": {"contract_disagreement_pct": 43.0},
+            "sampling_skew_seconds": 0.6,
+            "self_skew_seconds": 1.2,
+        }
+    )
+    out = capsys.readouterr().out
+    assert "SELF-VARIANCE CONTROL" in out
+    assert "CANDIDATE EXCEEDS FLOOR" in out
+
+
+def test_printer_refuses_to_credit_the_candidate_below_the_floor(capsys):
+    """43% cross against a 50% floor is not a finding, and must not read as one."""
+    feed_compare._print_self_variance(
+        {
+            "flow_self_variance": {"contract_disagreement_pct": 50.0},
+            "flow_classification": {"contract_disagreement_pct": 43.0},
+        }
+    )
+    out = capsys.readouterr().out
+    assert "NOT EVIDENCE" in out
+    assert "CANDIDATE EXCEEDS FLOOR" not in out
