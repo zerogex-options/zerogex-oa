@@ -1319,6 +1319,16 @@ class ThetaDataProvider(MarketDataProvider):
         this client wraps it under some other name, not that the feed does
         not exist. Run `make feed-probe` to see what the installed client
         actually exposes.
+
+        **This refusal is permanent, not provisional.** It was written when
+        the fee treatment of the raw quote was an open question. ThetaData's
+        commercial team answered it on 2026-10-07: consuming raw NBBO as an
+        internal input, never displayed and never redistributed, is
+        NON-DISPLAY USE under OPRA, sits outside the Market Value exemption
+        in the executed agreement, and carries a separate monthly OPRA fee.
+        So the fallback this refuses is not merely unaudited -- it is known
+        to bill. Do not weaken it, and do not add a flag that bypasses it.
+        See F9 in docs/compliance/market-data-feed-comparison-findings-2026-09.md.
         """
         if not self._market_value_endpoints:
             return getattr(self._client, realtime_name)

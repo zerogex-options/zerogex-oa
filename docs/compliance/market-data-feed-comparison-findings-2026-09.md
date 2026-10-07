@@ -378,8 +378,30 @@ Value stage, deliberately, for exactly this reason. It has not been weakened and
 
 Asked in writing 2026-09-28: does consuming raw NBBO purely as a classification input — never
 displayed, never redistributed — carry OPRA exchange fees or redistribution obligations we do not
-have today? **Unanswered as of 2026-09-30.** The technical half of the same thread moved within
-hours; only the licensing half is slow, most likely because it needs someone other than support.
+have today?
+
+**ANSWERED 2026-10-07, and the answer closes the route.** ThetaData's commercial team: using the
+raw NBBO as an internal input, *even never displayed and never redistributed*, counts as
+**non-display use** under OPRA; that sits **outside the Market Value exemption** in the executed
+agreement and would carry **a separate monthly OPRA fee**, to be quoted. Their own recommendation
+was not to go down that road.
+
+The reading recorded above was right as far as it went, and understated the problem. The concern
+was that raw NBBO sits outside Exhibit A's "This adjusted bid and ask value is derived from—"
+language. It does — and OPRA's non-display category means the exposure does not depend on never
+showing a user the quote, which was the entire premise of the workaround. "Never displayed" is
+not a defence against the fee; it is the name of the fee.
+
+Consequences, in order of how easy each is to get wrong later:
+
+1. `_endpoint()`'s refusal to fall back to the realtime endpoint on a Market Value stage is now
+   **permanent rather than provisional**. It was written against an open question; the question
+   is closed against us. Do not weaken it and do not add a flag that bypasses it.
+2. `option_snapshot_quote` stays unwired. It is already reachable as the non-MV path, which is
+   exactly why this needs to be written down rather than left to memory.
+3. The flow decision no longer has three routes, it has two: the quote test on the repaired
+   Market Value feed, if the post-fix measurement supports it, or the tick test, which reads no
+   quote at all.
 
 This is the precondition for the WORKAROUND, not the blocker itself. The blocker is the defect:
 fix the crossing and the workaround, this question and the tick test all become unnecessary. Kept
@@ -390,9 +412,9 @@ actually resolves the problem.
 
 | If | Then |
 |---|---|
-| ThetaData fixes the crossing | re-measure with `make feed-compare`; the problem may largely evaporate |
-| raw NBBO is fee-clean for us | small change — `option_snapshot_quote` is already wired as the non-MV path |
-| raw NBBO is fee-bearing | tick test: grade against the PREVIOUS TRADE PRICE, needs no quote at all, and **shrinks** the OPRA surface relative to both alternatives |
+| ThetaData fixes the crossing | re-measure with `make feed-compare`. Vendor says fixed 2026-10-07; our measurement pending |
+| ~~raw NBBO is fee-clean for us~~ | **DEAD 2026-10-07** — non-display use, fee-bearing. `option_snapshot_quote` stays unwired |
+| raw NBBO is fee-bearing | **This is the case.** Tick test: grade against the PREVIOUS TRADE PRICE, needs no quote at all, and **shrinks** the OPRA surface relative to both alternatives |
 
 Whichever lands, the published flow numbers change, and that has to be a deliberate and understood
 change rather than a side effect of a cutover.
@@ -419,6 +441,13 @@ rather than retroactively: `thetadata.log_entitlement_flags()` logs both flags o
 `false` flag from an absent one, and logs **the two flags only** — the auth response also carries
 the session token and the account email, and neither belongs in a log file. Asked of ThetaData
 2026-10-07 as a question, not an assertion, for exactly this reason.
+
+**Vendor says corrected 2026-10-07**, to non-professional and commercial. UNVERIFIED on our
+side, and not verifiable from the service logs: `_authenticate_shared_feed_session()` is a
+no-op for TradeStation, production is still on TradeStation, so nothing in the running
+deployment logs into ThetaData and the new line never fires there. The flags appear in the
+output of any tool that builds a ThetaData provider for real — `make feed-compare`,
+`make feed-probe`, `make crossed-capture` — and that is where to read them until cutover.
 
 ---
 
@@ -514,9 +543,10 @@ afterwards and append the result here rather than holding the cutover for it.
   failed IV solve against a 0.20 fallback without writing it back, so the contract carries a gamma
   into `_calculate_gex_by_strike` while `_gamma_exposure_profile` skips it on `sigma <= 0`.
   `net_gex` and `gamma_flip` are therefore not always computed over the same chain.
-- **F9's licensing question** — whether raw NBBO may be consumed as a classification input is
-  unanswered, and the cutover waits on it. Do not write code against `option_snapshot_quote`, and
-  do not weaken `_endpoint()`'s refusal, until it is answered in writing.
+- **F9's licensing question** — **RESOLVED 2026-10-07, against us.** Raw NBBO as an internal
+  input is non-display use under OPRA, outside the Market Value exemption, and fee-bearing.
+  `option_snapshot_quote` stays unwired and `_endpoint()`'s refusal is permanent. No longer a
+  thing to wait for; a constraint to hold.
 - **F9's crossed quotes** — acknowledged by the vendor, no fix date. `make crossed-capture`
   reproduces the evidence on demand; a capture returning nothing is the signal that it is fixed.
 - **F9's account classification** — `isProfessional: true` and `isRetail: true` both set, which by
