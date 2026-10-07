@@ -1738,7 +1738,7 @@ logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greek
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in analytics logs"
 
 .PHONY: theta-entitlements
-theta-entitlements: ## What the Theta Terminal said about this account's professional/retail flags at ITS last start
+theta-entitlements: ## What the Theta Terminal says about this account's entitlements, plus its whole current startup block (LINES=n)
 	@echo "$(BLUE)=== Theta Terminal entitlement flags ===$(NC)"
 	@echo "$(YELLOW)Source: the TERMINAL's own journal. Not the Python client --$(NC)"
 	@echo "$(YELLOW)a ThetaClient attaches to a running terminal over gRPC and$(NC)"
@@ -1746,8 +1746,22 @@ theta-entitlements: ## What the Theta Terminal said about this account's profess
 	@echo "$(YELLOW)cannot answer this however long you run them.$(NC)"
 	@echo ""
 	@sudo journalctl -u zerogex-oa-thetaterminal --no-pager \
-		| grep -iE "professional|retail|entitle" \
+		| grep -iE "professional|retail|entitle|subscription" \
 		|| echo "No entitlement line in the retained journal."
+	@echo ""
+	@echo "$(BLUE)=== Everything this terminal said on its CURRENT start ===$(NC)"
+	@echo "$(YELLOW)Printed whole, not grepped. 2026-10-07: a grep for$(NC)"
+	@echo "$(YELLOW)'professional' matched a 'Subscriptions:' line that may be a$(NC)"
+	@echo "$(YELLOW)plan tier rather than the user classification, and the$(NC)"
+	@echo "$(YELLOW)isProfessional/isRetail pair was never located at all. A$(NC)"
+	@echo "$(YELLOW)pattern can only find what you already guessed.$(NC)"
+	@echo ""
+	@INV=$$(systemctl show -p InvocationID --value zerogex-oa-thetaterminal 2>/dev/null); \
+		if [ -n "$$INV" ]; then \
+			sudo journalctl _SYSTEMD_INVOCATION_ID=$$INV --no-pager -n $${LINES:-60}; \
+		else \
+			echo "Unit has no current invocation -- is the terminal running?"; \
+		fi
 	@echo ""
 	@echo "$(YELLOW)This is what the terminal said WHEN IT LAST STARTED. A line dated$(NC)"
 	@echo "$(YELLOW)before 2026-10-07 predates ThetaData's claimed correction and says$(NC)"

@@ -457,10 +457,36 @@ An earlier revision of this paragraph said to read the flags from the output of
 `make feed-compare` or `make feed-probe`. **That was wrong** and is corrected here rather than
 deleted, because acting on it wastes a run and reads a silence as an answer.
 
-To check: `make theta-entitlements`, which greps the terminal's journal. It reports what the
-terminal said **when it last started**, so a reading older than 2026-10-07 predates the
-vendor's correction and proves nothing about it. Confirming the correction needs a terminal
-restart, which kills any live MDDS session — so never during a comparison run.
+To check: `make theta-entitlements`. It reports what the terminal said **when it last
+started**, so a reading older than 2026-10-07 predates the vendor's correction and proves
+nothing about it. Confirming the correction needs a terminal restart, which kills any live
+MDDS session — so never during a comparison run.
+
+**What the terminal actually prints, 2026-10-07 13:34:07 ET**, from a restart taken minutes
+earlier and therefore AFTER ThetaData said the account was corrected:
+
+```
+INFO: Subscriptions: Stock: PROFESSIONAL Options: PROFESSIONAL Index: PROFESSIONAL Rate: FREE
+```
+
+**This is not known to be the same thing as the `isProfessional`/`isRetail` pair, and must not
+be recorded as confirming or refuting the correction.** The line is prefixed `Subscriptions:`
+and ends `Rate: FREE`, which reads as per-product plan tiers rather than the user
+classification that decides OPRA fee treatment. The grep matched on the word and caught a
+different line; the boolean pair has still never been located. Either reading is live:
+
+- if it IS the classification, ThetaData's correction did not take, or has not propagated to
+  what the terminal reads, eight days after it was raised;
+- if it is a plan tier, the line says nothing either way and the pair is somewhere we have not
+  looked.
+
+Put to ThetaData 2026-10-07 quoting the line and its timestamp. `make theta-entitlements` now
+also prints the terminal's whole current startup block rather than only grep hits, because a
+pattern can only find what was already guessed — which is how a day was spent looking in the
+Python client for something the Java terminal prints.
+
+`Rate: FREE` on the same line is **not** a finding: the risk-free rate comes from
+`RISK_FREE_RATE` in `src/config.py`, never from the vendor.
 
 ---
 
