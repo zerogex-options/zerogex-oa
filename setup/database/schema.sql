@@ -608,6 +608,19 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS data_as_of TIMESTAMPTZ;
 -- 2026-09 looking exactly like a quiet session, and the only way to tell the
 -- difference afterwards was to replay the stored chains one cycle at a time.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_reason TEXT;
+
+-- The price the Call/Put Walls were split on (src/analytics/walls.py,
+-- step_wall_anchor): a sticky copy of spot that only moves once price closes
+-- more than wall_break_buffer away from it, so a strike changes sides when
+-- price breaks through it, not while price chops around it.  Price only --
+-- the same anchor splits every expiration selection, which is why it is
+-- stored once here and read back by the rewind chart and replay for any
+-- scope.  wall_break_buffer is the distance in index/share points: the larger
+-- of WALL_BREAK_MOVE_FRACTION of the typical 30-minute range and
+-- WALL_BREAK_MIN_PCT of spot.  NULL on rows written before the columns
+-- existed; readers then split on spot.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS wall_anchor DOUBLE PRECISION;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS wall_break_buffer DOUBLE PRECISION;
 COMMENT ON COLUMN gex_summary.data_as_of IS
     'Newest option_chains_latest.updated_at the snapshot read; what the row is as of. timestamp is the minute bucket.';
 

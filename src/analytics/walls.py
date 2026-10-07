@@ -10,26 +10,41 @@ Single source of truth for Call/Put Wall strikes consumed by:
     ~30min-prior walls used by ``trap_detection`` and ``gamma_vwap_confluence``)
   - all playbook patterns that read ``ctx.level("call_wall" | "put_wall")``
 
-The canonical definition (industry-standard, matching SpotGamma /
-SqueezeMetrics / Cheddar Flow):
+The canonical definition starts from the industry-standard one (SpotGamma /
+SqueezeMetrics / Cheddar Flow) and adds two stability rules:
 
-* **Call Wall** — strike at or above spot with the largest dollar call gamma
-  exposure ``γ_call × OI × 100 × S² × 0.01``, aggregated across the
-  expirations the caller chose to include.  Ties broken by nearest-to-spot
-  (lowest strike above spot wins).
-* **Put Wall**  — strike at or below spot with the largest dollar put gamma
-  exposure ``γ_put  × OI × 100 × S² × 0.01``, aggregated across the
-  expirations the caller chose to include.  Ties broken by nearest-to-spot
-  (highest strike below spot wins).
+* **Call Wall** — strike above the wall anchor with the largest dollar call
+  gamma exposure ``γ_call × OI × 100 × S² × 0.01``, aggregated across the
+  expirations the caller chose to include.
+* **Put Wall**  — strike below the wall anchor with the largest dollar put
+  gamma exposure ``γ_put  × OI × 100 × S² × 0.01``, same aggregation.
+* **Tie zone** — strikes within ``WALL_TIE_PCT`` (10%) of the largest on
+  their side count as tied, and the tied strike nearest the anchor wins
+  (lowest for calls, highest for puts).  An exact tie is the zero-width case.
+* **Wall anchor** — the price strikes are split on.  Not spot itself but a
+  sticky copy of it (:func:`step_wall_anchor`) that only moves once price
+  closes more than a break buffer away, so a strike changes sides only when
+  price breaks decisively through it.  Callers without an anchor split on
+  spot.
+
+Why the two rules: a plain argmax re-run every minute made the published
+walls jump and snap back (639 times across SPX/SPY/NDX/QQQ in the eight
+sessions from 2026-09-28).  About half were spot chopping across the
+biggest strike, which flipped it between Call Wall and Put Wall every time
+it crossed; the anchor makes that strike keep its role while price lingers
+and hand it over the minute price plows through.  The other half were two
+near-tied strikes trading places on small moves; the tie zone stops that
+without delaying a strike that is clearly bigger.  Both depend only on the
+strikes and on price, so every expiration selection behaves the same way.
 
 The **wall ladder** (:func:`compute_wall_ladder`) generalises that to the
-top-N strikes per side — ``C1``/``C2``/``C3`` above spot and ``P1``/``P2``/
-``P3`` below — using the *same* ordering, so ``C1`` and ``P1`` are by
-construction the Call Wall and Put Wall above.  Secondary walls are pure
-rank: the 2nd-largest eligible strike is ``C2`` even when it sits one tick
-from ``C1``.  No minimum-separation filter is applied, because any spacing
-rule would make the ladder disagree with the per-strike bars the charts
-draw right beside it.
+top-N strikes per side — ``C1``/``C2``/``C3`` above the anchor and
+``P1``/``P2``/``P3`` below — so ``C1`` and ``P1`` are by construction the
+Call Wall and Put Wall above.  Below rank 1, ranks are pure magnitude: the
+2nd-largest eligible strike is ``C2`` even when it sits one tick from
+``C1``.  No minimum-separation filter is applied, because any spacing rule
+would make the ladder disagree with the per-strike bars the charts draw
+right beside it.
 
 Notes on the formula choice:
 
@@ -43,8 +58,8 @@ Notes on the formula choice:
   ``put_gamma`` aggregate (as produced by ``_calculate_gex_by_strike`` or
   stored in ``gex_by_strike``) can rank on those directly without re-deriving
   the dollar exposure.
-* The spot-direction filter (``strike >= spot`` for call, ``strike <= spot``
-  for put) preserves the structural meaning of a "wall": calls above act as
+* The side filter (``strike >= anchor`` for call, ``strike <= anchor`` for
+  put) preserves the structural meaning of a "wall": calls above act as
   resistance, puts below act as support.  A historical bug where the
   ``/api/gex/summary`` endpoint disagreed with the signals layer was caused by
   the endpoint omitting this filter.
@@ -77,7 +92,9 @@ from src.config import (
     GAMMA_PROFILE_STRUCTURAL_MIN_FRAC,
     GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
-    WALL_HOLD_MINUTES,
+    WALL_BREAK_MIN_PCT,
+    WALL_BREAK_MOVE_FRACTION,
+    WALL_TIE_PCT,
 )
 
 _ET = ZoneInfo("America/New_York")
@@ -95,6 +112,9 @@ MAX_WALL_LADDER_DEPTH = 5
 def compute_call_put_walls(
     gex_by_strike: Iterable[Mapping[str, Any]],
     spot_price: float,
+    *,
+    anchor: Optional[float] = None,
+    tie_pct: float = WALL_TIE_PCT,
 ) -> Tuple[Optional[float], Optional[float]]:
     """Return ``(call_wall, put_wall)`` from per-strike gamma rows.
 
@@ -106,18 +126,21 @@ def compute_call_put_walls(
         already-summed rows.  To scope the walls to a specific expiration
         grouping (e.g. 0DTE only, or a single date), filter rows on the
         caller side before passing them in.
-    :param spot_price: current underlying price; used to split strikes into
-        the above-spot (call) and below-spot (put) regions.
+    :param spot_price: current underlying price; scales the dollar strength
+        and, when no ``anchor`` is given, splits strikes into the call and put
+        regions.
+    :param anchor: the wall anchor (:func:`step_wall_anchor`) to split on
+        instead of spot.  Publishing paths pass it so a strike keeps its side
+        while price lingers around it.
+    :param tie_pct: width of the tie zone (see the module docstring).
     :returns: ``(call_wall_strike, put_wall_strike)``.  Either side is
         ``None`` when no eligible strike exists (e.g. all-zero gamma on that
-        side, or no strikes on that side of spot).
+        side, or no strikes on that side of the anchor).
 
-    Tie-breaking matches the SQL counterpart in
-    :mod:`src.api.database` and the wall-migration query in
-    :mod:`src.signals.unified_signal_engine`:
+    Within the tie zone the strike nearest the anchor wins:
 
-    * Call wall ties → lowest strike (nearest to spot from above).
-    * Put wall ties  → highest strike (nearest to spot from below).
+    * Call wall → lowest tied strike above the anchor.
+    * Put wall  → highest tied strike below the anchor.
 
     This is the strike-only view.  Callers that also need the wall's
     dollar-gamma magnitude (e.g. TradeWorkz position sizing) should call
@@ -125,7 +148,7 @@ def compute_call_put_walls(
     ranking and additionally returns the dollar exposure at each wall.
     """
     call_wall, put_wall, _cw_strength, _pw_strength = compute_call_put_walls_with_strength(
-        gex_by_strike, spot_price
+        gex_by_strike, spot_price, anchor=anchor, tie_pct=tie_pct
     )
     return call_wall, put_wall
 
@@ -133,17 +156,20 @@ def compute_call_put_walls(
 def compute_call_put_walls_with_strength(
     gex_by_strike: Iterable[Mapping[str, Any]],
     spot_price: float,
+    *,
+    anchor: Optional[float] = None,
+    tie_pct: float = WALL_TIE_PCT,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """Return ``(call_wall, put_wall, call_wall_strength, put_wall_strength)``.
 
-    Same wall-selection ranking as :func:`compute_call_put_walls`, plus the
+    Same wall selection as :func:`compute_call_put_walls`, plus the
     **dollar-gamma magnitude at each wall strike**.  Both are the rank-1
     entries of :func:`compute_wall_ladder`, which is the single ranking
     implementation the three functions share — so ``C1`` on the ladder can
     never disagree with the scalar ``call_wall`` a caller reads beside it.
 
-    The magnitude is the OI-weighted gamma aggregate the ranking selected
-    on, converted to dollar GEX per 1% move via the canonical
+    The magnitude is the OI-weighted gamma aggregate at the chosen strike,
+    converted to dollar GEX per 1% move via the canonical
     ``γ_aggregate × 100 × S² × 0.01`` formula — the same convention
     ``AnalyticsEngine`` uses for the strike-profile ``abs_dollar_gex`` and
     ``_calculate_gex_by_strike`` uses inline, so a persisted
@@ -159,7 +185,9 @@ def compute_call_put_walls_with_strength(
         non-negative dollar magnitudes (``abs`` applied defensively) or
         ``None`` when that side has no wall / spot is unusable.
     """
-    call_walls, put_walls = compute_wall_ladder(gex_by_strike, spot_price, depth=1)
+    call_walls, put_walls = compute_wall_ladder(
+        gex_by_strike, spot_price, depth=1, anchor=anchor, tie_pct=tie_pct
+    )
     call_top = call_walls[0] if call_walls else None
     put_top = put_walls[0] if put_walls else None
     return (
@@ -183,6 +211,9 @@ def compute_wall_ladder(
     gex_by_strike: Iterable[Mapping[str, Any]],
     spot_price: float,
     depth: int = DEFAULT_WALL_LADDER_DEPTH,
+    *,
+    anchor: Optional[float] = None,
+    tie_pct: float = WALL_TIE_PCT,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Return ``(call_walls, put_walls)`` — the top-``depth`` walls per side.
 
@@ -205,27 +236,33 @@ def compute_wall_ladder(
         aggregated by strike first, exactly as
         :func:`compute_call_put_walls` does.  Restrict expirations on the
         caller side to scope the ladder.
-    :param spot_price: current underlying price; splits strikes into the
-        above-spot (call) and below-spot (put) regions.
+    :param spot_price: current underlying price; scales the dollar strength
+        and is the split price when no ``anchor`` is given.
     :param depth: how many ranks to return per side.  Clamped to
         ``[0, MAX_WALL_LADDER_DEPTH]``.  Fewer are returned when the chain
         has fewer eligible strikes on that side — a short list means the
         book genuinely has no further wall, so callers should render what
         they get rather than padding.
-    :returns: two lists ordered by rank ascending (strongest first).  Both
-        are empty when ``spot_price`` is unusable.
+    :param anchor: the wall anchor to split strikes on (call side
+        ``strike >= anchor``, put side ``strike <= anchor``).  ``None`` or a
+        non-positive value splits on ``spot_price``.
+    :param tie_pct: the tie zone.  Rank 1 is the strike nearest the anchor
+        among those within ``tie_pct`` of the side's largest; ``0`` makes rank
+        1 the largest (nearest-to-anchor on an exact tie).
+    :returns: two lists ordered by rank ascending.  Both are empty when
+        ``spot_price`` is unusable.
 
-    Ordering per side extends the primary tie-break exactly:
+    Ordering per side:
 
-    * Call walls → ``call_gamma`` DESC, then strike ASC (nearest above spot).
-    * Put walls  → ``put_gamma``  DESC, then strike DESC (nearest below spot).
-
-    Ranks are pure magnitude order.  Two adjacent strikes can be ``C1`` and
-    ``C2``; the chain, not a spacing heuristic, decides.
+    * Rank 1 → the tie-zone pick described above.
+    * Ranks 2.. → the remaining strikes by gamma DESC, then nearest to the
+      anchor (strike ASC for calls, DESC for puts).
     """
     depth = max(0, min(int(depth), MAX_WALL_LADDER_DEPTH))
     if depth == 0 or spot_price is None or spot_price <= 0:
         return [], []
+    split = float(anchor) if anchor is not None and anchor > 0 else float(spot_price)
+    tie = min(max(float(tie_pct or 0.0), 0.0), 1.0)
 
     # Aggregate per-(strike, expiration) rows into per-strike sums so the
     # ranking matches the cross-expiration view consumers actually see.
@@ -251,8 +288,17 @@ def compute_wall_ladder(
         candidates = [
             (strike, gamma) for strike, gamma in agg.items() if gamma > 0 and eligible(strike)
         ]
-        # Sort key mirrors the SQL ``ORDER BY gamma DESC, strike ASC|DESC``.
+        # Magnitude order, nearest-to-anchor on an exact tie.
         candidates.sort(key=lambda sg: (-sg[1], nearest_first(sg[0])))
+        if candidates and tie > 0:
+            # Rank 1 is the strike price reaches first among those within the
+            # tie zone of the largest; the rest keep magnitude order.
+            floor = candidates[0][1] * (1.0 - tie)
+            pick = min(
+                (sg for sg in candidates if sg[1] >= floor),
+                key=lambda sg: nearest_first(sg[0]),
+            )
+            candidates = [pick] + [sg for sg in candidates if sg is not pick]
         return [
             {
                 "rank": rank,
@@ -263,8 +309,8 @@ def compute_wall_ladder(
             for rank, (strike, gamma) in enumerate(candidates[:depth], start=1)
         ]
 
-    call_walls = _rank(agg_call, lambda s: s >= spot_price, lambda s: s, "call")
-    put_walls = _rank(agg_put, lambda s: s <= spot_price, lambda s: -s, "put")
+    call_walls = _rank(agg_call, lambda s: s >= split, lambda s: s, "call")
+    put_walls = _rank(agg_put, lambda s: s <= split, lambda s: -s, "put")
     return call_walls, put_walls
 
 
@@ -278,13 +324,11 @@ def align_wall_ladder(
 
     Callers that recompute the ladder from ``gex_by_strike`` but report the
     primary wall from somewhere else — ``/api/gex/summary`` reads the
-    Analytics-Engine-persisted ``gex_summary.call_wall``, and recomputes the
-    ladder against the latest ``underlying_quotes`` close — can end up with a
-    ladder whose ``C1`` is not the ``call_wall`` drawn beside it.  Normally
-    the two agree exactly (same rows, same helper); they diverge only when
-    spot has moved across a strike since the engine wrote the row, which
-    changes which side of spot that strike falls on and so whether it is
-    eligible at all.
+    Analytics-Engine-persisted ``gex_summary.call_wall`` and ranks the ladder
+    in SQL by plain magnitude — can end up with a ladder whose ``C1`` is not
+    the ``call_wall`` drawn beside it: the published wall is the tie-zone
+    pick, which need not be the largest strike, and the anchor it was split
+    on may sit away from the price the ladder was split on.
 
     Rather than let a chart draw ``C1`` at one price and "Call Wall" at
     another, promote the reported wall and renumber everything below it.  A
@@ -317,117 +361,100 @@ def align_wall_ladder(
     return out
 
 
-def wall_strength_at(
-    gex_by_strike: Iterable[Mapping[str, Any]],
-    strike: Optional[float],
-    side: str,
+def _et_day(ts: datetime) -> date:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(_ET).date()
+
+
+def wall_break_buffer(
     spot_price: float,
-) -> Optional[float]:
-    """Dollar-gamma magnitude at one strike, on the wall-ladder scale.
+    typical_move_30m: Optional[float],
+    *,
+    move_fraction: float = WALL_BREAK_MOVE_FRACTION,
+    min_pct: float = WALL_BREAK_MIN_PCT,
+) -> float:
+    """How far past a strike price must close before the strike changes sides.
 
-    The strength :func:`compute_wall_ladder` would quote for ``strike`` had it
-    ranked first: ``side`` gamma summed across expirations, times
-    ``100 × S² × 0.01``.  It exists for a held wall (:class:`WallHold`), whose
-    strike is no longer this cycle's rank-1 winner but still needs a strength
-    that describes it rather than the challenger.
-
-    ``None`` when there is no strike, no usable spot, or no positive gamma at
-    that strike — the same "no wall, no magnitude" convention as the ladder.
+    The larger of ``move_fraction`` of the typical 30-minute range (the
+    volatility yardstick ``AnalyticsEngine._typical_move_30m`` computes: a
+    5-day median of half-hour high-low ranges) and ``min_pct`` of spot.  A
+    fixed percentage alone reads the same on a quiet morning and a fast
+    afternoon; scaling by how far price usually travels makes "price plowed
+    through the wall" mean the same thing in both.  The floor keeps the
+    buffer sane when the typical move is unknown or unusually small — and a
+    pinned market is exactly when price chops tightest around a big strike.
     """
-    if strike is None or spot_price is None or spot_price <= 0:
-        return None
-    key = "call_gamma" if side == "call" else "put_gamma"
-    target = float(strike)
-    gamma = 0.0
-    for row in gex_by_strike:
-        try:
-            if float(row["strike"]) != target:
-                continue
-        except (KeyError, TypeError, ValueError):
-            continue
-        gamma += float(row.get(key) or 0.0)
-    if gamma <= 0:
-        return None
-    return abs(gamma * 100.0 * spot_price * spot_price * 0.01)
+    if spot_price is None or spot_price <= 0:
+        return 0.0
+    floor = max(0.0, float(min_pct)) * float(spot_price)
+    if typical_move_30m is None or typical_move_30m <= 0:
+        return floor
+    return max(floor, max(0.0, float(move_fraction)) * float(typical_move_30m))
 
 
-class WallHold:
-    """Keep a published wall until a new strike has won for ``hold_minutes``.
+def step_wall_anchor(prev_anchor: Optional[float], spot_price: float, buffer: float) -> float:
+    """Advance the wall anchor by one bucket.
 
-    The ranking above is a plain argmax re-run every minute with no memory.
-    Two near-tied strikes swap places on small moves, and when spot chops
-    across the biggest strike that strike flips between being the Call Wall
-    and the Put Wall (the ``strike >= spot`` / ``strike <= spot`` split).
-    Either way the published wall jumps and comes straight back, which reads
-    as a glitch and is not a change in dealer positioning.
+    The anchor is a sticky copy of spot: it stays put while price moves
+    within ``buffer`` of it and otherwise follows price at exactly
+    ``buffer`` behind (a "play" or backlash operator)::
 
-    This is a debounce on the bucket clock: a challenger replaces the
-    published wall only once it has been the raw winner continuously for
-    ``hold_minutes``.  Any minute in which it is not resets its clock.  "No
-    wall" (``None``) is a value like any other, so one degraded cycle cannot
-    blank a level either.
+        anchor = clamp(prev_anchor, spot - buffer, spot + buffer)
 
-    The first observation of each New York calendar day is published as-is:
-    yesterday's wall describes yesterday's expirations and must not be held
-    into the open.  ``hold_minutes <= 0`` passes every raw value through.
+    Splitting strikes on the anchor instead of on spot is the same as giving
+    every strike its own break test with no extra state: a strike only moves
+    from the call side to the put side once price has been more than
+    ``buffer`` above it, and only moves back once price has been more than
+    ``buffer`` below it.  Price chopping around a strike therefore leaves its
+    role alone, and price plowing through it hands the strike over on the
+    first bucket beyond the buffer.  ``prev_anchor`` of ``None`` (the first
+    bucket of a day) starts at spot.
+    """
+    if prev_anchor is None:
+        return float(spot_price)
+    b = max(0.0, float(buffer))
+    return min(max(float(prev_anchor), spot_price - b), spot_price + b)
 
-    One instance tracks one series (one symbol, one side).  Feed it in time
-    order; it keeps no history beyond the pending challenger.
+
+class WallAnchor:
+    """One symbol's wall anchor, advanced once per bucket.
+
+    The engine recomputes a bucket several times while its minute is open, so
+    each update steps from the anchor the PREVIOUS bucket ended on, never from
+    an earlier pass over the same bucket: a bucket's anchor is a function of
+    the prior bucket's anchor and this bucket's latest spot, and so reads the
+    same whichever pass wrote it last.
+
+    Each New York calendar day starts over at spot, so yesterday's close
+    cannot decide which side of price a strike is on this morning.
     """
 
-    def __init__(self, hold_minutes: float = WALL_HOLD_MINUTES) -> None:
-        self.hold_seconds = max(0.0, float(hold_minutes)) * 60.0
-        self.shown: Optional[float] = None
+    def __init__(self) -> None:
+        self.value: Optional[float] = None
+        self._bucket: Optional[datetime] = None
+        self._prior: Optional[float] = None
         self._day: Optional[date] = None
-        self._has_pending = False
-        self._pending: Optional[float] = None
-        self._pending_since: Optional[datetime] = None
 
-    @staticmethod
-    def _et_day(ts: datetime) -> date:
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return ts.astimezone(_ET).date()
+    def seed(self, anchor: Any, bucket_ts: datetime) -> None:
+        """Resume from the anchor stored for an EARLIER bucket (after a restart)."""
+        self.value = None if anchor is None else float(anchor)
+        self._bucket = bucket_ts
+        self._prior = None
+        self._day = _et_day(bucket_ts)
 
-    @staticmethod
-    def _norm(strike: Any) -> Optional[float]:
-        return None if strike is None else float(strike)
-
-    def _clear_pending(self) -> None:
-        self._has_pending = False
-        self._pending = None
-        self._pending_since = None
-
-    def seed(self, shown: Any, ts: datetime) -> None:
-        """Resume from a wall already published at ``ts`` (e.g. after a restart).
-
-        Only takes effect for the day of ``ts``: an observation on a later day
-        resets exactly as it would have without the seed.
-        """
-        self.shown = self._norm(shown)
-        self._day = self._et_day(ts)
-        self._clear_pending()
-
-    def update(self, raw: Any, ts: datetime) -> Optional[float]:
-        """Feed this cycle's raw winner; return the wall to publish."""
-        raw_f = self._norm(raw)
-        day = self._et_day(ts)
-        if self.hold_seconds <= 0 or self._day != day:
+    def update(self, spot_price: float, buffer: float, bucket_ts: datetime) -> float:
+        """This bucket's anchor, given its latest spot and break buffer."""
+        day = _et_day(bucket_ts)
+        if day != self._day:
             self._day = day
-            self.shown = raw_f
-            self._clear_pending()
-            return self.shown
-        if raw_f == self.shown:
-            self._clear_pending()
-            return self.shown
-        if not self._has_pending or self._pending != raw_f or self._pending_since is None:
-            self._has_pending = True
-            self._pending = raw_f
-            self._pending_since = ts
-        if (ts - self._pending_since).total_seconds() >= self.hold_seconds:
-            self.shown = raw_f
-            self._clear_pending()
-        return self.shown
+            self._bucket = None
+            self.value = None
+        if bucket_ts != self._bucket:
+            self._prior = self.value
+            self._bucket = bucket_ts
+        self.value = step_wall_anchor(self._prior, spot_price, buffer)
+        return self.value
 
 
 def _percentile_linear(values: List[float], percentile: float) -> float:
@@ -616,11 +643,12 @@ def compute_gamma_flip_from_strikes(
 # ``$call_gamma`` column, ``$put_gamma`` column, ``$spot`` numeric.  Wrap in a
 # CTE that selects from the relevant partition (e.g. a single timestamp).
 #
-# This is the canonical SQL counterpart of :func:`compute_call_put_walls` and
-# is used by ``get_historical_gex`` for buckets that pre-date the column
-# backfill.  New writes go through the Analytics Engine, which calls the
-# Python helper and persists the result to ``gex_summary.call_wall`` /
-# ``gex_summary.put_wall``.
+# This is the SQL counterpart of :func:`compute_call_put_walls` with
+# ``tie_pct=0`` split on spot -- the plain argmax, without the tie zone or the
+# wall anchor, which need Python.  It is used by ``get_historical_gex`` for
+# buckets that pre-date the column backfill.  New writes go through the
+# Analytics Engine, which calls the Python helper and persists the result to
+# ``gex_summary.call_wall`` / ``gex_summary.put_wall``.
 #
 # Note the GROUP BY strike — ``gex_by_strike`` is keyed
 # ``(strike, expiration)`` and the Python helper aggregates by strike before

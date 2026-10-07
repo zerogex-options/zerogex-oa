@@ -480,13 +480,24 @@ GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT = _getenv_float(
     "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", _FP["max_flip_distance_pct"], min=0.01, max=1.0
 )
 
-# How long a new Call/Put Wall strike must stay the winner before it replaces
-# the published one (see src.analytics.walls.WallHold).  The ranking is a
-# plain argmax re-run every minute, so two near-tied strikes, or spot chopping
-# across the biggest strike, swap the wall back and forth: 639 jump-and-revert
-# events across SPX/SPY/NDX/QQQ in the eight sessions from 2026-09-28, most of
-# them back within five minutes.  0 publishes the raw winner every cycle.
-WALL_HOLD_MINUTES = _getenv_int("WALL_HOLD_MINUTES", 5, min=0, max=60)
+# Call/Put Wall stability (see src.analytics.walls).  A plain argmax re-run
+# every minute made the walls jump and snap back: 639 times across
+# SPX/SPY/NDX/QQQ in the eight sessions from 2026-09-28, about half from spot
+# chopping across the biggest strike and half from two near-tied strikes
+# trading places.  Two rules answer the two causes, and both are functions of
+# price and the strikes alone, so every expiration selection behaves the same.
+#
+# Break buffer: how far past a strike price must close before that strike
+# changes sides (stops counting as above/below price).  The larger of a
+# fraction of the typical 30-minute range (the volatility yardstick
+# AnalyticsEngine._typical_move_30m computes) and a floor in percent of spot,
+# which also stands in when the typical move is unknown.  Price that lingers
+# inside the buffer moves nothing; a close beyond it moves the walls at once.
+WALL_BREAK_MOVE_FRACTION = _getenv_float("WALL_BREAK_MOVE_FRACTION", 0.4, min=0.0, max=5.0)
+WALL_BREAK_MIN_PCT = _getenv_float("WALL_BREAK_MIN_PCT", 0.001, min=0.0, max=0.02)
+# Tie zone: strikes within this fraction of the biggest on their side are
+# treated as tied, and the one price reaches first wins.  0 is a plain argmax.
+WALL_TIE_PCT = _getenv_float("WALL_TIE_PCT", 0.10, min=0.0, max=0.5)
 
 # The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
 # carries a colossal re-greeked Black-Scholes gamma spike (ATM gamma ∝

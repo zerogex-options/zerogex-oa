@@ -60,10 +60,10 @@ from src.config import (
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.tradeworkz.strikes import default_strike_increment
 from src.analytics.walls import (
-    WallHold,
+    WallAnchor,
     compute_call_put_walls,
     compute_call_put_walls_with_strength,
-    wall_strength_at,
+    wall_break_buffer,
 )
 from src.analytics import gamma_flip_carry
 from src.analytics import pin_strike as pin_strike_mod
@@ -165,6 +165,8 @@ _GEX_SUMMARY_COLUMNS = (
     "pin_strike_reason",
     "gamma_flip_reason",
     "data_as_of",
+    "wall_anchor",
+    "wall_break_buffer",
 )
 
 #: The conflict key. Never assigned in DO UPDATE SET, never in its guard.
@@ -198,6 +200,8 @@ _GEX_SUMMARY_OPTIONAL_COLUMNS = frozenset(
         "pin_score",
         "pin_confidence",
         "pin_strike_reason",
+        "wall_anchor",
+        "wall_break_buffer",
         "computed_at",
         "data_as_of",
         "gamma_flip_reason",
@@ -377,10 +381,13 @@ class AnalyticsEngine:
         # confirmed, so the database is asked once per bucket rather than on
         # every after-hours write.
         self._settled_bucket_ts: Optional[datetime] = None
-        # Debounce on the published Call/Put Wall (see _apply_wall_hold).
-        # None until the first summary, when it is built and seeded from the
-        # last row this symbol already published today.
-        self._wall_holds: Optional[Dict[str, WallHold]] = None
+        # The price the Call/Put Walls are split on (see _advance_wall_anchor).
+        # None until the first summary, when it is built and resumed from the
+        # anchor this symbol stored earlier today.
+        self._wall_anchor: Optional[WallAnchor] = None
+        # (bucket the typical 30-minute move was read at, the value) -- the
+        # break buffer's volatility yardstick, re-read every half hour.
+        self._wall_move_cache: Optional[Tuple[datetime, Optional[float]]] = None
         # Latch for the "snapshot has no Greek-bearing options" state.
         # A weekday night is inside the 24x5 run window, so the engine
         # keeps cycling after the close; once the underlying feed stops
@@ -2477,6 +2484,7 @@ class AnalyticsEngine:
         span_pct: Optional[float] = None,
         step_pct: Optional[float] = None,
         include_walls: bool = True,
+        wall_anchor: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Spot-shift dealer-gamma surface across multiple horizons.
 
@@ -2590,7 +2598,11 @@ class AnalyticsEngine:
         if include_walls and options and spot > 0:
             gex_by_strike = self._calculate_gex_by_strike(options, spot, timestamp)
             if gex_by_strike:
-                call_wall, put_wall = compute_call_put_walls(gex_by_strike, spot)
+                # Split on the published wall anchor so these are the walls
+                # the dashboard shows, not a fresh spot-split re-rank.
+                call_wall, put_wall = compute_call_put_walls(
+                    gex_by_strike, spot, anchor=wall_anchor
+                )
                 # Convert OI-weighted gamma at the wall strike to dollar
                 # GEX per 1% move via the canonical formula
                 # ``γ_aggregate × 100 × S² × 0.01`` (same convention
@@ -3006,8 +3018,13 @@ class AnalyticsEngine:
         options: List[Dict[str, Any]],
         underlying_price: float,
         timestamp: datetime,
+        wall_anchor: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Calculate summary GEX metrics"""
+        """Calculate summary GEX metrics.
+
+        ``wall_anchor`` is the price the Call/Put Walls are split on (see
+        :meth:`_advance_wall_anchor`); ``None`` splits on ``underlying_price``.
+        """
 
         if not gex_by_strike:
             logger.warning("No GEX data to summarize")
@@ -3266,7 +3283,9 @@ class AnalyticsEngine:
             put_wall,
             call_wall_strength,
             put_wall_strength,
-        ) = compute_call_put_walls_with_strength(gex_by_strike, underlying_price)
+        ) = compute_call_put_walls_with_strength(
+            gex_by_strike, underlying_price, anchor=wall_anchor
+        )
 
         # Pin Strike — reachable 0DTE strike with the strongest modeled positive
         # (restoring) dealer gamma into expiration.  Distinct from the walls /
@@ -3614,6 +3633,14 @@ class AnalyticsEngine:
                 str(gamma_flip_reason_val) if gamma_flip_reason_val is not None else None
             ),
             "data_as_of": summary.get("data_as_of"),
+            "wall_anchor": (
+                float(summary["wall_anchor"]) if summary.get("wall_anchor") is not None else None
+            ),
+            "wall_break_buffer": (
+                float(summary["wall_break_buffer"])
+                if summary.get("wall_break_buffer") is not None
+                else None
+            ),
         }
         cursor.execute(self._gex_summary_upsert(cursor), values)
         logger.debug("✅ Stored GEX summary")
@@ -5230,79 +5257,104 @@ class AnalyticsEngine:
             )
             return False
 
-    def _init_wall_holds(self, bucket_ts: datetime) -> Dict[str, WallHold]:
-        """Build the per-side wall holds, resumed from the last published row.
+    #: How long the typical 30-minute move behind the break buffer is reused.
+    #: It is a 5-day median and barely moves intraday (see _typical_move_30m).
+    WALL_MOVE_REFRESH = timedelta(minutes=30)
 
-        Without the seed, a restart mid-session would publish whatever raw
-        winner the first cycle saw, which is exactly the one-minute jump the
-        hold exists to suppress (deploys restart the engine during the
-        session).  ``WallHold.seed`` only applies to the row's own New York
-        day, so yesterday's last row is harmless.  A failed read starts
-        unseeded: the first cycle then publishes its raw winner, which is what
-        every cycle did before the hold existed.
+    def _read_stored_wall_anchor(
+        self, at: datetime, *, inclusive: bool
+    ) -> Optional[Tuple[datetime, float]]:
+        """The newest ``(timestamp, wall_anchor)`` stored today at or before ``at``.
+
+        ``inclusive=False`` stops strictly before ``at`` -- what resuming the
+        anchor after a restart needs, since the row for ``at`` itself is the
+        one about to be rewritten.  Bounded to ``at``'s New York day, the only
+        day an anchor is valid for.  ``None`` when there is none or the read
+        fails (logged): callers then split on spot.
         """
-        holds = {"call": WallHold(), "put": WallHold()}
+        et = at.astimezone(ET) if at.tzinfo else at
+        day_start = et.replace(hour=0, minute=0, second=0, microsecond=0)
+        op = "<=" if inclusive else "<"
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """
-                    SELECT timestamp, call_wall, put_wall
+                    f"""
+                    SELECT timestamp, wall_anchor
                     FROM gex_summary
-                    WHERE underlying = %s AND timestamp <= %s
+                    WHERE underlying = %s
+                      AND timestamp {op} %s
+                      AND timestamp >= %s
+                      AND wall_anchor IS NOT NULL
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
-                    (self.db_symbol, bucket_ts),
+                    (self.db_symbol, at, day_start),
                 )
                 row = cursor.fetchone()
-            if row is not None and row[0] is not None:
-                holds["call"].seed(row[1], row[0])
-                holds["put"].seed(row[2], row[0])
         except Exception:
             logger.warning(
-                "Could not read the last published walls for %s; the wall hold "
-                "starts from this cycle's raw winner",
+                "Could not read the stored wall anchor for %s; splitting the walls on spot",
                 self.db_symbol,
                 exc_info=True,
             )
-        return holds
+            return None
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return row[0], float(row[1])
 
-    def _apply_wall_hold(
-        self, summary: Dict[str, Any], gex_by_strike: List[Dict[str, Any]]
-    ) -> None:
-        """Replace this cycle's raw Call/Put Wall with the held one, in place.
+    def _wall_typical_move(self, bucket_ts: datetime) -> Optional[float]:
+        """The typical 30-minute range behind the break buffer, cached.
 
-        The persisted ``call_wall`` / ``put_wall`` feed every surface (the
-        dashboard, ``/api/gex/summary``, the signal engine, TradeWorkz), so
-        debouncing them here steadies all of them at once.  When the held
-        strike is not this cycle's winner, its ``*_strength`` is re-read at
-        the held strike so the magnitude describes the wall actually
-        published, not the challenger.
+        A failure is cached too, as ``None`` (the buffer then falls back to
+        its percent-of-spot floor), so a broken read costs one warning per
+        refresh rather than one per cycle.
         """
-        bucket_ts = summary.get("timestamp")
-        if not isinstance(bucket_ts, datetime):
-            # The hold runs on the bucket clock; with no bucket there is
-            # nothing to measure against, so publish the raw walls.
-            return
-        if self._wall_holds is None:
-            self._wall_holds = self._init_wall_holds(bucket_ts)
-        spot = float(summary.get("underlying_price") or 0.0)
-        for side in ("call", "put"):
-            raw = summary.get(f"{side}_wall")
-            held = self._wall_holds[side].update(raw, bucket_ts)
-            raw_f = None if raw is None else float(raw)
-            if held == raw_f:
-                continue
-            logger.debug(
-                "[%s] holding %s wall at %s (raw winner %s)",
+        cached: Optional[Tuple[datetime, Optional[float]]] = getattr(self, "_wall_move_cache", None)
+        if cached is not None:
+            read_at, cached_value = cached
+            if timedelta(0) <= bucket_ts - read_at < self.WALL_MOVE_REFRESH:
+                return cached_value
+        value: Optional[float] = None
+        try:
+            with db_connection() as conn:
+                value = self._typical_move_30m(conn.cursor(), bucket_ts)
+        except Exception:
+            logger.warning(
+                "Could not read the typical 30-minute move for %s; the wall break "
+                "buffer uses its percent-of-spot floor",
                 self.db_symbol,
-                side,
-                held,
-                raw_f,
+                exc_info=True,
             )
-            summary[f"{side}_wall"] = held
-            summary[f"{side}_wall_strength"] = wall_strength_at(gex_by_strike, held, side, spot)
+        self._wall_move_cache = (bucket_ts, value)
+        return value
+
+    def _advance_wall_anchor(
+        self, spot: float, bucket_ts: datetime
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """This bucket's ``(wall_anchor, wall_break_buffer)``.
+
+        The anchor is what the Call/Put Walls are split on: price only, so it
+        is computed once here and stored, and every expiration selection the
+        API draws later splits on the same value (see
+        :func:`src.analytics.walls.step_wall_anchor`).  ``(None, None)`` with no
+        usable spot or bucket, which makes the walls split on spot.
+        """
+        if not isinstance(bucket_ts, datetime) or spot is None or spot <= 0:
+            return None, None
+        anchor: Optional[WallAnchor] = getattr(self, "_wall_anchor", None)
+        if anchor is None:
+            # Resume from the anchor stored earlier today.  Without it, a
+            # restart mid-session (every deploy) would restart the anchor at
+            # spot, and a strike price was lingering around could change
+            # sides on the first cycle -- the jump the anchor exists to stop.
+            anchor = WallAnchor()
+            stored = self._read_stored_wall_anchor(bucket_ts, inclusive=False)
+            if stored is not None:
+                anchor.seed(stored[1], stored[0])
+            self._wall_anchor = anchor
+        buffer = wall_break_buffer(spot, self._wall_typical_move(bucket_ts))
+        return anchor.update(spot, buffer, bucket_ts), buffer
 
     def run_calculation(self) -> bool:
         """
@@ -5497,8 +5549,13 @@ class AnalyticsEngine:
             # Calculate GEX summary
             logger.debug("Calculating GEX summary metrics...")
             t0 = _time.monotonic()
+            wall_anchor, wall_buffer = self._advance_wall_anchor(underlying_price, latest_timestamp)
             gex_summary = self._calculate_gex_summary(
-                gex_by_strike, options, underlying_price, latest_timestamp
+                gex_by_strike,
+                options,
+                underlying_price,
+                latest_timestamp,
+                wall_anchor=wall_anchor,
             )
             stage_timings["gex_summary"] = _time.monotonic() - t0
 
@@ -5506,13 +5563,11 @@ class AnalyticsEngine:
                 logger.warning("Failed to calculate GEX summary")
                 self._last_stage_timings = stage_timings
                 return False
+            gex_summary["wall_anchor"] = wall_anchor
+            gex_summary["wall_break_buffer"] = wall_buffer
 
             # Validate internal arithmetic consistency before persisting.
             self._validate_gex_calculations(gex_by_strike, gex_summary, underlying_price)
-
-            # Publish the held walls, not this minute's raw argmax.  After
-            # validation, which checks the raw ranking against its own rows.
-            self._apply_wall_hold(gex_summary, gex_by_strike)
 
             # Store results
             logger.debug("Storing results to database...")

@@ -123,18 +123,17 @@ def _no_gex_summary_lookup(monkeypatch):
     monkeypatch.setattr(AnalyticsEngine, "_gex_summary_row_exists", lambda self, bucket_ts: False)
 
 
-# Same hazard, same answer: the wall hold resumes from the last published
-# gex_summary row on an engine's first summary, which would otherwise read the
-# production database from any engine test run on the server.  Start unseeded
-# instead -- the first cycle publishes its raw walls, as it did before the hold.
-# test_wall_hold.py exercises the real seed against a fake connection.
+# Same hazard, same answer: the wall anchor resumes from the anchor stored
+# earlier today and sizes its break buffer from underlying_quotes, two reads
+# that would otherwise hit the production database from any engine test run
+# on the server.  Start unseeded with no typical move instead -- the anchor
+# starts at spot and the buffer uses its percent-of-spot floor.
+# test_wall_anchor.py exercises both reads against a fake connection.
 @pytest.fixture(autouse=True)
-def _no_wall_hold_seed(monkeypatch):
+def _no_wall_anchor_reads(monkeypatch):
     from src.analytics.main_engine import AnalyticsEngine
-    from src.analytics.walls import WallHold
 
     monkeypatch.setattr(
-        AnalyticsEngine,
-        "_init_wall_holds",
-        lambda self, bucket_ts: {"call": WallHold(), "put": WallHold()},
+        AnalyticsEngine, "_read_stored_wall_anchor", lambda self, at, *, inclusive: None
     )
+    monkeypatch.setattr(AnalyticsEngine, "_wall_typical_move", lambda self, bucket_ts: None)

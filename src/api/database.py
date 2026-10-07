@@ -23,7 +23,6 @@ from src.analytics.walls import (
     compute_gamma_flip_from_strikes,
     compute_wall_ladder,
     wall_label,
-    wall_strength_at,
 )
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
@@ -208,30 +207,6 @@ def _replay_max_pain_for_expirations(raw: Any, exp_filter: List[date]) -> Option
         return None
 
 
-def _align_stored_wall(
-    ladder: List[Dict[str, Any]],
-    stored: Any,
-    side: str,
-    inputs: List[Dict[str, float]],
-    spot: float,
-) -> List[Dict[str, Any]]:
-    """Pin a bucket's ladder to the wall ``gex_summary`` published for it.
-
-    The published wall is the held one, so it can sit a strike away from this
-    bucket's raw rank 1, or on the far side of the close after spot poked
-    through it.  :func:`align_wall_ladder` promotes it to C1; when it is not
-    in the recomputed ladder at all (the far-side case) its strength is read
-    at that strike from the bucket's own rows rather than left empty.
-    ``stored`` of ``None`` returns the ladder untouched.
-    """
-    if stored is None:
-        return ladder
-    aligned = align_wall_ladder(ladder, float(stored), side, DEFAULT_WALL_LADDER_DEPTH)
-    if aligned and aligned[0]["strength"] is None:
-        aligned[0]["strength"] = wall_strength_at(inputs, aligned[0]["strike"], side, spot)
-    return aligned
-
-
 def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) -> Dict[str, Any]:
     """Re-derive one replay frame's level lines from its filtered ladder.
 
@@ -258,6 +233,7 @@ def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) ->
     """
     inputs = frame.pop("_gamma_inputs", None) or []
     spot = frame.pop("_spot", None)
+    anchor = frame.pop("_wall_anchor", None)
     max_pain_by_exp = frame.pop("_max_pain_by_expiration", None)
 
     try:
@@ -266,7 +242,12 @@ def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) ->
         spot_f = None
 
     if spot_f and spot_f > 0 and inputs:
-        call_wall, put_wall = compute_call_put_walls(inputs, spot_f)
+        # Split on the minute's stored wall anchor, so a filtered replay breaks
+        # a wall on the same move the whole-chain replay (and the live chart)
+        # did; spot when the row predates the anchor column.
+        call_wall, put_wall = compute_call_put_walls(
+            inputs, spot_f, anchor=float(anchor) if anchor is not None else None
+        )
         frame["call_wall"] = call_wall
         frame["put_wall"] = put_wall
         frame["gamma_flip"] = compute_gamma_flip_from_strikes(inputs, spot_f)
@@ -2124,6 +2105,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.net_gex_at_spot,
                     gs.call_wall AS stored_call_wall,
                     gs.put_wall  AS stored_put_wall,
+                    -- The price the engine split those walls on.  The
+                    -- ladders below split on it too, so C2/C3 sit on the
+                    -- same side of price as the C1 they are listed under.
+                    gs.wall_anchor,
                     gs.max_gamma_strike,
                     gs.gamma_flip_span_used,
                     gs.pin_strike,
@@ -2155,13 +2140,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                  AND gbs.timestamp = ls.timestamp
                 JOIN latest_quote lq ON TRUE
             ),
-            -- Canonical Call Wall ladder: call-gamma strikes at-or-above spot
-            -- ranked strongest-first, tiebreaker nearest-to-spot (lowest
-            -- strike above spot).  Rank 1 is the Call Wall — used as the
+            -- Call Wall ladder: call-gamma strikes at-or-above the wall anchor
+            -- the engine split the stored walls on (spot on rows without
+            -- one), ranked strongest-first, tiebreaker nearest (lowest
+            -- strike).  Rank 1 is the plain-magnitude Call Wall — used as the
             -- fallback when gex_summary.call_wall is NULL — and ranks 2..N
             -- are the optional secondary walls (C2/C3) the charts can draw.
-            -- One CTE serves both so the headline wall and the ladder can
-            -- never be ranked on different bases.
+            -- The stored wall is the tie-zone pick (compute_wall_ladder),
+            -- which need not be the largest, so _attach_wall_ladders pins it
+            -- to C1 and lists the rest under it.
             --
             -- Aggregates ``call_gamma`` across expirations per strike —
             -- gex_by_strike is keyed (strike, expiration), and ranking
@@ -2180,13 +2167,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                       ON gbs.underlying = ls.underlying
                      AND gbs.timestamp = ls.timestamp
                     JOIN latest_quote lq ON TRUE
-                    WHERE gbs.strike >= lq.spot_price
+                    WHERE gbs.strike >= COALESCE(ls.wall_anchor, lq.spot_price)
                     GROUP BY gbs.strike
                 ) per_strike
                 WHERE call_gamma > 0
             ),
-            -- Canonical Put Wall ladder: put-gamma strikes at-or-below spot,
-            -- tiebreaker nearest-to-spot (highest strike below spot).
+            -- Put Wall ladder: put-gamma strikes at-or-below the wall anchor,
+            -- tiebreaker nearest (highest strike).
             -- Cross-expiration aggregation (see ranked_call_walls above).
             ranked_put_walls AS (
                 SELECT
@@ -2200,7 +2187,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                       ON gbs.underlying = ls.underlying
                      AND gbs.timestamp = ls.timestamp
                     JOIN latest_quote lq ON TRUE
-                    WHERE gbs.strike <= lq.spot_price
+                    WHERE gbs.strike <= COALESCE(ls.wall_anchor, lq.spot_price)
                     GROUP BY gbs.strike
                 ) per_strike
                 WHERE put_gamma > 0
@@ -3337,6 +3324,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                        -- (front month, whole chain) is the wrong settlement to
                        -- quote beside a filtered ladder.
                        gs.max_pain_by_expiration,
+                       -- The price the engine split the walls on.  Read under
+                       -- a filter, where the walls are re-ranked from the
+                       -- filtered ladder but must break on the same move.
+                       gs.wall_anchor,
                        (SELECT uq.close::numeric
                           FROM underlying_quotes uq
                          WHERE uq.symbol = $1
@@ -3364,6 +3355,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 -- rank that minute's walls against the same price the bars
                 -- were scaled with.
                 s.spot,
+                s.wall_anchor,
                 ladder.strike,
                 ladder.net_gex,
                 ladder.call_gex,
@@ -3510,6 +3502,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # read touches neither the extra columns nor the extra
                     # per-minute list.
                     frames[ts]["_spot"] = r["spot"]
+                    frames[ts]["_wall_anchor"] = r.get("wall_anchor")
                     frames[ts]["_max_pain_by_expiration"] = r["max_pain_by_expiration"]
                     frames[ts]["_gamma_inputs"] = []
             if r["strike"] is not None:
@@ -4899,16 +4892,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         ``expirations=[d1, d2, …]`` → restrict the strikes payload to that
         set of expirations (summed per (bucket, strike) across the set).
 
-        Walls follow the request's expiration scope.  Each bucket's ladder
-        is computed live from the same (filtered, summed-by-strike) gamma
-        rows the bucket's bars render — via
-        :func:`src.analytics.walls.compute_wall_ladder` — against the
-        bucket's own close.  With a specific set, rank 1 is the wall,
-        scoped to that set's gamma alone.  With ``expirations=None`` the
-        wall is the one ``gex_summary`` published at the bucket's close —
-        the engine's held wall (:class:`src.analytics.walls.WallHold`),
-        pinned to C1 — so the line matches ``/api/gex/summary`` and does
-        not redraw the minute-by-minute flicker the hold suppresses.
+        Walls follow the request's expiration scope.  Each bucket's
+        ``call_wall`` / ``put_wall`` is computed live from the same
+        (filtered, summed-by-strike) gamma rows the bucket's bars
+        render — via :func:`src.analytics.walls.compute_wall_ladder`,
+        the single source of record — split on the wall anchor
+        ``gex_summary`` stored for the bucket (price only, so identical
+        for every filter; the bucket's close when NULL).  With
+        ``expirations=None`` walls are the cross-expiration aggregate and
+        match the engine's published ``gex_summary.call_wall`` /
+        ``put_wall`` for the same minute; with a specific set walls are
+        scoped to that set's gamma alone, under the same rule.
 
         Gamma flip scope:
 
@@ -5085,11 +5079,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     -- pin, so it is carried straight through rather than
                     -- recomputed under an expirations filter.
                     gs.max_gamma_strike,
-                    -- The published (held) walls as of the bucket's close.
-                    -- Whole-chain, so only the unfiltered view uses them —
-                    -- see _finalize_bucket.
-                    gs.call_wall AS stored_call_wall,
-                    gs.put_wall AS stored_put_wall
+                    -- The wall anchor as of the bucket's close: the price the
+                    -- engine split the walls on.  Price only, so it is the
+                    -- same for every expirations filter — see _finalize_bucket.
+                    gs.wall_anchor
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                     AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
@@ -5235,8 +5228,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 br.pin_strike,
                 br.pin_confidence,
                 br.max_gamma_strike,
-                br.stored_call_wall,
-                br.stored_put_wall,
+                br.wall_anchor,
                 s.strike,
                 -- Raw summed gamma at this (bucket, strike) — used by the
                 -- Python wall computation below.  Not exposed in the
@@ -5310,10 +5302,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 pending_ts: Any = _UNSET
                 pending_inputs: List[Dict[str, float]] = []
                 finalized: set = set()
-                # Each bucket's published walls (gex_summary.call_wall /
-                # put_wall at the bucket's representative row), kept out of
-                # the payload and consumed by _finalize_bucket.
-                stored_walls: Dict[Any, Tuple[Any, Any]] = {}
+                # Each bucket's wall anchor (gex_summary.wall_anchor at the
+                # bucket's representative row), kept out of the payload and
+                # consumed by _finalize_bucket.
+                bucket_anchors: Dict[Any, Any] = {}
 
                 def _finalize_bucket(ts: Any, inputs: List[Dict[str, float]]) -> None:
                     """Compute a completed bucket's walls (and, for a filtered
@@ -5333,33 +5325,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     """
                     bucket = grouped[ts]
                     close_val = bucket.get("close")
-                    stored_call, stored_put = stored_walls.pop(ts, (None, None))
+                    anchor = bucket_anchors.pop(ts, None)
                     if close_val is not None and inputs:
                         # One ranked pass serves both the scalar walls and the
-                        # optional C2/C3 · P2/P3 ladder, so under an
-                        # expirations filter rank 1 IS the bucket's Call/Put
-                        # Wall by construction.
+                        # optional C2/C3 · P2/P3 ladder, so rank 1 IS the
+                        # bucket's Call/Put Wall by construction.  Split on the
+                        # anchor the engine stored for this bucket — the same
+                        # price whatever the expirations filter, which is what
+                        # makes a 0DTE view and the All view break a wall on
+                        # the same move.  A bucket needs nothing but its own
+                        # rows and that one number, so the web chart's 3-bucket
+                        # tip poll gets the same wall a full reload draws.
+                        # Rows from before the column existed split on the
+                        # bucket's close, as every bucket used to.
                         call_walls, put_walls = compute_wall_ladder(
-                            inputs, float(close_val), DEFAULT_WALL_LADDER_DEPTH
+                            inputs,
+                            float(close_val),
+                            DEFAULT_WALL_LADDER_DEPTH,
+                            anchor=float(anchor) if anchor is not None else None,
                         )
-                        if exp_filter is None:
-                            # Unfiltered, the line is the wall the engine
-                            # PUBLISHED at the bucket's close: the held one
-                            # (see WallHold), so the chart steps when the
-                            # dashboard did and does not redraw the minute-by-
-                            # minute flicker the hold suppresses.  A bucket
-                            # cannot re-run the hold on its own — the web
-                            # chart polls a 3-bucket tip — so it reads the
-                            # stored value, exactly as /api/gex/summary does,
-                            # and pins it to C1 the same way.  NULL (rows from
-                            # before the wall columns) keeps the recomputed
-                            # rank 1, as the summary endpoint's fallback does.
-                            call_walls = _align_stored_wall(
-                                call_walls, stored_call, "call", inputs, float(close_val)
-                            )
-                            put_walls = _align_stored_wall(
-                                put_walls, stored_put, "put", inputs, float(close_val)
-                            )
                         bucket["call_walls"] = call_walls
                         bucket["put_walls"] = put_walls
                         bucket["call_wall"] = call_walls[0]["strike"] if call_walls else None
@@ -5411,10 +5395,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "strikes": [],
                         }
                         grouped[ts] = bucket
-                        stored_walls[ts] = (
-                            r.get("stored_call_wall"),
-                            r.get("stored_put_wall"),
-                        )
+                        bucket_anchors[ts] = r.get("wall_anchor")
                     if ts != pending_ts:
                         # Bucket boundary: the previous bucket has all its rows
                         # now, so finalise it and release its raw gamma rows.
