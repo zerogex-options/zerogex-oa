@@ -50,9 +50,15 @@ produce a tidy equity curve. It just will not be about the GOAT.
 
 ## Running it
 
-1. **Import.** NinjaTrader → New → NinjaScript Editor. Right-click *Strategies*
-   → Import → pick `ZeroGexGoat.cs`. Or create a new strategy and paste the
-   file in. Then Compile (F5).
+1. **Install.** Copy `ZeroGexGoat.cs` into
+   `Documents\NinjaTrader 8\bin\Custom\Strategies`, then open New →
+   NinjaScript Editor and Compile (F5). The error list should be empty.
+   Errors that name some other file are another script on that machine
+   blocking the compile, not this one.
+
+   Do not use File → Utilities → Import NinjaScript for this. That importer
+   takes a `.zip` exported from NinjaTrader, not a bare `.cs` (see
+   `zerogex-web/assets/ninjatrader/README.md` for what an export contains).
 2. **Open Strategy Analyzer.** New → Strategy Analyzer.
 3. **Pick the instrument and bar type.** Instrument `YM 12-26`, Bars type
    **Range**, Value **3**. (Or `NQ 12-26` at Range 5.)
