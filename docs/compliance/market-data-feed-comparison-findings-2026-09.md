@@ -404,6 +404,22 @@ ThetaData is confirming which governs entitlements and billing. They note profes
 follows registration (FINRA, SEC, a state agency, an exchange or a futures market) and does not
 change accessible data tiers. Billing and OPRA fee treatment are the reason it matters.
 
+**By that test this account is non-professional.** ZeroGEX is a sole proprietorship and none of
+those registrations apply, so `isProfessional: true` is wrong on its face. It matters because the
+professional and non-professional OPRA fee schedules are not close to each other, and whether any
+OPRA fee attaches at all is the open licensing question above. If a fee ever lands against a record
+that reads professional, it lands at the expensive rate.
+
+**When it started is not answerable from the record.** It was first observed 2026-09-29. Nothing
+captured the auth response during the September trial, and nothing in the codebase read those
+fields at all, so there is no evidence either way as to whether the flags were correct before
+cutover to production and changed, or were always this way. That gap is now closed going forward
+rather than retroactively: `thetadata.log_entitlement_flags()` logs both flags on every real login
+(not on a forked worker's adoption, which would repeat them per underlying), distinguishes a
+`false` flag from an absent one, and logs **the two flags only** — the auth response also carries
+the session token and the account email, and neither belongs in a log file. Asked of ThetaData
+2026-10-07 as a question, not an assertion, for exactly this reason.
+
 ---
 
 ## Findings that turned out not to be about the feed
@@ -503,6 +519,10 @@ afterwards and append the result here rather than holding the cutover for it.
   do not weaken `_endpoint()`'s refusal, until it is answered in writing.
 - **F9's crossed quotes** — acknowledged by the vendor, no fix date. `make crossed-capture`
   reproduces the evidence on demand; a capture returning nothing is the signal that it is fixed.
+- **F9's account classification** — `isProfessional: true` and `isRetail: true` both set, which by
+  ThetaData's own registration test is wrong for a sole proprietorship. Unanswered. The flags are
+  now logged at every login, so the next session's startup log is the record; before 2026-10-07
+  there is none.
 - **VIX / VXN CGIF coverage** — resolved 2026-09-28 for the operational question, not the
   contractual one. A pre-open probe returned a live VIX at 08:44:46 ET agreeing with the incumbent
   to within a penny while VIX was moving, so extended hours are served and no per-feed override is
