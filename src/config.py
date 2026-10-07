@@ -480,6 +480,14 @@ GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT = _getenv_float(
     "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", _FP["max_flip_distance_pct"], min=0.01, max=1.0
 )
 
+# How long a new Call/Put Wall strike must stay the winner before it replaces
+# the published one (see src.analytics.walls.WallHold).  The ranking is a
+# plain argmax re-run every minute, so two near-tied strikes, or spot chopping
+# across the biggest strike, swap the wall back and forth: 639 jump-and-revert
+# events across SPX/SPY/NDX/QQQ in the eight sessions from 2026-09-28, most of
+# them back within five minutes.  0 publishes the raw winner every cycle.
+WALL_HOLD_MINUTES = _getenv_int("WALL_HOLD_MINUTES", 5, min=0, max=60)
+
 # The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
 # carries a colossal re-greeked Black-Scholes gamma spike (ATM gamma ∝
 # 1/√T) that can pin it to a strike irrelevant for any multi-day horizon

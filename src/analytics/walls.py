@@ -63,7 +63,9 @@ Notes on the formula choice:
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 # The gamma-flip proxy below is gated with the SAME constants the canonical
 # spot-shift resolver uses, so the two paths reject the same noise-floor
@@ -75,7 +77,10 @@ from src.config import (
     GAMMA_PROFILE_STRUCTURAL_MIN_FRAC,
     GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
+    WALL_HOLD_MINUTES,
 )
+
+_ET = ZoneInfo("America/New_York")
 
 # ── Wall-ladder depth ───────────────────────────────────────────────────────
 # How many ranked walls per side the API computes by default (C1..C3 /
@@ -310,6 +315,119 @@ def align_wall_ladder(
     for rank, entry in enumerate(rest[: max(0, depth - 1)], start=2):
         out.append({**entry, "rank": rank, "label": wall_label(side, rank)})
     return out
+
+
+def wall_strength_at(
+    gex_by_strike: Iterable[Mapping[str, Any]],
+    strike: Optional[float],
+    side: str,
+    spot_price: float,
+) -> Optional[float]:
+    """Dollar-gamma magnitude at one strike, on the wall-ladder scale.
+
+    The strength :func:`compute_wall_ladder` would quote for ``strike`` had it
+    ranked first: ``side`` gamma summed across expirations, times
+    ``100 × S² × 0.01``.  It exists for a held wall (:class:`WallHold`), whose
+    strike is no longer this cycle's rank-1 winner but still needs a strength
+    that describes it rather than the challenger.
+
+    ``None`` when there is no strike, no usable spot, or no positive gamma at
+    that strike — the same "no wall, no magnitude" convention as the ladder.
+    """
+    if strike is None or spot_price is None or spot_price <= 0:
+        return None
+    key = "call_gamma" if side == "call" else "put_gamma"
+    target = float(strike)
+    gamma = 0.0
+    for row in gex_by_strike:
+        try:
+            if float(row["strike"]) != target:
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        gamma += float(row.get(key) or 0.0)
+    if gamma <= 0:
+        return None
+    return abs(gamma * 100.0 * spot_price * spot_price * 0.01)
+
+
+class WallHold:
+    """Keep a published wall until a new strike has won for ``hold_minutes``.
+
+    The ranking above is a plain argmax re-run every minute with no memory.
+    Two near-tied strikes swap places on small moves, and when spot chops
+    across the biggest strike that strike flips between being the Call Wall
+    and the Put Wall (the ``strike >= spot`` / ``strike <= spot`` split).
+    Either way the published wall jumps and comes straight back, which reads
+    as a glitch and is not a change in dealer positioning.
+
+    This is a debounce on the bucket clock: a challenger replaces the
+    published wall only once it has been the raw winner continuously for
+    ``hold_minutes``.  Any minute in which it is not resets its clock.  "No
+    wall" (``None``) is a value like any other, so one degraded cycle cannot
+    blank a level either.
+
+    The first observation of each New York calendar day is published as-is:
+    yesterday's wall describes yesterday's expirations and must not be held
+    into the open.  ``hold_minutes <= 0`` passes every raw value through.
+
+    One instance tracks one series (one symbol, one side).  Feed it in time
+    order; it keeps no history beyond the pending challenger.
+    """
+
+    def __init__(self, hold_minutes: float = WALL_HOLD_MINUTES) -> None:
+        self.hold_seconds = max(0.0, float(hold_minutes)) * 60.0
+        self.shown: Optional[float] = None
+        self._day: Optional[date] = None
+        self._has_pending = False
+        self._pending: Optional[float] = None
+        self._pending_since: Optional[datetime] = None
+
+    @staticmethod
+    def _et_day(ts: datetime) -> date:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(_ET).date()
+
+    @staticmethod
+    def _norm(strike: Any) -> Optional[float]:
+        return None if strike is None else float(strike)
+
+    def _clear_pending(self) -> None:
+        self._has_pending = False
+        self._pending = None
+        self._pending_since = None
+
+    def seed(self, shown: Any, ts: datetime) -> None:
+        """Resume from a wall already published at ``ts`` (e.g. after a restart).
+
+        Only takes effect for the day of ``ts``: an observation on a later day
+        resets exactly as it would have without the seed.
+        """
+        self.shown = self._norm(shown)
+        self._day = self._et_day(ts)
+        self._clear_pending()
+
+    def update(self, raw: Any, ts: datetime) -> Optional[float]:
+        """Feed this cycle's raw winner; return the wall to publish."""
+        raw_f = self._norm(raw)
+        day = self._et_day(ts)
+        if self.hold_seconds <= 0 or self._day != day:
+            self._day = day
+            self.shown = raw_f
+            self._clear_pending()
+            return self.shown
+        if raw_f == self.shown:
+            self._clear_pending()
+            return self.shown
+        if not self._has_pending or self._pending != raw_f or self._pending_since is None:
+            self._has_pending = True
+            self._pending = raw_f
+            self._pending_since = ts
+        if (ts - self._pending_since).total_seconds() >= self.hold_seconds:
+            self.shown = raw_f
+            self._clear_pending()
+        return self.shown
 
 
 def _percentile_linear(values: List[float], percentile: float) -> float:

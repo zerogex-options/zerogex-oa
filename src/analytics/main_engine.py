@@ -60,8 +60,10 @@ from src.config import (
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.tradeworkz.strikes import default_strike_increment
 from src.analytics.walls import (
+    WallHold,
     compute_call_put_walls,
     compute_call_put_walls_with_strength,
+    wall_strength_at,
 )
 from src.analytics import gamma_flip_carry
 from src.analytics import pin_strike as pin_strike_mod
@@ -375,6 +377,10 @@ class AnalyticsEngine:
         # confirmed, so the database is asked once per bucket rather than on
         # every after-hours write.
         self._settled_bucket_ts: Optional[datetime] = None
+        # Debounce on the published Call/Put Wall (see _apply_wall_hold).
+        # None until the first summary, when it is built and seeded from the
+        # last row this symbol already published today.
+        self._wall_holds: Optional[Dict[str, WallHold]] = None
         # Latch for the "snapshot has no Greek-bearing options" state.
         # A weekday night is inside the 24x5 run window, so the engine
         # keeps cycling after the close; once the underlying feed stops
@@ -5224,6 +5230,80 @@ class AnalyticsEngine:
             )
             return False
 
+    def _init_wall_holds(self, bucket_ts: datetime) -> Dict[str, WallHold]:
+        """Build the per-side wall holds, resumed from the last published row.
+
+        Without the seed, a restart mid-session would publish whatever raw
+        winner the first cycle saw, which is exactly the one-minute jump the
+        hold exists to suppress (deploys restart the engine during the
+        session).  ``WallHold.seed`` only applies to the row's own New York
+        day, so yesterday's last row is harmless.  A failed read starts
+        unseeded: the first cycle then publishes its raw winner, which is what
+        every cycle did before the hold existed.
+        """
+        holds = {"call": WallHold(), "put": WallHold()}
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT timestamp, call_wall, put_wall
+                    FROM gex_summary
+                    WHERE underlying = %s AND timestamp <= %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (self.db_symbol, bucket_ts),
+                )
+                row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                holds["call"].seed(row[1], row[0])
+                holds["put"].seed(row[2], row[0])
+        except Exception:
+            logger.warning(
+                "Could not read the last published walls for %s; the wall hold "
+                "starts from this cycle's raw winner",
+                self.db_symbol,
+                exc_info=True,
+            )
+        return holds
+
+    def _apply_wall_hold(
+        self, summary: Dict[str, Any], gex_by_strike: List[Dict[str, Any]]
+    ) -> None:
+        """Replace this cycle's raw Call/Put Wall with the held one, in place.
+
+        The persisted ``call_wall`` / ``put_wall`` feed every surface (the
+        dashboard, ``/api/gex/summary``, the signal engine, TradeWorkz), so
+        debouncing them here steadies all of them at once.  When the held
+        strike is not this cycle's winner, its ``*_strength`` is re-read at
+        the held strike so the magnitude describes the wall actually
+        published, not the challenger.
+        """
+        bucket_ts = summary.get("timestamp")
+        if not isinstance(bucket_ts, datetime):
+            # The hold runs on the bucket clock; with no bucket there is
+            # nothing to measure against, so publish the raw walls.
+            return
+        if self._wall_holds is None:
+            self._wall_holds = self._init_wall_holds(bucket_ts)
+        spot = float(summary.get("underlying_price") or 0.0)
+        for side in ("call", "put"):
+            raw = summary.get(f"{side}_wall")
+            held = self._wall_holds[side].update(raw, bucket_ts)
+            raw_f = None if raw is None else float(raw)
+            if held == raw_f:
+                continue
+            logger.debug(
+                "[%s] holding %s wall at %s (raw winner %s)",
+                self.db_symbol,
+                side,
+                held,
+                raw_f,
+            )
+            summary[f"{side}_wall"] = held
+            summary[f"{side}_wall_strength"] = wall_strength_at(gex_by_strike, held, side, spot)
+
     def run_calculation(self) -> bool:
         """
         Run one complete analytics calculation cycle
@@ -5429,6 +5509,10 @@ class AnalyticsEngine:
 
             # Validate internal arithmetic consistency before persisting.
             self._validate_gex_calculations(gex_by_strike, gex_summary, underlying_price)
+
+            # Publish the held walls, not this minute's raw argmax.  After
+            # validation, which checks the raw ranking against its own rows.
+            self._apply_wall_hold(gex_summary, gex_by_strike)
 
             # Store results
             logger.debug("Storing results to database...")
