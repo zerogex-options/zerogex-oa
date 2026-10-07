@@ -65,6 +65,7 @@ from src.analytics import gamma_weather as gw
 from src.analytics.flip_cushion import DEFAULT_RATE_BARS as CUSHION_RATE_BARS
 from src.analytics.flip_cushion import build_series as build_cushion_series
 from src.analytics.flip_cushion import describe as describe_cushion
+from src.analytics.scan_lights import scan_lights
 from src.analytics.hedging_flow import (
     DEFAULT_FLAT_BAND_RATIO,
     DEFAULT_SIGNIFICANCE_RATIO,
@@ -2055,6 +2056,9 @@ async def get_gamma_weather(
             "pending_label": weather.pending_label,
             "pending_bars": weather.pending_bars,
             "confirm_bars": gw.CONFIRM_BARS,
+            # Derived here rather than in the panel so the base-rate report
+            # grades the rules the panel runs. See scan_lights.
+            "lights": scan_lights(weather).as_dict(),
             "cushion_summary": describe_cushion(cushion, CUSHION_RATE_BARS),
             "components": {
                 "pressure_bar_usd": pressure_bar,

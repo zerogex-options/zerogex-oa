@@ -409,3 +409,52 @@ def test_http_a_malformed_date_is_refused_on_both_endpoints(
         _attach(mainmod, flow, regime)
         assert client.get("/api/gex/weather?symbol=SPY&date=nonsense").status_code == 400
         assert client.get("/api/gex/weather-series?symbol=SPY&date=nonsense").status_code == 400
+
+
+def test_http_serves_the_four_scan_lights(monkeypatch: pytest.MonkeyPatch):
+    """The strip renders what the API decides, so the panel cannot hold its own
+    copy of the rules and drift from the one the base-rate report grades.
+
+    All four keys are always present. A missing key and a false one would look
+    identical in the UI, and only one of them is the panel saying "this rule is
+    not met".
+    """
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(15, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather?symbol=SPY").json()
+
+    assert set(payload["lights"]) == {"agree", "heads_up", "fragile", "stand_down"}
+    assert all(isinstance(v, bool) for v in payload["lights"].values())
+
+
+def test_the_served_lights_are_the_module_s_own_verdict(monkeypatch: pytest.MonkeyPatch):
+    """Pinned against recomputation rather than against fixed values: the point
+    is that the endpoint serves scan_lights' answer for the bar it classified,
+    whatever that answer is."""
+    from src.analytics import gamma_weather as gw
+    from src.analytics.scan_lights import scan_lights
+
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(15, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather?symbol=SPY").json()
+
+    rebuilt = gw.Weather(
+        state=payload["state"],
+        label=payload["label"],
+        pressure=payload["pressure"],
+        structure=payload["structure"],
+        gamma_trend=payload["gamma_trend"],
+        lean_side=payload["lean_side"],
+        cushion=payload["cushion"],
+        sentence=payload["sentence"],
+        persistence=payload["persistence"],
+        cushion_band=payload["components"]["cushion_state"],
+    )
+
+    assert payload["lights"] == scan_lights(rebuilt).as_dict()

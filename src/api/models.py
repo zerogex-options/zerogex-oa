@@ -736,6 +736,14 @@ class GammaWeatherResponse(BaseModel):
     pending_state: Optional[str] = None
     pending_label: Optional[str] = None
     pending_bars: int = 0
+    #: Barrie's four-light scan strip, each true only when its whole rule is
+    #: met: agree / heads_up / fragile / stand_down. A reading aid over the
+    #: fields already in this payload, not a signal and never a trade. Any
+    #: combination is legal, including none and including Agree beside Fragile,
+    #: which on the capping side is guaranteed rather than coincidental. The
+    #: rules live in src/analytics/scan_lights.py and are computed here so the
+    #: base-rate report grades the same implementation the panel renders.
+    lights: Optional[Dict[str, bool]] = None
     #: Bars a new state must repeat before it takes the header, so a client
     #: can render "1 of 2" without hard-coding the rule.
     confirm_bars: int = 2
