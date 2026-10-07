@@ -443,11 +443,24 @@ the session token and the account email, and neither belongs in a log file. Aske
 2026-10-07 as a question, not an assertion, for exactly this reason.
 
 **Vendor says corrected 2026-10-07**, to non-professional and commercial. UNVERIFIED on our
-side, and not verifiable from the service logs: `_authenticate_shared_feed_session()` is a
-no-op for TradeStation, production is still on TradeStation, so nothing in the running
-deployment logs into ThetaData and the new line never fires there. The flags appear in the
-output of any tool that builds a ThetaData provider for real — `make feed-compare`,
-`make feed-probe`, `make crossed-capture` — and that is where to read them until cutover.
+side.
+
+**Where the flags actually come from, corrected 2026-10-07.** The **Theta Terminal** prints
+them, to its own journal, when **it** starts: the Java process under the systemd unit
+`zerogex-oa-thetaterminal`. They are not in anything the Python client can reach. A
+`ThetaClient` attaches to an already-running terminal over gRPC and never sees the account
+payload, which is why `log_entitlement_flags()` reports "absent from the auth response" on a
+real login. That probe is kept — a later client version may expose them, and it costs one
+log line — but it is not the source and must not be read as one.
+
+An earlier revision of this paragraph said to read the flags from the output of
+`make feed-compare` or `make feed-probe`. **That was wrong** and is corrected here rather than
+deleted, because acting on it wastes a run and reads a silence as an answer.
+
+To check: `make theta-entitlements`, which greps the terminal's journal. It reports what the
+terminal said **when it last started**, so a reading older than 2026-10-07 predates the
+vendor's correction and proves nothing about it. Confirming the correction needs a terminal
+restart, which kills any live MDDS session — so never during a comparison run.
 
 ---
 

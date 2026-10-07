@@ -1737,6 +1737,24 @@ logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greek
 	@echo "$(BLUE)=== Searching Analytics Logs ===$(NC)"
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in analytics logs"
 
+.PHONY: theta-entitlements
+theta-entitlements: ## What the Theta Terminal said about this account's professional/retail flags at ITS last start
+	@echo "$(BLUE)=== Theta Terminal entitlement flags ===$(NC)"
+	@echo "$(YELLOW)Source: the TERMINAL's own journal. Not the Python client --$(NC)"
+	@echo "$(YELLOW)a ThetaClient attaches to a running terminal over gRPC and$(NC)"
+	@echo "$(YELLOW)never sees the account payload, so feed-compare and feed-probe$(NC)"
+	@echo "$(YELLOW)cannot answer this however long you run them.$(NC)"
+	@echo ""
+	@sudo journalctl -u zerogex-oa-thetaterminal --no-pager \
+		| grep -iE "professional|retail|entitle" \
+		|| echo "No entitlement line in the retained journal."
+	@echo ""
+	@echo "$(YELLOW)This is what the terminal said WHEN IT LAST STARTED. A line dated$(NC)"
+	@echo "$(YELLOW)before 2026-10-07 predates ThetaData's claimed correction and says$(NC)"
+	@echo "$(YELLOW)nothing about it. To re-read, restart the unit -- which KILLS the$(NC)"
+	@echo "$(YELLOW)account's one MDDS session, so never during a comparison run:$(NC)"
+	@echo "$(YELLOW)  sudo systemctl restart zerogex-oa-thetaterminal$(NC)"
+
 .PHONY: journal-volume
 journal-volume: ## Why journal retention is short: what caps it, and which unit burns it
 	@echo "$(BLUE)=== Journal retention ===$(NC)"

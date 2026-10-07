@@ -315,6 +315,19 @@ def reset_shared_clients() -> None:
 #: or changed at cutover. This exists so that question is answerable the
 #: next time it is asked -- raised with ThetaData 2026-09-29, open.
 #:
+#: THIS IS NOT THE SOURCE, and 2026-10-07 proved it: on a real login it
+#: reports "absent". The flags are printed by the THETA TERMINAL, to its
+#: own journal, when the terminal starts -- the Java process under the
+#: systemd unit ``zerogex-oa-thetaterminal``. A ThetaClient attaches to an
+#: already-running terminal over gRPC and never sees the account payload,
+#: so no amount of running feed-compare or feed-probe will surface them.
+#: ``make theta-entitlements`` reads the right place.
+#:
+#: Kept anyway: a later client version may expose them, the cost is one log
+#: line per login, and an explicit "absent" is worth more than silence --
+#: it is what sent us to look somewhere else. Do not read its absence as
+#: the account having no flags.
+#:
 #: Each flag is given in both spellings because the shape of the auth
 #: response is not pinned by the wheel's signatures and may differ by
 #: client version.
