@@ -88,7 +88,6 @@
 using System;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
-using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.Gui;
@@ -159,6 +158,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 		//: would re-fire on every subsequent bar against a signal that no
 		//: longer has a position.
 		private bool target1Done;
+		//: Stop distance in ticks, measured on the SIGNAL bar. Held because by
+		//: the time the trail runs, the entry has filled and bar 0 is the bar
+		//: AFTER the one the stop was sized from. On a range chart every bar
+		//: has the same range so recomputing happened to agree, but on any
+		//: time-based bar type it would have silently sized lot 2's stop off
+		//: the wrong bar.
+		private int signalStopTicks;
 		//: Initial stop price, held so the lot 2 trail can never widen it.
 		private double initialStopPrice;
 		//: Best price reached since entry, which the lot 2 trail hangs off.
@@ -454,6 +460,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			// A degenerate range bar would otherwise ask for a zero-tick stop.
 			stopTicks = Math.Max(1, stopTicks);
+			signalStopTicks = stopTicks;
 
 			SetStopLoss("GOAT1", CalculationMode.Ticks, stopTicks, false);
 			SetStopLoss("GOAT2", CalculationMode.Ticks, stopTicks, false);
@@ -515,14 +522,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			if (double.IsNaN(initialStopPrice))
 			{
-				int stopTicks = StopMode == GoatStopMode.FixedTicks
-					? StopFixedTicks
-					: (int)Math.Round((High[0] - Low[0]) / TickSize) + StopExtraTicks;
-				stopTicks = Math.Max(1, stopTicks);
-
 				initialStopPrice = isLong
-					? entry - stopTicks * TickSize
-					: entry + stopTicks * TickSize;
+					? entry - signalStopTicks * TickSize
+					: entry + signalStopTicks * TickSize;
 				runExtreme = isLong ? High[0] : Low[0];
 			}
 
@@ -577,12 +579,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public int SmoothK { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(1, 100)]
+		[Range(1.0, 100.0)]
 		[Display(Name = "Overbought (green/white above)", Order = 3, GroupName = "3. Stochastic")]
 		public double StochOverbought { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 99)]
+		[Range(0.0, 99.0)]
 		[Display(Name = "Oversold (red/black below)", Order = 4, GroupName = "3. Stochastic")]
 		public double StochOversold { get; set; }
 
