@@ -8,10 +8,20 @@ the one metric that moves moves less than the incumbent feed already moves again
 **Answer, flow: yes, and materially.** Buy/sell classification was never measured at all until
 2026-09-28, because the harness meant to measure it was broken and said so in language that read
 like a quiet market. Once fixed, the published net imbalance came back with the **opposite sign in
-12 of 30 paired samples**. The cause is a defect in ThetaData's Market Value calculation, which
-they have since reproduced and acknowledged. See F9.
+12 of 30 paired samples**. See F9.
+
+**Amended 2026-10-07 (F10): the cause was misattributed here.** This line read "the cause is a
+defect in ThetaData's Market Value calculation, which they have since reproduced and
+acknowledged." There was such a defect, it was real, and it is now **fixed and confirmed** at the
+September 28 scope — and the flow disagreement barely moved: 43.5% of contracts still classify
+differently, and the candidate's net imbalance runs above the incumbent's in 26 of 30 samples by
+a mean exceeding the signal's own magnitude. The real cause is the penny randomisation itself,
+which is the product and not a defect. ThetaData's engineering now states that classification
+should not run against the Market Value quote at all. **The quote test is finished, not pending.**
+
 **Status:** step 14's evidence bar is **met for chain metrics and failed for flow**. Cutover is
-deferred with no date, pending F9. The *calendar* bar was never met either — see "Where this falls
+deferred with no date. The remaining question is no longer about the feed but about the METHOD:
+pay for raw NBBO, or adopt the tick test and publish a changed flow figure. See F10. The *calendar* bar was never met either — see "Where this falls
 short"; that gap is deliberate and recorded, not overlooked.
 
 **Amended 2026-09-29.** Everything above the F9 section was written 2026-09-22 and stands as
@@ -412,9 +422,10 @@ actually resolves the problem.
 
 | If | Then |
 |---|---|
-| ThetaData fixes the crossing | re-measure with `make feed-compare`. Vendor says fixed 2026-10-07; our measurement pending |
+| ~~ThetaData fixes the crossing~~ | **Fixed and measured 2026-10-07. It did not resolve flow.** Zero crossed in 30 samples, both feeds. The quote test still disagreed on 43.5% of contracts and the candidate's net imbalance ran above the incumbent's in 26 of 30 |
 | ~~raw NBBO is fee-clean for us~~ | **DEAD 2026-10-07** — non-display use, fee-bearing. `option_snapshot_quote` stays unwired |
-| raw NBBO is fee-bearing | **This is the case.** Tick test: grade against the PREVIOUS TRADE PRICE, needs no quote at all, and **shrinks** the OPRA surface relative to both alternatives |
+| raw NBBO is fee-bearing | **This is the case**, and the price is unquoted. Either pay it, or take the tick test |
+| the quote test on Market Value | **DEAD 2026-10-07, by vendor design.** See F10 |
 
 Whichever lands, the published flow numbers change, and that has to be a deliberate and understood
 change rather than a side effect of a cutover.
@@ -479,6 +490,74 @@ on their written statement of 2026-10-07, which is what the correspondence file 
 `make theta-entitlements` still shows the subscription tier and the terminal's startup block,
 which are useful operationally, but it does **not** answer this question and no longer claims
 to.
+
+---
+
+## F10 — the Market Value quote is not a classification input, by vendor design
+
+*Added 2026-10-07. This is the finding that ends the quote test, and it is the vendor's own.*
+
+### What ThetaData said
+
+Engineering, relayed by support 2026-10-07, answering the question put on 2026-10-06 about
+whether the crossing fix also bounds the midpoint shift on a one-cent spread:
+
+> The fix only stops the market value quote from reporting a crossed market when the underlying
+> NBBO is not crossed. It does not bound how far the adjustment can move the midpoint of a one
+> cent spread. Market Value is derived from the NBBO and its price can be shifted by design, so on
+> a one cent spread the midpoint moves with it.
+>
+> Engineering's view is that a buy or sell classification should run against the actual NBBO
+> rather than the market value quote, and the fix does not change that.
+
+### What we measured, independently, before receiving it
+
+30 paired samples, SPY, 2026-10-07 12:12–12:43 ET, 231 near-the-money contracts per sample,
+after the crossing fix shipped:
+
+| | Result |
+|---|---|
+| crossed quotes | **0 of 30 samples**, both feeds (was 38–67 per sample on 09-28) |
+| contracts classified differently | mean **43.5%** (35.1–51.1%); was 44.6–55.8% |
+| volume classified differently | mean 66.4% (43.3–81.6%) |
+| net imbalance sign reversed | 5 of 30; was 12 of 30 |
+| **candidate net ABOVE incumbent** | **26 of 30 samples** |
+| mean signed difference | **+1,223,415** |
+| mean \|incumbent net\| for scale | 1,041,127 |
+
+The signed mean is 90% of the mean absolute difference, so the differences nearly all point one
+way, and it exceeds the typical magnitude of the signal itself. That is bias, not noise.
+
+**The fixed poll order cannot explain it.** `compare_flow_classification` takes `volume` and
+`last` from the INCUMBENT for both sides and varies only the quote, so the feed polled second
+cannot contribute extra tape. The only differing input is the Market Value quote. The vendor's
+statement and this measurement are the same fact arrived at from two directions.
+
+### Consequence
+
+The quote test on the Market Value feed is **finished**, not pending further measurement. Two
+routes remain and neither is free of cost:
+
+1. **Raw NBBO + Lee-Ready.** Reproduces today's published number exactly. Non-display use under
+   OPRA per F9, fee-bearing, price unquoted as of this writing. The vendor's commercial team will
+   quote it.
+2. **Tick test.** Grades against the previous trade price, reads no quote, needs no licensing
+   answer, and shrinks the OPRA surface rather than expanding it. Changes what the published flow
+   figure means. Its cross-feed disagreement (5.89% mean, 5 of 29 sign reversals on 2026-10-07)
+   has **no noise floor under it yet** — unlike the quote test it reads each feed's own trade
+   sequence, and the feeds are polled 0.3–0.8s apart. `--self-control` was built for exactly this
+   and the measurement is outstanding.
+
+**That measurement is now the decision.** If the tick test clears its floor, the cutover proceeds
+with no OPRA fee and a changed flow figure. If it does not, the only remaining route is the paid
+one, and the question becomes what it costs.
+
+### Note on the chain metrics
+
+None of this touches them. Spot, both walls, max pain and the gamma flip were identical or within
+self-variance in the same 30 samples, as in all 116 before them. Market Value remains sound for
+everything the chain comparison covers; it is buy/sell classification, and only that, which it
+cannot serve.
 
 ---
 
@@ -578,12 +657,15 @@ afterwards and append the result here rather than holding the cutover for it.
   input is non-display use under OPRA, outside the Market Value exemption, and fee-bearing.
   `option_snapshot_quote` stays unwired and `_endpoint()`'s refusal is permanent. No longer a
   thing to wait for; a constraint to hold.
-- **F9's crossed quotes** — acknowledged by the vendor, no fix date. `make crossed-capture`
-  reproduces the evidence on demand; a capture returning nothing is the signal that it is fixed.
-- **F9's account classification** — `isProfessional: true` and `isRetail: true` both set, which by
-  ThetaData's own registration test is wrong for a sole proprietorship. Unanswered. The flags are
-  now logged at every login, so the next session's startup log is the record; before 2026-10-07
-  there is none.
+- **F9's crossed quotes** — **CLOSED 2026-10-07.** Vendor shipped a fix; confirmed from our
+  side at the September 28 scope, zero crossed in 30 samples on both feeds. `make crossed-capture`
+  still reproduces on demand if it ever regresses.
+- **F9's midpoint question** — **ANSWERED 2026-10-07, against us.** See F10: the fix bounds
+  crossing only, not the midpoint shift, and the vendor's own engineering says classification
+  should not run against the Market Value quote at all.
+- **F9's account classification** — **CLOSED 2026-10-07.** Vendor corrected the record to
+  non-professional and commercial. Not observable from our side by design; their written
+  statement is the evidence. The probe added to chase it has been removed.
 - **VIX / VXN CGIF coverage** — resolved 2026-09-28 for the operational question, not the
   contractual one. A pre-open probe returned a live VIX at 08:44:46 ET agreeing with the incumbent
   to within a penny while VIX was moving, so extended hours are served and no per-feed override is
