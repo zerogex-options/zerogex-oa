@@ -445,48 +445,40 @@ the session token and the account email, and neither belongs in a log file. Aske
 **Vendor says corrected 2026-10-07**, to non-professional and commercial. UNVERIFIED on our
 side.
 
-**Where the flags actually come from, corrected 2026-10-07.** The **Theta Terminal** prints
-them, to its own journal, when **it** starts: the Java process under the systemd unit
-`zerogex-oa-thetaterminal`. They are not in anything the Python client can reach. A
-`ThetaClient` attaches to an already-running terminal over gRPC and never sees the account
-payload, which is why `log_entitlement_flags()` reports "absent from the auth response" on a
-real login. That probe is kept — a later client version may expose them, and it costs one
-log line — but it is not the source and must not be read as one.
+**RESOLVED 2026-10-07 by the vendor, and the resolution is that we cannot observe it.**
+ThetaData (Anthony): the professional/non-professional and retail/commercial classification
+is an **account-level attribute held on their side**. It is not part of any data response,
+the Python client does not surface it, and there is no endpoint for it. He corrected the
+double flag on 2026-10-07; the record now reads **non-professional and commercial**.
 
-An earlier revision of this paragraph said to read the flags from the output of
-`make feed-compare` or `make feed-probe`. **That was wrong** and is corrected here rather than
-deleted, because acting on it wastes a run and reads a silence as an answer.
-
-To check: `make theta-entitlements`. It reports what the terminal said **when it last
-started**, so a reading older than 2026-10-07 predates the vendor's correction and proves
-nothing about it. Confirming the correction needs a terminal restart, which kills any live
-MDDS session — so never during a comparison run.
-
-**What the terminal actually prints, 2026-10-07 13:34:07 ET**, from a restart taken minutes
-earlier and therefore AFTER ThetaData said the account was corrected:
+The terminal's startup line is **not** that classification:
 
 ```
 INFO: Subscriptions: Stock: PROFESSIONAL Options: PROFESSIONAL Index: PROFESSIONAL Rate: FREE
 ```
 
-**This is not known to be the same thing as the `isProfessional`/`isRetail` pair, and must not
-be recorded as confirming or refuting the correction.** The line is prefixed `Subscriptions:`
-and ends `Rate: FREE`, which reads as per-product plan tiers rather than the user
-classification that decides OPRA fee treatment. The grep matched on the word and caught a
-different line; the boolean pair has still never been located. Either reading is live:
+That `PROFESSIONAL` is the **data subscription tier** — their Pro tier — confirmed by the
+vendor. Seeing it is expected and says nothing about OPRA fee treatment. `Rate: FREE` is also
+not a finding: `RISK_FREE_RATE` comes from `src/config.py`, never from the vendor.
 
-- if it IS the classification, ThetaData's correction did not take, or has not propagated to
-  what the terminal reads, eight days after it was raised;
-- if it is a plan tier, the line says nothing either way and the pair is somewhere we have not
-  looked.
+**What this cost, recorded because the mistake is repeatable.** Two separate places were
+searched for a value that traverses neither. A probe was added to the provider on 2026-10-06
+(`log_entitlement_flags`), reported "absent from the auth response" on its first real login,
+and was then kept on the reasoning that a later client version might expose the fields. The
+vendor's answer refutes that reasoning rather than deferring it, so the probe was **removed**
+on 2026-10-07 along with its seven tests. An earlier revision of this paragraph also told a
+reader to look in `make feed-compare` output; that was wrong and is corrected here rather
+than deleted. The general lesson is the specific one: before instrumenting for a value,
+establish that the value crosses the boundary being instrumented.
 
-Put to ThetaData 2026-10-07 quoting the line and its timestamp. `make theta-entitlements` now
-also prints the terminal's whole current startup block rather than only grep hits, because a
-pattern can only find what was already guessed — which is how a day was spent looking in the
-Python client for something the Java terminal prints.
-
-`Rate: FREE` on the same line is **not** a finding: the risk-free rate comes from
-`RISK_FREE_RATE` in `src/config.py`, never from the vendor.
+**Verification, such as it is.** There is nothing to read and nothing to assert. The vendor
+invited the only available check: if anything downstream ever behaves as though the
+professional flag were still set — an unexpected fee line, a refused entitlement, a billing
+change — report it with what was seen and they will re-check the record. Until then this rests
+on their written statement of 2026-10-07, which is what the correspondence file is for.
+`make theta-entitlements` still shows the subscription tier and the terminal's startup block,
+which are useful operationally, but it does **not** answer this question and no longer claims
+to.
 
 ---
 

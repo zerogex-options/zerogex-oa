@@ -1738,12 +1738,15 @@ logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greek
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in analytics logs"
 
 .PHONY: theta-entitlements
-theta-entitlements: ## What the Theta Terminal says about this account's entitlements, plus its whole current startup block (LINES=n)
+theta-entitlements: ## The terminal's data subscription tier and its whole current startup block (LINES=n). NOT the OPRA classification
 	@echo "$(BLUE)=== Theta Terminal entitlement flags ===$(NC)"
-	@echo "$(YELLOW)Source: the TERMINAL's own journal. Not the Python client --$(NC)"
-	@echo "$(YELLOW)a ThetaClient attaches to a running terminal over gRPC and$(NC)"
-	@echo "$(YELLOW)never sees the account payload, so feed-compare and feed-probe$(NC)"
-	@echo "$(YELLOW)cannot answer this however long you run them.$(NC)"
+	@echo "$(YELLOW)This shows your DATA SUBSCRIPTION TIER. It does NOT show the$(NC)"
+	@echo "$(YELLOW)OPRA professional/non-professional classification: ThetaData$(NC)"
+	@echo "$(YELLOW)confirmed 2026-10-07 that the classification is an account$(NC)"
+	@echo "$(YELLOW)attribute held on THEIR side, absent from every data response.$(NC)"
+	@echo "$(YELLOW)A PROFESSIONAL on the Subscriptions line is the Pro tier and is$(NC)"
+	@echo "$(YELLOW)expected. Nothing here, or anywhere on this box, answers the fee$(NC)"
+	@echo "$(YELLOW)question -- see F9.$(NC)"
 	@echo ""
 	@sudo journalctl -u zerogex-oa-thetaterminal --no-pager \
 		| grep -iE "professional|retail|entitle|subscription" \

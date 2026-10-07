@@ -304,106 +304,6 @@ def reset_shared_clients() -> None:
         _CLIENTS.clear()
 
 
-#: The auth response's entitlement flags, logged once per login.
-#:
-#: On 2026-09-29 the response came back with ``isProfessional`` AND
-#: ``isRetail`` both true. Professional status follows registration (FINRA,
-#: the SEC, a state agency, an exchange or a futures market) and decides
-#: which OPRA fee schedule an account sits on, so both cannot be right at
-#: once. Nothing recorded what the flags said during the September trial, so
-#: there is no way to tell whether the account was always recorded this way
-#: or changed at cutover. This exists so that question is answerable the
-#: next time it is asked -- raised with ThetaData 2026-09-29, open.
-#:
-#: THIS IS NOT THE SOURCE, and 2026-10-07 proved it: on a real login it
-#: reports "absent". The flags are printed by the THETA TERMINAL, to its
-#: own journal, when the terminal starts -- the Java process under the
-#: systemd unit ``zerogex-oa-thetaterminal``. A ThetaClient attaches to an
-#: already-running terminal over gRPC and never sees the account payload,
-#: so no amount of running feed-compare or feed-probe will surface them.
-#: ``make theta-entitlements`` reads the right place.
-#:
-#: Kept anyway: a later client version may expose them, the cost is one log
-#: line per login, and an explicit "absent" is worth more than silence --
-#: it is what sent us to look somewhere else. Do not read its absence as
-#: the account having no flags.
-#:
-#: Each flag is given in both spellings because the shape of the auth
-#: response is not pinned by the wheel's signatures and may differ by
-#: client version.
-_ENTITLEMENT_FLAGS: Tuple[Tuple[str, ...], ...] = (
-    ("isProfessional", "is_professional"),
-    ("isRetail", "is_retail"),
-)
-
-#: Attributes that have plausibly carried the decoded login response.
-_ENTITLEMENT_CONTAINERS: Tuple[str, ...] = (
-    "account",
-    "user",
-    "entitlements",
-    "login_response",
-    "session_info",
-)
-
-
-def _entitlement_flag(container: Any, spellings: Tuple[str, ...]) -> Any:
-    """``spellings`` off ``container``, by key or by attribute.
-
-    Returns ``None`` when absent, which a ``False`` flag is NOT -- the
-    difference between "they say non-professional" and "they did not say"
-    is the whole point of logging this.
-    """
-    for name in spellings:
-        if isinstance(container, dict):
-            if name in container:
-                return container[name]
-        else:
-            value = getattr(container, name, None)
-            if value is not None:
-                return value
-    return None
-
-
-def log_entitlement_flags(client: Any, *, log: Any = None) -> Dict[str, Any]:
-    """Log the professional/retail flags from a fresh login.
-
-    Logs the FLAGS ONLY. The auth response also carries the session token
-    and the account email, and neither belongs in a log file.
-
-    Never raises: a provider that cannot start because a log line failed
-    would be a far worse outcome than the gap this closes.
-    """
-    log = log or logger
-    try:
-        containers = [client]
-        for attr in _ENTITLEMENT_CONTAINERS:
-            found = getattr(client, attr, None)
-            if found is not None:
-                containers.append(found)
-
-        for container in containers:
-            flags = {
-                spellings[0]: _entitlement_flag(container, spellings)
-                for spellings in _ENTITLEMENT_FLAGS
-            }
-            if any(value is not None for value in flags.values()):
-                log.info(
-                    "ThetaData entitlement flags at login: %s",
-                    ", ".join(f"{name}={value}" for name, value in flags.items()),
-                )
-                return flags
-
-        log.info(
-            "ThetaData entitlement flags at login: absent from the auth response "
-            "(looked for %s)",
-            ", ".join(spellings[0] for spellings in _ENTITLEMENT_FLAGS),
-        )
-        return {}
-    except Exception:  # pragma: no cover - defensive; see the docstring
-        log.warning("Could not read the ThetaData entitlement flags", exc_info=True)
-        return {}
-
-
 def option_root_for(symbol: str) -> str:
     """ThetaData option root for a ZeroGEX/TradeStation underlying.
 
@@ -1124,26 +1024,18 @@ class ThetaDataProvider(MarketDataProvider):
         host = os.getenv("THETADATA_MDDS_HOST") or None
         port = os.getenv(port_var) or None
 
-        def _login() -> Any:
-            client = ThetaClient(
+        # Keyed by the CONNECTION, so the realtime and Market Value stages
+        # share one client when they share a terminal -- which they do, and
+        # must, because a second authentication invalidates the first.
+        client = shared_client(
+            lambda: ThetaClient(
                 email=os.getenv("THETADATA_EMAIL") or None,
                 password=os.getenv("THETADATA_PASSWORD") or None,
                 creds_file=os.getenv("THETADATA_CREDS_FILE") or None,
                 mdds_host=host,
                 mdds_port=port,
                 dataframe_type="pandas",
-            )
-            # Only on a REAL login. An adopting worker copies the parent's
-            # session, and logging there would repeat the same flags once
-            # per underlying while saying nothing new about the account.
-            log_entitlement_flags(client)
-            return client
-
-        # Keyed by the CONNECTION, so the realtime and Market Value stages
-        # share one client when they share a terminal -- which they do, and
-        # must, because a second authentication invalidates the first.
-        client = shared_client(
-            _login,
+            ),
             key=(host, port),
             # Reached only in a forked worker, where the parent already holds
             # the account's one session. No credentials: this path must not
