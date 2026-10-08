@@ -990,7 +990,7 @@ help: ## Show this help message
 	@echo "  make gamma-flip-resolution-healthcheck - Report how long the gamma flip was left unpublished"
 	@echo "  make gamma-flip-blackout-forensics - Say WHY the gamma flip was left unpublished (retention-exempt rows)"
 	@echo "  make gamma-flip-gate-replay - Replay a blank flip cycle and name the gate that rejected it"
-	@echo "  make wall-stability-report - Replay recent sessions' Call/Put Walls: old argmax vs current rule"
+	@echo "  make wall-stability-report - Replay recent sessions' Call/Put Walls: old argmax vs live vs new rule"
 	@echo "  make gamma-flip-resolution-install - Install gamma-flip resolution timer (hourly in-session + post-close)"
 	@echo "  make gamma-flip-resolution-status - Show gamma-flip resolution timer status + recent log"
 	@echo "  make gamma-flip-dark-digest - Which symbols are dark right now and since when"
@@ -4957,7 +4957,7 @@ gamma-flip-blackout-forensics: ## Say WHY the gamma flip was left unpublished, f
 		$(if $(JSON),--json)
 
 .PHONY: wall-stability-report
-wall-stability-report: ## Replay recent sessions' Call/Put Walls: old argmax vs current rule (flips, moves). Read-only; run after the close. SYMBOLS="SPX SPY" SESSIONS=5 WALL_SINCE=YYYY-MM-DD [TIE_PCT= BREAK_MIN_PCT= BREAK_MOVE_FRACTION=]
+wall-stability-report: ## Replay recent sessions' Call/Put Walls: old argmax vs live vs new rule (flips, moves). Read-only; run after the close. SYMBOLS="SPX SPY" SESSIONS=5 WALL_SINCE=YYYY-MM-DD [TIE_PCT= BREAK_MIN_PCT= BREAK_MOVE_FRACTION= REFRESH_MINUTES=]
 	@$(PY) -m src.tools.wall_stability_report \
 		$(if $(SYMBOLS),--symbols $(SYMBOLS)) \
 		$(if $(SESSIONS),--sessions $(SESSIONS)) \
@@ -4965,6 +4965,7 @@ wall-stability-report: ## Replay recent sessions' Call/Put Walls: old argmax vs 
 		$(if $(TIE_PCT),--tie-pct $(TIE_PCT)) \
 		$(if $(BREAK_MIN_PCT),--break-min-pct $(BREAK_MIN_PCT)) \
 		$(if $(BREAK_MOVE_FRACTION),--break-move-fraction $(BREAK_MOVE_FRACTION)) \
+		$(if $(REFRESH_MINUTES),--refresh-minutes $(REFRESH_MINUTES)) \
 		$(if $(JSON),--json)
 
 .PHONY: gamma-flip-gate-replay

@@ -27,6 +27,11 @@ SqueezeMetrics / Cheddar Flow) and adds two stability rules:
   price breaks decisively through it.  Callers without an anchor split on
   spot.
 
+**When** the walls are re-picked is the third piece (:class:`WallTracker`):
+on the minute price breaks out, and otherwise every ``WALL_REFRESH_MINUTES``
+(15), never while price merely lingers.  Between re-picks the walls stay the
+ones picked last time.
+
 Why the two rules: a plain argmax re-run every minute made the published
 walls jump and snap back (639 times across SPX/SPY/NDX/QQQ in the eight
 sessions from 2026-09-28).  About half were spot chopping across the
@@ -78,7 +83,8 @@ Notes on the formula choice:
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -94,6 +100,7 @@ from src.config import (
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
     WALL_BREAK_MIN_PCT,
     WALL_BREAK_MOVE_FRACTION,
+    WALL_REFRESH_MINUTES,
     WALL_TIE_PCT,
 )
 
@@ -417,44 +424,125 @@ def step_wall_anchor(prev_anchor: Optional[float], spot_price: float, buffer: fl
     return min(max(float(prev_anchor), spot_price - b), spot_price + b)
 
 
-class WallAnchor:
-    """One symbol's wall anchor, advanced once per bucket.
+@dataclass(frozen=True)
+class WallStep:
+    """One bucket's answer from :class:`WallTracker`.
 
-    The engine recomputes a bucket several times while its minute is open, so
-    each update steps from the anchor the PREVIOUS bucket ended on, never from
-    an earlier pass over the same bucket: a bucket's anchor is a function of
-    the prior bucket's anchor and this bucket's latest spot, and so reads the
-    same whichever pass wrote it last.
-
-    Each New York calendar day starts over at spot, so yesterday's close
-    cannot decide which side of price a strike is on this morning.
+    ``anchor`` is the price the walls are split on.  ``refresh_ts`` is the
+    bucket whose rows the walls are picked from: this bucket when
+    ``refreshed``, otherwise the last bucket that re-picked.  Every
+    expiration selection reads the same two values, which is what makes them
+    break and hold together.
     """
 
-    def __init__(self) -> None:
-        self.value: Optional[float] = None
-        self._bucket: Optional[datetime] = None
-        self._prior: Optional[float] = None
+    anchor: float
+    refresh_ts: datetime
+    refreshed: bool
+
+
+class WallTracker:
+    """When one symbol's walls are re-picked, and the price they are split on.
+
+    Re-picking the walls every minute, even split on the wall anchor, still
+    flips them: strike sizes wobble as price jiggles (0DTE gamma most of all)
+    and any re-pick that lands near a tie can go either way.  So the walls are
+    re-picked only when there is a reason to:
+
+    * the wall anchor moved -- price closed beyond the break buffer, so a
+      strike may have changed sides and the walls must follow at once;
+    * ``refresh_minutes`` have passed since the last re-pick -- slow drift
+      such as time decay or a shift in implied volatility, while price sat
+      still;
+    * the first bucket of a New York day.
+
+    Between re-picks the walls are the ones picked at ``refresh_ts``.  The
+    tracker never looks at gamma, only at price and the clock, so every
+    expiration selection re-picks on the same minutes and splits on the same
+    anchor.  ``refresh_minutes <= 0`` re-picks every bucket.
+
+    The engine recomputes a bucket several times while its minute is open, so
+    each update steps from the state the PREVIOUS bucket ended on, never from
+    an earlier pass over the same bucket: a bucket's answer depends only on
+    the prior bucket's final state and this bucket's latest spot.
+
+    The tracker also carries the walls themselves, as an opaque payload the
+    caller stores with :meth:`hold` on a re-pick and reads back with
+    :meth:`held`.  It follows the same per-bucket bookkeeping, so a bucket
+    that re-picks on one pass and holds on a later one ends up holding the
+    walls of the last real re-pick, not those of its own abandoned pass.
+    """
+
+    def __init__(self, refresh_minutes: float = WALL_REFRESH_MINUTES) -> None:
+        self.refresh_every = timedelta(minutes=max(0.0, float(refresh_minutes)))
         self._day: Optional[date] = None
+        self._bucket: Optional[datetime] = None
+        self._anchor: Optional[float] = None
+        self._refresh_ts: Optional[datetime] = None
+        self._payload: Any = None
+        self._prior_anchor: Optional[float] = None
+        self._prior_refresh_ts: Optional[datetime] = None
+        self._prior_payload: Any = None
 
-    def seed(self, anchor: Any, bucket_ts: datetime) -> None:
-        """Resume from the anchor stored for an EARLIER bucket (after a restart)."""
-        self.value = None if anchor is None else float(anchor)
-        self._bucket = bucket_ts
-        self._prior = None
+    def seed(
+        self,
+        bucket_ts: datetime,
+        anchor: Any,
+        refresh_ts: Optional[datetime],
+        payload: Any = None,
+    ) -> None:
+        """Resume from the state stored for an EARLIER bucket (after a restart).
+
+        ``payload`` is the walls that bucket published.  A ``refresh_ts`` or
+        ``payload`` of ``None`` (a row written before re-pick timing existed)
+        makes the next bucket re-pick.
+        """
         self._day = _et_day(bucket_ts)
+        self._bucket = bucket_ts
+        self._anchor = None if anchor is None else float(anchor)
+        self._refresh_ts = refresh_ts
+        self._payload = payload if refresh_ts is not None else None
+        self._prior_anchor = None
+        self._prior_refresh_ts = None
+        self._prior_payload = None
 
-    def update(self, spot_price: float, buffer: float, bucket_ts: datetime) -> float:
-        """This bucket's anchor, given its latest spot and break buffer."""
+    def update(self, spot_price: float, buffer: float, bucket_ts: datetime) -> WallStep:
+        """This bucket's anchor and re-pick decision, given its latest spot."""
         day = _et_day(bucket_ts)
         if day != self._day:
             self._day = day
             self._bucket = None
-            self.value = None
+            self._anchor = None
+            self._refresh_ts = None
+            self._payload = None
         if bucket_ts != self._bucket:
-            self._prior = self.value
+            self._prior_anchor = self._anchor
+            self._prior_refresh_ts = self._refresh_ts
+            self._prior_payload = self._payload
             self._bucket = bucket_ts
-        self.value = step_wall_anchor(self._prior, spot_price, buffer)
-        return self.value
+        anchor = step_wall_anchor(self._prior_anchor, spot_price, buffer)
+        prior_refresh_ts = self._prior_refresh_ts
+        self._anchor = anchor
+        if (
+            prior_refresh_ts is None
+            or self._prior_anchor is None
+            or self._prior_payload is None
+            or anchor != self._prior_anchor
+            or bucket_ts - prior_refresh_ts >= self.refresh_every
+        ):
+            self._refresh_ts = bucket_ts
+            self._payload = None  # set by hold() once this pass has its walls
+            return WallStep(anchor=anchor, refresh_ts=bucket_ts, refreshed=True)
+        self._refresh_ts = prior_refresh_ts
+        self._payload = self._prior_payload
+        return WallStep(anchor=anchor, refresh_ts=prior_refresh_ts, refreshed=False)
+
+    def hold(self, payload: Any) -> None:
+        """Store the walls a re-picking bucket published."""
+        self._payload = payload
+
+    def held(self) -> Any:
+        """The walls picked at the current ``refresh_ts`` (``None`` until held)."""
+        return self._payload
 
 
 def _percentile_linear(values: List[float], percentile: float) -> float:

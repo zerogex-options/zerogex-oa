@@ -8,7 +8,7 @@ import asyncpg
 import os
 import time as time_module
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import Awaitable, Callable, List, Dict, Mapping, Optional, Any, Tuple, Iterable
 from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
@@ -207,7 +207,11 @@ def _replay_max_pain_for_expirations(raw: Any, exp_filter: List[date]) -> Option
         return None
 
 
-def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) -> Dict[str, Any]:
+def _scope_replay_frame_levels(
+    frame: Dict[str, Any],
+    exp_filter: List[date],
+    inputs_by_ts: Optional[Dict[Any, List[Dict[str, float]]]] = None,
+) -> Dict[str, Any]:
     """Re-derive one replay frame's level lines from its filtered ladder.
 
     The persisted ``call_wall`` / ``put_wall`` / ``gamma_flip`` on
@@ -234,7 +238,21 @@ def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) ->
     inputs = frame.pop("_gamma_inputs", None) or []
     spot = frame.pop("_spot", None)
     anchor = frame.pop("_wall_anchor", None)
+    refresh_ts = frame.pop("_wall_refresh_ts", None)
     max_pain_by_exp = frame.pop("_max_pain_by_expiration", None)
+    # Where the engine held its walls on this minute, pick them from the rows
+    # of its last re-pick minute -- the same minute the live chart and every
+    # other filter re-pick from.  This minute's own rows when the frame for
+    # that minute is not in the session read (e.g. a pre-market re-pick) or
+    # the row predates the column.
+    wall_inputs = inputs
+    if (
+        refresh_ts is not None
+        and inputs_by_ts is not None
+        and refresh_ts != frame.get("timestamp")
+        and refresh_ts in inputs_by_ts
+    ):
+        wall_inputs = inputs_by_ts[refresh_ts]
 
     try:
         spot_f = float(spot) if spot is not None else None
@@ -246,7 +264,7 @@ def _scope_replay_frame_levels(frame: Dict[str, Any], exp_filter: List[date]) ->
         # a wall on the same move the whole-chain replay (and the live chart)
         # did; spot when the row predates the anchor column.
         call_wall, put_wall = compute_call_put_walls(
-            inputs, spot_f, anchor=float(anchor) if anchor is not None else None
+            wall_inputs, spot_f, anchor=float(anchor) if anchor is not None else None
         )
         frame["call_wall"] = call_wall
         frame["put_wall"] = put_wall
@@ -2109,6 +2127,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     -- ladders below split on it too, so C2/C3 sit on the
                     -- same side of price as the C1 they are listed under.
                     gs.wall_anchor,
+                    -- ...and the minute it picked them from, which the
+                    -- ladders read so C2/C3 come from the same rows as C1.
+                    COALESCE(gs.wall_refresh_ts, gs.timestamp) AS wall_rows_ts,
                     gs.max_gamma_strike,
                     gs.gamma_flip_span_used,
                     gs.pin_strike,
@@ -2165,7 +2186,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     FROM gex_by_strike gbs
                     JOIN latest_summary ls
                       ON gbs.underlying = ls.underlying
-                     AND gbs.timestamp = ls.timestamp
+                     AND gbs.timestamp = ls.wall_rows_ts
                     JOIN latest_quote lq ON TRUE
                     WHERE gbs.strike >= COALESCE(ls.wall_anchor, lq.spot_price)
                     GROUP BY gbs.strike
@@ -2185,7 +2206,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     FROM gex_by_strike gbs
                     JOIN latest_summary ls
                       ON gbs.underlying = ls.underlying
-                     AND gbs.timestamp = ls.timestamp
+                     AND gbs.timestamp = ls.wall_rows_ts
                     JOIN latest_quote lq ON TRUE
                     WHERE gbs.strike <= COALESCE(ls.wall_anchor, lq.spot_price)
                     GROUP BY gbs.strike
@@ -3328,6 +3349,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                        -- a filter, where the walls are re-ranked from the
                        -- filtered ladder but must break on the same move.
                        gs.wall_anchor,
+                       gs.wall_refresh_ts,
                        (SELECT uq.close::numeric
                           FROM underlying_quotes uq
                          WHERE uq.symbol = $1
@@ -3356,6 +3378,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 -- were scaled with.
                 s.spot,
                 s.wall_anchor,
+                s.wall_refresh_ts,
                 ladder.strike,
                 ladder.net_gex,
                 ladder.call_gex,
@@ -3503,6 +3526,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # per-minute list.
                     frames[ts]["_spot"] = r["spot"]
                     frames[ts]["_wall_anchor"] = r.get("wall_anchor")
+                    frames[ts]["_wall_refresh_ts"] = r.get("wall_refresh_ts")
                     frames[ts]["_max_pain_by_expiration"] = r["max_pain_by_expiration"]
                     frames[ts]["_gamma_inputs"] = []
             if r["strike"] is not None:
@@ -3523,7 +3547,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         }
                     )
         if exp_filter:
-            return [_scope_replay_frame_levels(f, exp_filter) for f in frames.values()]
+            # Every minute's filtered ladder, so a frame whose walls the engine
+            # held can pick them from its re-pick minute's frame.
+            inputs_by_ts = {ts: f.get("_gamma_inputs") or [] for ts, f in frames.items()}
+            return [
+                _scope_replay_frame_levels(f, exp_filter, inputs_by_ts) for f in frames.values()
+            ]
         return list(frames.values())
 
     async def get_intraday_level_series(
@@ -4898,11 +4927,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         render — via :func:`src.analytics.walls.compute_wall_ladder`,
         the single source of record — split on the wall anchor
         ``gex_summary`` stored for the bucket (price only, so identical
-        for every filter; the bucket's close when NULL).  With
-        ``expirations=None`` walls are the cross-expiration aggregate and
-        match the engine's published ``gex_summary.call_wall`` /
-        ``put_wall`` for the same minute; with a specific set walls are
-        scoped to that set's gamma alone, under the same rule.
+        for every filter; the bucket's close when NULL).  When the engine
+        held its walls on that minute (``wall_refresh_ts`` before the
+        bucket's own row), they are picked from the rows of that re-pick
+        minute instead, under the same filter.  With ``expirations=None``
+        walls are the cross-expiration aggregate and match the engine's
+        published ``gex_summary.call_wall`` / ``put_wall`` for the same
+        minute; with a specific set walls are scoped to that set's gamma
+        alone, under the same rule and on the same minutes.
 
         Gamma flip scope:
 
@@ -5079,10 +5111,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     -- pin, so it is carried straight through rather than
                     -- recomputed under an expirations filter.
                     gs.max_gamma_strike,
-                    -- The wall anchor as of the bucket's close: the price the
-                    -- engine split the walls on.  Price only, so it is the
+                    -- The wall anchor as of the bucket's close (the price the
+                    -- engine split the walls on) and the minute the engine last
+                    -- re-picked them.  Price and clock only, so both are the
                     -- same for every expirations filter — see _finalize_bucket.
-                    gs.wall_anchor
+                    gs.wall_anchor,
+                    gs.wall_refresh_ts
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                     AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
@@ -5229,6 +5263,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 br.pin_confidence,
                 br.max_gamma_strike,
                 br.wall_anchor,
+                br.rep_ts,
+                br.wall_refresh_ts,
                 s.strike,
                 -- Raw summed gamma at this (bucket, strike) — used by the
                 -- Python wall computation below.  Not exposed in the
@@ -5302,10 +5338,39 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 pending_ts: Any = _UNSET
                 pending_inputs: List[Dict[str, float]] = []
                 finalized: set = set()
-                # Each bucket's wall anchor (gex_summary.wall_anchor at the
-                # bucket's representative row), kept out of the payload and
+                # Each bucket's (wall_anchor, rep_ts, wall_refresh_ts) from its
+                # representative gex_summary row, kept out of the payload and
                 # consumed by _finalize_bucket.
-                bucket_anchors: Dict[Any, Any] = {}
+                bucket_anchors: Dict[Any, Tuple[Any, Any, Any]] = {}
+                # Buckets whose walls come from an earlier re-pick minute's
+                # rows: (bucket_ts, wall_refresh_ts, wall_anchor).  Filled by
+                # _finalize_bucket, resolved after the loop in one small read.
+                deferred_walls: List[Tuple[Any, Any, Any]] = []
+
+                def _set_walls(
+                    bucket: Dict[str, Any],
+                    inputs: List[Dict[str, float]],
+                    close_val: Any,
+                    anchor: Any,
+                ) -> None:
+                    # One ranked pass serves both the scalar walls and the
+                    # optional C2/C3 · P2/P3 ladder, so rank 1 IS the bucket's
+                    # Call/Put Wall by construction.  Split on the anchor the
+                    # engine stored for this bucket — the same price whatever
+                    # the expirations filter, which is what makes a 0DTE view
+                    # and the All view break a wall on the same move.  Rows
+                    # from before the column existed split on the bucket's
+                    # close, as every bucket used to.
+                    call_walls, put_walls = compute_wall_ladder(
+                        inputs,
+                        float(close_val),
+                        DEFAULT_WALL_LADDER_DEPTH,
+                        anchor=float(anchor) if anchor is not None else None,
+                    )
+                    bucket["call_walls"] = call_walls
+                    bucket["put_walls"] = put_walls
+                    bucket["call_wall"] = call_walls[0]["strike"] if call_walls else None
+                    bucket["put_wall"] = put_walls[0]["strike"] if put_walls else None
 
                 def _finalize_bucket(ts: Any, inputs: List[Dict[str, float]]) -> None:
                     """Compute a completed bucket's walls (and, for a filtered
@@ -5325,29 +5390,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     """
                     bucket = grouped[ts]
                     close_val = bucket.get("close")
-                    anchor = bucket_anchors.pop(ts, None)
+                    anchor, rep_ts, refresh_ts = bucket_anchors.pop(ts, (None, None, None))
                     if close_val is not None and inputs:
-                        # One ranked pass serves both the scalar walls and the
-                        # optional C2/C3 · P2/P3 ladder, so rank 1 IS the
-                        # bucket's Call/Put Wall by construction.  Split on the
-                        # anchor the engine stored for this bucket — the same
-                        # price whatever the expirations filter, which is what
-                        # makes a 0DTE view and the All view break a wall on
-                        # the same move.  A bucket needs nothing but its own
-                        # rows and that one number, so the web chart's 3-bucket
-                        # tip poll gets the same wall a full reload draws.
-                        # Rows from before the column existed split on the
-                        # bucket's close, as every bucket used to.
-                        call_walls, put_walls = compute_wall_ladder(
-                            inputs,
-                            float(close_val),
-                            DEFAULT_WALL_LADDER_DEPTH,
-                            anchor=float(anchor) if anchor is not None else None,
-                        )
-                        bucket["call_walls"] = call_walls
-                        bucket["put_walls"] = put_walls
-                        bucket["call_wall"] = call_walls[0]["strike"] if call_walls else None
-                        bucket["put_wall"] = put_walls[0]["strike"] if put_walls else None
+                        if refresh_ts is not None and refresh_ts != rep_ts:
+                            # The engine held its walls on this minute: they
+                            # were picked from the rows of its last re-pick
+                            # (price broke out, or the re-check clock ran out),
+                            # not re-picked from this minute's.  Every filter
+                            # re-picks from that same minute, so a 0DTE view
+                            # holds and moves when the All view does.  A
+                            # bucket needs only its stored anchor and re-pick
+                            # minute, so the web chart's 3-bucket tip poll gets
+                            # the same wall a full reload draws.
+                            deferred_walls.append((ts, refresh_ts, anchor))
+                        else:
+                            _set_walls(bucket, inputs, close_val, anchor)
                     if exp_filter is not None:
                         bucket["gamma_flip"] = (
                             compute_gamma_flip_from_strikes(inputs, float(close_val))
@@ -5395,7 +5452,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "strikes": [],
                         }
                         grouped[ts] = bucket
-                        bucket_anchors[ts] = r.get("wall_anchor")
+                        bucket_anchors[ts] = (
+                            r.get("wall_anchor"),
+                            r.get("rep_ts"),
+                            r.get("wall_refresh_ts"),
+                        )
                     if ts != pending_ts:
                         # Bucket boundary: the previous bucket has all its rows
                         # now, so finalise it and release its raw gamma rows.
@@ -5464,6 +5525,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # Finalise the last bucket (no boundary follows it).
                 if pending_ts is not _UNSET:
                     _finalize_bucket(pending_ts, pending_inputs)
+                if deferred_walls:
+                    refresh_inputs = await self._wall_refresh_inputs(
+                        conn,
+                        symbol,
+                        [refresh_ts for _, refresh_ts, _ in deferred_walls],
+                        exp_filter,
+                    )
+                    for ts, refresh_ts, anchor in deferred_walls:
+                        held_bucket = grouped[ts]
+                        _set_walls(
+                            held_bucket,
+                            refresh_inputs.get(refresh_ts, []),
+                            held_bucket["close"],
+                            anchor,
+                        )
                 result = list(grouped.values())
                 # Release the raw rows before _cache_set. Modest — the frame is
                 # about to be dropped anyway, which frees them — but it keeps
@@ -5494,6 +5570,50 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching strike profile timeseries: {e}", exc_info=True)
             raise
+
+    async def _wall_refresh_inputs(
+        self,
+        conn: Any,
+        symbol: str,
+        refresh_ts: List[Any],
+        exp_filter: Optional[List[date]],
+    ) -> Dict[Any, List[Dict[str, float]]]:
+        """Per-strike gamma at each re-pick minute, for the walls held on later buckets.
+
+        The same per-strike sums the strike-profile read ranks a bucket's own
+        rows on — summed across the request's expirations, all-zero strikes
+        dropped — keyed by timestamp.  One indexed read for the handful of
+        distinct re-pick minutes a window holds.
+        """
+        wanted = sorted(set(refresh_ts))
+        query = """
+            SELECT
+                gbs.timestamp,
+                gbs.strike,
+                SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma,
+                SUM(COALESCE(gbs.put_gamma, 0))  AS put_gamma
+            FROM gex_by_strike gbs
+            WHERE gbs.underlying = $1
+              AND gbs.timestamp = ANY($2::timestamptz[])
+              AND ($3::date[] IS NULL OR gbs.expiration = ANY($3::date[]))
+            GROUP BY gbs.timestamp, gbs.strike
+            HAVING SUM(COALESCE(gbs.call_gamma, 0)) <> 0
+                OR SUM(COALESCE(gbs.put_gamma, 0)) <> 0
+        """
+        rows = await asyncio.wait_for(
+            self._fetch_timed(conn, query, symbol, wanted, exp_filter, timeout=10.0),
+            timeout=10.0,
+        )
+        out: Dict[Any, List[Dict[str, float]]] = defaultdict(list)
+        for r in rows:
+            out[r["timestamp"]].append(
+                {
+                    "strike": float(r["strike"]),
+                    "call_gamma": float(r["call_gamma"] or 0.0),
+                    "put_gamma": float(r["put_gamma"] or 0.0),
+                }
+            )
+        return out
 
     async def get_historical_flips_at_offsets(
         self,

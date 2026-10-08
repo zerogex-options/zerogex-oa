@@ -621,6 +621,13 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_reason TEXT;
 -- existed; readers then split on spot.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS wall_anchor DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS wall_break_buffer DOUBLE PRECISION;
+-- The minute whose rows this row's walls were picked from (WallTracker): this
+-- row's own timestamp on the minute price broke out or the WALL_REFRESH_MINUTES
+-- clock ran out, otherwise the last such minute -- the walls are held, not
+-- re-picked, while price lingers.  Price and clock only, so the rewind chart and
+-- replay re-pick every expiration selection from the same minute.  NULL on rows
+-- written before the column existed; readers then pick from the row's own minute.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS wall_refresh_ts TIMESTAMPTZ;
 COMMENT ON COLUMN gex_summary.data_as_of IS
     'Newest option_chains_latest.updated_at the snapshot read; what the row is as of. timestamp is the minute bucket.';
 

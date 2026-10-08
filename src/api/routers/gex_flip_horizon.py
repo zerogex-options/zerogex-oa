@@ -394,10 +394,10 @@ def _compute_surface_sync(
     snapshot = engine._get_snapshot()
     if not snapshot or not snapshot.get("options"):
         return None
-    # The walls on this chart are the published ones: split on the wall
-    # anchor the analytics engine stored, not on this snapshot's spot.
-    stored_anchor = (
-        engine._read_stored_wall_anchor(snapshot["timestamp"], inclusive=True)
+    # The walls on this chart are the ones the analytics engine published
+    # (held between re-picks), not a fresh re-pick of this snapshot.
+    stored = (
+        engine._read_stored_wall_state(snapshot["timestamp"], inclusive=True)
         if include_walls
         else None
     )
@@ -409,7 +409,7 @@ def _compute_surface_sync(
         span_pct=span_pct,
         step_pct=step_pct,
         include_walls=include_walls,
-        wall_anchor=stored_anchor[1] if stored_anchor else None,
+        published_walls=(stored["call_wall"], stored["put_wall"]) if stored else None,
     )
     return {
         "spot": snapshot["underlying_price"],

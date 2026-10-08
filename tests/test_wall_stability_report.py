@@ -1,7 +1,8 @@
 """The wall stability report counts flips the way the production report did.
 
 Its database reads are exercised end to end by hand against a scratch
-Postgres; these pin the pure parts: the flip/change count and the replay.
+Postgres; these pin the pure parts: the flip/change count, the three-rule
+replay and the table.
 """
 
 from __future__ import annotations
@@ -40,34 +41,56 @@ def test_a_jump_to_no_wall_and_back_counts():
     assert stats.flips == 1
 
 
-def test_replay_old_rule_flickers_and_new_rule_holds():
+def _replay(rows_at, spots, refresh_minutes=15):
+    times = _times(len(spots))
+    walls = replay_session(
+        times,
+        {t: rows_at(i) for i, t in enumerate(times)},
+        dict(zip(times, spots)),
+        buffer_pct_of_spot=0.001,
+        buffer_points=None,
+        tie_pct=0.10,
+        refresh_minutes=refresh_minutes,
+    )
+    return summarize("SPX", "all", times, walls)
+
+
+def test_chop_across_a_strike_flips_old_and_neither_new_rule():
     rows = [
         {"strike": 7650.0, "call_gamma": 0.0, "put_gamma": 60.0},
         {"strike": 7700.0, "call_gamma": 100.0, "put_gamma": 100.0},
         {"strike": 7800.0, "call_gamma": 80.0, "put_gamma": 0.0},
     ]
-    times = _times(8)
-    spots = [7698.0, 7702.0] * 4
-    old, new = replay_session(
-        times,
-        {t: rows for t in times},
-        dict(zip(times, spots)),
-        buffer_pct_of_spot=0.001,
-        buffer_points=None,
-        tie_pct=0.10,
-    )
-    result = summarize("SPX", "all", times, old, new)
-    assert result.old_call.flips == 6 and result.old_put.flips == 6
-    assert result.new_call.changes == 0 and result.new_put.changes == 0
+    result = _replay(lambda i: rows, [7698.0, 7702.0] * 4)
+    old_call, old_put = result.stats["old"]
+    assert (old_call.flips, old_put.flips) == (6, 6)
+    for variant in ("live", "new"):
+        call, put = result.stats[variant]
+        assert (call.changes, put.changes) == (0, 0)
     assert result.differs == 4  # the minutes spot sat above 7700
+
+
+def test_wobbling_sizes_flip_live_but_not_new():
+    def rows_at(i):
+        a, b = (100.0, 70.0) if i % 2 else (70.0, 100.0)
+        return [
+            {"strike": 7710.0, "call_gamma": a, "put_gamma": 0.0},
+            {"strike": 7725.0, "call_gamma": b, "put_gamma": 0.0},
+            {"strike": 7690.0, "call_gamma": 0.0, "put_gamma": 50.0},
+        ]
+
+    result = _replay(rows_at, [7700.0 + (2 if i % 2 else -2) for i in range(10)])
+    assert result.stats["live"][0].flips == 8
+    assert result.stats["new"][0].changes == 0
     lines = format_report([result])
-    assert lines[-1].startswith("SPX    all")
+    assert lines[-1].split()[:7] == ["SPX", "all", "1", "10", "8/0", "8/0", "0/0"]
 
 
 def test_totals_add_up():
     a = ScopeResult(symbol="SPX", scope="all", sessions=1, minutes=10)
-    a.old_call.flips = 3
+    a.stats["old"][0].flips = 3
     b = ScopeResult(symbol="SPY", scope="all", sessions=2, minutes=20)
-    b.old_call.flips = 4
+    b.stats["old"][0].flips = 4
+    b.stats["new"][1].flips = 1
     lines = format_report([a, b])
-    assert lines[-1].split()[:4] == ["TOTAL", "3", "30", "7/0"]
+    assert lines[-1].split()[:6] == ["TOTAL", "3", "30", "7/0", "0/0", "0/1"]

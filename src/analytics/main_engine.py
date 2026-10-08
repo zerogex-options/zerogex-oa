@@ -60,7 +60,8 @@ from src.config import (
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.tradeworkz.strikes import default_strike_increment
 from src.analytics.walls import (
-    WallAnchor,
+    WallStep,
+    WallTracker,
     compute_call_put_walls,
     compute_call_put_walls_with_strength,
     wall_break_buffer,
@@ -167,6 +168,7 @@ _GEX_SUMMARY_COLUMNS = (
     "data_as_of",
     "wall_anchor",
     "wall_break_buffer",
+    "wall_refresh_ts",
 )
 
 #: The conflict key. Never assigned in DO UPDATE SET, never in its guard.
@@ -202,6 +204,7 @@ _GEX_SUMMARY_OPTIONAL_COLUMNS = frozenset(
         "pin_strike_reason",
         "wall_anchor",
         "wall_break_buffer",
+        "wall_refresh_ts",
         "computed_at",
         "data_as_of",
         "gamma_flip_reason",
@@ -381,10 +384,11 @@ class AnalyticsEngine:
         # confirmed, so the database is asked once per bucket rather than on
         # every after-hours write.
         self._settled_bucket_ts: Optional[datetime] = None
-        # The price the Call/Put Walls are split on (see _advance_wall_anchor).
-        # None until the first summary, when it is built and resumed from the
-        # anchor this symbol stored earlier today.
-        self._wall_anchor: Optional[WallAnchor] = None
+        # When the Call/Put Walls are re-picked, the price they are split on,
+        # and the walls held in between (see _advance_walls).  None until the
+        # first summary, when it is built and resumed from the state this
+        # symbol stored earlier today.
+        self._wall_tracker: Optional[WallTracker] = None
         # (bucket the typical 30-minute move was read at, the value) -- the
         # break buffer's volatility yardstick, re-read every half hour.
         self._wall_move_cache: Optional[Tuple[datetime, Optional[float]]] = None
@@ -2484,7 +2488,7 @@ class AnalyticsEngine:
         span_pct: Optional[float] = None,
         step_pct: Optional[float] = None,
         include_walls: bool = True,
-        wall_anchor: Optional[float] = None,
+        published_walls: Optional[Tuple[Optional[float], Optional[float]]] = None,
     ) -> Dict[str, Any]:
         """Spot-shift dealer-gamma surface across multiple horizons.
 
@@ -2598,11 +2602,15 @@ class AnalyticsEngine:
         if include_walls and options and spot > 0:
             gex_by_strike = self._calculate_gex_by_strike(options, spot, timestamp)
             if gex_by_strike:
-                # Split on the published wall anchor so these are the walls
-                # the dashboard shows, not a fresh spot-split re-rank.
-                call_wall, put_wall = compute_call_put_walls(
-                    gex_by_strike, spot, anchor=wall_anchor
-                )
+                # The walls the engine published (``published_walls``, from
+                # gex_summary) when the caller has them, so this chart shows
+                # the dashboard's walls rather than a fresh re-pick that would
+                # undo the breakout / re-check timing.  A plain re-pick on
+                # spot otherwise.
+                if published_walls is not None and any(w is not None for w in published_walls):
+                    call_wall, put_wall = published_walls
+                else:
+                    call_wall, put_wall = compute_call_put_walls(gex_by_strike, spot)
                 # Convert OI-weighted gamma at the wall strike to dollar
                 # GEX per 1% move via the canonical formula
                 # ``γ_aggregate × 100 × S² × 0.01`` (same convention
@@ -3023,7 +3031,7 @@ class AnalyticsEngine:
         """Calculate summary GEX metrics.
 
         ``wall_anchor`` is the price the Call/Put Walls are split on (see
-        :meth:`_advance_wall_anchor`); ``None`` splits on ``underlying_price``.
+        :meth:`_advance_walls`); ``None`` splits on ``underlying_price``.
         """
 
         if not gex_by_strike:
@@ -3641,6 +3649,7 @@ class AnalyticsEngine:
                 if summary.get("wall_break_buffer") is not None
                 else None
             ),
+            "wall_refresh_ts": summary.get("wall_refresh_ts"),
         }
         cursor.execute(self._gex_summary_upsert(cursor), values)
         logger.debug("✅ Stored GEX summary")
@@ -5261,16 +5270,19 @@ class AnalyticsEngine:
     #: It is a 5-day median and barely moves intraday (see _typical_move_30m).
     WALL_MOVE_REFRESH = timedelta(minutes=30)
 
-    def _read_stored_wall_anchor(
-        self, at: datetime, *, inclusive: bool
-    ) -> Optional[Tuple[datetime, float]]:
-        """The newest ``(timestamp, wall_anchor)`` stored today at or before ``at``.
+    #: The published wall fields a re-pick sets and a held bucket repeats.
+    _WALL_FIELDS = ("call_wall", "put_wall", "call_wall_strength", "put_wall_strength")
 
-        ``inclusive=False`` stops strictly before ``at`` -- what resuming the
-        anchor after a restart needs, since the row for ``at`` itself is the
-        one about to be rewritten.  Bounded to ``at``'s New York day, the only
-        day an anchor is valid for.  ``None`` when there is none or the read
-        fails (logged): callers then split on spot.
+    def _read_stored_wall_state(self, at: datetime, *, inclusive: bool) -> Optional[Dict[str, Any]]:
+        """The newest wall state stored today at or before ``at``.
+
+        A dict with ``timestamp``, ``wall_anchor``, ``wall_refresh_ts`` and the
+        published walls (:data:`_WALL_FIELDS`).  ``inclusive=False`` stops
+        strictly before ``at`` -- what resuming after a restart needs, since
+        the row for ``at`` itself is the one about to be rewritten.  Bounded to
+        ``at``'s New York day, the only day the state is valid for.  ``None``
+        when there is none or the read fails (logged): the walls then start
+        over at this cycle's spot.
         """
         et = at.astimezone(ET) if at.tzinfo else at
         day_start = et.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -5280,7 +5292,8 @@ class AnalyticsEngine:
                 cursor = conn.cursor()
                 cursor.execute(
                     f"""
-                    SELECT timestamp, wall_anchor
+                    SELECT timestamp, wall_anchor, wall_refresh_ts,
+                           call_wall, put_wall, call_wall_strength, put_wall_strength
                     FROM gex_summary
                     WHERE underlying = %s
                       AND timestamp {op} %s
@@ -5294,14 +5307,26 @@ class AnalyticsEngine:
                 row = cursor.fetchone()
         except Exception:
             logger.warning(
-                "Could not read the stored wall anchor for %s; splitting the walls on spot",
+                "Could not read the stored wall state for %s; the walls start over at spot",
                 self.db_symbol,
                 exc_info=True,
             )
             return None
         if row is None or row[0] is None or row[1] is None:
             return None
-        return row[0], float(row[1])
+
+        def _f(value: Any) -> Optional[float]:
+            return None if value is None else float(value)
+
+        return {
+            "timestamp": row[0],
+            "wall_anchor": float(row[1]),
+            "wall_refresh_ts": row[2],
+            "call_wall": _f(row[3]),
+            "put_wall": _f(row[4]),
+            "call_wall_strength": _f(row[5]),
+            "put_wall_strength": _f(row[6]),
+        }
 
     def _wall_typical_move(self, bucket_ts: datetime) -> Optional[float]:
         """The typical 30-minute range behind the break buffer, cached.
@@ -5329,32 +5354,60 @@ class AnalyticsEngine:
         self._wall_move_cache = (bucket_ts, value)
         return value
 
-    def _advance_wall_anchor(
+    def _advance_walls(
         self, spot: float, bucket_ts: datetime
-    ) -> Tuple[Optional[float], Optional[float]]:
-        """This bucket's ``(wall_anchor, wall_break_buffer)``.
+    ) -> Tuple[Optional[WallStep], Optional[float]]:
+        """This bucket's wall step and break buffer.
 
-        The anchor is what the Call/Put Walls are split on: price only, so it
-        is computed once here and stored, and every expiration selection the
-        API draws later splits on the same value (see
-        :func:`src.analytics.walls.step_wall_anchor`).  ``(None, None)`` with no
-        usable spot or bucket, which makes the walls split on spot.
+        The step says what price the Call/Put Walls are split on and whether
+        this bucket re-picks them or holds the walls picked at
+        ``step.refresh_ts`` (see :class:`src.analytics.walls.WallTracker`).
+        Both are price only, so they are decided once here and stored, and
+        every expiration selection the API draws later splits and re-picks on
+        the same values.  ``(None, None)`` with no usable spot or bucket, which
+        makes the walls a plain re-pick split on spot.
         """
         if not isinstance(bucket_ts, datetime) or spot is None or spot <= 0:
             return None, None
-        anchor: Optional[WallAnchor] = getattr(self, "_wall_anchor", None)
-        if anchor is None:
-            # Resume from the anchor stored earlier today.  Without it, a
-            # restart mid-session (every deploy) would restart the anchor at
-            # spot, and a strike price was lingering around could change
-            # sides on the first cycle -- the jump the anchor exists to stop.
-            anchor = WallAnchor()
-            stored = self._read_stored_wall_anchor(bucket_ts, inclusive=False)
+        tracker: Optional[WallTracker] = getattr(self, "_wall_tracker", None)
+        if tracker is None:
+            # Resume from the state stored earlier today.  Without it, a
+            # restart mid-session (every deploy) would start the anchor over
+            # at spot and re-pick at once, so a wall price was lingering
+            # around could jump on the first cycle -- the jump this exists to
+            # stop.
+            tracker = WallTracker()
+            stored = self._read_stored_wall_state(bucket_ts, inclusive=False)
             if stored is not None:
-                anchor.seed(stored[1], stored[0])
-            self._wall_anchor = anchor
+                tracker.seed(
+                    stored["timestamp"],
+                    stored["wall_anchor"],
+                    stored["wall_refresh_ts"],
+                    {field: stored[field] for field in self._WALL_FIELDS},
+                )
+            self._wall_tracker = tracker
         buffer = wall_break_buffer(spot, self._wall_typical_move(bucket_ts))
-        return anchor.update(spot, buffer, bucket_ts), buffer
+        return tracker.update(spot, buffer, bucket_ts), buffer
+
+    def _publish_walls(
+        self, summary: Dict[str, Any], step: Optional[WallStep], buffer: Optional[float]
+    ) -> None:
+        """Hold the walls between re-picks and stamp the wall state, in place.
+
+        On a re-pick the walls ``_calculate_gex_summary`` just picked are
+        published and remembered; otherwise the remembered ones are published
+        again, so the walls cannot move while price lingers.
+        """
+        tracker: Optional[WallTracker] = getattr(self, "_wall_tracker", None)
+        if step is None or tracker is None:
+            return
+        if step.refreshed:
+            tracker.hold({field: summary.get(field) for field in self._WALL_FIELDS})
+        else:
+            summary.update(tracker.held())
+        summary["wall_anchor"] = step.anchor
+        summary["wall_break_buffer"] = buffer
+        summary["wall_refresh_ts"] = step.refresh_ts
 
     def run_calculation(self) -> bool:
         """
@@ -5549,13 +5602,13 @@ class AnalyticsEngine:
             # Calculate GEX summary
             logger.debug("Calculating GEX summary metrics...")
             t0 = _time.monotonic()
-            wall_anchor, wall_buffer = self._advance_wall_anchor(underlying_price, latest_timestamp)
+            wall_step, wall_buffer = self._advance_walls(underlying_price, latest_timestamp)
             gex_summary = self._calculate_gex_summary(
                 gex_by_strike,
                 options,
                 underlying_price,
                 latest_timestamp,
-                wall_anchor=wall_anchor,
+                wall_anchor=wall_step.anchor if wall_step else None,
             )
             stage_timings["gex_summary"] = _time.monotonic() - t0
 
@@ -5563,8 +5616,7 @@ class AnalyticsEngine:
                 logger.warning("Failed to calculate GEX summary")
                 self._last_stage_timings = stage_timings
                 return False
-            gex_summary["wall_anchor"] = wall_anchor
-            gex_summary["wall_break_buffer"] = wall_buffer
+            self._publish_walls(gex_summary, wall_step, wall_buffer)
 
             # Validate internal arithmetic consistency before persisting.
             self._validate_gex_calculations(gex_by_strike, gex_summary, underlying_price)

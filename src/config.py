@@ -498,6 +498,15 @@ WALL_BREAK_MIN_PCT = _getenv_float("WALL_BREAK_MIN_PCT", 0.001, min=0.0, max=0.0
 # Tie zone: strikes within this fraction of the biggest on their side are
 # treated as tied, and the one price reaches first wins.  0 is a plain argmax.
 WALL_TIE_PCT = _getenv_float("WALL_TIE_PCT", 0.10, min=0.0, max=0.5)
+# When the walls are re-picked.  The break test alone halved the flicker
+# (930 -> 443 jump-and-revert events, SPX/SPY/QQQ/NDX, All and 0DTE views,
+# 2026-10-01 to 10-07): strike sizes still wobble minute to minute as price
+# jiggles -- 0DTE gamma most of all -- and every re-pick that lands near a
+# tie can flip.  So the walls are re-picked only on the minute price breaks
+# out (the wall anchor moves) and otherwise on this clock, which catches slow
+# drift such as time decay while price sits still.  Price only, so every
+# expiration selection re-picks on the same minutes.  0 re-picks every minute.
+WALL_REFRESH_MINUTES = _getenv_float("WALL_REFRESH_MINUTES", 15.0, min=0.0, max=390.0)
 
 # The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
 # carries a colossal re-greeked Black-Scholes gamma spike (ATM gamma ∝
