@@ -67,6 +67,10 @@
 //    Lot 2 ("GOAT2") trails by TrailTicks.
 //    Both carry an initial stop of the entry bar's range + StopExtraTicks,
 //    which on a 3-range chart is a 4-tick stop.
+//    When the opposite-closing bar leaves price within StopRaceGuardTicks of
+//    lot 1's stop, lot 1 is left to that stop instead of being sent a
+//    separate market exit. Live, the two filling together traded one
+//    contract too many (see ExitTarget1).
 //
 //  Jim's second target is also allowed to be a PREDRAWN LEVEL (opening range,
 //  ZeroGEX, Camarilla). That branch is deliberately NOT implemented here: a
@@ -169,6 +173,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private double initialStopPrice;
 		//: Best price reached since entry, which the lot 2 trail hangs off.
 		private double runExtreme;
+		//: Direction of the trade last entered. A position on the other side
+		//: can only come from an exit that overfilled, never from an entry.
+		private MarketPosition tradeDirection = MarketPosition.Flat;
+
+		//: How close price may be to lot 1's stop before ExitTarget1 leaves the
+		//: exit to that stop. Order plumbing, not a trading judgment, so it is
+		//: not a parameter.
+		private const int StopRaceGuardTicks = 2;
 
 		protected override void OnStateChange()
 		{
@@ -365,12 +377,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (slope >= slopeThreshold && QualifiesLong(slope))
 			{
 				SetStops();
+				tradeDirection = MarketPosition.Long;
 				EnterLong(LotSize, "GOAT1");
 				EnterLong(LotSize, "GOAT2");
 			}
 			else if (slope <= -slopeThreshold && QualifiesShort(slope))
 			{
 				SetStops();
+				tradeDirection = MarketPosition.Short;
 				EnterShort(LotSize, "GOAT1");
 				EnterShort(LotSize, "GOAT2");
 			}
@@ -469,7 +483,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				SetProfitTarget("GOAT1", CalculationMode.Ticks, Target1Ticks);
 
 			// Entry fills on the next bar's open, so the stop price is not
-			// known yet; TrailLot2 anchors it on the first bar in position.
+			// known yet; AnchorStops sets it on the first bar in position.
 			initialStopPrice = double.NaN;
 			runExtreme = double.NaN;
 			target1Done = false;
@@ -483,8 +497,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			}
 
+			AnchorStops();
 			ExitTarget1();
 			TrailLot2();
+		}
+
+		/// <summary>
+		/// Fix the initial stop price and the trail's starting extreme on the
+		/// first bar in position. Runs before ExitTarget1, which needs the stop
+		/// price on that very bar.
+		/// </summary>
+		private void AnchorStops()
+		{
+			if (!double.IsNaN(initialStopPrice))
+				return;
+
+			bool isLong = Position.MarketPosition == MarketPosition.Long;
+			double entry = Position.AveragePrice;
+
+			initialStopPrice = isLong
+				? entry - signalStopTicks * TickSize
+				: entry + signalStopTicks * TickSize;
+			runExtreme = isLong ? High[0] : Low[0];
 		}
 
 		/// <summary>
@@ -493,22 +527,53 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// lot is gone the aggregate position is still open, so without the
 		/// latch this would re-issue the exit on every later bar against an
 		/// entry signal that no longer holds anything.
+		///
+		/// Not when price is already at lot 1's stop. Under OnBarClose a range
+		/// bar is only seen to close when the next tick breaks out of it, and
+		/// when the first bar after entry runs straight against the trade that
+		/// tick IS the stop price. Live, the stop and a market exit then both
+		/// filled and sold one contract too many, leaving an unprotected
+		/// position on the wrong side (Jim's first live session, 2026-10-08). A
+		/// backtest never shows it, because historical fills are processed
+		/// before OnBarUpdate. So inside StopRaceGuardTicks lot 1 is left to its
+		/// stop, at most that many ticks from where the market exit would have
+		/// filled, and the latch stays open in case price turns back.
 		/// </summary>
 		private void ExitTarget1()
 		{
 			if (target1Done || Target1Mode != GoatTarget1Mode.FirstOppositeCloseBar)
 				return;
 
+			double guard = StopRaceGuardTicks * TickSize;
+
 			if (Position.MarketPosition == MarketPosition.Long && Close[0] <= Open[0])
 			{
+				if (ExitSidePrice(true) - initialStopPrice <= guard)
+					return;
 				ExitLong(LotSize, "X1", "GOAT1");
 				target1Done = true;
 			}
 			else if (Position.MarketPosition == MarketPosition.Short && Close[0] > Open[0])
 			{
+				if (initialStopPrice - ExitSidePrice(false) <= guard)
+					return;
 				ExitShort(LotSize, "X1", "GOAT1");
 				target1Done = true;
 			}
+		}
+
+		/// <summary>
+		/// The worse of the bar's close and the live quote on the side lot 1
+		/// exits into. Historically NinjaTrader substitutes the close for the
+		/// quote; the close is also the fallback when a feed sends no quote, since
+		/// a zero bid would otherwise read as "at the stop" on every bar.
+		/// </summary>
+		private double ExitSidePrice(bool isLong)
+		{
+			double quote = isLong ? GetCurrentBid() : GetCurrentAsk();
+			if (quote <= 0)
+				return Close[0];
+			return isLong ? Math.Min(Close[0], quote) : Math.Max(Close[0], quote);
 		}
 
 		/// <summary>
@@ -518,15 +583,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private void TrailLot2()
 		{
 			bool isLong = Position.MarketPosition == MarketPosition.Long;
-			double entry = Position.AveragePrice;
-
-			if (double.IsNaN(initialStopPrice))
-			{
-				initialStopPrice = isLong
-					? entry - signalStopTicks * TickSize
-					: entry + signalStopTicks * TickSize;
-				runExtreme = isLong ? High[0] : Low[0];
-			}
 
 			runExtreme = isLong
 				? Math.Max(runExtreme, High[0])
@@ -541,6 +597,33 @@ namespace NinjaTrader.NinjaScript.Strategies
 				: Math.Min(initialStopPrice, trail);
 
 			SetStopLoss("GOAT2", CalculationMode.Price, stop, false);
+		}
+
+		/// <summary>
+		/// Backstop for the race ExitTarget1 guards against. Entries only happen
+		/// when flat and always in tradeDirection, so a position on the other
+		/// side can only be an exit that filled after the stops had already
+		/// closed the trade. Close it at once rather than leave it unprotected:
+		/// no stop is attached to it, and nothing else in this strategy would
+		/// ever exit it before the session close.
+		/// </summary>
+		protected override void OnPositionUpdate(Cbi.Position position, double averagePrice,
+			int quantity, Cbi.MarketPosition marketPosition)
+		{
+			if (State != State.Realtime
+				|| marketPosition == MarketPosition.Flat
+				|| tradeDirection == MarketPosition.Flat
+				|| marketPosition == tradeDirection)
+				return;
+
+			Log(string.Format(
+				"ZeroGexGoat: an exit overfilled and left {0} {1} against a {2} trade. Closing it.",
+				quantity, marketPosition, tradeDirection), LogLevel.Warning);
+
+			if (marketPosition == MarketPosition.Short)
+				ExitShort("Overfill");
+			else
+				ExitLong("Overfill");
 		}
 
 		#region Properties
