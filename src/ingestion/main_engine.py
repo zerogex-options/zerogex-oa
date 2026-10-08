@@ -61,6 +61,7 @@ from src.config import (
     GREEKS_ENABLED,
     INGEST_PARITY_GUARD_ENABLED,
     OPTION_BUCKET_WRITE_MIN_SECONDS,
+    FLOW_CLASSIFIER,
     FLOW_CLASSIFY_MID_BAND_PCT,
     FLOW_CLASSIFY_SKIP_OPEN_AUCTION,
     FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS,
@@ -126,6 +127,19 @@ class _FlowAccumulator:
     # last_bid/last_ask/last_mid.  Used to age-check the prior tick before
     # trusting it as the pre-trade quote (see _select_classify_quote).
     last_quote_ts: Optional[datetime] = None
+    # The tick test's state, carried for the same reason the NBBO above is:
+    # it grades a trade against the PREVIOUS TRADE PRICE, so it is
+    # meaningless without one.  Only read when FLOW_CLASSIFIER == "tick".
+    #
+    # last_trade_price hydrates from option_chains.last, so a mid-session
+    # restart resumes against the right prior trade rather than silently
+    # re-seeding.  tick_direction does NOT hydrate: nothing persists it, and
+    # adding a production column for a diagnostic is not worth the schema
+    # change.  A cold start therefore carries 0 (mid) into the first
+    # zero-tick it meets, which decays within a few trades and only ever
+    # affects contracts that print flat immediately after a restart.
+    last_trade_price: Optional[float] = None
+    tick_direction: int = 0
 
 
 def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
@@ -1562,7 +1576,7 @@ class IngestionEngine:
                 cursor.execute(
                     """
                     SELECT volume, ask_volume, mid_volume, bid_volume,
-                           bid, ask, mid, timestamp
+                           bid, ask, mid, timestamp, last
                     FROM option_chains
                     WHERE option_symbol = %s
                       AND timestamp >= %s
@@ -1583,6 +1597,7 @@ class IngestionEngine:
                         last_ask=_to_db_float(row[5]),
                         last_mid=_to_db_float(row[6]),
                         last_quote_ts=row[7],
+                        last_trade_price=_to_db_float(row[8]),
                     )
         except Exception as e:
             logger.warning(
@@ -1678,18 +1693,29 @@ class IngestionEngine:
             if skip:
                 acc.mid_cum += vol_delta
             else:
-                # Quote to classify against: the prior tick when it is
-                # recent enough to be a valid pre-trade proxy, else the
-                # snapshot's own (contemporaneous) NBBO.  See
-                # _select_classify_quote for the staleness rationale.
-                q_bid, q_ask, q_mid = self._select_classify_quote(acc, snap)
-                av, mv, bv = self._classify_volume_chunk(
-                    vol_delta,
-                    snap.get("last"),
-                    q_bid,
-                    q_ask,
-                    q_mid,
-                )
+                if FLOW_CLASSIFIER == "tick":
+                    # Reads no quote at all, so the Market Value penny
+                    # randomisation cannot reach it (F10/F11). Returns the
+                    # direction to carry, which is what a zero tick inherits.
+                    av, mv, bv, acc.tick_direction = self._classify_volume_chunk_tick(
+                        vol_delta,
+                        snap.get("last"),
+                        acc.last_trade_price,
+                        acc.tick_direction,
+                    )
+                else:
+                    # Quote to classify against: the prior tick when it is
+                    # recent enough to be a valid pre-trade proxy, else the
+                    # snapshot's own (contemporaneous) NBBO.  See
+                    # _select_classify_quote for the staleness rationale.
+                    q_bid, q_ask, q_mid = self._select_classify_quote(acc, snap)
+                    av, mv, bv = self._classify_volume_chunk(
+                        vol_delta,
+                        snap.get("last"),
+                        q_bid,
+                        q_ask,
+                        q_mid,
+                    )
                 acc.ask_cum += av
                 acc.mid_cum += mv
                 acc.bid_cum += bv
@@ -1713,6 +1739,15 @@ class IngestionEngine:
             acc.last_mid = (acc.last_bid + acc.last_ask) / 2.0
         if quote_seen and snap.get("timestamp") is not None:
             acc.last_quote_ts = snap.get("timestamp")
+        # Advance the tick test's prior trade on EVERY snapshot, not only
+        # ones that classified. A contract whose volume did not move can
+        # still print a new last between polls, and the harness that
+        # measured this method advances its state before every early skip
+        # for the same reason -- a tick sequence with a hole in it carries
+        # the wrong direction forward from there on.
+        snap_last = _to_db_float(snap.get("last"))
+        if snap_last is not None and snap_last > 0:
+            acc.last_trade_price = snap_last
 
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False

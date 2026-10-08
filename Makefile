@@ -3534,9 +3534,9 @@ shadow-create: shadow-guard ## Create the cutover-rehearsal database and apply s
 # has to behave like production rather than like a second loader. Production
 # never saw any of this, because systemd does no expansion.
 .PHONY: shadow-run
-shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate feed. Ctrl-C to stop. Vars: SHADOW_PROVIDER, DEBUG=1
+shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate feed. Ctrl-C to stop. Vars: SHADOW_PROVIDER, FLOW_CLASSIFIER=tick, DEBUG=1
 	@echo "$(BLUE)================================================================================$(NC)"
-	@echo "$(BLUE)CUTOVER REHEARSAL — feed=$(SHADOW_PROVIDER)  db=$(SHADOW_DB)$(NC)"
+	@echo "$(BLUE)CUTOVER REHEARSAL — feed=$(SHADOW_PROVIDER)  db=$(SHADOW_DB)  classifier=$(or $(FLOW_CLASSIFIER),quote [default])$(NC)"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo "Production ingestion keeps running untouched; this writes only to $(SHADOW_DB)."
 	@echo "$(YELLOW)Note: the VIX/VXN/futures ingesters still call TradeStation directly,$(NC)"
@@ -3569,6 +3569,7 @@ shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate
 		echo "Symbol aliases: $$SYMBOL_ALIASES"; \
 	} >> "$$LOG"; \
 	DB_NAME=$(SHADOW_DB) MARKET_DATA_PROVIDER=$(SHADOW_PROVIDER) \
+		$(if $(FLOW_CLASSIFIER),FLOW_CLASSIFIER=$(FLOW_CLASSIFIER)) \
 		$(VENV_PYTHON) -m src.ingestion.main_engine $(if $(DEBUG),--debug) \
 		2>&1 | tee -a "$$LOG"
 

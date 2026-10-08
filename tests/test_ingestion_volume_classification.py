@@ -6,11 +6,13 @@ volume in ``option_chains``.
 """
 
 import threading
-from datetime import datetime
+from datetime import date, datetime
+from unittest.mock import patch
 
 import pytz
 
-from src.ingestion.main_engine import IngestionEngine
+from src.ingestion import main_engine
+from src.ingestion.main_engine import IngestionEngine, _FlowAccumulator
 
 ET = pytz.timezone("US/Eastern")
 
@@ -550,3 +552,239 @@ def test_explicit_zero_volume_snapshot_does_not_re_anchor_watermark():
 
     assert acc.last_volume_cum == 2422
     assert acc.bid_cum == 2422
+
+
+# ---------------------------------------------------------------------------
+# FLOW_CLASSIFIER=tick
+#
+# The tick test grades a trade against the PREVIOUS TRADE PRICE and reads no
+# quote, so the Market Value penny randomisation cannot reach it (F10/F11).
+# The classifier itself is already tested; what is new and untested is the
+# STATE THREADING -- carrying the prior trade and the inherited direction
+# across snapshots, and surviving a mid-session restart.
+# ---------------------------------------------------------------------------
+
+
+def _tick_engine(monkeypatch) -> IngestionEngine:
+    engine = IngestionEngine.__new__(IngestionEngine)
+    engine._option_flow_lock = threading.Lock()
+    monkeypatch.setattr(main_engine, "FLOW_CLASSIFIER", "tick")
+    return engine
+
+
+def _acc(**kw) -> "_FlowAccumulator":
+    base = dict(
+        session_date=date(2026, 10, 9),
+        last_volume_cum=0,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=0,
+    )
+    base.update(kw)
+    return _FlowAccumulator(**base)
+
+
+def test_quote_classifier_is_the_default():
+    """Production must not change behaviour because this flag exists."""
+    from src.config import FLOW_CLASSIFIER
+
+    assert FLOW_CLASSIFIER == "quote"
+
+
+def test_tick_uptick_is_ask_volume(monkeypatch):
+    engine = _tick_engine(monkeypatch)
+    bucket = ET.localize(datetime(2026, 10, 9, 10, 15))
+    acc = _acc(last_trade_price=5.57)
+
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        # Quote deliberately contradicts the tick: at 5.53/5.58 a 5.58 print
+        # is at the ask either way, so instead put the trade BELOW the mid
+        # where Lee-Ready would call it a sell. The uptick must win.
+        {"volume": 100, "last": 5.58, "bid": 9.00, "ask": 9.10, "mid": 9.05},
+        bucket,
+    )
+
+    assert (acc.ask_cum, acc.mid_cum, acc.bid_cum) == (100, 0, 0)
+    assert acc.tick_direction == 1
+    assert acc.last_trade_price == 5.58, "the prior trade must advance"
+
+
+def test_tick_downtick_is_bid_volume(monkeypatch):
+    engine = _tick_engine(monkeypatch)
+    bucket = ET.localize(datetime(2026, 10, 9, 10, 15))
+    acc = _acc(last_trade_price=5.58)
+
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 100, "last": 5.53, "bid": 0.01, "ask": 0.02, "mid": 0.015},
+        bucket,
+    )
+
+    assert (acc.ask_cum, acc.mid_cum, acc.bid_cum) == (0, 0, 100)
+    assert acc.tick_direction == -1
+
+
+def test_a_zero_tick_inherits_the_carried_direction(monkeypatch):
+    """The whole reason direction is state and not a local."""
+    engine = _tick_engine(monkeypatch)
+    bucket = ET.localize(datetime(2026, 10, 9, 10, 15))
+    acc = _acc(last_trade_price=5.50)
+
+    # Uptick establishes direction...
+    engine._ingest_snapshot_into_accumulator(
+        acc, {"volume": 100, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555}, bucket
+    )
+    assert acc.tick_direction == 1
+    # ...and a flat print at the same price inherits it rather than going mid.
+    engine._ingest_snapshot_into_accumulator(
+        acc, {"volume": 180, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555}, bucket
+    )
+
+    assert acc.ask_cum == 180, "80 more at the same price keep the up direction"
+    assert acc.mid_cum == 0
+    assert acc.tick_direction == 1
+
+
+def test_the_prior_trade_advances_even_when_no_volume_traded(monkeypatch):
+    """A hole in the tick sequence carries the wrong direction forward.
+
+    A contract whose cumulative volume did not move can still print a new
+    last between polls. If the accumulator only advanced on classified
+    snapshots, the NEXT trade would be graded against a stale price and the
+    direction would be wrong from there on.
+    """
+    engine = _tick_engine(monkeypatch)
+    bucket = ET.localize(datetime(2026, 10, 9, 10, 15))
+    acc = _acc(last_volume_cum=100, last_trade_price=5.50)
+
+    # No volume delta: nothing classifies, but the print is newer.
+    engine._ingest_snapshot_into_accumulator(
+        acc, {"volume": 100, "last": 5.60, "bid": 5.55, "ask": 5.60, "mid": 5.575}, bucket
+    )
+    assert (acc.ask_cum, acc.mid_cum, acc.bid_cum) == (0, 0, 0)
+    assert acc.last_trade_price == 5.60
+
+    # Now a trade at 5.55 -- a DOWNtick from 5.60. Graded against the stale
+    # 5.50 it would have read as an uptick and been credited to buyers.
+    engine._ingest_snapshot_into_accumulator(
+        acc, {"volume": 150, "last": 5.55, "bid": 5.50, "ask": 5.55, "mid": 5.525}, bucket
+    )
+    assert acc.bid_cum == 50
+    assert acc.ask_cum == 0
+
+
+def test_the_per_row_invariant_holds_on_the_tick_path(monkeypatch):
+    """ask + mid + bid == volume, which schema.sql:181 declares per row."""
+    engine = _tick_engine(monkeypatch)
+    bucket = ET.localize(datetime(2026, 10, 9, 10, 15))
+    acc = _acc(last_trade_price=5.00)
+
+    for cum, last in ((100, 5.10), (250, 5.10), (400, 4.90), (400, 4.90), (900, 5.30)):
+        engine._ingest_snapshot_into_accumulator(
+            acc, {"volume": cum, "last": last, "bid": 4.80, "ask": 4.85, "mid": 4.825}, bucket
+        )
+        assert (
+            acc.ask_cum + acc.mid_cum + acc.bid_cum == acc.last_volume_cum
+        ), f"invariant broken at cumulative={cum}"
+
+
+def test_a_cold_start_with_no_prior_trade_goes_to_mid(monkeypatch):
+    """Nothing to tick against is not a buy and not a sell."""
+    engine = _tick_engine(monkeypatch)
+    bucket = ET.localize(datetime(2026, 10, 9, 10, 15))
+    acc = _acc()
+
+    engine._ingest_snapshot_into_accumulator(
+        acc, {"volume": 100, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555}, bucket
+    )
+
+    assert (acc.ask_cum, acc.mid_cum, acc.bid_cum) == (0, 100, 0)
+    assert acc.last_trade_price == 5.58, "but the next trade has something to grade against"
+
+
+def test_hydration_restores_the_prior_trade_price(monkeypatch):
+    """A restart mid-session must resume against the right prior trade.
+
+    This is the ONLY reason last_trade_price is persisted rather than kept
+    in memory. Hydrate it as None and every contract's first trade after a
+    restart falls to mid_volume instead of being classified -- silently,
+    with no error and no log line, on every contract at once.
+    """
+    from unittest.mock import MagicMock
+
+    engine = IngestionEngine.__new__(IngestionEngine)
+    cursor = MagicMock()
+    # volume, ask_volume, mid_volume, bid_volume, bid, ask, mid, timestamp, last
+    cursor.fetchone.return_value = (
+        4200,
+        1500,
+        700,
+        2000,
+        5.53,
+        5.58,
+        5.555,
+        ET.localize(datetime(2026, 10, 9, 10, 14, 55)),
+        5.57,
+    )
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    ctx = MagicMock()
+    ctx.__enter__.return_value = conn
+    ctx.__exit__.return_value = False
+
+    with patch.object(main_engine, "db_connection", return_value=ctx):
+        acc = engine._hydrate_flow_accumulator("SPY   261009C00775000", date(2026, 10, 9))
+
+    assert acc.last_volume_cum == 4200
+    assert (acc.ask_cum, acc.mid_cum, acc.bid_cum) == (1500, 700, 2000)
+    assert acc.last_trade_price == 5.57, "the prior TRADE, not just the prior quote"
+    assert acc.last_bid == 5.53 and acc.last_ask == 5.58
+    # row[8] is a POSITIONAL read, so the SELECT's column list is the actual
+    # contract here and a mocked cursor cannot see it. Drop `last` from the
+    # query and the index silently reads the wrong column or raises into the
+    # except, which degrades to zeros with only a warning.
+    sql = cursor.execute.call_args[0][0]
+    assert "last" in sql, "the hydration query must actually select the trade price"
+
+
+def test_a_hydrated_accumulator_classifies_its_first_trade(monkeypatch):
+    """The restart case end to end: hydrate, then tick against what came back."""
+    from unittest.mock import MagicMock
+
+    engine = IngestionEngine.__new__(IngestionEngine)
+    engine._option_flow_lock = threading.Lock()
+    monkeypatch.setattr(main_engine, "FLOW_CLASSIFIER", "tick")
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        4200,
+        1500,
+        700,
+        2000,
+        5.53,
+        5.58,
+        5.555,
+        ET.localize(datetime(2026, 10, 9, 10, 14, 55)),
+        5.57,
+    )
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    ctx = MagicMock()
+    ctx.__enter__.return_value = conn
+    ctx.__exit__.return_value = False
+
+    with patch.object(main_engine, "db_connection", return_value=ctx):
+        acc = engine._hydrate_flow_accumulator("SPY   261009C00775000", date(2026, 10, 9))
+
+    # First print after the restart is 5.60 -- an UPTICK from the hydrated
+    # 5.57, so it is buyer-initiated. With last_trade_price lost it would
+    # have gone to mid.
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 4500, "last": 5.60, "bid": 5.55, "ask": 5.60, "mid": 5.575},
+        ET.localize(datetime(2026, 10, 9, 10, 15)),
+    )
+
+    assert acc.ask_cum == 1500 + 300, "300 new contracts credited to buyers"
+    assert acc.mid_cum == 700, "and none fell through to mid"

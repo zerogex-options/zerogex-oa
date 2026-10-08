@@ -762,12 +762,16 @@ afterwards and append the result here rather than holding the cutover for it.
 - **F4's Exhibit A gap** — accepted; correspondence is the record.
 - **Signal components whose gates the ingested chain cannot reach.** Two turned up by accident
   during this comparison, so all six basic signals, all six registered MSI components and the three
-  gamma delegates were swept deliberately for the same shape. Three found, one of them a regression
-  this migration introduces: signed
-  underlying volume goes NULL at cutover and takes four views with it (**blocks step 15**),
-  `skew_delta` has never produced a non-abstain reading on SPX or NDX, and `gex_gradient`'s wing
-  damper has never fired. See
+  gamma delegates were swept deliberately for the same shape. Three found. See
   [signal-component-inert-gate-sweep-2026-09.md](signal-component-inert-gate-sweep-2026-09.md).
+  - **S1, signed underlying volume** — **RESOLVED (`b391764` + follow-up); this entry said
+    "blocks step 15" and was stale as of 2026-10-08.** Total underlying volume survives cutover;
+    what is lost is the uptick/downtick SPLIT alone (`buy_pct`, `period_buy_pct`,
+    `uptick_vol_pct`, `tick_bias`), which now return NULL behind a "No Tick Data" label instead
+    of the fabricated `50` / neutral they used to. That is an improvement on the prior
+    behaviour, accepted and documented. **Cutover is not blocked by this.**
+  - `skew_delta` has never produced a non-abstain reading on SPX or NDX — open.
+  - `gex_gradient`'s wing damper has never fired — open.
 
 ---
 

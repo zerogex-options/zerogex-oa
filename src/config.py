@@ -1033,6 +1033,29 @@ OPTION_BUCKET_WRITE_MIN_SECONDS = _getenv_float("OPTION_BUCKET_WRITE_MIN_SECONDS
 # fills (e.g. a print at 5.57 with bid 5.53 / ask 5.58) land in mid_volume
 # rather than being credited as full ask volume.
 FLOW_CLASSIFY_MID_BAND_PCT = _getenv_float("FLOW_CLASSIFY_MID_BAND_PCT", 0.70)
+# Which classifier decides buyer- from seller-initiated: "quote" (Lee-Ready
+# against the prevailing NBBO, what production has always run) or "tick"
+# (against the PREVIOUS TRADE PRICE, reading no quote at all).
+#
+# Defaults to "quote". Production behaviour does not change unless this is
+# set explicitly, which is the point: it exists so a shadow run can write
+# the tick figures into a rehearsal database while production keeps
+# publishing the quote figures, and the two can be diffed at the bucket
+# level the site actually serves.
+#
+# WHY THE CHOICE IS LIVE. ThetaData's engineering stated 2026-10-07 that a
+# buy/sell classification should not run against the Market Value quote at
+# all -- its midpoint shift on a one-cent spread is by design -- and our own
+# measurement agreed (F10, F11). The raw NBBO that would preserve today's
+# number is non-display use under OPRA and fee-bearing (F9). So the tick
+# test is the route, and the open question is no longer whether the FEED
+# changes the answer (F11: cross-feed 4.22% against a 5.60% noise floor)
+# but how much the METHOD does at the published aggregation. Measured on
+# snapshots it relabels 47.6% of contracts and flips the net sign 16 of 27
+# times; whether that survives one-minute bucketing is what this flag is
+# for. See docs/compliance/market-data-feed-comparison-findings-2026-09.md.
+FLOW_CLASSIFIER = (_getenv_str("FLOW_CLASSIFIER", "quote") or "quote").strip().lower()
+
 # Route the opening-auction bucket (09:30 ET) to mid_volume instead of running
 # Lee-Ready against post-open quotes that don't reflect the auction cross.
 FLOW_CLASSIFY_SKIP_OPEN_AUCTION = _getenv_bool("FLOW_CLASSIFY_SKIP_OPEN_AUCTION", True)
