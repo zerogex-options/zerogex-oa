@@ -19,7 +19,7 @@ import re
 from typing import Annotated, Dict, List, Optional, Literal
 import pytz
 
-from .database import DatabaseManager
+from .database import FLOW_BY_CONTRACT_1MIN_MAX_MINUTES, DatabaseManager
 from .delayed_read import MAX_DELAY_MINUTES, delayed_ceiling
 from .errors import handle_api_errors
 from .futures_middleware import FuturesProjectionMiddleware
@@ -1074,24 +1074,52 @@ async def get_flow_by_contract(
         ge=1,
         le=390,
         description=(
-            "Number of trailing 5-minute buckets to return. Defaults to the "
-            "entire session (09:30–16:15 ET, ~81 buckets). Capped at 390 "
-            "(one trading day at 1-minute resolution) to bound DB load."
+            "Number of trailing buckets to return. With 5-minute buckets it "
+            "defaults to the entire session (09:30–16:15 ET, ~81 buckets) and "
+            "is capped at 390 to bound DB load. With timeframe=1min it defaults "
+            f"to {FLOW_BY_CONTRACT_1MIN_MAX_MINUTES} and is capped there."
+        ),
+    ),
+    timeframe: Literal["5min", "1min"] = Query(
+        default="5min",
+        description=(
+            "Bucket size: '5min' (default) or '1min'. Both carry the same "
+            "session-cumulative values, so a contract's 10:04 one-minute row "
+            "reads the same totals as its 10:00 five-minute row."
         ),
     ),
 ):
-    """Per-contract option flow in 5-min buckets with session-cumulative values.
+    """Per-contract option flow in 5-min buckets, or 1-min buckets with
+    ``timeframe=1min``, with session-cumulative values.
 
-    Returns one row per (option_type, strike, expiration) per 5-min bucket.
+    Returns one row per (option_type, strike, expiration) per bucket.
     raw_volume, raw_premium, net_volume and net_premium are day-to-date
     cumulative for each contract as of the end of its bucket; counters reset
     at 09:30 ET (TradeStation RTH open).
 
     session=current returns today's open session (or most recent if closed);
     session=prior returns the previous full session. Pass intervals=N to
-    limit the response to the most recent N 5-minute buckets.
+    limit the response to the most recent N buckets.
+
+    One-minute requests cover a short trailing window (see ``intervals``).
+    Every contract that has traded appears in every later bucket, so rows grow
+    as contracts x buckets, and a full session at one minute would be five
+    times the five-minute response. To follow a session at one minute, poll a
+    few trailing minutes and keep the rows.
     """
-    data = await _db().get_flow(symbol, session, intervals=intervals)
+    if (
+        timeframe == "1min"
+        and intervals is not None
+        and intervals > FLOW_BY_CONTRACT_1MIN_MAX_MINUTES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"intervals must be at most {FLOW_BY_CONTRACT_1MIN_MAX_MINUTES} "
+                "with timeframe=1min"
+            ),
+        )
+    data = await _db().get_flow(symbol, session, intervals=intervals, timeframe=timeframe)
     return [FlowPoint(**row) for row in data]
 
 

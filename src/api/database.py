@@ -374,6 +374,111 @@ def _get_flow_session_bounds(session: str = "current") -> tuple:
     return start, end
 
 
+# One-minute /api/flow/by-contract requests cover the trailing 30 minutes at
+# most. Every contract that has traded appears in every later bucket, so rows
+# grow as contracts x buckets, and a busy symbol's full session at one minute
+# would run to hundreds of thousands of rows. On a synthetic 854-contract
+# session (SPY's production size), 30 minutes is 26k rows and costs the database
+# about what the full 5-minute session already does, the largest response this
+# endpoint serves; a full hour cost three times that.
+FLOW_BY_CONTRACT_1MIN_MAX_MINUTES = 30
+
+# /api/flow/by-contract at ``timeframe=1min``. flow_by_contract only exists at
+# five minutes, so these rows are built from flow_contract_facts the way
+# AnalyticsEngine._refresh_flow_caches builds a five-minute row: per contract,
+# SUM over the facts from the 09:30 ET open to the end of the bucket, contracts
+# with no volume yet omitted. A contract's 10:04 row is therefore its 10:00
+# five-minute row.
+#
+# Summing from the open for every minute would rescan the session once per
+# row. Instead the facts before the window are summed once per contract
+# (``opening``), the window's own facts once per minute (``in_window``), and a
+# running SUM over a minutes x contracts grid adds them up. The grid is what
+# keeps a contract in every minute after its first trade, carrying its totals
+# through the quiet ones, as the five-minute table does.
+#
+# $1 symbol, $2 session open, $3 first minute returned, $4 last minute returned.
+_FLOW_BY_CONTRACT_1MIN_SQL = """
+    WITH opening AS (
+        SELECT
+            option_type,
+            strike,
+            expiration,
+            SUM(volume_delta) AS raw_volume,
+            SUM(premium_delta) AS raw_premium,
+            SUM(buy_volume - sell_volume) AS net_volume,
+            SUM(buy_premium - sell_premium) AS net_premium,
+            MAX(underlying_price) AS underlying_price
+        FROM flow_contract_facts
+        WHERE symbol = $1
+          AND timestamp >= $2::timestamptz
+          AND timestamp < $3::timestamptz
+        GROUP BY option_type, strike, expiration
+    ),
+    in_window AS (
+        SELECT
+            date_trunc('minute', timestamp) AS minute,
+            option_type,
+            strike,
+            expiration,
+            SUM(volume_delta) AS raw_volume,
+            SUM(premium_delta) AS raw_premium,
+            SUM(buy_volume - sell_volume) AS net_volume,
+            SUM(buy_premium - sell_premium) AS net_premium,
+            MAX(underlying_price) AS underlying_price
+        FROM flow_contract_facts
+        WHERE symbol = $1
+          AND timestamp >= $3::timestamptz
+          AND timestamp < $4::timestamptz + INTERVAL '1 minute'
+        GROUP BY date_trunc('minute', timestamp), option_type, strike, expiration
+    ),
+    contracts AS (
+        SELECT option_type, strike, expiration FROM opening
+        UNION
+        SELECT option_type, strike, expiration FROM in_window
+    ),
+    running AS (
+        SELECT
+            m.minute,
+            c.option_type,
+            c.strike,
+            c.expiration,
+            COALESCE(o.raw_volume, 0) + SUM(COALESCE(w.raw_volume, 0)) OVER bars AS raw_volume,
+            COALESCE(o.raw_premium, 0) + SUM(COALESCE(w.raw_premium, 0)) OVER bars AS raw_premium,
+            COALESCE(o.net_volume, 0) + SUM(COALESCE(w.net_volume, 0)) OVER bars AS net_volume,
+            COALESCE(o.net_premium, 0) + SUM(COALESCE(w.net_premium, 0)) OVER bars AS net_premium,
+            GREATEST(o.underlying_price, MAX(w.underlying_price) OVER bars) AS underlying_price
+        FROM generate_series($3::timestamptz, $4::timestamptz, INTERVAL '1 minute') AS m(minute)
+        CROSS JOIN contracts c
+        LEFT JOIN in_window w
+          ON w.minute = m.minute
+         AND w.option_type = c.option_type
+         AND w.strike = c.strike
+         AND w.expiration = c.expiration
+        LEFT JOIN opening o
+          ON o.option_type = c.option_type
+         AND o.strike = c.strike
+         AND o.expiration = c.expiration
+        WINDOW bars AS (PARTITION BY c.option_type, c.strike, c.expiration ORDER BY m.minute)
+    )
+    SELECT
+        minute AS timestamp,
+        $1::text AS symbol,
+        option_type,
+        strike,
+        expiration,
+        (expiration - CURRENT_DATE)::int AS dte,
+        raw_volume::bigint AS raw_volume,
+        raw_premium::numeric AS raw_premium,
+        net_volume::bigint AS net_volume,
+        net_premium::numeric AS net_premium,
+        underlying_price::numeric AS underlying_price
+    FROM running
+    WHERE raw_volume > 0
+    ORDER BY timestamp DESC, option_type, strike, expiration
+"""
+
+
 # SQL fragment allowlists live in `_sql_helpers` so that both
 # DatabaseManager and the query mixins it composes can import them
 # without a circular import.
@@ -5596,16 +5701,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol: str = "SPY",
         session: str = "current",
         intervals: Optional[int] = None,
+        timeframe: str = "5min",
     ) -> List[Dict[str, Any]]:
         """Get unified option flow keyed by (type, strike, expiration) in 5-min buckets.
 
-        Reads from the flow_by_contract rollup populated by the analytics
-        engine and decorates each row with running cumulative totals plus a
-        per (strike, expiration) running put/call ratio. When *intervals* is
-        set, the query window is narrowed to the most recent N 5-minute
-        buckets within the session; cumulative totals are then partial sums
-        from the start of that window rather than session opens.
+        Reads the flow_by_contract rollup populated by the analytics engine.
+        Each row is day-to-date cumulative for its contract as of the end of
+        its bucket. When *intervals* is set, the query window is narrowed to
+        the most recent N 5-minute buckets within the session; the values
+        stay cumulative from the session open.
+
+        ``timeframe="1min"`` returns the same rows on a 1-minute grid instead;
+        see :meth:`_get_flow_1min`.
         """
+        if timeframe == "1min":
+            return await self._get_flow_1min(symbol, session, intervals)
         symbol = symbol.upper()
         intervals_key = intervals if intervals and intervals > 0 else "all"
         cache_key = f"flow:{symbol}:{session}:{intervals_key}"
@@ -5677,6 +5787,71 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow query timed out for {symbol}, returning empty")
+            return []
+
+    async def _get_flow_1min(
+        self,
+        symbol: str,
+        session: str,
+        intervals: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        """One-minute rows for ``get_flow(timeframe="1min")``.
+
+        Same session window, columns, ordering and day-to-date values as the
+        5-minute rows, built by ``_FLOW_BY_CONTRACT_1MIN_SQL`` from
+        flow_contract_facts because there is no 1-minute rollup to read. The
+        window is the trailing FLOW_BY_CONTRACT_1MIN_MAX_MINUTES minutes by
+        default and at most: the endpoint rejects a larger *intervals*, and a
+        direct caller is clamped.
+        """
+        symbol = symbol.upper()
+        minutes = min(
+            intervals if intervals and intervals > 0 else FLOW_BY_CONTRACT_1MIN_MAX_MINUTES,
+            FLOW_BY_CONTRACT_1MIN_MAX_MINUTES,
+        )
+        cache_key = f"flow_1min:{symbol}:{session}:{minutes}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        session_start, session_end = _get_flow_session_bounds(session)
+        # As with the 5-minute buckets, the newest minute is the one strictly
+        # before session_end, so a close at exactly 16:15:00 ends on 16:14.
+        end_epoch = int((session_end.timestamp() - 1e-6) // 60) * 60
+        open_epoch = int(session_start.timestamp() // 60) * 60
+        start_epoch = max(open_epoch, end_epoch - (minutes - 1) * 60)
+        if end_epoch < start_epoch:
+            self._cache_set(cache_key, [], self._flow_endpoint_cache_ttl_seconds)
+            return []
+
+        try:
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                async with conn.transaction():
+                    # The planner cannot know how few contracts the CTEs hold,
+                    # so it costs the minutes x contracts grid many times too
+                    # high and JIT-compiles the query. On a busy symbol's
+                    # 30-minute window (PostgreSQL 16) that took 1.6 s against
+                    # 0.3 s without it; short windows stay under the JIT
+                    # threshold either way.
+                    await conn.execute("SET LOCAL jit = off")
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            _FLOW_BY_CONTRACT_1MIN_SQL,
+                            symbol,
+                            datetime.fromtimestamp(open_epoch, tz=timezone.utc),
+                            datetime.fromtimestamp(start_epoch, tz=timezone.utc),
+                            datetime.fromtimestamp(end_epoch, tz=timezone.utc),
+                            timeout=15.0,
+                        ),
+                        timeout=15.0,
+                    )
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"1-minute flow query timed out for {symbol}, returning empty")
             return []
 
     async def _market_tide_anchor(self, conn) -> Optional[datetime]:

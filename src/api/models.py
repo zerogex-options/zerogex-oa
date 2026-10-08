@@ -410,11 +410,11 @@ class FlowMapBucketResponse(BaseModel):
 
 
 class FlowPoint(BaseModel):
-    """Per-contract 5-min-bucketed flow row with session-cumulative values.
+    """Per-contract flow row, 5-min or 1-min bucketed, with session-cumulative values.
 
-    One row per (option_type, strike, expiration) per 5-min bucket. Values
-    are day-to-date cumulative for THIS contract as of the end of the
-    bucket, with the session resetting at 09:30 ET (TradeStation RTH open).
+    One row per (option_type, strike, expiration) per bucket. Values are
+    day-to-date cumulative for THIS contract as of the end of the bucket,
+    with the session resetting at 09:30 ET (TradeStation RTH open).
 
     raw_volume / raw_premium: total session volume and flow-weighted premium
     regardless of buy/sell direction.

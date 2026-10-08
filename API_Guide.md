@@ -753,12 +753,15 @@ Get GEX heatmap matrix (strike × time).
 Scope: `flow` (the `analytics` tier).
 
 ### GET /api/flow/by-contract
-Per-contract option flow in 5-minute buckets with session-cumulative values.
+Per-contract option flow in 5-minute buckets, or 1-minute buckets with `timeframe=1min`, with session-cumulative values.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `session` (optional): `current` | `prior`, default `current`
-- `intervals` (optional): trailing N 5-minute buckets, `1`–`390`; omit for the full session
+- `timeframe` (optional): `5min` | `1min`, default `5min`
+- `intervals` (optional): trailing N buckets of the chosen timeframe. `5min`: `1`–`390`, omit for the full session. `1min`: `1`–`30`, default `30`
+
+Both timeframes carry the same session-cumulative values, so a contract's 10:04 one-minute row reads the same totals as its 10:00 five-minute row. Every contract that has traded appears in every later bucket, so rows grow with contracts × buckets: one minute of a busy symbol is several hundred rows. That is why one-minute requests cover the trailing 30 minutes at most. To follow a session at one minute, poll each symbol once a minute with a few trailing minutes (`intervals=5` also picks up late revisions to the newest minutes) and keep the rows.
 
 ### GET /api/flow/series
 Server-accumulated flow series — one row per 5-minute bar, or per 1-minute bar with `timeframe=1min` (cumulative call/put premium, volume, position, net volume, put/call ratio). Rows are newest→oldest.
