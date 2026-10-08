@@ -198,8 +198,15 @@ def test_a_capping_agree_always_carries_fragile():
     """Not a bug, and pinned so nobody "fixes" it into one.
 
     Fragile's second arm is exactly the structural pair Agree's capping side
-    requires, so the two are never independent on that side. A book coherently
-    saying "this will not be contained" is both agreed and fragile.
+    requires, so the two are never independent on that side. This was put to
+    Barrie as a question once it surfaced, and he chose to keep it:
+
+        "I don't see agree and fragile together on the capping side as a
+        conflict. Agree is saying the book is coherent and Fragile is saying
+        that coherent structure is not the stable/pinning kind, so the level
+        may not behave reliably. That's useful to see together."
+
+    Decoupling them would need a new conversation with him, not a refactor.
     """
     bar = _capping()
 

@@ -133,10 +133,17 @@ def fragile(weather: gw.Weather) -> bool:
 
     Note the overlap, which is a property of the rules rather than a bug: the
     second arm is exactly the structural pair Agree's capping side requires, so
-    a capping Agree always carries Fragile with it. That reads correctly -- a
-    book coherently saying "this will not be contained" is both agreed and
-    fragile -- but it does mean those two lights are never independent on that
-    side.
+    a capping Agree always carries Fragile with it. Raised with Barrie once it
+    showed up, and kept deliberately. His reasoning, which is better than the
+    one this docstring used to carry:
+
+        "I don't see agree and fragile together on the capping side as a
+        conflict. Agree is saying the book is coherent and Fragile is saying
+        that coherent structure is not the stable/pinning kind, so the level
+        may not behave reliably. That's useful to see together."
+
+    So the two lights are never independent on that side, and that is the
+    intended reading rather than something to decouple.
     """
     if weather.cushion_band in CLOSE_BANDS and weather.cushion in (
         gw.CUSHION_NARROWING,
