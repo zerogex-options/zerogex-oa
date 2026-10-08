@@ -19,10 +19,15 @@ a mean exceeding the signal's own magnitude. The real cause is the penny randomi
 which is the product and not a defect. ThetaData's engineering now states that classification
 should not run against the Market Value quote at all. **The quote test is finished, not pending.**
 
-**Status:** step 14's evidence bar is **met for chain metrics and failed for flow**. Cutover is
-deferred with no date. The remaining question is no longer about the feed but about the METHOD:
-pay for raw NBBO, or adopt the tick test and publish a changed flow figure. See F10. The *calendar* bar was never met either — see "Where this falls
-short"; that gap is deliberate and recorded, not overlooked.
+**Status, 2026-10-08: the method question is DECIDED and the flow bar is MET, by the tick
+test.** Measured against a noise floor for the first time (F11), the tick test's cross-feed
+disagreement came in *below* the floor — 4.22% mean against a 5.60% floor — and both of its
+net sign flips landed in samples where the incumbent flipped against ITSELF, leaving nothing
+attributable to the candidate. The quote test exceeded its floor in 28 of 28. Raw NBBO is not
+needed and **no OPRA non-display fee is incurred**. What remains is engineering, not evidence:
+wire the tick test into the production write path, and decide how the changed flow figure is
+explained to subscribers. The *calendar* bar was never met — see "Where this falls short";
+that gap is deliberate and recorded, not overlooked.
 
 **Amended 2026-09-29.** Everything above the F9 section was written 2026-09-22 and stands as
 written; the verdict below was always a verdict on the chain metrics, which is all the harness
@@ -561,6 +566,84 @@ cannot serve.
 
 ---
 
+## F11 — the tick test clears its noise floor; the quote test does not
+
+*Added 2026-10-08. This is the finding that decided the method, and with it the cutover.*
+
+### Why a floor was needed at all
+
+Every flow number before this one was reported without knowing what the measurement's own noise
+was. The chain table has carried a self-variance column since it was written, and the line it
+prints — *"the incumbent moved further from ITSELF between samples than the two feeds ever
+differed"* — is the only reason those numbers are believable. Flow had no such column, and on
+2026-10-07 that gap stopped the decision: the tick test's 5.89% cross-feed disagreement and 5-of-29
+sign reversals could not be separated from the 0.3–0.8s gap between the two polls, because the tick
+test reads each feed's OWN trade sequence and a print landing between polls flips a direction that
+then carries forward.
+
+`--self-control` takes a third snapshot, of the incumbent again, and runs both comparators over the
+two incumbent samples. It is sampled THIRD, so the cross-feed pair keeps the short gap every prior
+run was measured at and the floor inherits the longer one — a handicap that overstates the floor,
+which is the direction that cannot manufacture a finding.
+
+### What was measured
+
+28 paired samples, SPY, 2026-10-08 10:02–10:32 ET, 240 contracts per sample, three nearest
+expirations, strikes within 3% of spot. Cross-feed gap 0.28–0.74s; self gap 2.73–3.39s.
+
+| | tick test | quote test |
+|---|---|---|
+| noise floor (incumbent vs itself), mean | **5.60%** | 8.18% |
+| cross-feed disagreement, mean | **4.22%** | **39.73%** |
+| samples where cross EXCEEDED the floor | **3 of 27** | **28 of 28** |
+| largest excess over the floor | **+0.82 pp** | +40.71 pp |
+| cross-feed NET sign flips | 2 of 27 | 14 of 28 |
+| …of those, flips the floor ALSO flipped on | **2** | 7 |
+| …leaving, attributable to the candidate | **0** | 7 |
+
+**The tick test's cross-feed disagreement is smaller than the floor beneath it.** The harness
+cannot distinguish TradeStation from ThetaData under the tick test because it cannot reliably
+distinguish TradeStation from itself. The three samples that exceeded the floor did so by at most
+0.82 percentage points. Both cross-feed sign flips occurred in samples where the incumbent flipped
+against itself in the same sample, leaving **nothing** that could be the candidate.
+
+**The quote test exceeded its floor in every sample**, by roughly five times. Independently:
+the candidate's net imbalance was higher than the incumbent's in **26 of 28**, and **positive in
+all 28** while the incumbent's swung both ways. That is the same one-directional bias measured on
+2026-10-07 (26 of 30, mean +1,223,415), and it agrees with ThetaData engineering's own statement
+in F10 that classification should not run against the Market Value quote.
+
+### Decision
+
+**Adopt the tick test.** It needs no quote, so the Market Value randomisation cannot reach it;
+it needs no raw NBBO, so **no OPRA non-display fee is incurred** (F9); and it is now the only
+classification method on record that has been measured against its own noise and passed.
+
+The published flow figure will change. That is a product decision, not an evidence gap: switching
+method on the SAME feed relabels 30–66% of contracts per sample. It has to be a deliberate,
+explained change rather than a side effect of a cutover.
+
+### A separate finding about our own metric, not the vendor's
+
+The quote test's net imbalance flipped sign against the **same feed, same trades**, in 12 of 28
+samples — the only variable being a quote 2.8s older. A single snapshot's net imbalance is a
+knife-edge quantity. The production figure aggregates differently and this does not transfer to it
+directly, but it should be understood before any weight is put on a one-sample reading, and it is
+the reason the quote test's 14 cross-feed flips are only half a finding on their own. The 28-of-28
+floor exceedance and the 28-of-28 positive bias are what settle that question.
+
+### Methodology note
+
+The per-sample figures above were extracted with a throwaway script that first collected cross-feed
+rows and self rows into two parallel lists. **That was wrong and briefly produced a false result**
+("0 of 2 overlap"): the first sample of a run emits a self row but no cross row, so the lists were
+off by one and every pair compared one sample's result against another sample's floor. The
+corrected version splits the output on the sample header and pairs rows only within a block.
+Anything comparing a measurement to its control must pair them inside the sample, never by position
+across two collections.
+
+---
+
 ## Findings that turned out not to be about the feed
 
 Recorded because each cost investigation time and each looked like a vendor problem first.
@@ -663,9 +746,14 @@ afterwards and append the result here rather than holding the cutover for it.
 - **F9's midpoint question** — **ANSWERED 2026-10-07, against us.** See F10: the fix bounds
   crossing only, not the midpoint shift, and the vendor's own engineering says classification
   should not run against the Market Value quote at all.
-- **F9's account classification** — **CLOSED 2026-10-07.** Vendor corrected the record to
-  non-professional and commercial. Not observable from our side by design; their written
-  statement is the evidence. The probe added to chase it has been removed.
+- **F9's account classification** — **CLOSED 2026-10-08, and VERIFIED from our side.** The
+  vendor said on 2026-10-07 that the flags come back through no data response and the client
+  cannot surface them. That is **not correct**: the `thetadata` library logs the entire auth
+  response at INFO on every login, flags included. The 10:02:28 ET login on 2026-10-08 printed
+  `"isProfessional": false, "isRetail": false` — non-professional and commercial, exactly the
+  record they said they had set. Their correction is confirmed by their own client. To re-check,
+  grep any run's output for `isProfessional`; no tooling is needed and none should be added
+  (the removed probe failed because the fields are not client ATTRIBUTES, only log content).
 - **VIX / VXN CGIF coverage** — resolved 2026-09-28 for the operational question, not the
   contractual one. A pre-open probe returned a live VIX at 08:44:46 ET agreeing with the incumbent
   to within a penny while VIX was moving, so extended hours are served and no per-feed override is
