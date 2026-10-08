@@ -75,6 +75,30 @@ produce a tidy equity curve. It just will not be about the GOAT.
 To export the trade list: right-click the results grid → Export → CSV. That
 file is what the level join consumes.
 
+## Running it on a live chart
+
+It was written for Strategy Analyzer, and live order handling has failure
+modes a backtest cannot show. Jim's first live session (2026-10-08, sim
+account) found one. When the first bar after entry ran straight against the
+trade, the tick that closed that bar was also lot 1's stop price. The stop and
+lot 1's market exit both filled, so one contract too many traded, leaving
+an unprotected position on the wrong side that looked like a backwards entry.
+`ExitTarget1` now leaves lot 1 to its stop when price is that close to it, and
+`OnPositionUpdate` closes any wrong-side position as a backstop. The compile
+check cannot verify either; only a live sim session can.
+
+Rules that keep live runs readable:
+
+- **One copy at a time.** Control Center → Strategies tab lists every running
+  instance, including ones on other charts. A copy he thought was off kept
+  trading from another chart.
+- **No manual trading on the same instrument and account while it is on.**
+  NinjaTrader plots the account's executions on every chart of that
+  instrument, so its trades appear on his manual chart. And closing its
+  position by hand leaves the strategy still believing it holds one.
+- **To get out of a trade, untick Enabled first,** then flatten from the
+  SuperDOM.
+
 ## Optimizing
 
 Strategy Analyzer's Optimize mode sweeps any parameter with a range. Everything

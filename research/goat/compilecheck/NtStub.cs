@@ -23,6 +23,14 @@ namespace NinjaTrader.Cbi
 {
     public enum MarketPosition { Flat, Long, Short }
     public enum OrderFillResolution { Standard, High }
+    public enum LogLevel { Information, Warning, Error, Alert }
+
+    public class Position
+    {
+        public MarketPosition MarketPosition { get; set; }
+        public double AveragePrice { get; set; }
+        public int Quantity { get; set; }
+    }
 }
 
 namespace NinjaTrader.Data
@@ -91,12 +99,6 @@ namespace NinjaTrader.NinjaScript
     public class TEMA : IndicatorBase { }
     public class StdDev : IndicatorBase { }
 
-    public class PositionInfo
-    {
-        public MarketPosition MarketPosition { get; set; }
-        public double AveragePrice { get; set; }
-    }
-
     public abstract class NinjaScriptBase
     {
         protected State State;
@@ -116,6 +118,10 @@ namespace NinjaTrader.NinjaScript
 
         protected virtual void OnStateChange() { }
         protected virtual void OnBarUpdate() { }
+
+        protected void Log(string message, LogLevel logLevel) { }
+        protected double GetCurrentBid() { return 0.0; }
+        protected double GetCurrentAsk() { return 0.0; }
 
         protected MIN MIN(ISeries<double> input, int period) { return new MIN(); }
         protected MAX MAX(ISeries<double> input, int period) { return new MAX(); }
@@ -157,10 +163,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         public StopTargetHandling StopTargetHandling { get; set; }
         public bool IsInstantiatedOnEachOptimizationIteration { get; set; }
 
-        public PositionInfo Position { get; protected set; }
+        public Position Position { get; protected set; }
+
+        protected virtual void OnPositionUpdate(Position position, double averagePrice,
+            int quantity, MarketPosition marketPosition) { }
 
         protected void EnterLong(int quantity, string signalName) { }
         protected void EnterShort(int quantity, string signalName) { }
+        protected void ExitLong(string signalName) { }
+        protected void ExitShort(string signalName) { }
         protected void ExitLong(int quantity, string signalName, string fromEntrySignal) { }
         protected void ExitShort(int quantity, string signalName, string fromEntrySignal) { }
 
