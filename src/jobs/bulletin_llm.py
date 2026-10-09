@@ -1121,9 +1121,7 @@ List a problem for each of these you find:
 5. On the close post, the top-level levels are the next session's map (the
    day's 0DTE options expired at the bell and the chain re-priced).  A
    sentence that has today's tape reacting to a level that appears only
-   there, and not in level_history, is a problem.  So is prose that explains
-   the 0DTE options expiring or rolling off, or the chain re-pricing after
-   the bell: the levels heading already says it, and it happens every day.
+   there, and not in level_history, is a problem.
 6. Headlines ignored: when the headlines include real market, economic, rate
    or company news, the post should use at least one of them.
 7. Writing that gives it away as generated or careless: British spellings;
@@ -1138,7 +1136,10 @@ List a problem for each of these you find:
 
 Don't flag correct statements you would phrase differently, wording
 preferences, the header line, or the key levels lists and their headings
-(those are checked separately), or numbers that match the inputs.
+(those are checked separately), or numbers that match the inputs.  The close
+post's levels heading, "With today's 0DTE rolling off, here is the map for
+tomorrow:" (or for the next trading day), is written that way on purpose:
+never flag it.
 
 The image ("image_problems"): it should be a fully rendered ZeroGEX Live
 Bulletin card for the featured symbol.  Flag a blank, cut-off or error page,

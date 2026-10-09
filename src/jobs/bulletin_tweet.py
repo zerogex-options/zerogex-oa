@@ -1189,9 +1189,61 @@ def _review(
         return result
     if not review.ran:
         result.blocking.append(f"The fact-check couldn't run ({review.error}).")
-    result.fixable += review.problems
+    for problem in review.problems:
+        if _quotes_only_caller_text(problem, tweet):
+            logger.info(
+                "bulletin_tweet[%s]: set aside a fact-check finding about text the "
+                "job writes, not the writer: %s",
+                mode,
+                problem,
+            )
+            continue
+        result.fixable.append(problem)
     result.blocking += [f"Image: {p}" for p in review.image_problems]
     return result
+
+
+_QUOTED_RE = re.compile(r'"([^"]+)"|“([^”]+)”')
+
+
+def _squash(text: str) -> str:
+    """Whitespace collapsed, so a quote matches across the post's line breaks."""
+    return " ".join(text.split())
+
+
+def _caller_text(tweet: TweetBody) -> str:
+    """The post with the writer's prose cut out: the lines Python wrote (the
+    header, the key-levels lists and their headings, the "Bottom line:"
+    label).  Empty when there's no writer draft to tell the two apart."""
+    post = tweet.llm_post
+    if post is None:
+        return ""
+    text = tweet.text or ""
+    bottom = _BOTTOM_LINE_LABEL_RE.sub("", post.bottom_line or "")
+    for fragment in (post.opening, bottom):
+        fragment = (fragment or "").strip()
+        if fragment:
+            text = text.replace(fragment, "\n")
+    return text
+
+
+def _quotes_only_caller_text(problem: str, tweet: TweetBody) -> bool:
+    """Whether a fact-check finding is only about text Python wrote.
+
+    The writer can't change the header or the levels lists, so a finding
+    about them can't be fixed by a rewrite and would hold the post every
+    time; those lines are checked by :func:`_text_problems` instead.  The
+    finding counts as that only when every passage it quotes is in those
+    lines and nowhere in the writer's prose or reply.  A finding that quotes
+    nothing, or anything the writer wrote, stands."""
+    quotes = [_squash(a or b).strip(" .,:;") for a, b in _QUOTED_RE.findall(problem)]
+    quotes = [q for q in quotes if q]
+    caller = _squash(_caller_text(tweet))
+    if not quotes or not caller:
+        return False
+    post = tweet.llm_post
+    writer = _squash(" ".join([post.opening, post.bottom_line, post.reply]))
+    return all(q in caller and q not in writer for q in quotes)
 
 
 def _write_and_review(

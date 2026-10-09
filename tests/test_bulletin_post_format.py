@@ -127,9 +127,13 @@ def test_the_prompts_carry_the_house_style():
     for prompt in (bulletin_llm.SYSTEM_PROMPT, bulletin_llm.REVIEW_SYSTEM_PROMPT):
         assert "midday" not in prompt.lower()
         assert "$6B" in prompt and "0.4%" in prompt and "~747" in prompt
-    # The writer is told not to explain the roll-off, and the reviewer holds it to that.
+    # The writer is told not to explain the roll-off.  The fact-check isn't
+    # asked to police it: on 2026-10-09 it flagged the levels heading itself,
+    # which the writer can't change, and held the close post.  It's told to
+    # leave that heading alone instead.
     assert "Don't explain that the day's 0DTE options expired" in bulletin_llm.SYSTEM_PROMPT
-    assert "explains\n   the 0DTE options expiring" in bulletin_llm.REVIEW_SYSTEM_PROMPT
+    assert "rolling off" not in bulletin_llm.REVIEW_SYSTEM_PROMPT.split("Don't flag")[0]
+    assert "never flag it" in bulletin_llm.REVIEW_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -465,3 +469,86 @@ def test_the_status_report_says_what_is_on(monkeypatch):
     assert report[0].startswith("Morning Read: ON")
     assert report[1].startswith("Post-Market Read: off")
     assert "MISSING" in report[2] and "X_BOT_ACCESS_TOKEN_SECRET" in report[2]
+
+
+# ---------------------------------------------------------------------------
+# A fact-check finding about text the job writes can't hold the post
+# ---------------------------------------------------------------------------
+
+# What the fact-check said about the 2026-10-09 close post, after the rewrite.
+HEADING_FINDING = (
+    '"With today\'s 0DTE rolling off, here is the map for Monday" - explaining the 0DTE '
+    "expiry/roll-off is redundant boilerplate the levels heading already covers."
+)
+
+
+def _close_post(mod, monkeypatch, opening="SPY opened near 776, dipped to 775 and held."):
+    from src.jobs import bulletin_llm
+
+    post = bulletin_llm.LlmPost(
+        opening=opening,
+        bottom_line="Bottom line: a grind inside 775 to 780 until one side gives.",
+        reply="Watch the first test of 775.",
+    )
+    monkeypatch.setattr(mod, "_try_llm_post", lambda *a, **k: post)
+    spy = _spy(mod, gamma_flip=772.07, call_wall=780.0, put_wall=775.0)
+    tweet = mod.build_tweet_body("close", date(2026, 10, 9), [spy], lead_symbol="SPY")
+    return tweet, spy
+
+
+def test_a_finding_that_quotes_the_levels_heading_is_set_aside(monkeypatch):
+    mod = _reload_module()
+    tweet, _ = _close_post(mod, monkeypatch)
+    assert mod._quotes_only_caller_text(HEADING_FINDING, tweet)
+    assert mod._quotes_only_caller_text('"Post-Market Read - $SPY" is a bare header.', tweet)
+    # A levels-list line is the job's too; the job checks those numbers itself.
+    assert mod._quotes_only_caller_text('"• 775 put wall" repeats the prose.', tweet)
+    # "775" is in the list AND in the prose, so it may be about the prose.
+    assert mod._quotes_only_caller_text('"775" is the wrong level.', tweet) is False
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        # The writer's own words.
+        '"dipped to 775 and held" is contradicted by the session low of 774.10.',
+        # The bottom line, quoted with the label the job adds in front of it.
+        '"Bottom line: a grind inside 775 to 780" reads as a trade call.',
+        # A quote from the reply.
+        '"Watch the first test of 775" restates the bottom line.',
+        # One quote from the heading, one from the prose: the prose one stands.
+        '"here is the map for Monday" and "dipped to 775" disagree.',
+        # Nothing quoted: can't tell, so it stands.
+        "The post never mentions the jobs report headline.",
+    ],
+)
+def test_findings_about_the_writers_words_still_count(monkeypatch, finding):
+    mod = _reload_module()
+    tweet, _ = _close_post(mod, monkeypatch)
+    assert mod._quotes_only_caller_text(finding, tweet) is False
+
+
+def test_the_heading_finding_no_longer_holds_the_close_post(monkeypatch):
+    """Replays 2026-10-09: the fact-check's only finding was about the levels
+    heading, so the post passes instead of being held."""
+    from src.jobs import bulletin_llm
+
+    mod = _reload_module()
+    tweet, spy = _close_post(mod, monkeypatch)
+    monkeypatch.setattr(
+        bulletin_llm,
+        "review_post",
+        lambda **kwargs: bulletin_llm.Review(ran=True, problems=[HEADING_FINDING]),
+    )
+    result = mod._review("close", date(2026, 10, 9), tweet, spy, [], b"png")
+    assert result.problems == []
+
+    # A real finding about the prose still goes back to the writer.
+    real = '"opened near 776" is contradicted by the 776.25 open.'
+    monkeypatch.setattr(
+        bulletin_llm,
+        "review_post",
+        lambda **kwargs: bulletin_llm.Review(ran=True, problems=[HEADING_FINDING, real]),
+    )
+    result = mod._review("close", date(2026, 10, 9), tweet, spy, [], b"png")
+    assert result.fixable == [real]
