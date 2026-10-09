@@ -3771,6 +3771,25 @@ shadow-compare: shadow-guard ## Side-by-side coverage for today's ET session: pr
 		       MAX(timestamp AT TIME ZONE 'America/New_York') \
 		FROM vxn_bars WHERE timestamp >= $(SHADOW_DAY_START) ORDER BY 1;"
 
+.PHONY: shadow-compare-flow
+shadow-compare-flow: shadow-guard ## Diff the PUBLISHED flow figure per minute: production vs rehearsal (DAY=YYYY-MM-DD, UNDERLYING, VERBOSE=1)
+	@echo "$(BLUE)=== Published flow, per one-minute bucket ===$(NC)"
+	@echo "$(YELLOW)Production runs the quote test; the rehearsal runs whatever$(NC)"
+	@echo "$(YELLOW)FLOW_CLASSIFIER its shadow-run was started with. Same feed on$(NC)"
+	@echo "$(YELLOW)both means the only variable is the METHOD.$(NC)"
+	@echo "$(YELLOW)Compares the INPUT to order_flow_imbalance / tape_flow_bias,$(NC)"
+	@echo "$(YELLOW)not the rendered signal -- shadow-run runs ingestion only.$(NC)"
+	@echo ""
+	@D=$${DAY:-$$(TZ=America/New_York date +%F)}; \
+		START=$$(TZ=America/New_York date -d "$$D 09:30" -u +%Y-%m-%dT%H:%M:%SZ); \
+		END=$$(TZ=America/New_York date -d "$$D 16:00" -u +%Y-%m-%dT%H:%M:%SZ); \
+		echo "ET session $$D 09:30-16:00  ->  $$START .. $$END"; \
+		$(VENV_PYTHON) -m src.tools.shadow_flow_compare \
+			$(if $(DB_NAME),--production-db '$(DB_NAME)') --shadow-db "$(SHADOW_DB)" \
+			--session-start "$$START" --session-end "$$END" \
+			$(if $(UNDERLYING),--underlying '$(UNDERLYING)') \
+			$(if $(VERBOSE),--verbose)
+
 .PHONY: shadow-psql
 shadow-psql: shadow-guard ## Open an interactive psql session against the rehearsal database
 	@$(SHADOW_PSQL)
