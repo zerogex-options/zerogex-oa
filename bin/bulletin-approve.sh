@@ -10,7 +10,7 @@
 # runs this script to post it — or to reject it.
 #
 # Usage:
-#   bin/bulletin-approve.sh <premarket|midday|close> [flags]
+#   bin/bulletin-approve.sh <premarket|close> [flags]
 #
 # Common invocations:
 #   bin/bulletin-approve.sh close                    # POST today's close draft
@@ -29,7 +29,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
     cat <<EOF >&2
-Usage: bin/bulletin-approve.sh <premarket|midday|close> [--discard]
+Usage: bin/bulletin-approve.sh <premarket|close> [--discard]
                                [--print [--mark-posted]] [--short]
                                [--date YYYY-MM-DD] [--artifact-dir /path]
 
@@ -43,11 +43,11 @@ MODE="$1"
 shift
 
 case "$MODE" in
-    premarket|midday|close) ;;
+    premarket|close) ;;
     -h|--help)
         exec "$0" 2>&1 || true ;;
     *)
-        echo "bulletin-approve.sh: unknown mode '$MODE' (want premarket|midday|close)" >&2
+        echo "bulletin-approve.sh: unknown mode '$MODE' (want premarket|close)" >&2
         exit 2 ;;
 esac
 

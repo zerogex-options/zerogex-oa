@@ -5826,16 +5826,17 @@ forecast-tweet-status: ## Show forecast tweet timers + last/next fire + recent l
 	@sudo journalctl -u zerogex-oa-forecast-tweet-morning -u zerogex-oa-forecast-tweet-receipt -n 30 --no-pager || true
 
 # =============================================================================
-# Live Bulletin auto-tweet (09:15 pre-market, 12:30 midday, 16:05 close ET)
+# Live Bulletin auto-tweet (09:15 pre-market, 16:05 close ET)
 # =============================================================================
-# Three fires per trading day, one script.  Each fire screenshots the lead
-# symbol's live Live Bulletin card (the frontend's Playwright helper), writes
-# the post from that card's numbers and the latest CNBC headlines, has it
-# fact-checked, and only then posts it with the card attached.  Anything
-# that goes wrong holds the post and emails the reasons.  Every mode is
-# dry-run by default; artifacts (post + reply + PNG + manifest.json) land
-# in $BULLETIN_TWEET_ARTIFACT_DIR (default /var/lib/zerogex-oa/
-# bulletin-tweets) for operator inspection before flipping --post on.
+# Two fires per trading day, one script (there is no midday post).  Each
+# fire screenshots the lead symbol's live Live Bulletin card (the frontend's
+# Playwright helper), writes the post from that card's numbers and the
+# latest CNBC headlines, has it fact-checked, and only then posts it with
+# the card attached.  Anything that goes wrong holds the post and emails
+# the reasons.  Every mode is dry-run by default; artifacts (post + reply +
+# PNG + manifest.json) land in $BULLETIN_TWEET_ARTIFACT_DIR (default
+# /var/lib/zerogex-oa/bulletin-tweets) for operator inspection before
+# flipping --post on.
 #
 # Override the symbols fetched with BULLETIN_TWEET_SYMBOLS (default SPY), the
 # symbol the post is about with BULLETIN_TWEET_LEAD_SYMBOL (default SPY),
@@ -5844,14 +5845,6 @@ forecast-tweet-status: ## Show forecast tweet timers + last/next fire + recent l
 bulletin-tweet-premarket-dry-run: ## Dry-run today's pre-market bulletin tweet (09:15 slot)
 	@echo "$(BLUE)=== Dry-run pre-market bulletin tweet ===$(NC)"
 	@$(PY) -m src.jobs.bulletin_tweet --mode premarket \
-		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
-		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
-		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
-
-.PHONY: bulletin-tweet-midday-dry-run
-bulletin-tweet-midday-dry-run: ## Dry-run today's mid-session bulletin tweet (12:30 slot)
-	@echo "$(BLUE)=== Dry-run mid-session bulletin tweet ===$(NC)"
-	@$(PY) -m src.jobs.bulletin_tweet --mode midday \
 		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
 		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
 		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
@@ -5872,14 +5865,6 @@ bulletin-tweet-premarket-post: ## Post today's pre-market bulletin tweet (needs 
 		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
 		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
 
-.PHONY: bulletin-tweet-midday-post
-bulletin-tweet-midday-post: ## Post today's mid-session bulletin tweet (needs the four X OAuth1 keys)
-	@echo "$(BLUE)=== Posting mid-session bulletin tweet ===$(NC)"
-	@$(PY) -m src.jobs.bulletin_tweet --mode midday --post \
-		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
-		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
-		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
-
 .PHONY: bulletin-tweet-close-post
 bulletin-tweet-close-post: ## Post today's post-market bulletin tweet (needs the four X OAuth1 keys)
 	@echo "$(BLUE)=== Posting post-market bulletin tweet ===$(NC)"
@@ -5894,22 +5879,22 @@ bulletin-tweet-bootstrap: ## One-shot runtime bootstrap (idempotent): ffmpeg + N
 	@bash deploy/steps/205.bulletin_tweet_setup
 
 .PHONY: bulletin-tweet-install
-bulletin-tweet-install: ## Install all three bulletin tweet timers (09:15, 12:30, 16:05 ET Mon-Fri)
+bulletin-tweet-install: ## Install both bulletin tweet timers (09:15, 16:05 ET Mon-Fri) and retire the old midday one
 	@echo "$(BLUE)=== Installing Live Bulletin Tweet Timers ===$(NC)"
 	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-premarket.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-premarket.timer /etc/systemd/system/
-	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-midday.service /etc/systemd/system/
-	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-midday.timer /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-close.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-close.timer /etc/systemd/system/
+	@# The 12:30 midday post was retired; stop and remove its timer if this box still has it.
+	@sudo systemctl disable --now zerogex-oa-bulletin-tweet-midday.timer 2>/dev/null || true
+	@sudo rm -f /etc/systemd/system/zerogex-oa-bulletin-tweet-midday.timer /etc/systemd/system/zerogex-oa-bulletin-tweet-midday.service
 	@sudo install -d -o ubuntu -g ubuntu -m 0755 /var/lib/zerogex-oa/bulletin-tweets
 	@sudo systemctl daemon-reload
 	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-premarket.timer
-	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-midday.timer
 	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-close.timer
-	@echo "$(GREEN)✅ Bulletin tweet timers installed (09:15 premarket, 12:30 midday, 16:05 close; Mon-Fri)$(NC)"
+	@echo "$(GREEN)✅ Bulletin tweet timers installed (09:15 premarket, 16:05 close; Mon-Fri)$(NC)"
 	@echo "$(YELLOW)Status:      systemctl list-timers 'zerogex-oa-bulletin-tweet-*'$(NC)"
-	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-midday -u zerogex-oa-bulletin-tweet-close$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-close$(NC)"
 	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-bulletin-tweet-close.service$(NC)"
 
 .PHONY: bulletin-tweet-status
@@ -5917,7 +5902,7 @@ bulletin-tweet-status: ## Show bulletin tweet timers + last/next fire + recent l
 	@echo "$(BLUE)=== Bulletin Tweet Timers ===$(NC)"
 	@systemctl list-timers --all --no-pager 'zerogex-oa-bulletin-tweet-*.timer' || true
 	@echo ""
-	@sudo journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-midday -u zerogex-oa-bulletin-tweet-close -n 30 --no-pager || true
+	@sudo journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-close -n 30 --no-pager || true
 
 # =============================================================================
 # Daily ATM IV history backfill (pre-open seed of daily_atm_iv)

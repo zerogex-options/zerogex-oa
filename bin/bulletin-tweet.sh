@@ -3,7 +3,7 @@
 # Manual runner for the Live Bulletin X-post job.
 # ------------------------------------------------
 # Convenience wrapper around ``python -m src.jobs.bulletin_tweet`` so the
-# operator can preview any of the three daily fires without having to
+# operator can preview either of the two daily fires without having to
 # remember the flag grammar.  Every invocation is dry-run by default: it
 # screenshots the live bulletin card, writes the post from its numbers
 # and the latest CNBC headlines, runs the review, and writes the post,
@@ -17,15 +17,14 @@
 # posted.
 #
 # Usage:
-#   bin/bulletin-tweet.sh <premarket|midday|close> [flags]
+#   bin/bulletin-tweet.sh <premarket|close> [flags]
 #
 # Convenience aliases (default to dry-run):
 #   bin/bulletin-tweet.sh premarket           # 09:15 slot
-#   bin/bulletin-tweet.sh midday              # 12:30 slot
 #   bin/bulletin-tweet.sh close               # 16:05 slot
 #
 #   bin/bulletin-tweet.sh close --post        # live post the close read
-#   bin/bulletin-tweet.sh midday --date 2026-07-03 --allow-non-trading-day
+#   bin/bulletin-tweet.sh premarket --date 2026-07-03 --allow-non-trading-day
 #   bin/bulletin-tweet.sh close --no-media    # skip the screenshot (can't post)
 #   bin/bulletin-tweet.sh close --short       # force 280-char fallback
 #   bin/bulletin-tweet.sh close --artifact-dir /tmp/preview
@@ -36,7 +35,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
     cat <<EOF >&2
-Usage: bin/bulletin-tweet.sh <premarket|midday|close> [--post] [--date YYYY-MM-DD]
+Usage: bin/bulletin-tweet.sh <premarket|close> [--post] [--date YYYY-MM-DD]
                              [--symbols SPY,SPX,QQQ] [--lead-symbol SPY]
                              [--artifact-dir /path] [--no-media] [--short]
                              [--allow-non-trading-day]
@@ -52,11 +51,11 @@ MODE="$1"
 shift
 
 case "$MODE" in
-    premarket|midday|close) ;;
+    premarket|close) ;;
     -h|--help)
         exec "$0" 2>&1 || true ;;
     *)
-        echo "bulletin-tweet.sh: unknown mode '$MODE' (want premarket|midday|close)" >&2
+        echo "bulletin-tweet.sh: unknown mode '$MODE' (want premarket|close)" >&2
         exit 2 ;;
 esac
 

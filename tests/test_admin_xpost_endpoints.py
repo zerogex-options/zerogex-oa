@@ -34,17 +34,26 @@ async def test_symbols_endpoint_defaults_to_spy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_latest_resolves_timing_and_reads_record(monkeypatch):
-    monkeypatch.setattr(bt, "resolve_current_mode", lambda: "midday")
+    monkeypatch.setattr(bt, "resolve_current_mode", lambda: "premarket")
     monkeypatch.setattr(
         bt,
         "read_latest_record",
         lambda sym, mode: {"symbol": sym, "mode": mode, "post_text": "hi"},
     )
     out = await ax.latest(symbol=None, mode=None)
-    assert out["mode"] == "midday"
-    assert out["timing_label"] == "Midday Read"
+    assert out["mode"] == "premarket"
+    assert out["timing_label"] == "Morning Read"
     assert out["symbol"] == "SPY"
     assert out["record"]["post_text"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_latest_rejects_the_retired_midday_timing():
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        await ax.latest(symbol="SPY", mode="midday")
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -75,7 +84,7 @@ async def test_latest_falls_back_to_any_symbol_on_initial_load(monkeypatch):
         "read_latest_record_any",
         lambda mode: {"symbol": "SPX", "mode": mode, "post_text": "spx read"},
     )
-    out = await ax.latest(symbol=None, mode="midday")
+    out = await ax.latest(symbol=None, mode="premarket")
     assert out["symbol"] == "SPX"
     assert out["record"]["post_text"] == "spx read"
 
@@ -92,7 +101,7 @@ async def test_latest_no_fallback_when_symbol_explicit(monkeypatch):
         return {"symbol": "SPX"}
 
     monkeypatch.setattr(bt, "read_latest_record_any", _any)
-    out = await ax.latest(symbol="SPY", mode="midday")
+    out = await ax.latest(symbol="SPY", mode="premarket")
     assert out["record"] is None
     assert out["symbol"] == "SPY"
     assert called["any"] is False
@@ -103,7 +112,7 @@ async def test_regenerate_rejects_unconfigured_symbol(monkeypatch):
     from fastapi import HTTPException
 
     monkeypatch.setenv("BULLETIN_TWEET_SYMBOLS", "SPY")
-    body = ax.RegenerateRequest(symbol="TSLA", mode="midday")
+    body = ax.RegenerateRequest(symbol="TSLA", mode="premarket")
     with pytest.raises(HTTPException) as ex:
         await ax.regenerate(body, db=object())
     assert ex.value.status_code == 400
@@ -137,5 +146,5 @@ async def test_regenerate_surfaces_generation_failure_as_502(monkeypatch):
         AsyncMock(side_effect=RuntimeError("llm down")),
     )
     with pytest.raises(HTTPException) as ex:
-        await ax.regenerate(ax.RegenerateRequest(symbol="SPY", mode="midday"), db=object())
+        await ax.regenerate(ax.RegenerateRequest(symbol="SPY", mode="premarket"), db=object())
     assert ex.value.status_code == 502

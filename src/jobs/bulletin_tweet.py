@@ -1,13 +1,14 @@
-"""Live-Bulletin auto-tweet — three daily reads posted to the ZeroGEX X account.
+"""Live-Bulletin auto-tweet — two daily reads posted to the ZeroGEX X account.
 
-Fires three times per trading day, backed by the same script + three
-systemd timers:
+Fires twice per trading day, backed by the same script + two systemd timers:
 
   * ``--mode premarket`` at 09:15 ET — the Morning Read, 15 min before the
-    cash open.
-  * ``--mode midday`` at 12:30 ET — the Midday Read.
+    cash open.  It lists the levels twice: across all expirations (the
+    card's) and from today's expiring options alone (0DTE).
   * ``--mode close`` at 16:05 ET — the Post-Market Read, 5 min after the
     cash bell.
+
+There is no midday post; the operator posts mid-session by hand.
 
 Every post features ONE symbol: ``$BULLETIN_TWEET_LEAD_SYMBOL`` (SPY by
 default), falling back to the symbol with the cleanest setup only when the
@@ -59,7 +60,7 @@ Other rules:
   primary path isn't writable (dev laptops).
 
 Run manually:
-    python -m src.jobs.bulletin_tweet --mode midday            # today, dry-run
+    python -m src.jobs.bulletin_tweet --mode premarket         # today, dry-run
     python -m src.jobs.bulletin_tweet --mode close --date 2026-07-03
     python -m src.jobs.bulletin_tweet --mode premarket --post  # live
 """
@@ -79,7 +80,6 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
@@ -88,6 +88,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
+from src.jobs import bulletin_format as fmt
 from src.jobs import level_history as lh
 from src.jobs.index_projection import implied_index_spot
 from src.market_calendar import NYSE_HOLIDAYS
@@ -134,67 +135,24 @@ X_LINK_LEN = 23
 # The latest ET time each fire may still post.  The timers are Persistent, so
 # a run delayed by downtime still fires later; a Morning Read that says
 # "heading into the open" must not go out at noon.
-POST_DEADLINE_ET = {"premarket": time(9, 30), "midday": time(14, 0), "close": time(18, 0)}
+POST_DEADLINE_ET = {"premarket": time(9, 30), "close": time(18, 0)}
 # Only headlines published within this many hours count as the latest news.
 DEFAULT_NEWS_MAX_AGE_HOURS = 24.0
 
 # Modes ---------------------------------------------------------------------
-MODES = ("premarket", "midday", "close")
+MODES = ("premarket", "close")
 
 # The header label each fire opens with — the operator-approved "…Read — $SPY"
 # format.  Also the "timing" label the admin review page switches on
-# (09:15 ET → Morning, 12:30 ET → Midday, 16:05 ET → Post-Market).
+# (09:15 ET → Morning, 16:05 ET → Post-Market).
 MODE_READ_LABEL = {
     "premarket": "Morning Read",
-    "midday": "Midday Read",
     "close": "Post-Market Read",
 }
 
 
 def _mode_read_label(mode: str) -> str:
     return MODE_READ_LABEL.get(mode, "Market Read")
-
-
-@dataclass
-class ModeCopy:
-    """Static per-mode copy — headline label + the section preamble.
-
-    Keeping the copy in code (not in a JSON blob or CMS) means the
-    tweet body renders even if the DB is only partially available.
-    The auto-lead sentence is deliberately generic; the operator can
-    swap it out by editing the class if a specific day warrants a
-    hand-written lead (e.g. FOMC or CPI print)."""
-
-    label: str
-    lead_variants: list[str]
-
-
-MODE_COPY: dict[str, ModeCopy] = {
-    "premarket": ModeCopy(
-        label="pre-market update",
-        lead_variants=[
-            "Opening the tape with the dealer gamma map locked in.",
-            "Fifteen minutes to the open — here is where dealers are positioned.",
-            "Pre-cash read: the gamma structure heading into the bell.",
-        ],
-    ),
-    "midday": ModeCopy(
-        label="midday update",
-        lead_variants=[
-            "Halfway through the session — checking in on the dealer gamma map.",
-            "Mid-session read on where the walls have held (and where they haven't).",
-            "Noon-hour snapshot of the gamma structure carrying the tape.",
-        ],
-    ),
-    "close": ModeCopy(
-        label="post-market update",
-        lead_variants=[
-            "Closing read on where the tape parked into the bell.",
-            "The bell rang — here is the dealer gamma map on the close.",
-            "End-of-day read on the levels that mattered.",
-        ],
-    ),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -210,16 +168,13 @@ def resolve_current_mode(now: datetime | None = None) -> str:
     """The "timing" the /admin review page shows, by wall-clock ET.
 
     The page switches format at each fire time and holds it until the next:
-      * 09:15 → 12:30  → ``premarket`` (Morning Read)
-      * 12:30 → 16:05  → ``midday``    (Midday Read)
+      * 09:15 → 16:05  → ``premarket`` (Morning Read)
       * 16:05 → 09:15  → ``close``     (Post-Market Read; incl. overnight)
     Before the first fire of the day it stays on the prior session's close."""
     now = now or datetime.now(tz=ET)
     hm = (now.hour, now.minute)
-    if (9, 15) <= hm < (12, 30):
+    if (9, 15) <= hm < (16, 5):
         return "premarket"
-    if (12, 30) <= hm < (16, 5):
-        return "midday"
     return "close"
 
 
@@ -273,31 +228,16 @@ def _fmt_price_spot(v: float | None) -> str:
 
 
 def _fmt_net_gex(v: float | None) -> str:
+    """Signed, in whole units: "+$6B", "-$340M".  A plain hyphen, not the
+    typographic minus the card draws: the post has to read as typed."""
     if v is None:
         return "—"
-    abs_v = abs(v)
-    # A plain hyphen, not the typographic minus the card draws: the post has
-    # to read as typed.
-    sign = "+" if v >= 0 else "-"
-    if abs_v >= 1e9:
-        return f"{sign}${abs_v / 1e9:.2f}B"
-    if abs_v >= 1e6:
-        return f"{sign}${abs_v / 1e6:.1f}M"
-    if abs_v >= 1e3:
-        return f"{sign}${abs_v / 1e3:.0f}K"
-    return f"{sign}${abs_v:.0f}"
+    return fmt.signed_dollars(v)
 
 
 def _fmt_dollars(v: float) -> str:
-    """Compact UNSIGNED dollar magnitude: $1.20B / $340M / $12K / $500."""
-    a = abs(v)
-    if a >= 1e9:
-        return f"${a / 1e9:.2f}B"
-    if a >= 1e6:
-        return f"${a / 1e6:.0f}M"
-    if a >= 1e3:
-        return f"${a / 1e3:.0f}K"
-    return f"${a:.0f}"
+    """Compact UNSIGNED dollar magnitude in whole units: $1B / $340M / $12K / $500."""
+    return fmt.dollars(v)
 
 
 # Only surface the Charm-into-Close headline when it clears this floor, so a
@@ -306,22 +246,12 @@ _CHARM_HEADLINE_MIN_USD = 1_000_000.0
 
 
 def _fmt_level(v: float | None) -> str:
-    """Format a level for the post, with the same digits the card shows.
-
-    The Live Bulletin card prints prices under 1,000 to the cent ("745.00",
-    "747.29") and index-scale prices as whole numbers with separators
-    ("7,483").  The post rounds the same way (half up on the exact value, as
-    the browser does) and drops a whole number's ".00", which is how a
-    person writes a strike: "745", "747.29", "7,483"."""
+    """A level as the post writes it: the nearest whole dollar, with "~" in
+    front when that rounds something off ("745", "~747" for 747.29, "~7,483").
+    See :mod:`src.jobs.bulletin_format`."""
     if v is None:
         return "—"
-    exact = Decimal(v)
-    if abs(v) >= 1000:
-        return f"{exact.quantize(Decimal(1), rounding=ROUND_HALF_UP):,}"
-    cents = exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if cents == cents.to_integral_value():
-        return f"{int(cents)}"
-    return f"{cents}"
+    return fmt.price(v)
 
 
 def _derive_regime(
@@ -381,6 +311,29 @@ def _derive_momentum_label(b: "SymbolBulletin") -> str | None:
 
 
 @dataclass
+class ZeroDteLevels:
+    """The walls and gamma flip from today's expiring options alone.
+
+    The Morning Read lists these next to the all-expirations map the card
+    shows.  Same names as :class:`SymbolBulletin`'s level fields, so the
+    key-levels list renders either one."""
+
+    put_wall: float | None = None
+    call_wall: float | None = None
+    gamma_flip: float | None = None
+
+    def has_any(self) -> bool:
+        return any(v is not None for v in (self.put_wall, self.call_wall, self.gamma_flip))
+
+    def to_dict(self) -> dict[str, float | None]:
+        return {
+            "put_wall": self.put_wall,
+            "call_wall": self.call_wall,
+            "gamma_flip": self.gamma_flip,
+        }
+
+
+@dataclass
 class SymbolBulletin:
     """The subset of GEX summary fields we render in the tweet.
 
@@ -417,12 +370,16 @@ class SymbolBulletin:
     future_symbol: str | None = None
     # How the walls / flip MOVED through the session, and what price did to
     # each one while it was in force (see :mod:`src.jobs.level_history`).
-    # Populated on the midday and close fires only — the pre-market read has
-    # no session path yet.  None everywhere else.
+    # Populated on the close fire only — the pre-market read has no session
+    # path yet.  None everywhere else.
     level_history: "lh.LevelHistory | None" = None
     # The card's own "as of" label once its numbers have replaced the ones
     # from the database (see :func:`_apply_card_levels`); None until then.
     card_as_of: str | None = None
+    # The Morning Read's second map, from today's expiring options alone (see
+    # :func:`_attach_zero_dte_levels`).  None on the close read, and whenever
+    # there's no same-day expiration to read.
+    zero_dte: ZeroDteLevels | None = None
 
     def has_any_level(self) -> bool:
         return any(
@@ -674,16 +631,23 @@ def build_tweet_body(
 
     Layout (the operator-approved voice):
 
-        <Morning|Midday|Post-Market> Read - $<FEATURED>
+        <Morning|Post-Market> Read - $<FEATURED>
 
         <two to four short paragraphs: news, price action, regime>
 
-        Key levels:            (the close read: "Levels for tomorrow:")
+        Key levels (all expirations):
         • <put wall> put wall
         • <call wall> call wall
-        • <flip> gamma flip
+        • ~<flip> gamma flip
+
+        Key levels (0DTE only):        (the Morning Read only)
+        • …
 
         Bottom line: <takeaway>
+
+    The close read has one list, headed "With today's 0DTE rolling off, here
+    is the map for tomorrow:".  Every price is rounded to the dollar, with a
+    "~" when that rounds something off.
 
     The prose comes from Claude (:func:`_try_llm_post`), fed the day's
     headlines + the featured symbol's price action + its gamma structure.
@@ -830,6 +794,7 @@ def _llm_symbol_inputs(present: list[SymbolBulletin]) -> list:
             ),
             historical_level_values=(b.level_history.quoted_values() if b.level_history else []),
             level_paths=(b.level_history.session_values() if b.level_history else {}),
+            zero_dte=b.zero_dte.to_dict() if b.zero_dte else None,
         )
         for b in present
     ]
@@ -902,6 +867,9 @@ def _append_para(blocks: list[str], value: str) -> None:
 
 # The key-levels list, in the order the operator reads it.
 KEY_LEVELS = (("put_wall", "put wall"), ("call_wall", "call wall"), ("gamma_flip", "gamma flip"))
+# The Morning Read lists the levels twice; these headings say which map is which.
+ALL_EXPIRATIONS_HEADING = "Key levels (all expirations):"
+ZERO_DTE_HEADING = "Key levels (0DTE only):"
 
 
 def _next_trading_day(day: date) -> date | None:
@@ -913,46 +881,63 @@ def _next_trading_day(day: date) -> date | None:
     return None
 
 
-def _levels_heading(mode: str, day: date) -> str:
-    """The key-levels list's heading.
+def _levels_heading(mode: str, day: date, with_zero_dte: bool = False) -> str:
+    """The (all-expirations) key-levels list's heading.
 
     The close read quotes what the live card shows at 16:05, which is the
-    next session's map (the day's 0DTE rolled off at the bell), so it says so
-    rather than passing tomorrow's levels off as today's."""
+    next session's map (the day's 0DTE rolled off at the bell).  The heading
+    is where the post says that, once, as the lead-in to the map, so the
+    prose never has to explain the roll-off.  On the Morning Read, when the
+    0DTE-only list follows, this one names its scope too."""
     if mode != "close":
-        return "Key levels:"
+        return ALL_EXPIRATIONS_HEADING if with_zero_dte else "Key levels:"
     nxt = _next_trading_day(day)
     if nxt is None or nxt == day + timedelta(days=1):
-        return "Levels for tomorrow:"
-    return f"Levels for {nxt.strftime('%A')}:"
+        when = "tomorrow"
+    else:
+        when = nxt.strftime("%A")
+    return f"With today's 0DTE rolling off, here is the map for {when}:"
 
 
 def _key_level_line(value: float, label: str) -> str:
     return f"• {_fmt_level(value)} {label}"
 
 
-def _key_levels_block(featured: SymbolBulletin) -> str:
+def _key_levels_block(levels: "SymbolBulletin | ZeroDteLevels") -> str:
     """The ``• <price> <level>`` lines, written the way a person types them.
 
-    Python owns every price here, and they are the live card's numbers (see
-    :func:`_apply_card_levels`).  No expiration scope and no annotations: the
-    prose says what happened at a level, the list just says where it is."""
+    Python owns every price here.  For the featured symbol they are the live
+    card's numbers (see :func:`_apply_card_levels`); for its 0DTE-only map,
+    today's expiration's.  No annotations: the prose says what happened at a
+    level, the list just says where it is."""
     lines = [
         _key_level_line(value, label)
         for key, label in KEY_LEVELS
-        if (value := getattr(featured, key)) is not None
+        if (value := getattr(levels, key)) is not None
     ]
     return "\n".join(lines)
 
 
+def _zero_dte_section(featured: SymbolBulletin) -> str:
+    """The Morning Read's "Key levels (0DTE only):" list, or "" without one."""
+    if featured.zero_dte is None:
+        return ""
+    levels = _key_levels_block(featured.zero_dte)
+    return f"{ZERO_DTE_HEADING}\n{levels}" if levels else ""
+
+
 def _append_key_levels(blocks: list[str], featured: SymbolBulletin, mode: str, day: date) -> None:
+    zero_dte = _zero_dte_section(featured)
     levels = _key_levels_block(featured)
     if levels:
-        _append_para(blocks, f"{_levels_heading(mode, day)}\n{levels}")
+        heading = _levels_heading(mode, day, with_zero_dte=bool(zero_dte))
+        _append_para(blocks, f"{heading}\n{levels}")
+    if zero_dte:
+        _append_para(blocks, zero_dte)
 
 
 def _post_header(mode: str, symbol: str) -> str:
-    """The first line, with a plain hyphen: "Midday Read - $SPY"."""
+    """The first line, with a plain hyphen: "Morning Read - $SPY"."""
     return f"{_mode_read_label(mode)} - ${symbol}"
 
 
@@ -1093,6 +1078,9 @@ def _text_problems(
         value = getattr(featured, key)
         if value is not None and _key_level_line(value, label) not in text:
             problems.append(f"The key levels list is missing the {label} at {_fmt_level(value)}.")
+    zero_dte = _zero_dte_section(featured)
+    if zero_dte and zero_dte not in text:
+        problems.append("The 0DTE-only key levels list is missing or was changed.")
     reply = tweet.reply_text or ""
     for where, body in (("post", text), ("reply", reply)):
         for char, name in _BANNED_CHARACTERS.items():
@@ -1288,7 +1276,7 @@ def resolve_artifact_dir(explicit: str | None, mode: str, day: date) -> Path:
       5. ``$HOME/.local/state/zerogex-oa/bulletin-tweets`` (dev)
 
     First writable path wins. The chosen root gets ``/<mode>/<date>/``
-    appended so a day's three fires each land in their own folder and
+    appended so a day's fires each land in their own folder and
     successive dry-runs don't smear over each other."""
     for root in _artifact_root_candidates(explicit):
         target = root / mode / day.isoformat()
@@ -1393,6 +1381,8 @@ def build_latest_record(
             "regime": featured.regime,
             # The live card's "as of" label when the levels came from it.
             "card_as_of": featured.card_as_of,
+            # The Morning Read's 0DTE-only map (null otherwise).
+            "zero_dte": featured.zero_dte.to_dict() if featured.zero_dte else None,
             # The session's level path (walls that migrated, what price did
             # to each print, the post-bell roll-off).  Null on pre-market
             # fires and on days with too thin a path to read.  Lets the
@@ -1429,7 +1419,7 @@ def write_latest_record(record: dict[str, Any]) -> Path | None:
         logger.warning("bulletin_tweet: no writable latest dir — skipping review record")
         return None
     symbol = str(record.get("symbol") or DEFAULT_LEAD_SYMBOL)
-    mode = str(record.get("mode") or "midday")
+    mode = str(record.get("mode") or "premarket")
     path = _latest_record_path(latest_dir, symbol, mode)
     try:
         path.write_text(json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8")
@@ -1917,7 +1907,7 @@ def _reference_close(closes: dict[str, Any], mode: str) -> Any:
     Which one is "the prior close" the read gaps from depends on the fire,
     because the featured ``spot`` refers to a different session in each:
 
-      * premarket / midday — ``spot`` is today's pre-market / live price and
+      * premarket — ``spot`` is today's pre-market price and
         today's session has NOT closed, so ``current_session_close`` is
         yesterday's close: exactly the reference the gap is measured from.
       * close — fired at 16:05 once today's session HAS closed, so ``spot``
@@ -1925,9 +1915,8 @@ def _reference_close(closes: dict[str, Any], mode: str) -> Any:
         reference is the session *before* it, ``prior_session_close``.
 
     Reading ``prior_session_close`` for every mode (the old behaviour) quoted
-    the close from TWO sessions ago on the pre-market and midday reads — e.g.
-    a Wednesday Morning Read gapping from Monday's close instead of
-    Tuesday's."""
+    the close from TWO sessions ago on the pre-market read — e.g. a Wednesday
+    Morning Read gapping from Monday's close instead of Tuesday's."""
     key = "prior_session_close" if mode == "close" else "current_session_close"
     return closes.get(key)
 
@@ -1970,7 +1959,7 @@ async def _attach_price_action(
 # The fires that have a session path worth reading.  The 09:15 pre-market
 # read is deliberately excluded: nothing has traded yet, so there is no
 # migration to describe and no tape to test a level against.
-LEVEL_HISTORY_MODES = ("midday", "close")
+LEVEL_HISTORY_MODES = ("close",)
 
 
 async def _attach_level_history(
@@ -2020,6 +2009,54 @@ async def _attach_level_history(
     if history is None:
         return
     bulletin.level_history = history
+
+
+# The fires that list a 0DTE-only map next to the all-expirations one.  The
+# close read is excluded: by 16:05 the day's 0DTE has expired.
+ZERO_DTE_MODES = ("premarket",)
+# How many of the latest analytics minutes the 0DTE read looks back over for
+# one with levels (see :func:`_attach_zero_dte_levels`).
+ZERO_DTE_LOOKBACK_MINUTES = 5
+
+
+async def _attach_zero_dte_levels(
+    db: DatabaseManager, bulletin: SymbolBulletin, day: date, mode: str
+) -> None:
+    """Best-effort: the walls and gamma flip from today's expiring options alone.
+
+    Read exactly the way the Strike Profile chart shows them with today's
+    expiry selected: ``get_strike_profile_timeseries`` scoped to ``day``,
+    whose walls come from the same wall helper as the all-expirations walls
+    and whose flip is the zero crossing of those options' own gamma.  It
+    reads the last few minutes and keeps the newest one with levels, because
+    a minute whose price bar hasn't landed yet comes back without any.  Any
+    miss (no same-day expiration, a slow query) leaves ``zero_dte`` None, and
+    the post lists the all-expirations map alone rather than being held."""
+    if mode not in ZERO_DTE_MODES:
+        return
+    sym = bulletin.symbol
+    try:
+        buckets = await db.get_strike_profile_timeseries(
+            symbol=sym,
+            timeframe="1min",
+            window_units=ZERO_DTE_LOOKBACK_MINUTES,
+            expirations=[day],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: 0DTE levels for %s failed (%s)", sym, exc)
+        return
+    for bucket in reversed(buckets if isinstance(buckets, list) else []):
+        if not isinstance(bucket, dict):
+            continue
+        levels = ZeroDteLevels(
+            put_wall=_to_float(bucket.get("put_wall")),
+            call_wall=_to_float(bucket.get("call_wall")),
+            gamma_flip=_to_float(bucket.get("gamma_flip")),
+        )
+        if levels.has_any():
+            bulletin.zero_dte = levels
+            return
+    logger.warning("bulletin_tweet: no 0DTE levels for %s on %s", sym, day.isoformat())
 
 
 async def _fetch_bulletins(
@@ -2090,8 +2127,10 @@ async def _fetch_bulletins(
                 proj.cash_ref_close,
                 proj.gap_points,
             )
-        # The day's level path (midday and close fires).
+        # The day's level path (close fire).
         await _attach_level_history(db, bulletin, day, mode)
+        # Today's expiration's own walls and flip (Morning Read).
+        await _attach_zero_dte_levels(db, bulletin, day, mode)
         # Price action (prior close, session range, regime, momentum) — the
         # inputs the LLM narrates the day's path from.  Best-effort.
         await _attach_price_action(db, bulletin, day, mode)
@@ -2164,6 +2203,7 @@ def _write_manifest_and_text(
                 "net_gex": b.net_gex,
                 # The live card's label when the fields above came from it.
                 "card_as_of": b.card_as_of,
+                "zero_dte": b.zero_dte.to_dict() if b.zero_dte else None,
                 # Traceability: the session path behind anything the post
                 # says about a level.
                 "level_history": (b.level_history.to_prompt_dict() if b.level_history else None),
@@ -2500,8 +2540,8 @@ def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> N
 
 
 # Friendly timing word for the email subject — matches the operator's
-# "market open / midday / market close" phrasing.
-_TIMING_WORD = {"premarket": "Market Open", "midday": "Midday", "close": "Market Close"}
+# "market open / market close" phrasing.
+_TIMING_WORD = {"premarket": "Market Open", "close": "Market Close"}
 
 
 def _xpost_admin_url() -> str:
@@ -2790,7 +2830,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--mode",
         choices=MODES,
         required=True,
-        help="Which of the three daily fires this invocation is.",
+        help="Which of the two daily fires this invocation is.",
     )
     parser.add_argument(
         "--symbols",

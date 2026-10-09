@@ -46,9 +46,9 @@ def _tweet(bt, text: str, reply: str = "One more beat.\n\nhttps://zerogex.io"):
 
 
 GOOD_POST = (
-    "Midday Read - $SPY\n\n"
+    "Morning Read - $SPY\n\n"
     "SPY slid into the 740 put wall after the jobs report and buyers showed up.\n\n"
-    "Key levels:\n• 740 put wall\n• 745 call wall\n• 747.29 gamma flip\n\n"
+    "Key levels:\n• 740 put wall\n• 745 call wall\n• ~747 gamma flip\n\n"
     "Bottom line: chop between the walls until the flip gives way."
 )
 
@@ -61,13 +61,13 @@ GOOD_POST = (
 def test_a_clean_post_has_no_text_problems():
     from src.jobs import bulletin_tweet as bt
 
-    assert bt._text_problems(_tweet(bt, GOOD_POST), _featured(bt), "midday") == []
+    assert bt._text_problems(_tweet(bt, GOOD_POST), _featured(bt), "premarket") == []
 
 
 @pytest.mark.parametrize(
     "mutate, expected",
     [
-        (lambda t: t.replace("Midday Read - $SPY", "Midday Read — $SPY"), "should be"),
+        (lambda t: t.replace("Morning Read - $SPY", "Morning Read — $SPY"), "should be"),
         (lambda t: t.replace("after the jobs", "— after the jobs"), "em dash"),
         (lambda t: t.replace("and buyers", "and buyers favour it; buyers"), '"favour"'),
         (lambda t: t + " #SPY", "hashtag"),
@@ -80,7 +80,7 @@ def test_a_clean_post_has_no_text_problems():
 def test_text_problems_catch_what_gives_a_post_away(mutate, expected):
     from src.jobs import bulletin_tweet as bt
 
-    problems = bt._text_problems(_tweet(bt, mutate(GOOD_POST)), _featured(bt), "midday")
+    problems = bt._text_problems(_tweet(bt, mutate(GOOD_POST)), _featured(bt), "premarket")
     assert any(expected in p for p in problems), problems
 
 
@@ -88,21 +88,23 @@ def test_text_problems_check_the_reply_too():
     from src.jobs import bulletin_tweet as bt
 
     assert "no link" in " ".join(
-        bt._text_problems(_tweet(bt, GOOD_POST, reply="No link here."), _featured(bt), "midday")
+        bt._text_problems(_tweet(bt, GOOD_POST, reply="No link here."), _featured(bt), "premarket")
     )
     long_reply = "x" * 270 + "\n\nhttps://zerogex.io"  # 270 + 2 + 23 as X counts it
     assert "over the 280 limit" in " ".join(
-        bt._text_problems(_tweet(bt, GOOD_POST, reply=long_reply), _featured(bt), "midday")
+        bt._text_problems(_tweet(bt, GOOD_POST, reply=long_reply), _featured(bt), "premarket")
     )
     ok_reply = "x" * 250 + "\n\nhttps://zerogex.io/some/very/long/path/that/x/shortens"
-    assert bt._text_problems(_tweet(bt, GOOD_POST, reply=ok_reply), _featured(bt), "midday") == []
+    assert (
+        bt._text_problems(_tweet(bt, GOOD_POST, reply=ok_reply), _featured(bt), "premarket") == []
+    )
 
 
 def test_british_spelling_check_skips_proper_nouns():
     from src.jobs import bulletin_tweet as bt
 
     text = GOOD_POST.replace("buyers showed up", "the Ministry of Defence spoke")
-    assert bt._text_problems(_tweet(bt, text), _featured(bt), "midday") == []
+    assert bt._text_problems(_tweet(bt, text), _featured(bt), "premarket") == []
 
 
 def test_data_problems_name_every_missing_piece():
@@ -172,7 +174,7 @@ def test_render_bulletin_card_reads_back_the_cards_levels(tmp_path, monkeypatch)
     monkeypatch.setenv("BULLETIN_SNAPSHOT_TOKEN", "tok")
     card = bt.render_bulletin_card(
         "spy",
-        "midday",
+        "premarket",
         "http://127.0.0.1:3000",
         tmp_path / "bulletin-spy.png",
         helper_path=str(_helper(tmp_path)),
@@ -201,7 +203,7 @@ def test_render_bulletin_card_explains_each_failure(tmp_path, monkeypatch, rc, e
     monkeypatch.setattr(bt, "_run_frontend_helper", lambda *a, **k: (rc, "boom"))
     card = bt.render_bulletin_card(
         "SPY",
-        "midday",
+        "premarket",
         "https://zerogex.io",
         tmp_path / "b.png",
         helper_path=str(_helper(tmp_path)),
@@ -220,7 +222,7 @@ def test_render_bulletin_card_rejects_a_wrong_or_empty_picture(tmp_path, monkeyp
     monkeypatch.setattr(bt, "_run_frontend_helper", _tiny)
     card = bt.render_bulletin_card(
         "SPY",
-        "midday",
+        "premarket",
         "https://zerogex.io",
         tmp_path / "b.png",
         helper_path=str(_helper(tmp_path)),
@@ -237,7 +239,7 @@ def test_render_bulletin_card_rejects_a_wrong_or_empty_picture(tmp_path, monkeyp
     monkeypatch.setattr(bt, "_run_frontend_helper", _other_symbol)
     card = bt.render_bulletin_card(
         "SPY",
-        "midday",
+        "premarket",
         "https://zerogex.io",
         tmp_path / "b.png",
         helper_path=str(_helper(tmp_path)),
@@ -252,7 +254,7 @@ def test_render_bulletin_card_never_reuses_an_old_picture(tmp_path, monkeypatch)
     out.write_bytes(_png_bytes())  # this morning's card
     monkeypatch.setattr(bt, "_run_frontend_helper", lambda *a, **k: (0, ""))
     card = bt.render_bulletin_card(
-        "SPY", "midday", "https://zerogex.io", out, helper_path=str(_helper(tmp_path))
+        "SPY", "premarket", "https://zerogex.io", out, helper_path=str(_helper(tmp_path))
     )
     assert not card.ok
     assert not out.exists()
@@ -262,7 +264,7 @@ def test_render_bulletin_card_without_the_helper(tmp_path, monkeypatch):
     from src.jobs import bulletin_tweet as bt
 
     monkeypatch.setattr(bt, "_locate_frontend_helper", lambda *a, **k: None)
-    card = bt.render_bulletin_card("SPY", "midday", "https://zerogex.io", tmp_path / "b.png")
+    card = bt.render_bulletin_card("SPY", "premarket", "https://zerogex.io", tmp_path / "b.png")
     assert "ZEROGEX_WEB_DIR" in card.error
 
 
@@ -277,7 +279,7 @@ def test_render_bulletin_card_passes_on_the_scripts_own_reason(tmp_path, monkeyp
     monkeypatch.setattr(bt, "_run_frontend_helper", lambda *a, **k: (7, said))
     card = bt.render_bulletin_card(
         "SPY",
-        "midday",
+        "premarket",
         "http://127.0.0.1:3000",
         tmp_path / "b.png",
         helper_path=str(_helper(tmp_path)),
@@ -291,7 +293,7 @@ def test_render_bulletin_card_passes_on_the_scripts_own_reason(tmp_path, monkeyp
     monkeypatch.setattr(bt, "_run_frontend_helper", lambda *a, **k: (1, crash))
     card = bt.render_bulletin_card(
         "SPY",
-        "midday",
+        "premarket",
         "http://127.0.0.1:3000",
         tmp_path / "b.png",
         helper_path=str(_helper(tmp_path)),
@@ -306,12 +308,12 @@ def test_the_screenshot_loads_the_website_on_this_box(monkeypatch):
 
     monkeypatch.delenv("BULLETIN_TWEET_RENDER_URL", raising=False)
     monkeypatch.delenv("ZEROGEX_SITE_URL", raising=False)
-    args = bt._parse_args(["--mode", "midday"])
+    args = bt._parse_args(["--mode", "premarket"])
     assert args.render_url == "http://127.0.0.1:3000"
     assert args.site_url == "https://zerogex.io"  # links in the post stay public
 
     monkeypatch.setenv("BULLETIN_TWEET_RENDER_URL", "http://10.0.0.5:3000")
-    assert bt._parse_args(["--mode", "midday"]).render_url == "http://10.0.0.5:3000"
+    assert bt._parse_args(["--mode", "premarket"]).render_url == "http://10.0.0.5:3000"
 
 
 def test_the_snapshot_token_never_reaches_the_log_or_the_email(tmp_path, monkeypatch, caplog):
@@ -342,7 +344,7 @@ def test_the_snapshot_token_never_reaches_the_log_or_the_email(tmp_path, monkeyp
     with caplog.at_level(logging.WARNING, logger="zerogex.bulletin_tweet"):
         card = bt.render_bulletin_card(
             "SPY",
-            "midday",
+            "premarket",
             "http://127.0.0.1:3000",
             tmp_path / "b.png",
             helper_path=str(_helper(tmp_path)),
@@ -417,7 +419,7 @@ def test_held_email_lists_the_reasons_and_attaches_the_card(tmp_path, monkeypatc
     png = tmp_path / "bulletin-spy.png"
     png.write_bytes(_png_bytes())
     assert bt._send_xpost_held_email(
-        "midday",
+        "premarket",
         "SPY",
         ["The post says CPI ran hot; no headline says that.", "Image: the card is blank."],
         _tweet(bt, GOOD_POST),
@@ -425,7 +427,7 @@ def test_held_email_lists_the_reasons_and_attaches_the_card(tmp_path, monkeypatc
         posting=True,
     )
     email = sent[0]
-    assert email["subject"] == "Midday X-Post NOT sent: $SPY"
+    assert email["subject"] == "Market Open X-Post NOT sent: $SPY"
     assert "Nothing was posted to X." in email["text"]
     assert "- The post says CPI ran hot; no headline says that." in email["text"]
     assert GOOD_POST in email["text"]
@@ -501,9 +503,9 @@ async def test_regenerate_reviews_the_post_without_an_image(monkeypatch):
         "review_post",
         lambda **k: reviews.append(k) or bulletin_llm.Review(ran=True),
     )
-    record = await bt.generate_and_store(db, "midday", "SPY", day=date(2026, 9, 24))
+    record = await bt.generate_and_store(db, "premarket", "SPY", day=date(2026, 9, 24))
     assert record["status"] == "regenerated"
-    assert record["post_text"].startswith("Midday Read - $SPY")
+    assert record["post_text"].startswith("Morning Read - $SPY")
     # The missing news is reported; the missing image is expected here.
     assert record["problems"] == ["No CNBC headlines."]
     assert reviews[0]["card_png"] is None
@@ -532,7 +534,7 @@ def test_generate_post_hands_back_the_draft_with_the_review(monkeypatch):
     monkeypatch.setattr(bulletin_llm, "_call_claude", _fake_call)
     draft = bulletin_llm.LlmPost(opening="SPY rallied.", bottom_line="Up.", reply="Nice.")
     post = bulletin_llm.generate_post(
-        mode="midday",
+        mode="premarket",
         day=date(2026, 9, 24),
         symbols=[bulletin_llm.SymbolInput(symbol="SPY", spot=744.62)],
         api_key="k",
@@ -558,7 +560,7 @@ def test_generate_post_reports_why_it_failed(monkeypatch):
     )
     errors: list[str] = []
     post = bulletin_llm.generate_post(
-        mode="midday",
+        mode="premarket",
         day=date(2026, 9, 24),
         symbols=[bulletin_llm.SymbolInput(symbol="SPY", spot=744.62)],
         api_key="k",
@@ -581,9 +583,9 @@ def test_review_post_returns_the_verdict_with_the_image(monkeypatch):
 
     monkeypatch.setattr(bulletin_llm, "_call_claude", _fake_call)
     review = bulletin_llm.review_post(
-        mode="midday",
+        mode="premarket",
         day=date(2026, 9, 24),
-        post_text="Midday Read - $SPY\n\nSPY rallied.",
+        post_text="Morning Read - $SPY\n\nSPY rallied.",
         reply_text="Watch 740.\n\nhttps://zerogex.io",
         symbol=bulletin_llm.SymbolInput(symbol="SPY", spot=744.62, prior_close=749.10),
         headlines=[bulletin_llm.Headline(title="Stocks slip after jobs report")],
@@ -597,7 +599,7 @@ def test_review_post_returns_the_verdict_with_the_image(monkeypatch):
     image, text = seen["content"]
     assert image["type"] == "image" and image["source"]["media_type"] == "image/png"
     payload = json.loads(text["text"])
-    assert payload["post"].startswith("Midday Read - $SPY")
+    assert payload["post"].startswith("Morning Read - $SPY")
     assert payload["levels"]["change_vs_prior_close_pct"] < 0
     assert payload["headlines"][0]["title"] == "Stocks slip after jobs report"
 
@@ -607,7 +609,7 @@ def test_review_post_that_cannot_run_is_not_an_approval(monkeypatch):
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     review = bulletin_llm.review_post(
-        mode="midday",
+        mode="premarket",
         day=date(2026, 9, 24),
         post_text="x",
         reply_text="y",
@@ -620,7 +622,7 @@ def test_review_post_that_cannot_run_is_not_an_approval(monkeypatch):
         bulletin_llm, "_call_claude", lambda *a: {"content": [], "stop_reason": "max_tokens"}
     )
     review = bulletin_llm.review_post(
-        mode="midday",
+        mode="premarket",
         day=date(2026, 9, 24),
         post_text="x",
         reply_text="y",
@@ -782,13 +784,13 @@ async def test_image_endpoint_serves_the_attached_card(tmp_path, monkeypatch):
     from src.jobs import bulletin_tweet as bt
 
     root = tmp_path / "artifacts"
-    png = root / "midday" / "2026-09-24" / "bulletin-spy.png"
+    png = root / "premarket" / "2026-09-24" / "bulletin-spy.png"
     png.parent.mkdir(parents=True)
     png.write_bytes(_png_bytes())
     monkeypatch.setattr(bt, "_artifact_root_candidates", lambda explicit=None: [root])
 
     monkeypatch.setattr(bt, "read_latest_record", lambda sym, mode: {"media": {"png": str(png)}})
-    resp = await ax.image(symbol="spy", mode="midday")
+    resp = await ax.image(symbol="spy", mode="premarket")
     assert Path(resp.path) == png.resolve()
     assert resp.media_type == "image/png"
 
@@ -799,12 +801,12 @@ async def test_image_endpoint_serves_the_attached_card(tmp_path, monkeypatch):
         bt, "read_latest_record", lambda sym, mode: {"media": {"png": str(outside)}}
     )
     with pytest.raises(HTTPException) as exc:
-        await ax.image(symbol="SPY", mode="midday")
+        await ax.image(symbol="SPY", mode="premarket")
     assert exc.value.status_code == 404
 
     monkeypatch.setattr(bt, "read_latest_record", lambda sym, mode: None)
     with pytest.raises(HTTPException) as exc:
-        await ax.image(symbol="SPY", mode="midday")
+        await ax.image(symbol="SPY", mode="premarket")
     assert exc.value.status_code == 404
 
 

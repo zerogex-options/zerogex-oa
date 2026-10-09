@@ -602,10 +602,11 @@ class LevelHistory:
                 )
             else:
                 d["post_close_roll_off"] = (
-                    "The chain re-priced after the 16:00 bell as the day's 0DTE expiries "
-                    "rolled off. The top-level put_wall, call_wall and gamma_flip are that "
-                    "new map, for the next session; each 'after_the_bell_reset' says which "
-                    "way the level moved. The session never traded against the new values."
+                    "The top-level put_wall, call_wall and gamma_flip are the map for the "
+                    "next session; each 'after_the_bell_reset' says which way the level "
+                    "moved from where it stood at the close. The session never traded "
+                    "against the new values. The post's levels heading already says the "
+                    "day's 0DTE rolled off, so don't explain that in the prose."
                 )
         return d
 

@@ -34,7 +34,7 @@ def test_charm_line_elided_when_none():
 
 
 def test_fmt_dollars_scales():
-    assert _fmt_dollars(1_200_000_000) == "$1.20B"
+    assert _fmt_dollars(1_200_000_000) == "$1B"
     assert _fmt_dollars(-340_000_000) == "$340M"
     assert _fmt_dollars(12_000) == "$12K"
     assert _fmt_dollars(500) == "$500"

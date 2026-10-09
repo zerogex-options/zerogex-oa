@@ -53,7 +53,7 @@ from src.jobs.bulletin_tweet import (
 logger = logging.getLogger("zerogex.bulletin_approve")
 ET = ZoneInfo("America/New_York")
 
-MODES = ("premarket", "midday", "close")
+MODES = ("premarket", "close")
 
 
 def _today_et() -> date:
@@ -269,7 +269,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--mode",
         choices=MODES,
         required=True,
-        help="Which of the three daily fires to approve.",
+        help="Which of the two daily fires to approve.",
     )
     parser.add_argument(
         "--date",

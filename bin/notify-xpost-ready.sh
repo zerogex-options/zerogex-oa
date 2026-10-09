@@ -48,11 +48,10 @@ if [[ -z "$RESEND_API_KEY" || -z "$RESEND_FROM_EMAIL" || -z "$BULLETIN_TWEET_EMA
     exit 0
 fi
 
-# Friendly timing word from the mode — matches "market open / midday /
-# market close".
+# Friendly timing word from the mode — matches "market open / market
+# close".
 case "$MODE" in
     premarket) TIMING="Market Open" ;;
-    midday)    TIMING="Midday" ;;
     close)     TIMING="Market Close" ;;
     *)         TIMING="$MODE" ;;
 esac

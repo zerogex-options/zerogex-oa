@@ -11,7 +11,7 @@ Endpoints (prefix ``/api/admin/x-post``):
   regenerate dropdown (``$BULLETIN_TWEET_SYMBOLS`` / SPY).
 * ``GET  /latest``      — the last auto-generated post + reply for a
   (timing, symbol).  Timing defaults to the current wall-clock ET slot
-  (Morning / Midday / Post-Market).  ``record`` is null when nothing has
+  (Morning / Post-Market).  ``record`` is null when nothing has
   been generated yet for that slot.
 * ``POST /regenerate``  — generate a fresh post+reply for (symbol, mode)
   on demand, review it, persist it as the new latest, and return it.  Never

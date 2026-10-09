@@ -1,4 +1,4 @@
-"""Tests for src.jobs.bulletin_tweet — the 09:15 / 12:30 / 16:05 daily
+"""Tests for src.jobs.bulletin_tweet — the 09:15 / 16:05 daily
 Live-Bulletin X-post job.
 
 Contract mirrors the other tweet crons (:mod:`test_forecast_tweet_job`,
@@ -193,11 +193,15 @@ def test_fmt_price_uses_locale_thousands_for_indices():
     assert mod._fmt_price(None) == "—"
 
 
-def test_fmt_net_gex_scales_by_magnitude():
+def test_fmt_net_gex_rounds_to_whole_units():
+    """Net gamma reads the way a person says it: "$6B", not "$6.28B"."""
     mod = _reload_module()
-    assert mod._fmt_net_gex(72_300_000.0) == "+$72.3M"
-    assert mod._fmt_net_gex(19_500_000_000.0) == "+$19.50B"
-    assert mod._fmt_net_gex(-1_200_000_000.0) == "-$1.20B"
+    assert mod._fmt_net_gex(72_300_000.0) == "+$72M"
+    assert mod._fmt_net_gex(6_280_000_000.0) == "+$6B"
+    assert mod._fmt_net_gex(19_500_000_000.0) == "+$20B"
+    assert mod._fmt_net_gex(-1_200_000_000.0) == "-$1B"
+    # Rounding up into the next scale is written in that scale.
+    assert mod._fmt_net_gex(-999_600_000.0) == "-$1B"
     assert mod._fmt_net_gex(None) == "—"
 
 
@@ -274,10 +278,16 @@ def test_build_tweet_body_close_shape(monkeypatch):
     # The header takes a plain hyphen, not a dash.
     assert lines[0] == "Post-Market Read - $SPY"
     assert "SPY closed right on its flip." in body.text
-    # The close read's levels are the next session's map, and say so; Python
-    # owns every price, written the way a person types them.
-    assert "Levels for tomorrow:\n• 740 put wall\n• 750 call wall\n• 744.51 gamma flip" in body.text
-    assert "DTE" not in body.text and "→" not in body.text and "—" not in body.text
+    # The close read's levels are the next session's map, and the heading is
+    # where it says so; Python owns every price, rounded to the dollar with a
+    # "~" when that rounds something off.
+    assert (
+        "With today's 0DTE rolling off, here is the map for tomorrow:\n"
+        "• 740 put wall\n• 750 call wall\n• ~745 gamma flip"
+    ) in body.text
+    # The heading is the only place 0DTE comes up.
+    assert body.text.count("DTE") == 1
+    assert "→" not in body.text and "—" not in body.text
     assert "Bottom line:" in body.text
     # The other two symbols get NO numeric block of their own.
     assert "$SPX" not in body.text and "$QQQ" not in body.text
@@ -297,9 +307,8 @@ def test_build_tweet_body_labels_per_mode(monkeypatch):
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
     for mode, header, heading in (
         ("premarket", "Morning Read - $SPY", "Key levels:"),
-        ("midday", "Midday Read - $SPY", "Key levels:"),
         # 2026-07-03 is a Friday, so the close read's map is for Monday.
-        ("close", "Post-Market Read - $SPY", "Levels for Monday:"),
+        ("close", "Post-Market Read - $SPY", "here is the map for Monday:"),
     ):
         body = mod.build_tweet_body(
             mode=mode,
@@ -585,7 +594,7 @@ def test_reply_text_carries_the_link(monkeypatch):
     _stub_writer(monkeypatch, mod, reply="Watch how 740 trades on the first test.")
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
     body = mod.build_tweet_body(
-        "midday", date(2026, 7, 3), bulletins, site_url="https://zerogex.io/", lead_symbol="SPY"
+        "premarket", date(2026, 7, 3), bulletins, site_url="https://zerogex.io/", lead_symbol="SPY"
     )
     # Trailing slash on the site URL is trimmed.
     assert body.reply_text == "Watch how 740 trades on the first test.\n\nhttps://zerogex.io"
@@ -596,7 +605,7 @@ def test_reply_text_env_override(monkeypatch):
     _stub_writer(monkeypatch, mod)
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
     body = mod.build_tweet_body(
-        "midday",
+        "premarket",
         date(2026, 7, 3),
         bulletins,
         site_url="https://zerogex.io",
@@ -643,8 +652,8 @@ def _png_media(mod, tmp_path):
 
 def _tweet(mod):
     return mod.TweetBody(
-        text="Midday Read - $SPY\n\nbody",
-        fallback="Midday Read - $SPY: spot 744.62",
+        text="Morning Read - $SPY\n\nbody",
+        fallback="Morning Read - $SPY: spot ~745",
         lead_symbol="SPY",
         symbols_present=["SPY"],
         reply_text="One more beat.\n\nhttps://zerogex.io",
@@ -658,7 +667,7 @@ def test_post_bulletin_posts_main_with_image_then_link_reply(monkeypatch, tmp_pa
     mod = _reload_module()
     calls = _fake_x(monkeypatch)
     result = mod.post_bulletin(
-        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="premarket"
     )
     assert result.ok
     assert result.tweet_id == "main-123"
@@ -666,7 +675,7 @@ def test_post_bulletin_posts_main_with_image_then_link_reply(monkeypatch, tmp_pa
     assert result.tweet_url == "https://x.com/i/web/status/main-123"
     assert len(calls["upload"]) == 1
     assert calls["post"][0] == {
-        "text": "Midday Read - $SPY\n\nbody",
+        "text": "Morning Read - $SPY\n\nbody",
         "media_ids": ["media-1"],
         "reply_to": None,
     }
@@ -679,7 +688,7 @@ def test_post_bulletin_survives_failed_reply(monkeypatch, tmp_path):
     mod = _reload_module()
     _fake_x(monkeypatch, fail_reply=True)
     result = mod.post_bulletin(
-        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="premarket"
     )
     assert result.ok
     assert result.tweet_id == "main-123"
@@ -690,7 +699,7 @@ def test_post_bulletin_survives_failed_reply(monkeypatch, tmp_path):
 def test_post_bulletin_never_posts_without_the_image(monkeypatch, tmp_path):
     mod = _reload_module()
     calls = _fake_x(monkeypatch)
-    result = mod.post_bulletin(_tweet(mod), mod.MediaArtifacts(), long=True, mode_label="midday")
+    result = mod.post_bulletin(_tweet(mod), mod.MediaArtifacts(), long=True, mode_label="premarket")
     assert not result.ok
     assert "image" in result.error
     assert calls == {"upload": [], "post": []}
@@ -701,7 +710,7 @@ def test_post_bulletin_stops_when_the_upload_fails(monkeypatch, tmp_path):
     mod = _reload_module()
     calls = _fake_x(monkeypatch, fail_upload=True)
     result = mod.post_bulletin(
-        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="premarket"
     )
     assert not result.ok
     assert "image upload" in result.error
@@ -713,7 +722,7 @@ def test_post_bulletin_does_not_swap_in_the_short_body(monkeypatch, tmp_path):
     mod = _reload_module()
     calls = _fake_x(monkeypatch, fail_post=True)
     result = mod.post_bulletin(
-        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="premarket"
     )
     assert not result.ok
     assert "X rejected the post" in result.error
@@ -723,7 +732,7 @@ def test_post_bulletin_does_not_swap_in_the_short_body(monkeypatch, tmp_path):
 def test_post_bulletin_needs_the_oauth_keys(monkeypatch, tmp_path):
     mod = _reload_module()
     result = mod.post_bulletin(
-        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="midday"
+        _tweet(mod), _png_media(mod, tmp_path), long=True, mode_label="premarket"
     )
     assert not result.ok
     assert "X_BOT_API_KEY" in result.error
@@ -807,7 +816,7 @@ async def test_dry_run_writes_artifacts_and_never_posts(tmp_path, monkeypatch):
     # card's numbers (744.62 spot / 747.29 flip), not the DB row's.
     assert stubs["cards"] == ["SPY"]
     text = (day_dir / "tweet_text.md").read_text()
-    assert "• 747.29 gamma flip" in text
+    assert "• ~747 gamma flip" in text
     assert manifest["bulletins"][0]["spot"] == pytest.approx(744.62)
     assert manifest["bulletins"][0]["card_as_of"] == "Jul 6, 2026 · 12:30 PM EDT"
 
@@ -825,7 +834,7 @@ async def test_skips_non_trading_days(tmp_path, monkeypatch, caplog):
     args = mod._parse_args(
         [
             "--mode",
-            "midday",
+            "premarket",
             "--date",
             "2026-07-04",  # Saturday
             "--artifact-dir",
@@ -838,7 +847,7 @@ async def test_skips_non_trading_days(tmp_path, monkeypatch, caplog):
     # DB should never have been touched on the skip path
     db_instance.connect.assert_not_awaited()
     # And no artifact directory should have been created
-    assert not (tmp_path / "midday").exists()
+    assert not (tmp_path / "premarket").exists()
 
 
 @pytest.mark.asyncio
@@ -1097,7 +1106,7 @@ def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
     assert body.text.startswith("Post-Market Read - $SPY\n\nInteresting close into the holiday.")
     assert "Bottom line: With the market closed tomorrow" in body.text
     # The levels list is still the Python-composed one, with no notes.
-    assert "• 740 put wall\n• 750 call wall\n• 744.51 gamma flip" in body.text
+    assert "• 740 put wall\n• 750 call wall\n• ~745 gamma flip" in body.text
     # No hashtag row / link in the main post; the link rides in the reply.
     assert "#Gamma" not in body.text
     assert "zerogex.io" not in body.text
@@ -1468,7 +1477,7 @@ def test_compose_reply_static_fallback_when_no_llm():
 
 def test_key_levels_block_orders_and_formats():
     """Put wall, call wall, gamma flip; whole strikes lose their ".00", the
-    flip keeps its cents, and nothing else rides on the line."""
+    flip rounds to the dollar with a "~", and nothing else rides on the line."""
     mod = _reload_module()
     b = mod._shape_bulletin(
         _summary_row(
@@ -1483,19 +1492,21 @@ def test_key_levels_block_orders_and_formats():
     assert mod._key_levels_block(b).splitlines() == [
         "• 740 put wall",
         "• 745 call wall",
-        "• 747.29 gamma flip",
+        "• ~747 gamma flip",
     ]
 
 
-def test_fmt_level_matches_the_cards_digits():
-    """The card rounds half up on the exact value (the browser's toFixed /
-    toLocaleString); the post must show the same digits."""
+def test_fmt_level_rounds_to_the_dollar_and_marks_approximations():
+    """Levels go to the nearest dollar (half up on the exact value, as the
+    card rounds), with a "~" whenever that rounds anything off."""
     mod = _reload_module()
     assert mod._fmt_level(745.0) == "745"
-    assert mod._fmt_level(747.29) == "747.29"
-    assert mod._fmt_level(747.125) == "747.13"  # an exact tie rounds up
+    assert mod._fmt_level(747.29) == "~747"
+    assert mod._fmt_level(747.5) == "~748"  # an exact tie rounds up
+    assert mod._fmt_level(745.5) == "~746"  # a half-dollar strike is approximate
+    # Float noise on a whole strike is still the strike, not "about" it.
     assert mod._fmt_level(744.996) == "745"
-    assert mod._fmt_level(7482.71) == "7,483"  # index scale: whole, like the card
+    assert mod._fmt_level(7482.71) == "~7,483"
     assert mod._fmt_level(7500.0) == "7,500"
 
 
@@ -1556,10 +1567,9 @@ async def test_attach_price_action_sets_prior_close_and_regime():
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
-        # Wednesday's pre-market / midday reads gap from Tuesday's close (the
-        # most recent completed session = current_session_close), NOT Monday's.
+        # Wednesday's pre-market read gaps from Tuesday's close (the most
+        # recent completed session = current_session_close), NOT Monday's.
         ("premarket", 772.68),
-        ("midday", 772.68),
         # The 16:05 close read fires once today's session has closed, so
         # current_session_close is today and the reference is the one before
         # it: prior_session_close.
@@ -1582,7 +1592,7 @@ async def test_attach_price_action_prior_close_is_mode_aware(mode, expected):
         # Tuesday is now prior_session_close.
         closes = {"current_session_close": 775.38, "prior_session_close": 772.68}
     else:
-        # Pre-market / midday: today (Wed) not yet closed, so Tuesday is
+        # Pre-market: today (Wed) not yet closed, so Tuesday is
         # current_session_close and Monday is prior_session_close.
         closes = {"current_session_close": 772.68, "prior_session_close": 758.33}
     db.get_session_closes = AsyncMock(return_value=closes)
@@ -1608,27 +1618,27 @@ def test_latest_record_roundtrip(tmp_path, monkeypatch):
         "SPY",
     )
     tweet = mod.TweetBody(
-        text="Midday Read — $SPY\n\nbody",
-        fallback="$SPY midday",
+        text="Morning Read - $SPY\n\nbody",
+        fallback="$SPY premarket",
         lead_symbol="SPY",
         symbols_present=["SPY"],
         reply_text="Watch the levels: https://zerogex.io",
         featured_symbol="SPY",
     )
     rec = mod.build_latest_record(
-        mode="midday",
+        mode="premarket",
         day=date(2026, 7, 3),
         tweet=tweet,
         featured=feat,
         headlines=[{"title": "Oil eases", "summary": "", "source": "CNBC"}],
-        generated_at="2026-07-03T12:30:00-04:00",
+        generated_at="2026-07-03T09:15:00-04:00",
     )
     path = mod.write_latest_record(rec)
     assert path is not None and path.exists()
-    got = mod.read_latest_record("SPY", "midday")
-    assert got["post_text"] == "Midday Read — $SPY\n\nbody"
+    got = mod.read_latest_record("SPY", "premarket")
+    assert got["post_text"] == "Morning Read - $SPY\n\nbody"
     assert got["reply_text"].endswith("https://zerogex.io")
-    assert got["timing_label"] == "Midday Read"
+    assert got["timing_label"] == "Morning Read"
     assert got["headlines"][0]["title"] == "Oil eases"
     # Absent (symbol, mode) → None, not an error.
     assert mod.read_latest_record("QQQ", "close") is None
@@ -1638,29 +1648,29 @@ def test_read_latest_record_any_returns_newest(tmp_path, monkeypatch):
     """read_latest_record_any picks the newest record for a mode across symbols."""
     mod = _reload_module()
     monkeypatch.setenv("BULLETIN_TWEET_ARTIFACT_DIR", str(tmp_path))
-    # Neutralize the other candidate roots so the "premarket absent" check and
+    # Neutralize the other candidate roots so the "close absent" check and
     # the newest-pick can't be perturbed by real records on a configured host.
     monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", tmp_path / "primary-noexist")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     latest = mod.resolve_latest_dir()
     assert latest is not None
-    (latest / "SPX-midday.json").write_text(
+    (latest / "SPX-premarket.json").write_text(
         json.dumps(
             {
                 "symbol": "SPX",
-                "mode": "midday",
-                "generated_at": "2026-07-27T12:30:00-04:00",
+                "mode": "premarket",
+                "generated_at": "2026-07-27T09:15:00-04:00",
                 "post_text": "spx",
             }
         )
     )
-    (latest / "SPY-midday.json").write_text(
+    (latest / "SPY-premarket.json").write_text(
         json.dumps(
             {
                 "symbol": "SPY",
-                "mode": "midday",
-                "generated_at": "2026-07-27T12:31:30-04:00",
+                "mode": "premarket",
+                "generated_at": "2026-07-27T09:16:30-04:00",
                 "post_text": "spy",
             }
         )
@@ -1675,11 +1685,13 @@ def test_read_latest_record_any_returns_newest(tmp_path, monkeypatch):
             }
         )
     )
-    got = mod.read_latest_record_any("midday")
-    assert got["symbol"] == "SPY"  # newer generated_at than the SPX midday row
+    # The newer close record is another mode's, so it isn't picked.
+    got = mod.read_latest_record_any("premarket")
+    assert got["symbol"] == "SPY"  # newer generated_at than the SPX premarket row
     assert got["post_text"] == "spy"
     # A mode with no records → None, never an error.
-    assert mod.read_latest_record_any("premarket") is None
+    (latest / "SPY-close.json").unlink()
+    assert mod.read_latest_record_any("close") is None
 
 
 def test_read_latest_record_when_write_dir_unresolvable(tmp_path, monkeypatch):
@@ -1717,7 +1729,7 @@ def test_xpost_ready_email_skips_without_resend_config(monkeypatch):
     for k in ("RESEND_API_KEY", "RESEND_FROM_EMAIL", "BULLETIN_TWEET_EMAIL_TO"):
         monkeypatch.delenv(k, raising=False)
     # Never raises, returns False when unconfigured.
-    assert mod._send_xpost_ready_email("midday") is False
+    assert mod._send_xpost_ready_email("premarket") is False
 
 
 def test_xpost_ready_email_posts_to_resend(monkeypatch):
@@ -1748,13 +1760,13 @@ def test_xpost_ready_email_posts_to_resend(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(mod, "urlopen", _fake_urlopen)
-    assert mod._send_xpost_ready_email("midday") is True
+    assert mod._send_xpost_ready_email("premarket") is True
     assert captured["url"] == "https://api.resend.com/emails"
     assert captured["auth"] == "Bearer re_test"
     # A real product UA — NOT the default Python-urllib one that Cloudflare 403s.
     assert captured["ua"] and "urllib" not in captured["ua"].lower()
     payload = json.loads(captured["body"])
-    assert payload["subject"] == "Midday X-Post Ready"
+    assert payload["subject"] == "Market Open X-Post Ready"
     assert payload["to"] == ["me@example.com"]
     assert "https://zerogex.io/admin/x-post" in payload["text"]
 
@@ -1770,7 +1782,7 @@ def test_xpost_ready_email_respects_disable_flag(monkeypatch):
         raise AssertionError("must not send when disabled")
 
     monkeypatch.setattr(mod, "urlopen", _boom)
-    assert mod._send_xpost_ready_email("midday") is False
+    assert mod._send_xpost_ready_email("premarket") is False
 
 
 def test_xpost_admin_url_defaults_to_site_url(monkeypatch):
@@ -2416,19 +2428,6 @@ async def test_close_read_net_gex_stays_what_the_card_shows():
 
 
 @pytest.mark.asyncio
-async def test_midday_read_tracks_migration_without_a_roll_off_line():
-    mod = _reload_module()
-    b = mod._shape_bulletin(_summary_row("SPY", spot=775.40, put_wall=775.0), "SPY")
-    await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "midday")
-    assert b.level_history is not None
-    # Midday never re-anchors — the latest row IS the session structure.
-    assert b.put_wall == pytest.approx(775.0)
-    from src.jobs import level_history as lh
-
-    assert lh.note_for(b.level_history, "put_wall").startswith("moved 777 → 776 → 775")
-
-
-@pytest.mark.asyncio
 async def test_premarket_read_skips_level_history():
     """Nothing has traded yet — there is no path to describe."""
     mod = _reload_module()
@@ -2462,14 +2461,14 @@ async def test_key_levels_block_carries_no_notes_even_when_the_walls_moved():
     assert mod._key_levels_block(b).splitlines() == [
         "• 765 put wall",
         "• 780 call wall",
-        "• 769.80 gamma flip",
+        "• ~770 gamma flip",
     ]
 
 
 @pytest.mark.asyncio
 async def test_close_post_labels_the_levels_as_the_next_sessions_map():
-    """The post quotes the card's post-bell levels, so it says whose map they
-    are instead of appending a separate after-the-bell line."""
+    """The post quotes the card's post-bell levels, so its heading says whose
+    map they are, framed as the lead-in to tomorrow rather than as news."""
     mod = _reload_module()
     from src.jobs import bulletin_llm
 
@@ -2480,13 +2479,14 @@ async def test_close_post_labels_the_levels_as_the_next_sessions_map():
     await mod._attach_level_history(_history_db(), b, date(2026, 8, 13), "close")
     post = bulletin_llm.LlmPost(
         opening="SPY lost 777 and 776 before 775 finally held.",
-        bottom_line="The roll-off drops the put wall to 765 for tomorrow.",
+        bottom_line="Tomorrow starts with the put wall down at 765.",
         reply="Watch whether 765 gets tested early.",
     )
     text = mod._compose_new_post(post, b, "close", date(2026, 8, 13))  # a Thursday
-    assert "Levels for tomorrow:\n• 765 put wall\n• 780 call wall\n• 769.80 gamma flip" in text
+    heading = "With today's 0DTE rolling off, here is the map for tomorrow:"
+    assert f"{heading}\n• 765 put wall\n• 780 call wall\n• ~770 gamma flip" in text
     assert "After the bell" not in text
-    assert text.index("Levels for tomorrow:") < text.index("Bottom line:")
+    assert text.index(heading) < text.index("Bottom line:")
 
 
 @pytest.mark.asyncio

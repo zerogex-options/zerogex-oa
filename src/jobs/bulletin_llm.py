@@ -1,7 +1,7 @@
 """LLM-written narrative for bulletin tweets, plus the review that gates them.
 
-The bulletin auto-tweet fires three times a trading day (pre-market,
-midday, close).  Each fire hands the day's structured snapshot (the
+The bulletin auto-tweet fires twice a trading day (pre-market and
+close).  Each fire hands the day's structured snapshot (the
 Live Bulletin card's levels, the featured symbol's price action vs the
 previous close, and the latest market headlines from CNBC) to Claude and
 asks it to write a natural market read in the founder's voice, plus a
@@ -49,6 +49,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from src.jobs import bulletin_format as fmt
 from src.market_calendar import NYSE_HOLIDAYS
 
 logger = logging.getLogger("zerogex.bulletin_llm")
@@ -80,16 +81,16 @@ _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
 # The header label for each mode.  Python writes the header line itself.
 MODE_HEADER_LABEL = {
     "premarket": "Morning Read",
-    "midday": "Midday Read",
     "close": "Post-Market Read",
 }
 
 
 SYSTEM_PROMPT = """\
-You write the market posts the ZeroGEX X account publishes three times each
-trading day.  The founder posts them as their own, so every one has to read
-like the founder typed it: a sharp trader explaining what the tape is doing,
-in plain American English.  Never like a bot, a newsletter or a data readout.
+You write the market posts the ZeroGEX X account publishes each trading day:
+a Morning Read before the open and a Post-Market Read after the close.  The
+founder posts them as their own, so every one has to read like the founder
+typed it: a sharp trader explaining what the tape is doing, in plain American
+English.  Never like a bot, a newsletter or a data readout.
 
 Each post is about ONE symbol, the one named in "featured_symbol".
 
@@ -98,15 +99,18 @@ WHAT YOU ARE GIVEN
    time each was published.
 2. "levels": the featured symbol's numbers.  spot, put_wall, call_wall,
    gamma_flip, max_pain and net_gex are exactly what the Live Bulletin image
-   attached to the post shows, and "regime" is the regime that image shows
-   ("positive": spot above the gamma flip, dealers long gamma; "negative":
-   below it, dealers short gamma; "neutral": sitting right on the flip).
-   Price action: prior_close, change_vs_prior_close_pct, session_open,
-   session_high, session_low and momentum.  On the midday and close posts,
-   "level_history" says how the walls and the flip moved during the session
-   and what price did at each one.
-3. "context": the mode (premarket, midday or close), the date and calendar
-   flags (a holiday tomorrow, a half day).
+   attached to the post shows (all expirations), and "regime" is the regime
+   that image shows ("positive": spot above the gamma flip, dealers long
+   gamma; "negative": below it, dealers short gamma; "neutral": sitting right
+   on the flip).  Price action: prior_close, change_vs_prior_close_pct,
+   session_open, session_high, session_low and momentum.  "display" has each
+   of those numbers written the way the post writes them.  On the Morning
+   Read, "zero_dte" has the put wall, call wall and gamma flip from today's
+   expiring options alone (0DTE); it is null when there are none.  On the
+   close post, "level_history" says how the walls and the flip moved during
+   the session and what price did at each one.
+3. "context": the mode (premarket or close), the date and calendar flags (a
+   holiday tomorrow, a half day).
 
 WHAT TO WRITE
 * "opening": two to four short paragraphs.  Tie the news to what price has
@@ -123,22 +127,27 @@ WHAT TO WRITE
   setup.  Don't restate the bottom line, don't end with a colon or a call to
   action, and don't include a link or hashtags; the zerogex.io link is added
   after it for you.
-The caller adds the header line and the list of key levels.  Don't write
+The caller adds the header line and the key levels lists.  Don't write
 either, and don't list the levels in your prose.
 
 MATCH THE MODE
 * premarket (the Morning Read, 9:15 AM ET): look ahead to the open.  Where
   the symbol sits against the levels going in, and what the overnight and
-  morning news sets up.
-* midday (the Midday Read, 12:30 PM ET): what has happened so far this
-  session, what held and what didn't.
+  morning news sets up.  When "zero_dte" is there, the post lists two maps,
+  all expirations and 0DTE only.  When they differ in a way that matters (a
+  0DTE wall much closer to spot, a 0DTE flip on the other side of price),
+  that's worth a sentence.  Call a 0DTE level the 0DTE one; a level named
+  without "0DTE" is the all-expirations one.
 * close (the Post-Market Read, 4:05 PM ET): look back at the session, then
   ahead.  On this post the top-level put_wall, call_wall and gamma_flip are
-  the map for the NEXT session: after the 4:00 PM bell the day's 0DTE
-  options expired, the chain re-priced, and the attached image shows the new
-  map.  What the levels were during the session is in "level_history".  Keep
-  the two apart, and never say today's tape reacted to a level that is only
-  in the new map.
+  the map for the NEXT session, and the caller lists them under "With
+  today's 0DTE rolling off, here is the map for tomorrow:".  What the levels
+  were during the session is in "level_history".  Keep the two apart, and
+  never say today's tape reacted to a level that is only in the new map.
+  Don't explain that the day's 0DTE options expired or rolled off, or that
+  the chain re-priced after the bell: it happens every day and the list's
+  heading already says it.  Look ahead by talking about the new map itself,
+  where tomorrow's walls and flip sit against the close.
 
 FACTS: ONLY WHAT YOU ARE GIVEN
 * Every piece of news comes from the headlines (a title or a summary).  Add
@@ -152,12 +161,21 @@ FACTS: ONLY WHAT YOU ARE GIVEN
   session_low, and what happened at a level only from level_history's
   outcomes ("broke", "held", "untested").  Without level_history, don't say a
   level held, broke or was tested.
-* Every price or level you write must appear in "levels": a level's value,
-  or a value from its own path in level_history.  Write a level the way the
-  input gives it; a 778 call wall is never "the 780 call wall".  If you quote
-  net gamma, use "net_gex_display".
+* Every price or level you write must appear in "levels": a level's value
+  (a 0DTE one included), or a value from its own path in level_history.  A
+  778 call wall is never "the 780 call wall".
 * Use the most relevant of the headlines.  If none of them is about markets,
   the economy, rates or companies, leave the news out rather than stretch.
+
+NUMBERS: ROUND THEM THE WAY A PERSON SAYS THEM
+* Prices and levels go to the nearest whole dollar, with a "~" in front when
+  that rounds something off: a 747.29 flip is "~747", a 745 wall is "745", a
+  744.51 spot is "~745".  "display" has each one written that way; use it.
+  A value from level_history gets the same treatment.  Never write cents.
+* Net gamma is whole billions or millions: "$6B", never "$6.28B".  Use
+  display's net_gex.
+* The day's change takes one decimal: "0.4%", never "0.39%".  Use display's
+  change_vs_prior_close.
 
 HOW IT SHOULD SOUND
 * American English spelling and usage (color, favor, center, analyze).
@@ -253,11 +271,43 @@ class SymbolInput:
     level_history: dict[str, Any] | None = None
     historical_level_values: list[float] = field(default_factory=list)
     level_paths: dict[str, list[float]] = field(default_factory=dict)
+    # The Morning Read's second map: "put_wall" / "call_wall" / "gamma_flip"
+    # from today's expiring options alone.  None on the close read and when
+    # there's no same-day expiration.
+    zero_dte: dict[str, float | None] | None = None
 
     def change_pct(self) -> float | None:
         if self.spot is None or self.prior_close in (None, 0):
             return None
         return (self.spot - self.prior_close) / self.prior_close * 100
+
+    def display(self) -> dict[str, Any]:
+        """Every number the model may quote, written the way the post writes
+        it (see :mod:`src.jobs.bulletin_format`)."""
+
+        def _price(v: float | None) -> str | None:
+            return fmt.price(v) if v is not None else None
+
+        out: dict[str, Any] = {
+            key: _price(getattr(self, key))
+            for key in (
+                "spot",
+                "prior_close",
+                "session_open",
+                "session_high",
+                "session_low",
+                "gamma_flip",
+                "call_wall",
+                "put_wall",
+                "max_pain",
+            )
+        }
+        out["net_gex"] = fmt.signed_dollars(self.net_gex) if self.net_gex is not None else None
+        change = self.change_pct()
+        out["change_vs_prior_close"] = fmt.pct(change) if change is not None else None
+        if self.zero_dte:
+            out["zero_dte"] = {key: _price(v) for key, v in self.zero_dte.items()}
+        return out
 
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
@@ -274,42 +324,22 @@ class SymbolInput:
             "call_wall": self.call_wall,
             "put_wall": self.put_wall,
             "max_pain": self.max_pain,
-            # Present net_gex both as raw float (for the model to reason
-            # about magnitude/sign) AND pre-formatted in the short scale
-            # the model MUST use verbatim if it quotes the number.
+            # The raw float is for reasoning about magnitude and sign; the
+            # model quotes display["net_gex"] ("-$1B"), never this.
             "net_gex": self.net_gex,
-            "net_gex_display": _short_scale_gex(self.net_gex),
             "regime": self.regime,
             "momentum": self.momentum_label,
             "vwap": self.vwap,
             "vwap_position": self.vwap_position,
-            # Present only on the midday / close fires: how the levels moved
-            # during the session and what price did at each.  The level fields
-            # above are what the attached card shows now (on the close read,
-            # the map for the next session).
+            # The Morning Read's 0DTE-only map; None on the close read.
+            "zero_dte": self.zero_dte,
+            # Every number above as the post writes it.
+            "display": self.display(),
+            # Present only on the close fire: how the levels moved during the
+            # session and what price did at each.  The level fields above are
+            # what the attached card shows now, the map for the next session.
             "level_history": self.level_history,
         }
-
-
-def _short_scale_gex(v: float | None) -> str | None:
-    """Mirror :func:`src.jobs.bulletin_tweet._fmt_net_gex` — the short-scale
-    form ("+$7.74B", "-$125.0M") the post uses.  A plain hyphen, not the
-    typographic minus the card draws: the post has to read as typed.
-
-    Duplicated here so bulletin_llm has no import dependency on
-    bulletin_tweet (which imports the LLM module lazily).  Keeps them
-    decoupled."""
-    if v is None:
-        return None
-    abs_v = abs(v)
-    sign = "+" if v >= 0 else "-"
-    if abs_v >= 1e9:
-        return f"{sign}${abs_v / 1e9:.2f}B"
-    if abs_v >= 1e6:
-        return f"{sign}${abs_v / 1e6:.1f}M"
-    if abs_v >= 1e3:
-        return f"{sign}${abs_v / 1e3:.0f}K"
-    return f"{sign}${abs_v:.0f}"
 
 
 @dataclass
@@ -629,6 +659,7 @@ def _input_prices(s: SymbolInput) -> list[float]:
         s.max_pain,
         s.vwap,
         *s.historical_level_values,
+        *(s.zero_dte or {}).values(),
     )
     return [v for v in values if v is not None]
 
@@ -826,6 +857,22 @@ def _claim_holds(n: float, key: str, values: list[float]) -> bool:
     return any(abs(n - v) <= 0.5 for v in values)
 
 
+def _zero_dte_values(s: SymbolInput, key: str) -> list[float]:
+    """``key``'s value in the Morning Read's 0DTE-only map, if it has one."""
+    keys = ("call_wall", "put_wall") if key == "wall" else (key,)
+    zero_dte = s.zero_dte or {}
+    return [v for k in keys if (v := zero_dte.get(k)) is not None]
+
+
+def _claim_holds_for(n: float, key: str, s: SymbolInput) -> bool:
+    """Whether ``n`` is a value ``key`` had for ``s``: across all expirations
+    (its standing value or its session path) or in the 0DTE-only map.  The
+    0DTE value is checked on its own, so it never widens the flip's band."""
+    if _claim_holds(n, key, _level_values(s, key)):
+        return True
+    return any(_claim_holds(n, key, [v]) for v in _zero_dte_values(s, key))
+
+
 def _fmt_value(v: float) -> str:
     """Print a level as the post would: "765", "758.4", "7,650"."""
     return f"{v:,.2f}".rstrip("0").rstrip(".")
@@ -838,14 +885,21 @@ def _describe_level(s: SymbolInput, key: str) -> str:
         return " and ".join(parts)
     name = LEVEL_NAMES[key]
     values = _level_values(s, key)
-    if not values:
+    zero_dte = _zero_dte_values(s, key)
+    if not values and not zero_dte:
         return f"the input has no {name}"
-    if key == "gamma_flip" and len(values) > 1:
+    if not values:
+        said = f"the input has no all-expirations {name}"
+    elif key == "gamma_flip" and len(values) > 1:
         # Its values are the ends of a drift band, not a sequence of prints.
-        return f"the {name} ranged {_fmt_value(min(values))}–{_fmt_value(max(values))}"
-    if len(values) == 1:
-        return f"the {name} was {_fmt_value(values[0])}"
-    return f"the {name} was {' then '.join(_fmt_value(v) for v in values)}"
+        said = f"the {name} ranged {_fmt_value(min(values))}–{_fmt_value(max(values))}"
+    elif len(values) == 1:
+        said = f"the {name} was {_fmt_value(values[0])}"
+    else:
+        said = f"the {name} was {' then '.join(_fmt_value(v) for v in values)}"
+    if zero_dte:
+        said += f" (0DTE: {_fmt_value(zero_dte[0])})"
+    return said
 
 
 def _misstated_levels(post: LlmPost, symbols: list[SymbolInput]) -> list[tuple[float, str]]:
@@ -865,10 +919,10 @@ def _misstated_levels(post: LlmPost, symbols: list[SymbolInput]) -> list[tuple[f
             # A points move or a news figure ("the call wall is 15 points
             # up"), not a price for the level.
             continue
-        if any(_claim_holds(n, key, _level_values(s, key)) for s in in_band):
+        if any(_claim_holds_for(n, key, s) for s in in_band):
             continue
         actual = _describe_level(in_band[0], key)
-        if _level_values(in_band[0], key):
+        if _level_values(in_band[0], key) or _zero_dte_values(in_band[0], key):
             actual += f", never {_fmt_value(n)}"
         problems.append((n, f'"{snippet}": {actual}'))
     return problems
@@ -1056,15 +1110,20 @@ List a problem for each of these you find:
    level_history, and without level_history no such claim is supported.
 3. A level with the wrong number: a number named as the put wall, call wall,
    gamma flip or max pain must be that level's value in "levels" or a value
-   from its own level_history path.  A flip rounded to fewer decimals is
-   fine; a wall rounded to a different strike is not.
+   from its own level_history path, and one named as a 0DTE level must be
+   that level in "zero_dte".  The post writes prices and levels to the
+   nearest whole dollar, with "~" in front when that rounds something off
+   ("~747" for 747.29); that is the house style, not a mismatch.  A wall
+   written as a different strike is a problem.
 4. A regime claim the data contradicts: above the gamma flip is positive
    gamma (dealers long gamma), below it is negative gamma (dealers short
    gamma), and "regime" is what the attached image shows.
 5. On the close post, the top-level levels are the next session's map (the
    day's 0DTE options expired at the bell and the chain re-priced).  A
    sentence that has today's tape reacting to a level that appears only
-   there, and not in level_history, is a problem.
+   there, and not in level_history, is a problem.  So is prose that explains
+   the 0DTE options expiring or rolling off, or the chain re-pricing after
+   the bell: the levels heading already says it, and it happens every day.
 6. Headlines ignored: when the headlines include real market, economic, rate
    or company news, the post should use at least one of them.
 7. Writing that gives it away as generated or careless: British spellings;
@@ -1072,19 +1131,24 @@ List a problem for each of these you find:
    exclamation points; stock phrases or a formula hook; anything that reads
    like a bot or a press release instead of a trader typing; trade
    recommendations; hype.
+8. Our own numbers written more precisely than the house style: net gamma
+   with decimals ("$6.28B" where "display" says "$6B"), the day's change
+   with two decimals ("0.39%" where it says "0.4%"), or a price or level
+   with cents.  Figures quoted from a headline are exempt.
 
 Don't flag correct statements you would phrase differently, wording
-preferences, the header line, or the key levels list (those are checked
-separately), or numbers that match the inputs.
+preferences, the header line, or the key levels lists and their headings
+(those are checked separately), or numbers that match the inputs.
 
 The image ("image_problems"): it should be a fully rendered ZeroGEX Live
 Bulletin card for the featured symbol.  Flag a blank, cut-off or error page,
 a card for a different symbol, or a card whose main levels show a dash
 instead of a number.  The exact numbers were read from the page itself and
-are in "levels", so don't re-read small digits from the picture.  The change
-shown next to the card's price is measured from the card's own reference
-close, which after the 4:00 PM bell is today's close; judge the day's move by
-change_vs_prior_close_pct only.
+are in "levels", so don't re-read small digits from the picture.  The
+Morning Read's 0DTE-only levels are not on the image; that's expected.  The
+change shown next to the card's price is measured from the card's own
+reference close, which after the 4:00 PM bell is today's close; judge the
+day's move by change_vs_prior_close_pct only.
 
 Each problem is one short sentence that quotes the words at fault and says
 what is wrong.  Empty lists mean the post can go out.
