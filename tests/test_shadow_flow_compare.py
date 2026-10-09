@@ -142,3 +142,127 @@ def test_no_overlap_at_all_is_not_agreement():
     assert out["buckets_compared"] == 0
     assert out["sign_agreement_pct"] is None, "must not be reported as 100%"
     assert out["production_only"] == 1 and out["shadow_only"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Flip SIZE, not just flip rate
+#
+# 2026-10-09 came back at 71-77% sign agreement, which the pre-registered
+# rule called the middle band. A rate alone could not resolve it: a flip on
+# a near-zero bucket means the site read "balanced" either way, and a flip on
+# a big print is a different claim about the session.
+# ---------------------------------------------------------------------------
+
+
+def test_flips_are_banded_against_the_groups_own_median():
+    """Banded relative, not absolute. SPY's typical bucket and NDX's differ
+    by orders of magnitude, and a shared cutoff would call every NDX bucket
+    near-zero and report its flips as cosmetic."""
+    prod = [_row(i, 10_000) for i in range(9)] + [
+        _row(90, 1_000),  # 0.1x median -> near zero
+        _row(91, 10_000),  # 1.0x        -> typical
+        _row(92, 50_000),  # 5.0x        -> large
+    ]
+    shad = [_row(i, 10_000) for i in range(9)] + [
+        _row(90, -1_000),
+        _row(91, -10_000),
+        _row(92, -50_000),
+    ]
+    out = compare_buckets(prod, shad)
+
+    assert out["sign_disagrees"] == 3
+    assert out["flips_near_zero"] == 1
+    assert out["flips_typical"] == 1
+    assert out["flips_large"] == 1
+
+
+def test_banding_follows_a_thin_symbols_own_scale():
+    """The case relative banding exists for, and the one a fixed cutoff gets
+    wrong. Here the median bucket is 200, so a flip at 150 is an ordinary
+    bucket for this symbol. Any absolute threshold tuned to SPY would call it
+    near-zero and report a real disagreement as cosmetic.
+    """
+    prod = [_row(i, 200) for i in range(9)] + [_row(90, 150), _row(91, 2_000)]
+    shad = [_row(i, 200) for i in range(9)] + [_row(90, -150), _row(91, -2_000)]
+    out = compare_buckets(prod, shad)
+
+    assert out["median_abs_production"] == 200
+    assert out["flips_near_zero"] == 0, "150 is 0.75x this symbol's median, not near zero"
+    assert out["flips_typical"] == 1
+    assert out["flips_large"] == 1
+
+
+def test_many_flips_near_zero_are_a_small_share_of_the_flow():
+    """The case the share exists to expose: a 50% flip RATE that a subscriber
+    would barely see, because the flipped buckets carry almost no imbalance."""
+    prod = [_row(i, 100) for i in range(5)] + [_row(10 + i, 100_000) for i in range(5)]
+    shad = [_row(i, -100) for i in range(5)] + [_row(10 + i, 100_000) for i in range(5)]
+    out = compare_buckets(prod, shad)
+
+    assert out["sign_agreement_pct"] == 50.0, "half the buckets flipped"
+    assert out["flipped_share_of_flow_pct"] < 1.0, (
+        "but they carry under 1% of the session's imbalance -- the rate and "
+        "the impact are different questions"
+    )
+
+
+def test_few_flips_on_big_prints_are_a_large_share_of_the_flow():
+    """The mirror case, and the one that would stop a cutover."""
+    prod = [_row(i, 100) for i in range(8)] + [_row(10, 100_000), _row(11, 100_000)]
+    shad = [_row(i, 100) for i in range(8)] + [_row(10, -100_000), _row(11, -100_000)]
+    out = compare_buckets(prod, shad)
+
+    assert out["sign_agreement_pct"] == 80.0, "only a fifth of buckets flipped"
+    assert out["flipped_share_of_flow_pct"] > 99.0, "but they are nearly all the flow"
+
+
+def test_flip_bands_do_not_blow_up_on_an_all_zero_session():
+    out = compare_buckets([_row(0, 0), _row(1, 0)], [_row(0, 0), _row(1, 0)])
+
+    assert out["median_abs_production"] == 0
+    assert out["flipped_share_of_flow_pct"] is None, "0/0 is not 0%"
+
+
+# ---------------------------------------------------------------------------
+# Per-symbol
+# ---------------------------------------------------------------------------
+
+
+def test_each_symbol_is_summarised_separately():
+    """2026-10-09 gave 76.7% on SPY and 71.2% overall, so the rest agreed
+    around 69% -- INFERRED from two aggregates. Measure it instead."""
+    from src.tools.shadow_flow_compare import compare_by_underlying
+
+    prod = [
+        _row(0, 5_000, underlying="SPY"),
+        _row(1, 5_000, underlying="SPY"),
+        _row(0, 5_000, underlying="NDX"),
+    ]
+    shad = [
+        _row(0, 5_000, underlying="SPY"),
+        _row(1, 5_000, underlying="SPY"),
+        _row(0, -5_000, underlying="NDX"),
+    ]
+    out = compare_by_underlying(prod, shad)
+
+    assert set(out) == {"SPY", "NDX"}
+    assert out["SPY"]["sign_agreement_pct"] == 100.0
+    assert out["NDX"]["sign_agreement_pct"] == 0.0
+    assert out["SPY"]["buckets_compared"] == 2
+    assert out["NDX"]["buckets_compared"] == 1
+
+
+def test_a_symbol_the_rehearsal_missed_entirely_is_still_listed():
+    """Dropping it would hide a symbol the rehearsal never ingested, which is
+    a coverage failure and not agreement."""
+    from src.tools.shadow_flow_compare import compare_by_underlying
+
+    out = compare_by_underlying(
+        [_row(0, 5_000, underlying="SPY"), _row(0, 5_000, underlying="QQQ")],
+        [_row(0, 5_000, underlying="SPY")],
+    )
+
+    assert "QQQ" in out
+    assert out["QQQ"]["buckets_compared"] == 0
+    assert out["QQQ"]["production_only"] == 1
+    assert out["QQQ"]["sign_agreement_pct"] is None

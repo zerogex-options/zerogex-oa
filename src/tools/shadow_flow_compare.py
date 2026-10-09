@@ -144,7 +144,42 @@ def compare_buckets(
     diffs = [r["difference"] for r in rows]
     agree = sum(1 for r in rows if r["sign_agrees"])
 
+    # A flip is not one thing. On a bucket reading near zero the sign was
+    # never meaningful -- the site showed "roughly balanced" and would still
+    # show roughly balanced, with the arrow pointing the other way. On a
+    # bucket carrying real imbalance it is a different claim about the
+    # session. Counting both as one "flip" is what made 2026-10-09's 71-77%
+    # unreadable: the rate alone cannot distinguish them.
+    #
+    # Banded against this group's OWN median, not a fixed threshold, because
+    # SPY's typical bucket and NDX's are orders of magnitude apart and a
+    # shared cutoff would call every NDX bucket near-zero.
+    flips = [r for r in rows if not r["sign_agrees"]]
+    median_abs = st.median(scale) if scale else 0.0
+    bands = {"near_zero": 0, "typical": 0, "large": 0}
+    for r in flips:
+        mag = abs(r["production"])
+        if median_abs <= 0 or mag < 0.5 * median_abs:
+            bands["near_zero"] += 1
+        elif mag <= 1.5 * median_abs:
+            bands["typical"] += 1
+        else:
+            bands["large"] += 1
+
+    # The number that actually answers "would a subscriber notice": what
+    # share of the session's total absolute imbalance sits in buckets whose
+    # sign changed. A 25% flip RATE concentrated in near-zero buckets can be
+    # a low single-digit share of the flow, and that is a different product
+    # decision from the same rate spread across the day's big prints.
+    total_abs = sum(scale)
+    flipped_abs = sum(abs(r["production"]) for r in flips)
+
     return {
+        "median_abs_production": median_abs,
+        "flips_near_zero": bands["near_zero"],
+        "flips_typical": bands["typical"],
+        "flips_large": bands["large"],
+        "flipped_share_of_flow_pct": ((100.0 * flipped_abs / total_abs) if total_abs else None),
         "buckets_compared": len(rows),
         "production_only": len(set(prod) - set(shad)),
         "shadow_only": len(set(shad) - set(prod)),
@@ -156,6 +191,29 @@ def compare_buckets(
         "mean_abs_production": st.mean(scale) if scale else None,
         "shadow_higher": sum(1 for d in diffs if d > 0),
         "rows": rows,
+    }
+
+
+def compare_by_underlying(
+    production: Sequence[Tuple[Any, Any, int, int]],
+    shadow: Sequence[Tuple[Any, Any, int, int]],
+) -> Dict[Any, Dict[str, Any]]:
+    """The same summary, per symbol.
+
+    2026-10-09 gave 76.7% agreement on SPY and 71.2% across everything, which
+    means the rest agreed around 69% -- inferred from two aggregates rather
+    than measured. The tick test reads a SEQUENCE of trade prices, so a
+    contract that prints rarely leaves more zero ticks inheriting a carried
+    direction; it should degrade on thinner symbols, and SPX/NDX/QQQ are
+    thinner than SPY. That is a number worth having rather than deducing.
+    """
+    symbols = sorted({u for u, _, _, _ in production} | {u for u, _, _, _ in shadow}, key=str)
+    return {
+        sym: compare_buckets(
+            [r for r in production if r[0] == sym],
+            [r for r in shadow if r[0] == sym],
+        )
+        for sym in symbols
     }
 
 
@@ -225,6 +283,30 @@ def _print_report(result: Dict[str, Any], prod_db: str, shadow_db: str, verbose:
     print(f"  mean signed difference    {result['mean_signed_difference']:+,.0f}")
     print(f"  mean |production net|     {result['mean_abs_production']:,.0f}   <- for scale")
 
+    # A flip RATE alone cannot tell a cosmetic disagreement from a real one.
+    print(
+        f"\n  OF THE {result['sign_disagrees']} FLIPS, by the size of the bucket " f"they landed on"
+    )
+    print(f"    (this group's median |net| is {result['median_abs_production']:,.0f})")
+    print(
+        f"    near zero  (< 0.5x median)  {result['flips_near_zero']:>4}   "
+        f"<- sign was never meaningful; the site read 'balanced' either way"
+    )
+    print(f"    typical    (0.5-1.5x)       {result['flips_typical']:>4}")
+    print(
+        f"    large      (> 1.5x median)  {result['flips_large']:>4}   "
+        f"<- a different claim about the session"
+    )
+    if result["flipped_share_of_flow_pct"] is not None:
+        print(
+            f"\n  SHARE OF THE SESSION'S TOTAL |IMBALANCE| IN FLIPPED BUCKETS: "
+            f"{result['flipped_share_of_flow_pct']:.1f}%"
+        )
+        print("    This is the number that answers 'would a subscriber notice'.")
+        print("    A high flip RATE concentrated near zero can still be a low")
+        print("    single-digit share of the flow, and that is a different")
+        print("    product decision from the same rate on the day's big prints.")
+
     print("\n  Snapshot measurement for comparison (F11, 2026-10-08):")
     print("    47.6% of contracts relabelled, net sign flipped 16 of 27 (59%).")
     print("    If the sign agreement above is far better than 41%, bucketing")
@@ -265,6 +347,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _print_report(
         compare_buckets(production, shadow), args.production_db, args.shadow_db, args.verbose
     )
+
+    per_symbol = compare_by_underlying(production, shadow)
+    if len(per_symbol) > 1:
+        print("\n=== PER SYMBOL ===")
+        print("  The tick test reads a SEQUENCE of trade prices, so a contract")
+        print("  that prints rarely leaves more zero ticks inheriting a carried")
+        print("  direction. Expect thinner symbols to agree less than SPY.")
+        print(
+            f"\n  {'symbol':<10} {'buckets':>8} {'sign agrees':>13} "
+            f"{'flips near0/typ/large':>22} {'flipped % of flow':>18}"
+        )
+        for sym, r in per_symbol.items():
+            if not r["buckets_compared"]:
+                print(f"  {str(sym):<10} (no overlapping buckets)")
+                continue
+            pct = f"{r['sign_agreement_pct']:.1f}%"
+            bands = f"{r['flips_near_zero']}/{r['flips_typical']}/{r['flips_large']}"
+            share = (
+                f"{r['flipped_share_of_flow_pct']:.1f}%"
+                if r["flipped_share_of_flow_pct"] is not None
+                else "n/a"
+            )
+            print(
+                f"  {str(sym):<10} {r['buckets_compared']:>8} {pct:>13} " f"{bands:>22} {share:>18}"
+            )
     return 0
 
 
