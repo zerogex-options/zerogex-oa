@@ -146,6 +146,16 @@ backtest does not depend on a third-party indicator being installed. Under
 path (a running high/low updated per tick) is only reachable on each-tick
 calculation, which neither his chart nor this strategy uses.
 
+The colors only match his chart while the strategy's stochastic settings
+(%K 3, smoothing 3, 60/40) match that chart's jeStochastics. His YM chart's do.
+Check any other chart before trusting a color filter on it.
+
+`EntryBarColor` filters on the entry bar's own color. Jim asked for it on
+2026-10-09 ("the red/green is a good filter"). **Bright** means lime for a
+long and red for a short. **Skip** means white or black, which with
+`RequireColorFlip` on is the black-straight-to-white jump. **BrightOrSkip**
+accepts either.
+
 ## Open questions
 
 These are the places where the written rules left a genuine choice, and the
@@ -157,7 +167,9 @@ testable rather than load-bearing — but they are worth settling with him.
    long would then exclude forest green (K < 40), which contradicts "green
    should follow a black bar". The strategy implements the looser reading: any
    bar closing in the trade direction after an opposite-extreme bar.
-   `RequireSkip` narrows it to the stronger variant.
+   `EntryBarColor` now narrows it. `BrightOrSkip` is his written short rule
+   ("red or black") and its mirror for longs (lime or white); `Bright` is the
+   narrower filter he asked for on 2026-10-09.
 2. **Wave three and five.** Still unresolved — he asked whether the proposal
    meant waves or pulses, which it did not answer. Not implemented.
 3. **Midline break.** Measured on closes, from the pinch forward.

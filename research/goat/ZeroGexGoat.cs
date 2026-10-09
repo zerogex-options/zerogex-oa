@@ -57,7 +57,9 @@
 //    3. Price has not broken the midband against the trade since that pinch
 //       (see RequireNoMidlineBreak / MidlineBreakBypassSlopeTicks — Jim asked
 //       for flexibility here when slope is strong).
-//    4. The entry bar closes UP and the bar before it was BLACK.
+//    4. The entry bar closes UP and the bar before it was BLACK
+//       (RequireColorFlip). EntryBarColor can also require the entry bar's
+//       own color: bright green, or white for the "skipped green" jump.
 //    5. The entry bar closes AT OR ABOVE the EE line (within
 //       EntryEeToleranceTicks). A bar that closes away from the EE line is
 //       what Jim calls a REACHER, and a reacher is no trade.
@@ -138,11 +140,29 @@ namespace NinjaTrader.NinjaScript.Strategies
 		FixedTicks,
 	}
 
+	/// <summary>
+	/// The entry bar's own color, for a long (mirror for a short). Bright is
+	/// lime / red; Skip is white / black.
+	/// </summary>
+	public enum GoatEntryBar
+	{
+		Any,
+		Bright,
+		BrightOrSkip,
+		Skip,
+	}
+
 	public class ZeroGexGoat : Strategy
 	{
 		// -- indicator state ------------------------------------------------
 		private Series<double> fastK;   // raw stochastic, before smoothing
-		private SMA kSeries;            // jeStochastics' "slow %K"
+		//: jeStochastics' "slow %K": fastK averaged over SmoothK bars. Kept as
+		//: a series written every bar rather than SMA(fastK): ColorOf only
+		//: reads it when flat and pinched, and how NinjaTrader keeps an
+		//: indicator hosted on a custom series current between reads is not
+		//: something the compile check can verify. Written in place, the
+		//: colors depend on nothing but this file.
+		private Series<double> slowK;
 		private MIN minLow;
 		private MAX maxHigh;
 		private StdDev stdDev;
@@ -234,7 +254,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				MidlineBreakToleranceTicks = 0;
 				MidlineBreakBypassSlopeTicks = 0;   // 0 == bypass disabled
 				RequireColorFlip = true;
-				RequireSkip = false;
+				EntryBarColor = GoatEntryBar.Any;
 				EntryEeToleranceTicks = 0;
 				MinBandWidthTicks = 0;
 
@@ -259,9 +279,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 			else if (State == State.DataLoaded)
 			{
 				fastK = new Series<double>(this);
+				slowK = new Series<double>(this);
 				minLow = MIN(Low, PeriodK);
 				maxHigh = MAX(High, PeriodK);
-				kSeries = SMA(fastK, SmoothK);
 				stdDev = StdDev(Close, MidPeriod);
 
 				mid = MovingAverage(MidMaType, MidPeriod);
@@ -285,9 +305,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		protected override void OnBarUpdate()
 		{
-			// fastK has to be written before kSeries is read: SMA(fastK, n)
-			// pulls the value this bar just produced.
-			UpdateFastK();
+			// Every bar, warm-up included, so the colors are current whenever
+			// an entry check reads them.
+			UpdateStochastic();
 
 			if (CurrentBar < BarsRequiredToTrade)
 				return;
@@ -309,7 +329,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		// per tick) differs from its on-bar-close path. Under
 		// Calculate.OnBarClose only the branch below is ever taken, so this is
 		// the same arithmetic the chart shows.
-		private void UpdateFastK()
+		private void UpdateStochastic()
 		{
 			double hi = maxHigh[0];
 			double lo = minLow[0];
@@ -319,12 +339,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 				fastK[0] = CurrentBar == 0 ? 50.0 : fastK[1];
 			else
 				fastK[0] = Math.Min(100.0, Math.Max(0.0, 100.0 * (Close[0] - lo) / den));
+
+			// Same as NinjaTrader's SMA, which averages whatever bars exist
+			// until it has SmoothK of them.
+			int n = Math.Min(SmoothK, CurrentBar + 1);
+			double sum = 0.0;
+			for (int i = 0; i < n; i++)
+				sum += fastK[i];
+			slowK[0] = sum / n;
 		}
 
 		/// <summary>jeStochastics' "slow %K" — the line the colors key on.</summary>
 		private double K(int barsAgo)
 		{
-			return kSeries[barsAgo];
+			return slowK[barsAgo];
 		}
 
 		/// <summary>The paint-bar color of a bar, per Jim's brush mapping.</summary>
@@ -397,9 +425,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return false;
 			if (RequireColorFlip && ColorOf(1) != GoatBarColor.Black)
 				return false;
-			// "Skipped green": one bar carried K from below oversold to above
-			// overbought. Jim calls this the stronger version.
-			if (RequireSkip && ColorOf(0) != GoatBarColor.White)
+			if (!EntryBarAllowed(true))
 				return false;
 
 			// Rule 5 — snuggler, not reacher.
@@ -415,13 +441,37 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return false;
 			if (RequireColorFlip && ColorOf(1) != GoatBarColor.White)
 				return false;
-			if (RequireSkip && ColorOf(0) != GoatBarColor.Black)
+			if (!EntryBarAllowed(false))
 				return false;
 
 			if (Close[0] > ee[0] + EntryEeToleranceTicks * TickSize)
 				return false;
 
 			return !MidlineBrokenAgainst(false, slope);
+		}
+
+		/// <summary>
+		/// The entry bar's own color, per EntryBarColor. RequireColorFlip
+		/// governs the bar before it; this governs the entry bar itself.
+		/// Bright is lime for a long and red for a short: K between the
+		/// thresholds with the close in the trade's direction. Jim, 2026-10-09:
+		/// "the red/green is a good filter". Skip is white for a long and black
+		/// for a short; with the color flip on, that is his "skipped green"
+		/// jump, which he calls the stronger version.
+		/// </summary>
+		private bool EntryBarAllowed(bool isLong)
+		{
+			GoatBarColor color = ColorOf(0);
+			GoatBarColor bright = isLong ? GoatBarColor.Lime : GoatBarColor.Red;
+			GoatBarColor skip = isLong ? GoatBarColor.White : GoatBarColor.Black;
+
+			switch (EntryBarColor)
+			{
+				case GoatEntryBar.Bright:       return color == bright;
+				case GoatEntryBar.BrightOrSkip: return color == bright || color == skip;
+				case GoatEntryBar.Skip:         return color == skip;
+				default:                        return true;
+			}
 		}
 
 		/// <summary>
@@ -710,8 +760,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public bool RequireColorFlip { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Require skipped green/red (stronger)", Order = 9, GroupName = "4. Setup filters")]
-		public bool RequireSkip { get; set; }
+		[Display(Name = "Entry bar color (Bright = lime/red, Skip = white/black)", Order = 9, GroupName = "4. Setup filters")]
+		public GoatEntryBar EntryBarColor { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
@@ -734,12 +784,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Stop: extra ticks beyond entry bar", Order = 3, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Stop: extra ticks beyond entry bar (range mode only)", Order = 3, GroupName = "5. Sizing and exits")]
 		public int StopExtraTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name = "Stop: fixed ticks", Order = 4, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Stop: fixed ticks (FixedTicks mode only)", Order = 4, GroupName = "5. Sizing and exits")]
 		public int StopFixedTicks { get; set; }
 
 		[NinjaScriptProperty]
@@ -748,7 +798,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name = "Target 1: fixed ticks", Order = 6, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Target 1: fixed ticks (FixedTicks mode only)", Order = 6, GroupName = "5. Sizing and exits")]
 		public int Target1Ticks { get; set; }
 
 		[NinjaScriptProperty]
