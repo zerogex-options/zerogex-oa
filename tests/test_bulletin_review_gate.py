@@ -825,7 +825,7 @@ def test_a_crash_on_a_scheduled_run_still_emails_the_operator(monkeypatch):
             {"mode": mode, "symbol": symbol, "problems": problems, "posting": posting}
         ),
     )
-    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT", raising=False)
+    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT_CLOSE", raising=False)
     assert bt.main(["--mode", "close", "--stage"]) == 1
     assert held[0]["symbol"] == "SPY"
     assert "disk full" in held[0]["problems"][0]

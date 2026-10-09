@@ -20,8 +20,9 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 # premarket unit for the full stage → review → approve → post lifecycle.
 # The attached card is the live bulletin at 16:05, which is the next
 # session's map once the day's 0DTE has rolled off; the post labels its
-# levels that way.  Flip BULLETIN_TWEET_AUTOPILOT=1 in the
-# EnvironmentFile to auto-post without approval.
+# levels that way.  BULLETIN_TWEET_AUTOPILOT_CLOSE=1 in the EnvironmentFile
+# would auto-post it without approval; it's meant to stay off (the morning
+# post is the one to automate).
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode close --stage
 
 # Screenshot + writing + an independent fact-check (and one rewrite when it

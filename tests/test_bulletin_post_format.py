@@ -338,3 +338,130 @@ async def test_a_morning_fire_records_and_posts_both_maps(tmp_path, monkeypatch)
         "call_wall": 748.0,
         "gamma_flip": 745.6,
     }
+
+
+# ---------------------------------------------------------------------------
+# Autopilot: one switch per post, both off by default
+# ---------------------------------------------------------------------------
+
+SWITCHES = ("BULLETIN_TWEET_AUTOPILOT_MORNING", "BULLETIN_TWEET_AUTOPILOT_CLOSE")
+
+
+async def _scheduled_fire(mod, monkeypatch, tmp_path, mode: str) -> dict:
+    """Run one timer fire (--stage) with everything outside stubbed, and
+    report whether it posted or emailed "X-Post Ready"."""
+    _passing_run(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_deadline_problem", lambda *a, **k: None)
+    monkeypatch.delenv("BULLETIN_TWEET_NOTIFY_HOOK", raising=False)
+    out: dict = {"posted": [], "ready": [], "sent": []}
+
+    def _fake_post(**kwargs):
+        out["posted"].append(kwargs)
+        return mod.PostResult(ok=True, tweet_id="t-1", reply_id="r-1")
+
+    monkeypatch.setattr(mod, "post_bulletin", _fake_post)
+    monkeypatch.setattr(
+        mod,
+        "_send_xpost_ready_email",
+        lambda mode, png_path=None: out["ready"].append(mode) or True,
+    )
+    monkeypatch.setattr(mod, "_send_xpost_sent_email", lambda *a: out["sent"].append(a) or True)
+    args = mod._parse_args(
+        [
+            "--mode",
+            mode,
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path),
+            "--stage",
+            "--allow-non-trading-day",
+        ]
+    )
+    out["rc"] = await mod._run(args)
+    return out
+
+
+@pytest.mark.parametrize("mode", ["premarket", "close"])
+@pytest.mark.asyncio
+async def test_by_default_every_post_waits_for_you(tmp_path, monkeypatch, mode):
+    """Both switches off (the default): each fire stages the post and emails
+    "X-Post Ready"; nothing goes to X."""
+    mod = _reload_module()
+    for switch in SWITCHES:
+        monkeypatch.delenv(switch, raising=False)
+    out = await _scheduled_fire(mod, monkeypatch, tmp_path, mode)
+    assert out["rc"] == 0
+    assert out["posted"] == []
+    assert out["ready"] == [mode]
+
+
+@pytest.mark.asyncio
+async def test_the_morning_switch_posts_the_morning_read(tmp_path, monkeypatch):
+    mod = _reload_module()
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_MORNING", "1")
+    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT_CLOSE", raising=False)
+    out = await _scheduled_fire(mod, monkeypatch, tmp_path, "premarket")
+    assert out["rc"] == 0
+    assert len(out["posted"]) == 1
+    assert out["posted"][0]["media"].png_path.name == "bulletin-spy.png"
+    assert out["ready"] == []
+    assert len(out["sent"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_morning_switch_leaves_the_close_post_waiting(tmp_path, monkeypatch):
+    mod = _reload_module()
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_MORNING", "1")
+    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT_CLOSE", raising=False)
+    out = await _scheduled_fire(mod, monkeypatch, tmp_path, "close")
+    assert out["posted"] == []
+    assert out["ready"] == ["close"]
+
+
+@pytest.mark.parametrize("mode", ["premarket", "close"])
+@pytest.mark.asyncio
+async def test_the_old_shared_switch_turns_nothing_on(tmp_path, monkeypatch, caplog, mode):
+    """A BULLETIN_TWEET_AUTOPILOT=1 left in .env must not put either post on
+    autopilot; the log says which switch to use instead."""
+    mod = _reload_module()
+    for switch in SWITCHES:
+        monkeypatch.delenv(switch, raising=False)
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    with caplog.at_level("WARNING", logger="zerogex.bulletin_tweet"):
+        out = await _scheduled_fire(mod, monkeypatch, tmp_path, mode)
+    assert out["posted"] == []
+    assert out["ready"] == [mode]
+    assert mod.AUTOPILOT_SWITCHES[mode] in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("value", "on"),
+    [("1", True), ("true", True), ("YES", True), (" on ", True), ("0", False), ("", False)],
+)
+def test_switch_values(monkeypatch, value, on):
+    mod = _reload_module()
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_MORNING", value)
+    assert mod.autopilot_on("premarket") is on
+
+
+def test_a_manual_post_flag_still_posts_without_any_switch(monkeypatch):
+    mod = _reload_module()
+    for switch in SWITCHES:
+        monkeypatch.delenv(switch, raising=False)
+    assert mod._will_post(mod._parse_args(["--mode", "close", "--post"])) is True
+    assert mod._will_post(mod._parse_args(["--mode", "close", "--stage"])) is False
+
+
+def test_the_status_report_says_what_is_on(monkeypatch):
+    mod = _reload_module()
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_MORNING", "1")
+    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT_CLOSE", raising=False)
+    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT", raising=False)
+    for key in ("X_BOT_API_KEY", "X_BOT_API_SECRET", "X_BOT_ACCESS_TOKEN"):
+        monkeypatch.setenv(key, "x")
+    monkeypatch.delenv("X_BOT_ACCESS_TOKEN_SECRET", raising=False)
+    report = mod.autopilot_report().splitlines()
+    assert report[0].startswith("Morning Read: ON")
+    assert report[1].startswith("Post-Market Read: off")
+    assert "MISSING" in report[2] and "X_BOT_ACCESS_TOKEN_SECRET" in report[2]

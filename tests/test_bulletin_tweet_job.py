@@ -1819,7 +1819,8 @@ async def test_stage_flag_writes_pending_and_calls_hook(tmp_path, monkeypatch):
         lambda mode, png_path=None: ready.append({"mode": mode, "png": png_path}) or True,
     )
     monkeypatch.setenv("X_BOT_API_KEY", "k")
-    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT", raising=False)
+    for switch in ("BULLETIN_TWEET_AUTOPILOT_MORNING", "BULLETIN_TWEET_AUTOPILOT_CLOSE"):
+        monkeypatch.delenv(switch, raising=False)
 
     # Set up a notify hook to confirm it gets called.
     hook_called_marker = tmp_path / "hook_fired"
@@ -1858,11 +1859,11 @@ async def test_stage_flag_writes_pending_and_calls_hook(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_autopilot_env_var_upgrades_stage_to_post(tmp_path, monkeypatch):
-    """BULLETIN_TWEET_AUTOPILOT=1 silently upgrades --stage → --post.
+async def test_the_morning_switch_upgrades_the_morning_stage_to_post(tmp_path, monkeypatch):
+    """BULLETIN_TWEET_AUTOPILOT_MORNING=1 upgrades the morning --stage → --post.
 
-    Enables one-line-env-flip switch to autopilot without editing the
-    systemd unit file or touching daemon-reload."""
+    A one-line .env flip, without editing the systemd unit file or touching
+    daemon-reload."""
     mod = _reload_module()
     _passing_run(monkeypatch, mod)
     monkeypatch.setattr(mod, "_deadline_problem", lambda *a, **k: None)
@@ -1876,13 +1877,13 @@ async def test_autopilot_env_var_upgrades_stage_to_post(tmp_path, monkeypatch):
     sent: list = []
     monkeypatch.setattr(mod, "post_bulletin", _fake_post)
     monkeypatch.setattr(mod, "_send_xpost_sent_email", lambda *a: sent.append(a) or True)
-    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_MORNING", "1")
     monkeypatch.delenv("BULLETIN_TWEET_NOTIFY_HOOK", raising=False)
 
     args = mod._parse_args(
         [
             "--mode",
-            "close",
+            "premarket",
             "--date",
             "2026-07-06",  # Monday
             "--artifact-dir",
@@ -1898,12 +1899,12 @@ async def test_autopilot_env_var_upgrades_stage_to_post(tmp_path, monkeypatch):
     assert len(posts) == 1
     assert posts[0]["media"].png_path.name == "bulletin-spy.png"
     manifest = json.loads(
-        (tmp_path / "artifacts" / "close" / "2026-07-06" / "manifest.json").read_text(),
+        (tmp_path / "artifacts" / "premarket" / "2026-07-06" / "manifest.json").read_text(),
     )
     assert manifest["state"] == "posted"
     assert manifest["posted_id"] == "fake-tweet-id-42"
     assert len(sent) == 1
-    record = mod.read_latest_record("SPY", "close")
+    record = mod.read_latest_record("SPY", "premarket")
     assert record["status"] == "posted"
     assert record["tweet_url"] == "https://x.com/i/web/status/fake-tweet-id-42"
 
@@ -1945,7 +1946,7 @@ async def test_autopilot_holds_the_post_when_the_review_still_finds_problems(tmp
     problem = "The post says CPI came in hot; no headline says that."
     stubs = _passing_run(monkeypatch, mod, review_problems=[[problem], [problem]])
     monkeypatch.setattr(mod, "_deadline_problem", lambda *a, **k: None)
-    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_CLOSE", "1")
 
     def _boom(**kwargs):
         raise AssertionError("posted a post the review rejected!")
@@ -1993,7 +1994,7 @@ async def test_a_failed_card_render_holds_the_post(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(mod, "_deadline_problem", lambda *a, **k: None)
-    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_CLOSE", "1")
     monkeypatch.setattr(mod, "post_bulletin", lambda **k: pytest.fail("posted without the image"))
 
     args = mod._parse_args(
@@ -2042,7 +2043,7 @@ async def test_autopilot_holds_a_post_past_its_cutoff(tmp_path, monkeypatch):
     """A catch-up run after downtime must not publish a stale read."""
     mod = _reload_module()
     stubs = _passing_run(monkeypatch, mod)
-    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT_CLOSE", "1")
     monkeypatch.setattr(mod, "post_bulletin", lambda **k: pytest.fail("posted after the cutoff"))
 
     args = mod._parse_args(

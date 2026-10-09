@@ -5917,9 +5917,13 @@ bulletin-tweet-install: ## Install both bulletin tweet timers (09:15, 16:05 ET M
 	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-bulletin-tweet-close.service$(NC)"
 
 .PHONY: bulletin-tweet-status
-bulletin-tweet-status: ## Show bulletin tweet timers + last/next fire + recent logs
+bulletin-tweet-status: ## Show bulletin tweet timers, which posts are on autopilot, and recent logs
 	@echo "$(BLUE)=== Bulletin Tweet Timers ===$(NC)"
 	@systemctl list-timers --all --no-pager 'zerogex-oa-bulletin-tweet-*.timer' || true
+	@echo ""
+	@echo "$(BLUE)=== Autopilot (BULLETIN_TWEET_AUTOPILOT_MORNING / _CLOSE in .env) ===$(NC)"
+	@$(PY) -c "from src.jobs.bulletin_tweet import autopilot_report; print(autopilot_report())" 2>/dev/null \
+		|| echo "Couldn't read the autopilot settings (is the venv in place?)"
 	@echo ""
 	@sudo journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-close -n 30 --no-pager || true
 

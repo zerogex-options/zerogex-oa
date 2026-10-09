@@ -23,9 +23,10 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 # the reasons when it didn't (state=blocked, exit 1).
 #
 # Flip to full autopilot (no approval) by setting
-# ``BULLETIN_TWEET_AUTOPILOT=1`` in the EnvironmentFile — that upgrades
-# --stage to --post at runtime.  Even then nothing goes out unless the
-# review passes and the image uploads.
+# ``BULLETIN_TWEET_AUTOPILOT_MORNING=1`` in the EnvironmentFile — that
+# upgrades --stage to --post at runtime, from the next fire on, with no
+# restart.  Even then nothing goes out unless the review passes and the
+# image uploads.
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode premarket --stage
 
 # Screenshot + writing + an independent fact-check (and one rewrite when it

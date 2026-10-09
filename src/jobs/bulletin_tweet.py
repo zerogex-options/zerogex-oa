@@ -47,10 +47,11 @@ systemd marks the run failed.  There is no text-only or template fallback.
 Other rules:
 
 * **Dry-run by default.**  Live posting requires the ``--post`` flag (or
-  ``--stage`` with ``BULLETIN_TWEET_AUTOPILOT=1``) plus the four OAuth1
-  credentials (``X_BOT_API_KEY``, ``X_BOT_API_SECRET``,
-  ``X_BOT_ACCESS_TOKEN``, ``X_BOT_ACCESS_TOKEN_SECRET``), which sign both
-  the image upload and the post.
+  ``--stage`` with that post's autopilot switch on, see
+  :data:`AUTOPILOT_SWITCHES`) plus the four OAuth1 credentials
+  (``X_BOT_API_KEY``, ``X_BOT_API_SECRET``, ``X_BOT_ACCESS_TOKEN``,
+  ``X_BOT_ACCESS_TOKEN_SECRET``), which sign both the image upload and the
+  post.
 * **Skip silently on non-trading days.**  Half-days count as trading days.
 * **Artifacts on disk.**  The post, reply, PNG and a manifest (with the
   state and any problems) land under
@@ -2217,15 +2218,66 @@ def _write_manifest_and_text(
     )
 
 
+# Autopilot: whether a scheduled (--stage) fire posts to X on its own once
+# the review passes, instead of emailing "X-Post Ready" and waiting for the
+# operator.  One switch per post, in .env, both OFF unless set.  The timers
+# re-read .env at every fire, so flipping one takes effect at the next post
+# with no restart.  A post on autopilot still goes out only if the review
+# passes, the image rendered and uploaded, and it's before the cutoff.
+AUTOPILOT_SWITCHES = {
+    "premarket": "BULLETIN_TWEET_AUTOPILOT_MORNING",
+    "close": "BULLETIN_TWEET_AUTOPILOT_CLOSE",
+}
+# The one switch both posts used to share.  No longer read, so a value left
+# in .env can't put the close post on autopilot along with the morning one.
+RETIRED_AUTOPILOT_SWITCH = "BULLETIN_TWEET_AUTOPILOT"
+_SWITCH_ON = ("1", "true", "yes", "on")
+
+
+def autopilot_on(mode: str) -> bool:
+    """Whether ``mode``'s post is on autopilot (see :data:`AUTOPILOT_SWITCHES`)."""
+    switch = AUTOPILOT_SWITCHES.get(mode)
+    return bool(switch) and os.environ.get(switch, "").strip().lower() in _SWITCH_ON
+
+
+def autopilot_report() -> str:
+    """Which posts go out on their own, for ``make bulletin-tweet-status``."""
+    from src.jobs import x_media_client  # local import — optional dep path
+
+    lines = []
+    for mode, switch in AUTOPILOT_SWITCHES.items():
+        if autopilot_on(mode):
+            state = "ON, posts to X by itself once the review passes"
+        else:
+            state = "off, emails X-Post Ready for you to post"
+        lines.append(f"{_mode_read_label(mode)}: {state} ({switch})")
+    try:
+        x_media_client.load_credentials_from_env()
+        lines.append("X posting keys: all four are set")
+    except x_media_client.MissingCredentialsError as exc:
+        lines.append(f"X posting keys: MISSING, a post on autopilot would be held ({exc})")
+    if os.environ.get(RETIRED_AUTOPILOT_SWITCH, "").strip():
+        lines.append(f"{RETIRED_AUTOPILOT_SWITCH} is set but no longer read; remove it from .env")
+    return "\n".join(lines)
+
+
 def _will_post(args: argparse.Namespace) -> bool:
     """Whether this run posts to X once the review passes.
 
-    Autopilot: BULLETIN_TWEET_AUTOPILOT=1 in .env silently upgrades
-    --stage to --post at runtime, so switching to full autopost is a
-    one-line env-var flip — no systemd surgery required.  Explicit
-    --post on the CLI always wins regardless."""
-    autopilot = os.environ.get("BULLETIN_TWEET_AUTOPILOT", "").strip() in ("1", "true", "yes")
-    return bool(args.post) or (bool(args.stage) and autopilot)
+    ``--post`` on the CLI always does.  ``--stage`` (what the timers run)
+    does only when this post's autopilot switch is on; otherwise it stages
+    the draft and emails "X-Post Ready"."""
+    if args.post:
+        return True
+    if not args.stage:
+        return False
+    if os.environ.get(RETIRED_AUTOPILOT_SWITCH, "").strip():
+        logger.warning(
+            "bulletin_tweet: %s is no longer read; set %s=1 to put this post on autopilot",
+            RETIRED_AUTOPILOT_SWITCH,
+            AUTOPILOT_SWITCHES.get(args.mode, "its switch"),
+        )
+    return autopilot_on(args.mode)
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -2526,7 +2578,7 @@ def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> N
         "Text length:  %d chars (fallback %d)\n"
         "Approve with: bin/bulletin-approve.sh %s\n"
         "Discard with: bin/bulletin-approve.sh %s --discard\n"
-        "Autopilot:    set BULLETIN_TWEET_AUTOPILOT=1 in .env\n"
+        "Autopilot:    set %s=1 in .env\n"
         "================================================================\n"
         "----\n%s\n----",
         mode,
@@ -2535,6 +2587,7 @@ def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> N
         len(tweet.fallback),
         mode,
         mode,
+        AUTOPILOT_SWITCHES.get(mode, "its autopilot switch"),
         tweet.text,
     )
 
@@ -2862,8 +2915,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "the full artifact set (text + PNG + manifest with state=pending, "
             "or state=blocked when the review fails) and emails the operator.  "
             "Operator approves with ``bin/bulletin-approve.sh <mode>``.  "
-            "Set BULLETIN_TWEET_AUTOPILOT=1 in .env to upgrade --stage to "
-            "--post at runtime — the one-line switch to full autopilot."
+            "BULLETIN_TWEET_AUTOPILOT_MORNING=1 (or _CLOSE=1) in .env "
+            "upgrades --stage to --post for that post: its autopilot switch."
         ),
     )
     parser.add_argument(
