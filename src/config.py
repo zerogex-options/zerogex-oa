@@ -507,6 +507,15 @@ WALL_TIE_PCT = _getenv_float("WALL_TIE_PCT", 0.10, min=0.0, max=0.5)
 # drift such as time decay while price sits still.  Price only, so every
 # expiration selection re-picks on the same minutes.  0 re-picks every minute.
 WALL_REFRESH_MINUTES = _getenv_float("WALL_REFRESH_MINUTES", 15.0, min=0.0, max=390.0)
+# The current wall's edge at a re-pick: it keeps its place while it is still
+# on its side of the wall anchor and within this fraction of the biggest strike
+# there, so a rival has to be clearly bigger to take over (0.25: a third
+# bigger).  Re-pick timing alone still let two close strikes trade places at
+# every re-check: on NDX 2026-10-09, as price moved between 30,795 and 30,865,
+# the 30800 put swung smoothly between 75% and 100% of the 30700 put, crossing
+# the tie zone's 90% line again and again, and the Put Wall changed six times
+# in an hour.  Never narrower than WALL_TIE_PCT.
+WALL_KEEP_PCT = _getenv_float("WALL_KEEP_PCT", 0.25, min=0.0, max=0.9)
 
 # The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
 # carries a colossal re-greeked Black-Scholes gamma spike (ATM gamma ∝

@@ -67,23 +67,39 @@ def test_chop_across_a_strike_flips_old_and_neither_new_rule():
     for variant in ("live", "new"):
         call, put = result.stats[variant]
         assert (call.changes, put.changes) == (0, 0)
-    assert result.differs == 4  # the minutes spot sat above 7700
+    assert result.differs == 0  # new and live agree on every minute
 
 
-def test_wobbling_sizes_flip_live_but_not_new():
+def test_sizes_drifting_across_the_tie_line_flip_live_but_not_new():
+    """NDX 2026-10-09 in miniature: two close strikes trade the lead, and every
+    re-pick (here every minute) lands on whichever leads.  The wall in place
+    keeps its place unless clearly beaten."""
+
     def rows_at(i):
-        a, b = (100.0, 70.0) if i % 2 else (70.0, 100.0)
+        a, b = (100.0, 80.0) if i % 2 == 0 else (80.0, 100.0)
         return [
             {"strike": 7710.0, "call_gamma": a, "put_gamma": 0.0},
             {"strike": 7725.0, "call_gamma": b, "put_gamma": 0.0},
             {"strike": 7690.0, "call_gamma": 0.0, "put_gamma": 50.0},
         ]
 
-    result = _replay(rows_at, [7700.0 + (2 if i % 2 else -2) for i in range(10)])
+    result = _replay(rows_at, [7700.0] * 10, refresh_minutes=0)
     assert result.stats["live"][0].flips == 8
     assert result.stats["new"][0].changes == 0
+    assert result.differs == 5  # the minutes live handed the wall to 7725
     lines = format_report([result])
-    assert lines[-1].split()[:7] == ["SPX", "all", "1", "10", "8/0", "8/0", "0/0"]
+    assert lines[-1].split()[:10] == [
+        "SPX",
+        "all",
+        "1",
+        "10",
+        "8/0",
+        "8/0",
+        "0/0",
+        "9/0",
+        "9/0",
+        "0/0",
+    ]
 
 
 def test_totals_add_up():

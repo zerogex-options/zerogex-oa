@@ -60,6 +60,7 @@ from src.config import (
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.tradeworkz.strikes import default_strike_increment
 from src.analytics.walls import (
+    WallPair,
     WallStep,
     WallTracker,
     compute_call_put_walls,
@@ -3027,11 +3028,15 @@ class AnalyticsEngine:
         underlying_price: float,
         timestamp: datetime,
         wall_anchor: Optional[float] = None,
+        wall_incumbent: Optional[WallPair] = None,
     ) -> Dict[str, Any]:
         """Calculate summary GEX metrics.
 
         ``wall_anchor`` is the price the Call/Put Walls are split on (see
         :meth:`_advance_walls`); ``None`` splits on ``underlying_price``.
+        ``wall_incumbent`` is the ``(call_wall, put_wall)`` already published,
+        which keep their place unless clearly beaten (see
+        :meth:`_wall_incumbent`); ``None`` picks fresh.
         """
 
         if not gex_by_strike:
@@ -3292,7 +3297,7 @@ class AnalyticsEngine:
             call_wall_strength,
             put_wall_strength,
         ) = compute_call_put_walls_with_strength(
-            gex_by_strike, underlying_price, anchor=wall_anchor
+            gex_by_strike, underlying_price, anchor=wall_anchor, incumbent=wall_incumbent
         )
 
         # Pin Strike — reachable 0DTE strike with the strongest modeled positive
@@ -5389,6 +5394,22 @@ class AnalyticsEngine:
         buffer = wall_break_buffer(spot, self._wall_typical_move(bucket_ts))
         return tracker.update(spot, buffer, bucket_ts), buffer
 
+    @staticmethod
+    def _wall_incumbent(step: Optional[WallStep]) -> Optional[WallPair]:
+        """The ``(call_wall, put_wall)`` a re-pick has to clearly beat.
+
+        The walls the previous bucket published (:attr:`WallStep.incumbent`),
+        so a re-pick keeps a wall that is still on its side of the anchor and
+        not clearly outgrown instead of handing it to whichever close strike
+        is a touch bigger this minute.  ``None`` -- a fresh pick -- on a hold,
+        on the first bucket of a day, and when the previous bucket published
+        nothing.
+        """
+        held = step.incumbent if step is not None and step.refreshed else None
+        if not isinstance(held, dict):
+            return None
+        return held.get("call_wall"), held.get("put_wall")
+
     def _publish_walls(
         self, summary: Dict[str, Any], step: Optional[WallStep], buffer: Optional[float]
     ) -> None:
@@ -5609,6 +5630,7 @@ class AnalyticsEngine:
                 underlying_price,
                 latest_timestamp,
                 wall_anchor=wall_step.anchor if wall_step else None,
+                wall_incumbent=self._wall_incumbent(wall_step),
             )
             stage_timings["gex_summary"] = _time.monotonic() - t0
 

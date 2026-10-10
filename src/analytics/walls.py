@@ -32,6 +32,17 @@ on the minute price breaks out, and otherwise every ``WALL_REFRESH_MINUTES``
 (15), never while price merely lingers.  Between re-picks the walls stay the
 ones picked last time.
 
+**Who keeps the wall** at a re-pick is the fourth (``incumbent``): the
+current wall stays while it is still on its side of the anchor and within
+``WALL_KEEP_PCT`` (25%) of the biggest strike there, so a rival has to be
+clearly bigger to take over.  Strike sizes drift with price even when nothing
+else changes -- on NDX 2026-10-09 the 30800 put swung smoothly between 75% and
+100% of the 30700 put while price moved 70 points -- and without this edge
+every re-pick near the tie zone's 90% line could land on the other strike, so
+the walls traded places at each re-check.  Price breaking through the current
+wall still moves it at once: a wall on the wrong side of the anchor has no
+claim to keep.
+
 Why the two rules: a plain argmax re-run every minute made the published
 walls jump and snap back (639 times across SPX/SPY/NDX/QQQ in the eight
 sessions from 2026-09-28).  About half were spot chopping across the
@@ -100,11 +111,15 @@ from src.config import (
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
     WALL_BREAK_MIN_PCT,
     WALL_BREAK_MOVE_FRACTION,
+    WALL_KEEP_PCT,
     WALL_REFRESH_MINUTES,
     WALL_TIE_PCT,
 )
 
 _ET = ZoneInfo("America/New_York")
+
+#: ``(call_wall, put_wall)`` strikes; either side ``None`` when there is none.
+WallPair = Tuple[Optional[float], Optional[float]]
 
 # ── Wall-ladder depth ───────────────────────────────────────────────────────
 # How many ranked walls per side the API computes by default (C1..C3 /
@@ -122,6 +137,8 @@ def compute_call_put_walls(
     *,
     anchor: Optional[float] = None,
     tie_pct: float = WALL_TIE_PCT,
+    incumbent: Optional[WallPair] = None,
+    keep_pct: float = WALL_KEEP_PCT,
 ) -> Tuple[Optional[float], Optional[float]]:
     """Return ``(call_wall, put_wall)`` from per-strike gamma rows.
 
@@ -140,6 +157,11 @@ def compute_call_put_walls(
         instead of spot.  Publishing paths pass it so a strike keeps its side
         while price lingers around it.
     :param tie_pct: width of the tie zone (see the module docstring).
+    :param incumbent: the ``(call_wall, put_wall)`` in place before this pick.
+        A side keeps its wall while that strike is still on its side of the
+        anchor and within ``keep_pct`` of the side's largest.  ``None`` (or a
+        ``None`` side) picks fresh.
+    :param keep_pct: the incumbent's edge; never narrower than ``tie_pct``.
     :returns: ``(call_wall_strike, put_wall_strike)``.  Either side is
         ``None`` when no eligible strike exists (e.g. all-zero gamma on that
         side, or no strikes on that side of the anchor).
@@ -155,7 +177,12 @@ def compute_call_put_walls(
     ranking and additionally returns the dollar exposure at each wall.
     """
     call_wall, put_wall, _cw_strength, _pw_strength = compute_call_put_walls_with_strength(
-        gex_by_strike, spot_price, anchor=anchor, tie_pct=tie_pct
+        gex_by_strike,
+        spot_price,
+        anchor=anchor,
+        tie_pct=tie_pct,
+        incumbent=incumbent,
+        keep_pct=keep_pct,
     )
     return call_wall, put_wall
 
@@ -166,6 +193,8 @@ def compute_call_put_walls_with_strength(
     *,
     anchor: Optional[float] = None,
     tie_pct: float = WALL_TIE_PCT,
+    incumbent: Optional[WallPair] = None,
+    keep_pct: float = WALL_KEEP_PCT,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """Return ``(call_wall, put_wall, call_wall_strength, put_wall_strength)``.
 
@@ -193,7 +222,13 @@ def compute_call_put_walls_with_strength(
         ``None`` when that side has no wall / spot is unusable.
     """
     call_walls, put_walls = compute_wall_ladder(
-        gex_by_strike, spot_price, depth=1, anchor=anchor, tie_pct=tie_pct
+        gex_by_strike,
+        spot_price,
+        depth=1,
+        anchor=anchor,
+        tie_pct=tie_pct,
+        incumbent=incumbent,
+        keep_pct=keep_pct,
     )
     call_top = call_walls[0] if call_walls else None
     put_top = put_walls[0] if put_walls else None
@@ -221,6 +256,8 @@ def compute_wall_ladder(
     *,
     anchor: Optional[float] = None,
     tie_pct: float = WALL_TIE_PCT,
+    incumbent: Optional[WallPair] = None,
+    keep_pct: float = WALL_KEEP_PCT,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Return ``(call_walls, put_walls)`` — the top-``depth`` walls per side.
 
@@ -256,12 +293,21 @@ def compute_wall_ladder(
     :param tie_pct: the tie zone.  Rank 1 is the strike nearest the anchor
         among those within ``tie_pct`` of the side's largest; ``0`` makes rank
         1 the largest (nearest-to-anchor on an exact tie).
+    :param incumbent: the ``(call_wall, put_wall)`` in place before this pick.
+        A side's incumbent stays rank 1 while it is still eligible (on its
+        side of the anchor, positive gamma) and its gamma is within
+        ``keep_pct`` of the side's largest; otherwise that side picks fresh.
+    :param keep_pct: the incumbent's edge, clamped to ``[tie_pct, 1]``: a
+        strike already tied with the largest is never handed over to another
+        tied strike.  ``1`` keeps an eligible incumbent unconditionally,
+        which is how a reader reproduces a stored pick.
     :returns: two lists ordered by rank ascending.  Both are empty when
         ``spot_price`` is unusable.
 
     Ordering per side:
 
-    * Rank 1 → the tie-zone pick described above.
+    * Rank 1 → the incumbent when it keeps its place, else the tie-zone pick
+      described above.
     * Ranks 2.. → the remaining strikes by gamma DESC, then nearest to the
       anchor (strike ASC for calls, DESC for puts).
     """
@@ -270,6 +316,8 @@ def compute_wall_ladder(
         return [], []
     split = float(anchor) if anchor is not None and anchor > 0 else float(spot_price)
     tie = min(max(float(tie_pct or 0.0), 0.0), 1.0)
+    keep = min(max(float(keep_pct or 0.0), tie), 1.0)
+    held_call, held_put = _incumbent_strikes(incumbent)
 
     # Aggregate per-(strike, expiration) rows into per-strike sums so the
     # ranking matches the cross-expiration view consumers actually see.
@@ -291,20 +339,34 @@ def compute_wall_ladder(
         eligible: Any,
         nearest_first: Any,
         side: str,
+        held: Optional[float],
     ) -> List[Dict[str, Any]]:
         candidates = [
             (strike, gamma) for strike, gamma in agg.items() if gamma > 0 and eligible(strike)
         ]
         # Magnitude order, nearest-to-anchor on an exact tie.
         candidates.sort(key=lambda sg: (-sg[1], nearest_first(sg[0])))
-        if candidates and tie > 0:
-            # Rank 1 is the strike price reaches first among those within the
-            # tie zone of the largest; the rest keep magnitude order.
-            floor = candidates[0][1] * (1.0 - tie)
-            pick = min(
-                (sg for sg in candidates if sg[1] >= floor),
-                key=lambda sg: nearest_first(sg[0]),
+        if candidates:
+            largest = candidates[0][1]
+            keeper = (
+                next((sg for sg in candidates if abs(sg[0] - held) <= 1e-6), None)
+                if held is not None
+                else None
             )
+            if keeper is not None and keeper[1] >= largest * (1.0 - keep):
+                # The wall in place is still on its side and not clearly
+                # beaten: it stays, however the strikes around it wobble.
+                pick = keeper
+            elif tie > 0:
+                # Rank 1 is the strike price reaches first among those within
+                # the tie zone of the largest; the rest keep magnitude order.
+                floor = largest * (1.0 - tie)
+                pick = min(
+                    (sg for sg in candidates if sg[1] >= floor),
+                    key=lambda sg: nearest_first(sg[0]),
+                )
+            else:
+                pick = candidates[0]
             candidates = [pick] + [sg for sg in candidates if sg is not pick]
         return [
             {
@@ -316,9 +378,23 @@ def compute_wall_ladder(
             for rank, (strike, gamma) in enumerate(candidates[:depth], start=1)
         ]
 
-    call_walls = _rank(agg_call, lambda s: s >= split, lambda s: s, "call")
-    put_walls = _rank(agg_put, lambda s: s <= split, lambda s: -s, "put")
+    call_walls = _rank(agg_call, lambda s: s >= split, lambda s: s, "call", held_call)
+    put_walls = _rank(agg_put, lambda s: s <= split, lambda s: -s, "put", held_put)
     return call_walls, put_walls
+
+
+def _incumbent_strikes(incumbent: Optional[WallPair]) -> Tuple[Optional[float], Optional[float]]:
+    """``incumbent`` as two floats, a side ``None`` when absent or unreadable."""
+    if not incumbent:
+        return None, None
+
+    def _f(value: Any) -> Optional[float]:
+        try:
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return _f(incumbent[0]), _f(incumbent[1])
 
 
 def align_wall_ladder(
@@ -432,12 +508,16 @@ class WallStep:
     bucket whose rows the walls are picked from: this bucket when
     ``refreshed``, otherwise the last bucket that re-picked.  Every
     expiration selection reads the same two values, which is what makes them
-    break and hold together.
+    break and hold together.  ``incumbent`` is, on a re-pick, the payload the
+    previous bucket ended on -- the walls in place, which keep their place
+    unless clearly beaten (see :func:`compute_wall_ladder`).  ``None`` on the
+    first bucket of a day and on a hold.
     """
 
     anchor: float
     refresh_ts: datetime
     refreshed: bool
+    incumbent: Any = None
 
 
 class WallTracker:
@@ -458,7 +538,9 @@ class WallTracker:
     Between re-picks the walls are the ones picked at ``refresh_ts``.  The
     tracker never looks at gamma, only at price and the clock, so every
     expiration selection re-picks on the same minutes and splits on the same
-    anchor.  ``refresh_minutes <= 0`` re-picks every bucket.
+    anchor.  ``refresh_minutes <= 0`` re-picks every bucket.  A re-pick is
+    not a fresh start either: :attr:`WallStep.incumbent` carries the walls in
+    place, which the pick keeps unless a rival is clearly bigger.
 
     The engine recomputes a bucket several times while its minute is open, so
     each update steps from the state the PREVIOUS bucket ended on, never from
@@ -531,7 +613,12 @@ class WallTracker:
         ):
             self._refresh_ts = bucket_ts
             self._payload = None  # set by hold() once this pass has its walls
-            return WallStep(anchor=anchor, refresh_ts=bucket_ts, refreshed=True)
+            return WallStep(
+                anchor=anchor,
+                refresh_ts=bucket_ts,
+                refreshed=True,
+                incumbent=self._prior_payload,
+            )
         self._refresh_ts = prior_refresh_ts
         self._payload = self._prior_payload
         return WallStep(anchor=anchor, refresh_ts=prior_refresh_ts, refreshed=False)

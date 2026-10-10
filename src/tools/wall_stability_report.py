@@ -4,15 +4,17 @@ The walls used to be a plain argmax re-run every minute, split on spot.  They
 jumped and snapped back 639 times across SPX/SPY/NDX/QQQ in the eight
 sessions from 2026-09-28, about half from spot chopping across the biggest
 strike and half from two near-tied strikes trading places.  The rules in
-``src/analytics/walls.py`` answer that in two steps, and this report shows
-each one against the old argmax:
+``src/analytics/walls.py`` answer that, and this report shows the rule live
+since 2026-10-08 and the next one against the old argmax:
 
 * ``live`` -- split strikes on the wall anchor (a sticky copy of spot that
-  only follows a close beyond the break buffer) and treat strikes within the
-  tie zone of the biggest as tied, nearest wins; re-picked every minute.
-* ``new`` -- the same, but re-picked only on the minute price breaks out or
-  when the ``--refresh-minutes`` re-check clock runs out (WallTracker), and
-  held in between.
+  only follows a close beyond the break buffer), treat strikes within the tie
+  zone of the biggest as tied, nearest wins, and re-pick only on the minute
+  price breaks out or when the ``--refresh-minutes`` re-check clock runs out
+  (WallTracker), holding in between.
+* ``new`` -- the same, but at a re-pick the walls in place keep their place
+  while still on their side of the anchor and within ``--keep-pct`` of the
+  biggest strike there (the ``incumbent`` rule).
 
 This tool answers "what does that do to real sessions" before or after a
 deploy, from data that already exists:
@@ -36,6 +38,7 @@ Usage:
     python -m src.tools.wall_stability_report --symbols SPY QQQ --since 2026-09-28
     python -m src.tools.wall_stability_report --tie-pct 0.15 --break-min-pct 0.0015
     python -m src.tools.wall_stability_report --refresh-minutes 30
+    python -m src.tools.wall_stability_report --keep-pct 0.2
 
 Exit codes:
     0 -- report produced.
@@ -58,6 +61,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from src.config import (
     WALL_BREAK_MIN_PCT,
     WALL_BREAK_MOVE_FRACTION,
+    WALL_KEEP_PCT,
     WALL_REFRESH_MINUTES,
     WALL_TIE_PCT,
 )
@@ -81,8 +85,8 @@ STRIKE_BAND_PCT = 0.10
 
 SCOPES = ("all", "0dte")
 
-#: The rules replayed: the old argmax, the rule re-picked every minute, and
-#: the rule with re-pick timing.
+#: The rules replayed: the old argmax, the rule live since 2026-10-08 (break
+#: test, tie zone, re-pick timing), and that rule with the incumbent's edge.
 VARIANTS = ("old", "live", "new")
 
 Walls = Tuple[Optional[float], Optional[float]]
@@ -104,7 +108,7 @@ class ScopeResult:
     stats: Dict[str, Tuple[SideStats, SideStats]] = field(
         default_factory=lambda: {v: (SideStats(), SideStats()) for v in VARIANTS}
     )
-    #: Minutes where the ``new`` rule shows a different Call/Put Wall than the old.
+    #: Minutes where the ``new`` rule shows a different Call/Put Wall than ``live``.
     differs: int = 0
     buffers: List[float] = field(default_factory=list)
 
@@ -151,6 +155,7 @@ def replay_session(
     buffer_points: Optional[float],
     tie_pct: float,
     refresh_minutes: float = WALL_REFRESH_MINUTES,
+    keep_pct: float = WALL_KEEP_PCT,
 ) -> Dict[str, List[Walls]]:
     """Walk one session: each rule's ``(call_wall, put_wall)`` per minute.
 
@@ -159,11 +164,12 @@ def replay_session(
     spot -- :func:`src.analytics.walls.wall_break_buffer` with the typical move
     already scaled.  ``live`` and ``new`` run the production
     :class:`~src.analytics.walls.WallTracker`, so a re-pick here happens on the
-    minute the engine's would.
+    minute the engine's would, and ``new`` hands each re-pick the walls in
+    place exactly as the engine does.
     """
     from src.analytics.walls import WallTracker, compute_call_put_walls
 
-    trackers = {"live": WallTracker(refresh_minutes=0), "new": WallTracker(refresh_minutes)}
+    trackers = {"live": WallTracker(refresh_minutes), "new": WallTracker(refresh_minutes)}
     out: Dict[str, List[Walls]] = {v: [] for v in VARIANTS}
     for ts in times:
         rows = rows_by_minute.get(ts, [])
@@ -174,7 +180,14 @@ def replay_session(
             step = tracker.update(spot, buffer, ts)
             if step.refreshed:
                 tracker.hold(
-                    compute_call_put_walls(rows, spot, anchor=step.anchor, tie_pct=tie_pct)
+                    compute_call_put_walls(
+                        rows,
+                        spot,
+                        anchor=step.anchor,
+                        tie_pct=tie_pct,
+                        incumbent=step.incumbent if name == "new" else None,
+                        keep_pct=keep_pct,
+                    )
                 )
             out[name].append(tracker.held())
     return out
@@ -190,7 +203,7 @@ def summarize(
             count_changes_and_flips(times, [c for c, _ in series]),
             count_changes_and_flips(times, [p for _, p in series]),
         )
-    result.differs = sum(1 for o, n in zip(walls["old"], walls["new"]) if o != n)
+    result.differs = sum(1 for live, new in zip(walls["live"], walls["new"]) if live != new)
     return result
 
 
@@ -271,6 +284,7 @@ def examine_session(
     break_min_pct: float,
     break_move_fraction: float,
     refresh_minutes: float = WALL_REFRESH_MINUTES,
+    keep_pct: float = WALL_KEEP_PCT,
 ) -> List[ScopeResult]:
     from src.analytics.main_engine import AnalyticsEngine
 
@@ -310,6 +324,7 @@ def examine_session(
             buffer_points,
             tie_pct,
             refresh_minutes,
+            keep_pct,
         )
         result = summarize(symbol, scope, times, walls)
         result.buffers.append(
@@ -329,13 +344,14 @@ def format_report(results: Sequence[ScopeResult]) -> List[str]:
         "Call/Put Wall stability (flip = jump that reverts within "
         f"{FLIP_MINUTES} min; C/P = call side / put side)",
         "  old  = plain argmax, every minute (before 2026-10-08)",
-        "  live = break test + tie zone, re-picked every minute",
-        "  new  = live, re-picked only on a breakout or the re-check clock",
+        "  live = break test + tie zone, re-picked on a breakout or the re-check clock",
+        "  new  = live, and the wall in place keeps it unless clearly beaten",
+        "  differs = share of minutes where new shows a different wall than live",
         "",
-        f"{'':<18}{'':>7}  {'------ flips C/P ------':^29}  {'--- moves C/P ---':^19}",
+        f"{'':<18}{'':>7}  {'------ flips C/P ------':^29}  {'------ moves C/P ------':^29}",
         f"{'symbol':<7}{'view':<6}{'sess':>5}{'min':>7}  "
-        f"{'old':>9}{'live':>10}{'new':>10}  {'old':>9}{'new':>10}  {'differs':>8}  "
-        f"{'buffer':>8}",
+        f"{'old':>9}{'live':>10}{'new':>10}  {'old':>9}{'live':>10}{'new':>10}  "
+        f"{'differs':>8}  {'buffer':>8}",
     ]
     total = ScopeResult(symbol="TOTAL", scope="")
     for r in results:
@@ -357,7 +373,8 @@ def _line(r: ScopeResult) -> str:
         f"{r.symbol:<7}{r.scope:<6}{r.sessions:>5}{r.minutes:>7}  "
         f"{_pair(r.stats['old'], 'flips'):>9}{_pair(r.stats['live'], 'flips'):>10}"
         f"{_pair(r.stats['new'], 'flips'):>10}  "
-        f"{_pair(r.stats['old'], 'changes'):>9}{_pair(r.stats['new'], 'changes'):>10}  "
+        f"{_pair(r.stats['old'], 'changes'):>9}{_pair(r.stats['live'], 'changes'):>10}"
+        f"{_pair(r.stats['new'], 'changes'):>10}  "
         f"{differs:>8}  {buffer:>8}"
     )
 
@@ -376,7 +393,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--refresh-minutes",
         type=float,
         default=WALL_REFRESH_MINUTES,
-        help="Re-check clock for the 'new' rule (0 = every minute).",
+        help="Re-check clock for the 'live' and 'new' rules (0 = every minute).",
+    )
+    parser.add_argument(
+        "--keep-pct",
+        type=float,
+        default=WALL_KEEP_PCT,
+        help="The wall in place's edge for the 'new' rule.",
     )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     parser.add_argument("--log-level", default="INFO")
@@ -406,6 +429,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         break_min_pct=args.break_min_pct,
                         break_move_fraction=args.break_move_fraction,
                         refresh_minutes=args.refresh_minutes,
+                        keep_pct=args.keep_pct,
                     ):
                         key = (r.symbol, r.scope)
                         if key in by_key:

@@ -20,6 +20,10 @@ strikes, so every expiration selection behaves the same:
   every minute's re-pick near a tie could flip.  So the walls are re-picked
   only on the minute price breaks out or when the 15-minute re-check clock
   runs out, and held in between.
+
+The fourth piece, the wall in place keeping its place at a re-pick unless
+clearly beaten, is pinned in tests/test_wall_incumbent.py.  The replays here
+leave it out, so they show what the first three do on their own.
 """
 
 from __future__ import annotations
@@ -524,14 +528,23 @@ def test_filtered_chart_uses_the_same_anchor():
 
 
 class _DispatchConn:
-    """The bucket read gets the bucket rows; the re-pick read its own rows."""
+    """The bucket read gets the bucket rows; the re-pick read its own rows.
+
+    The filtered view's re-pick chain (tests/test_wall_incumbent.py) finds no
+    stored re-pick rows here, so these tests see the walls re-picked with no
+    wall in place.
+    """
 
     def __init__(self, rows, refresh_rows):
         self.rows = rows
         self.refresh_rows = refresh_rows
         self.refresh_calls = []
+        self.chain_calls = []
 
     async def fetch(self, query, *args, **_kwargs):
+        if "-- wall re-pick minutes" in query:
+            self.chain_calls.append(args)
+            return []
         if "ANY($2::timestamptz[])" in query:
             self.refresh_calls.append(args)
             return self.refresh_rows
@@ -577,6 +590,7 @@ def test_a_filtered_view_re_picks_from_the_same_minute_under_its_filter():
     )
     assert result[0]["call_wall"] == 500.0
     assert conn.refresh_calls[0][2] == exps
+    assert len(conn.chain_calls) == 1  # and asked for the view's re-pick chain
 
 
 def test_a_bucket_that_re_picked_itself_needs_no_second_read():
