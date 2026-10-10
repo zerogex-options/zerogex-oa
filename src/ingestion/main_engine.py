@@ -63,6 +63,7 @@ from src.config import (
     OPTION_BUCKET_WRITE_MIN_SECONDS,
     FLOW_CLASSIFIER,
     FLOW_CLASSIFY_MID_BAND_PCT,
+    FLOW_TICK_MAX_CARRY_SECONDS,
     FLOW_CLASSIFY_SKIP_OPEN_AUCTION,
     FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS,
     SESSION_TEMPLATE,
@@ -140,6 +141,36 @@ class _FlowAccumulator:
     # affects contracts that print flat immediately after a restart.
     last_trade_price: Optional[float] = None
     tick_direction: int = 0
+    #: When the snapshot carrying ``last_trade_price`` was observed. Used
+    #: only to age the carried direction (FLOW_TICK_MAX_CARRY_SECONDS).
+    #: Observation time, not exchange print time -- the same approximation
+    #: ``last_quote_ts`` already makes, and the only one available here.
+    last_trade_ts: Optional[datetime] = None
+
+
+def _tick_carry_age_seconds(acc: "_FlowAccumulator", snap: Dict[str, Any]) -> Optional[float]:
+    """Seconds between this snapshot and the one that set the prior trade.
+
+    ``None`` whenever it cannot be computed, which the classifier treats as
+    "do not expire the carry" -- the guard must never fire on a missing or
+    unusable timestamp, because that would silently route live flow to mid
+    on every contract rather than on stale ones.
+
+    Negative ages are returned as 0.0 rather than as a negative number. Rows
+    can arrive slightly out of order, and a negative age compared against a
+    positive threshold would read as fresh, which is the right answer by
+    accident; making it explicit stops a later reader from "fixing" the
+    comparison and inverting the guard.
+    """
+    prior = acc.last_trade_ts
+    now = snap.get("timestamp")
+    if prior is None or not isinstance(now, datetime) or not isinstance(prior, datetime):
+        return None
+    if (now.tzinfo is None) != (prior.tzinfo is None):
+        # Mixing naive and aware raises. A guard that throws is worse than a
+        # guard that abstains.
+        return None
+    return max((now - prior).total_seconds(), 0.0)
 
 
 def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
@@ -1360,6 +1391,7 @@ class IngestionEngine:
         last: Optional[float],
         prev_last: Optional[float],
         prev_direction: int = 0,
+        prev_trade_age_seconds: Optional[float] = None,
     ) -> tuple:
         """Classify a volume chunk by the TICK test, not against a quote.
 
@@ -1386,7 +1418,24 @@ class IngestionEngine:
 
         * uptick  (``last > prev_last``) -> buyer-initiated
         * downtick (``last < prev_last``) -> seller-initiated
-        * zero tick (equal) -> carry the last NON-ZERO direction
+        * zero tick (equal) -> carry the last NON-ZERO direction, unless
+          that carry has gone stale (see below)
+
+        STALENESS. With ``FLOW_TICK_MAX_CARRY_SECONDS`` set, a zero tick
+        whose prior trade is older than that routes to mid instead of
+        inheriting. Unbounded, the carry never expires, so a contract that
+        prints rarely credits a whole chunk to a direction set minutes ago
+        -- and on a high-premium contract that one inherited call moves a
+        lot of imbalance. F12 measured the shape this damages: NDX, which
+        prints rarely and in size, put 36.5% of its session imbalance in
+        sign-flipped buckets against QQQ's 8.8%, with 18 of 57 flips on
+        above-median buckets.
+
+        Scoped to the carry alone. A stale up- or downtick still
+        classifies -- it compares two real prices, just across a longer
+        gap, and unlike :meth:`_select_classify_quote` there is no
+        contemporaneous fallback to reach for. Defaults to 0 (disabled),
+        matching what was measured on 2026-10-09.
 
         A chunk with no prior trade to compare against routes to mid. That
         is the same convention the quote test uses when it has no quote:
@@ -1414,6 +1463,16 @@ class IngestionEngine:
             return (volume_delta, 0, 0, 1)
         if last < prev_last:
             return (0, 0, volume_delta, -1)
+        # Zero tick. Inherit the carried direction, unless it has expired.
+        if (
+            FLOW_TICK_MAX_CARRY_SECONDS > 0
+            and prev_trade_age_seconds is not None
+            and prev_trade_age_seconds > FLOW_TICK_MAX_CARRY_SECONDS
+        ):
+            # The direction is kept, not cleared: the next trade at a NEW
+            # price re-establishes it anyway, and zeroing here would also
+            # discard it for a tick that arrives promptly afterwards.
+            return (0, volume_delta, 0, prev_direction)
         if prev_direction > 0:
             return (volume_delta, 0, 0, prev_direction)
         if prev_direction < 0:
@@ -1598,6 +1657,7 @@ class IngestionEngine:
                         last_mid=_to_db_float(row[6]),
                         last_quote_ts=row[7],
                         last_trade_price=_to_db_float(row[8]),
+                        last_trade_ts=row[7] if _to_db_float(row[8]) else None,
                     )
         except Exception as e:
             logger.warning(
@@ -1702,6 +1762,7 @@ class IngestionEngine:
                         snap.get("last"),
                         acc.last_trade_price,
                         acc.tick_direction,
+                        _tick_carry_age_seconds(acc, snap),
                     )
                 else:
                     # Quote to classify against: the prior tick when it is
@@ -1748,6 +1809,7 @@ class IngestionEngine:
         snap_last = _to_db_float(snap.get("last"))
         if snap_last is not None and snap_last > 0:
             acc.last_trade_price = snap_last
+            acc.last_trade_ts = snap.get("timestamp")
 
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False

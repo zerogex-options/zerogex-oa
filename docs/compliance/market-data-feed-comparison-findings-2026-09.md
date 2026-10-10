@@ -644,6 +644,107 @@ across two collections.
 
 ---
 
+## F12 — at bucket level the method change is small on ETFs and large on indices
+
+*Added 2026-10-09. The measurement that resolved F11's open question, and
+split the answer by symbol.*
+
+### What was open
+
+F11 settled the FEED and left the METHOD. Measured on 230-contract snapshots,
+switching the quote test for the tick test relabelled 47.6% of contracts and
+flipped the net imbalance sign 16 of 27 times — 41% sign agreement. A snapshot
+is not what a subscriber sees; the site serves one-minute buckets aggregated
+across the chain, and nothing could say whether aggregation absorbed that.
+
+`--self-control` could not answer it either: it bounds the harness, not the
+product. So `FLOW_CLASSIFIER=quote|tick` was added to the engine and a shadow
+session run with `FLOW_CLASSIFIER=tick` on the SAME feed as production, so the
+only variable was the method, with `make shadow-compare-flow` diffing the two
+databases at the aggregation the site publishes.
+
+**A rule was written down before the numbers existed**: 80%+ sign agreement
+means bucketing absorbs the change and the cutover is cosmetic for flow; near
+41% means it is as disruptive as snapshots suggested; anything between is
+judgement and must be called as such rather than forced.
+
+### What was measured
+
+TradeStation on both sides, `FLOW_CLASSIFIER=quote` in production and `tick`
+in the rehearsal DB. 2026-10-09 full session, 09:30–16:00 ET. Coverage 150 of
+155 SPY buckets and 600 of 610 overall, no rehearsal-only buckets.
+
+| | all symbols | SPY |
+|---|---|---|
+| net imbalance sign agrees | **71.2%** (427/600) | **76.7%** (115/150) |
+| rehearsal net higher | 286 of 600 (47.7%) | 63 of 150 (42%) |
+| mean \|difference\| vs mean \|production net\| | 1,199 / 1,607 = 75% | 2,420 / 3,227 = 75% |
+| **share of session imbalance in flipped buckets** | **14.7%** | **15.8%** |
+
+**It landed between, and was called between.** Bucketing roughly halves the
+disagreement, from 59% to 23–29%, but does not remove it.
+
+**No systematic bias.** The rehearsal reads higher 42–48% of the time, which is
+a coin flip. Set against the quote test's 26-of-28 one-directional feed bias
+(F10/F11), the tick test is differently NOISY, not differently OPINIONATED —
+the single most reassuring number in this finding.
+
+**The flip RATE overstated the impact.** 95 of 173 flips landed on below-median
+buckets where the site read "roughly balanced" either way, so 85% of the
+session's total imbalance sits in buckets both methods agree on.
+
+### The finding that actually matters: it splits by symbol
+
+| symbol | sign agrees | flips near-zero / typical / large | **share of flow flipped** |
+|---|---|---|---|
+| QQQ | 78.0% | 16 / 16 / **1** | **8.8%** |
+| SPY | 76.7% | 14 / 14 / **7** | **15.8%** |
+| SPX | 68.0% | 19 / 19 / **10** | **22.2%** |
+| **NDX** | **62.0%** | 18 / 21 / **18** | **36.5%** |
+
+A four-fold spread, and the two ETFs sit clear of the two cash indices. The
+prediction was that thinner symbols would fare worse; the split is cleaner
+than liquidity alone, since QQQ edges SPY.
+
+**NDX is not shippable on the tick test as it stands.** Over a third of its
+published flow would point the other way, and 18 of its 57 flips land on
+above-median buckets — those are not cosmetic reversals on quiet minutes but
+different claims about the session.
+
+### A cause with an obvious test, and the fix
+
+`_classify_volume_chunk_tick` routes a zero tick — a print at the same price as
+the last one — to whichever direction it last saw, **with no expiry**. The quote
+path has carried `FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS` (10s) since it was
+written for the symmetric reason: a stale prior tick is not a valid proxy. The
+tick path had no equivalent.
+
+NDX contracts print rarely and in size. A flat print inherits a direction that
+may have been set minutes ago, and on a high-premium contract one inherited
+call moves a lot of imbalance. That fits all three NDX symptoms at once: worst
+agreement, most large flips, highest flow share.
+
+`FLOW_TICK_MAX_CARRY_SECONDS` expires the carry, routing a stale zero tick to
+mid instead of inheriting. Scoped to the carry alone — a stale up- or downtick
+still classifies, because it compares two real prices and, unlike the quote
+test, has no contemporaneous fallback to reach for.
+
+**It defaults to 0, disabled.** The table above was measured without it, and
+session 2 (ThetaData + tick) has to stay comparable with session 1. Changing
+two things at once teaches nothing. **This is a hypothesis with an obvious
+test, not a measured cause**, and it must not be written up as the latter
+until a session with the guard on is compared against one with it off.
+
+### What this does not cover
+
+One session, one day, no OPEX. The published SIGNAL was not compared —
+`shadow-run` runs ingestion without analytics, so this is the input to
+`order_flow_imbalance` and `tape_flow_bias`. The transform is deterministic, so
+matching inputs mean matching outputs, but if a later session differs
+materially the next step is pointing analytics at the rehearsal DB.
+
+---
+
 ## Findings that turned out not to be about the feed
 
 Recorded because each cost investigation time and each looked like a vendor problem first.
