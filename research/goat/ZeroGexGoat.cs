@@ -63,6 +63,9 @@
 //    5. The entry bar closes AT OR ABOVE the EE line (within
 //       EntryEeToleranceTicks). A bar that closes away from the EE line is
 //       what Jim calls a REACHER, and a reacher is no trade.
+//    6. Optionally, the entry bar closes no more than EntryMaxTicksBeyondMid
+//       above the midband. Jim, 2026-10-09: "I would still like to enter at
+//       or below the midband." Off by default (-1).
 //
 //  EXITS — two lots:
 //    Lot 1 ("GOAT1") exits on the first opposite-closing bar.
@@ -257,6 +260,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				EntryBarColor = GoatEntryBar.Any;
 				EntryEeToleranceTicks = 0;
 				MinBandWidthTicks = 0;
+				EntryMaxTicksBeyondMid = -1;   // -1 == off
 
 				// --- sizing and exits ---
 				LotSize = 1;
@@ -432,6 +436,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (Close[0] < ee[0] - EntryEeToleranceTicks * TickSize)
 				return false;
 
+			// Rule 6 — at the midband, not up and away from it. The pinch
+			// only says the EE line was near the midband within the last
+			// PinchLookbackBars; by the time a qualifying bar prints, price
+			// can be well above it.
+			if (EntryMaxTicksBeyondMid >= 0
+				&& Close[0] > mid[0] + EntryMaxTicksBeyondMid * TickSize)
+				return false;
+
 			return !MidlineBrokenAgainst(true, slope);
 		}
 
@@ -445,6 +457,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return false;
 
 			if (Close[0] > ee[0] + EntryEeToleranceTicks * TickSize)
+				return false;
+
+			if (EntryMaxTicksBeyondMid >= 0
+				&& Close[0] < mid[0] - EntryMaxTicksBeyondMid * TickSize)
 				return false;
 
 			return !MidlineBrokenAgainst(false, slope);
@@ -772,6 +788,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(0, int.MaxValue)]
 		[Display(Name = "Min band width (ticks, 0=off)", Order = 11, GroupName = "4. Setup filters")]
 		public int MinBandWidthTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(-1, int.MaxValue)]
+		[Display(Name = "Entry: max ticks above midband (below for shorts, -1=off)", Order = 12, GroupName = "4. Setup filters")]
+		public int EntryMaxTicksBeyondMid { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
