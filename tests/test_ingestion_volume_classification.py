@@ -6,7 +6,7 @@ volume in ``option_chains``.
 """
 
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 import pytz
@@ -788,3 +788,125 @@ def test_a_hydrated_accumulator_classifies_its_first_trade(monkeypatch):
 
     assert acc.ask_cum == 1500 + 300, "300 new contracts credited to buyers"
     assert acc.mid_cum == 700, "and none fell through to mid"
+
+
+# ---------------------------------------------------------------------------
+# FLOW_TICK_MAX_CARRY_SECONDS -- expiring the zero-tick carry
+#
+# F12: the 2026-10-09 bucket comparison split hard by symbol. QQQ put 8.8% of
+# its session imbalance in sign-flipped buckets and SPY 15.8%, against SPX
+# 22.2% and NDX 36.5% -- and 18 of NDX's 57 flips landed on ABOVE-median
+# buckets, so they are not cosmetic reversals on quiet minutes. NDX prints
+# rarely and in size, which is the shape an unbounded carry damages most.
+# ---------------------------------------------------------------------------
+
+
+def _tick(engine_cls, **kw):
+    base = dict(volume_delta=100, last=5.50, prev_last=5.50, prev_direction=1)
+    base.update(kw)
+    return engine_cls._classify_volume_chunk_tick(**base)
+
+
+def test_the_carry_guard_is_off_by_default():
+    """Monday's session 2 has to stay comparable with Friday's, and Friday
+    was measured with no guard at all."""
+    from src.config import FLOW_TICK_MAX_CARRY_SECONDS
+
+    assert FLOW_TICK_MAX_CARRY_SECONDS == 0.0
+
+
+def test_a_fresh_zero_tick_still_inherits(monkeypatch):
+    monkeypatch.setattr(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", 30.0)
+    av, mv, bv, d = _tick(IngestionEngine, prev_trade_age_seconds=5.0)
+
+    assert (av, mv, bv) == (100, 0, 0), "5s old is not stale at a 30s limit"
+    assert d == 1
+
+
+def test_a_stale_zero_tick_goes_to_mid_instead_of_inheriting(monkeypatch):
+    """The whole point: a direction set minutes ago must stop crediting
+    fresh volume to a side."""
+    monkeypatch.setattr(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", 30.0)
+    av, mv, bv, d = _tick(IngestionEngine, prev_trade_age_seconds=120.0)
+
+    assert (av, mv, bv) == (0, 100, 0)
+    assert d == 1, "the direction is kept, not cleared -- a prompt next tick reuses it"
+
+
+def test_staleness_does_not_touch_a_real_up_or_downtick(monkeypatch):
+    """Scoped to the CARRY. An old baseline is still two real prices, and
+    unlike the quote test there is no contemporaneous fallback to use."""
+    monkeypatch.setattr(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", 30.0)
+
+    up = _tick(IngestionEngine, last=5.60, prev_last=5.50, prev_trade_age_seconds=600.0)
+    down = _tick(IngestionEngine, last=5.40, prev_last=5.50, prev_trade_age_seconds=600.0)
+
+    assert up[:3] == (100, 0, 0)
+    assert down[:3] == (0, 0, 100)
+
+
+def test_an_unknown_age_never_expires_the_carry(monkeypatch):
+    """A guard that fires on a missing timestamp would route LIVE flow to
+    mid on every contract, not stale flow on a few. Abstain instead."""
+    monkeypatch.setattr(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", 30.0)
+    av, mv, bv, _ = _tick(IngestionEngine, prev_trade_age_seconds=None)
+
+    assert (av, mv, bv) == (100, 0, 0)
+
+
+def test_disabled_guard_ignores_even_an_ancient_carry(monkeypatch):
+    monkeypatch.setattr(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", 0.0)
+    av, mv, bv, _ = _tick(IngestionEngine, prev_trade_age_seconds=86_400.0)
+
+    assert (av, mv, bv) == (100, 0, 0)
+
+
+# --- the age helper --------------------------------------------------------
+
+
+def test_age_is_measured_from_the_snapshot_that_set_the_prior_trade():
+    t0 = ET.localize(datetime(2026, 10, 9, 10, 15, 0))
+    acc = _acc(last_trade_price=5.50, last_trade_ts=t0)
+    age = main_engine._tick_carry_age_seconds(acc, {"timestamp": t0 + timedelta(seconds=45)})
+    assert age == 45.0
+
+
+def test_age_is_none_when_there_is_no_prior_trade():
+    acc = _acc()
+    assert main_engine._tick_carry_age_seconds(acc, {"timestamp": datetime.now()}) is None
+
+
+def test_mixing_naive_and_aware_timestamps_abstains_rather_than_raising():
+    """Subtracting one from the other raises. A guard that throws inside the
+    ingestion hot path is worse than a guard that declines to fire."""
+    acc = _acc(
+        last_trade_price=5.50,
+        last_trade_ts=ET.localize(datetime(2026, 10, 9, 10, 15)),
+    )
+    assert (
+        main_engine._tick_carry_age_seconds(acc, {"timestamp": datetime(2026, 10, 9, 10, 16)})
+        is None
+    )
+
+
+def test_out_of_order_rows_give_zero_age_not_a_negative_one():
+    t0 = ET.localize(datetime(2026, 10, 9, 10, 15, 0))
+    acc = _acc(last_trade_price=5.50, last_trade_ts=t0)
+    age = main_engine._tick_carry_age_seconds(acc, {"timestamp": t0 - timedelta(seconds=10)})
+    assert age == 0.0
+
+
+def test_the_accumulator_stamps_the_trade_time_alongside_the_price(monkeypatch):
+    """Without this the age is always None and the guard can never fire."""
+    engine = _tick_engine(monkeypatch)
+    ts = ET.localize(datetime(2026, 10, 9, 10, 15, 30))
+    acc = _acc()
+
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 100, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555, "timestamp": ts},
+        ET.localize(datetime(2026, 10, 9, 10, 15)),
+    )
+
+    assert acc.last_trade_price == 5.58
+    assert acc.last_trade_ts == ts

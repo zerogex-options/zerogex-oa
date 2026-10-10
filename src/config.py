@@ -1065,6 +1065,33 @@ FLOW_CLASSIFY_MID_BAND_PCT = _getenv_float("FLOW_CLASSIFY_MID_BAND_PCT", 0.70)
 # for. See docs/compliance/market-data-feed-comparison-findings-2026-09.md.
 FLOW_CLASSIFIER = (_getenv_str("FLOW_CLASSIFIER", "quote") or "quote").strip().lower()
 
+# Staleness guard for the TICK test's carried direction. 0 disables it,
+# which is the DEFAULT and is exactly the behaviour measured on 2026-10-09.
+#
+# The tick test routes a zero tick -- a print at the same price as the last
+# one -- to whichever direction it last saw. With no time limit that carry
+# has no expiry, so a contract that prints rarely inherits a direction set
+# minutes ago. The quote path has had FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS
+# since it was written for the symmetric reason: a stale prior tick is not a
+# valid proxy. The tick path had no equivalent.
+#
+# WHY IT WAS ADDED. F12: the 2026-10-09 bucket-level comparison split hard by
+# symbol. QQQ 8.8% and SPY 15.8% of session imbalance in sign-flipped buckets,
+# against SPX 22.2% and NDX 36.5% -- and 18 of NDX's 57 flips landed on
+# ABOVE-median buckets, so they are not cosmetic reversals on quiet minutes.
+# NDX contracts print rarely and in size, which is precisely the shape an
+# unbounded carry damages most. That is a HYPOTHESIS with an obvious test,
+# not a measured cause, which is why this defaults to off: Monday's session 2
+# has to stay comparable with Friday's, and changing two things at once
+# teaches nothing.
+#
+# Scoped to the ZERO-TICK CARRY only. A stale up- or downtick still
+# classifies: it is a real comparison between two real prices, just an old
+# baseline, and unlike the quote test there is no contemporaneous fallback to
+# reach for. The inherited direction is the weaker inference and the one
+# worth expiring.
+FLOW_TICK_MAX_CARRY_SECONDS = _getenv_float("FLOW_TICK_MAX_CARRY_SECONDS", 0.0)
+
 # Route the opening-auction bucket (09:30 ET) to mid_volume instead of running
 # Lee-Ready against post-open quotes that don't reflect the auction cross.
 FLOW_CLASSIFY_SKIP_OPEN_AUCTION = _getenv_bool("FLOW_CLASSIFY_SKIP_OPEN_AUCTION", True)

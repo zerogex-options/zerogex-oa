@@ -75,12 +75,32 @@ def test_a_missing_last_price_classifies_nothing_as_a_side():
 
 
 def test_the_tick_test_reads_no_quote_at_all():
-    """Its whole reason for existing. Signature carries no bid, ask or mid."""
+    """Its whole reason for existing. Signature carries no bid, ask or mid.
+
+    The exact-set assertion is deliberate and is NOT to be relaxed into the
+    denylist above. A denylist only catches a quote arriving under a name
+    somebody already thought of; pinning the whole signature forces any new
+    parameter to be justified in a diff, which is the actual guarantee.
+
+    ``prev_trade_age_seconds`` was added 2026-10-09 for
+    FLOW_TICK_MAX_CARRY_SECONDS (F12), and is admissible on exactly one
+    ground: it is a DURATION, derived from two observation timestamps, and
+    carries no price information of any kind. A parameter that could encode
+    a price -- however it were named -- would break the premise that the
+    Market Value randomisation cannot reach this classifier, and with it the
+    licensing argument in F9 for not paying OPRA non-display fees.
+    """
     import inspect
 
     params = set(inspect.signature(tick).parameters)
     assert not params & {"bid", "ask", "mid", "band_pct"}
-    assert params == {"volume_delta", "last", "prev_last", "prev_direction"}
+    assert params == {
+        "volume_delta",
+        "last",
+        "prev_last",
+        "prev_direction",
+        "prev_trade_age_seconds",
+    }
 
 
 # ---------------------------------------------------------------------------
