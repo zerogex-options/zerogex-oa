@@ -39,7 +39,7 @@ existing bots ignore the new fields and behave exactly as before.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -653,3 +653,300 @@ def fetch_vix_lookback(
     if not row:
         return None
     return _f(row[0])
+
+
+# ===========================================================================
+# v6 — volatility-pricing layer
+# ===========================================================================
+# The v6 candidates trade realized-vs-implied MAGNITUDE (see
+# docs/design/tradeworkz-v6-strategies.md), so the snapshot needs what every
+# earlier tier lacked: the price of the ATM straddle on the front expiration,
+# the morning forecast's committed implied move, where today's ATM IV sits in
+# its own recent history, and the CASH session's open / high / low (the
+# existing session_high / session_low span the trailing 24 hours and include
+# the pre-market). Same contract as everything above: best-effort, as-of
+# bounded, savepoint-isolated, None on anything missing.
+
+
+def _latest_per_key(rows: Any, key_idx: Tuple[int, ...], ts_idx: int) -> dict:
+    """Collapse ``rows`` (newest first or not) to the latest row per key."""
+    latest: dict = {}
+    for row in rows or []:
+        key = tuple(row[i] for i in key_idx)
+        prev = latest.get(key)
+        if prev is None or (
+            row[ts_idx] is not None and prev[ts_idx] is not None and row[ts_idx] > prev[ts_idx]
+        ):
+            latest[key] = row
+    return latest
+
+
+def fetch_atm_front_quote(
+    conn: Any,
+    underlying: str,
+    spot: float,
+    expiration_iso: str,
+    as_of: Optional[datetime] = None,
+    tolerance_min: int = 10,
+    band_pct: float = 0.006,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """ATM straddle on ``expiration_iso`` as of ``as_of``.
+
+    Returns ``(atm_strike, straddle_mid, straddle_bid, atm_iv)``:
+
+    * ``atm_strike`` — the listed strike nearest to ``spot`` that has a
+      two-sided (bid > 0 and ask > 0) quote for BOTH the call and the put
+      inside the lookback window.
+    * ``straddle_mid`` — call mid + put mid at that strike, per share. This
+      is the market's price for the remaining move on that expiration — the
+      implied side of every realized-vs-implied gate in the v6 bots.
+    * ``straddle_bid`` — call bid + put bid: what a seller actually collects
+      before slippage. The gap to ``straddle_mid`` is the spread cost.
+    * ``atm_iv`` — mean of the call and put implied vols at that strike
+      (whichever are present and positive).
+
+    Reads ``option_chains`` first and falls back to ``option_chains_archive``
+    (which carries bid/ask/IV but no volume) so a replay past the hot
+    table's retention still prices. The window is bounded to
+    ``[as_of - tolerance_min, as_of]`` — never forward — mirroring the
+    harness's own ``_quote_from_table``. All ``None`` on no usable quote.
+    """
+    if spot is None or spot <= 0 or not expiration_iso:
+        return (None, None, None, None)
+    lo_k, hi_k = spot * (1.0 - band_pct), spot * (1.0 + band_pct)
+    rows: list = []
+    for table, sp in (("option_chains", "tw_atm_hot"), ("option_chains_archive", "tw_atm_arch")):
+        cur = conn.cursor()
+        armed = _savepoint(cur, sp)
+        try:
+            cur.execute(
+                f"""
+                SELECT option_type, strike, bid, ask, implied_volatility, timestamp
+                FROM {table}
+                WHERE underlying = %s
+                  AND expiration = %s
+                  AND strike BETWEEN %s AND %s
+                  AND timestamp <= COALESCE(%s::timestamptz, NOW())
+                  AND timestamp >= COALESCE(%s::timestamptz, NOW())
+                                   - (%s * INTERVAL '1 minute')
+                ORDER BY timestamp DESC
+                """,
+                (underlying, expiration_iso[:10], lo_k, hi_k, as_of, as_of, int(tolerance_min)),
+            )
+            rows = cur.fetchall() or []
+            _release(cur, sp, armed)
+        except Exception:
+            _rollback(cur, sp, armed)
+            logger.debug("fetch_atm_front_quote(%s) failed on %s", underlying, table, exc_info=True)
+            rows = []
+        if rows:
+            break
+    if not rows:
+        return (None, None, None, None)
+
+    latest = _latest_per_key(rows, key_idx=(0, 1), ts_idx=5)
+    by_strike: dict = {}
+    for (otype, strike), row in latest.items():
+        k = _f(strike)
+        if k is None:
+            continue
+        side = str(otype or "").upper()[:1]
+        if side not in ("C", "P"):
+            continue
+        by_strike.setdefault(k, {})[side] = row
+    for k in sorted(by_strike, key=lambda s: (abs(s - spot), s)):
+        legs = by_strike[k]
+        if "C" not in legs or "P" not in legs:
+            continue
+        c_bid, c_ask = _f(legs["C"][2]), _f(legs["C"][3])
+        p_bid, p_ask = _f(legs["P"][2]), _f(legs["P"][3])
+        if not all(v is not None and v > 0 for v in (c_bid, c_ask, p_bid, p_ask)):
+            continue
+        mid = (c_bid + c_ask) / 2.0 + (p_bid + p_ask) / 2.0
+        ivs = [v for v in (_f(legs["C"][4]), _f(legs["P"][4])) if v is not None and v > 0]
+        atm_iv = sum(ivs) / len(ivs) if ivs else None
+        return (k, mid, c_bid + p_bid, atm_iv)
+    return (None, None, None, None)
+
+
+def fetch_daily_forecast(
+    conn: Any, underlying: str, as_of: Optional[datetime] = None
+) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[float], Optional[bool]]:
+    """The morning forecast's committed magnitude claims for this session.
+
+    Returns ``(implied_move, expected_vol_ratio, expected_vol_state,
+    vix_z_score_20d, is_event_day)`` from the ``daily_forecast`` row whose
+    ``date`` is the ET session date of ``as_of`` AND whose ``open_ts`` (the
+    08:30 ET write) is at or before ``as_of`` — so a replayed 09:35 tick sees
+    the row, a replayed 08:00 tick does not, and no row is ever read before
+    it was written. The row is immutable once committed, which is what makes
+    it safe as a bot input: nothing about it changes as the day unfolds.
+
+    * ``implied_move`` — the VIX/VXN-implied 1-day $ move at 08:30 ET; the
+      bots scale it to the remaining session with the cone model's diurnal
+      profile (``MarketSnapshot.expected_remaining_move``).
+    * ``expected_vol_ratio`` / ``expected_vol_state`` — predicted realized
+      range as a multiple of a normal day's, and its compression / normal /
+      expansion bucket.
+    * ``vix_z_score_20d`` / ``is_event_day`` — from the ``forecast_inputs``
+      audit blob (the latter reflects the EVENT_DAYS env at write time).
+
+    All ``None`` when no forecast was written for this symbol (the writer
+    defaults to SPY only; check coverage before gating on it).
+    """
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_daily_forecast")
+    try:
+        cur.execute(
+            """
+            SELECT implied_move, expected_vol_ratio, expected_vol_state, forecast_inputs
+            FROM daily_forecast
+            WHERE symbol = %s
+              AND date = (COALESCE(%s::timestamptz, NOW()) AT TIME ZONE 'America/New_York')::date
+              AND open_ts <= COALESCE(%s::timestamptz, NOW())
+            ORDER BY open_ts DESC
+            LIMIT 1
+            """,
+            (underlying, as_of, as_of),
+        )
+        row = cur.fetchone()
+        _release(cur, "tw_daily_forecast", armed)
+    except Exception:
+        _rollback(cur, "tw_daily_forecast", armed)
+        logger.debug("fetch_daily_forecast failed for %s", underlying, exc_info=True)
+        return (None, None, None, None, None)
+    if not row:
+        return (None, None, None, None, None)
+    implied_move, ratio, state, inputs = row
+    if isinstance(inputs, str):
+        try:
+            import json
+
+            inputs = json.loads(inputs)
+        except (TypeError, ValueError):
+            inputs = {}
+    inputs = inputs if isinstance(inputs, dict) else {}
+    vix_z = _f(inputs.get("vix_z_score_20d"))
+    raw_event = inputs.get("is_event_day")
+    is_event = bool(raw_event) if isinstance(raw_event, (bool, int)) else None
+    return (_f(implied_move), _f(ratio), str(state) if state else None, vix_z, is_event)
+
+
+def fetch_atm_iv_history(
+    conn: Any, underlying: str, as_of: Optional[datetime] = None, lookback_days: int = 60
+) -> list:
+    """Prior sessions' ATM call IV (``daily_atm_iv``), newest first.
+
+    Only trading dates STRICTLY BEFORE the ET session date of ``as_of`` are
+    returned: today's row is rewritten on every analytics cycle and settles
+    to its end-of-day value, so reading it intraday would leak the rest of
+    the session into a replay. Prior days are frozen and safe. The snapshot
+    ranks today's live ``atm_iv_front`` against this list
+    (``atm_iv_pctile_60d``). Empty on error or no history.
+    """
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_atm_iv_hist")
+    try:
+        cur.execute(
+            """
+            SELECT atm_call_iv
+            FROM daily_atm_iv
+            WHERE underlying = %s
+              AND trading_date < (COALESCE(%s::timestamptz, NOW())
+                                  AT TIME ZONE 'America/New_York')::date
+            ORDER BY trading_date DESC
+            LIMIT %s
+            """,
+            (underlying, as_of, max(1, int(lookback_days))),
+        )
+        rows = cur.fetchall() or []
+        _release(cur, "tw_atm_iv_hist", armed)
+    except Exception:
+        _rollback(cur, "tw_atm_iv_hist", armed)
+        logger.debug("fetch_atm_iv_history failed for %s", underlying, exc_info=True)
+        return []
+    out = []
+    for (iv,) in rows:
+        v = _f(iv)
+        if v is not None and v > 0:
+            out.append(v)
+    return out
+
+
+def fetch_cash_session_bars(
+    conn: Any,
+    underlying: str,
+    as_of: Optional[datetime] = None,
+    open_offset_min: int = 0,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """This CASH session's ``(open, high, low, first_half_hour_close)``.
+
+    The snapshot's ``session_high`` / ``session_low`` / ``open_price`` span
+    the trailing 24 hours of bars, which on SPY/QQQ includes the pre-market
+    and on SPX includes the prior afternoon. These are bounded to the 09:30
+    ET cash open of the session ``as_of`` falls in (``cash_session_date``),
+    which is what a realized-range-versus-implied-move comparison needs: the
+    morning forecast's ``implied_move`` is a cash-session quantity.
+
+    * ``open`` — the ``open`` of the first bar at or after 09:30 ET plus
+      ``open_offset_min`` (pass 1 for a cash index, whose 09:30 bar is a
+      stale print near the prior close until its constituents open).
+    * ``high`` / ``low`` — extremes over ``[cash open, as_of]``.
+    * ``first_half_hour_close`` — the close of the last bar stamped before
+      10:00 ET; ``None`` until 10:00 ET has passed (every bar it reads is
+      then complete, so a replay never sees a forming bar).
+
+    All ``None`` before the cash open, outside the session's own ET date, or
+    on error.
+    """
+    from src.validation import cash_session_date, cash_session_start_utc
+
+    now = as_of if as_of is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    session = cash_session_date(now)
+    if now.astimezone(_ET).date() != session:
+        return (None, None, None, None)
+    start = cash_session_start_utc(session)
+    if now < start:
+        return (None, None, None, None)
+    open_from = start + timedelta(minutes=max(0, int(open_offset_min)))
+    fhh_end = start + timedelta(minutes=30)
+    cur = conn.cursor()
+    armed = _savepoint(cur, "tw_cash_session")
+    try:
+        cur.execute(
+            """
+            SELECT
+                (SELECT open FROM underlying_quotes
+                  WHERE symbol = %s AND timestamp >= %s AND timestamp <= %s
+                  ORDER BY timestamp ASC LIMIT 1),
+                MAX(high), MIN(low),
+                (SELECT close FROM underlying_quotes
+                  WHERE symbol = %s AND timestamp >= %s AND timestamp < %s
+                  ORDER BY timestamp DESC LIMIT 1)
+            FROM underlying_quotes
+            WHERE symbol = %s AND timestamp >= %s AND timestamp <= %s
+            """,
+            (
+                underlying,
+                open_from,
+                now,
+                underlying,
+                start,
+                min(fhh_end, now),
+                underlying,
+                start,
+                now,
+            ),
+        )
+        row = cur.fetchone()
+        _release(cur, "tw_cash_session", armed)
+    except Exception:
+        _rollback(cur, "tw_cash_session", armed)
+        logger.debug("fetch_cash_session_bars failed for %s", underlying, exc_info=True)
+        return (None, None, None, None)
+    if not row:
+        return (None, None, None, None)
+    fhh = _f(row[3]) if now >= fhh_end else None
+    return (_f(row[0]), _f(row[1]), _f(row[2]), fhh)

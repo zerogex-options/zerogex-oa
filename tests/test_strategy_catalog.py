@@ -116,7 +116,9 @@ def test_every_strategy_is_backtestable():
 
 
 def test_bot_and_pattern_bindings_cover_both_implementations():
-    assert len(bot_bound()) == 28
+    # 28 through v5, plus the two v6 bot-only strategies (long_gamma_iron_fly,
+    # hedging_demand_close_momentum).
+    assert len(bot_bound()) == 30
     assert len(pattern_bound()) == 18
     # Eleven strategies carry both bindings, so the union is the catalog.
     both = [e for e in all_strategies() if e.bot_class and e.has_pattern]

@@ -18,6 +18,14 @@ Usage (same DB the backtest uses):
 
     python -m src.tools.tw_execution_sweep --bot call_wall_rejector --days 45
     python -m src.tools.tw_execution_sweep --bot put_wall_bouncer --interval-min 5
+    python -m src.tools.tw_execution_sweep --bot long_gamma_iron_fly --days 90
+    python -m src.tools.tw_execution_sweep --bot hedging_demand_close_momentum --days 90
+
+The grid is chosen from the bot's class (``--grid`` overrides): the wall
+grid for the wall-reversion bots, the short-premium grid (gated default vs
+the gamma-blind / no-band / tail-only / clock-only twins, plus geometry) for
+any ``ShortPremiumBot``, and the gamma-sign x structure grid for the close
+momentum bot.
 
 It runs two passes (train, test); at interval 5 that is ~2× a normal screen.
 Nothing here writes to any tw_* table.
@@ -83,6 +91,89 @@ def wall_execution_grid() -> List[Tuple[str, Dict[str, Any]]]:
     return grid
 
 
+def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
+    """(label, param-overrides) for a v6 short-premium bot (``ShortPremiumBot``).
+
+    Two axes, kept small so a winner is not found by arithmetic:
+
+    * the GATE axis is the experiment — the gated default against the twins
+      that drop one conditioning at a time, down to clock-only (pure 0DTE
+      variance premium). If a twin matches the gated PF within ~0.1, that
+      gate is not earning its place;
+    * the GEOMETRY axis on the gated default — wing width, credit take, the
+      condor form and a looser stop.
+    """
+    grid: List[Tuple[str, Dict[str, Any]]] = [
+        ("gated/default", {}),
+        ("twin/gamma_blind", {"required_regimes": "any"}),
+        ("twin/no_band", {"allowed_magnitude_bands": None}),
+        (
+            "twin/tail_only",
+            {"required_regimes": "any", "allowed_magnitude_bands": None},
+        ),
+        (
+            "twin/clock_only",
+            {
+                "required_regimes": "any",
+                "allowed_magnitude_bands": None,
+                "max_realized_over_implied": None,
+            },
+        ),
+    ]
+    for wing in (1.0, 1.5):
+        grid.append((f"gated/wing{wing:g}", {"wing_sigma_mult": wing}))
+    for take in (0.35, 0.7):
+        grid.append((f"gated/take{int(take * 100)}", {"credit_take_frac": take}))
+    grid.append(("gated/condor1.0", {"short_offset_sigma": 1.0, "wing_sigma_mult": 0.75}))
+    grid.append(("gated/stop1.5", {"credit_stop_mult": 1.5}))
+    return grid
+
+
+def close_momentum_grid() -> List[Tuple[str, Dict[str, Any]]]:
+    """(label, param-overrides) for ``hedging_demand_close_momentum``.
+
+    The gamma-sign axis IS the Baltussen hypothesis: negative (the paper's
+    condition) against ``any`` (the unconditional Gao et al. trade) and
+    ``positive`` (the complement the mechanism says should not work), each as
+    the debit and the credit form; plus Gao's first-half-hour agreement and a
+    higher day-move floor on the default arm.
+    """
+    grid: List[Tuple[str, Dict[str, Any]]] = []
+    for sign in ("negative", "any", "positive"):
+        for structure in ("debit_vertical", "credit_vertical"):
+            grid.append(
+                (
+                    f"{sign}/{'debit' if structure == 'debit_vertical' else 'credit'}",
+                    {"required_gamma_sign": sign, "structure": structure},
+                )
+            )
+    grid.append(("negative/debit/fhh", {"require_first_half_hour_agreement": True}))
+    grid.append(("negative/debit/move0.75", {"min_day_move_sigma": 0.75}))
+    return grid
+
+
+GRIDS: Dict[str, Any] = {
+    "wall": wall_execution_grid,
+    "short_premium": short_premium_grid,
+    "close_momentum": close_momentum_grid,
+}
+
+
+def grid_for(base: BotSpec, name: str = "auto") -> List[Tuple[str, Dict[str, Any]]]:
+    """Resolve the grid for ``base``: an explicit name, or by its bot class."""
+    if name != "auto":
+        return GRIDS[name]()
+    from src.tradeworkz.bots.short_premium import ShortPremiumBot
+    from src.tradeworkz.registry import get_bot_class
+
+    cls = get_bot_class(base.strategy_class)
+    if issubclass(cls, ShortPremiumBot):
+        return short_premium_grid()
+    if base.strategy_class == "HedgingDemandCloseMomentum":
+        return close_momentum_grid()
+    return wall_execution_grid()
+
+
 def build_specs(base: BotSpec, grid: List[Tuple[str, Dict[str, Any]]]) -> List[BotSpec]:
     specs: List[BotSpec] = []
     for i, (label, over) in enumerate(grid):
@@ -133,6 +224,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--days", type=int, default=45)
     ap.add_argument("--interval-min", type=int, default=5)
     ap.add_argument("--tolerance-min", type=int, default=10)
+    ap.add_argument(
+        "--grid",
+        choices=["auto", *GRIDS],
+        default="auto",
+        help="which execution grid to sweep (default: chosen from the bot's class)",
+    )
     args = ap.parse_args(argv)
 
     catalog = known_specs()
@@ -141,7 +238,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"unknown bot id: {args.bot}")
         return 2
 
-    grid = wall_execution_grid()
+    grid = grid_for(base, args.grid)
     specs = build_specs(base, grid)
 
     from src.database import db_connection

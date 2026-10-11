@@ -98,6 +98,7 @@ import math
 from datetime import timedelta
 from typing import List, Optional
 
+from src.signals.basic.gex_gradient import _LONG_GAMMA_DAMPING
 from src.tradeworkz.bots.base import BaseBot, _utcnow, resolve_expiration_iso
 from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import ExitDecision, OpenPosition, TradeSignal
@@ -160,8 +161,22 @@ class GexGradientDrift(BaseBot):
         if grad is None:
             return self._skip("no_gradient")
         min_score = float(self.params.get("min_gradient_score", 40.0))
-        if abs(grad) < min_score:
-            return self._skip("gradient_weak")
+        # The component damps its reading by SIGNAL_GEX_GRADIENT_LONG_GAMMA_DAMPING
+        # (0.40) under long gamma, and the pattern's threshold is 40 on the
+        # x100 scale: numerically identical constants, so under long gamma the
+        # gate is reachable only at the theoretical maximum and the strategy
+        # is negative-gamma-only by arithmetic (second bot screen, 2026-09-14).
+        # ``undamp_long_gamma`` compares a long-gamma reading at the SAME
+        # effective asymmetry threshold as a short-gamma one. Off by default:
+        # the fidelity run keeps the pattern's exact gate; the undamped run is
+        # a separate hypothesis about the positive-gamma side. The miss label
+        # is split by regime so the funnel shows which side a screen starved.
+        long_gamma = snap.net_gex is not None and snap.net_gex > 0
+        grad_eff = grad
+        if long_gamma and bool(self.params.get("undamp_long_gamma", False)):
+            grad_eff = grad / max(_LONG_GAMMA_DAMPING, 1e-6)
+        if abs(grad_eff) < min_score:
+            return self._skip("gradient_weak_long" if long_gamma else "gradient_weak_short")
         drift = "bullish" if grad > 0 else "bearish"
 
         # -- Gate 2: net_gex sign must agree with the gradient's sign. The
@@ -240,7 +255,9 @@ class GexGradientDrift(BaseBot):
         # overlay still compose normally. It is a penalty, never a veto — the
         # Breakout Mode gate above is the hard version of that check.
         grad_sat = float(self.params.get("quality_gradient_saturation", 70.0))
-        gradient_strength = min(1.0, abs(grad) / max(min_score, grad_sat))
+        # Quality reads the same effective gradient the gate did, so the
+        # undamped variant is not admitted by Gate 1 only to die at conviction.
+        gradient_strength = min(1.0, abs(grad_eff) / max(min_score, grad_sat))
         vol_floor = float(self.params.get("min_volatility_regime", -0.5))
         vol_sat = float(self.params.get("quality_vol_saturation", 0.5))
         vol_span = max(1e-6, vol_sat - vol_floor)

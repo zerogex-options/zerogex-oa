@@ -15,13 +15,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from src.opening_range import OPENING_RANGE_SQL, opening_range_from_row, opening_range_window
+from src.symbols import is_cash_index
 from src.tradeworkz.flow_context import (
+    fetch_atm_front_quote,
+    fetch_atm_iv_history,
+    fetch_cash_session_bars,
+    fetch_daily_forecast,
     fetch_forced_flow,
     fetch_hedge_impulse,
     fetch_profile_geometry,
@@ -34,6 +41,33 @@ from src.tradeworkz.flow_context import (
 )
 from src.tradeworkz.gex_stats import fetch_net_gex_pctile, fetch_wall_strength_pctile
 from src.tradeworkz.strikes import default_strike_increment, nearest_strike
+
+# Fewest prior sessions of ATM IV before a percentile is published. Below this
+# a rank is a coin toss against a handful of days.
+_ATM_IV_PCTILE_MIN_OBS = 20
+
+# Magnitude-only MSI rebuild (see MarketSnapshot.magnitude_score). The four
+# components and their full-scale points mirror ScoringEngine.COMPONENT_POINTS
+# and ScoringEngine.BAND_CANDIDATE_COMPONENTS; the saturation scale is its
+# _COMPOSITE_SAT_SCALE. Kept here as numbers rather than imported so the
+# snapshot does not pull the signals engine into the bot tier.
+_MAGNITUDE_COMPONENT_POINTS = {
+    "gamma_anchor": 30.0,
+    "net_gex_sign": 16.0,
+    "volatility_regime": 6.0,
+    "put_call_ratio": 12.0,
+}
+_MAGNITUDE_FULL_SCALE = 100.0
+_MAGNITUDE_SAT_SCALE = 50.0
+
+# RTH minutes per year — annualizes a 1-minute realized sigma onto the same
+# footing as an option's implied vol.
+_RTH_MINUTES_PER_YEAR = 252.0 * 390.0
+
+# E|Z| for a standard normal: a straddle's fair value is ~0.798 x the 1-sigma
+# move it spans, so straddle_mid / 0.798 recovers the market's 1-sigma
+# remaining move.
+_STRADDLE_TO_SIGMA = math.sqrt(2.0 / math.pi)
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +295,47 @@ class MarketSnapshot:
     #: against) and ``context_values``.
     signal_components: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+    # ===================================================================
+    # v6 volatility-pricing layer (see flow_context: fetch_atm_front_quote,
+    # fetch_daily_forecast, fetch_atm_iv_history, fetch_cash_session_bars).
+    # Every earlier tier traded DIRECTION off a magnitude signal; these are
+    # the inputs a bot needs to trade the magnitude itself — what the market
+    # is charging for the remaining move versus what the tape is realizing.
+    # Same best-effort contract: None when unavailable, and a bot that
+    # gates on one must fail closed.
+    # ===================================================================
+
+    #: ATM straddle on the FRONT expiration (today's, for every symbol the
+    #: fleet trades): the strike it sits at, its mid and bid per share, and
+    #: the mean ATM implied vol. ``straddle_mid`` is the market's price for
+    #: the remaining move; ``straddle_bid`` is what a seller collects before
+    #: slippage.
+    atm_strike_front: Optional[float] = None
+    atm_straddle_mid_front: Optional[float] = None
+    atm_straddle_bid_front: Optional[float] = None
+    atm_iv_front: Optional[float] = None
+    #: Where ``atm_iv_front`` ranks in this symbol's prior ~60 sessions of
+    #: daily ATM call IV [0..100]; None until enough history exists.
+    atm_iv_pctile_60d: Optional[float] = None
+
+    #: The morning forecast's committed claims for this session
+    #: (``daily_forecast``, written 08:30 ET, immutable): the VIX-implied
+    #: 1-day $ move, the predicted realized/normal range ratio and its
+    #: bucket, the 20-day VIX z-score it saw, and its event-day flag.
+    forecast_implied_move: Optional[float] = None
+    forecast_expected_vol_ratio: Optional[float] = None
+    forecast_expected_vol_state: Optional[str] = None  # compression|normal|expansion
+    forecast_vix_z: Optional[float] = None
+    forecast_is_event_day: Optional[bool] = None
+
+    #: This CASH session's open / high / low (from 09:30 ET, not the trailing
+    #: 24h the session_* fields span) and the close of the first half hour
+    #: (None before 10:00 ET).
+    cash_open: Optional[float] = None
+    cash_high: Optional[float] = None
+    cash_low: Optional[float] = None
+    first_half_hour_close: Optional[float] = None
+
     # ---- Convenience derivations ---------------------------------------
 
     @property
@@ -465,6 +540,161 @@ class MarketSnapshot:
             return None
         score = comp.get("score")
         return float(score) if isinstance(score, (int, float)) else None
+
+    # ---- Magnitude-only regime read ------------------------------------
+
+    def magnitude_score(self) -> Optional[float]:
+        """The MSI rebuilt from its MAGNITUDE components only, 0-100.
+
+        ``docs/design/msi-regime-excursion.md`` measured that the shipped MSI
+        is roughly a third direction read (order flow, dealer delta) wearing a
+        regime label, and that the magnitude-only rebuild from gamma_anchor,
+        net_gex_sign, volatility_regime and put_call_ratio orders forward
+        realized excursion better on 30 of 30 instrument-horizon cells. The
+        scoring engine now publishes that rebuild as
+        ``components.__aggregation__.magnitude_score``; this prefers the
+        published figure and otherwise recomputes it from the persisted
+        component scores with the engine's own arithmetic (renormalize the
+        active points onto the full scale, then ``50 + 50·tanh(x/50)``), so a
+        replay over history written before the shadow score existed reads the
+        same number. ``None`` when no magnitude component is present.
+        """
+        comps = self.msi_components or {}
+        agg = comps.get("__aggregation__")
+        if isinstance(agg, dict):
+            published = agg.get("magnitude_score")
+            if isinstance(published, (int, float)):
+                return max(0.0, min(100.0, float(published)))
+        offset = 0.0
+        active = 0.0
+        for name, default_pts in _MAGNITUDE_COMPONENT_POINTS.items():
+            comp = comps.get(name)
+            if not isinstance(comp, dict):
+                continue
+            score = comp.get("score")
+            if not isinstance(score, (int, float)):
+                continue
+            pts = comp.get("max_points")
+            points = float(pts) if isinstance(pts, (int, float)) and pts > 0 else default_pts
+            offset += points * max(-1.0, min(1.0, float(score)))
+            active += points
+        if active <= 0.0:
+            return None
+        full = offset * (_MAGNITUDE_FULL_SCALE / active)
+        value = 50.0 + 50.0 * math.tanh(full / _MAGNITUDE_SAT_SCALE)
+        return max(0.0, min(100.0, value))
+
+    def magnitude_band(self) -> Optional[str]:
+        """Band label for :meth:`magnitude_score` on the engine's own edges.
+
+        Same thresholds as ``ScoringEngine._regime_label`` (>= 70 trend
+        expansion, >= 40 controlled trend, >= 20 chop range, else high-risk
+        reversal) so a bot gating on "the chop band" means what the gauge
+        means. ``None`` when the score is unavailable.
+        """
+        score = self.magnitude_score()
+        if score is None:
+            return None
+        if score >= 70.0:
+            return "trend_expansion"
+        if score >= 40.0:
+            return "controlled_trend"
+        if score >= 20.0:
+            return "chop_range"
+        return "high_risk_reversal"
+
+    # ---- Realized vs implied ------------------------------------------
+
+    def realized_sigma_1min(self, bars: int = 30) -> Optional[float]:
+        """Population sigma of the last ``bars`` one-minute simple returns.
+
+        A fraction (0.0007 == 7 bps per minute). ``None`` with fewer than
+        six usable closes, the same floor the base class's short-horizon
+        estimator uses.
+        """
+        closes = [float(c) for c in (self.recent_closes or []) if c is not None and c > 0]
+        if len(closes) < 6:
+            return None
+        rets = [closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes))]
+        rets = rets[-max(2, int(bars)) :]
+        if len(rets) < 2:
+            return None
+        sigma = statistics.pstdev(rets)
+        return sigma if sigma > 0.0 else None
+
+    def realized_over_implied(self, bars: int = 30) -> Optional[float]:
+        """Annualized trailing realized vol over the ATM front implied vol.
+
+        Below 1 the tape is realizing less than the straddle is charging —
+        the premium seller's condition; above 1 the gamma is paying more
+        than its theta. ``None`` when either side is unavailable.
+        """
+        sigma = self.realized_sigma_1min(bars)
+        if sigma is None or self.atm_iv_front is None or self.atm_iv_front <= 0:
+            return None
+        return (sigma * math.sqrt(_RTH_MINUTES_PER_YEAR)) / float(self.atm_iv_front)
+
+    def straddle_implied_sigma(self) -> Optional[float]:
+        """The market's 1-sigma remaining move in $, from the ATM straddle mid.
+
+        A straddle is worth ~0.798 sigma for a normal move, so mid / 0.798 is
+        the sigma the market is pricing for the rest of the front
+        expiration's life. ``None`` when no straddle quote is present.
+        """
+        mid = self.atm_straddle_mid_front
+        if mid is None or mid <= 0:
+            return None
+        return float(mid) / _STRADDLE_TO_SIGMA
+
+    def expected_remaining_move(self) -> Optional[float]:
+        """The morning forecast's 1-sigma $ move scaled to the rest of today.
+
+        ``forecast_implied_move`` is a full-session sigma; the intraday cone
+        model's diurnal variance profile (``variance_fraction``) says what
+        share of the day's variance is still ahead, which is far more than
+        ``sqrt(minutes_to_close / 390)`` around the bell and far less at
+        lunch. ``None`` outside the session or without a forecast.
+        """
+        im = self.forecast_implied_move
+        elapsed = self.minutes_since_open
+        if im is None or im <= 0 or elapsed is None or elapsed >= 390.0:
+            return None
+        from src.jobs.intraday_cone_model import SESSION_MINUTES, variance_fraction
+
+        frac = variance_fraction(elapsed, float(SESSION_MINUTES), SESSION_MINUTES)
+        if frac <= 0.0:
+            return None
+        return float(im) * math.sqrt(frac)
+
+    def cash_range_over_implied(self) -> Optional[float]:
+        """Today's cash-session high-low range over the forecast's implied move.
+
+        The realized-range half of the morning forecast's own receipt, read
+        live: a tape already past its implied 1-day move is not one to sell.
+        ``None`` without both inputs.
+        """
+        if self.cash_high is None or self.cash_low is None:
+            return None
+        im = self.forecast_implied_move
+        if im is None or im <= 0:
+            return None
+        return (float(self.cash_high) - float(self.cash_low)) / float(im)
+
+    def day_return(self) -> Optional[float]:
+        """Cash-session return so far: spot / cash open - 1 (signed fraction)."""
+        if self.cash_open is None or self.cash_open <= 0 or self.spot <= 0:
+            return None
+        return self.spot / float(self.cash_open) - 1.0
+
+    def first_half_hour_return(self) -> Optional[float]:
+        """09:30-10:00 ET return: first-half-hour close / cash open - 1.
+
+        The predictor in Gao, Han, Li & Zhou's market intraday momentum;
+        ``None`` before 10:00 ET or without a cash open.
+        """
+        if self.first_half_hour_close is None or self.cash_open is None or self.cash_open <= 0:
+            return None
+        return float(self.first_half_hour_close) / float(self.cash_open) - 1.0
 
 
 def _fetch_signal_state(
@@ -881,6 +1111,35 @@ def build_snapshot(
         conn, underlying, 15, as_of
     )
 
+    # ---- v6 volatility-pricing layer (same best-effort / as-of semantics).
+    # The front expiration is this session's own date — every symbol the
+    # fleet trades lists a same-day expiration — and a symbol that does not
+    # simply reads None and the dependent bots abstain.
+    snap_et_date = (
+        (snapshot_ts.replace(tzinfo=timezone.utc) if snapshot_ts.tzinfo is None else snapshot_ts)
+        .astimezone(_ET)
+        .date()
+    )
+    (
+        atm_strike_front,
+        atm_straddle_mid_front,
+        atm_straddle_bid_front,
+        atm_iv_front,
+    ) = fetch_atm_front_quote(conn, underlying, float(spot), snap_et_date.isoformat(), as_of)
+    (
+        forecast_implied_move,
+        forecast_expected_vol_ratio,
+        forecast_expected_vol_state,
+        forecast_vix_z,
+        forecast_is_event_day,
+    ) = fetch_daily_forecast(conn, underlying, as_of)
+    atm_iv_pctile_60d = _percentile_rank(
+        atm_iv_front, fetch_atm_iv_history(conn, underlying, as_of, 60)
+    )
+    cash_open, cash_high, cash_low, first_half_hour_close = fetch_cash_session_bars(
+        conn, underlying, as_of, open_offset_min=1 if is_cash_index(underlying) else 0
+    )
+
     return MarketSnapshot(
         underlying=underlying,
         timestamp=snapshot_ts,
@@ -961,7 +1220,34 @@ def build_snapshot(
         put_panic_premium=put_panic_premium,
         put_panic_dominance=put_panic_dominance,
         put_panic_baseline=put_panic_baseline,
+        # -- v6 volatility-pricing layer --
+        atm_strike_front=atm_strike_front,
+        atm_straddle_mid_front=atm_straddle_mid_front,
+        atm_straddle_bid_front=atm_straddle_bid_front,
+        atm_iv_front=atm_iv_front,
+        atm_iv_pctile_60d=atm_iv_pctile_60d,
+        forecast_implied_move=forecast_implied_move,
+        forecast_expected_vol_ratio=forecast_expected_vol_ratio,
+        forecast_expected_vol_state=forecast_expected_vol_state,
+        forecast_vix_z=forecast_vix_z,
+        forecast_is_event_day=forecast_is_event_day,
+        cash_open=cash_open,
+        cash_high=cash_high,
+        cash_low=cash_low,
+        first_half_hour_close=first_half_hour_close,
     )
+
+
+def _percentile_rank(value: Optional[float], history: list) -> Optional[float]:
+    """Share of ``history`` at or below ``value``, x100; None when thin.
+
+    Needs at least ``_ATM_IV_PCTILE_MIN_OBS`` observations — a rank against a
+    handful of sessions says nothing.
+    """
+    if value is None or len(history) < _ATM_IV_PCTILE_MIN_OBS:
+        return None
+    below = sum(1 for h in history if h <= value)
+    return 100.0 * below / len(history)
 
 
 def _maybe_float(v: Any) -> Optional[float]:

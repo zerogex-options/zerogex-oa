@@ -83,6 +83,45 @@ def _fleet_screen(
 # Wall structure
 # =======================================================================
 
+# Catalog defaults shared by the v6 short-premium family — every entry bound to
+# a ``ShortPremiumBot`` subclass (src/tradeworkz/bots/short_premium.py) starts
+# from these and overrides only the gates that define it, so a sweep axis has
+# one name across the family. Plain data, like everything else in this file.
+_SHORT_PREMIUM_PARAMS = {
+    "dte_target": 0,
+    # 1-sigma remaining move: the ATM straddle's own, then the morning
+    # forecast scaled to the remaining session. Realized vol is opt-in.
+    "sigma_sources": ["straddle", "forecast"],
+    "realized_window_bars": 30,
+    # 0 => iron butterfly (shorts at the center); k => condor, shorts k sigma out.
+    "short_offset_sigma": 0.0,
+    "wing_sigma_mult": 1.25,
+    "min_wing_increments": 1,
+    "flip_clear_sigma_mult": 1.0,
+    "flip_exit_sigma_mult": 0.5,
+    "short_touch_buffer_sigma": 0.0,
+    "max_vix_change_frac": 0.05,
+    "max_atm_iv_pctile": 80.0,
+    "require_iv_pctile": False,
+    "event_dates": [],
+    "forbid_forecast_vol_state": "expansion",
+    "max_cash_range_over_implied": None,
+    "credit_take_frac": 0.5,
+    "credit_stop_mult": 1.0,
+    "eod_exit_buffer_minutes": 20,
+    # Irrelevant for a credit (the debit premium stop skips entry <= 0) but
+    # set explicitly so a reader does not go looking for it.
+    "max_premium_loss_pct": 0.0,
+    # 5-minute replay: the entry-tick four-leg spread must not knife the
+    # position before the first real mark.
+    "premium_stop_grace_seconds": 600,
+    "scale_out_enabled": False,
+    # Quality is calibrated to this floor: a top-quartile regime with realized
+    # at half of implied clears it; a boundary setup does not.
+    "confidence_threshold_default": 0.50,
+    "confidence_base_default": 0.50,
+}
+
 _WALL_FILTER_PARAMS = {
     "wall_proximity_pct": 0.002,
     "wall_reject_margin_pct": 0.0007,
@@ -1089,6 +1128,38 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
             ),
         ),
     ),
+    StrategyEntry(
+        id="long_gamma_iron_fly",
+        name="Long-Gamma Iron Butterfly",
+        family=Family.VOL_REGIME,
+        tier="0DTE",
+        direction_mode="neutral",
+        tagline="Top-quartile long gamma, quiet tape. Sell the 0DTE straddle, wings on.",
+        thesis=(
+            "Dealers long gamma must sell rallies and buy dips, which compresses "
+            "realized range — the one effect this platform's own data confirms "
+            "at every horizon — while 0DTE buyers pay for the move regardless. "
+            "Sells a defined-risk ATM iron butterfly midday, only when dealer "
+            "gamma is in the symbol's top quartile, the magnitude-only MSI reads "
+            "chop, and trailing realized vol is under the ATM implied; wings and "
+            "exits are multiples of the straddle's own remaining move."
+        ),
+        stage=Stage.RESEARCH,
+        bot_class="LongGammaIronFly",
+        params={
+            **_SHORT_PREMIUM_PARAMS,
+            "min_minutes_since_open": 60,
+            "min_minutes_to_close": 150,
+            "max_hold_minutes": 150,
+            "required_regimes": ["positive_strong"],
+            "regime_fail_closed": True,
+            "allowed_magnitude_bands": ["chop_range", "high_risk_reversal"],
+            "require_magnitude": True,
+            "max_realized_over_implied": 0.85,
+            "max_cash_range_over_implied": 1.0,
+        },
+        research=(),
+    ),
 )
 
 
@@ -1150,6 +1221,13 @@ _TREND: Tuple[StrategyEntry, ...] = (
             # and the screen returns zero trades (see weekly_charm_grind).
             "quality_gradient_saturation": 70.0,
             "quality_vol_saturation": 0.5,
+            # The 2026-09-14 screen found Gate 1 unreachable under long gamma
+            # by arithmetic (the component's 0.40 damping equals the 40-point
+            # threshold). False keeps the pattern's exact gate for the
+            # fidelity run; True compares a long-gamma reading at the same
+            # effective asymmetry and is a SEPARATE hypothesis about the
+            # positive-gamma side, screened on its own (see the bot).
+            "undamp_long_gamma": False,
         },
         research=(
             ResearchRun(
@@ -1240,6 +1318,64 @@ _TREND: Tuple[StrategyEntry, ...] = (
                 ),
             ),
         ),
+    ),
+    StrategyEntry(
+        id="hedging_demand_close_momentum",
+        name="Hedging-Demand Close Momentum",
+        family=Family.TREND,
+        tier="0DTE",
+        direction_mode="context",
+        tagline="Short-gamma hedgers must chase the day's move into the bell. Ride it.",
+        thesis=(
+            "Market intraday momentum (Gao, Han, Li & Zhou 2018): the day's "
+            "return predicts the last half hour in the same direction, and "
+            "Baltussen, Da, Lammers & Martens (2021) attribute it to dealers "
+            "short gamma and leveraged ETFs that must rebalance with the move "
+            "into the close. ZeroGEX measures the hedgers' sign directly. At "
+            "15:00 ET, when dealer gamma is negative and the cash session has "
+            "moved at least half an implied daily sigma, buys a 0DTE ATM "
+            "vertical in the day's direction and holds it to 15:55. The one "
+            "clock-to-clock structure no study here has tested."
+        ),
+        stage=Stage.RESEARCH,
+        bot_class="HedgingDemandCloseMomentum",
+        params={
+            "dte_target": 0,
+            "min_minutes_to_close": 40,
+            "max_minutes_to_close": 60,
+            # "negative" is the paper's condition; "positive" the complement
+            # control; "any" the unconditional Gao et al. trade.
+            "required_gamma_sign": "negative",
+            "max_net_gex_pctile": None,
+            "min_day_move_sigma": 0.5,
+            "max_day_move_sigma": 3.0,
+            "require_first_half_hour_agreement": False,
+            "wall_room_sigma_mult": 0.0,
+            "structure": "debit_vertical",
+            "vertical_width_sigma_mult": 0.5,
+            "min_width_increments": 1,
+            "stop_sigma_mult": 0.0,
+            "eod_exit_buffer_minutes": 5,
+            "exit_on_momentum_loss": True,
+            "max_hold_minutes": 60,
+        },
+        bot_params={
+            # A 15:00 ET 0DTE ATM vertical bleeds fast; the base 0.40 stop
+            # would fire on the first adverse bar of a trade whose object is
+            # the 15:55 mark. 0.60 with a grace longer than one replay step.
+            "max_premium_loss_pct": 0.60,
+            "premium_stop_grace_seconds": 600,
+            # Credit-structure exits, used only when structure=credit_vertical.
+            "credit_take_frac": 0.6,
+            "credit_stop_mult": 1.0,
+            # The fused trade bias measured as noise on nine inputs; vetoing
+            # the paper's own signal with it would muddy the screen.
+            "bias_veto_enabled": False,
+            "scale_out_enabled": False,
+            "confidence_threshold_default": 0.50,
+            "confidence_base_default": 0.50,
+        },
+        research=(),
     ),
     StrategyEntry(
         id="vwap_reversion",

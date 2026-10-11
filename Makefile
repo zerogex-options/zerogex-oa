@@ -4401,6 +4401,11 @@ tradeworkz-review: ## Show scale-out ladder activity for the latest session (arm
 	@echo "$(BLUE)=== TradeWorkz scale-out review ===$(NC)"
 	@$(PSQL) -f setup/database/diagnostics/tradeworkz_scale_review.sql
 
+.PHONY: tradeworkz-v6-prescreen
+tradeworkz-v6-prescreen: ## v6 pre-screen: forecast skill, gamma base rates, raw last-hour momentum, realized-vs-normal range (read-only SQL)
+	@echo "$(BLUE)=== TradeWorkz v6 pre-screen (read-only) ===$(NC)"
+	@$(PSQL) -f setup/database/diagnostics/tradeworkz_v6_prescreen.sql
+
 .PHONY: tradeworkz-backtest
 tradeworkz-backtest: ## Replay bots over history to screen for entry edge (args: ARGS="--days 5 --interval-min 5 --bots id1,id2 --json")
 	@echo "$(BLUE)=== TradeWorkz backtest (research screen: 1 contract, scaling OFF, ML neutral) ===$(NC)"

@@ -75,6 +75,20 @@ _COVERAGE = [
         "flow_series_5min",
         ["net_premium_cum", "net_volume_cum"],
     ),
+    # v6: the volatility-pricing layer. daily_forecast is written once per
+    # symbol per morning (SPY only by default — a symbol with no rows here
+    # makes every forecast-gated bot abstain on that symbol, honestly);
+    # daily_atm_iv is one row per symbol per session.
+    (
+        "daily_forecast",
+        "daily_forecast",
+        ["implied_move", "expected_vol_ratio", "expected_vol_state", "forecast_inputs"],
+    ),
+    (
+        "daily_atm_iv",
+        "daily_atm_iv",
+        ["atm_call_iv"],
+    ),
     # v5: the per-contract microstructure the hedge-impulse and
     # put-capitulation bots aggregate, and the curve the shelf bot reads.
     (
@@ -113,6 +127,21 @@ _EDGE_FIELDS = [
     "hedge_tape_volume",
     "put_panic_premium",
     "put_panic_baseline",
+    # v6: volatility-pricing layer
+    "atm_strike_front",
+    "atm_straddle_mid_front",
+    "atm_straddle_bid_front",
+    "atm_iv_front",
+    "atm_iv_pctile_60d",
+    "forecast_implied_move",
+    "forecast_expected_vol_ratio",
+    "forecast_expected_vol_state",
+    "forecast_vix_z",
+    "forecast_is_event_day",
+    "cash_open",
+    "cash_high",
+    "cash_low",
+    "first_half_hour_close",
 ]
 
 
@@ -148,9 +177,18 @@ def _table_exists(conn: Any, table: str) -> bool:
     return bool(row and row[0])
 
 
+# Tables whose time column is not ``timestamp``. flow_series_5min keys on the
+# bar start; the two daily tables are one row per session, keyed on the
+# forecast's 08:30 ET write and the ATM-IV sample's source instant.
+_TS_COLUMNS = {
+    "flow_series_5min": "bar_start",
+    "daily_forecast": "open_ts",
+    "daily_atm_iv": "source_timestamp",
+}
+
+
 def _ts_column(conn: Any, table: str) -> str:
-    # flow_series_5min keys its time column 'bar_start'; everything else 'timestamp'.
-    return "bar_start" if table == "flow_series_5min" else "timestamp"
+    return _TS_COLUMNS.get(table, "timestamp")
 
 
 def print_coverage(conn: Any, start: datetime, end: datetime) -> None:

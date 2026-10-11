@@ -48,6 +48,8 @@ from src.tradeworkz.bots.gamma_flip_defender import GammaFlipDefender
 from src.tradeworkz.bots.gamma_regime_shift_rider import GammaRegimeShiftRider
 from src.tradeworkz.bots.gex_gradient_drift import GexGradientDrift
 from src.tradeworkz.bots.hedge_impulse_quiet_tape import HedgeImpulseQuietTape
+from src.tradeworkz.bots.hedging_demand_close_momentum import HedgingDemandCloseMomentum
+from src.tradeworkz.bots.long_gamma_iron_fly import LongGammaIronFly
 from src.tradeworkz.bots.max_pain_gravitator import MaxPainGravitator
 from src.tradeworkz.bots.opening_range_hunter import OpeningRangeHunter
 from src.tradeworkz.bots.profile_shelf_breaker import ProfileShelfBreaker
@@ -85,6 +87,8 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     "GammaRegimeShiftRider": GammaRegimeShiftRider,
     "GexGradientDrift": GexGradientDrift,
     "HedgeImpulseQuietTape": HedgeImpulseQuietTape,
+    "HedgingDemandCloseMomentum": HedgingDemandCloseMomentum,
+    "LongGammaIronFly": LongGammaIronFly,
     "MaxPainGravitator": MaxPainGravitator,
     "OpeningRangeHunter": OpeningRangeHunter,
     "ProfileShelfBreaker": ProfileShelfBreaker,

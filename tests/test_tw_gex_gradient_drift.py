@@ -474,3 +474,45 @@ def test_the_audit_queues_it_for_a_bot_screen():
     g = gaps()
     assert g["awaiting_bot_screen"] == ["gex_gradient_trend"]
     assert g["validated_without_bot"] == []
+
+
+# ======================================================================
+# The long-gamma damping collision, and the opt-in undamped variant
+# ======================================================================
+
+
+def test_fidelity_run_names_which_regime_starved_the_gradient_gate():
+    """The 2026-09-14 screen died 2,921 times at one undifferentiated label.
+
+    A long-gamma reading of 30 is the component's damped output and the
+    pattern's own gate rejects it; the bot must still reject it by default
+    (fidelity), but the funnel now says which side of the book did so.
+    """
+    bot = _bot()
+    assert bot.open_criteria(_snap(_ctx(gradient_score=30.0, net_gex=0.5e9))) is None
+    assert bot.miss_reasons == {"gradient_weak_long": 1}
+    bot = _bot()
+    assert bot.open_criteria(_snap(_ctx(gradient_score=-30.0, net_gex=-0.5e9))) is None
+    assert bot.miss_reasons == {"gradient_weak_short": 1}
+
+
+def test_undamped_variant_admits_a_long_gamma_reading_at_the_same_asymmetry():
+    """``undamp_long_gamma`` divides a long-gamma reading by the component's
+    damping (0.40 by default), so 30 reads as 75 and clears the 40 floor —
+    while the pattern, which has no such switch, still declines. This is a
+    deliberate, labelled divergence: a separate hypothesis, not fidelity."""
+    from src.signals.basic.gex_gradient import _LONG_GAMMA_DAMPING
+
+    ctx = _ctx(gradient_score=30.0, net_gex=0.5e9)
+    assert GGT.match(ctx) is None
+    sig = _bot(undamp_long_gamma=True).open_criteria(_snap(ctx))
+    assert sig is not None and sig.direction == "bullish"
+    # A reading that stays under the floor even undamped is still rejected...
+    below = 40.0 * _LONG_GAMMA_DAMPING - 1.0
+    bot = _bot(undamp_long_gamma=True)
+    assert bot.open_criteria(_snap(_ctx(gradient_score=below, net_gex=0.5e9))) is None
+    assert bot.miss_reasons == {"gradient_weak_long": 1}
+    # ...and the switch never touches a short-gamma reading.
+    bot = _bot(undamp_long_gamma=True)
+    assert bot.open_criteria(_snap(_ctx(gradient_score=-30.0, net_gex=-0.5e9))) is None
+    assert bot.miss_reasons == {"gradient_weak_short": 1}
