@@ -15,12 +15,35 @@ only while the first is at full strength.
 
 The edge-defining question is WHEN NOT TO SELL, and every gate is a stand-down:
 top-quartile positive gamma by the symbol's own history (not merely positive),
-the magnitude-only MSI band in chop or reversal, trailing realized vol under
-the ATM implied so the premium is accruing now, neither gamma flip within a
-sigma of the strike, no VIX shock in the last half hour, ATM IV not in its
-top quintile, no scheduled macro release, and the morning forecast not calling
-expansion. The structure is an ATM iron butterfly with wings a sigma-multiple
-out, where sigma is the market's own remaining move read from the straddle.
+the trailing realized move projected over the rest of the day under what the
+ATM straddle charges for it (dollars against dollars, on the cone model's
+diurnal profile), neither gamma flip within a sigma of the strike, no VIX
+shock in the last half hour, no scheduled macro release, and the morning
+forecast not calling expansion. The structure is an ATM iron butterfly with
+wings a sigma-multiple out, where sigma is the market's own remaining move
+read from the straddle.
+
+What the adversarial review (2026-10-11) changed before the first screen
+------------------------------------------------------------------------
+* The only clock-and-tape-adjusted gamma figures on this platform are SHORT
+  gamma at 1.08x and the "neither" zone at 0.92x; long gamma was never
+  reported and is implied to be about 1.0x. The MSI band ratios are against
+  the unconditional base rate. So the prior that the gamma gate adds
+  anything beyond a quiet tape is weaker than the designers assumed, and the
+  tape-only twin is the PRIMARY comparison, not a control.
+* The magnitude band gate is off by default (a sweep axis) and the ATM IV
+  percentile gate is off (it ranked two different quantities).
+* The realized-vs-implied gate now compares dollars with dollars; the
+  annualized-vol form mixed an RTH and a calendar convention and read ~0.43
+  for a fair straddle.
+* The credit stop is 0.5x the credit; at a 1.25-sigma wing the wing itself is
+  the loss, roughly 0.8-0.9x the credit, so a 1.0x stop could never fire.
+* Roughly 35 gated trades in 80 sessions cannot distinguish PF 1.1 from 1.0
+  (the PF sampling error is of order 0.5). The 80-session screen can return
+  ``insufficient`` or ``no-edge`` on the gamma conditioning, never a defensible
+  ``edge``; the paired per-session comparison of the gated fly against its
+  twins on the SAME sessions is the statistic to read, and the pre-screen
+  SQL's straddle-versus-realized table is the option-free test to run first.
 
 Why this is not a dead row
 --------------------------
@@ -53,9 +76,9 @@ class LongGammaIronFly(ShortPremiumBot):
     tagline = "Top-quartile long gamma, quiet tape. Sell the 0DTE straddle, wings on."
     description = (
         "Sells a defined-risk 0DTE ATM iron butterfly between 10:30 and 13:30 ET "
-        "only when dealer gamma is in the symbol's top quartile, the magnitude-"
-        "only MSI reads chop or reversal, trailing realized vol is under the ATM "
-        "implied, and no flip, VIX shock, elevated IV or scheduled release says "
-        "stand down. Wings sit 1.25 sigma out on the straddle's own remaining "
-        "move; exits book half the credit or cut at one credit."
+        "only when dealer gamma is in the symbol's top quartile, the trailing "
+        "realized move projected over the rest of the day is under what the ATM "
+        "straddle charges for it, and no flip, VIX shock or scheduled release "
+        "says stand down. Wings sit 1.25 sigma out on the straddle's own "
+        "remaining move; exits book half the credit or cut at half of it."
     )

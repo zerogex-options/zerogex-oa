@@ -4402,7 +4402,7 @@ tradeworkz-review: ## Show scale-out ladder activity for the latest session (arm
 	@$(PSQL) -f setup/database/diagnostics/tradeworkz_scale_review.sql
 
 .PHONY: tradeworkz-v6-prescreen
-tradeworkz-v6-prescreen: ## v6 pre-screen: forecast skill, gamma base rates, raw last-hour momentum, realized-vs-normal range (read-only SQL)
+tradeworkz-v6-prescreen: ## v6 pre-screen: forecast skill, gamma base rates, raw last-hour momentum, realized-vs-normal range, straddle charged vs paid by gamma sign (read-only SQL)
 	@echo "$(BLUE)=== TradeWorkz v6 pre-screen (read-only) ===$(NC)"
 	@$(PSQL) -f setup/database/diagnostics/tradeworkz_v6_prescreen.sql
 

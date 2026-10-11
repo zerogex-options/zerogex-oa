@@ -389,3 +389,45 @@ def test_cash_range_and_returns():
     assert bare.cash_range_over_implied() is None
     assert bare.day_return() is None
     assert bare.first_half_hour_return() is None
+
+
+def test_realized_remaining_move_scales_by_the_diurnal_profile():
+    from src.jobs.intraday_cone_model import SESSION_MINUTES, variance_fraction
+
+    # Alternating +/- 10 bps closes at 12:00 ET: 30 returns, population sigma ~0.001.
+    closes = [100.0 * (1.001 if i % 2 else 1.0) for i in range(31)]
+    snap = _snap(spot=100.0, recent_closes=closes)
+    sigma = snap.realized_sigma_1min()
+    trailing_var = sigma**2 * 30
+    share_trailing = variance_fraction(120.0, 150.0, SESSION_MINUTES)
+    share_remaining = variance_fraction(150.0, 390.0, SESSION_MINUTES)
+    expected = 100.0 * math.sqrt(trailing_var * share_remaining / share_trailing)
+    assert abs(snap.realized_remaining_move() - expected) < 1e-9
+    # The lunch trough is quieter than the close hump, so the projection is
+    # MORE than naive sqrt-of-time scaling of the trailing half hour.
+    assert snap.realized_remaining_move() > 100.0 * sigma * math.sqrt(240.0)
+    # None without history, before the open, or after the close.
+    assert _snap(recent_closes=[656.0] * 5).realized_remaining_move() is None
+    assert _snap(recent_closes=closes, timestamp=EARLY_0945ET).realized_remaining_move() is not None
+    after_close = _snap(
+        recent_closes=closes, timestamp=datetime(2026, 8, 6, 20, 30, tzinfo=timezone.utc)
+    )
+    assert after_close.realized_remaining_move() is None
+
+
+def test_realized_over_straddle_is_convention_free():
+    # Dollars realized over the rest of the day against dollars the straddle
+    # charges: no annualization enters, so the IV field is irrelevant to it.
+    closes = [100.0 * (1.001 if i % 2 else 1.0) for i in range(31)]
+    snap = _snap(spot=100.0, recent_closes=closes, atm_straddle_mid_front=1.0)
+    ratio = snap.realized_over_straddle()
+    assert abs(ratio - snap.realized_remaining_move() / snap.straddle_implied_sigma()) < 1e-12
+    same_iv_free = _snap(
+        spot=100.0, recent_closes=closes, atm_straddle_mid_front=1.0, atm_iv_front=0.9
+    )
+    assert same_iv_free.realized_over_straddle() == ratio
+    # A straddle that charges twice as much halves the ratio.
+    doubled = _snap(spot=100.0, recent_closes=closes, atm_straddle_mid_front=2.0)
+    assert abs(doubled.realized_over_straddle() - ratio / 2.0) < 1e-12
+    assert _snap(spot=100.0, recent_closes=closes).realized_over_straddle() is None  # no straddle
+    assert _snap(atm_straddle_mid_front=1.0).realized_over_straddle() is None  # no history

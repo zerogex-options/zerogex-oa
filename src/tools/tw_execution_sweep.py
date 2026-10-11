@@ -23,9 +23,9 @@ Usage (same DB the backtest uses):
 
 The grid is chosen from the bot's class (``--grid`` overrides): the wall
 grid for the wall-reversion bots, the short-premium grid (gated default vs
-the gamma-blind / no-band / tail-only / clock-only twins, plus geometry) for
-any ``ShortPremiumBot``, and the gamma-sign x structure grid for the close
-momentum bot.
+the tail-only / clock-only / negative-gamma twins, the band and uniform-gates
+arms, plus geometry) for any ``ShortPremiumBot``, and the gamma-sign x
+structure grid for the close momentum bot.
 
 It runs two passes (train, test); at interval 5 that is ~2× a normal screen.
 Nothing here writes to any tw_* table.
@@ -94,38 +94,51 @@ def wall_execution_grid() -> List[Tuple[str, Dict[str, Any]]]:
 def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
     """(label, param-overrides) for a v6 short-premium bot (``ShortPremiumBot``).
 
-    Two axes, kept small so a winner is not found by arithmetic:
+    Two axes, kept small so a winner is not found by arithmetic. Gates are
+    disabled with falsy values (``0`` / ``""`` / ``[]``), never ``None``, which
+    the engine reads as "use the default".
 
     * the GATE axis is the experiment — the gated default against the twins
-      that drop one conditioning at a time, down to clock-only (pure 0DTE
-      variance premium). If a twin matches the gated PF within ~0.1, that
-      gate is not earning its place;
+      that drop one conditioning at a time: ``tail_only`` (regime gate off;
+      the PRIMARY comparison per the adversarial review), ``clock_only``
+      (regime and tail gates off: pure 0DTE variance premium),
+      ``negative_gamma`` (the complement the mechanism says should NOT
+      work), ``band`` (the magnitude band switched on), and
+      ``uniform_gates`` (the stand-downs whose inputs do not cover the whole
+      window switched off, so both halves of the split run the same gate
+      set). A twin within ~0.1 PF of the gated default means that gate is
+      not earning its place;
     * the GEOMETRY axis on the gated default — wing width, credit take, the
-      condor form and a looser stop.
+      two exit clocks the reviewers disagreed on (flat before the close hump
+      vs hold to settlement), the condor form, and no credit stop (the wing
+      is the stop).
     """
     grid: List[Tuple[str, Dict[str, Any]]] = [
         ("gated/default", {}),
-        ("twin/gamma_blind", {"required_regimes": "any"}),
-        ("twin/no_band", {"allowed_magnitude_bands": None}),
+        ("twin/tail_only", {"required_regimes": "any"}),
+        ("twin/clock_only", {"required_regimes": "any", "max_realized_over_straddle": 0}),
+        ("twin/negative_gamma", {"required_regimes": ["negative_weak", "negative_strong"]}),
         (
-            "twin/tail_only",
-            {"required_regimes": "any", "allowed_magnitude_bands": None},
+            "gated/band",
+            {"allowed_magnitude_bands": ["chop_range", "high_risk_reversal"]},
         ),
         (
-            "twin/clock_only",
+            "gated/uniform_gates",
             {
-                "required_regimes": "any",
-                "allowed_magnitude_bands": None,
-                "max_realized_over_implied": None,
+                "max_vix_change_frac": 0,
+                "exit_on_vol_shock": False,
+                "forbid_forecast_vol_state": "",
+                "max_cash_range_over_implied": 0,
             },
         ),
     ]
     for wing in (1.0, 1.5):
         grid.append((f"gated/wing{wing:g}", {"wing_sigma_mult": wing}))
-    for take in (0.35, 0.7):
-        grid.append((f"gated/take{int(take * 100)}", {"credit_take_frac": take}))
+    grid.append(("gated/take35", {"credit_take_frac": 0.35}))
+    grid.append(("gated/exit15:05", {"eod_exit_buffer_minutes": 55}))
+    grid.append(("gated/hold_to_settle", {"eod_exit_buffer_minutes": 5}))
     grid.append(("gated/condor1.0", {"short_offset_sigma": 1.0, "wing_sigma_mult": 0.75}))
-    grid.append(("gated/stop1.5", {"credit_stop_mult": 1.5}))
+    grid.append(("gated/no_stop", {"credit_stop_mult": 0}))
     return grid
 
 

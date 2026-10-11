@@ -33,30 +33,47 @@ The gates every subclass inherits (each a named ``_skip`` reason)
 * ``no_straddle`` / ``no_sigma`` — the implied side must be priced.
 * ``regime`` / ``no_pctile`` — a symbol-relative dealer-gamma regime; fails
   CLOSED when the percentile history is absent (never the absolute fallback).
-* ``magnitude_band`` / ``no_magnitude`` — the magnitude-only MSI band.
-* ``tail_realized`` / ``no_history`` — trailing realized vol over the ATM
-  implied vol must be under a cap: the premium must be accruing NOW.
+* ``tail_realized`` / ``no_history`` — the trailing realized move, projected
+  over the rest of the day on the cone model's diurnal profile, must sit
+  under a cap of the straddle-implied remaining move
+  (``snap.realized_over_straddle``). Dollars against dollars: the earlier
+  annualized-vol form compared RTH-annualized realized with a
+  calendar-annualized IV and read ~0.43 for a fair straddle, so it never
+  tripped — the adversarial review caught it.
+* ``magnitude_band`` / ``no_magnitude`` — the magnitude-only MSI band. OFF
+  by default: its evidence is unadjusted for the clock and the tape, and
+  its ``net_gex_sign`` component is near-collinear with the regime gate.
+  A sweep axis that has to earn its place.
 * ``range_spent`` / ``forecast_expansion`` — today's cash range against the
   morning forecast, and the forecast's own expansion call.
 * ``flip_near`` — the gamma flip (either convention) inside a sigma of the
   center: a flip cross turns the absorber into an amplifier.
-* ``vol_shock`` / ``iv_elevated`` / ``event_day`` — the tail stand-downs.
+* ``vol_shock`` / ``event_day`` — the tail stand-downs. ``iv_elevated`` is
+  available but OFF by default: ``daily_atm_iv`` is an all-expiration EOD
+  figure and ``atm_iv_front`` a same-day midday one, so the percentile is
+  not of the same thing.
 * ``conviction`` — the base-class gate, with a quality scale calibrated so a
   typical gate-passing setup clears it (the v5 lesson).
 
+Param convention: a gate is DISABLED by a falsy value (``0``, ``""``, ``[]``);
+``None`` means "use the engine default". This is what lets a sweep twin drop
+one gate at a time.
+
 Exits: the base class's credit take / stop (``credit_take_frac`` /
-``credit_stop_mult``) plus invalidations that close regardless of P&L —
+``credit_stop_mult`` — note the WING is the real stop on a fly: max loss is
+roughly 0.8-0.9x the credit at a 1.25-sigma wing, so a stop multiple above
+that never fires) plus invalidations that close regardless of P&L —
 ``regime_lost``, ``flip_entered``, ``short_touched``, ``vol_shock`` — and a
-time stop that never holds the short straddle into the settlement window.
+time stop that by default never holds the short straddle into the settlement
+window (``eod_exit_buffer_minutes``; a sweep arm holds to settlement).
 
 Controls are params, not new bots: ``required_regimes: "any"`` is the
-gamma-blind twin, ``allowed_magnitude_bands: null`` drops the band gate, and
-``tw_execution_sweep`` runs the grid in one pass.
+tape-only twin, ``max_realized_over_straddle: 0`` on top of it is the
+clock-only twin, and ``tw_execution_sweep`` runs the grid in one pass.
 """
 
 from __future__ import annotations
 
-import math
 from datetime import timedelta
 from typing import Any, List, Optional
 
@@ -100,15 +117,15 @@ class ShortPremiumBot(BaseBot):
     def quality(self, snap: MarketSnapshot, sigma: float) -> float:
         """0..1 read of how clean the setup is, calibrated against the
         conviction floor (see ``confidence_threshold_default`` in the catalog):
-        half regime strength, half how far realized sits under implied."""
+        half regime strength, half how far realized sits under the straddle."""
         if self._regime_gate_enabled():
             pct = snap.net_gex_pctile
             q_regime = _clamp01((float(pct) - 50.0) / 50.0) if pct is not None else 0.0
         else:
-            q_regime = 0.6  # gamma-blind twin: neutral, so conviction cannot bias it
-        cap = self._p("max_realized_over_implied", 0.85)
-        roi = snap.realized_over_implied(int(self._p("realized_window_bars", 30)))
-        q_tail = _clamp01(1.0 - roi / cap) if (roi is not None and cap) else 0.5
+            q_regime = 0.6  # tape-only twin: neutral, so conviction cannot bias it
+        cap = self._p("max_realized_over_straddle", 0.85)
+        ratio = snap.realized_over_straddle(int(self._p("realized_window_bars", 30)))
+        q_tail = _clamp01(1.0 - ratio / cap) if (ratio is not None and cap) else 0.5
         return 0.5 * q_regime + 0.5 * q_tail
 
     # ------------------------------------------------------------------
@@ -116,6 +133,8 @@ class ShortPremiumBot(BaseBot):
     # ------------------------------------------------------------------
 
     def _p(self, key: str, default: Any) -> Any:
+        """Param with an engine default. ``None`` => default; a falsy value
+        (0, "", []) is a deliberate OFF and is returned as-is."""
         v = self.params.get(key)
         return default if v is None else v
 
@@ -137,9 +156,7 @@ class ShortPremiumBot(BaseBot):
             elif src == SIGMA_FORECAST:
                 s = snap.expected_remaining_move()
             elif src == SIGMA_REALIZED:
-                s1 = snap.realized_sigma_1min(int(self._p("realized_window_bars", 30)))
-                mtc = snap.minutes_to_close
-                s = s1 * snap.spot * math.sqrt(mtc) if (s1 and mtc) else None
+                s = snap.realized_remaining_move(int(self._p("realized_window_bars", 30)))
             else:
                 s = None
             if s is not None and s > 0:
@@ -186,7 +203,7 @@ class ShortPremiumBot(BaseBot):
             if snap.gex_regime() not in set(required):
                 return self._skip("regime")
 
-        # -- Magnitude-only MSI band.
+        # -- Magnitude-only MSI band (off unless the catalog lists bands).
         bands = self._p("allowed_magnitude_bands", None)
         if bands:
             band = snap.magnitude_band()
@@ -196,13 +213,14 @@ class ShortPremiumBot(BaseBot):
             elif band not in set(bands):
                 return self._skip("magnitude_band")
 
-        # -- Tail: the tape must be realizing under the straddle's implied.
-        cap = self._p("max_realized_over_implied", 0.85)
+        # -- Tail: the tape must be realizing under what the straddle charges.
+        bars = int(self._p("realized_window_bars", 30))
+        cap = self._p("max_realized_over_straddle", 0.85)
+        ratio_now = snap.realized_over_straddle(bars)
         if cap:
-            roi = snap.realized_over_implied(int(self._p("realized_window_bars", 30)))
-            if roi is None:
+            if ratio_now is None:
                 return self._skip("no_history")
-            if roi > float(cap):
+            if ratio_now > float(cap):
                 return self._skip("tail_realized")
 
         # -- The morning forecast, when it exists for this symbol.
@@ -228,8 +246,8 @@ class ShortPremiumBot(BaseBot):
         dvix = snap.vix_change()
         if max_dvix and dvix is not None and snap.vix and dvix / snap.vix > float(max_dvix):
             return self._skip("vol_shock")
-        max_pctile = self._p("max_atm_iv_pctile", 80.0)
-        if max_pctile is not None:
+        max_pctile = self._p("max_atm_iv_pctile", 0)
+        if max_pctile:
             if snap.atm_iv_pctile_60d is None:
                 if bool(self._p("require_iv_pctile", False)):
                     return self._skip("no_iv_pctile")
@@ -269,10 +287,9 @@ class ShortPremiumBot(BaseBot):
 
         # -- Conviction.
         q = _clamp01(self.quality(snap, sigma))
-        roi_now = snap.realized_over_implied(int(self._p("realized_window_bars", 30)))
         ml_components = {
             "net_gex_pctile": snap.net_gex_pctile,
-            "realized_over_implied": roi_now,
+            "realized_over_straddle": ratio_now,
             "magnitude_score": snap.magnitude_score(),
             "sigma": sigma,
             "straddle_mid": snap.atm_straddle_mid_front,
@@ -304,7 +321,7 @@ class ShortPremiumBot(BaseBot):
             stop_price=None,
             time_stop_at=_utcnow() + timedelta(minutes=hold),
             rationale=self.rationale(
-                snap, sigma, sigma_src, put_long, put_short, call_short, call_long
+                snap, sigma, sigma_src, ratio_now, put_long, put_short, call_short, call_long
             ),
             components_at_entry={
                 "center": center,
@@ -318,7 +335,10 @@ class ShortPremiumBot(BaseBot):
                 "net_gex": snap.net_gex,
                 "net_gex_pctile": snap.net_gex_pctile,
                 "gamma_flip": snap.gamma_flip,
-                "realized_over_implied": roi_now,
+                "realized_over_straddle": ratio_now,
+                "realized_remaining_move": snap.realized_remaining_move(bars),
+                # Diagnostic only — mixed conventions, see the snapshot docstring.
+                "realized_over_implied_annualized": snap.realized_over_implied(bars),
                 "magnitude_score": snap.magnitude_score(),
                 "magnitude_band": snap.magnitude_band(),
                 "straddle_mid": snap.atm_straddle_mid_front,
@@ -327,6 +347,7 @@ class ShortPremiumBot(BaseBot):
                 "atm_iv_pctile_60d": snap.atm_iv_pctile_60d,
                 "forecast_expected_vol_state": snap.forecast_expected_vol_state,
                 "entry_spot": snap.spot,
+                "minutes_to_close": mtc,
                 "quality": q,
             },
         )
@@ -336,22 +357,19 @@ class ShortPremiumBot(BaseBot):
         snap: MarketSnapshot,
         sigma: float,
         sigma_src: Optional[str],
+        ratio: Optional[float],
         put_long: float,
         put_short: float,
         call_short: float,
         call_long: float,
     ) -> str:
         pct = snap.net_gex_pctile
-        roi = snap.realized_over_implied(int(self._p("realized_window_bars", 30)))
+        mag = snap.magnitude_score()
         return (
             f"{snap.gex_regime()}"
             + (f" (pctile {pct:.0f})" if pct is not None else "")
-            + (f", realized/implied {roi:.2f}" if roi is not None else "")
-            + (
-                f", magnitude {snap.magnitude_score():.0f}"
-                if snap.magnitude_score() is not None
-                else ""
-            )
+            + (f", realized/straddle {ratio:.2f}" if ratio is not None else "")
+            + (f", magnitude {mag:.0f}" if mag is not None else "")
             + f"; sigma ${sigma:.2f} ({sigma_src}); "
             + f"{put_long:g}/{put_short:g}/{call_short:g}/{call_long:g}"
         )

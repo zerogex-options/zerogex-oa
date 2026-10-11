@@ -101,13 +101,21 @@ _SHORT_PREMIUM_PARAMS = {
     "flip_exit_sigma_mult": 0.5,
     "short_touch_buffer_sigma": 0.0,
     "max_vix_change_frac": 0.05,
-    "max_atm_iv_pctile": 80.0,
+    # OFF (0): daily_atm_iv is a mean ATM call IV across ALL expirations,
+    # settled to its end-of-day value; atm_iv_front is same-day midday IV. A
+    # percentile of one against the other is not a percentile of the same
+    # thing (adversarial review, 2026-10-11). The field stays on the snapshot
+    # as a diagnostic; set a value here to gate on it anyway.
+    "max_atm_iv_pctile": 0,
     "require_iv_pctile": False,
     "event_dates": [],
     "forbid_forecast_vol_state": "expansion",
     "max_cash_range_over_implied": None,
     "credit_take_frac": 0.5,
-    "credit_stop_mult": 1.0,
+    # The WING is the real stop on a fly: at a 1.25-sigma wing the max loss
+    # is ~0.8-0.9x the credit, so 1.0 (the first draft) could never fire.
+    # 0.5 cuts at roughly 60% of the way to the wing.
+    "credit_stop_mult": 0.5,
     "eod_exit_buffer_minutes": 20,
     # Irrelevant for a credit (the debit premium stop skips entry <= 0) but
     # set explicitly so a reader does not go looking for it.
@@ -1140,9 +1148,11 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
             "realized range — the one effect this platform's own data confirms "
             "at every horizon — while 0DTE buyers pay for the move regardless. "
             "Sells a defined-risk ATM iron butterfly midday, only when dealer "
-            "gamma is in the symbol's top quartile, the magnitude-only MSI reads "
-            "chop, and trailing realized vol is under the ATM implied; wings and "
-            "exits are multiples of the straddle's own remaining move."
+            "gamma is in the symbol's top "
+            "quartile and the trailing realized move, projected over the rest of "
+            "the day, is under what the ATM straddle charges for it; wings and "
+            "exits are multiples of the straddle's own remaining move. The "
+            "tape-only and clock-only twins run in the same screen."
         ),
         stage=Stage.RESEARCH,
         bot_class="LongGammaIronFly",
@@ -1153,9 +1163,16 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
             "max_hold_minutes": 150,
             "required_regimes": ["positive_strong"],
             "regime_fail_closed": True,
-            "allowed_magnitude_bands": ["chop_range", "high_risk_reversal"],
+            # OFF ([]): the band's excursion evidence is unadjusted for the
+            # clock and the tape, and its net_gex_sign component is
+            # near-collinear with the regime gate. A sweep axis
+            # (gated/band) that has to earn >= 0.1 PF over the default.
+            "allowed_magnitude_bands": [],
             "require_magnitude": True,
-            "max_realized_over_implied": 0.85,
+            # Dollars against dollars (realized remaining move on the diurnal
+            # profile / straddle-implied remaining move); the annualized-vol
+            # form compared two conventions and never tripped.
+            "max_realized_over_straddle": 0.85,
             "max_cash_range_over_implied": 1.0,
         },
         research=(),

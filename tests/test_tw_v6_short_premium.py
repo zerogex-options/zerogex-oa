@@ -10,11 +10,15 @@ and lock in, for the shared engine:
   clean setup, neutral, premium-exit only, time-stopped before the bell;
 * every stand-down gate abstains with its own ``_skip`` reason, and a None
   precondition abstains rather than crashing or trading;
+* gates switch OFF with a falsy param (``0`` / ``""`` / ``[]``), never with
+  ``None`` (which means "use the engine default") — the sweep's control arms
+  depend on that convention;
 * the sigma source falls back from the straddle to the forecast and no further
   by default; the gamma-blind twin is a param, not a different bot;
 * the invalidation exits fire regardless of P&L and the base credit take /
   stop still works underneath them;
-* the registry / catalog invariants: registered, RESEARCH, never funded.
+* the registry / catalog invariants: registered, RESEARCH, never funded, with
+  the review's defaults (stop at half the credit, band and IV gates off).
 
 All timestamps are ET -> UTC for August (EDT, UTC-4).
 """
@@ -45,8 +49,14 @@ def _bot(bot_id: str = BOT_ID, **param_over):
     return get_bot_class(spec.strategy_class)(spec, ml_state=None)
 
 
-def _quiet_closes(spot: float, bps: float = 2.0, n: int = 31) -> list[float]:
-    """Closes alternating +/- ``bps`` around spot: a low, steady realized sigma."""
+def _quiet_closes(spot: float, bps: float = 1.0, n: int = 31) -> list[float]:
+    """Closes alternating +/- ``bps`` around spot: a low, steady realized sigma.
+
+    Against the $3.00 straddle in :func:`_snap` (sigma $3.76) the realized
+    move projected over the rest of the day reads about 0.29 of the straddle
+    at 1 bp, 0.59 at 2 bps, 0.73 at 2.5 bps, 0.88 at 3 bps (over the 0.85
+    cap) and 5.9 at 20 bps.
+    """
     step = spot * bps / 10_000.0
     return [spot + (step if i % 2 else 0.0) for i in range(n)]
 
@@ -140,7 +150,12 @@ def test_fires_an_atm_iron_butterfly_with_sigma_wings():
     assert comps["sigma_source"] == SIGMA_STRADDLE
     assert comps["wing_increments"] == 5
     assert comps["magnitude_band"] == "chop_range"
-    assert 0.0 < comps["realized_over_implied"] < 0.85
+    # The gate's own ratio: dollars realized over dollars charged, both for
+    # the rest of the day. The annualized form is carried as a diagnostic.
+    assert 0.0 < comps["realized_over_straddle"] < 0.85
+    assert comps["realized_remaining_move"] > 0.0
+    assert comps["realized_over_implied_annualized"] is not None
+    assert "realized/straddle" in sig.rationale
 
 
 def test_time_stop_never_reaches_the_settlement_window():
@@ -199,8 +214,10 @@ def test_condor_variant_offsets_the_shorts():
 
 def test_wings_never_collapse_below_one_increment():
     # A tiny straddle (sigma ~0.25) would round the wing to zero increments.
-    sig = _bot().open_criteria(_snap(atm_straddle_mid_front=0.20, atm_straddle_bid_front=0.18))
-    assert sig is not None
+    # It also makes any tape look busy against it, so the tail gate is off here.
+    bot = _bot(max_realized_over_straddle=0)
+    sig = bot.open_criteria(_snap(atm_straddle_mid_front=0.20, atm_straddle_bid_front=0.18))
+    assert sig is not None, bot.miss_reasons
     by = {(lg.option_type, lg.side): lg for lg in sig.legs}
     assert by[("put", "long")].strike == 655.0 and by[("call", "long")].strike == 657.0
 
@@ -241,17 +258,34 @@ def test_gamma_blind_twin_is_a_param_not_a_bot():
     assert sig.conviction >= bot.confidence_threshold()
 
 
-def test_magnitude_band_gate():
-    assert _miss(_bot(), _snap(msi_components=_msi(55.0))) == "magnitude_band"  # controlled_trend
-    assert _miss(_bot(), _snap(msi_components={})) == "no_magnitude"
-    bot = _bot(allowed_magnitude_bands=None)
+def test_magnitude_band_gate_is_off_by_default_and_a_sweep_axis():
+    # Off: the review found the band collinear with the regime gate and its
+    # ratios unadjusted, so a controlled_trend read or no MSI at all still fires.
+    assert _bot().open_criteria(_snap(msi_components=_msi(55.0))) is not None
+    assert _bot().open_criteria(_snap(msi_components={})) is not None
+    # On (the sweep's ``gated/band`` arm): bands outside the list and a
+    # missing read both stand down, unless the caller says missing is fine.
+    on = dict(allowed_magnitude_bands=["chop_range", "high_risk_reversal"])
+    assert _miss(_bot(**on), _snap(msi_components=_msi(55.0))) == "magnitude_band"
+    assert _miss(_bot(**on), _snap(msi_components={})) == "no_magnitude"
+    bot = _bot(require_magnitude=False, **on)
     assert bot.open_criteria(_snap(msi_components={})) is not None, bot.miss_reasons
 
 
-def test_realized_over_implied_tail_gate():
-    # Busy tape: +/- 20 bps a minute annualizes far above a 16% ATM IV.
+def test_realized_over_straddle_tail_gate():
+    # Busy tape: +/- 20 bps a minute projects to ~6x what the straddle charges.
     assert _miss(_bot(), _snap(recent_closes=_quiet_closes(656.0, bps=20.0))) == "tail_realized"
+    # Just over the 0.85 cap (3 bps -> 0.88).
+    assert _miss(_bot(), _snap(recent_closes=_quiet_closes(656.0, bps=3.0))) == "tail_realized"
     assert _miss(_bot(), _snap(recent_closes=[656.0] * 4)) == "no_history"
+    # The gate is a dollar ratio, so the ATM IV level alone never trips it.
+    assert _bot().open_criteria(_snap(atm_iv_front=0.60)) is not None
+    # ``0`` switches it off (the clock-only twin); ``None`` keeps the default.
+    bot = _bot(max_realized_over_straddle=0)
+    assert bot.open_criteria(_snap(recent_closes=_quiet_closes(656.0, bps=20.0))) is not None
+    assert _miss(_bot(max_realized_over_straddle=None), _snap(recent_closes=[656.0] * 4)) == (
+        "no_history"
+    )
 
 
 def test_forecast_gates_only_when_a_forecast_exists():
@@ -265,6 +299,10 @@ def test_forecast_gates_only_when_a_forecast_exists():
         forecast_expected_vol_state="normal",
     )
     assert _bot().open_criteria(ok) is not None
+    # The uniform-gates arm switches both off with falsy values.
+    off = _bot(forbid_forecast_vol_state="", max_cash_range_over_implied=0)
+    assert off.open_criteria(_snap(forecast_expected_vol_state="expansion")) is not None
+    assert off.open_criteria(spent) is not None
 
 
 def test_flip_within_a_sigma_of_the_center_stands_down():
@@ -275,9 +313,20 @@ def test_flip_within_a_sigma_of_the_center_stands_down():
 
 def test_tail_stand_downs():
     assert _miss(_bot(), _snap(vix=16.0, prior_vix=15.0)) == "vol_shock"  # +6.7%
-    assert _miss(_bot(), _snap(atm_iv_pctile_60d=92.0)) == "iv_elevated"
-    assert _bot().open_criteria(_snap(atm_iv_pctile_60d=None)) is not None  # permissive by default
-    assert _miss(_bot(require_iv_pctile=True), _snap(atm_iv_pctile_60d=None)) == "no_iv_pctile"
+    assert _bot(max_vix_change_frac=0).open_criteria(_snap(vix=16.0, prior_vix=15.0)) is not None
+    # The ATM IV percentile gate is OFF by default: it ranked a calendar-
+    # annualized IV against a history on another convention.
+    assert _bot().open_criteria(_snap(atm_iv_pctile_60d=92.0)) is not None
+    assert _bot().open_criteria(_snap(atm_iv_pctile_60d=None)) is not None
+    assert _miss(_bot(max_atm_iv_pctile=85), _snap(atm_iv_pctile_60d=92.0)) == "iv_elevated"
+    assert _bot(max_atm_iv_pctile=85).open_criteria(_snap(atm_iv_pctile_60d=None)) is not None
+    assert (
+        _miss(
+            _bot(max_atm_iv_pctile=85, require_iv_pctile=True),
+            _snap(atm_iv_pctile_60d=None),
+        )
+        == "no_iv_pctile"
+    )
     assert _miss(_bot(), _snap(forecast_is_event_day=True)) == "event_day"
     assert _miss(_bot(event_dates=["2026-08-06"]), _snap()) == "event_day"
 
@@ -300,8 +349,10 @@ def test_conviction_floor_is_reachable_on_a_typical_setup_and_binds_on_a_margina
     bot = _bot()
     sig = bot.open_criteria(_snap())
     assert sig is not None and sig.conviction >= bot.confidence_threshold()
-    # Boundary regime (pctile 75) with realized almost at the cap: dies at conviction.
-    marginal = _snap(net_gex_pctile=75.0, recent_closes=_quiet_closes(656.0, bps=4.0))
+    # Boundary regime (pctile 75) with realized inside the cap but close to
+    # it (2.5 bps -> ~0.73 of the straddle): passes every gate, dies at conviction.
+    marginal = _snap(net_gex_pctile=75.0, recent_closes=_quiet_closes(656.0, bps=2.5))
+    assert 0.6 < marginal.realized_over_straddle() <= 0.85
     assert _miss(_bot(), marginal) == "conviction"
 
 
@@ -313,6 +364,9 @@ def test_conviction_floor_is_reachable_on_a_typical_setup_and_binds_on_a_margina
 def test_regime_loss_closes_regardless_of_pnl():
     dec = _bot().exit_criteria(_snap(net_gex=-5.0e8), _pos(current_price=-0.80))
     assert dec.should_close and dec.reason == "regime_lost"
+    # The tape-only twin never entered on gamma, so it never exits on it.
+    dec = _bot(required_regimes="any").exit_criteria(_snap(net_gex=-5.0e8), _pos())
+    assert not dec.should_close
 
 
 def test_flip_entering_the_structure_closes():
@@ -329,16 +383,26 @@ def test_short_touch_and_vol_shock_exits():
     assert not dec.should_close  # inside the half-sigma buffer
     dec = _bot().exit_criteria(_snap(vix=16.0, prior_vix=15.0), _pos())
     assert dec.should_close and dec.reason == "vol_shock"
+    dec = _bot(exit_on_vol_shock=False).exit_criteria(_snap(vix=16.0, prior_vix=15.0), _pos())
+    assert not dec.should_close
 
 
 def test_base_credit_take_and_stop_still_run_underneath():
     # Credit 1.40 received; mark decays to -0.60 => profit 0.80 >= 0.5 x credit.
     dec = _bot().exit_criteria(_snap(), _pos(entry_price=-1.40, current_price=-0.60))
     assert dec.should_close and dec.reason == "credit_take"
-    # Mark blows out to -2.90 => loss 1.50 >= 1.0 x credit.
-    dec = _bot().exit_criteria(_snap(), _pos(entry_price=-1.40, current_price=-2.90))
+    # The stop is HALF the credit (the wing is ~0.8-0.9x, so 1.0x could never
+    # fire): mark -2.15 => loss 0.75 >= 0.70 stops; -1.90 => loss 0.50 holds.
+    dec = _bot().exit_criteria(_snap(), _pos(entry_price=-1.40, current_price=-2.15))
     assert dec.should_close and dec.reason == "credit_stop"
+    dec = _bot().exit_criteria(_snap(), _pos(entry_price=-1.40, current_price=-1.90))
+    assert not dec.should_close
     dec = _bot().exit_criteria(_snap(), _pos(entry_price=-1.40, current_price=-1.30))
+    assert not dec.should_close
+    # ``credit_stop_mult: 0`` (the sweep's no-stop arm) leaves the wing as the stop.
+    dec = _bot(credit_stop_mult=0).exit_criteria(
+        _snap(), _pos(entry_price=-1.40, current_price=-2.15)
+    )
     assert not dec.should_close
 
 
@@ -356,10 +420,16 @@ def test_registered_in_research_and_never_funded():
     assert all(s.id != BOT_ID for s in DEFAULT_ROSTER)
     spec = known_specs()[BOT_ID]
     assert spec.enabled is False
-    # The shared defaults reach the bot through the catalog.
+    # The shared defaults reach the bot through the catalog...
     assert spec.params["credit_take_frac"] == 0.5
     assert spec.params["premium_stop_grace_seconds"] >= 600
     assert spec.params["confidence_threshold_default"] == 0.50
+    # ...including what the adversarial review changed before the first screen.
+    assert spec.params["credit_stop_mult"] == 0.5
+    assert spec.params["allowed_magnitude_bands"] == []
+    assert spec.params["max_atm_iv_pctile"] == 0
+    assert spec.params["max_realized_over_straddle"] == 0.85
+    assert spec.params["required_regimes"] == ["positive_strong"]
 
 
 # ======================================================================
@@ -373,20 +443,35 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
     base = known_specs()[BOT_ID]
     grid = grid_for(base)  # auto: any ShortPremiumBot subclass
     assert [label for label, _ in grid] == [label for label, _ in short_premium_grid()]
-    labels = {label for label, _ in grid}
-    # The experiment: the gated default against the twins that drop one gate at a time.
+    labels = [label for label, _ in grid]
+    assert len(set(labels)) == len(labels)
+    # The experiment: the gated default against the twins that drop one
+    # conditioning at a time, the complement, and the band switched on.
     assert {
         "gated/default",
-        "twin/gamma_blind",
-        "twin/no_band",
         "twin/tail_only",
         "twin/clock_only",
-    } <= labels
+        "twin/negative_gamma",
+        "gated/band",
+        "gated/uniform_gates",
+        "gated/no_stop",
+        "gated/hold_to_settle",
+    } <= set(labels)
     specs = build_specs(base, grid)
     assert len({s.id for s in specs}) == len(specs)
     by = {s.display_name: s for s in specs}
-    assert by["twin/gamma_blind"].params["required_regimes"] == "any"
-    assert by["twin/clock_only"].params["max_realized_over_implied"] is None
+    assert by["twin/tail_only"].params["required_regimes"] == "any"
+    assert by["twin/clock_only"].params["max_realized_over_straddle"] == 0
+    assert by["gated/band"].params["allowed_magnitude_bands"] == [
+        "chop_range",
+        "high_risk_reversal",
+    ]
+    # The control arms really drop their gates: the clock-only twin fires on
+    # a busy, negative-gamma tape the gated default refuses.
+    busy = _snap(net_gex=-1.0e9, net_gex_pctile=10.0, recent_closes=_quiet_closes(656.0, bps=20.0))
+    cls = get_bot_class(base.strategy_class)
+    assert cls(by["twin/clock_only"], ml_state=None).open_criteria(busy) is not None
+    assert cls(by["gated/default"], ml_state=None).open_criteria(busy) is None
     # Every config keeps the shared defaults it did not override.
-    assert all(s.params["credit_stop_mult"] in (1.0, 1.5) for s in specs)
+    assert all(s.params["credit_stop_mult"] in (0.5, 0) for s in specs)
     assert all(s.params["premium_stop_grace_seconds"] == 600 for s in specs)

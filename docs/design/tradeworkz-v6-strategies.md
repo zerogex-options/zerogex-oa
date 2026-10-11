@@ -8,6 +8,26 @@ not yet run — see §7 for the order to run them in.
 
 ---
 
+## 0. The honest summary
+
+- Twenty-eight directional bots died on a signal that measures **how far**,
+  not **which way**. The structure paid for "less travel than the market
+  priced" is a short option structure. That is the v6 thesis, and the one
+  bot built on it (§3.1) is a defined-risk 0DTE ATM iron butterfly.
+- The published 0DTE variance risk premium is the only part of that thesis
+  with a replicated prior. The gamma **gate** on top of it has a weaker prior
+  than the designers assumed: the only clock-and-tape-adjusted gamma figures
+  on this platform are short gamma 1.08x and the "neither" zone 0.92x; long
+  gamma was never reported and is implied to be about 1.0x. So the bot ships
+  with its tape-only twin as the **primary comparison**, not a control.
+- Eighty sessions cannot distinguish a profit factor of 1.1 from 1.0 on ~35
+  gated trades. The first screen can return `insufficient` or `no-edge` on
+  the gamma conditioning; it cannot return a defensible `edge`. Run the
+  option-free measurement in the pre-screen (§7 step 1, section G) first.
+- One directional exception (§3.2) with a published mechanism and a fixed
+  clock, untested here, and the cheapest action of all: a clean re-screen of
+  the one VALIDATED strategy (§3.3).
+
 ## 1. Why every earlier bot was the wrong shape
 
 Twenty-eight bots have shipped since the fleet began. Every one of them is a
@@ -21,8 +41,8 @@ data converged on one finding, and it is not a directional one:
 
 | Study | What it asked | What it found |
 |---|---|---|
-| `docs/design/msi-regime-excursion.md` | Do the MSI regime bands predict realized excursion? | Yes, monotonically, on every instrument (15m forward range vs base: SPY 0.81/0.97/1.04/1.09 across the four bands); 1,386 of 4,140 tests survive BH. A **magnitude-only** rebuild of the MSI beats the shipped one on 30 of 30 cells; the directional components carry zero excursion information. |
-| `research/trade_bias_movement` | Do the Trade Bias states say how far price moves? | Nothing detectable for the states. But production's short-gamma definition travels **1.08x [1.03, 1.13]** after adjusting for clock and tape; the "neither" zone 0.92x [0.88, 0.97]. |
+| `docs/design/msi-regime-excursion.md` | Do the MSI regime bands predict realized excursion? | Yes, monotonically, on every instrument (15m forward range vs base: SPY 0.81/0.97/1.04/1.09 across the four bands); 1,386 of 4,140 tests survive BH. A **magnitude-only** rebuild of the MSI beats the shipped one on 30 of 30 cells; the directional components carry zero excursion information. **These ratios are against the unconditional base rate, not clock- or tape-adjusted.** |
+| `research/trade_bias_movement` | Do the Trade Bias states say how far price moves? | Nothing detectable for the states. Production's short-gamma definition travels **1.08x [1.03, 1.13]** after adjusting for clock and tape; the "neither" zone 0.92x [0.88, 0.97]. **Long gamma was not reported; the adjusted ratios average to 1.0 across the zones by construction, so long gamma is implied near 1.0x after adjustment.** |
 | `research/short_gamma_trend` | Does short gamma + one-sided flow continue? | No (leans to reversal). Those minutes DO move 1.29x as far. |
 | `research/trade_bias_inputs` | Does any of the nine inputs predict 30m direction? | None, Holm-corrected. |
 | `research/wall_break_odds` | What predicts a wall break? | Nothing replicates across symbols. Break odds are a per-index property (S&P ~31%, Nasdaq ~50% at 60m). |
@@ -33,31 +53,42 @@ extract direction from a magnitude signal. The structure that is paid for
 most replicated anomaly in index options — the variance risk premium, and
 specifically the 0DTE version (Beckmeyer, Branger & Gayda 2023; Bandi, Fusari
 & Reno 2023) — says the market systematically overprices that travel. The
-edge-defining question is only **when not to sell**, and that is exactly the
-question the magnitude findings answer.
+edge-defining question is only **when not to sell**.
 
-The v6 thesis in one line:
+What the record does **not** establish is that long gamma, after the clock
+and the tape are accounted for, compresses the day below what a quiet tape
+alone would. The short-gamma side is confirmed at 1.08x; the long-gamma side
+is inferred. That is why the v6 thesis is stated as an experiment:
 
-> **Sell the 0DTE move, defined-risk, only when this platform's confirmed
-> magnitude signals say the tape will travel less than the straddle is
-> charging — and run the gamma-blind twin alongside so the gate has to earn
-> its place.**
+> **Sell the 0DTE move, defined-risk, when the tape is realizing less than the
+> straddle charges — and run the gamma-gated version against the tape-only
+> twin on the same sessions, so the gate has to earn its place or be
+> retired.**
 
 Plus one directional exception with a published mechanism and a fixed clock
 that no study here has tested (§3.2).
 
-## 2. How these were designed
+## 2. How these were designed, and what did not run
 
 Five independent designers (a variance trader, a dealer-hedging quant, an
 empirical-finance academic, the repository's own post-mortem engineer, and an
 options execution specialist) each read the full research record and
-proposed strategies from their own lens. Their proposals were clustered, then
-each candidate was attacked by three adversarial reviewers (an archivist
-looking for dead rows in disguise, a market maker pricing the friction and the
-tail, and a statistician checking testability and look-ahead). Only candidates
-at most one reviewer could refute went forward. Four of the five designers
-independently proposed the same core trade (§3.1); two proposed the same
-directional exception (§3.2).
+proposed strategies from their own lens: fifteen proposals, ten distinct
+candidates after clustering. Four of the five independently proposed the
+core trade (§3.1); two proposed the directional exception (§3.2); two
+proposed an overnight 1DTE condor (§9).
+
+The plan was for three adversarial reviewers (an archivist looking for dead
+rows in disguise, a market maker pricing the friction and the tail, and a
+statistician checking testability and look-ahead) to attack every candidate,
+then a synthesis. **The review run hit the session limit after four of the
+thirty verdicts**: all three reviewers on the core fly, and the archivist on
+the overnight condor. The other eight candidates — the close-momentum
+exception included — were **not** reviewed, and the synthesis step did not
+run; the author did the synthesis from the four verdicts and the brief. The
+four verdicts changed the fly materially before its first screen (the list
+in §3.1), which is the strongest argument for finishing the other
+twenty-six before anything here is believed.
 
 ## 3. The strategies
 
@@ -79,36 +110,85 @@ empty.
 - **Entry (10:30–13:30 ET), every gate a named `_skip`:** `window` ·
   `no_straddle` / `no_sigma` · `regime` — `positive_strong` (top quartile of
   the symbol's own 30-day history; **fails closed** on a missing percentile,
-  never the absolute fallback) · `magnitude_band` — the magnitude-only MSI
-  (`snap.magnitude_score()`, §4) in chop or reversal · `tail_realized` —
-  trailing 30-bar realized vol ≤ 0.85× the ATM implied · `forecast_expansion`
-  / `range_spent` — the morning forecast's own expansion call and today's
+  never the absolute fallback) · `tail_realized` — the trailing 30-bar
+  realized move, projected over the rest of the day on the cone model's
+  diurnal profile, at most 0.85 of the straddle's own remaining move
+  (**dollars against dollars**, see below) · `forecast_expansion` /
+  `range_spent` — the morning forecast's own expansion call and today's
   cash range vs its implied move, when a forecast exists · `flip_near` —
   neither flip convention within a sigma of the strike · `vol_shock` (30m
-  ΔVIX > 5% of level) · `iv_elevated` (ATM IV above its 80th percentile of
-  the prior 60 sessions) · `event_day` · `conviction`.
-- **Exits:** `credit_take` at 50% of the credit, `credit_stop` at 1.0× the
+  ΔVIX > 5% of level) · `event_day` · `conviction`. Two more gates exist but
+  are **off by default**: `magnitude_band` (the magnitude-only MSI in chop or
+  reversal; collinear with the regime gate and built on unadjusted ratios, so
+  it is a sweep axis, `gated/band`) and `iv_elevated` (the live ATM IV and
+  its 60-day history come from different computations and do not rank on one
+  scale; carried as a diagnostic until reconciled).
+- **Exits:** `credit_take` at 50% of the credit, `credit_stop` at **0.5×** the
   credit (base-class credit branch), plus invalidations that close regardless
-  of P&L — `regime_lost` (net gamma turns negative), `flip_entered` (a flip
-  within half a sigma of the strike), `short_touched`, `vol_shock` — and a
-  time stop 20 minutes before the bell. Never holds the short straddle into
-  the settlement window.
+  of P&L — `regime_lost` (net gamma turns negative; only when the regime gate
+  is on), `flip_entered` (a flip within half a sigma of the strike),
+  `short_touched`, `vol_shock` — and a time stop 20 minutes before the bell.
+  Never holds the short straddle into the settlement window by default; the
+  `gated/hold_to_settle` arm does.
+- **What the review changed before the first screen:**
+  - *Convention.* The first draft compared a realized vol annualized on RTH
+    minutes (sqrt(252·390)) with an ATM IV annualized on calendar seconds
+    (`market_calendar.calculate_time_to_expiration`). For a fairly priced
+    0DTE straddle that ratio reads about 0.43, so a 0.85 cap would have
+    admitted a tape realizing twice what the straddle charged. The gate is
+    now `realized_over_straddle`: the trailing variance projected over the
+    rest of the day by `intraday_cone_model.variance_fraction`, against the
+    straddle's remaining 1-sigma move. The annualized form is kept on the
+    snapshot and in the components as a diagnostic only.
+  - *Stop.* At a 1.25-sigma wing the fly's maximum loss is roughly 0.8–0.9×
+    the credit, so the 1.0× stop could never fire. It is 0.5× now, with a
+    `gated/no_stop` arm where the wing is the only stop.
+  - *Gates off.* Band and IV percentile, as above.
+  - *Controls can actually drop their gates.* Params switch a gate off with a
+    falsy value (`0`, `""`, `[]`); `None` means "engine default". The first
+    draft read `None` as the default, so the twins silently kept the gates
+    they were meant to drop.
 - **Why not a dead row:** `range_iron_condor` sold at the walls (where a
   tested wall breaks 31–50% of the time), on absolute VIX, any positive
   gamma, a flat 180-minute hold and no credit exit. This bot never reads a
   wall, centers on the money where credit per unit of wing is largest, gates
-  on the symbol-relative percentile and a measured realized-under-implied
-  condition, and books or cuts on the credit.
-- **Controls (params, not bots):** `required_regimes: "any"` is the
-  gamma-blind twin (pure clock + VRP); `allowed_magnitude_bands: null` drops
-  the band gate; `short_offset_sigma: 1.0` turns it into a condor. If the
-  gamma-blind twin's PF is within 0.1 of the gated bot's, the gamma gate adds
-  nothing and the catalog will say so.
-- **Prior:** PF 1.1–1.3, win rate 65–75%, losers 2× winners, ~3–5
-  trades/week across SPY/QQQ/SPX. The failure mode is three to five afternoon
-  trend days in 80 sessions landing in one half of the split.
+  on the symbol-relative percentile and a measured realized-under-straddle
+  condition, and books or cuts on the credit. The archivist agreed it is not
+  a dead row in disguise — and added that the long-gamma evidence is weaker
+  than the brief implied (§1).
+- **Controls (params, not bots), all in `tw_execution_sweep`:**
+  `twin/tail_only` (`required_regimes: "any"`: the quiet tape plus the
+  variance premium, no gamma — **the primary comparison**), `twin/clock_only`
+  (tail gate off as well: pure 0DTE variance premium at this clock),
+  `twin/negative_gamma` (the complement the mechanism says should NOT work),
+  `gated/band` (the magnitude band switched on), `gated/uniform_gates` (the
+  VIX, forecast and cash-range stand-downs off, so both halves of the
+  train/test split run one gate set whatever the input coverage), and the
+  geometry arms (wing 1.0 / 1.5 sigma, take at 35%, flat at 15:05, hold to
+  settlement, 1.0-sigma condor, no credit stop).
+- **How to read it:** the twins trade a superset of the gated bot's sessions.
+  The statistic is the **paired** comparison — the gated bot's result on its
+  sessions against the tape-only twin's result on those same sessions —
+  not two profit factors side by side. If the twin matches the gated bot
+  within 0.1 PF on the paired sessions, the gamma conditioning adds nothing
+  and the catalog says so. `twin/negative_gamma` beating `gated/default`
+  retires the mechanism outright.
+- **Power.** Roughly 35 gated trades in 80 sessions with a ~70% win rate and
+  losers near 2× winners give a PF sampling error of order 0.5. The screen
+  cannot distinguish PF 1.1 from 1.0 on the gated arm; it can only say
+  `insufficient`, or `no-edge` if the arm is plainly negative. The pre-screen's
+  section G (straddle charged vs tape paid, by gamma sign, ~60 sessions per
+  slot per symbol) is the better-powered test and needs no option fill model.
+- **Prior:** the unconditional 0DTE straddle sale at bid, after the wings and
+  the harness's 2% slippage on four legs, is near breakeven on the
+  published premium; whatever edge exists must come from the gates. Honest
+  prior for the gated arm: PF 1.0–1.2, with the failure mode being three to
+  five afternoon trend days in 80 sessions landing in one half of the split.
 
 ### 3.2 Hedging-Demand Close Momentum — `hedging_demand_close_momentum`
+
+**Not reviewed by the adversarial panel** (§2). The design stands on the two
+papers and the brief.
 
 - **Published mechanism:** Gao, Han, Li & Zhou (2018, JFE): the day's return
   predicts the last half hour in the same direction. Baltussen, Da, Lammers &
@@ -135,8 +215,8 @@ empty.
   open) and a 60% premium stop as the only early exits.
 - **Prior:** honest read is `insufficient`. The effect is real but small
   (single-digit bps on average); the gamma conditioning multiplies it. The
-  cash-tape pre-test in §7 step 1 answers most of this before an option is
-  priced.
+  cash-tape pre-test in §7 step 1 (section E) answers most of this before an
+  option is priced.
 
 ### 3.3 The cheapest action: re-screen `gex_gradient_trend` properly
 
@@ -164,19 +244,29 @@ v4/v5 fetcher contract. Every existing bot ignores them.
 |---|---|---|---|
 | `atm_strike_front`, `atm_straddle_mid_front`, `atm_straddle_bid_front`, `atm_iv_front` | `option_chains` → `option_chains_archive` fallback, front (same-day) expiration, nearest two-sided strike, 10-minute lookback | `fetch_atm_front_quote` | The implied side of every v6 gate. Mid is the market's price for the remaining move; bid is what a seller keeps before slippage. |
 | `forecast_implied_move`, `forecast_expected_vol_ratio`, `forecast_expected_vol_state`, `forecast_vix_z`, `forecast_is_event_day` | `daily_forecast` row for the session date with `open_ts <= as_of` | `fetch_daily_forecast` | Immutable once committed at 08:30 ET; a replayed 08:00 tick does not see it. **The writer defaults to SPY only** — QQQ/SPX read None unless the forecast runs for them, and forecast-gated bots abstain there honestly. |
-| `atm_iv_pctile_60d` | `daily_atm_iv`, trading dates strictly before today | `fetch_atm_iv_history` + `_percentile_rank` | Today's row is rewritten all day, so only prior (frozen) days are ranked against. Needs 20 observations. |
+| `atm_iv_pctile_60d` | `daily_atm_iv`, trading dates strictly before today | `fetch_atm_iv_history` + `_percentile_rank` | Today's row is rewritten all day, so only prior (frozen) days are ranked against. Needs 20 observations. **Diagnostic only until the live chain IV and the daily table's IV are shown to be on one convention.** |
 | `cash_open`, `cash_high`, `cash_low`, `first_half_hour_close` | `underlying_quotes` from the 09:30 ET cash open (09:31 for a cash index) | `fetch_cash_session_bars` | The existing `session_*` fields span the trailing 24 hours and include the pre-market. |
 
-Helpers on `MarketSnapshot`: `magnitude_score()` / `magnitude_band()` (the
-magnitude-only MSI — prefers the engine's published
-`__aggregation__.magnitude_score`, which only began persisting in September
-2026, and otherwise rebuilds it from the four persisted component scores with
-the engine's own renormalize-then-`tanh` arithmetic, so a replay over the
-whole archive reads the same number); `realized_sigma_1min()`,
-`realized_over_implied()`, `straddle_implied_sigma()`,
-`expected_remaining_move()` (the forecast's implied move scaled by the
-intraday cone model's **diurnal** variance profile, not sqrt-of-time),
-`cash_range_over_implied()`, `day_return()`, `first_half_hour_return()`.
+Helpers on `MarketSnapshot`:
+
+- `magnitude_score()` / `magnitude_band()` — the magnitude-only MSI. Prefers
+  the engine's published `__aggregation__.magnitude_score`, which only began
+  persisting in September 2026, and otherwise rebuilds it from the four
+  persisted component scores with the engine's own renormalize-then-`tanh`
+  arithmetic, so a replay over the whole archive reads the same number.
+- `straddle_implied_sigma()` — the straddle mid over sqrt(2/π): the 1-sigma
+  dollar move the market prices for the rest of the front expiration.
+- `realized_remaining_move()` — the trailing one-minute variance scaled by
+  the cone model's diurnal variance profile to the rest of the day, in
+  dollars. `realized_over_straddle()` divides the two: **the gate's ratio,
+  convention-free.**
+- `realized_sigma_1min()`, `realized_over_implied()` — the annualized form.
+  `realized_over_implied` mixes an RTH-minute and a calendar-second
+  convention and reads about 0.43 for a fairly priced straddle; it is on the
+  snapshot and in the trade components as a diagnostic, not a gate.
+- `expected_remaining_move()` — the forecast's implied move on the same
+  diurnal profile; `cash_range_over_implied()`, `day_return()`,
+  `first_half_hour_return()`.
 
 `src/tools/tw_edge_field_probe.py` reports coverage for the two new tables and
 all fourteen new fields. Run it before trusting any screen.
@@ -190,10 +280,12 @@ implied-side presence check, the regime / band / tail / forecast / flip /
 VIX / IV / event gates, the sigma source fallback (straddle → forecast;
 realized vol is opt-in), the structure geometry (fly or condor, wings floored
 at one increment, snapped to the symbol grid), the conviction scale
-(calibrated so a top-quartile regime with realized at half of implied clears
-the 0.50 floor — the v5 lesson about zero-trade screens dying at conviction),
-and the invalidation exits. One module to screen, one set of miss labels
-across the family, one sweep grid.
+(calibrated so a top-quartile regime with realized at a third of the straddle
+clears the 0.50 floor, and a boundary regime with realized near the cap does
+not — the v5 lesson about zero-trade screens dying at conviction), and the
+invalidation exits. One module to screen, one set of miss labels across the
+family, one sweep grid. The param convention is the one the sweep depends
+on: a falsy value switches a gate off, `None` means the engine default.
 
 ## 6. What the harness measures, and what it does not
 
@@ -206,17 +298,28 @@ across the family, one sweep grid.
 - The harness models slippage but **not commissions** (~$2.60 round trip on
   a 2-leg vertical, roughly double on four legs). A PF just over 1.1 on
   thin per-trade expectancy is breakeven in practice.
-- The regime percentile bands are today's 30-day aggregate at every past
-  instant (disclosed in `backtest.py`); they never flip a sign.
+- **The regime percentile is a look-ahead for this bot.** `net_gex_pctile` is
+  today's 30-day time-of-day band applied at every past instant (disclosed in
+  `backtest.py`). For a directional bot that only flips a sign it was
+  harmless; for a gate that selects the *top quartile* it means the replay
+  knows the window's gamma distribution in advance. Read the gated-vs-twin
+  comparison as "conditioned on the end-of-window ranking" until the
+  percentile is made as-of (§9). The gamma **sign**, which section G of the
+  pre-screen and `twin/negative_gamma` use, has no such problem.
+- Several stand-downs (`vol_shock`, the forecast gates, `range_spent`) depend
+  on inputs whose coverage differs across the window; a train/test split can
+  then compare two different gate sets. `gated/uniform_gates` runs the same
+  set on both halves.
 - The dead rows this family must not become: a short premium structure
   that works only because the window happened to be quiet. That is why the
-  gamma-blind twin runs in the same screen, and why §7 step 1 reports the
-  realized-vs-normal range split by gamma sign before any option is priced.
+  twins run in the same screen on the same sessions, and why the pre-screen
+  reports the straddle charged against the move paid by gamma sign before any
+  option is priced.
 
 ## 7. What to run first, in order
 
 Cheapest and most informative first. Steps 1–3 need no new code paths beyond
-this branch and run in seconds.
+this branch and run in seconds to a minute.
 
 1. **`make tradeworkz-v6-prescreen`** (read-only SQL,
    `setup/database/diagnostics/tradeworkz_v6_prescreen.sql`). It answers:
@@ -225,12 +328,20 @@ this branch and run in seconds.
      forecast gates are noise and only the raw-VRP control is worth running;
    - how often positive gamma holds midday and negative gamma at 15:00 (the
      two regime base rates the bots' frequency estimates rest on);
-   - **the raw last-hour momentum test**: on sessions with a ≥0.5-sigma day
-     return, how often 15:00→15:55 continues, split by gamma sign at 15:00.
-     If the short-gamma row is not clearly above 50%, §3.2 cannot be rescued
-     by an option structure;
+   - **the raw last-hour momentum test** (section E): on sessions with a
+     ≥0.5-sigma day return, how often 15:00→15:55 continues, split by gamma
+     sign at 15:00. If the short-gamma row is not clearly above 50%, §3.2
+     cannot be rescued by an option structure;
    - whether positive gamma compresses the realized day on this tape
-     (realized range / normal range, split by gamma sign at noon).
+     (section F: realized range / normal range, split by gamma sign at noon);
+   - **the fly's P&L before any bot runs** (section G): at 10:30, 12:00 and
+     13:30 ET, the 0DTE ATM straddle mid and bid against |px_1555 − strike|,
+     split by gamma sign before entry. The mean paid/charged ratio is 1.0
+     under fair pricing and near 0.85–0.90 on the published premium. **The
+     gamma gate earns its place only if the long-gamma row sits ≥0.10 below
+     the all-sessions row at the same slot.** `seller_bps_of_spot` negative
+     on a row means no exit logic rescues it; `beyond_1p25_sigma_wing_pct` is
+     how often the fly would have reached its wing.
 2. **`python -m src.tools.tw_edge_field_probe --days 90`** — coverage for
    `daily_forecast`, `daily_atm_iv` and the fourteen new snapshot fields. A
    field at 0% non-null is the reason a bot will abstain, found before the
@@ -247,33 +358,44 @@ this branch and run in seconds.
    ```
    make tradeworkz-backtest ARGS="--days 90 --interval-min 5 --bots long_gamma_iron_fly,hedging_demand_close_momentum --json"
    ```
-   and the controls through the execution sweep, which now picks its grid
-   from the bot's class and scores every config on a train/test split:
+   and the controls through the execution sweep, which picks its grid from
+   the bot's class and scores every config on a train/test split:
    ```
    python -m src.tools.tw_execution_sweep --bot long_gamma_iron_fly --days 90
    python -m src.tools.tw_execution_sweep --bot hedging_demand_close_momentum --days 90
    ```
-   The fly's grid is the gated default against the twins that drop one gate
-   at a time (`twin/gamma_blind`, `twin/no_band`, `twin/tail_only`,
-   `twin/clock_only`) plus wing / take / condor / stop geometry; the
-   momentum bot's grid is `required_gamma_sign ∈ {negative, any, positive}`
-   × `structure ∈ {debit, credit}` plus the first-half-hour agreement and a
-   higher move floor. Read the `twin/*` rows against `gated/default`: that
-   comparison is the whole experiment.
+   The fly's grid is `gated/default` against `twin/tail_only` (the primary
+   comparison), `twin/clock_only`, `twin/negative_gamma`, `gated/band`,
+   `gated/uniform_gates` and the geometry arms; the momentum bot's grid is
+   `required_gamma_sign ∈ {negative, any, positive}` × `structure ∈ {debit,
+   credit}` plus the first-half-hour agreement and a higher move floor. Read
+   the `twin/*` rows against `gated/default` **on the gated bot's sessions**:
+   that paired comparison is the whole experiment.
 5. **Read the verdicts the way the catalog does.** `edge` needs PF ≥ 1.1,
-   positive expectancy, ≥ 20 trades AND `split.robust`. Record every run in
-   the catalog's `research` tuple whatever it says.
+   positive expectancy, ≥ 20 trades AND `split.robust`. On the gated fly,
+   treat `edge` with ~35 trades as `insufficient` whatever the harness prints
+   (§3.1, Power). Record every run in the catalog's `research` tuple whatever
+   it says.
 
 ## 8. Kill criteria
 
-- **Long-gamma fly:** `no-edge` (n ≥ 20, PF < 1.0) retires the gamma-gated
-  hypothesis for this tuning generation. The gamma-blind twin within 0.1 PF
-  of the gated bot means the gate adds nothing: keep whichever is simpler if
-  it has edge, and record that the magnitude conditioning did not.
-- **Close momentum:** the raw cash-tape test (step 1) showing the short-gamma
-  continuation share ≤ 52% with ≥ 30 qualifying sessions is a kill before the
-  screen. On the screen, the negative-gamma arm must beat the `"any"` arm by
-  ≥ 0.1 PF or the Baltussen conditioning is not present on this data.
+- **Long-gamma fly, before the screen (section G):** the long-gamma row's
+  mean paid/charged within 0.10 of the all-sessions row at every slot, with
+  ≥40 sessions per row, retires the gamma gate; screen `twin/tail_only` and
+  `twin/clock_only` as the hypotheses. `seller_bps_of_spot` negative on the
+  all-sessions row at every slot retires the 0DTE short-premium thesis on
+  this tape, gate or no gate.
+- **Long-gamma fly, on the screen:** `no-edge` (n ≥ 20, PF < 1.0) retires the
+  gamma-gated hypothesis for this tuning generation. The tape-only twin
+  within 0.1 PF of the gated bot on the paired sessions means the gate adds
+  nothing: keep whichever is simpler if it has edge, and record that the
+  gamma conditioning did not. `twin/negative_gamma` ≥ `gated/default`
+  retires the mechanism.
+- **Close momentum:** the raw cash-tape test (section E) showing the
+  short-gamma continuation share ≤ 52% with ≥ 30 qualifying sessions is a
+  kill before the screen. On the screen, the negative-gamma arm must beat the
+  `"any"` arm by ≥ 0.1 PF or the Baltussen conditioning is not present on
+  this data.
 - **Gradient re-screen:** `insufficient` on 90 days means the regime the
   pattern's 33 trades came from is episodic; that is a sample statement, not
   a verdict. `no-edge` on n ≥ 20 for the fidelity run is a verdict on the bot
@@ -281,12 +403,25 @@ this branch and run in seconds.
 
 ## 9. Open items this branch does not close
 
+- **Twenty-six of thirty adversarial verdicts and the synthesis did not run**
+  (§2). The close-momentum bot and the other unreviewed candidates (ATM pin
+  fly, charm-decay, compression-forecast, forecast-disagreement, quiet-open,
+  overnight condor) should go back through the panel before any of them is
+  funded or screened beyond `RESEARCH`.
+- **An as-of `net_gex_pctile`.** The replay's percentile uses the window's
+  own bands (§6). A percentile computed from `gex_historical_stats` as of
+  each snapshot removes the look-ahead; until then the gated arm's result is
+  conditioned on information it would not have had.
+- **One IV convention.** `atm_iv_front` (chain) and `daily_atm_iv` (daily
+  job) must be shown to be the same quantity on the same annualization before
+  `max_atm_iv_pctile` is switched on.
 - The overnight 1DTE condor (Muravyev & Ni 2020: delta-hedged index option
   returns are reliably negative overnight) was proposed by two designers and
   is the one holding period no bot has ever traded. It needs a 1DTE straddle
   fetch (the front-quote fetcher takes an expiration argument, so the field
-  is a one-line addition) and a next-morning time stop. Deferred until the
-  0DTE fly has a first screen, so the two are not confounded.
+  is a one-line addition) and a next-morning time stop. The archivist agreed
+  with deferring it until the 0DTE fly has a first screen, so the two are not
+  confounded.
 - `vanna_vol_crush_rider` is still blocked by `VIX_BARS_RETENTION_DAYS=30`.
   Raising it is a config change, not a code change.
 - Forecast coverage for QQQ and SPX: the morning writer runs for SPY by

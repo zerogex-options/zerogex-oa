@@ -623,16 +623,66 @@ class MarketSnapshot:
         return sigma if sigma > 0.0 else None
 
     def realized_over_implied(self, bars: int = 30) -> Optional[float]:
-        """Annualized trailing realized vol over the ATM front implied vol.
+        """RTH-annualized trailing realized vol over the ATM front implied vol.
 
-        Below 1 the tape is realizing less than the straddle is charging —
-        the premium seller's condition; above 1 the gamma is paying more
-        than its theta. ``None`` when either side is unavailable.
+        DIAGNOSTIC ONLY — the two sides are on different conventions. The
+        realized side annualizes 1-minute RTH returns over 252 x 390 minutes;
+        the implied side is a Black-Scholes IV whose time-to-expiry is
+        CALENDAR time (``market_calendar.calculate_time_to_expiration``:
+        seconds / 86,400 / 365), so for a same-day option it spreads the
+        remaining move over 1,440-minute days. A fairly priced 0DTE straddle
+        therefore reads about sqrt(98,280 / 525,600) = 0.43 here, not 1.0.
+        Gate on :meth:`realized_over_straddle`, which compares dollars to
+        dollars; keep this for the components log.
         """
         sigma = self.realized_sigma_1min(bars)
         if sigma is None or self.atm_iv_front is None or self.atm_iv_front <= 0:
             return None
         return (sigma * math.sqrt(_RTH_MINUTES_PER_YEAR)) / float(self.atm_iv_front)
+
+    def realized_remaining_move(self, bars: int = 30) -> Optional[float]:
+        """Trailing realized variance projected over the rest of today, in $.
+
+        The variance realized over the last ``bars`` one-minute returns is
+        scaled by the share of the session's variance the cone model's
+        diurnal profile assigns to the rest of the day relative to the share
+        it assigns to that trailing window (``variance_fraction``), then
+        turned into a 1-sigma dollar move. Scaling by the profile rather than
+        by sqrt-of-time is what lets a lunchtime reading be compared with a
+        straddle that prices the close hump. ``None`` without enough closes,
+        before the open, or after the close.
+        """
+        closes = [float(c) for c in (self.recent_closes or []) if c is not None and c > 0]
+        n_rets = min(max(2, int(bars)), len(closes) - 1)
+        sigma = self.realized_sigma_1min(bars)
+        elapsed = self.minutes_since_open
+        if sigma is None or n_rets < 2 or elapsed is None or elapsed >= 390.0 or self.spot <= 0:
+            return None
+        from src.jobs.intraday_cone_model import SESSION_MINUTES, variance_fraction
+
+        start = max(0.0, elapsed - float(n_rets))
+        share_trailing = variance_fraction(start, elapsed, SESSION_MINUTES)
+        share_remaining = variance_fraction(elapsed, float(SESSION_MINUTES), SESSION_MINUTES)
+        if share_trailing <= 0.0 or share_remaining <= 0.0:
+            return None
+        trailing_var = (sigma**2) * float(n_rets)
+        remaining_var = trailing_var * share_remaining / share_trailing
+        return self.spot * math.sqrt(remaining_var)
+
+    def realized_over_straddle(self, bars: int = 30) -> Optional[float]:
+        """Realized remaining move over the straddle-implied remaining move.
+
+        Both in dollars, both for the rest of the front expiration's life,
+        so no annualization convention enters. Below 1 the tape is realizing
+        less than the straddle is charging — the premium seller's condition;
+        above 1 the gamma is paying more than its theta. ``None`` when either
+        side is unavailable.
+        """
+        realized = self.realized_remaining_move(bars)
+        implied = self.straddle_implied_sigma()
+        if realized is None or implied is None or implied <= 0:
+            return None
+        return realized / implied
 
     def straddle_implied_sigma(self) -> Optional[float]:
         """The market's 1-sigma remaining move in $, from the ATM straddle mid.
