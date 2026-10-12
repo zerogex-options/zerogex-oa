@@ -792,7 +792,8 @@ def fetch_daily_forecast(
       audit blob (the latter reflects the EVENT_DAYS env at write time).
 
     All ``None`` when no forecast was written for this symbol (the writer
-    defaults to SPY only; check coverage before gating on it).
+    covers SPY, QQQ, SPX and NDX in production; check coverage before gating
+    on it, since a symbol it is not configured for reads None all day).
     """
     cur = conn.cursor()
     armed = _savepoint(cur, "tw_daily_forecast")

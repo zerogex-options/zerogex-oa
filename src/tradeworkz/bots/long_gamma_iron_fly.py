@@ -37,7 +37,8 @@ What the adversarial review (2026-10-11) changed before the first screen
   annualized-vol form mixed an RTH and a calendar convention and read ~0.43
   for a fair straddle.
 * The credit stop is 0.5x the credit; at a 1.25-sigma wing the wing itself is
-  the loss, roughly 0.8-0.9x the credit, so a 1.0x stop could never fire.
+  the loss, roughly 0.9-1.0x the credit (the wing is 1.57x the straddle mid
+  out, the credit ~0.8x the mid), so a 1.0x stop could never fire.
 * Roughly 35 gated trades in 80 sessions cannot distinguish PF 1.1 from 1.0
   (the PF sampling error is of order 0.5). The 80-session screen can return
   ``insufficient`` or ``no-edge`` on the gamma conditioning, never a defensible

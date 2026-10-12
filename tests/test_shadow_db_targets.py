@@ -421,6 +421,146 @@ def test_shadow_compare_counts_flat_volatility_candles():
     ), "nothing counts flat candles, so a flattened accumulation reads as healthy"
 
 
+# --- shadow-stop -----------------------------------------------------------
+#
+# Ctrl-C failed to stop the rehearsal twice (2026-10-09 and 2026-10-12): the
+# supervisor terminates its children and then joins them with no timeout, so
+# one worker stuck in a retry backoff holds the shutdown open and the terminal
+# looks hung. The hand-rolled recovery from that is where someone reaches for
+# `pkill -f main_engine` -- which on this box kills PRODUCTION INGESTION,
+# because the live service runs the same module as the same user. The only
+# thing telling the two apart is DB_NAME in the process environment.
+#
+# These tests exist to keep that the ONLY thing shadow-stop will kill on.
+
+
+def test_shadow_stop_never_kills_on_a_process_name():
+    """A pattern kill here takes production down with the rehearsal."""
+    body = _recipe("shadow-stop")
+    assert "pkill" not in body, "shadow-stop must never pkill -- production runs the same module"
+    assert "killall" not in body
+
+
+def test_shadow_stop_kills_only_pids_it_resolved_one_at_a_time():
+    """Every signal must name a single resolved PID variable.
+
+    Not a pattern, not a negative PID (that is the whole process GROUP, which
+    on a `make shadow-run` includes the make and the tee), and not -1.
+    """
+    body = _recipe("shadow-stop")
+    targets = re.findall(r"\bkill\s+(?:-\w+\s+)?(\S+)", body)
+    assert targets, "shadow-stop sends no signal at all"
+    for target in targets:
+        assert target == '"$$p"', (
+            f"shadow-stop signals {target!r}; only a single resolved PID " '("$$p") is safe here'
+        )
+
+
+def test_shadow_stop_resolves_pids_only_through_the_db_name_environment():
+    """The pid list must be filtered on DB_NAME before anything is signalled."""
+    body = _recipe("shadow-stop")
+    check = "grep -qxF 'DB_NAME=$(SHADOW_DB)'"
+    assert check in body, (
+        "shadow-stop must select processes by an exact whole-line, "
+        f"fixed-string match on {check!r} against /proc/<pid>/environ"
+    )
+    assert "/proc/$$p/environ" in body
+    assert body.index(check) < body.index(
+        "kill"
+    ), "shadow-stop signals something before it has filtered on DB_NAME"
+
+
+def test_shadow_stop_match_is_anchored_and_literal():
+    """`-x` and `-F` are both load-bearing, so pin them separately.
+
+    Without `-x`, DB_NAME=zerogex matches a line reading
+    DB_NAME=zerogex_shadow -- so stopping the rehearsal on a box whose
+    production database is a PREFIX of the shadow one would signal
+    production. Without `-F`, the database name is a regex.
+    """
+    body = _recipe("shadow-stop")
+    match = re.search(r"grep -(\w+) 'DB_NAME=\$\(SHADOW_DB\)'", body)
+    assert match, "shadow-stop does not grep the environ for DB_NAME=$(SHADOW_DB)"
+    flags = match.group(1)
+    assert "x" in flags, "the DB_NAME match must be whole-line (-x)"
+    assert "F" in flags, "the DB_NAME match must be a fixed string (-F)"
+
+
+def test_shadow_stop_resolves_and_signals_in_the_same_shell():
+    """Same trap as shadow-drop: make spawns a shell per recipe line.
+
+    Split across lines, $$PIDS would be empty in the shell that signals --
+    and the obvious "fix" for a stop command that stops nothing is a pkill.
+    """
+    lines = _logical_lines("shadow-stop")
+    signalling = [ln for ln in lines if "kill" in ln]
+    assert len(signalling) == 1, (
+        "shadow-stop must resolve and signal in ONE shell; found "
+        f"{len(signalling)} lines that signal"
+    )
+    assert (
+        "pgrep" in signalling[0]
+    ), "the shell that signals must be the same one that resolved the PIDs"
+
+
+def test_shadow_stop_excludes_its_own_shell():
+    """`pgrep -f` matches this recipe's own shell: the pattern is in its argv."""
+    body = _recipe("shadow-stop")
+    assert (
+        '[ "$$p" = "$$$$" ] && continue' in body
+    ), "shadow-stop must skip its own PID or it can signal itself"
+
+
+def test_shadow_stop_asks_politely_before_it_insists():
+    """SIGTERM first: the worker's handler flushes the last minute of volume.
+
+    A SIGKILL straight away costs committed rows from the session being
+    measured, which is the entire point of the rehearsal.
+    """
+    body = _recipe("shadow-stop")
+    assert "kill -TERM" in body
+    assert "kill -KILL" in body, (
+        "without an escalation a wedged worker hangs shadow-stop the same way "
+        "Ctrl-C already hangs"
+    )
+    assert body.index("kill -TERM") < body.index("kill -KILL")
+
+
+def test_shadow_stop_grace_window_is_bounded():
+    """The wait must terminate. An unbounded poll is the bug, not the fix."""
+    body = _recipe("shadow-stop")
+    assert (
+        '-lt "$(SHADOW_STOP_GRACE)"' in body
+    ), "the grace loop must be bounded by SHADOW_STOP_GRACE"
+    assert re.search(
+        r"^SHADOW_STOP_GRACE \?= \d+$", _text(), re.M
+    ), "SHADOW_STOP_GRACE needs a default or the loop never runs"
+
+
+def test_shadow_stop_lists_what_it_is_about_to_signal():
+    body = _recipe("shadow-stop")
+    assert "ps -o pid" in body
+    assert body.index("ps -o pid") < body.index(
+        "kill"
+    ), "shadow-stop must print the processes before it signals them"
+
+
+def test_shadow_stop_dry_run_signals_nothing():
+    """DRY_RUN must exit before the first kill, in that same shell."""
+    body = _recipe("shadow-stop")
+    match = re.search(r'if \[ -n "\$\(DRY_RUN\)" \]; then.*?exit 0;', body, re.S)
+    assert match, "shadow-stop has no DRY_RUN escape"
+    assert match.end() < body.index(
+        "kill"
+    ), "DRY_RUN exits after shadow-stop has already signalled something"
+
+
+def test_shadow_stop_reports_a_process_it_could_not_kill():
+    """Silence here reads as success and leaves a second writer on the DB."""
+    body = _recipe("shadow-stop")
+    assert "exit 1" in body, "shadow-stop must fail loudly if something survived SIGKILL"
+
+
 # --- shadow-compare-flow's session window ----------------------------------
 #
 # `TZ=America/New_York date -d "$D 09:30" -u` does NOT convert ET to UTC. GNU

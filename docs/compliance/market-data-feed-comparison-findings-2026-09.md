@@ -745,6 +745,104 @@ materially the next step is pointing analytics at the rehearsal DB.
 
 ---
 
+## F13 — NDX cannot be ingested on ThetaData at all: the index level is unentitled
+
+Not a data-quality finding. The Nasdaq index level is refused outright, so there is no
+NDX spot, and without spot there is no NDX chain. As of 2026-10-12 on the Market Value
+feed, NDX is absent
+rather than degraded.
+
+### What happened
+
+Shadow session 2 started 2026-10-12 at about 08:55 ET on `thetadata_mv` with
+`FLOW_CLASSIFIER=tick`. The NDX worker failed to initialize, repeatedly, with:
+
+```
+INVALID_ARGUMENT: Requesting data for NASDAQ GIDs symbols: [NDX] without proper permissions
+```
+
+raised out of `index_snapshot_market_value` — the endpoint `_endpoint()` selects for index
+spot on this feed (`src/ingestion/providers/thetadata.py:1434`). It surfaces through
+`StreamManager._fetch_underlying_bar`, whose `except Exception` logs it at ERROR and returns
+`None` (`src/ingestion/stream_manager.py:1595`). `_get_underlying_price` then returns `None`,
+`initialize()` returns `False` (`stream_manager.py:2134`), and `run_streaming()` takes its
+retry path (`main_engine.py:2454`).
+
+So the worker never dies and the supervisor never sees a crash. It loops on failed
+initialization behind `_worker_restart_delay`, 5s escalating to the 120s cap. SPY, QQQ and
+SPX were unaffected and ran the full session.
+
+Scope is the **account's NASDAQ GIDS entitlement**, not the Market Value product and not the
+OPRA options data. SPX is CBOE and the ETFs are not index products, which is why only NDX
+fails. The NDX *options* chain was never reached, so whether it is entitled is still unknown —
+spot and chain are separately entitled on this vendor, and the failure stops at spot.
+
+### Log volume, since this was the live concern
+
+About 0.6 MB for the session: 229 retries at roughly 2,679 bytes each, including the
+traceback `exc_info=True` attaches. The 5s→120s backoff is doing exactly the job it was
+added for, and its own comment names this case — "a symbol the vendor does not serve" —
+alongside the run that wrote 73 million lines and 7 GB in seven minutes. Without it this
+would have been a disk-exhaustion event on the box that also runs the live service. `/` had
+17 GB free and `/var/log` is a separate 10 GB volume at 55%.
+
+### Why the comparison runs could not surface it — and what did
+
+`make feed-compare` cannot find it, by design. The candidate is sampled with
+`spot_hint=incumbent.spot` (`src/tools/feed_compare.py:1491`), and `sample_provider` takes
+that hint in place of calling the feed (`feed_compare.py:565`). That is a **correct** control,
+not a defect: letting each feed pick its own spot would let a small price difference select
+different contracts, and the divergence would be an artefact of the harness. The cost is that
+a comparison never asks the candidate for an index level.
+
+`make feed-probe` does ask — it passes no hint and runs `require_spot=False`. And it found
+this, on **2026-09-25**, seventeen days before it stopped an ingestion run. The escape
+hatch added in that commit
+is commented:
+
+> A probe reports what IS reachable. Stopping at a failed spot call left "$NDXP.X" reading as
+> a total outage when only the Nasdaq GIDS index level was unentitled and the OPRA chain
+> underneath it was never asked for.
+
+The signal was absorbed as harness robustness and never carried anywhere: no vendor question,
+no cutover gate, no entry here. **The gap was in what happened to the finding, not in the
+coverage.** A first pass at this finding, on the morning of 2026-10-12, said three weeks of
+testing had never exercised the endpoint. That is true of `feed-compare` and wrong about
+`feed-probe`, which exercised it and reported it; corrected here.
+
+The corrected lesson: per-symbol reachability is a **probe** question, and a comparison
+harness is structurally unable to answer it. The gate before any cutover has to be one
+`feed-probe` per production symbol on the candidate feed, read for a spot error — not a
+comparison run, however long.
+
+### Consequence for cutover
+
+NDX is blocked on ThetaData until the entitlement is added. This stacks on F12, where NDX was
+already the worst symbol on the method change (62.0% of buckets differing, 36.5% of session
+imbalance in flipped buckets, judged not shippable on the tick test as it stands). Two
+independent blockers on the same symbol.
+
+It does not change the position on SPY, QQQ or SPX.
+
+### Status
+
+Raised with ThetaData 2026-10-12; Anthony confirmed he is looking into it. Open, alongside the
+credit outstanding from 28 September.
+
+A standing re-check, read for `spot_error` rather than pass/fail:
+
+```bash
+PROVIDER=thetadata_mv UNDERLYING='$NDXP.X' make feed-probe
+```
+
+**Not while a shadow run is up.** The account holds one MDDS connection and a second login
+kicks the first, so probing the candidate feed during a rehearsal on that same feed ends the
+rehearsal. This is also why the cutover gate below cannot be a same-day check: the
+per-symbol probes have to run on a day with no rehearsal holding the connection, or before
+one starts.
+
+---
+
 ## Findings that turned out not to be about the feed
 
 Recorded because each cost investigation time and each looked like a vendor problem first.
@@ -837,6 +935,17 @@ afterwards and append the result here rather than holding the cutover for it.
   failed IV solve against a 0.20 fallback without writing it back, so the contract carries a gamma
   into `_calculate_gex_by_strike` while `_gamma_exposure_profile` skips it on `sigma <= 0`.
   `net_gex` and `gamma_flip` are therefore not always computed over the same chain.
+- **NDX is unentitled on ThetaData (F13) — OPEN, raised 2026-10-12.** The NASDAQ GIDS index
+  level is refused, so there is no NDX spot and therefore no NDX chain. Absent, not degraded.
+  The NDX options chain has never been reached, so its entitlement is still unknown. Stacks on
+  F12, which already judged NDX not shippable on the tick test. SPY / QQQ / SPX unaffected.
+- **Per-symbol reachability is a probe question, and belongs in the cutover gate.** `feed-compare`
+  passes `spot_hint=incumbent.spot` as a deliberate control, so it can never ask the candidate for
+  an index level. `feed-probe` can, and did on 2026-09-25 — seventeen days before F13 surfaced in
+  ingestion — and the finding went into a harness comment instead of into this document. Before
+  cutover: one `feed-probe` per production symbol on the candidate feed, read for `spot_error`
+  — on a day with no rehearsal running, since the single MDDS connection makes the two
+  mutually exclusive.
 - **F9's licensing question** — **RESOLVED 2026-10-07, against us.** Raw NBBO as an internal
   input is non-display use under OPRA, outside the Market Value exemption, and fee-bearing.
   `option_snapshot_quote` stays unwired and `_endpoint()`'s refusal is permanent. No longer a
