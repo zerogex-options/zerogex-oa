@@ -3582,6 +3582,84 @@ shadow-log: shadow-guard ## Follow today's rehearsal log (Ctrl-C stops following
 	echo "$(BLUE)=== $$LOG ($$(wc -l < "$$LOG") lines) -- Ctrl-C stops FOLLOWING, not the run ===$(NC)"; \
 	tail -f "$$LOG"
 
+# The counterpart to shadow-run's Ctrl-C, which has now twice failed to stop a
+# rehearsal. The supervisor's handler terminates its children and then joins
+# them with NO timeout, so one worker stuck in a retry backoff (NDX on
+# 2026-10-12, up to the 120s restart cap) holds the whole shutdown open and the
+# terminal just looks hung. Hand-rolling the kill loop under that pressure is
+# exactly when someone reaches for `pkill -f main_engine`.
+#
+# So: NEVER pattern-match the module name to kill. Production runs the same
+# module, as the same user, on the same box. The ONLY thing separating a
+# rehearsal process from the live service is DB_NAME in its environment, so
+# that is what this matches on -- whole-line, fixed-string, against
+# /proc/<pid>/environ. Workers are forked (not spawned), so they inherit the
+# parent's DB_NAME and match alongside it.
+#
+# Signals go to the supervisor AND every worker directly, so a stuck child dies
+# whether or not its parent's join ever returns. SIGTERM first: the worker's
+# handler drops out of its poll and the `finally` path flushes the last minute
+# of volume and closes the pool, so an impatient SIGKILL costs real rows.
+# Anything still alive after the grace window is killed -- a worker wedged in a
+# backoff sleep has nothing buffered to lose.
+SHADOW_STOP_GRACE ?= 30
+
+.PHONY: shadow-stop
+shadow-stop: shadow-guard ## Stop the rehearsal run and ONLY the rehearsal (production is untouched). Vars: SHADOW_STOP_GRACE=30, DRY_RUN=1
+	@PIDS=""; \
+	for p in $$(pgrep -f 'src\.ingestion\.main_engine' 2>/dev/null); do \
+		[ "$$p" = "$$$$" ] && continue; \
+		if tr '\0' '\n' < /proc/$$p/environ 2>/dev/null | grep -qxF 'DB_NAME=$(SHADOW_DB)'; then \
+			PIDS="$$PIDS $$p"; \
+		fi; \
+	done; \
+	PIDS=$$(echo $$PIDS); \
+	if [ -z "$$PIDS" ]; then \
+		echo "$(YELLOW)No rehearsal processes running (nothing has DB_NAME=$(SHADOW_DB)). Nothing to stop.$(NC)"; \
+		exit 0; \
+	fi; \
+	echo "$(BLUE)=== rehearsal processes — DB_NAME=$(SHADOW_DB) ===$(NC)"; \
+	ps -o pid,ppid,etime,rss,args -p "$$(echo $$PIDS | tr ' ' ',')" 2>/dev/null | cut -c1-120 || true; \
+	echo ""; \
+	if [ -n "$(DRY_RUN)" ]; then \
+		echo "$(YELLOW)DRY_RUN set — would SIGTERM:$$PIDS$(NC)"; \
+		echo "$(YELLOW)Rerun without DRY_RUN to stop them.$(NC)"; \
+		exit 0; \
+	fi; \
+	echo "$(BLUE)SIGTERM ->$$PIDS   (up to $(SHADOW_STOP_GRACE)s to flush)$(NC)"; \
+	for p in $$PIDS; do kill -TERM "$$p" 2>/dev/null || true; done; \
+	W=0; \
+	while [ "$$W" -lt "$(SHADOW_STOP_GRACE)" ]; do \
+		ALIVE=""; \
+		for p in $$PIDS; do \
+			case "$$(ps -o stat= -p "$$p" 2>/dev/null | tr -d ' \n')" in \
+				""|Z*) ;; \
+				*) ALIVE="$$ALIVE $$p" ;; \
+			esac; \
+		done; \
+		[ -z "$$ALIVE" ] && break; \
+		sleep 1; W=$$((W+1)); \
+	done; \
+	if [ -n "$$ALIVE" ]; then \
+		echo "$(YELLOW)Still alive after $(SHADOW_STOP_GRACE)s:$$ALIVE — SIGKILL$(NC)"; \
+		for p in $$ALIVE; do kill -KILL "$$p" 2>/dev/null || true; done; \
+		sleep 2; \
+	fi; \
+	LEFT=""; \
+	for p in $$PIDS; do \
+		case "$$(ps -o stat= -p "$$p" 2>/dev/null | tr -d ' \n')" in \
+			""|Z*) ;; \
+			*) LEFT="$$LEFT $$p" ;; \
+		esac; \
+	done; \
+	if [ -n "$$LEFT" ]; then \
+		echo "$(RED)❌ Would not die:$$LEFT. Check them by hand, matching on DB_NAME — never on the module name.$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✅ Rehearsal stopped. Production ingestion was never signalled.$(NC)"; \
+	echo "The tmux window and $${SHADOW_LOG:-$$HOME/shadow-run-$$(date +%F).log} are untouched."; \
+	echo "$(BLUE)Next: make shadow-compare  &&  make shadow-compare-flow$(NC)"
+
 .PHONY: shadow-status
 shadow-status: shadow-guard ## One-screen answer to "is the rehearsal healthy right now?"
 	@LOG=$${SHADOW_LOG:-$$HOME/shadow-run-$$(date +%F).log}; \
