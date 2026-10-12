@@ -133,14 +133,16 @@ ORDER BY underlying;
 \echo ============================================================
 \echo  The hedging_demand_close_momentum hypothesis before any option is
 \echo  priced: on sessions where the 09:30 -> 15:00 cash return is at least
-\echo  half the daily sigma implied by the prior-session ATM IV (daily_atm_iv,
-\echo  ~115 sessions per symbol; vix_bars keeps ~30 days and would clamp the
-\echo  window), how often does 15:00 -> 15:55 go the
+\echo  half the daily sigma implied by the prior-session ATM IV (daily_atm_iv;
+\echo  the earlier VIX join clamped this to ~29 sessions, the cash bars allow
+\echo  ~63 in the 95-day window), how often does 15:00 -> 15:55 go the
 \echo  same way, and how many bps does it travel in the direction of the day? Split
 \echo  by the dealer-gamma sign at 15:00. Baltussen et al. say the short-gamma
-\echo  row should carry the effect and the long-gamma row should not; if the
-\echo  short-gamma continuation share is not clearly above 50% here, the bot
-\echo  screen cannot rescue it. Index symbols open on their 09:31 bar (the
+\echo  row should carry the effect and the long-gamma row should not. With
+\echo  ~15 qualifying sessions per symbol this table can only rule OUT a large
+\echo  effect; SPY and SPX are the same days, so pool them as one. The
+\echo  gamma labels disagree between SPY and SPX on the same days (section D:
+\echo  44% vs 60% positive midday), so a short-gamma row is not one condition. Index symbols open on their 09:31 bar (the
 \echo  09:30 print is stale). Each symbol is scaled by its own ATM IV.
 \echo
 
@@ -228,12 +230,12 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo  by the prior-session ATM IV), split by the dealer-gamma sign at 12:00 ET.
 \echo  The LEVEL sits well under 1 on every row: the cash range excludes the
 \echo  overnight gap and implied vol carries a premium, so read the long-gamma
-\echo  row against the short-gamma row, not against 1. pm_ratio is the same
-\echo  for the 12:00-16:00 range alone, which is what the fly is exposed to. Barbon
+\echo  row against the short-gamma row, not against 1 (there is no compression
+\echo  share here for that reason). pm_ratio is the 12:00-16:00 range alone,
+\echo  which is what the fly is exposed to and the only range the 12:00 gamma
+\echo  reading does not already contain. Barbon
 \echo  and Buraschi and the excursion studies on this platform say the
-\echo  long-gamma rows should sit lower. The compression share (<= 0.85) is
-\echo  roughly the fraction of sessions on which an ATM straddle sold at the
-\echo  open would have been paid; midday entries see less of the range.
+\echo  long-gamma rows should sit lower, on pm_ratio above all.
 \echo
 
 WITH bars AS (
@@ -295,8 +297,7 @@ SELECT symbol,
        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_over_normal::float8)::numeric, 3) AS median_ratio,
        ROUND(AVG(realized_over_normal)::numeric, 3) AS mean_ratio,
        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pm_over_normal::float8)::numeric, 3) AS median_pm_ratio,
-       ROUND(100.0 * AVG((realized_over_normal <= 0.85)::int), 1) AS compression_pct,
-       ROUND(100.0 * AVG((realized_over_normal >= 1.15)::int), 1) AS expansion_pct
+       ROUND(AVG(pm_over_normal)::numeric, 3) AS mean_pm_ratio
 FROM ratios
 GROUP BY ROLLUP (symbol, CASE WHEN net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END)
 ORDER BY symbol NULLS LAST, 2 NULLS LAST;
@@ -316,9 +317,14 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo  does not, the tape-only twin is the trade to screen and the regime gate
 \echo  is a diagnostic. seller_bps_of_spot is the mean gross result of the naked
 \echo  seller at the straddle bid, in bps of spot, before the cost of the wings: a
-\echo  row that is already negative here cannot be rescued by exits.
-\echo  Chains are read hot UNION archive; a slot with few sessions means the
-\echo  0DTE chain was not captured in the ten minutes before it.
+\echo  row that is already negative here cannot be rescued by exits. This is a
+\echo  hold-to-15:55 measurement, i.e. the gated/hold_to_settle arm, not the
+\echo  default bot (take 50%, stop 0.5x, flat 15:40). Pooled rows average three
+\echo  symbols on the SAME days (SPY and SPX are one index), so their effective
+\echo  sample is ~52 sessions, not 156, and the wing column is a COUNT because
+\echo  1 vs 4 sessions should read like 1 vs 4. Chains are read hot UNION
+\echo  archive; a slot with few sessions means the 0DTE chain was not captured
+\echo  in the ten minutes before it.
 \echo
 
 WITH slots AS (
@@ -425,10 +431,10 @@ SELECT symbol,
        ROUND(AVG(paid / straddle_mid)::numeric, 3) AS mean_paid_over_charged,
        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (paid / straddle_mid)::float8)::numeric, 3)
            AS median_paid_over_charged,
+       ROUND((10000 * AVG(paid / spot))::numeric, 1) AS mean_paid_bps_of_spot,
        ROUND(100.0 * AVG((paid < straddle_bid)::int), 1) AS seller_win_pct_at_bid,
        ROUND((10000 * AVG((straddle_bid - paid) / spot))::numeric, 1) AS seller_bps_of_spot,
-       ROUND(100.0 * AVG((paid > 1.25 * straddle_mid / SQRT(2.0 / PI()))::int), 1)
-           AS beyond_1p25_sigma_wing_pct
+       SUM((paid > 1.25 * straddle_mid / SQRT(2.0 / PI()))::int) AS beyond_1p25_sigma_wing_n
 FROM settled
 GROUP BY GROUPING SETS (
     (symbol, slot, CASE WHEN net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END),
@@ -436,6 +442,243 @@ GROUP BY GROUPING SETS (
     (slot)
 )
 ORDER BY symbol NULLS LAST, slot, 3 NULLS LAST;
+
+\echo
+\echo  G2. The same straddles, gamma sign x direction of the day at entry.
+\echo  net_gex_at_spot is read off the structural (prior-close open interest)
+\echo  profile, so its sign at 13:30 largely says which side of the multi-day
+\echo  flip spot sits on, i.e. whether the day is up or down. If the long-gamma
+\echo  advantage lives only in the up-day rows, the gate is reading the day
+\echo  direction, not dealer hedging; a long-gamma advantage inside BOTH
+\echo  direction rows is the mechanism. First pre-screen (2026-10-11) also
+\echo  showed the short-gamma straddle 10-26% richer in every cell, so G3
+\echo  re-cuts by straddle richness instead of gamma sign.
+\echo
+
+WITH slots AS (
+    SELECT unnest(ARRAY['12:00', '13:30', '14:30']::time[]) AS slot
+),
+bars AS (
+    SELECT symbol, timestamp, close,
+           (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+           (timestamp AT TIME ZONE 'America/New_York')::time AS et
+    FROM underlying_quotes
+    WHERE symbol IN ('SPY', 'QQQ', 'SPX')
+      AND timestamp >= NOW() - INTERVAL '95 days'
+),
+opens AS (
+    SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_open
+    FROM bars
+    WHERE et >= CASE WHEN symbol IN ('SPX', 'NDX') THEN '09:31'::time ELSE '09:30'::time END
+      AND et < '09:40'
+    ORDER BY symbol, sess, timestamp
+),
+spot_at AS (
+    SELECT DISTINCT ON (b.symbol, b.sess, s.slot) b.symbol, b.sess, s.slot, b.close AS spot
+    FROM bars b CROSS JOIN slots s
+    WHERE b.et > s.slot - INTERVAL '5 minutes' AND b.et <= s.slot
+    ORDER BY b.symbol, b.sess, s.slot, b.timestamp DESC
+),
+at_1555 AS (
+    SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_1555
+    FROM bars WHERE et BETWEEN '15:40' AND '15:55'
+    ORDER BY symbol, sess, timestamp DESC
+),
+gamma_at AS (
+    SELECT DISTINCT ON (g.underlying, g.sess, s.slot) g.underlying AS symbol, g.sess, s.slot,
+           g.net_gex_at_spot
+    FROM (SELECT underlying, net_gex_at_spot, timestamp,
+                 (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+                 (timestamp AT TIME ZONE 'America/New_York')::time AS et
+          FROM gex_summary
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND net_gex_at_spot IS NOT NULL) g
+    CROSS JOIN slots s
+    WHERE g.et > s.slot - INTERVAL '60 minutes' AND g.et <= s.slot
+    ORDER BY g.underlying, g.sess, s.slot, g.timestamp DESC
+),
+chain AS (
+    SELECT c.underlying AS symbol, c.timestamp, c.strike, c.option_type, c.bid, c.ask,
+           COALESCE(c.mid, (c.bid + c.ask) / 2.0) AS mid,
+           sp.sess, sp.slot, sp.spot
+    FROM (SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
+          FROM option_chains
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')
+          UNION ALL
+          SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
+          FROM option_chains_archive
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')) c
+    JOIN spot_at sp
+      ON sp.symbol = c.underlying
+     AND sp.sess = (c.timestamp AT TIME ZONE 'America/New_York')::date
+     AND (c.timestamp AT TIME ZONE 'America/New_York')::time > sp.slot - INTERVAL '10 minutes'
+     AND (c.timestamp AT TIME ZONE 'America/New_York')::time <= sp.slot
+    WHERE ABS(c.strike - sp.spot) <= 0.01 * sp.spot
+      AND c.bid > 0 AND c.ask > 0
+),
+chain_ts AS (
+    SELECT symbol, sess, slot, MAX(timestamp) AS chain_ts
+    FROM chain
+    GROUP BY symbol, sess, slot
+),
+straddles AS (
+    SELECT DISTINCT ON (k.symbol, k.sess, k.slot) k.symbol, k.sess, k.slot, k.spot, k.strike,
+           k.mid + p.mid AS straddle_mid,
+           k.bid + p.bid AS straddle_bid
+    FROM chain k
+    JOIN chain_ts t ON t.symbol = k.symbol AND t.sess = k.sess AND t.slot = k.slot
+                   AND t.chain_ts = k.timestamp
+    JOIN chain p ON p.symbol = k.symbol AND p.timestamp = k.timestamp AND p.slot = k.slot
+                AND p.strike = k.strike AND p.option_type = 'P'
+    WHERE k.option_type = 'C'
+    ORDER BY k.symbol, k.sess, k.slot, ABS(k.strike - k.spot), k.strike
+),
+settled AS (
+    SELECT s.symbol, s.sess, s.slot, s.spot, s.straddle_mid, s.straddle_bid,
+           ABS(c.px_1555 - s.strike) AS paid,
+           CASE WHEN g.net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END AS gamma_sign,
+           CASE WHEN s.spot >= o.px_open THEN 'up day' ELSE 'down day' END AS day_dir,
+           NTILE(2) OVER (PARTITION BY s.symbol, s.slot ORDER BY s.straddle_mid / s.spot) AS richness
+    FROM straddles s
+    JOIN at_1555 c USING (symbol, sess)
+    JOIN gamma_at g USING (symbol, sess, slot)
+    JOIN opens o USING (symbol, sess)
+    WHERE s.straddle_mid > 0
+)
+SELECT symbol, slot AS entry_et, gamma_sign, day_dir,
+       COUNT(*) AS sessions,
+       ROUND(AVG(straddle_mid)::numeric, 2) AS mean_straddle_mid,
+       ROUND(AVG(paid / straddle_mid)::numeric, 3) AS mean_paid_over_charged,
+       ROUND((10000 * AVG(paid / spot))::numeric, 1) AS mean_paid_bps_of_spot,
+       ROUND((10000 * AVG((straddle_bid - paid) / spot))::numeric, 1) AS seller_bps_of_spot,
+       SUM((paid > 1.25 * straddle_mid / SQRT(2.0 / PI()))::int) AS beyond_1p25_sigma_wing_n
+FROM settled
+GROUP BY GROUPING SETS ((symbol, slot, gamma_sign, day_dir), (symbol, slot, day_dir))
+ORDER BY symbol, slot, day_dir, gamma_sign NULLS LAST;
+
+\echo
+\echo  G3. The same straddles cut by straddle richness (straddle mid / spot,
+\echo  above or below the symbol-slot median) instead of gamma sign. If the
+\echo  cheap half pays the seller as well as the long-gamma rows do, the gate
+\echo  is a proxy for a quiet (cheap-straddle) tape and twin/tail_only is the
+\echo  trade.
+\echo
+
+WITH slots AS (
+    SELECT unnest(ARRAY['12:00', '13:30', '14:30']::time[]) AS slot
+),
+bars AS (
+    SELECT symbol, timestamp, close,
+           (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+           (timestamp AT TIME ZONE 'America/New_York')::time AS et
+    FROM underlying_quotes
+    WHERE symbol IN ('SPY', 'QQQ', 'SPX')
+      AND timestamp >= NOW() - INTERVAL '95 days'
+),
+spot_at AS (
+    SELECT DISTINCT ON (b.symbol, b.sess, s.slot) b.symbol, b.sess, s.slot, b.close AS spot
+    FROM bars b CROSS JOIN slots s
+    WHERE b.et > s.slot - INTERVAL '5 minutes' AND b.et <= s.slot
+    ORDER BY b.symbol, b.sess, s.slot, b.timestamp DESC
+),
+at_1555 AS (
+    SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_1555
+    FROM bars WHERE et BETWEEN '15:40' AND '15:55'
+    ORDER BY symbol, sess, timestamp DESC
+),
+gamma_at AS (
+    SELECT DISTINCT ON (g.underlying, g.sess, s.slot) g.underlying AS symbol, g.sess, s.slot,
+           g.net_gex_at_spot
+    FROM (SELECT underlying, net_gex_at_spot, timestamp,
+                 (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+                 (timestamp AT TIME ZONE 'America/New_York')::time AS et
+          FROM gex_summary
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND net_gex_at_spot IS NOT NULL) g
+    CROSS JOIN slots s
+    WHERE g.et > s.slot - INTERVAL '60 minutes' AND g.et <= s.slot
+    ORDER BY g.underlying, g.sess, s.slot, g.timestamp DESC
+),
+chain AS (
+    SELECT c.underlying AS symbol, c.timestamp, c.strike, c.option_type, c.bid, c.ask,
+           COALESCE(c.mid, (c.bid + c.ask) / 2.0) AS mid,
+           sp.sess, sp.slot, sp.spot
+    FROM (SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
+          FROM option_chains
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')
+          UNION ALL
+          SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
+          FROM option_chains_archive
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')) c
+    JOIN spot_at sp
+      ON sp.symbol = c.underlying
+     AND sp.sess = (c.timestamp AT TIME ZONE 'America/New_York')::date
+     AND (c.timestamp AT TIME ZONE 'America/New_York')::time > sp.slot - INTERVAL '10 minutes'
+     AND (c.timestamp AT TIME ZONE 'America/New_York')::time <= sp.slot
+    WHERE ABS(c.strike - sp.spot) <= 0.01 * sp.spot
+      AND c.bid > 0 AND c.ask > 0
+),
+chain_ts AS (
+    SELECT symbol, sess, slot, MAX(timestamp) AS chain_ts
+    FROM chain
+    GROUP BY symbol, sess, slot
+),
+straddles AS (
+    SELECT DISTINCT ON (k.symbol, k.sess, k.slot) k.symbol, k.sess, k.slot, k.spot, k.strike,
+           k.mid + p.mid AS straddle_mid,
+           k.bid + p.bid AS straddle_bid
+    FROM chain k
+    JOIN chain_ts t ON t.symbol = k.symbol AND t.sess = k.sess AND t.slot = k.slot
+                   AND t.chain_ts = k.timestamp
+    JOIN chain p ON p.symbol = k.symbol AND p.timestamp = k.timestamp AND p.slot = k.slot
+                AND p.strike = k.strike AND p.option_type = 'P'
+    WHERE k.option_type = 'C'
+    ORDER BY k.symbol, k.sess, k.slot, ABS(k.strike - k.spot), k.strike
+),
+settled AS (
+    SELECT s.symbol, s.sess, s.slot, s.spot, s.straddle_mid, s.straddle_bid,
+           ABS(c.px_1555 - s.strike) AS paid,
+           CASE WHEN g.net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END AS gamma_sign,
+           NTILE(2) OVER (PARTITION BY s.symbol, s.slot ORDER BY s.straddle_mid / s.spot) AS richness
+    FROM straddles s
+    JOIN at_1555 c USING (symbol, sess)
+    JOIN gamma_at g USING (symbol, sess, slot)
+    WHERE s.straddle_mid > 0
+)
+SELECT symbol, slot AS entry_et,
+       CASE richness WHEN 1 THEN 'cheap half' ELSE 'rich half' END AS straddle_richness,
+       COUNT(*) AS sessions,
+       ROUND(100.0 * AVG((gamma_sign = 'long gamma')::int), 1) AS long_gamma_pct,
+       ROUND(AVG(straddle_mid)::numeric, 2) AS mean_straddle_mid,
+       ROUND(AVG(paid / straddle_mid)::numeric, 3) AS mean_paid_over_charged,
+       ROUND((10000 * AVG(paid / spot))::numeric, 1) AS mean_paid_bps_of_spot,
+       ROUND((10000 * AVG((straddle_bid - paid) / spot))::numeric, 1) AS seller_bps_of_spot,
+       SUM((paid > 1.25 * straddle_mid / SQRT(2.0 / PI()))::int) AS beyond_1p25_sigma_wing_n
+FROM settled
+GROUP BY symbol, slot, richness
+ORDER BY symbol, slot, richness;
 
 \echo
 \echo  Done. Next: python -m src.tools.tw_edge_field_probe --days 90 for the

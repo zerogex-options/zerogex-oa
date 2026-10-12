@@ -143,11 +143,13 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
     grid.append(("gated/condor1.0", {"short_offset_sigma": 1.0, "wing_sigma_mult": 0.75}))
     grid.append(("gated/no_stop", {"credit_stop_mult": 0}))
     # The afternoon window. The first pre-screen (section G, 2026-10-11) put
-    # the seller's edge and the whole long-gamma advantage at the 13:30 slot
-    # and REVERSED it at 10:30, so the default 10:30-13:30 window spans both.
-    # Entries 12:30-14:00 ET, held to 15:40; the tape-only twin runs the same
-    # window so the paired comparison exists there too.
-    afternoon = {"min_minutes_since_open": 180, "min_minutes_to_close": 120}
+    # the only statistically resolved premium and the whole long-gamma lean at
+    # the 13:30 slot, with 12:00 mixed and 10:30 flat-to-reversed, so the
+    # default 10:30-13:30 window spans all three. Entries 13:00-14:00 ET, held
+    # to 15:40; the tape-only twin runs the same window so the paired
+    # comparison exists there too. Re-set the bounds from the 13:30 and 14:30
+    # rows once the re-run pre-screen has them.
+    afternoon = {"min_minutes_since_open": 210, "min_minutes_to_close": 120}
     grid.append(("gated/afternoon", dict(afternoon)))
     grid.append(("twin/tail_only_afternoon", {**afternoon, "required_regimes": "any"}))
     return grid

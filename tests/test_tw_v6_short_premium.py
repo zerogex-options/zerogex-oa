@@ -472,9 +472,9 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
     cls = get_bot_class(base.strategy_class)
     assert cls(by["twin/clock_only"], ml_state=None).open_criteria(busy) is not None
     assert cls(by["gated/default"], ml_state=None).open_criteria(busy) is None
-    # The afternoon arms (first pre-screen, section G): entries 12:30-14:00
+    # The afternoon arms (first pre-screen, section G): entries 13:00-14:00
     # ET only, gated and tape-only, so a 12:00 ET setup is a window miss there.
-    assert by["gated/afternoon"].params["min_minutes_since_open"] == 180
+    assert by["gated/afternoon"].params["min_minutes_since_open"] == 210
     assert by["twin/tail_only_afternoon"].params["required_regimes"] == "any"
     pm = cls(by["gated/afternoon"], ml_state=None)
     assert _miss(pm, _snap()) == "window"

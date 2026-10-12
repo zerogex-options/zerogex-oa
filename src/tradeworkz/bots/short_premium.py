@@ -60,9 +60,11 @@ Param convention: a gate is DISABLED by a falsy value (``0``, ``""``, ``[]``);
 one gate at a time.
 
 Exits: the base class's credit take / stop (``credit_take_frac`` /
-``credit_stop_mult`` — note the WING is the real stop on a fly: max loss is
-roughly 0.8-0.9x the credit at a 1.25-sigma wing, so a stop multiple above
-that never fires) plus invalidations that close regardless of P&L —
+``credit_stop_mult`` — note the WING is the real stop on a fly: the wing
+sits 1.25 sigma = 1.57x the straddle mid out and the credit is ~0.8x the
+mid, so max loss is ~0.9-1.0x the credit, less where the strike grid rounds
+the wing in to 1.0 sigma; a stop multiple above that never fires) plus
+invalidations that close regardless of P&L —
 ``regime_lost``, ``flip_entered``, ``short_touched``, ``vol_shock`` — and a
 time stop that by default never holds the short straddle into the settlement
 window (``eod_exit_buffer_minutes``; a sweep arm holds to settlement).
