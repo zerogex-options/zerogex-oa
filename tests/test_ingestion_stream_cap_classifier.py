@@ -59,6 +59,7 @@ def _bare_option_acc(monkeypatch):
     acc._chunks = [["SPY"], ["QQQ"]]  # two chunks so the WARN reports `len=2`
     acc._current_responses = [None, None]
     acc._response_lock = threading.Lock()
+    acc._connection_opened_at = {}
     acc._connected = threading.Event()
     acc._state = {}
     acc._lock = threading.Lock()
