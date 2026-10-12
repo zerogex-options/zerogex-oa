@@ -426,3 +426,92 @@ this branch and run in seconds to a minute.
   Raising it is a config change, not a code change. The pre-screen no longer
   depends on it: sections E and F scale by the prior session's `daily_atm_iv`
   (115+ sessions per symbol) after the first run came back with 29 sessions.
+
+## 10. First pre-screen reading (production DB, 2026-10-11)
+
+The first `make tradeworkz-v6-prescreen` run, before any bot screen. Sections
+E and F were clamped to 29 sessions by the VIX join (fixed since; re-run
+them). Section G is the table that matters, and it is read here as a
+hypothesis for the bot screen, not a result: the screen runs on the same
+sessions.
+
+**B — forecast skill.** Spearman rho between the committed
+`expected_vol_ratio` and the realized receipt: SPY 0.11, QQQ 0.23, SPX 0.27,
+NDX 0.49 on 54–62 graded days (standard error about 0.13). Committed
+compression days realized a little less than other days (SPY 0.87 vs 0.91,
+QQQ 0.91 vs 1.02). On SPY the forecast is within noise, so the
+`forecast_expansion` gate barely binds there and `gated/uniform_gates` is
+the control that says whether it matters anywhere. The writer covers all
+four symbols, which the earlier draft of this doc had wrong.
+
+**D — base rates.** Positive gamma held 44% of SPY midday minutes, 50% QQQ,
+60% SPX; negative gamma held 59% of SPY minutes at 15:00, 45% QQQ, 42% SPX.
+The fly's `positive_strong` gate is the top quartile of each symbol's own
+history, so roughly a quarter of midday minutes qualify before the tail
+gate; expect the gated arm to trade on the order of 20–25 sessions per
+symbol in a 60-session window before `tail_realized` cuts it further.
+
+**E — last-hour momentum.** 20 qualifying sessions pooled across the three
+symbols, 40% continuation, a mean of −3 bps in the day's direction; the
+short-gamma cells hold one to three sessions each. Nothing visible, and not
+a verdict either way at that count. Re-run with the ATM-IV scale before
+judging the close-momentum bot.
+
+**F — realized range by gamma sign.** The level (median 0.39–0.57 of the
+"normal" range) is a normalization artifact: the cash range excludes the
+overnight gap and implied vol carries a premium. The only reading is long
+against short gamma, and on 29 sessions it ran against the thesis (SPY
+median 0.51 long vs 0.38 short; SPX 0.42 vs 0.37; QQQ flat). The re-run
+adds the mean and the 12:00–16:00 range, which is what the fly is exposed
+to.
+
+**G — what the straddle charged against what the tape paid.** 52 sessions
+per symbol per slot (the chain was captured before every slot on 52 of the
+window's sessions). Pooled over SPY, QQQ and SPX:
+
+| entry | mean paid/charged | median | seller win % at bid | seller bps of spot | beyond 1.25σ wing |
+|---|---|---|---|---|---|
+| 10:30 | 0.863 | 0.765 | 68.6 | +5.4 | 12.8% |
+| 12:00 | 0.877 | 0.715 | 65.4 | +3.3 | 16.0% |
+| 13:30 | 0.724 | 0.606 | 70.5 | +5.7 | 9.6% |
+
+1. **The unconditional 0DTE premium is on this tape.** A naked straddle sold
+   at the bid paid out 72–88% of what it charged on average, before wings,
+   slippage and commissions. That is the published 0DTE variance premium,
+   and it is largest at 13:30, where the median session paid 61% and the
+   wing was reached on fewer than one session in ten.
+2. **The gamma gate shows up at 13:30 and nowhere earlier.** Mean paid over
+   charged, long gamma vs short gamma, at 13:30: SPY 0.590 vs 0.777, SPX
+   0.612 vs 0.887, QQQ 0.692 vs 0.852; the wing was reached on 4.5% / 3.0% /
+   10.3% of long-gamma sessions against 13.3% / 10.5% / 17.4% of short-gamma
+   ones. At 12:00 the split is mixed (SPX short gamma lost money, −2.4 bps,
+   28% beyond the wing; SPY flat). At 10:30 it **reverses** on all three
+   symbols: long gamma was worse for the seller (SPY 0.980 vs 0.809, SPX
+   0.935 vs 0.874, QQQ 0.859 vs 0.759).
+3. **How much to believe it.** Each 13:30 difference is about 1 to 1.7
+   standard errors on 19–33 sessions per cell, and SPY and SPX are the same
+   index, so this is one suggestive observation, not three replications.
+   The 13:30 slot clears the §8 bar on SPY and SPX (long gamma at least 0.10
+   below the all-sessions row) and misses it on QQQ (0.07). It is consistent
+   with the mechanism — 0DTE dealer gamma and the hedging pin are largest in
+   the last hours, and the day's gamma sign is not established at 10:30 —
+   which is why it earns a sweep arm and not a new default.
+4. **Fly economics at 13:30.** With wings at 1.25σ costing roughly 13% of
+   the straddle and four-leg slippage another 8%, the fly keeps about 0.8×
+   the straddle mid as credit and risks about 0.6–0.7× that credit to the
+   wing. Netted against the naked seller's +5.7 bps pooled, the fly is worth
+   on the order of +2 to +3 bps of spot on SPY (about $15–25 per contract)
+   and +1 to +2 bps on SPX (about $100–120 per contract) before commissions.
+   Thin and positive, and most of it is the unconditional premium.
+5. **What changed in the branch because of it.** The sweep gained
+   `gated/afternoon` and `twin/tail_only_afternoon` (entries 12:30–14:00 ET,
+   held to 15:40), the pre-screen gained a 14:30 slot, and the default
+   10:30–13:30 window stays as the designers set it so the screen can show
+   the morning entries losing on their own.
+
+What G does not say: nothing here is out of sample for the bot screen, the
+"both legs two-sided" rule drops the sessions with no clean ATM quote in the
+ten minutes before the slot (52 kept of about 63 with cash bars, per symbol),
+and the gamma sign is the sign at entry, not the top quartile the bot gates
+on. The screen's `twin/tail_only` row against `gated/default`, and
+the afternoon pair against each other, are the next reading.
