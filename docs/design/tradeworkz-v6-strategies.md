@@ -243,7 +243,7 @@ v4/v5 fetcher contract. Every existing bot ignores them.
 | Snapshot field | Source | Fetcher | Note |
 |---|---|---|---|
 | `atm_strike_front`, `atm_straddle_mid_front`, `atm_straddle_bid_front`, `atm_iv_front` | `option_chains` → `option_chains_archive` fallback, front (same-day) expiration, nearest two-sided strike, 10-minute lookback | `fetch_atm_front_quote` | The implied side of every v6 gate. Mid is the market's price for the remaining move; bid is what a seller keeps before slippage. |
-| `forecast_implied_move`, `forecast_expected_vol_ratio`, `forecast_expected_vol_state`, `forecast_vix_z`, `forecast_is_event_day` | `daily_forecast` row for the session date with `open_ts <= as_of` | `fetch_daily_forecast` | Immutable once committed at 08:30 ET; a replayed 08:00 tick does not see it. **The writer defaults to SPY only** — QQQ/SPX read None unless the forecast runs for them, and forecast-gated bots abstain there honestly. |
+| `forecast_implied_move`, `forecast_expected_vol_ratio`, `forecast_expected_vol_state`, `forecast_vix_z`, `forecast_is_event_day` | `daily_forecast` row for the session date with `open_ts <= as_of` | `fetch_daily_forecast` | Immutable once committed at 08:30 ET; a replayed 08:00 tick does not see it. The writer covers SPY, QQQ, SPX and NDX in production (pre-screen section B: ~60 graded days each); a symbol without a forecast reads None and its forecast gates stand aside. |
 | `atm_iv_pctile_60d` | `daily_atm_iv`, trading dates strictly before today | `fetch_atm_iv_history` + `_percentile_rank` | Today's row is rewritten all day, so only prior (frozen) days are ranked against. Needs 20 observations. **Diagnostic only until the live chain IV and the daily table's IV are shown to be on one convention.** |
 | `cash_open`, `cash_high`, `cash_low`, `first_half_hour_close` | `underlying_quotes` from the 09:30 ET cash open (09:31 for a cash index) | `fetch_cash_session_bars` | The existing `session_*` fields span the trailing 24 hours and include the pre-market. |
 
@@ -423,7 +423,6 @@ this branch and run in seconds to a minute.
   with deferring it until the 0DTE fly has a first screen, so the two are not
   confounded.
 - `vanna_vol_crush_rider` is still blocked by `VIX_BARS_RETENTION_DAYS=30`.
-  Raising it is a config change, not a code change.
-- Forecast coverage for QQQ and SPX: the morning writer runs for SPY by
-  default. Enabling it for the other two symbols would make the forecast
-  gates and `expected_remaining_move()` available fleet-wide.
+  Raising it is a config change, not a code change. The pre-screen no longer
+  depends on it: sections E and F scale by the prior session's `daily_atm_iv`
+  (115+ sessions per symbol) after the first run came back with 29 sessions.

@@ -43,15 +43,15 @@ ORDER BY 1, 2;
 
 \echo
 \echo ============================================================
-\echo  B. Does the morning forecast's expected_vol_ratio predict the day?
+\echo  B. Does the morning forecast expected_vol_ratio predict the day?
 \echo ============================================================
 \echo  The compression-forecast gate assumes the graded daily_forecast rows
 \echo  carry skill. Spearman rho between the committed expected_vol_ratio and
-\echo  the receipt's realized_vol_ratio, per symbol, plus the bucket hit rate
+\echo  the realized_vol_ratio on the graded receipt, per symbol, plus the hit rate
 \echo  and mean realized ratio on committed-compression days vs the rest.
 \echo  rho near 0 => the forecast gate is noise; run only the ungated control.
 \echo  A symbol with no rows here has no forecast => its forecast-gated bots
-\echo  abstain on that symbol (the writer defaults to SPY only).
+\echo  abstain on that symbol (the writer covers SPY, QQQ, SPX and NDX).
 \echo
 
 WITH graded AS (
@@ -133,14 +133,15 @@ ORDER BY underlying;
 \echo ============================================================
 \echo  The hedging_demand_close_momentum hypothesis before any option is
 \echo  priced: on sessions where the 09:30 -> 15:00 cash return is at least
-\echo  half the VIX-implied daily sigma, how often does 15:00 -> 15:55 go the
-\echo  same way, and how many bps does it travel in the day's direction? Split
+\echo  half the daily sigma implied by the prior-session ATM IV (daily_atm_iv,
+\echo  ~115 sessions per symbol; vix_bars keeps ~30 days and would clamp the
+\echo  window), how often does 15:00 -> 15:55 go the
+\echo  same way, and how many bps does it travel in the direction of the day? Split
 \echo  by the dealer-gamma sign at 15:00. Baltussen et al. say the short-gamma
 \echo  row should carry the effect and the long-gamma row should not; if the
 \echo  short-gamma continuation share is not clearly above 50% here, the bot
 \echo  screen cannot rescue it. Index symbols open on their 09:31 bar (the
-\echo  09:30 print is stale). QQQ is scaled with VIX rather than VXN here,
-\echo  which only shifts how many of its sessions qualify.
+\echo  09:30 print is stale). Each symbol is scaled by its own ATM IV.
 \echo
 
 WITH bars AS (
@@ -179,26 +180,28 @@ gamma_1500 AS (
     WHERE et BETWEEN '14:00' AND '15:00' AND net_gex_at_spot IS NOT NULL
     ORDER BY underlying, sess, timestamp DESC
 ),
-vix_1500 AS (
-    SELECT DISTINCT ON (sess) sess, close AS vix
-    FROM (SELECT close, timestamp,
-                 (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
-                 (timestamp AT TIME ZONE 'America/New_York')::time AS et
-          FROM vix_bars WHERE timestamp >= NOW() - INTERVAL '95 days') v
-    WHERE et BETWEEN '14:00' AND '15:00'
-    ORDER BY sess, timestamp DESC
+iv_scale AS (
+    -- the prior session's ATM IV per symbol, as a daily 1-sigma fraction
+    SELECT o.symbol, o.sess, d.atm_call_iv / SQRT(252) AS implied_daily
+    FROM opens o
+    JOIN LATERAL (
+        SELECT atm_call_iv FROM daily_atm_iv
+        WHERE underlying = o.symbol AND trading_date < o.sess AND atm_call_iv > 0
+        ORDER BY trading_date DESC
+        LIMIT 1
+    ) d ON TRUE
 ),
 sessions AS (
     SELECT o.symbol, o.sess,
            a.px_1500 / o.px_open - 1 AS day_ret,
            c.px_1555 / a.px_1500 - 1 AS last_ret,
-           v.vix / 100.0 / SQRT(252) AS implied_daily,
+           v.implied_daily,
            g.net_gex_at_spot
     FROM opens o
     JOIN at_1500 a USING (symbol, sess)
     JOIN at_1555 c USING (symbol, sess)
     JOIN gamma_1500 g USING (symbol, sess)
-    JOIN vix_1500 v USING (sess)
+    JOIN iv_scale v USING (symbol, sess)
 ),
 qualifying AS (
     SELECT *, SIGN(day_ret) * last_ret AS last_ret_in_day_direction
@@ -220,10 +223,14 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo ============================================================
 \echo  F. Does positive gamma compress the realized day, on this tape?
 \echo ============================================================
-\echo  The fly's thesis in one table: the cash session's high-low range as a
-\echo  multiple of a NORMAL day's range (sqrt(8/pi) x the VIX-implied 1-sigma
-\echo  move at the open), split by the dealer-gamma sign at 12:00 ET. Barbon
-\echo  and Buraschi and this platform's own excursion studies say the
+\echo  The fly thesis in one table: the cash-session high-low range as a
+\echo  multiple of a NORMAL range (sqrt(8/pi) x the 1-sigma daily move implied
+\echo  by the prior-session ATM IV), split by the dealer-gamma sign at 12:00 ET.
+\echo  The LEVEL sits well under 1 on every row: the cash range excludes the
+\echo  overnight gap and implied vol carries a premium, so read the long-gamma
+\echo  row against the short-gamma row, not against 1. pm_ratio is the same
+\echo  for the 12:00-16:00 range alone, which is what the fly is exposed to. Barbon
+\echo  and Buraschi and the excursion studies on this platform say the
 \echo  long-gamma rows should sit lower. The compression share (<= 0.85) is
 \echo  roughly the fraction of sessions on which an ATM straddle sold at the
 \echo  open would have been paid; midday entries see less of the range.
@@ -245,7 +252,9 @@ opens AS (
     ORDER BY symbol, sess, timestamp
 ),
 ranges AS (
-    SELECT symbol, sess, MAX(high) - MIN(low) AS day_range
+    SELECT symbol, sess,
+           MAX(high) - MIN(low) AS day_range,
+           MAX(high) FILTER (WHERE et >= '12:00') - MIN(low) FILTER (WHERE et >= '12:00') AS pm_range
     FROM bars WHERE et BETWEEN '09:30' AND '16:00'
     GROUP BY symbol, sess
 ),
@@ -260,27 +269,32 @@ gamma_1200 AS (
     WHERE et BETWEEN '11:00' AND '12:00' AND net_gex_at_spot IS NOT NULL
     ORDER BY underlying, sess, timestamp DESC
 ),
-vix_open AS (
-    SELECT DISTINCT ON (sess) sess, close AS vix
-    FROM (SELECT close, timestamp,
-                 (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
-                 (timestamp AT TIME ZONE 'America/New_York')::time AS et
-          FROM vix_bars WHERE timestamp >= NOW() - INTERVAL '95 days') v
-    WHERE et BETWEEN '09:30' AND '09:45'
-    ORDER BY sess, timestamp
+iv_scale AS (
+    -- the prior session's ATM IV per symbol, as a daily 1-sigma fraction
+    SELECT o.symbol, o.sess, d.atm_call_iv / SQRT(252) AS implied_daily
+    FROM opens o
+    JOIN LATERAL (
+        SELECT atm_call_iv FROM daily_atm_iv
+        WHERE underlying = o.symbol AND trading_date < o.sess AND atm_call_iv > 0
+        ORDER BY trading_date DESC
+        LIMIT 1
+    ) d ON TRUE
 ),
 ratios AS (
     SELECT o.symbol, o.sess, g.net_gex_at_spot,
-           r.day_range / (o.px_open * v.vix / 100.0 / SQRT(252) * SQRT(8.0 / PI())) AS realized_over_normal
+           r.day_range / (o.px_open * v.implied_daily * SQRT(8.0 / PI())) AS realized_over_normal,
+           r.pm_range / (o.px_open * v.implied_daily * SQRT(8.0 / PI())) AS pm_over_normal
     FROM opens o
     JOIN ranges r USING (symbol, sess)
     JOIN gamma_1200 g USING (symbol, sess)
-    JOIN vix_open v USING (sess)
+    JOIN iv_scale v USING (symbol, sess)
 )
 SELECT symbol,
        CASE WHEN net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END AS gamma_at_1200,
        COUNT(*) AS sessions,
        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_over_normal::float8)::numeric, 3) AS median_ratio,
+       ROUND(AVG(realized_over_normal)::numeric, 3) AS mean_ratio,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pm_over_normal::float8)::numeric, 3) AS median_pm_ratio,
        ROUND(100.0 * AVG((realized_over_normal <= 0.85)::int), 1) AS compression_pct,
        ROUND(100.0 * AVG((realized_over_normal >= 1.15)::int), 1) AS expansion_pct
 FROM ratios
@@ -291,7 +305,7 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo ============================================================
 \echo  G. What the ATM straddle charged vs what the tape paid (measure first)
 \echo ============================================================
-\echo  The fly's P&L before any bot runs. At 10:30, 12:00 and 13:30 ET, the
+\echo  The fly P&L before any bot runs. At 10:30, 12:00, 13:30 and 14:30 ET, the
 \echo  0DTE strike nearest spot with two-sided quotes on both legs, straddle
 \echo  mid (and bid, which is what the harness sells at) against the move it
 \echo  settled into, |px_1555 - strike|. Split by the dealer-gamma sign in the
@@ -300,15 +314,15 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo  0.85-0.90. The gamma gate earns its place only if the long-gamma row
 \echo  sits at least 0.10 below the all-sessions row at the same slot. If it
 \echo  does not, the tape-only twin is the trade to screen and the regime gate
-\echo  is a diagnostic. seller_bps_of_spot is the naked seller's mean gross
-\echo  result at the straddle bid, in bps of spot, before the wings' cost: a
+\echo  is a diagnostic. seller_bps_of_spot is the mean gross result of the naked
+\echo  seller at the straddle bid, in bps of spot, before the cost of the wings: a
 \echo  row that is already negative here cannot be rescued by exits.
 \echo  Chains are read hot UNION archive; a slot with few sessions means the
 \echo  0DTE chain was not captured in the ten minutes before it.
 \echo
 
 WITH slots AS (
-    SELECT unnest(ARRAY['10:30', '12:00', '13:30']::time[]) AS slot
+    SELECT unnest(ARRAY['10:30', '12:00', '13:30', '14:30']::time[]) AS slot
 ),
 bars AS (
     SELECT symbol, timestamp, close,
@@ -355,7 +369,8 @@ chain AS (
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
-                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30')
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')
           UNION ALL
           SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
           FROM option_chains_archive
@@ -364,7 +379,8 @@ chain AS (
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
-                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30')) c
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')) c
     JOIN spot_at sp
       ON sp.symbol = c.underlying
      AND sp.sess = (c.timestamp AT TIME ZONE 'America/New_York')::date

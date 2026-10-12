@@ -472,6 +472,14 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
     cls = get_bot_class(base.strategy_class)
     assert cls(by["twin/clock_only"], ml_state=None).open_criteria(busy) is not None
     assert cls(by["gated/default"], ml_state=None).open_criteria(busy) is None
+    # The afternoon arms (first pre-screen, section G): entries 12:30-14:00
+    # ET only, gated and tape-only, so a 12:00 ET setup is a window miss there.
+    assert by["gated/afternoon"].params["min_minutes_since_open"] == 180
+    assert by["twin/tail_only_afternoon"].params["required_regimes"] == "any"
+    pm = cls(by["gated/afternoon"], ml_state=None)
+    assert _miss(pm, _snap()) == "window"
+    at_1300 = _snap(timestamp=datetime(2026, 8, 6, 17, 0, tzinfo=timezone.utc))
+    assert pm.open_criteria(at_1300) is not None, pm.miss_reasons
     # Every config keeps the shared defaults it did not override.
     assert all(s.params["credit_stop_mult"] in (0.5, 0) for s in specs)
     assert all(s.params["premium_stop_grace_seconds"] == 600 for s in specs)
