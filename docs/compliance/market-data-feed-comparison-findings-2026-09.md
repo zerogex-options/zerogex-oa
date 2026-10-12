@@ -649,6 +649,39 @@ across two collections.
 *Added 2026-10-09. The measurement that resolved F11's open question, and
 split the answer by symbol.*
 
+> **CORRECTED 2026-10-12 — this measured the MORNING, not the session.** The
+> `shadow-compare-flow` target converted the ET cash session to UTC with
+> `TZ=America/New_York date -d "$D 09:30" -u`. GNU date's `-u` sets `TZ=UTC0`
+> for the whole operation, the parse of `-d` included, so the prefix was ignored
+> and 09:30 ET came out as 09:30Z. The window queried was 09:30Z–16:00Z, which
+> is 05:30–12:00 ET — the right six-and-a-half-hour duration in the wrong place.
+> Data starts at 09:30 ET, so the window that actually bit was **09:30–12:00 ET**:
+> 150 one-minute buckets per symbol out of 390.
+>
+> It read as healthy coverage because nothing stated what complete would be.
+> "600 of 610 buckets" is 4 symbols × 150, not 4 × 390. A span check would not
+> have caught it either; the bad window really was 390 minutes long.
+>
+> **What survives.** Every figure below is a like-for-like comparison of the two
+> databases over the same 150 minutes, so the internal findings — no systematic
+> bias, flips concentrated near zero, the split by symbol — stand as stated for
+> the morning. F14 truncated identically, so F12 and F14 remain comparable to
+> each other.
+>
+> **What does not.** Every "share of session imbalance" below is the MORNING's
+> share. Read "session" as "morning" throughout this finding.
+>
+> **What is now untested.** 12:00–16:00 ET has never been measured on any arm.
+> That is not a neutral gap: 0DTE flow concentrates into the afternoon and the
+> close, so the unmeasured half is the half where the method change plausibly
+> matters most. Both days' rows are still in the rehearsal database, so both
+> arms can be re-measured over the full session without waiting for a new
+> market day.
+>
+> Fixed in the target, with the computed bound converted back to ET and checked
+> before any query runs, and the report now prints the window span alongside the
+> bucket count.
+
 ### What was open
 
 F11 settled the FEED and left the METHOD. Measured on 230-contract snapshots,
@@ -671,15 +704,16 @@ judgement and must be called as such rather than forced.
 ### What was measured
 
 TradeStation on both sides, `FLOW_CLASSIFIER=quote` in production and `tick`
-in the rehearsal DB. 2026-10-09 full session, 09:30–16:00 ET. Coverage 150 of
-155 SPY buckets and 600 of 610 overall, no rehearsal-only buckets.
+in the rehearsal DB. 2026-10-09, **09:30–12:00 ET** — recorded at the time as
+the full session; see the correction above. Coverage 150 of 155 SPY buckets and
+600 of 610 overall within that window, no rehearsal-only buckets.
 
 | | all symbols | SPY |
 |---|---|---|
 | net imbalance sign agrees | **71.2%** (427/600) | **76.7%** (115/150) |
 | rehearsal net higher | 286 of 600 (47.7%) | 63 of 150 (42%) |
 | mean \|difference\| vs mean \|production net\| | 1,199 / 1,607 = 75% | 2,420 / 3,227 = 75% |
-| **share of session imbalance in flipped buckets** | **14.7%** | **15.8%** |
+| **share of MORNING imbalance in flipped buckets** | **14.7%** | **15.8%** |
 
 **It landed between, and was called between.** Bucketing roughly halves the
 disagreement, from 59% to 23–29%, but does not remove it.
@@ -691,7 +725,7 @@ the single most reassuring number in this finding.
 
 **The flip RATE overstated the impact.** 95 of 173 flips landed on below-median
 buckets where the site read "roughly balanced" either way, so 85% of the
-session's total imbalance sits in buckets both methods agree on.
+morning's total imbalance sits in buckets both methods agree on.
 
 ### The finding that actually matters: it splits by symbol
 
@@ -737,11 +771,16 @@ until a session with the guard on is compared against one with it off.
 
 ### What this does not cover
 
-One session, one day, no OPEX. The published SIGNAL was not compared —
-`shadow-run` runs ingestion without analytics, so this is the input to
-`order_flow_imbalance` and `tape_flow_bias`. The transform is deterministic, so
-matching inputs mean matching outputs, but if a later session differs
-materially the next step is pointing analytics at the rehearsal DB.
+**The afternoon.** Half of one day, 09:30–12:00 ET — see the correction at the
+top. 12:00–16:00 has never been measured on any arm, and 0DTE flow concentrates
+into the close, so the untested half is where the method change plausibly
+matters most. Re-measurable from rows already in the rehearsal database.
+
+One day, no OPEX. The published SIGNAL was not compared — `shadow-run` runs
+ingestion without analytics, so this is the input to `order_flow_imbalance` and
+`tape_flow_bias`. The transform is deterministic, so matching inputs mean
+matching outputs, but if a later session differs materially the next step is
+pointing analytics at the rehearsal DB.
 
 ---
 
@@ -843,6 +882,104 @@ one starts.
 
 ---
 
+## F14 — changing the feed on top of the method costs SPY, and only SPY
+
+*Added 2026-10-12. Arm C: ThetaData Market Value + tick test, against
+production. Morning only — see the window caveat below.*
+
+### What was open
+
+F12 isolated the METHOD (TradeStation on both sides, quote vs tick). F11 said
+the FEED contributes nothing detectable under the tick test: cross-feed
+disagreement 4.22% against a 5.60% self-variance floor, measured on snapshots.
+Arm C changes both at once, which is what a cutover actually does, and tests
+whether F11's snapshot result holds at the aggregation the site publishes.
+
+**Pre-registered**, from F12: if arm C lands close to arm B, the feed adds
+nothing at bucket level and F11 is confirmed. If it is markedly worse, that is
+new information about the feed and must not be explained away.
+
+### Window caveat, stated before the numbers
+
+Measured 2026-10-12 **09:30–12:00 ET**, not the full session, for the reason
+recorded in the correction at the top of F12. Arm B truncated identically, so
+**arm B and arm C remain comparable to each other** — which is what this
+finding rests on. The afternoon is unmeasured on both.
+
+### Coverage
+
+450 buckets in both, 153 production-only, 2 rehearsal-only. The 153 is NDX:
+production has it, the rehearsal cannot (F13), and the per-symbol table reads
+`NDX (no overlapping buckets)`. Net of NDX the coverage is 3 symbols × 150 with
+essentially nothing missing. **No integration failure** — this was the first
+time ThetaData went through the production write path, and it held.
+
+Option volume agrees closely where it matters: SPY 7,586,256 against
+production's 7,580,891; QQQ 5,313,683 against 5,324,166. The rehearsal wrote
+8.7% fewer SPY rows and 9.5% fewer QQQ rows for near-identical volume, i.e. it
+polled less densely — see the confound below.
+
+### What was measured
+
+| | arm B (2026-10-09, feed held) | arm C (2026-10-12, feed changed) |
+|---|---|---|
+| sign agrees, all symbols | 71.2% | **70.7%** |
+| share of morning imbalance flipped, all | 14.7% | **25.2%** |
+| QQQ sign agrees / share flipped | 78.0% / 8.8% | **80.0% / 11.9%** |
+| SPX sign agrees / share flipped | 68.0% / 22.2% | **67.3% / 23.3%** |
+| SPY sign agrees / share flipped | 76.7% / 15.8% | **64.7% / 34.5%** |
+
+**Overall sign agreement is unchanged: 70.7% against 71.2%.** On that measure
+F11 holds exactly — the feed adds nothing.
+
+**But the decision number more than doubled on SPY**, 15.8% to 34.5%, with sign
+agreement down 12 points. QQQ and SPX moved by about a point each, which is
+noise at one session per arm. The whole of the overall degradation is SPY.
+
+That is the opposite of the expected shape. SPY is the most liquid symbol here
+and prints most often, so it should be the LEAST exposed to a tick test; F12's
+own prediction was that thinner symbols fare worse. A degradation concentrated
+on the thickest symbol does not fit the carried-direction story, and must not
+be filed under it.
+
+SPY's flips also sit on big buckets: 16 near-zero, 21 typical, **16 large** of
+53 — against arm B's distribution, where flips clustered below the median. The
+10:12 ET bucket went −42,437 in production to +26,543 in the rehearsal.
+
+### The confound to rule out first, before concluding anything about the feed
+
+The rehearsal polled SPY 8.7% less densely than production for the same volume.
+Fewer polls mean larger per-delta volume chunks and fewer distinct trade prices,
+and the tick test reads a SEQUENCE of prices — so sparser polling leaves more
+zero ticks inheriting a carried direction. That is a plausible mechanism for
+exactly this degradation, and it is a property of the RUN, not of the feed.
+
+Arm B's row counts were not recorded, so it cannot be said from here whether
+arm B polled at production density or was equally sparse. **That is the first
+thing to check**, and it is checkable from rows already in the rehearsal
+database — no new market day required. Until it is checked, this finding does
+not establish that the feed is responsible.
+
+Either way, the pre-registered rule is not satisfied for SPY: a third of the
+morning's published flow pointing the other way is not cosmetic, whatever the
+cause.
+
+### Status
+
+- Overall sign agreement: F11 confirmed at bucket level.
+- SPY: open. A doubled share-of-flow on the most liquid symbol, cause not
+  established, polling density the leading candidate.
+- QQQ, SPX: unchanged from arm B.
+- NDX: no data (F13).
+- First end-to-end run of ThetaData through the production write path: clean.
+
+### What this does not cover
+
+The afternoon, on any arm. One session per arm. No OPEX. The published signal,
+as in F12.
+
+---
+
 ## Findings that turned out not to be about the feed
 
 Recorded because each cost investigation time and each looked like a vendor problem first.
@@ -935,6 +1072,20 @@ afterwards and append the result here rather than holding the cutover for it.
   failed IV solve against a 0.20 fallback without writing it back, so the contract carries a gamma
   into `_calculate_gex_by_strike` while `_gamma_exposure_profile` skips it on `sigma <= 0`.
   `net_gex` and `gamma_flip` are therefore not always computed over the same chain.
+- **The afternoon has never been measured, on any arm — do this first.** The
+  `shadow-compare-flow` window bug (corrected at the top of F12) meant both F12
+  and F14 covered 09:30–12:00 ET only. 0DTE flow concentrates into the close, so
+  the unmeasured half is where the method change plausibly matters most. Both
+  days' rows are still in the rehearsal database, so re-running the fixed target
+  with `DAY=2026-10-09` and `DAY=2026-10-12` re-measures both arms over the full
+  session with no new market day and no feed connection.
+- **SPY's doubled share-of-flow (F14) — OPEN, cause not established.** 15.8% to
+  34.5% between arm B and arm C, with sign agreement down 12 points, while QQQ
+  and SPX moved about a point. Concentrated on the thickest symbol, which is the
+  opposite of the carried-direction story. Leading candidate is polling density,
+  not the feed: the rehearsal wrote 8.7% fewer SPY rows for the same volume.
+  **Check arm B's row counts before attributing any of this to the feed** —
+  checkable from existing rows.
 - **NDX is unentitled on ThetaData (F13) — OPEN, raised 2026-10-12.** The NASDAQ GIDS index
   level is refused, so there is no NDX spot and therefore no NDX chain. Absent, not degraded.
   The NDX options chain has never been reached, so its entitlement is still unknown. Stacks on
