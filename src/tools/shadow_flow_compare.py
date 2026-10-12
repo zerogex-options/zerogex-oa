@@ -33,6 +33,7 @@ import argparse
 import os
 import statistics as st
 import sys
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.utils import get_logger
@@ -249,7 +250,27 @@ def fetch(db_name: str, params: Dict[str, Any]) -> List[Tuple[Any, Any, int, int
         conn.close()
 
 
-def _print_report(result: Dict[str, Any], prod_db: str, shadow_db: str, verbose: bool) -> None:
+def _window_minutes(session_start: str, session_end: str) -> Optional[int]:
+    """Minutes the requested window spans, or None if either bound won't parse.
+
+    Only used to say what full coverage WOULD be. A diagnostic never fails
+    the comparison, so an unparseable bound just omits the line.
+    """
+    try:
+        start = datetime.fromisoformat(session_start.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(session_end.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return max(int((end - start).total_seconds() // 60), 0)
+
+
+def _print_report(
+    result: Dict[str, Any],
+    prod_db: str,
+    shadow_db: str,
+    verbose: bool,
+    window_minutes: Optional[int] = None,
+) -> None:
     print("\n=== PUBLISHED FLOW, per one-minute bucket ===")
     print(f"  production: {prod_db}   rehearsal: {shadow_db}")
 
@@ -265,6 +286,15 @@ def _print_report(result: Dict[str, Any], prod_db: str, shadow_db: str, verbose:
         return
 
     print(f"\n  buckets in both           {n}")
+    if window_minutes:
+        # A window that silently covered a fraction of the session read as
+        # healthy coverage for two sessions (the 2026-10-12 ET-to-UTC bug),
+        # because nothing stated what complete looked like. State it.
+        symbols = max(len({r["underlying"] for r in result["rows"]}), 1)
+        print(
+            f"  window                    {window_minutes} minutes"
+            f"  -> up to {window_minutes * symbols} buckets across {symbols} symbol(s)"
+        )
     if result["production_only"] or result["shadow_only"]:
         print(
             f"  production-only           {result['production_only']}   "
@@ -345,7 +375,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     _print_report(
-        compare_buckets(production, shadow), args.production_db, args.shadow_db, args.verbose
+        compare_buckets(production, shadow),
+        args.production_db,
+        args.shadow_db,
+        args.verbose,
+        _window_minutes(args.session_start, args.session_end),
     )
 
     per_symbol = compare_by_underlying(production, shadow)

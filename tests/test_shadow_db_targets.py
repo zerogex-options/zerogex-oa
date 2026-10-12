@@ -419,3 +419,59 @@ def test_shadow_compare_counts_flat_volatility_candles():
     assert (
         "COUNT(*) FILTER (WHERE open = high AND high = low AND low = close) AS flat" in body
     ), "nothing counts flat candles, so a flattened accumulation reads as healthy"
+
+
+# --- shadow-compare-flow's session window ----------------------------------
+#
+# `TZ=America/New_York date -d "$D 09:30" -u` does NOT convert ET to UTC. GNU
+# date's `-u` sets TZ=UTC0 for the whole operation, the parse of `-d` included,
+# so the prefix is ignored and 09:30 ET comes out as 09:30Z. The target queried
+# 09:30Z-16:00Z, which is 05:30-12:00 ET -- the right six-and-a-half-hour
+# DURATION in the wrong PLACE, so no span check would have caught it. Two
+# sessions (2026-10-09 and 2026-10-12) were measured and written up over the
+# morning alone before anyone noticed.
+#
+# The working idiom is the embedded one, which bin/futures-feed-logs.sh already
+# uses: date -d 'TZ="America/New_York" <date> <time>' -u
+
+
+def test_compare_flow_converts_et_to_utc_with_the_embedded_tz():
+    body = _recipe("shadow-compare-flow")
+    assert 'date -d "TZ=\\"America/New_York\\"' in body, (
+        "shadow-compare-flow must put the zone INSIDE the -d argument; a "
+        "TZ= prefix is overridden by -u and the window is never converted"
+    )
+
+
+def test_compare_flow_never_puts_tz_before_a_date_that_takes_dash_u():
+    """The exact shape of the bug, pinned so it cannot come back."""
+    body = _recipe("shadow-compare-flow")
+    offenders = re.findall(r"TZ=\S+ date -d [^;|]*-u", body)
+    assert not offenders, (
+        f"TZ= prefix on a `date -d ... -u` call: {offenders}. `-u` wins and the "
+        "conversion silently does not happen."
+    )
+
+
+def test_compare_flow_verifies_the_window_round_trips_back_to_et():
+    """A guard, because the bad window looked entirely plausible in the banner.
+
+    It printed a well-formed ISO timestamp and a correct-looking 09:30-16:00
+    label. Converting back and comparing is what distinguishes them.
+    """
+    body = _recipe("shadow-compare-flow")
+    assert (
+        'BACK=$$(TZ=America/New_York date -d "$$START"' in body
+    ), "nothing converts the computed window back to ET to check it"
+    assert '"$$BACK" != "$$D 09:30"' in body
+    assert "exit 1" in body, "a window that did not convert must refuse, not warn"
+
+
+def test_compare_flow_refuses_in_the_same_shell_that_queries():
+    """Same trap as shadow-drop: a guard on its own recipe line exits 0."""
+    lines = _logical_lines("shadow-compare-flow")
+    querying = [ln for ln in lines if "shadow_flow_compare" in ln]
+    assert len(querying) == 1
+    assert (
+        "exit 1" in querying[0]
+    ), "the round-trip guard must be in the same shell as the query it guards"

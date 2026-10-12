@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from src.tools.shadow_flow_compare import bucket_flow_sql, compare_buckets
+from src.tools.shadow_flow_compare import _window_minutes, bucket_flow_sql, compare_buckets
 
 T0 = datetime(2026, 10, 9, 13, 30, tzinfo=timezone.utc)
 
@@ -266,3 +266,94 @@ def test_a_symbol_the_rehearsal_missed_entirely_is_still_listed():
     assert out["QQQ"]["buckets_compared"] == 0
     assert out["QQQ"]["production_only"] == 1
     assert out["QQQ"]["sign_agreement_pct"] is None
+
+
+# --- the session window ----------------------------------------------------
+#
+# On 2026-10-12 the shadow-compare-flow target converted the ET cash session to
+# UTC with `TZ=America/New_York date -d "$D 09:30" -u`. GNU date's `-u` sets
+# TZ=UTC0 for the whole operation, INCLUDING the parse of -d, so the TZ prefix
+# was ignored and 09:30 ET came out as 09:30Z. The queried window was 09:30Z to
+# 16:00Z, which is 05:30-12:00 ET; data starts at 09:30 ET, so the comparison
+# silently covered 09:30-12:00 and reported 150 buckets per symbol out of 390.
+#
+# Two sessions were measured and written up that way before anyone noticed,
+# because 150 buckets with ~0 missing reads as healthy coverage when nothing
+# states what complete would be. These pin the arithmetic that makes it visible.
+
+
+def test_window_minutes_measures_the_full_cash_session():
+    assert _window_minutes("2026-10-12T13:30:00Z", "2026-10-12T20:00:00Z") == 390
+
+
+def test_window_minutes_exposes_the_truncated_window_that_shipped():
+    """The bug's window was a real 390 minutes, so a span check alone is not enough.
+
+    It spanned 09:30Z-16:00Z -- six and a half hours, the right DURATION at the
+    wrong PLACE. What gave it away was 150 buckets against a 390-minute window,
+    which is why the report prints both.
+    """
+    assert _window_minutes("2026-10-12T09:30:00Z", "2026-10-12T16:00:00Z") == 390
+
+
+def test_window_minutes_handles_offsets_and_bare_timestamps():
+    assert _window_minutes("2026-10-12T13:30:00+00:00", "2026-10-12T20:00:00+00:00") == 390
+    assert _window_minutes("2026-11-03T14:30:00Z", "2026-11-03T21:00:00Z") == 390
+
+
+def test_window_minutes_never_goes_negative():
+    assert _window_minutes("2026-10-12T20:00:00Z", "2026-10-12T13:30:00Z") == 0
+
+
+def test_window_minutes_abstains_rather_than_raising():
+    """A diagnostic that throws is worse than one that stays quiet."""
+    assert _window_minutes("not a timestamp", "2026-10-12T20:00:00Z") is None
+    assert _window_minutes(None, None) is None
+
+
+def test_report_states_what_complete_coverage_would_be(capsys):
+    """The missing line. 150 buckets in a 390-minute window must be legible."""
+    from src.tools.shadow_flow_compare import _print_report
+
+    base = datetime(2026, 10, 12, 13, 30, tzinfo=timezone.utc)
+    prod = [("SPY", base + timedelta(minutes=i), 1000, 1000) for i in range(150)]
+    _print_report(
+        compare_buckets(prod, list(prod)),
+        "zerogexdb",
+        "zerogex_shadow",
+        verbose=False,
+        window_minutes=390,
+    )
+    out = capsys.readouterr().out
+    assert "buckets in both           150" in out
+    assert "390 minutes" in out, "the report does not say how long the window was"
+    assert "up to 390 buckets" in out, "the report does not say what complete would be"
+
+
+def test_report_scales_expected_buckets_by_symbol_count(capsys):
+    from src.tools.shadow_flow_compare import _print_report
+
+    base = datetime(2026, 10, 12, 13, 30, tzinfo=timezone.utc)
+    prod = [
+        (sym, base + timedelta(minutes=i), 1000, 1000)
+        for sym in ("SPY", "QQQ", "SPX")
+        for i in range(150)
+    ]
+    _print_report(
+        compare_buckets(prod, list(prod)),
+        "zerogexdb",
+        "zerogex_shadow",
+        verbose=False,
+        window_minutes=390,
+    )
+    out = capsys.readouterr().out
+    assert "up to 1170 buckets across 3 symbol(s)" in out
+
+
+def test_report_omits_the_window_line_when_it_is_unknown(capsys):
+    from src.tools.shadow_flow_compare import _print_report
+
+    base = datetime(2026, 10, 12, 13, 30, tzinfo=timezone.utc)
+    prod = [("SPY", base + timedelta(minutes=i), 1000, 1000) for i in range(10)]
+    _print_report(compare_buckets(prod, list(prod)), "zerogexdb", "zerogex_shadow", verbose=False)
+    assert "minutes" not in capsys.readouterr().out

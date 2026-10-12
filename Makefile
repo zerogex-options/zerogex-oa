@@ -3781,8 +3781,14 @@ shadow-compare-flow: shadow-guard ## Diff the PUBLISHED flow figure per minute: 
 	@echo "$(YELLOW)not the rendered signal -- shadow-run runs ingestion only.$(NC)"
 	@echo ""
 	@D=$${DAY:-$$(TZ=America/New_York date +%F)}; \
-		START=$$(TZ=America/New_York date -d "$$D 09:30" -u +%Y-%m-%dT%H:%M:%SZ); \
-		END=$$(TZ=America/New_York date -d "$$D 16:00" -u +%Y-%m-%dT%H:%M:%SZ); \
+		START=$$(date -d "TZ=\"America/New_York\" $$D 09:30" -u +%Y-%m-%dT%H:%M:%SZ); \
+		END=$$(date -d "TZ=\"America/New_York\" $$D 16:00" -u +%Y-%m-%dT%H:%M:%SZ); \
+		BACK=$$(TZ=America/New_York date -d "$$START" +"%Y-%m-%d %H:%M"); \
+		if [ "$$BACK" != "$$D 09:30" ]; then \
+			echo "$(RED)❌ Session bounds did not convert: $$START reads back as $$BACK ET, not $$D 09:30.$(NC)"; \
+			echo "$(YELLOW)Refusing to compare a window that is not the ET cash session.$(NC)"; \
+			exit 1; \
+		fi; \
 		echo "ET session $$D 09:30-16:00  ->  $$START .. $$END"; \
 		$(VENV_PYTHON) -m src.tools.shadow_flow_compare \
 			$(if $(DB_NAME),--production-db '$(DB_NAME)') --shadow-db "$(SHADOW_DB)" \
