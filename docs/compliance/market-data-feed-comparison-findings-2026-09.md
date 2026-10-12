@@ -835,6 +835,12 @@ A standing re-check, read for `spot_error` rather than pass/fail:
 PROVIDER=thetadata_mv UNDERLYING='$NDXP.X' make feed-probe
 ```
 
+**Not while a shadow run is up.** The account holds one MDDS connection and a second login
+kicks the first, so probing the candidate feed during a rehearsal on that same feed ends the
+rehearsal. This is also why the cutover gate below cannot be a same-day check: the
+per-symbol probes have to run on a day with no rehearsal holding the connection, or before
+one starts.
+
 ---
 
 ## Findings that turned out not to be about the feed
@@ -937,7 +943,9 @@ afterwards and append the result here rather than holding the cutover for it.
   passes `spot_hint=incumbent.spot` as a deliberate control, so it can never ask the candidate for
   an index level. `feed-probe` can, and did on 2026-09-25 — seventeen days before F13 surfaced in
   ingestion — and the finding went into a harness comment instead of into this document. Before
-  cutover: one `feed-probe` per production symbol on the candidate feed, read for `spot_error`.
+  cutover: one `feed-probe` per production symbol on the candidate feed, read for `spot_error`
+  — on a day with no rehearsal running, since the single MDDS connection makes the two
+  mutually exclusive.
 - **F9's licensing question** — **RESOLVED 2026-10-07, against us.** Raw NBBO as an internal
   input is non-display use under OPRA, outside the Market Value exemption, and fee-bearing.
   `option_snapshot_quote` stays unwired and `_endpoint()`'s refusal is permanent. No longer a
