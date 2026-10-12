@@ -202,6 +202,7 @@ def _bare_option_acc():
     acc._chunks = [["SPY"]]
     acc._current_responses = [None]
     acc._response_lock = threading.Lock()
+    acc._connection_opened_at = {}
     acc._connected = threading.Event()
     acc._state = {}
     acc._lock = threading.Lock()

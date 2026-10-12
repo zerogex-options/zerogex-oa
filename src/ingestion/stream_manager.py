@@ -123,6 +123,28 @@ def _stream_reconnect_delay(consecutive_failures: int) -> float:
     return base + random.uniform(0, base * 0.1)
 
 
+def _stream_stayed_healthy(opened_at: Optional[float], attempt_started: float) -> bool:
+    """True when this attempt's connection opened and stayed up long enough
+    to count as healthy (``_STREAM_RECONNECT_HEALTHY_SECONDS``).
+
+    TradeStation ends long-lived streams by cutting them mid-chunk
+    ("Response ended prematurely"), which surfaces as an exception rather
+    than a clean return, so the reader loops need this on the exception path
+    too or the failure count climbs all session and every routine drop pays
+    the full backoff cap.
+
+    Measured from when the stream opened, not from when the attempt began, so
+    a connect that hangs until its timeout is not mistaken for a healthy
+    stream; ``opened_at`` older than ``attempt_started`` belongs to an earlier
+    attempt and is ignored.
+    """
+    return (
+        opened_at is not None
+        and opened_at >= attempt_started
+        and time.monotonic() - opened_at >= _STREAM_RECONNECT_HEALTHY_SECONDS
+    )
+
+
 def _sleep_interruptible(seconds: float, is_running) -> None:
     """Sleep up to ``seconds`` but return early once ``is_running()`` is False.
 
@@ -495,6 +517,10 @@ class OptionStreamAccumulator:
         ] or [[]]
         self._threads: List[threading.Thread] = []
         self._current_responses: List[Optional[Any]] = []
+        # Monotonic time each chunk's current connection opened; the reader
+        # loop uses it to tell a healthy stream that dropped from a streak of
+        # failed attempts (see _stream_stayed_healthy).
+        self._connection_opened_at: Dict[int, float] = {}
         self._response_lock = threading.Lock()
         self._updates_received: int = 0
         self._connected = threading.Event()
@@ -732,6 +758,8 @@ class OptionStreamAccumulator:
                     _sleep_interruptible(e.delay, lambda: self._running)
             except Exception as e:
                 if self._running:
+                    if _stream_stayed_healthy(self._connection_opened_at.get(chunk_idx), started):
+                        consecutive_failures = 0
                     consecutive_failures += 1
                     delay = _stream_reconnect_delay(consecutive_failures)
                     logger.warning(
@@ -809,6 +837,7 @@ class OptionStreamAccumulator:
         # loudly when we see it so it isn't lost in the generic
         # "disconnected (Response ended prematurely)" noise.
         connection_open_mono = time.monotonic()
+        self._connection_opened_at[chunk_idx] = connection_open_mono
 
         with self._response_lock:
             self._current_responses[chunk_idx] = response
@@ -1029,6 +1058,8 @@ class UnderlyingBarAccumulator:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._current_response = None
+        # See OptionStreamAccumulator._connection_opened_at.
+        self._connection_opened_at: Optional[float] = None
         self._response_lock = threading.Lock()
         self._connected = threading.Event()
         self._updates_received: int = 0
@@ -1113,6 +1144,8 @@ class UnderlyingBarAccumulator:
                     _sleep_interruptible(e.delay, lambda: self._running)
             except Exception as e:
                 if self._running:
+                    if _stream_stayed_healthy(self._connection_opened_at, started):
+                        consecutive_failures = 0
                     consecutive_failures += 1
                     delay = _stream_reconnect_delay(consecutive_failures)
                     logger.warning(
@@ -1180,6 +1213,7 @@ class UnderlyingBarAccumulator:
         # network hiccup. Track open time so the finally block can emit a
         # dedicated cap-exhaustion warning that names the symptom.
         connection_open_mono = time.monotonic()
+        self._connection_opened_at = connection_open_mono
 
         with self._response_lock:
             self._current_response = response

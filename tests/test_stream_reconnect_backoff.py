@@ -13,6 +13,9 @@
 """
 
 import threading
+import types
+
+import requests
 
 import src.ingestion.stream_manager as sm
 from src.ingestion.stream_manager import (
@@ -191,3 +194,137 @@ def test_reader_loop_honors_rate_limit_delay(monkeypatch):
     # First (and only) sleep is the rate-limit delay, not an exponential
     # backoff value (2.x with jitter).
     assert sleeps == [7.5]
+
+
+# --- backoff resets after a healthy stream drops -----------------------------
+#
+# TradeStation ends long-lived streams by cutting them mid-chunk, which
+# requests raises as ChunkedEncodingError("Response ended prematurely") rather
+# than returning cleanly. The prod journal on 2026-10-12 showed one option
+# reader counting 1 -> 2 -> 3 across connections that had each streamed for
+# minutes, so every routine drop was on its way to the 60s cap.
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+
+class _DroppingResponse:
+    """200 OK that streams one line, stays up ``lifetime`` seconds, then is cut."""
+
+    status_code = 200
+    headers = {}
+
+    def __init__(self, clock, lifetime, line):
+        self._clock = clock
+        self._lifetime = lifetime
+        self._line = line
+
+    def raise_for_status(self):
+        pass
+
+    def iter_lines(self, decode_unicode=True):
+        yield self._line
+        self._clock.t += self._lifetime
+        raise requests.exceptions.ChunkedEncodingError("Response ended prematurely")
+
+    def close(self):
+        pass
+
+
+_QUOTE_LINE = '{"Symbol": "SPY 260619C500", "Last": "1.00"}'
+
+
+def _drive(monkeypatch, acc, run_loop, attempts, max_sleeps=3):
+    """Run ``run_loop`` against scripted attempts on a fake clock; return the
+    reconnect delays it chose. Each attempt is a connection lifetime in seconds,
+    or ``("connect_fail", seconds)`` for a connect that fails after hanging."""
+    clock = _Clock()
+    script = iter(attempts)
+
+    def _get(*a, **k):
+        attempt = next(script)
+        if isinstance(attempt, tuple):
+            clock.t += attempt[1]
+            raise requests.exceptions.ConnectionError("connect timed out")
+        line = _QUOTE_LINE if isinstance(acc, OptionStreamAccumulator) else "heartbeat"
+        return _DroppingResponse(clock, attempt, line)
+
+    sleeps = []
+
+    def _sleep(secs, is_running):
+        sleeps.append(secs)
+        if len(sleeps) >= max_sleeps:
+            acc._running = False
+
+    monkeypatch.setattr(
+        sm, "time", types.SimpleNamespace(monotonic=clock.monotonic, sleep=lambda s: None)
+    )
+    monkeypatch.setattr(sm, "_requests", types.SimpleNamespace(get=_get))
+    monkeypatch.setattr(sm, "_sleep_interruptible", _sleep)
+    acc._running = True
+    acc._current_responses = [None]
+    run_loop()
+    return sleeps
+
+
+def _is_first_backoff(delay):
+    base = sm._STREAM_RECONNECT_BASE_SECONDS
+    return base <= delay < base * 1.1 + 1e-9
+
+
+def _escalated(sleeps):
+    """Delays doubled at each step (2, 4, 8 ...), not restarted. Checked by
+    size, not ordering: three jittered first-step delays can sort by chance."""
+    base = sm._STREAM_RECONNECT_BASE_SECONDS
+    return all(d >= base * 2**i for i, d in enumerate(sleeps))
+
+
+def test_option_reader_restarts_backoff_after_each_healthy_stream_drops(monkeypatch):
+    acc = _accumulator()
+    sleeps = _drive(
+        monkeypatch, acc, lambda: acc._reader_loop(0, ["SPY 260619C500"]), [300, 60, 300]
+    )
+    assert len(sleeps) == 3
+    assert all(_is_first_backoff(d) for d in sleeps), sleeps
+
+
+def test_option_reader_still_escalates_on_short_lived_streams(monkeypatch):
+    """Streams that die within seconds (the per-account cap fingerprint) are a
+    real streak and must keep backing off."""
+    acc = _accumulator()
+    sleeps = _drive(monkeypatch, acc, lambda: acc._reader_loop(0, ["SPY 260619C500"]), [5, 5, 5])
+    assert _escalated(sleeps), sleeps
+
+
+def test_option_reader_does_not_count_a_slow_failed_connect_as_healthy(monkeypatch):
+    """A connect that hangs past the healthy threshold and then fails never
+    opened a stream; neither it nor the earlier stream's open time may reset
+    the streak."""
+    acc = _accumulator()
+    slow = sm._STREAM_RECONNECT_HEALTHY_SECONDS + 1
+    sleeps = _drive(
+        monkeypatch,
+        acc,
+        lambda: acc._reader_loop(0, ["SPY 260619C500"]),
+        [300, ("connect_fail", slow), ("connect_fail", slow)],
+    )
+    assert _is_first_backoff(sleeps[0])
+    assert _escalated(sleeps), sleeps
+
+
+def test_underlying_reader_restarts_backoff_after_each_healthy_stream_drops(monkeypatch):
+    acc = sm.UnderlyingBarAccumulator(_FakeClient(), "SPY", "SPY")
+    sleeps = _drive(monkeypatch, acc, acc._reader_loop, [300, 60, 300])
+    assert len(sleeps) == 3
+    assert all(_is_first_backoff(d) for d in sleeps), sleeps
+
+
+def test_underlying_reader_still_escalates_on_short_lived_streams(monkeypatch):
+    acc = sm.UnderlyingBarAccumulator(_FakeClient(), "SPY", "SPY")
+    sleeps = _drive(monkeypatch, acc, acc._reader_loop, [5, 5, 5])
+    assert _escalated(sleeps), sleeps
