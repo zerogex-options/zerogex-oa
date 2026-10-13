@@ -3533,8 +3533,21 @@ shadow-create: shadow-guard ## Create the cutover-rehearsal database and apply s
 # sets these literally, python-dotenv interpolates `$${VAR}`, and the rehearsal
 # has to behave like production rather than like a second loader. Production
 # never saw any of this, because systemd does no expansion.
+#
+# The loader `export`s unconditionally, so it OVERWRITES anything already in
+# the environment: `INGEST_UNDERLYINGS=SPY make shadow-run` is silently
+# ignored and you get .env's full symbol list while believing you narrowed it.
+# SHADOW_UNDERLYINGS exists because of that -- it is applied AFTER the loader,
+# which is the only place it can win, and the banner says so when it is set.
+#
+# Narrowing matters for more than convenience. TradeStation caps concurrent
+# streams per account at nominally 10 and production alone approaches it
+# (docs/design/api-gateway-architecture.md), so a second TradeStation engine
+# on all four symbols doubles the load on a cap whose exhaustion is not
+# header-observable and whose symptom is a stream that dies inside 30s --
+# the 2026-06 incident. A one-symbol arm costs 2-3 streams instead of ~10.
 .PHONY: shadow-run
-shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate feed. Ctrl-C to stop. Vars: SHADOW_PROVIDER, FLOW_CLASSIFIER=tick, DEBUG=1
+shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate feed. Vars: SHADOW_PROVIDER, FLOW_CLASSIFIER=tick, SHADOW_UNDERLYINGS=SPY, SHADOW_LOG, DEBUG=1
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo "$(BLUE)CUTOVER REHEARSAL — feed=$(SHADOW_PROVIDER)  db=$(SHADOW_DB)  classifier=$(or $(FLOW_CLASSIFIER),quote [default])$(NC)"
 	@echo "$(BLUE)================================================================================$(NC)"
@@ -3554,11 +3567,12 @@ shadow-run: shadow-guard ## Run ingestion into the rehearsal DB on the candidate
 		val=$$(printf '%s' "$${line#*=}" | sed -e 's/^"\(.*\)"$$/\1/' -e "s/^'\(.*\)'$$/\1/"); \
 		export "$$key=$$val"; \
 	done < .env; \
+	$(if $(SHADOW_UNDERLYINGS),export INGEST_UNDERLYINGS='$(SHADOW_UNDERLYINGS)'; ) \
 	if [ -z "$$INGEST_UNDERLYINGS" ]; then \
 		echo "$(RED)❌ INGEST_UNDERLYINGS is not set in .env$(NC)"; exit 1; \
 	fi; \
 	LOG=$${SHADOW_LOG:-$$HOME/shadow-run-$$(date +%F).log}; \
-	echo "Underlyings:    $$INGEST_UNDERLYINGS"; \
+	echo "Underlyings:    $$INGEST_UNDERLYINGS$(if $(SHADOW_UNDERLYINGS), $(YELLOW)<- NARROWED by SHADOW_UNDERLYINGS; .env has more$(NC))"; \
 	echo "Symbol aliases: $$SYMBOL_ALIASES"; \
 	echo "$(YELLOW)Both lines must show the \$$ on index symbols. Missing means mangled.$(NC)"; \
 	echo "Logging to:     $$LOG"; \

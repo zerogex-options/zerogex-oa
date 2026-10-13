@@ -615,3 +615,67 @@ def test_compare_flow_refuses_in_the_same_shell_that_queries():
     assert (
         "exit 1" in querying[0]
     ), "the round-trip guard must be in the same shell as the query it guards"
+
+
+# --- SHADOW_UNDERLYINGS ----------------------------------------------------
+#
+# shadow-run's .env loader `export`s unconditionally, so it OVERWRITES whatever
+# is already in the environment. `INGEST_UNDERLYINGS=SPY make shadow-run` is
+# therefore silently ignored: the run comes up on .env's full symbol list while
+# the operator believes it was narrowed to one. Verified by simulating the
+# loader -- a pre-set SPY came out the other side as SPY,QQQ,SPX,NDX.
+#
+# That matters beyond convenience. TradeStation caps concurrent streams per
+# account at nominally 10 and production alone approaches it, so a second
+# TradeStation engine on four symbols doubles the load on a cap that is not
+# header-observable and whose only fingerprint is a stream dying inside 30s.
+# Narrowing an arm to one symbol is the cheap way to keep a rehearsal away from
+# production's stream budget, so the narrowing has to actually take effect.
+
+
+def test_shadow_underlyings_is_applied_after_the_env_loader():
+    """The ordering IS the fix; before the loader it would be overwritten."""
+    body = _recipe("shadow-run")
+    override = "export INGEST_UNDERLYINGS='$(SHADOW_UNDERLYINGS)'"
+    assert override in body, "shadow-run has no SHADOW_UNDERLYINGS override"
+    assert body.index("done < .env") < body.index(override), (
+        "the SHADOW_UNDERLYINGS override runs BEFORE the .env loader, which "
+        "exports unconditionally and will overwrite it"
+    )
+
+
+def test_shadow_underlyings_override_is_in_the_same_shell_as_the_loader():
+    """Make spawns a shell per recipe line; an export in another one is lost."""
+    lines = _logical_lines("shadow-run")
+    loading = [ln for ln in lines if "done < .env" in ln]
+    assert len(loading) == 1
+    assert "export INGEST_UNDERLYINGS='$(SHADOW_UNDERLYINGS)'" in loading[0], (
+        "the override must be exported in the same shell that loads .env and "
+        "launches python, or it reaches neither"
+    )
+
+
+def test_shadow_underlyings_is_conditional_so_the_default_path_is_unchanged():
+    """Unset, it must export nothing -- not an empty INGEST_UNDERLYINGS."""
+    body = _recipe("shadow-run")
+    assert "$(if $(SHADOW_UNDERLYINGS),export INGEST_UNDERLYINGS=" in body, (
+        "the override must be guarded by $(if ...) or an unset variable "
+        "blanks INGEST_UNDERLYINGS and the run refuses to start"
+    )
+
+
+def test_shadow_run_still_refuses_an_empty_symbol_list_after_the_override():
+    body = _recipe("shadow-run")
+    override = "export INGEST_UNDERLYINGS='$(SHADOW_UNDERLYINGS)'"
+    assert body.index(override) < body.index('-z "$$INGEST_UNDERLYINGS"'), (
+        "the emptiness check must run AFTER the override so a typo in "
+        "SHADOW_UNDERLYINGS is caught rather than silently accepted"
+    )
+
+
+def test_shadow_run_says_when_the_symbol_list_was_narrowed():
+    """A narrowed arm mistaken for a full one is a wrong conclusion, not a slow run."""
+    body = _recipe("shadow-run")
+    assert (
+        "NARROWED by SHADOW_UNDERLYINGS" in body
+    ), "the banner must state that the symbol list is not .env's"
