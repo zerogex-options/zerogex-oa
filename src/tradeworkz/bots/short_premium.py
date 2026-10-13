@@ -205,6 +205,16 @@ class ShortPremiumBot(BaseBot):
             if snap.gex_regime() not in set(required):
                 return self._skip("regime")
 
+        # -- Optional stand-down: short gamma on a down day. The third
+        # pre-screen (G2, 2026-10-13) put every losing afternoon cell in
+        # short gamma on down days and found the long-gamma advantage only
+        # there, so the gate's information is a stand-down, not a selection.
+        # Off by default; a sweep arm on the tape-only twin.
+        if bool(self._p("stand_down_short_gamma_down_days", False)):
+            r_day = snap.day_return()
+            if snap.net_gex is not None and snap.net_gex < 0 and r_day is not None and r_day < 0:
+                return self._skip("short_gamma_down_day")
+
         # -- Magnitude-only MSI band (off unless the catalog lists bands).
         bands = self._p("allowed_magnitude_bands", None)
         if bands:

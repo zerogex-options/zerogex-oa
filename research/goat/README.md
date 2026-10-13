@@ -99,6 +99,11 @@ Rules that keep live runs readable:
 - **To get out of a trade, untick Enabled first,** then flatten from the
   SuperDOM.
 
+**Dead zones** (Jim's ask, 2026-10-13) are up to three time windows where no
+new trade opens; open trades are still managed. They are HHMM on the 24-hour
+clock, in whatever time zone the chart shows, and off while from equals to. A
+window whose from is after its to wraps past midnight.
+
 ## Optimizing
 
 Strategy Analyzer's Optimize mode sweeps any parameter with a range. Everything

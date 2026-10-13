@@ -311,6 +311,20 @@ def test_realized_over_straddle_tail_gate():
     )
 
 
+def test_short_gamma_down_day_stand_down_is_off_by_default_and_a_sweep_axis():
+    # Tape-only twin on a short-gamma DOWN day (spot 656 under a 660 open).
+    down_short = _snap(net_gex=-1.0e9, net_gex_pctile=10.0, cash_open=660.0)
+    twin = _bot(required_regimes="any")
+    assert twin.open_criteria(down_short) is not None, twin.miss_reasons
+    on = _bot(required_regimes="any", stand_down_short_gamma_down_days=True)
+    assert _miss(on, down_short) == "short_gamma_down_day"
+    # Up day, long gamma, or no cash open: nothing to stand down on.
+    up_short = _snap(net_gex=-1.0e9, net_gex_pctile=10.0, cash_open=650.0)
+    assert on.open_criteria(up_short) is not None, on.miss_reasons
+    assert on.open_criteria(_snap(cash_open=660.0)) is not None, on.miss_reasons
+    assert on.open_criteria(_snap(net_gex=-1.0e9, net_gex_pctile=10.0)) is not None
+
+
 def test_forecast_gates_only_when_a_forecast_exists():
     assert _miss(_bot(), _snap(forecast_expected_vol_state="expansion")) == "forecast_expansion"
     spent = _snap(forecast_implied_move=4.0, cash_high=660.0, cash_low=651.0)  # 9 > 1.0 x 4
@@ -508,10 +522,20 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
         "gated/afternoon",
         "twin/tail_only_afternoon",
         "twin/negative_gamma_morning",
+        "gated/any_positive",
+        "twin/tail_only/no_short_down",
+        "twin/tail_only_afternoon/start13:30",
     } <= set(labels)
     specs = build_specs(base, grid)
     assert len({s.id for s in specs}) == len(specs)
     by = {s.display_name: s for s in specs}
+    assert by["gated/any_positive"].params["required_regimes"] == [
+        "positive_weak",
+        "positive_strong",
+    ]
+    assert by["twin/tail_only/no_short_down"].params["stand_down_short_gamma_down_days"] is True
+    late = by["twin/tail_only_afternoon/start13:30"].params
+    assert late["min_minutes_since_open"] == 240 and late["min_minutes_to_close"] == 90
     assert by["twin/tail_only"].params["required_regimes"] == "any"
     assert by["twin/clock_only"].params["max_realized_over_straddle"] == 0
     assert by["gated/band"].params["allowed_magnitude_bands"] == [

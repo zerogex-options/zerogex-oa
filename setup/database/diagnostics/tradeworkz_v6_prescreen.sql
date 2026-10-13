@@ -8,8 +8,8 @@
 -- first; a section that comes back thin or null says the dependent bot will
 -- read "insufficient" or "underpowered", and which gate to look at.
 --
--- Read-only against the schema: every statement is a SELECT except one
--- session-local TEMP TABLE for section G (dropped at the end).
+-- Read-only against the schema: every statement is a SELECT except two
+-- session-local TEMP TABLES (sections G and H, both dropped at the end).
 -- Runs on-demand via `make tradeworkz-v6-prescreen`.
 
 \pset pager off
@@ -490,39 +490,62 @@ gamma_at AS (
     WHERE g.et > s.slot - INTERVAL '60 minutes' AND g.et <= s.slot
     ORDER BY g.underlying, g.sess, s.slot, g.timestamp DESC
 ),
-chain AS (
-    -- 0DTE rows only, within 1% of the slot's spot, in the ten minutes before it.
-    SELECT c.underlying AS symbol, c.timestamp, c.strike, c.option_type, c.bid, c.ask,
-           COALESCE(c.mid, (c.bid + c.ask) / 2.0) AS mid,
-           sp.sess, sp.slot, sp.spot
-    FROM (SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
-          FROM option_chains
+chain_rows AS (
+    -- 0DTE rows in the ten minutes before each slot, hot UNION archive,
+    -- deduplicated on the primary key with the archive first so a hot row
+    -- re-quoted after the nightly copy cannot pair with its own archive
+    -- copy, and carrying the option root.
+    SELECT DISTINCT ON (option_symbol, timestamp)
+           option_symbol, underlying AS symbol, timestamp, strike, option_type, bid, ask,
+           COALESCE(mid, (bid + ask) / 2.0) AS mid,
+           split_part(option_symbol, ' ', 1) AS root
+    FROM (SELECT 0 AS src, option_symbol, underlying, timestamp, strike, option_type, bid, ask, mid
+          FROM option_chains_archive
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
             AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND bid > 0 AND ask > 0
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')
           UNION ALL
-          SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
-          FROM option_chains_archive
+          SELECT 1 AS src, option_symbol, underlying, timestamp, strike, option_type, bid, ask, mid
+          FROM option_chains
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
             AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND bid > 0 AND ask > 0
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
-                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')) c
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')) u
+    ORDER BY option_symbol, timestamp, src
+),
+rooted AS (
+    -- On SPX dual-listing dates (third Fridays and displaced holidays) the
+    -- AM-settled SPX root and the PM SPXW root are both same-day; the AM
+    -- contracts settle at the open and quote garbage after it. Keep only the
+    -- PM root where both exist; a book with one root keeps everything.
+    SELECT * FROM (
+        SELECT r.*, BOOL_OR(r.root = 'SPXW') OVER (PARTITION BY r.symbol, r.timestamp) AS has_spxw
+        FROM chain_rows r
+    ) x
+    WHERE NOT (symbol = 'SPX' AND root = 'SPX' AND has_spxw)
+),
+chain AS (
+    -- within 1% of the slot's spot
+    SELECT c.symbol, c.timestamp, c.strike, c.option_type, c.bid, c.ask, c.mid, c.root,
+           sp.sess, sp.slot, sp.spot
+    FROM rooted c
     JOIN spot_at sp
-      ON sp.symbol = c.underlying
+      ON sp.symbol = c.symbol
      AND sp.sess = (c.timestamp AT TIME ZONE 'America/New_York')::date
      AND (c.timestamp AT TIME ZONE 'America/New_York')::time > sp.slot - INTERVAL '10 minutes'
      AND (c.timestamp AT TIME ZONE 'America/New_York')::time <= sp.slot
     WHERE ABS(c.strike - sp.spot) <= 0.01 * sp.spot
-      AND c.bid > 0 AND c.ask > 0
 ),
 chain_ts AS (
     -- the latest chain stamp before each slot
@@ -539,7 +562,7 @@ straddles AS (
     JOIN chain_ts t ON t.symbol = k.symbol AND t.sess = k.sess AND t.slot = k.slot
                    AND t.chain_ts = k.timestamp
     JOIN chain p ON p.symbol = k.symbol AND p.timestamp = k.timestamp AND p.slot = k.slot
-                AND p.strike = k.strike AND p.option_type = 'P'
+                AND p.strike = k.strike AND p.root = k.root AND p.option_type = 'P'
     WHERE k.option_type = 'C'
     ORDER BY k.symbol, k.sess, k.slot, ABS(k.strike - k.spot), k.strike
 )
@@ -629,8 +652,8 @@ DROP TABLE IF EXISTS pg_temp.tw_v6_straddles;
 \echo  dense back to 2026-04-20, so this section rebuilds section G without
 \echo  the cash bars: spot at each slot and at 15:55 is read off the 0DTE
 \echo  chain itself by put-call parity (the strike where |call - put| is
-\echo  smallest; spot = strike + call - put, exact to a tick with hours to
-\echo  expiry and no carry). No gamma sign is available this far back, so H
+\echo  smallest; spot = strike + call - put, within ~3 SPX ticks of carry at
+\echo  10:30 and exact at 15:55). No gamma sign is available this far back, so H
 \echo  tests the UNCONDITIONAL premium by slot (afternoon_iron_fly) and the
 \echo  straddle-richness cut (H2), not the gate. Run it on the default window
 \echo  first: if H agrees with G there, H on the holdout is credible.
@@ -640,42 +663,55 @@ CREATE TEMP TABLE tw_v6_arch AS
 WITH slots AS (
     SELECT unnest(ARRAY['10:30', '12:00', '13:00', '13:30', '14:30', '15:55']::time[]) AS slot
 ),
-rows AS (
-    SELECT underlying AS symbol, timestamp, strike, option_type, bid, ask,
+chain_rows AS (
+    -- hot UNION archive, deduplicated on the primary key with the archive
+    -- first (a hot row re-quoted after the nightly copy must not pair with
+    -- its own archive copy), carrying the option root
+    SELECT DISTINCT ON (option_symbol, timestamp)
+           option_symbol, underlying AS symbol, timestamp, strike, option_type, bid, ask,
            COALESCE(mid, (bid + ask) / 2.0) AS mid,
+           split_part(option_symbol, ' ', 1) AS root,
            (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
            (timestamp AT TIME ZONE 'America/New_York')::time AS et
-    FROM option_chains_archive
-    WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
-      AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
-      AND bid > 0 AND ask > 0
-      AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '15:45' AND '15:55')
-    UNION
-    SELECT underlying AS symbol, timestamp, strike, option_type, bid, ask,
-           COALESCE(mid, (bid + ask) / 2.0) AS mid,
-           (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
-           (timestamp AT TIME ZONE 'America/New_York')::time AS et
-    FROM option_chains
-    WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
-      AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
-      AND bid > 0 AND ask > 0
-      AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30'
-           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '15:45' AND '15:55')
+    FROM (SELECT 0 AS src, option_symbol, underlying, timestamp, strike, option_type, bid, ask, mid
+          FROM option_chains_archive
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
+            AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND bid > 0 AND ask > 0
+            AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '15:45' AND '15:55')
+          UNION ALL
+          SELECT 1 AS src, option_symbol, underlying, timestamp, strike, option_type, bid, ask, mid
+          FROM option_chains
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
+            AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+            AND bid > 0 AND ask > 0
+            AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '15:45' AND '15:55')) u
+    ORDER BY option_symbol, timestamp, src
+),
+rooted AS (
+    -- SPX dual-listing dates: keep only the PM (SPXW) root where both
+    -- roots are same-day; a book with one root keeps everything.
+    SELECT * FROM (
+        SELECT r.*, BOOL_OR(r.root = 'SPXW') OVER (PARTITION BY r.symbol, r.timestamp) AS has_spxw
+        FROM chain_rows r
+    ) x
+    WHERE NOT (symbol = 'SPX' AND root = 'SPX' AND has_spxw)
 ),
 stamped AS (
     SELECT r.*, s.slot
-    FROM rows r
+    FROM rooted r
     JOIN slots s ON r.et > s.slot - INTERVAL '10 minutes' AND r.et <= s.slot
 ),
 latest AS (
@@ -692,16 +728,19 @@ pairs AS (
     FROM stamped c
     JOIN latest l ON l.symbol = c.symbol AND l.sess = c.sess AND l.slot = c.slot AND l.ts = c.timestamp
     JOIN stamped p ON p.symbol = c.symbol AND p.timestamp = c.timestamp AND p.slot = c.slot
-                  AND p.strike = c.strike AND p.option_type = 'P'
+                  AND p.strike = c.strike AND p.root = c.root AND p.option_type = 'P'
     WHERE c.option_type = 'C'
 ),
 atm AS (
     -- the strike where |call - put| is smallest is the ATM strike, and
-    -- strike + call - put is spot by parity
+    -- strike + call - put is spot by parity. A stamp whose capture lacks
+    -- the true ATM pair would land on a neighbor strike (|call - put| over
+    -- half a strike step): dropped rather than recorded.
     SELECT DISTINCT ON (symbol, sess, slot) symbol, sess, slot, strike,
            straddle_mid, straddle_bid,
            strike + c_mid - p_mid AS spot_est
     FROM pairs
+    WHERE ABS(c_mid - p_mid) <= 0.6 * CASE symbol WHEN 'SPX' THEN 5 ELSE 1 END
     ORDER BY symbol, sess, slot, ABS(c_mid - p_mid), strike
 )
 SELECT a.symbol, a.sess, a.slot, a.spot_est AS spot, a.strike, a.straddle_mid, a.straddle_bid,
