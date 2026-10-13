@@ -247,6 +247,11 @@ def test_fade_arm_trades_against_the_day_and_books_on_the_cross_back():
     assert dec.should_close and dec.reason == "fade_complete"
     # The default never reads as a fade.
     assert _bot().open_criteria(_snap()).components_at_entry["trade_direction"] == "continuation"
+    # The gamma-blind control cuts by day direction instead.
+    ctl = _bot(required_gamma_sign="any", trade_direction="fade", required_day_direction="up")
+    assert ctl.open_criteria(_snap()) is not None, ctl.miss_reasons  # +1% day
+    assert _miss(ctl, _snap(spot=643.5)) == "day_direction"
+    assert _miss(_bot(required_day_direction="down"), _snap()) == "day_direction"
 
 
 def test_momentum_lost_closes_on_a_cross_back_through_the_open():
@@ -301,6 +306,7 @@ def test_sweep_grid_is_the_gamma_sign_experiment():
     assert by["positive/fade"].params["trade_direction"] == "fade"
     assert by["positive/fade"].params["required_gamma_sign"] == "positive"
     assert by["any/fade"].params["required_gamma_sign"] == "any"
+    assert by["any/fade/up_days"].params["required_day_direction"] == "up"
     # A wall bot still gets the wall grid.
     from src.tools.tw_execution_sweep import wall_execution_grid
 

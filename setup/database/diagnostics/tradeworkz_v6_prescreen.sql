@@ -143,7 +143,10 @@ ORDER BY underlying;
 \echo  ~15 qualifying sessions per symbol this table can only rule OUT a large
 \echo  effect; SPY and SPX are the same days, so pool them as one. The
 \echo  gamma labels disagree between SPY and SPX on the same days (section D:
-\echo  44% vs 60% positive midday), so a short-gamma row is not one condition. Index symbols open on their 09:31 bar (the
+\echo  44% vs 60% positive midday), so a short-gamma row is not one condition,
+\echo  and the 15:00 label is the structural (multi-day) gamma read, which
+\echo  largely tracks whether the day is up or down. The second table splits
+\echo  the same sessions by day direction so the two readings can be told apart. Index symbols open on their 09:31 bar (the
 \echo  09:30 print is stale). Each symbol is scaled by its own ATM IV.
 \echo
 
@@ -207,20 +210,101 @@ sessions AS (
     JOIN iv_scale v USING (symbol, sess)
 ),
 qualifying AS (
-    SELECT *, SIGN(day_ret) * last_ret AS last_ret_in_day_direction
+    SELECT *, SIGN(day_ret) * last_ret AS last_ret_in_day_direction,
+           CASE WHEN net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END AS gamma_at_1500,
+           CASE WHEN day_ret > 0 THEN 'up day' ELSE 'down day' END AS day_dir
     FROM sessions
     WHERE ABS(day_ret) >= 0.5 * implied_daily AND ABS(day_ret) <= 3.0 * implied_daily
 )
 SELECT symbol,
-       CASE WHEN net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END AS gamma_at_1500,
+       gamma_at_1500,
        COUNT(*) AS qualifying_sessions,
        ROUND(100.0 * AVG((SIGN(day_ret) = SIGN(last_ret))::int), 1) AS continuation_pct,
        ROUND((10000 * AVG(last_ret_in_day_direction))::numeric, 1) AS mean_last_55m_bps_in_day_dir,
        ROUND((10000 * PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY last_ret_in_day_direction::float8))::numeric, 1)
            AS median_last_55m_bps_in_day_dir
 FROM qualifying
-GROUP BY ROLLUP (symbol, CASE WHEN net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END)
+GROUP BY ROLLUP (symbol, gamma_at_1500)
 ORDER BY symbol NULLS LAST, 2 NULLS LAST;
+
+\echo
+\echo  E2. The same qualifying sessions by direction of the day, then by gamma
+\echo  sign inside each direction. If the long-gamma reversal above is only
+\echo  the up-day rows reverting, the label is reading the day, not dealers.
+\echo
+
+WITH bars AS (
+    SELECT symbol, timestamp, close,
+           (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+           (timestamp AT TIME ZONE 'America/New_York')::time AS et
+    FROM underlying_quotes
+    WHERE symbol IN ('SPY', 'QQQ', 'SPX')
+      AND timestamp >= NOW() - INTERVAL '95 days'
+),
+opens AS (
+    SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_open
+    FROM bars
+    WHERE et >= CASE WHEN symbol IN ('SPX', 'NDX') THEN '09:31'::time ELSE '09:30'::time END
+      AND et < '09:40'
+    ORDER BY symbol, sess, timestamp
+),
+at_1500 AS (
+    SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_1500
+    FROM bars WHERE et BETWEEN '14:45' AND '15:00'
+    ORDER BY symbol, sess, timestamp DESC
+),
+at_1555 AS (
+    SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_1555
+    FROM bars WHERE et BETWEEN '15:40' AND '15:55'
+    ORDER BY symbol, sess, timestamp DESC
+),
+gamma_1500 AS (
+    SELECT DISTINCT ON (underlying, sess) underlying AS symbol, sess, net_gex_at_spot
+    FROM (SELECT underlying, net_gex_at_spot, timestamp,
+                 (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+                 (timestamp AT TIME ZONE 'America/New_York')::time AS et
+          FROM gex_summary
+          WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+            AND timestamp >= NOW() - INTERVAL '95 days') g
+    WHERE et BETWEEN '14:00' AND '15:00' AND net_gex_at_spot IS NOT NULL
+    ORDER BY underlying, sess, timestamp DESC
+),
+iv_scale AS (
+    SELECT o.symbol, o.sess, d.atm_call_iv / SQRT(252) AS implied_daily
+    FROM opens o
+    JOIN LATERAL (
+        SELECT atm_call_iv FROM daily_atm_iv
+        WHERE underlying = o.symbol AND trading_date < o.sess AND atm_call_iv > 0
+        ORDER BY trading_date DESC
+        LIMIT 1
+    ) d ON TRUE
+),
+sessions AS (
+    SELECT o.symbol, o.sess,
+           a.px_1500 / o.px_open - 1 AS day_ret,
+           c.px_1555 / a.px_1500 - 1 AS last_ret,
+           v.implied_daily,
+           g.net_gex_at_spot
+    FROM opens o
+    JOIN at_1500 a USING (symbol, sess)
+    JOIN at_1555 c USING (symbol, sess)
+    JOIN gamma_1500 g USING (symbol, sess)
+    JOIN iv_scale v USING (symbol, sess)
+),
+qualifying AS (
+    SELECT *, SIGN(day_ret) * last_ret AS last_ret_in_day_direction,
+           CASE WHEN net_gex_at_spot < 0 THEN 'short gamma' ELSE 'long gamma' END AS gamma_at_1500,
+           CASE WHEN day_ret > 0 THEN 'up day' ELSE 'down day' END AS day_dir
+    FROM sessions
+    WHERE ABS(day_ret) >= 0.5 * implied_daily AND ABS(day_ret) <= 3.0 * implied_daily
+)
+SELECT symbol, day_dir, gamma_at_1500,
+       COUNT(*) AS qualifying_sessions,
+       ROUND(100.0 * AVG((SIGN(day_ret) = SIGN(last_ret))::int), 1) AS continuation_pct,
+       ROUND((10000 * AVG(last_ret_in_day_direction))::numeric, 1) AS mean_last_55m_bps_in_day_dir
+FROM qualifying
+GROUP BY GROUPING SETS ((symbol, day_dir, gamma_at_1500), (symbol, day_dir), (day_dir, gamma_at_1500), (day_dir))
+ORDER BY symbol NULLS LAST, day_dir, gamma_at_1500 NULLS LAST;
 
 \echo
 \echo ============================================================
@@ -234,7 +318,9 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo  row against the short-gamma row, not against 1 (there is no compression
 \echo  share here for that reason). pm_ratio is the 12:00-16:00 range alone,
 \echo  which is what the fly is exposed to and the only range the 12:00 gamma
-\echo  reading does not already contain. Barbon
+\echo  reading does not already contain; am_ratio is the 09:30-12:00 range,
+\echo  printed because the second run showed flat full-day ranges with lower
+\echo  afternoons, i.e. the noon label co-varied with a BIGGER morning. Barbon
 \echo  and Buraschi and the excursion studies on this platform say the
 \echo  long-gamma rows should sit lower, on pm_ratio above all.
 \echo
@@ -257,6 +343,7 @@ opens AS (
 ranges AS (
     SELECT symbol, sess,
            MAX(high) - MIN(low) AS day_range,
+           MAX(high) FILTER (WHERE et < '12:00') - MIN(low) FILTER (WHERE et < '12:00') AS am_range,
            MAX(high) FILTER (WHERE et >= '12:00') - MIN(low) FILTER (WHERE et >= '12:00') AS pm_range
     FROM bars WHERE et BETWEEN '09:30' AND '16:00'
     GROUP BY symbol, sess
@@ -286,6 +373,7 @@ iv_scale AS (
 ratios AS (
     SELECT o.symbol, o.sess, g.net_gex_at_spot,
            r.day_range / (o.px_open * v.implied_daily * SQRT(8.0 / PI())) AS realized_over_normal,
+           r.am_range / (o.px_open * v.implied_daily * SQRT(8.0 / PI())) AS am_over_normal,
            r.pm_range / (o.px_open * v.implied_daily * SQRT(8.0 / PI())) AS pm_over_normal
     FROM opens o
     JOIN ranges r USING (symbol, sess)
@@ -297,6 +385,7 @@ SELECT symbol,
        COUNT(*) AS sessions,
        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_over_normal::float8)::numeric, 3) AS median_ratio,
        ROUND(AVG(realized_over_normal)::numeric, 3) AS mean_ratio,
+       ROUND(AVG(am_over_normal)::numeric, 3) AS mean_am_ratio,
        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pm_over_normal::float8)::numeric, 3) AS median_pm_ratio,
        ROUND(AVG(pm_over_normal)::numeric, 3) AS mean_pm_ratio
 FROM ratios
@@ -307,7 +396,7 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo ============================================================
 \echo  G. What the ATM straddle charged vs what the tape paid (measure first)
 \echo ============================================================
-\echo  The fly P&L before any bot runs. At 10:30, 12:00, 13:30 and 14:30 ET, the
+\echo  The fly P&L before any bot runs. At 10:30, 12:00, 13:00, 13:30 and 14:30 ET, the
 \echo  0DTE strike nearest spot with two-sided quotes on both legs, straddle
 \echo  mid (and bid, which is what the harness sells at) against the move it
 \echo  settled into, |px_1555 - strike|. Split by the dealer-gamma sign in the
@@ -325,7 +414,13 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo  sample is ~52 sessions, not 156, and the wing column is a COUNT because
 \echo  1 vs 4 sessions should read like 1 vs 4. Chains are read hot UNION
 \echo  archive; a slot with few sessions means the 0DTE chain was not captured
-\echo  in the ten minutes before it.
+\echo  in the ten minutes before it. Adjacent slots are the SAME sessions
+\echo  settling to the SAME 15:55 print (13:30 and 14:30 share ~57% of their
+\echo  variance), so a second slot agreeing is a third of a replication, not
+\echo  a second one. Read seller_bps_of_spot before the ratio: a ratio that
+\echo  falls while the bps stay flat is the straddle getting smaller, and the
+\echo  case for that slot is cost structure (wings and slippage scale with the
+\echo  straddle), not more premium.
 \echo
 \echo  The straddle set is built ONCE into a session-local temporary table
 \echo  (the chain scan is the slow part; G, G2 and G3 then read it in
@@ -336,7 +431,7 @@ DROP TABLE IF EXISTS pg_temp.tw_v6_straddles;
 
 CREATE TEMP TABLE tw_v6_straddles AS
 WITH slots AS (
-    SELECT unnest(ARRAY['10:30', '12:00', '13:30', '14:30']::time[]) AS slot
+    SELECT unnest(ARRAY['10:30', '12:00', '13:00', '13:30', '14:30']::time[]) AS slot
 ),
 bars AS (
     SELECT symbol, timestamp, close,
@@ -390,6 +485,7 @@ chain AS (
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')
           UNION ALL
@@ -400,6 +496,7 @@ chain AS (
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+                 OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30')) c
     JOIN spot_at sp

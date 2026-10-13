@@ -169,9 +169,9 @@ def test_time_stop_never_reaches_the_settlement_window():
     finally:
         bot_base.set_backtest_clock(None)
     assert sig is not None
-    # (150 to close - 20 buffer) = 130 < max_hold 150 -> flat at 15:40 ET
-    assert sig.time_stop_at == PM_1330ET + timedelta(minutes=130)
-    # the last entry of the window holds 70 minutes to the same 15:40
+    # (150 to close - 5 buffer) = 145 < max_hold 180 -> held to 15:55 ET, the harness cap
+    assert sig.time_stop_at == PM_1330ET + timedelta(minutes=145)
+    # the last entry of the window holds 85 minutes to the same 15:55
     bot_base.set_backtest_clock(lambda: LATE_1430ET)
     try:
         bot = _bot()
@@ -179,11 +179,11 @@ def test_time_stop_never_reaches_the_settlement_window():
     finally:
         bot_base.set_backtest_clock(None)
     assert sig is not None, bot.miss_reasons
-    assert sig.time_stop_at == LATE_1430ET + timedelta(minutes=90 - 20)
-    # an earlier entry with a long hold allowed still never reaches 15:40
+    assert sig.time_stop_at == LATE_1430ET + timedelta(minutes=90 - 5)
+    # the sweep's early-flat arm leaves at 15:40 instead
     bot_base.set_backtest_clock(lambda: PM_1330ET)
     try:
-        sig = _bot(max_hold_minutes=400).open_criteria(_snap())
+        sig = _bot(eod_exit_buffer_minutes=20).open_criteria(_snap())
     finally:
         bot_base.set_backtest_clock(None)
     assert sig is not None and sig.time_stop_at == PM_1330ET + timedelta(minutes=130)
@@ -435,12 +435,36 @@ def test_registered_in_research_and_never_funded():
     assert spec.params["credit_take_frac"] == 0.5
     assert spec.params["premium_stop_grace_seconds"] >= 600
     assert spec.params["confidence_threshold_default"] == 0.50
+    assert spec.params["eod_exit_buffer_minutes"] == 5  # hold to the harness cap
     # ...including what the adversarial review changed before the first screen.
     assert spec.params["credit_stop_mult"] == 0.5
     assert spec.params["allowed_magnitude_bands"] == []
     assert spec.params["max_atm_iv_pctile"] == 0
     assert spec.params["max_realized_over_straddle"] == 0.85
     assert spec.params["required_regimes"] == ["positive_strong"]
+
+
+def test_afternoon_iron_fly_is_the_ungated_twin_as_its_own_entry():
+    entry = get("afternoon_iron_fly")
+    assert entry.stage is Stage.RESEARCH and entry.bot_class == "AfternoonIronFly"
+    assert not entry.is_provisionable
+    assert all(s.id != "afternoon_iron_fly" for s in DEFAULT_ROSTER)
+    spec = known_specs()["afternoon_iron_fly"]
+    assert spec.params["required_regimes"] == "any"
+    assert spec.params["min_minutes_since_open"] == 210
+    # Same engine, same window, no gamma gate: fires on a negative-gamma tape
+    # the gated fly refuses, and never exits on regime loss.
+    bot = _bot("afternoon_iron_fly")
+    busy_gamma = _snap(net_gex=-1.0e9, net_gex_pctile=10.0)
+    sig = bot.open_criteria(busy_gamma)
+    assert sig is not None, bot.miss_reasons
+    assert sig.strategy_type == "SHORT_IRON_BUTTERFLY"
+    assert _miss(_bot(), busy_gamma) == "regime"
+    assert not bot.exit_criteria(_snap(net_gex=-5.0e8), _pos()).should_close
+    # The quiet-tape gate still binds.
+    assert _miss(
+        _bot("afternoon_iron_fly"), _snap(recent_closes=_quiet_closes(656.0, bps=20.0))
+    ) == ("tail_realized")
 
 
 # ======================================================================
@@ -466,7 +490,7 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
         "gated/band",
         "gated/uniform_gates",
         "gated/no_stop",
-        "gated/hold_to_settle",
+        "gated/flat15:40",
         "gated/morning",
         "twin/tail_only_morning",
     } <= set(labels)

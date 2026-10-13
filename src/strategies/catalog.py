@@ -113,10 +113,16 @@ _SHORT_PREMIUM_PARAMS = {
     "max_cash_range_over_implied": None,
     "credit_take_frac": 0.5,
     # The WING is the real stop on a fly: at a 1.25-sigma wing the max loss
-    # is ~0.8-0.9x the credit, so 1.0 (the first draft) could never fire.
-    # 0.5 cuts at roughly 60% of the way to the wing.
+    # is ~0.9-1.0x the credit, so 1.0 (the first draft) could never fire.
+    # 0.5 cuts about halfway to the wing.
     "credit_stop_mult": 0.5,
-    "eod_exit_buffer_minutes": 20,
+    # Hold to the harness cap (15:55 ET). A 15:40 flat buys back about half
+    # of a 14:30 straddle's value plus four legs of friction, and on a pinned
+    # tape the 50% credit take cannot fire before ~15:45, so the early flat
+    # was the fly's winning exit and its most expensive one. The earlier
+    # exits are sweep arms (gated/flat15:40, gated/exit15:05). SPY/QQQ pin
+    # risk at the bell is a LIVE concern, not a paper-trading one.
+    "eod_exit_buffer_minutes": 5,
     # Irrelevant for a credit (the debit premium stop skips entry <= 0) but
     # set explicitly so a reader does not go looking for it.
     "max_premium_loss_pct": 0.0,
@@ -1158,14 +1164,15 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
         bot_class="LongGammaIronFly",
         params={
             **_SHORT_PREMIUM_PARAMS,
-            # Entries 13:00-14:30 ET, flat by 15:40. The designers chose
-            # 10:30-13:30; the pre-screen's straddle table (section G, two
-            # runs) put the 0DTE premium at 13:30 and 14:30 and left the
+            # Entries 13:00-14:30 ET, held to the harness cap. The designers
+            # chose 10:30-13:30; the pre-screen's straddle table (section G,
+            # two runs) put the 0DTE premium at 13:30 and 14:30 and left the
             # 10:30 and 12:00 straddles at or above fair pricing, so the
-            # morning window is a sweep arm (gated/morning) instead.
+            # morning window is a sweep arm (gated/morning) instead. This is
+            # an in-sample choice of which arm to paper-trade first.
             "min_minutes_since_open": 210,
             "min_minutes_to_close": 90,
-            "max_hold_minutes": 150,
+            "max_hold_minutes": 180,
             "required_regimes": ["positive_strong"],
             "regime_fail_closed": True,
             # OFF ([]): the band's excursion evidence is unadjusted for the
@@ -1177,6 +1184,40 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
             # Dollars against dollars (realized remaining move on the diurnal
             # profile / straddle-implied remaining move); the annualized-vol
             # form compared two conventions and never tripped.
+            "max_realized_over_straddle": 0.85,
+            "max_cash_range_over_implied": 1.0,
+        },
+        research=(),
+    ),
+    StrategyEntry(
+        id="afternoon_iron_fly",
+        name="Afternoon Iron Butterfly",
+        family=Family.VOL_REGIME,
+        tier="0DTE",
+        direction_mode="neutral",
+        tagline="The 0DTE premium at 13:00-14:30, no gamma gate. The fly the pre-screen supports.",
+        thesis=(
+            "The same defined-risk ATM iron butterfly as long_gamma_iron_fly, "
+            "without the dealer-gamma gate: the tape-only twin as its own "
+            "catalog entry. Two pre-screen runs put the 0DTE straddle paying "
+            "out about 70% of what it charged at 13:30 and 14:30 on SPY, QQQ "
+            "and SPX (3-4 standard errors below fair pricing), while the "
+            "long-gamma split seen at 13:30 did not carry into 14:30 on the "
+            "same sessions. So the best-supported hypothesis is the clock plus "
+            "the quiet-tape gate, and the gated fly is the test of the gate. "
+            "Held to the harness cap; a 15:40 flat was the costliest exit."
+        ),
+        stage=Stage.RESEARCH,
+        bot_class="AfternoonIronFly",
+        params={
+            **_SHORT_PREMIUM_PARAMS,
+            "min_minutes_since_open": 210,
+            "min_minutes_to_close": 90,
+            "max_hold_minutes": 180,
+            "required_regimes": "any",
+            "regime_fail_closed": True,
+            "allowed_magnitude_bands": [],
+            "require_magnitude": True,
             "max_realized_over_straddle": 0.85,
             "max_cash_range_over_implied": 1.0,
         },

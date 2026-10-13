@@ -30,9 +30,13 @@ The controls that decide whether the gamma gate earns its place are params:
 ``trade_direction: "fade"`` sells the day's move instead of buying it. The
 pre-screen's cash-tape table (section E, 2026-10-12, ~63 sessions) showed the
 last hour REVERSING the day on this tape — 36% continuation pooled, 29% under
-long gamma — so on this data the mechanism-consistent trade is the fade under
-long gamma, with the unconditional fade as its control. The continuation
-default stays so the screen records the papers' object on its own.
+long gamma, 45% under short gamma — a post-hoc hypothesis from 53 rows, not
+a finding. The 15:00 gamma label is the structural (multi-day) read and
+largely tracks whether the day is up or down, so the fade under long gamma
+has to beat the same fade cut by day direction (``required_day_direction:
+"up"``) and the unconditional fade before it is read as dealer hedging. The
+continuation default stays so the screen records the papers' object on its
+own.
 
 Structure: a 0DTE ATM vertical in the day-return direction, ~0.5 sigma wide
 on the remaining move, held to the bell. Debit by default (direction plus the
@@ -155,6 +159,15 @@ class HedgingDemandCloseMomentum(BaseBot):
             return self._skip("day_flat")
         if move_sigmas > float(self._p("max_day_move_sigma", 3.0)):
             return self._skip("day_exhausted")
+        # -- Optional day-direction cut. The structural gamma sign largely
+        # tracks whether the day is up or down, so "long gamma" rows need a
+        # same-direction, gamma-blind control: ``required_day_direction`` is
+        # "any" (default), "up" or "down".
+        want_dir = str(self._p("required_day_direction", "any")).lower()
+        if want_dir == "up" and r_day <= 0:
+            return self._skip("day_direction")
+        if want_dir == "down" and r_day >= 0:
+            return self._skip("day_direction")
         # -- Which way to trade the day's move. ``continuation`` is the
         # papers' object (Gao; Baltussen under short gamma). ``fade`` sells
         # it: the first pre-screen (section E, 2026-10-12) showed the last
