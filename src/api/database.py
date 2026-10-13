@@ -2837,6 +2837,45 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching strike gamma profile: {e}", exc_info=True)
             raise
 
+    async def get_latest_max_pain_for_expiration(
+        self,
+        symbol: str,
+        expiration: date,
+    ) -> Optional[float]:
+        """Max pain for ONE expiration, from the newest ``gex_summary`` row.
+
+        ``gex_summary.max_pain`` is the front-month scalar, so it is the wrong
+        settlement to quote beside levels scoped to any other expiration.  The
+        engine also persists the full ``{expiration: strike}`` breakdown, and
+        this reads that expiration's own entry -- the same rule a one-date
+        replay scope follows (:func:`_replay_max_pain_for_expirations`).
+
+        ``None`` when the breakdown is missing or does not list
+        ``expiration``.  The raw breakdown is cached per symbol at the
+        analytics TTL, so every expiration a caller scopes to shares one read.
+        """
+        symbol = symbol.upper()
+        cache_key = f"latest_max_pain_by_expiration:{symbol}"
+        raw = self._cache_get(cache_key)
+        if raw is None:
+            query = """
+                SELECT max_pain_by_expiration
+                FROM gex_summary
+                WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """
+            try:
+                async with self._acquire_connection() as conn:
+                    rows = await conn.fetch(query, symbol)
+            except Exception as e:
+                logger.error(f"Error fetching max pain by expiration: {e}", exc_info=True)
+                raise
+            # An empty dict stands for "no breakdown" so a miss is cached too.
+            raw = (rows[0]["max_pain_by_expiration"] if rows else None) or {}
+            self._cache_set(cache_key, raw, self._analytics_cache_ttl_seconds)
+        return _replay_max_pain_for_expirations(raw, [expiration])
+
     async def get_gex_summary_at_ts(self, symbol: str, at_ts: datetime) -> Optional[Dict[str, Any]]:
         """Most recent ``gex_summary`` row at or before ``at_ts``.
 
