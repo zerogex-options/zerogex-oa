@@ -107,7 +107,10 @@ empty.
   ATM front straddle's mid divided by 0.798 (a straddle is worth ~E|Z|
   sigma), so wing width, flip clearance and exits all scale with what the
   market is pricing for the rest of the day, on SPY and SPX alike.
-- **Entry (10:30–13:30 ET), every gate a named `_skip`:** `window` ·
+- **Entry (13:00–14:30 ET, flat by 15:40), every gate a named `_skip`:**
+  the designers chose 10:30–13:30; the pre-screen's straddle table moved it
+  (§10, second run), and the morning window is the `gated/morning` sweep arm.
+  `window` ·
   `no_straddle` / `no_sigma` · `regime` — `positive_strong` (top quartile of
   the symbol's own 30-day history; **fails closed** on a missing percentile,
   never the absolute fallback) · `tail_realized` — the trailing 30-bar
@@ -215,6 +218,13 @@ papers and the brief.
   leaving behind instead). Held to 15:55 — the published object IS the
   last-half-hour return — with `momentum_lost` (a cross back through the cash
   open) and a 60% premium stop as the only early exits.
+- **The fade (`trade_direction: "fade"`):** sells the day's move instead.
+  The pre-screen's cash-tape table (§10, second run) showed the last hour
+  REVERSING the day on this tape, most under long gamma, which is what
+  dealers long gamma hedging into the close would do. Sweep arms
+  `positive/fade` (long gamma) and `any/fade` (unconditional); a fade's
+  cross back through the open books as `fade_complete`. The continuation
+  default stays so the screen records the papers' object on its own.
 - **Prior:** honest read is `insufficient`. The effect is real but small
   (single-digit bps on average); the gamma conditioning multiplies it. The
   cash-tape pre-test in §7 step 1 (section E) answers most of this before an
@@ -324,7 +334,10 @@ Cheapest and most informative first. Steps 1–3 need no new code paths beyond
 this branch and run in seconds to a minute.
 
 1. **`make tradeworkz-v6-prescreen`** (read-only SQL,
-   `setup/database/diagnostics/tradeworkz_v6_prescreen.sql`). It answers:
+   `setup/database/diagnostics/tradeworkz_v6_prescreen.sql`; section G
+   builds its straddle set once into a session-local temp table, so the
+   whole file runs in a few minutes — run it under `tmux` or `nohup ... |
+   tee` so an SSH drop does not lose the output). It answers:
    - whether the morning forecast's `expected_vol_ratio` carries skill
      (Spearman vs the realized receipt, per symbol) — if rho is ~0 the
      forecast gates are noise and only the raw-VRP control is worth running;
@@ -373,10 +386,12 @@ this branch and run in seconds to a minute.
    ```
    The fly's grid is `gated/default` against `twin/tail_only` (the primary
    comparison), `twin/clock_only`, `twin/negative_gamma`, `gated/band`,
-   `gated/uniform_gates`, the geometry arms and the afternoon pair
-   (`gated/afternoon` vs `twin/tail_only_afternoon`); the momentum bot's grid is
-   `required_gamma_sign ∈ {negative, any, positive}` × `structure ∈ {debit,
-   credit}` plus the first-half-hour agreement and a higher move floor. Read
+   `gated/uniform_gates`, the geometry arms and the morning pair
+   (`gated/morning` vs `twin/tail_only_morning`, the designers' original
+   window); the momentum bot's grid is `required_gamma_sign ∈ {negative, any,
+   positive}` × `structure ∈ {debit, credit}` plus the first-half-hour
+   agreement, a higher move floor, and the two fade arms (`positive/fade`,
+   `any/fade`). Read
    the `twin/*` rows against `gated/default` **on the gated bot's sessions**:
    that paired comparison is the whole experiment.
 5. **Read the verdicts the way the catalog does.** `edge` needs PF ≥ 1.1,
