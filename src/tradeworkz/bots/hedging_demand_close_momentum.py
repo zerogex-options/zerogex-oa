@@ -27,6 +27,16 @@ hedgers are short gamma. The brief records this structure as untested here.
 The controls that decide whether the gamma gate earns its place are params:
 ``required_gamma_sign: "any"`` is the unconditional Gao et al. trade, and
 ``"positive"`` is the complement, which the mechanism says should NOT work.
+``trade_direction: "fade"`` sells the day's move instead of buying it. The
+pre-screen's cash-tape table (section E, 2026-10-12, ~63 sessions) showed the
+last hour REVERSING the day on this tape — 36% continuation pooled, 29% under
+long gamma, 45% under short gamma — a post-hoc hypothesis from 53 rows, not
+a finding. The 15:00 gamma label is the structural (multi-day) read and
+largely tracks whether the day is up or down, so the fade under long gamma
+has to beat the same fade cut by day direction (``required_day_direction:
+"up"``) and the unconditional fade before it is read as dealer hedging. The
+continuation default stays so the screen records the papers' object on its
+own.
 
 Structure: a 0DTE ATM vertical in the day-return direction, ~0.5 sigma wide
 on the remaining move, held to the bell. Debit by default (direction plus the
@@ -149,8 +159,26 @@ class HedgingDemandCloseMomentum(BaseBot):
             return self._skip("day_flat")
         if move_sigmas > float(self._p("max_day_move_sigma", 3.0)):
             return self._skip("day_exhausted")
-        direction = "bullish" if r_day > 0 else "bearish"
-        sign = 1.0 if r_day > 0 else -1.0
+        # -- Optional day-direction cut. The structural gamma sign largely
+        # tracks whether the day is up or down, so "long gamma" rows need a
+        # same-direction, gamma-blind control: ``required_day_direction`` is
+        # "any" (default), "up" or "down".
+        want_dir = str(self._p("required_day_direction", "any")).lower()
+        if want_dir == "up" and r_day <= 0:
+            return self._skip("day_direction")
+        if want_dir == "down" and r_day >= 0:
+            return self._skip("day_direction")
+        # -- Which way to trade the day's move. ``continuation`` is the
+        # papers' object (Gao; Baltussen under short gamma). ``fade`` sells
+        # it: the first pre-screen (section E, 2026-10-12) showed the last
+        # hour REVERSING the day on this tape, most under long gamma, which
+        # is what dealers long gamma hedging into the close would do.
+        trade_dir = str(self._p("trade_direction", "continuation")).lower()
+        with_day = r_day > 0
+        if trade_dir == "fade":
+            with_day = not with_day
+        direction = "bullish" if with_day else "bearish"
+        sign = 1.0 if with_day else -1.0
 
         # -- Gao's own predictor, optionally required to agree.
         fhh = snap.first_half_hour_return()
@@ -183,9 +211,15 @@ class HedgingDemandCloseMomentum(BaseBot):
         min_move = float(self._p("min_day_move_sigma", 0.5))
         q_move = _clamp01((move_sigmas - min_move) / 0.75)
         pct = snap.net_gex_pctile
-        q_regime = _clamp01((50.0 - float(pct)) / 50.0) if pct is not None else 0.5
-        if want == "any":
-            q_regime = 0.6
+        # How strongly the REQUIRED sign holds: deep negative for the paper's
+        # arm, deep positive for the complement (which the first draft
+        # penalized for its own condition, so it could never clear the floor).
+        if want == "any" or pct is None:
+            q_regime = 0.6 if want == "any" else 0.5
+        elif want == "positive":
+            q_regime = _clamp01((float(pct) - 50.0) / 50.0)
+        else:
+            q_regime = _clamp01((50.0 - float(pct)) / 50.0)
         q_fhh = 1.0 if fhh_agrees else 0.0
         quality = 0.6 * q_move + 0.3 * q_regime + 0.1 * q_fhh
         ml_components = {
@@ -247,7 +281,7 @@ class HedgingDemandCloseMomentum(BaseBot):
             stop_price=stop_price,
             time_stop_at=_utcnow() + timedelta(minutes=hold),
             rationale=(
-                f"day {r_day * 100:+.2f}% = {move_sigmas:.2f} implied sigmas, "
+                f"{trade_dir}: day {r_day * 100:+.2f}% = {move_sigmas:.2f} implied sigmas, "
                 f"net_gex {snap.net_gex / 1e9:+.2f}B"
                 + (f" (pctile {pct:.0f})" if pct is not None else "")
                 + (", first half hour agrees" if fhh_agrees else "")
@@ -263,6 +297,7 @@ class HedgingDemandCloseMomentum(BaseBot):
                 "net_gex": snap.net_gex,
                 "net_gex_pctile": pct,
                 "structure": structure,
+                "trade_direction": trade_dir,
                 "width_increments": width_incs,
                 "entry_spot": snap.spot,
                 "quality": quality,
@@ -281,10 +316,23 @@ class HedgingDemandCloseMomentum(BaseBot):
         whatever the premium says.
         """
         if bool(self._p("exit_on_momentum_loss", True)):
-            cash_open = position.components_at_entry.get("cash_open")
+            comps = position.components_at_entry or {}
+            cash_open = comps.get("cash_open")
+            fading = str(comps.get("trade_direction") or "continuation") == "fade"
             if isinstance(cash_open, (int, float)) and cash_open > 0 and snap.spot > 0:
-                if position.direction == "bullish" and snap.spot < float(cash_open):
-                    return ExitDecision(should_close=True, reason="momentum_lost")
-                if position.direction == "bearish" and snap.spot > float(cash_open):
-                    return ExitDecision(should_close=True, reason="momentum_lost")
+                # A continuation trade is long the day's direction, so a cross
+                # back through the open is the thesis gone. A fade is short it,
+                # so the same cross is the move fully given back: book it.
+                crossed = (
+                    position.direction == "bearish"
+                    if fading
+                    else position.direction == "bullish"
+                ) and snap.spot < float(cash_open)
+                crossed = crossed or (
+                    (position.direction == "bullish" if fading else position.direction == "bearish")
+                    and snap.spot > float(cash_open)
+                )
+                if crossed:
+                    reason = "fade_complete" if fading else "momentum_lost"
+                    return ExitDecision(should_close=True, reason=reason)
         return super().exit_criteria(snap, position)

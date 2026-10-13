@@ -109,12 +109,12 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
       set). A twin within ~0.1 PF of the gated default means that gate is
       not earning its place;
     * the GEOMETRY axis on the gated default — wing width, credit take, the
-      two exit clocks the reviewers disagreed on (flat before the close hump
-      vs hold to settlement), the condor form, and no credit stop (the wing
-      is the stop);
-    * the WINDOW axis — the afternoon-only entry window the first pre-screen
-      pointed at, gated and tape-only, so the gate is compared on the hours
-      where section G says it should matter.
+      two earlier exit clocks against the hold-to-cap default (flat at 15:05
+      before the close hump, flat at 15:40), the condor form, and no credit
+      stop (the wing is the stop);
+    * the WINDOW axis — the designers' original morning window (10:30-13:30
+      ET), gated and tape-only, against the afternoon default the pre-screen
+      pointed at.
     """
     grid: List[Tuple[str, Dict[str, Any]]] = [
         ("gated/default", {}),
@@ -139,19 +139,26 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
         grid.append((f"gated/wing{wing:g}", {"wing_sigma_mult": wing}))
     grid.append(("gated/take35", {"credit_take_frac": 0.35}))
     grid.append(("gated/exit15:05", {"eod_exit_buffer_minutes": 55}))
-    grid.append(("gated/hold_to_settle", {"eod_exit_buffer_minutes": 5}))
+    grid.append(("gated/flat15:40", {"eod_exit_buffer_minutes": 20}))
     grid.append(("gated/condor1.0", {"short_offset_sigma": 1.0, "wing_sigma_mult": 0.75}))
     grid.append(("gated/no_stop", {"credit_stop_mult": 0}))
-    # The afternoon window. The first pre-screen (section G, 2026-10-11) put
-    # the only statistically resolved premium and the whole long-gamma lean at
-    # the 13:30 slot, with 12:00 mixed and 10:30 flat-to-reversed, so the
-    # default 10:30-13:30 window spans all three. Entries 13:00-14:00 ET, held
-    # to 15:40; the tape-only twin runs the same window so the paired
-    # comparison exists there too. Re-set the bounds from the 13:30 and 14:30
-    # rows once the re-run pre-screen has them.
-    afternoon = {"min_minutes_since_open": 210, "min_minutes_to_close": 120}
-    grid.append(("gated/afternoon", dict(afternoon)))
-    grid.append(("twin/tail_only_afternoon", {**afternoon, "required_regimes": "any"}))
+    # The morning window the designers first chose (entries 10:30-13:30 ET).
+    # The pre-screen (section G, 2026-10-11 and -12) put the 0DTE premium at
+    # 13:30 and 14:30 and left the 10:30 and 12:00 straddles at or above fair
+    # pricing, so the catalog default moved to 13:00-14:30 and the morning
+    # runs here, gated and tape-only, so the screen shows it on its own.
+    morning = {"min_minutes_since_open": 60, "min_minutes_to_close": 150}
+    grid.append(("gated/morning", dict(morning)))
+    grid.append(("twin/tail_only_morning", {**morning, "required_regimes": "any"}))
+    # The one pre-screen cell where a richer straddle still underpriced the
+    # move was SPX short gamma at 12:00 (second run: 1.056 paid/charged,
+    # 5 of 18 beyond the wing). The mechanism says this arm loses there.
+    grid.append(
+        (
+            "twin/negative_gamma_morning",
+            {**morning, "required_regimes": ["negative_weak", "negative_strong"]},
+        )
+    )
     return grid
 
 
@@ -175,6 +182,26 @@ def close_momentum_grid() -> List[Tuple[str, Dict[str, Any]]]:
             )
     grid.append(("negative/debit/fhh", {"require_first_half_hour_agreement": True}))
     grid.append(("negative/debit/move0.75", {"min_day_move_sigma": 0.75}))
+    # The fade. Pre-screen section E (2026-10-12) showed the last hour
+    # reversing the day on this tape, 29% continuation under long gamma, so
+    # the mechanism-consistent trade on this data is the opposite of the
+    # papers' object: sell the day's move into the close when dealers are
+    # long gamma. The unconditional fade is its control.
+    grid.append(("positive/fade", {"required_gamma_sign": "positive", "trade_direction": "fade"}))
+    grid.append(("any/fade", {"required_gamma_sign": "any", "trade_direction": "fade"}))
+    # The gamma-blind, same-direction control: the structural gamma label at
+    # 15:00 largely says the day is up, so the fade under long gamma has to
+    # beat "fade up days" before it is read as dealer hedging.
+    grid.append(
+        (
+            "any/fade/up_days",
+            {
+                "required_gamma_sign": "any",
+                "trade_direction": "fade",
+                "required_day_direction": "up",
+            },
+        )
+    )
     return grid
 
 
