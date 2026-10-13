@@ -107,10 +107,11 @@ empty.
   ATM front straddle's mid divided by 0.798 (a straddle is worth ~E|Z|
   sigma), so wing width, flip clearance and exits all scale with what the
   market is pricing for the rest of the day, on SPY and SPX alike.
-- **Entry (13:00–14:30 ET, flat by 15:40), every gate a named `_skip`:**
-  the designers chose 10:30–13:30; the pre-screen's straddle table moved it
-  (§10, second run), and the morning window is the `gated/morning` sweep arm.
-  `window` ·
+- **Entry (10:30–13:30 ET, the pre-registered window), every gate a named
+  `_skip`:** the default was moved to 13:00–14:30 after the second pre-screen
+  run and reverted on 2026-10-13 because the move exceeded the
+  pre-commitment (§10); the afternoon window is `afternoon_iron_fly` and the
+  `gated/afternoon` sweep arm. `window` ·
   `no_straddle` / `no_sigma` · `regime` — `positive_strong` (top quartile of
   the symbol's own 30-day history; **fails closed** on a missing percentile,
   never the absolute fallback) · `tail_realized` — the trailing 30-bar
@@ -434,9 +435,10 @@ this branch and run in seconds to a minute.
    ```
    The fly's grid is `gated/default` against `twin/tail_only` (the primary
    comparison), `twin/clock_only`, `twin/negative_gamma`, `gated/band`,
-   `gated/uniform_gates`, the geometry arms and the morning pair
-   (`gated/morning` vs `twin/tail_only_morning`, the designers' original
-   window); the momentum bot's grid is `required_gamma_sign ∈ {negative, any,
+   `gated/uniform_gates`, the geometry arms and both window pairs
+   (`gated/morning` vs `twin/tail_only_morning`, `gated/afternoon` vs
+   `twin/tail_only_afternoon`, plus `twin/negative_gamma_morning`); the
+   momentum bot's grid is `required_gamma_sign ∈ {negative, any,
    positive}` × `structure ∈ {debit, credit}` plus the first-half-hour
    agreement, a higher move floor, and the fade arms (`positive/fade`,
    `any/fade`, `any/fade/up_days`). Read
@@ -512,12 +514,13 @@ this branch and run in seconds to a minute.
   depends on it: sections E and F scale by the prior session's `daily_atm_iv`
   after the first run came back with 29 sessions; the binding window is now
   the 95-day cash-bar read, about 63 sessions per symbol.
-- **The default window exceeds the pre-commitment.** §10's first-run item 7
-  decided only whether to keep the afternoon sweep arms, and item 6 said the
-  default stays 10:30–13:30. The default was moved to 13:00–14:30 after the
-  second run, on the best two of four slots. Reverting is two numbers in
-  `src/strategies/catalog.py` (`min_minutes_since_open` 210 → 60,
-  `min_minutes_to_close` 90 → 150) on both fly entries.
+- **The default window exceeded the pre-commitment, and was reverted.**
+  §10's first-run item 7 decided only whether to keep the afternoon sweep
+  arms, and item 6 said the default stays 10:30–13:30. The default was moved
+  to 13:00–14:30 after the second run, on the best two of four slots, and
+  reverted on 2026-10-13 at Michael's decision. `afternoon_iron_fly` keeps
+  the afternoon window, so the screen compares the two windows as two
+  entries and the sweep covers both windows for both.
 - **SPY and QQQ must flat before the bell when live.** SPXW is cash-settled
   on the 16:00 index, pays no closing commissions on expiring legs and has no
   pin risk, so holding to the cap is a legitimate SPX default. SPY and QQQ
@@ -820,10 +823,12 @@ nor the harness (15:55 cap) measures the settlement move (0.4–1.1 bps).
 
 **What changed in the branch because of the second run.**
 
-- The fly's default window is 13:00–14:30 ET. This is an in-sample choice of
-  which arm to paper-trade first and reverses item 6 of the first-run
-  reading; the morning window is the `gated/morning` arm, and the forward
-  test is afternoon vs morning paid/charged on the same live sessions (§9).
+- The fly's default window was moved to 13:00–14:30 ET on 2026-10-12 — an
+  in-sample choice that reversed item 6 of the first-run reading — and
+  reverted to the pre-registered 10:30–13:30 on 2026-10-13 at Michael's
+  decision. The afternoon window lives in `afternoon_iron_fly` and the
+  `gated/afternoon` arm; the forward test is afternoon vs morning
+  paid/charged on the same live sessions (§9).
 - Both flies hold to the harness cap; `gated/flat15:40` and `gated/exit15:05`
   are the earlier exits.
 - `afternoon_iron_fly` (§3.1b): the tape-only twin as its own entry, because

@@ -76,7 +76,7 @@ class LongGammaIronFly(ShortPremiumBot):
     direction_mode = "neutral"
     tagline = "Top-quartile long gamma, quiet tape. Sell the 0DTE straddle, wings on."
     description = (
-        "Sells a defined-risk 0DTE ATM iron butterfly between 13:00 and 14:30 ET "
+        "Sells a defined-risk 0DTE ATM iron butterfly between 10:30 and 13:30 ET "
         "only when dealer gamma is in the symbol's top quartile, the trailing "
         "realized move projected over the rest of the day is under what the ATM "
         "straddle charges for it, and no flip, VIX shock or scheduled release "

@@ -34,12 +34,13 @@ from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import OpenPosition
 from src.tradeworkz.registry import DEFAULT_ROSTER, get_bot_class, known_specs
 
-# Thursday 2026-08-06. The catalog window is 13:00-14:30 ET entries.
+# Thursday 2026-08-06. The gated fly's catalog window is 10:30-13:30 ET entries
+# (the pre-registered one); afternoon_iron_fly's is 13:00-14:30. 13:30 is inside both.
 PM_1330ET = datetime(2026, 8, 6, 17, 30, tzinfo=timezone.utc)  # 13:30 ET: 240 in, 150 to go
-MID_12ET = datetime(2026, 8, 6, 16, 0, tzinfo=timezone.utc)  # 12:00 ET: before the window
+MID_12ET = datetime(2026, 8, 6, 16, 0, tzinfo=timezone.utc)  # 12:00 ET: 150 in, 240 to go
 OPEN_0945ET = datetime(2026, 8, 6, 13, 45, tzinfo=timezone.utc)  # 09:45 ET
-LATE_1430ET = datetime(2026, 8, 6, 18, 30, tzinfo=timezone.utc)  # 14:30 ET: 90 to go, last entry
-LATE_1435ET = datetime(2026, 8, 6, 18, 35, tzinfo=timezone.utc)  # 14:35 ET: 85 to go, too late
+LATE_1430ET = datetime(2026, 8, 6, 18, 30, tzinfo=timezone.utc)  # 14:30 ET: 90 to go
+LATE_1435ET = datetime(2026, 8, 6, 18, 35, tzinfo=timezone.utc)  # 14:35 ET: 85 to go
 
 BOT_ID = "long_gamma_iron_fly"
 
@@ -171,15 +172,22 @@ def test_time_stop_never_reaches_the_settlement_window():
     assert sig is not None
     # (150 to close - 5 buffer) = 145 < max_hold 180 -> held to 15:55 ET, the harness cap
     assert sig.time_stop_at == PM_1330ET + timedelta(minutes=145)
-    # the last entry of the window holds 85 minutes to the same 15:55
+    # the afternoon fly's last entry (14:30) holds 85 minutes to the same 15:55
     bot_base.set_backtest_clock(lambda: LATE_1430ET)
     try:
-        bot = _bot()
+        bot = _bot("afternoon_iron_fly")
         sig = bot.open_criteria(_snap(timestamp=LATE_1430ET))
     finally:
         bot_base.set_backtest_clock(None)
     assert sig is not None, bot.miss_reasons
     assert sig.time_stop_at == LATE_1430ET + timedelta(minutes=90 - 5)
+    # an early entry is capped by max_hold (180) long before the bell
+    bot_base.set_backtest_clock(lambda: MID_12ET)
+    try:
+        sig = _bot().open_criteria(_snap(timestamp=MID_12ET))
+    finally:
+        bot_base.set_backtest_clock(None)
+    assert sig is not None and sig.time_stop_at == MID_12ET + timedelta(minutes=180)
     # the sweep's early-flat arm leaves at 15:40 instead
     bot_base.set_backtest_clock(lambda: PM_1330ET)
     try:
@@ -243,10 +251,14 @@ def _miss(bot, snap) -> str:
 
 
 def test_window_gates_both_ends():
-    assert _miss(_bot(), _snap(timestamp=OPEN_0945ET)) == "window"  # 15 min in
-    assert _miss(_bot(), _snap(timestamp=MID_12ET)) == "window"  # 150 in < 210
-    assert _miss(_bot(), _snap(timestamp=LATE_1435ET)) == "window"  # 85 to close < 90
-    assert _bot().open_criteria(_snap(timestamp=LATE_1430ET)) is not None  # 90 is the edge
+    assert _miss(_bot(), _snap(timestamp=OPEN_0945ET)) == "window"  # 15 min in < 60
+    assert _bot().open_criteria(_snap(timestamp=MID_12ET)) is not None  # 150 in, 240 to go
+    assert _miss(_bot(), _snap(timestamp=LATE_1430ET)) == "window"  # 90 to close < 150
+    # The afternoon fly's window is the complement: 13:00-14:30 entries.
+    pm = _bot("afternoon_iron_fly")
+    assert _miss(pm, _snap(timestamp=MID_12ET)) == "window"  # 150 in < 210
+    assert pm.open_criteria(_snap(timestamp=LATE_1430ET)) is not None  # 90 is the edge
+    assert _miss(_bot("afternoon_iron_fly"), _snap(timestamp=LATE_1435ET)) == "window"
 
 
 def test_needs_the_straddle_priced():
@@ -493,6 +505,9 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
         "gated/flat15:40",
         "gated/morning",
         "twin/tail_only_morning",
+        "gated/afternoon",
+        "twin/tail_only_afternoon",
+        "twin/negative_gamma_morning",
     } <= set(labels)
     specs = build_specs(base, grid)
     assert len({s.id for s in specs}) == len(specs)
@@ -509,13 +524,15 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
     cls = get_bot_class(base.strategy_class)
     assert cls(by["twin/clock_only"], ml_state=None).open_criteria(busy) is not None
     assert cls(by["gated/default"], ml_state=None).open_criteria(busy) is None
-    # The morning arms run the designers' original 10:30-13:30 ET window,
-    # gated and tape-only; the default (13:00-14:30) is a window miss at noon.
+    # Both windows run as arms: the afternoon arm is a window miss at noon,
+    # the morning arm (the gated fly's default) fires there.
+    assert by["gated/afternoon"].params["min_minutes_since_open"] == 210
+    assert by["twin/tail_only_afternoon"].params["required_regimes"] == "any"
     assert by["gated/morning"].params["min_minutes_since_open"] == 60
-    assert by["twin/tail_only_morning"].params["required_regimes"] == "any"
+    pm = cls(by["gated/afternoon"], ml_state=None)
+    assert _miss(pm, _snap(timestamp=MID_12ET)) == "window"
     am = cls(by["gated/morning"], ml_state=None)
     assert am.open_criteria(_snap(timestamp=MID_12ET)) is not None, am.miss_reasons
-    assert _miss(cls(by["gated/default"], ml_state=None), _snap(timestamp=MID_12ET)) == "window"
     # Every config keeps the shared defaults it did not override.
     assert all(s.params["credit_stop_mult"] in (0.5, 0) for s in specs)
     assert all(s.params["premium_stop_grace_seconds"] == 600 for s in specs)

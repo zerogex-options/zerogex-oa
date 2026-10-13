@@ -1164,14 +1164,16 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
         bot_class="LongGammaIronFly",
         params={
             **_SHORT_PREMIUM_PARAMS,
-            # Entries 13:00-14:30 ET, held to the harness cap. The designers
-            # chose 10:30-13:30; the pre-screen's straddle table (section G,
-            # two runs) put the 0DTE premium at 13:30 and 14:30 and left the
-            # 10:30 and 12:00 straddles at or above fair pricing, so the
-            # morning window is a sweep arm (gated/morning) instead. This is
-            # an in-sample choice of which arm to paper-trade first.
-            "min_minutes_since_open": 210,
-            "min_minutes_to_close": 90,
+            # Entries 10:30-13:30 ET, the pre-registered window, held to the
+            # harness cap. The pre-screen's straddle table (section G, two
+            # runs) put the 0DTE premium at 13:30 and 14:30 and left the
+            # 10:30 and 12:00 straddles at or above fair pricing; the default
+            # was moved to the afternoon on 2026-10-12 and reverted on
+            # 2026-10-13 (Michael's call) because the move exceeded the
+            # pre-commitment. The afternoon window is afternoon_iron_fly and
+            # the gated/afternoon sweep arm.
+            "min_minutes_since_open": 60,
+            "min_minutes_to_close": 150,
             "max_hold_minutes": 180,
             "required_regimes": ["positive_strong"],
             "regime_fail_closed": True,

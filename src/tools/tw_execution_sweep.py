@@ -112,9 +112,9 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
       two earlier exit clocks against the hold-to-cap default (flat at 15:05
       before the close hump, flat at 15:40), the condor form, and no credit
       stop (the wing is the stop);
-    * the WINDOW axis — the designers' original morning window (10:30-13:30
-      ET), gated and tape-only, against the afternoon default the pre-screen
-      pointed at.
+    * the WINDOW axis — the morning (10:30-13:30 ET) and afternoon
+      (13:00-14:30) entry windows, each gated and tape-only, so the two flies
+      are compared on both windows in one pass.
     """
     grid: List[Tuple[str, Dict[str, Any]]] = [
         ("gated/default", {}),
@@ -142,14 +142,16 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
     grid.append(("gated/flat15:40", {"eod_exit_buffer_minutes": 20}))
     grid.append(("gated/condor1.0", {"short_offset_sigma": 1.0, "wing_sigma_mult": 0.75}))
     grid.append(("gated/no_stop", {"credit_stop_mult": 0}))
-    # The morning window the designers first chose (entries 10:30-13:30 ET).
-    # The pre-screen (section G, 2026-10-11 and -12) put the 0DTE premium at
-    # 13:30 and 14:30 and left the 10:30 and 12:00 straddles at or above fair
-    # pricing, so the catalog default moved to 13:00-14:30 and the morning
-    # runs here, gated and tape-only, so the screen shows it on its own.
+    # Both entry windows, gated and tape-only, so whichever fly runs the
+    # sweep covers the other window. The gated fly's catalog default is the
+    # pre-registered morning (10:30-13:30 ET); afternoon_iron_fly's is the
+    # afternoon (13:00-14:30) the pre-screen's straddle table pointed at.
     morning = {"min_minutes_since_open": 60, "min_minutes_to_close": 150}
+    afternoon = {"min_minutes_since_open": 210, "min_minutes_to_close": 90}
     grid.append(("gated/morning", dict(morning)))
     grid.append(("twin/tail_only_morning", {**morning, "required_regimes": "any"}))
+    grid.append(("gated/afternoon", dict(afternoon)))
+    grid.append(("twin/tail_only_afternoon", {**afternoon, "required_regimes": "any"}))
     # The one pre-screen cell where a richer straddle still underpriced the
     # move was SPX short gamma at 12:00 (second run: 1.056 paid/charged,
     # 5 of 18 beyond the wing). The mechanism says this arm loses there.
