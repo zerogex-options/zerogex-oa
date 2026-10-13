@@ -115,6 +115,7 @@ namespace NinjaTrader.NinjaScript
         public ISeries<double> High { get; protected set; }
         public ISeries<double> Low { get; protected set; }
         public ISeries<double> Close { get; protected set; }
+        public ISeries<DateTime> Time { get; protected set; }
 
         protected virtual void OnStateChange() { }
         protected virtual void OnBarUpdate() { }
