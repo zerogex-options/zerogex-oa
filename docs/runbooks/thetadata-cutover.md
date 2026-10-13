@@ -1,6 +1,6 @@
 # Cutting production over to ThetaData
 
-Decided 2026-10-13. Rehearse Wednesday 15 October, rehearse Friday 16 October
+Decided 2026-10-13. Rehearse Wednesday 14 October, rehearse Friday 16 October
 (monthly OPEX), **cut over before the open on Monday 19 October**. Paths assume
 the standard deploy root `/home/ubuntu/zerogex-oa`.
 
