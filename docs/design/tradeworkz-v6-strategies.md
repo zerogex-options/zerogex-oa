@@ -382,10 +382,15 @@ this branch and run in seconds to a minute.
    whole file runs in a few minutes — run it under `tmux` or `nohup ... |
    tee` so an SSH drop does not lose the output). The window is anchored
    (defaults reproduce the 2026-10-12 run); `START=YYYY-MM-DD END=YYYY-MM-DD`
-   override it, and **`START=2026-04-20 END=2026-07-10` is a holdout no
-   reading in this doc has seen** — the one pre-screen-level out-of-sample
-   check available before paper trading, if `underlying_quotes` and
-   `gex_summary` reach back that far. It answers:
+   override it. **The holdout lives in section H only:** `underlying_quotes`
+   and `gex_summary` are pruned at `DATA_RETENTION_DAYS` (90), so on
+   `START=2026-04-20 END=2026-07-10` sections E–G see about 8 sessions and
+   are noise; section H rebuilds the straddle test from the retention-exempt
+   chain archive alone (spot by put-call parity on the 0DTE chain), with no
+   gamma sign, so it tests the unconditional premium by slot and the
+   richness cut — `afternoon_iron_fly`'s hypothesis. Run H on the default
+   window first; if it agrees with G there, H on the holdout is credible. It
+   answers:
    - whether the morning forecast's `expected_vol_ratio` carries skill
      (Spearman vs the realized receipt, per symbol) — if rho is ~0 the
      forecast gates are noise and only the raw-VRP control is worth running;
@@ -540,6 +545,11 @@ this branch and run in seconds to a minute.
   of credit), so the harness overstates entry friction by roughly the size
   of the fly's computed edge (~0.7–0.9 bps) and cannot resolve PF 1.0 from
   1.15. Only live paper fills settle it.
+- **A gamma sign for the holdout.** Nothing retention-exempt carries a
+  per-session gamma sign before 2026-07-10, so section H cannot test the
+  gate out of sample. `level_history` reads `net_gex_at_spot` at the session
+  close for its write-ups but does not persist it; a one-row-per-session
+  table of the close read would make the gate testable on the archive.
 - **A 0DTE-book gamma sign for the pre-screen.** `gex_summary.net_gex_at_spot`
   is the DTE-weighted structural read (§10, item 4). `gex_by_strike` carries
   per-strike net GEX with an `expiration_bucket`, so a same-day-bucket net
@@ -839,8 +849,18 @@ nor the harness (15:55 cap) measures the settlement move (0.4–1.1 bps).
 - Pre-screen: E2 (day direction), F's morning range, G's 13:00 slot (the new
   window's start was not measured), straddle set built once.
 
+**Holdout attempt (2026-10-13).** `START=2026-04-20 END=2026-07-10` found 8
+sessions per symbol in every section: the cash bars and `gex_summary` are
+pruned at 90 days, so the run covered only 2026-07-01 to 07-09 and is a
+sliver, not a holdout. For the record, on those 8 sessions the pooled
+straddle paid 0.63 / 0.68 / 0.55 of what it charged at 13:00 / 13:30 /
+14:30 (+9.5 / +9.4 / +9.7 bps, 0–1 wing breaches of 24) against 0.84 at
+10:30 — the same direction as the main window in a quiet early-July tape,
+and nothing to score. Section H (archive-only, spot by put-call parity) is
+the holdout that can actually run.
+
 **Pre-committed readings for the third run (anchored window, then the
-2026-04-20 → 2026-07-10 holdout).**
+2026-04-20 → 2026-07-10 holdout via section H).**
 
 - G2: dealer hedging requires the long-gamma row ≥ 0.10 below the
   symbol-slot all-sessions row inside BOTH the up-day and the down-day rows
@@ -858,5 +878,11 @@ nor the harness (15:55 cap) measures the settlement move (0.4–1.1 bps).
 - F: long-gamma mornings larger than short-gamma mornings (am_ratio) confirm
   the afternoon compression is partly a within-day budget effect; F counts as
   mechanism only if the afternoon gap survives G2's direction split.
+- H on the default window must agree with G within ~0.03 on the pooled
+  paid/charged at every shared slot (same sessions, parity spot vs bar
+  spot); if it does not, fix H before reading the holdout. H on the holdout
+  then keeps `afternoon_iron_fly` as the lead only if the pooled 13:00–14:30
+  paid/charged stays ≤ 0.80 with positive seller bps on SPX and SPY; a
+  holdout at or above 0.85 says the main window was one quiet quarter.
 - No further default or window change from G2/G3/E2. The gate decision
   belongs to the screen's paired twin comparison and to live paper trading.
