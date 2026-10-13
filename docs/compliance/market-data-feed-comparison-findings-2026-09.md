@@ -881,12 +881,15 @@ one starts.
 *Added 2026-10-12, revised the same evening on full-session data. Arm C:
 ThetaData Market Value + tick test, against production.*
 
-> **REVISED.** The first version of this finding was written on the truncated
-> morning window (see the correction at the top of F12) and reported SPY's share
-> of flipped flow going 15.8% to 34.5% — a doubling, called a possible crisis.
-> On the full session the move is **16.5% to 23.7%**, and the morning window had
-> overstated that delta by a factor of 2.6. Both arms were re-measured from rows
-> already in the rehearsal database. The numbers below are the full session.
+> **REVISED TWICE on 2026-10-12, both times downward in confidence about my own
+> reading.** First version: written on the truncated morning window (see the
+> correction at the top of F12), it reported SPY's share of flipped flow going
+> 15.8% to 34.5% — a doubling, called a possible crisis. On the full session the
+> move is **16.5% to 23.7%**; the morning window had overstated that delta by a
+> factor of 2.6. Second version: it named polling density as the leading cause,
+> on row counts taken from an unbounded window. Measured inside the cash session
+> the density is identical, and the hypothesis is refuted — see below. What
+> remains is the feed or the day, with no variance estimate to tell them apart.
 
 ### What was open
 
@@ -950,39 +953,97 @@ adding noise rather than an opinion, but one session per arm cannot separate
 that from day-to-day variation, and these buckets are autocorrelated within a
 symbol, so no significance is claimed.
 
-### The confound to rule out first, and the evidence for it
+### The polling-density confound — RAISED AND REFUTED, same evening
 
-The rehearsal polled SPY 8.7% less densely than production (343,945 rows against
-376,568) and QQQ 9.5% less densely, for near-identical volume. Fewer polls mean
-larger per-delta volume chunks and fewer distinct trade prices, and the tick
-test reads a SEQUENCE of prices — so sparser polling leaves more zero ticks
-inheriting a carried direction. That is a property of the RUN, not the feed.
+The first version of this finding named polling density as the leading
+explanation: the rehearsal appeared to have written 8.7% fewer SPY rows and 9.5%
+fewer QQQ rows than production for near-identical volume, and since the tick
+test reads a SEQUENCE of trade prices, sparser polling would leave more zero
+ticks inheriting a carried direction — a property of the run, not the feed.
 
-**The internal evidence supports it.** SPX was the one symbol that polled at
-production density or better (545,819 rows against 544,579), and SPX is the one
-symbol whose sign agreement did not move at all — 66.4% on both arms. The two
-symbols that polled sparser are the two whose agreement fell.
+**Those row counts were wrong, and wrong in a way worth recording.** They came
+from `make shadow-compare`, whose coverage query has **no upper time bound and
+starts at midnight ET**. Production runs 24×5, so it holds overnight and
+after-hours rows; the rehearsal started at 08:38. The entire 8.7% was rows
+outside the cash session. The same window's own output shows it — production's
+SPY `first_et` reads `00:00:00` against the rehearsal's `09:30:00` — and it was
+quoted anyway.
 
-It is not a clean fit: SPY's row shortfall (8.7%) is smaller than QQQ's (9.5%)
-yet SPY degraded more, so density alone does not order the three. Treat it as
-the leading candidate, not the answer.
+Measured properly, inside the 09:30–16:00 ET window the comparison actually
+uses, polls per contract are:
 
-**The decisive check**, and it needs no new market day and no feed connection:
-compare polls-per-contract per symbol across both days and both databases. If
-arm B also polled sparsely on SPY and QQQ yet held its agreement, density is not
-the explanation and the feed is. Arm B's row counts were never recorded; the
-rows are still there.
+| | arm B (2026-10-09) | arm C (2026-10-12) |
+|---|---|---|
+| SPY, rehearsal vs production | 358.4 vs 358.2 (+0.1%) | 364.2 vs 367.0 (−0.8%) |
+| QQQ, rehearsal vs production | 370.6 vs 370.6 (0.0%) | 377.6 vs 377.0 (+0.2%) |
+| SPX, rehearsal vs production | 340.7 vs 336.8 (+1.2%) | 361.1 vs 361.1 (0.0%) |
+| NDX, rehearsal vs production | 325.2 vs 322.3 (+0.9%) | — |
+
+**Every symbol on both days polled within 1.2% of production.** There is no
+density difference to explain anything. Two further points finish it off: arm C
+polled SPY 1.6% MORE densely than arm B (364.2 against 358.4), which is the
+wrong direction; and the supporting correlation claimed in the first version —
+"SPX was the one symbol that polled at production density and the one symbol
+whose agreement did not move" — was vacuous, because all three symbols polled at
+production density. There was no variation to correlate with.
+
+### What that leaves, and the measurement that is actually missing
+
+With density gone, SPY's +7.2pp is the feed **or the day**, and the two cannot
+be separated from what has been run. Arm B is 2026-10-09 and arm C is
+2026-10-12: different market days, one measurement each.
+
+**There is no day-to-day variance estimate for this bucket-level comparison**,
+so a 7-point difference between two single-day arms is not yet interpretable in
+either direction. That is the same gap F11 was built to close for snapshots —
+`--self-control` exists precisely because a cross-feed number means nothing
+without a floor under it — and this finding walked into it again one level up.
+It is recorded here rather than resolved because resolving it needs a market
+day, not an argument.
+
+Weak evidence against a large day effect, not enough to lean on: SPX's sign
+agreement was **66.4% on both days**, on two different feeds. Something that
+moved SPY by 7 points day-to-day might be expected to move SPX too.
+
+**The clean design, and it needs one day rather than two.** Run both arms
+simultaneously against the same market, into two rehearsal databases, both on
+the tick test:
+
+```bash
+make shadow-pgpass SHADOW_DB=zerogex_shadow_ts
+make shadow-create SHADOW_DB=zerogex_shadow_ts
+
+# TradeStation arm (method only) -- repeats arm B
+SHADOW_LOG=~/shadow-ts-$(date +%F).log make shadow-run \
+    SHADOW_DB=zerogex_shadow_ts SHADOW_PROVIDER=tradestation FLOW_CLASSIFIER=tick
+
+# ThetaData arm (method + feed) -- repeats arm C
+SHADOW_LOG=~/shadow-td-$(date +%F).log make shadow-run \
+    SHADOW_DB=zerogex_shadow FLOW_CLASSIFIER=tick
+```
+
+Then `make shadow-compare-flow SHADOW_DB=...` once per rehearsal database. The
+difference between the two results is the feed, with the day held fixed. This is
+within the single ThetaData MDDS connection — only one consumer of that feed —
+and the TradeStation side is the same two-consumer arrangement arm B already
+ran. `make shadow-stop SHADOW_DB=...` stops one arm without touching the other,
+since it selects on `DB_NAME`.
 
 ### Status
 
-- **The feed is not disqualifying.** A few points of flipped flow per symbol,
-  overall sign agreement unchanged, no systematic direction. F11 broadly holds.
-- **SPY: open**, pending the polling-density check. +7.2pp on the most liquid
-  symbol, cause not established.
-- QQQ, SPX: small, expected movements.
+- **Nothing here disqualifies the feed**, and nothing here clears it either. A
+  few points of flipped flow per symbol with overall sign agreement unchanged is
+  a small effect, but it is measured across two different days with no estimate
+  of how much this figure moves day-to-day, so its size is not established.
+- **SPY: open.** +7.2pp on the most liquid symbol, which is the wrong shape for
+  the carried-direction story. Density is ruled out. Feed and day are
+  unseparated.
+- QQQ +3.4pp, SPX +2.9pp: small, and SPX's sign agreement did not move at all.
 - NDX: no data (F13).
 - First full-session end-to-end run of ThetaData through the production write
-  path: clean.
+  path: clean. That much is settled.
+- **Blocking the flow half of the cutover decision: one same-day two-arm
+  session.** Not a vendor question and not an argument — a market day.
 
 ### What this does not cover
 
@@ -1089,17 +1150,21 @@ afterwards and append the result here rather than holding the cutover for it.
   the rehearsal database. Coverage turned out complete on both. The morning
   window had overstated SPY's arm-B-to-arm-C degradation by 2.6x, which is the
   one conclusion it materially changed.
-- **SPY's share-of-flow under the feed change (F14) — OPEN, cause not
-  established.** 16.5% to 23.7% between arm B and arm C, with sign agreement
-  down 6.7 points, against +3.4pp on QQQ and +2.9pp on SPX. Modest in absolute
-  terms, but concentrated on the thickest symbol, which is the opposite of the
-  carried-direction story. Leading candidate is polling density rather than the
-  feed: the rehearsal wrote 8.7% fewer SPY rows for the same volume, and SPX —
-  the one symbol that polled at production density — is the one symbol whose
-  sign agreement did not move at all. **Next step: compare polls-per-contract
-  per symbol across both days and both databases.** No new market day and no
-  feed connection needed; arm B's row counts were never recorded but the rows
-  are still there.
+- **SPY's share-of-flow under the feed change (F14) — OPEN, and the blocker is a
+  market day.** 16.5% to 23.7% between arm B and arm C, sign agreement down 6.7
+  points, against +3.4pp on QQQ and +2.9pp on SPX. Polling density was raised as
+  the cause and is **refuted**: inside the cash session every symbol on both days
+  polled within 1.2% of production, and arm C polled SPY 1.6% more densely than
+  arm B. What remains is the feed or the day, and the two arms are different days
+  with one measurement each, so there is no day-to-day variance estimate to tell
+  them apart. **Next step: one session running both arms simultaneously into two
+  rehearsal databases** (commands in F14), which holds the day fixed and fits
+  inside the single ThetaData connection.
+- **Row counts must come from a bounded window.** `make shadow-compare` starts at
+  midnight ET with no upper bound, and production runs 24×5 while a rehearsal
+  starts in the morning, so its row counts are not comparable between the two and
+  must never be read as polling density. That mistake produced and then had to
+  retract F14's first explanation. The cash-session query is in F14.
 - **NDX is unentitled on ThetaData (F13) — OPEN, raised 2026-10-12.** The NASDAQ GIDS index
   level is refused, so there is no NDX spot and therefore no NDX chain. Absent, not degraded.
   The NDX options chain has never been reached, so its entitlement is still unknown. Stacks on
