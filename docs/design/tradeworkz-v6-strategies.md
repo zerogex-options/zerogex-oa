@@ -130,9 +130,14 @@ empty.
   credit (base-class credit branch), plus invalidations that close regardless
   of P&L — `regime_lost` (net gamma turns negative; only when the regime gate
   is on), `flip_entered` (a flip within half a sigma of the strike),
-  `short_touched`, `vol_shock` — and a time stop 20 minutes before the bell.
-  Never holds the short straddle into the settlement window by default; the
-  `gated/hold_to_settle` arm does.
+  `short_touched`, `vol_shock` — and a time stop at the harness cap
+  (15:55 ET). The first draft went flat at 15:40; the market-maker review of
+  the second pre-screen showed that buys back about half of a 14:30
+  straddle's value plus four legs of friction, and that on a pinned tape the
+  50% credit take cannot fire before ~15:45, so the early flat was the
+  winning exit and the costliest one. `gated/flat15:40` and `gated/exit15:05`
+  keep the earlier exits measurable. SPY/QQQ pin risk at the bell is a
+  live-trading concern the paper harness does not model.
 - **What the review changed before the first screen:**
   - *Convention.* The first draft compared a realized vol annualized on RTH
     minutes (sqrt(252·390)) with an ATM IV annualized on calendar seconds
@@ -190,6 +195,23 @@ empty.
   prior for the gated arm: PF 1.0–1.2, with the failure mode being three to
   five afternoon trend days in 80 sessions landing in one half of the split.
 
+### 3.1b Afternoon Iron Butterfly — `afternoon_iron_fly`
+
+The tape-only twin of §3.1 as its own catalog entry (class
+`AfternoonIronFly`, a thin subclass of the same engine): entries 13:00–14:30
+ET, the quiet-tape gate (`max_realized_over_straddle` 0.85), **no gamma
+gate**, held to the harness cap. It exists because two pre-screen runs (§10)
+put the 0DTE straddle paying out about 70% of what it charged at 13:30 and
+14:30 on all three symbols while the long-gamma split did not carry from
+13:30 to 14:30 on the same sessions, so the best-supported hypothesis is the
+clock plus the quiet tape, and the gated fly is the test of the gate. The
+afternoon case is cost structure, not more premium: the naked seller's gross
+edge in bps of spot is about the same at 10:30 and 14:30, but the straddle is
+half the size, so wings and slippage consume less of it. Fixed commissions
+cut the other way, which is why SPX is the instrument. Same sweep grid as
+§3.1 (the `twin/*` arms are no-ops for it; the geometry and window arms are
+not).
+
 ### 3.2 Hedging-Demand Close Momentum — `hedging_demand_close_momentum`
 
 **Not reviewed by the adversarial panel** (§2). The design stands on the two
@@ -220,11 +242,15 @@ papers and the brief.
   open) and a 60% premium stop as the only early exits.
 - **The fade (`trade_direction: "fade"`):** sells the day's move instead.
   The pre-screen's cash-tape table (§10, second run) showed the last hour
-  REVERSING the day on this tape, most under long gamma, which is what
-  dealers long gamma hedging into the close would do. Sweep arms
-  `positive/fade` (long gamma) and `any/fade` (unconditional); a fade's
-  cross back through the open books as `fade_complete`. The continuation
-  default stays so the screen records the papers' object on its own.
+  reversing the day on this tape — a post-hoc hypothesis from 53 rows, not a
+  finding, and the reversal is tape-wide with the long-gamma rows inheriting
+  it. The 15:00 gamma label is the structural read and largely says the day
+  is up, so the fade under long gamma (`positive/fade`) has to beat the same
+  fade cut by day direction (`any/fade/up_days`, via
+  `required_day_direction`) and the unconditional fade (`any/fade`) before
+  it is read as dealer hedging. A fade's cross back through the open books
+  as `fade_complete`. The continuation default stays so the screen records
+  the papers' object on its own.
 - **Prior:** honest read is `insufficient`. The effect is real but small
   (single-digit bps on average); the gamma conditioning multiplies it. The
   cash-tape pre-test in §7 step 1 (section E) answers most of this before an
@@ -376,11 +402,12 @@ this branch and run in seconds to a minute.
    `gradient_weak_long` vs `gradient_weak_short`.
 4. **The v6 screen**, gated bots and their twins in one pass:
    ```
-   make tradeworkz-backtest ARGS="--days 90 --interval-min 5 --bots long_gamma_iron_fly,hedging_demand_close_momentum --json"
+   make tradeworkz-backtest ARGS="--days 90 --interval-min 5 --bots afternoon_iron_fly,long_gamma_iron_fly,hedging_demand_close_momentum --json"
    ```
    and the controls through the execution sweep, which picks its grid from
    the bot's class and scores every config on a train/test split:
    ```
+   python -m src.tools.tw_execution_sweep --bot afternoon_iron_fly --days 90
    python -m src.tools.tw_execution_sweep --bot long_gamma_iron_fly --days 90
    python -m src.tools.tw_execution_sweep --bot hedging_demand_close_momentum --days 90
    ```
@@ -390,8 +417,8 @@ this branch and run in seconds to a minute.
    (`gated/morning` vs `twin/tail_only_morning`, the designers' original
    window); the momentum bot's grid is `required_gamma_sign ∈ {negative, any,
    positive}` × `structure ∈ {debit, credit}` plus the first-half-hour
-   agreement, a higher move floor, and the two fade arms (`positive/fade`,
-   `any/fade`). Read
+   agreement, a higher move floor, and the fade arms (`positive/fade`,
+   `any/fade`, `any/fade/up_days`). Read
    the `twin/*` rows against `gated/default` **on the gated bot's sessions**:
    that paired comparison is the whole experiment.
 5. **Read the verdicts the way the catalog does.** `edge` needs PF ≥ 1.1,
@@ -410,9 +437,11 @@ this branch and run in seconds to a minute.
   this tape, gate or no gate. A long-gamma advantage that appears only in
   the up-day rows of G2, or that the cheap-straddle half of G3 matches,
   retires the mechanism reading: the gate is then a proxy for day direction
-  or a quiet tape. **Status after the first run (§10): insufficient** — the
-  margin clears 0.10 at one slot of three on SPY and SPX only, and no split
-  row has 40 sessions.
+  or a quiet tape. **Status after two runs (§10): insufficient, leaning
+  "diagnostic"** — the 13:30 margins (0.13 / 0.11 / 0.07) shrank to 0.05 /
+  0.01 / 0.03 at 14:30 on the same sessions and nearly identical labels, no
+  split row has 40 sessions, and the mean long-vs-all margin over all twelve
+  symbol × slot cells is −0.02.
 - **Long-gamma fly, on the screen:** `no-edge` (n ≥ 20, PF < 1.0) retires the
   gamma-gated hypothesis for this tuning generation. The tape-only twin
   within 0.1 PF of the gated bot on the paired sessions means the gate adds
@@ -424,9 +453,13 @@ this branch and run in seconds to a minute.
   sessions and 10–12 short-gamma ones are all a 63-session window yields,
   and a 52%-on-30 test cannot separate 50% from the published mid-50s. The
   kill before the screen is therefore: pooled short-gamma continuation at or
-  below 50% with the long-gamma rows no worse, on the re-run. On the
-  screen, the negative-gamma arm must beat the `"any"` arm by ≥ 0.1 PF or
-  the Baltussen conditioning is not present on this data.
+  below 50% with the long-gamma rows no worse, on the re-run. **Status after
+  the second run (§10): no support, not a kill** — short gamma 45% meets the
+  first clause, but long gamma at 29% is worse, so the differential runs in
+  the Baltussen direction (Fisher p 0.26) and the rule's second clause is
+  not met. On the screen, the negative-gamma arm must beat the `"any"` arm
+  by ≥ 0.1 PF or the Baltussen conditioning is not present on this data; the
+  fade arms are read the same way against `any/fade` and `any/fade/up_days`.
 - **Gradient re-screen:** `insufficient` on 90 days means the regime the
   pattern's 33 trades came from is episodic; that is a sample statement, not
   a verdict. `no-edge` on n ≥ 20 for the fidelity run is a verdict on the bot
@@ -458,6 +491,19 @@ this branch and run in seconds to a minute.
   depends on it: sections E and F scale by the prior session's `daily_atm_iv`
   after the first run came back with 29 sessions; the binding window is now
   the 95-day cash-bar read, about 63 sessions per symbol.
+- **Paper-trade the morning window beside the afternoon.** The default
+  window was chosen on the same sessions the screen runs on, so the screen
+  cannot adjudicate it. The forward test is afternoon vs morning paid/charged
+  on the same live sessions (about 60 sessions resolve a 0.15 difference at
+  2 SE). The roster takes one spec per catalog entry, so running the morning
+  window live needs either a thin `MorningIronFly` entry or roster support
+  for param variants of one class. Not built here.
+- **Fill realism.** The harness fills each leg at bid × 0.98 / ask × 1.02,
+  about 8–9% of an SPX fly's credit off package mid. A desk fills a routine
+  SPX 0DTE ATM fly at 13:00–14:30 near package mid minus $0.10–0.25 (1–2.5%
+  of credit), so the harness overstates entry friction by roughly the size
+  of the fly's computed edge (~0.7–0.9 bps) and cannot resolve PF 1.0 from
+  1.15. Only live paper fills settle it.
 - **A 0DTE-book gamma sign for the pre-screen.** `gex_summary.net_gex_at_spot`
   is the DTE-weighted structural read (§10, item 4). `gex_by_strike` carries
   per-strike net GEX with an `expiration_bucket`, so a same-day-bucket net
@@ -615,3 +661,120 @@ contiguous window is one vol regime, the two-sided-quote rule may drop busy
 sessions, and the screen's `twin/tail_only` row against `gated/default` on
 the same sessions, then the afternoon pair against each other, are the next
 reading.
+
+### Second run (2026-10-12), after the E/F scale fix and the 14:30 slot
+
+Four adversarial reviewers and a completeness critic read this run against
+the author's first reading; the corrections are folded in. G2 and G3 did not
+print (the SSH session dropped while they re-scanned the chains; section G
+now builds its straddle set once).
+
+**E — last-hour momentum, 53 qualifying symbol-sessions on ~63 sessions.**
+Continuation 19 of 53 (36%; nominal two-sided p 0.05, about 1.4 SE on the
+~25 effectively independent days once SPY/SPX and QQQ's correlation are
+counted; Wilson interval 24–49%), mean −4.6 bps in the day's direction. The
+reversal is tape-wide: every all-sessions row is negative (QQQ −10.5, SPX
+−1.3, SPY −2.4 bps). Under the 15:00 gamma label, long gamma continued 9 of
+31 (29%) and short gamma 10 of 22 (45%, −2.9 bps n-weighted, bimodal: QQQ 1
+of 8 at −12.2 bps, SPX 5 of 6 at +4.7, SPY 4 of 8 at +0.8). The short-minus-
+long differential of +16 points runs in the Baltussen direction (Fisher p
+0.26 pooled; SPX 0.06; reversed on QQQ), so §8's two-clause kill does **not**
+fire: status is no support, not a kill. The 15:00 label is the structural
+gamma read (item 4 above), so "long gamma reverses" is equally "up days fade
+into the close"; the re-run's E2 splits by day direction. The fade arm added
+to the momentum bot is a post-hoc hypothesis from these 53 rows and is read
+only against `any/fade` and `any/fade/up_days`.
+
+**F — realized range by gamma sign, 66 sessions per symbol.** The afternoon
+(12:00–16:00) range is lower under long gamma at noon on all three symbols:
+means 0.277 vs 0.347 (QQQ), 0.291 vs 0.377 (SPX), 0.292 vs 0.336 (SPY), i.e.
+13–23% lower; against the all-sessions row the long-gamma afternoon is
+0.89–0.92×, the only footing comparable to the MSI excursion ratios. With a
+range coefficient of variation of 0.4–0.5 the gaps are 1.1–1.4 (SPY),
+1.8–2.3 (QQQ) and 2.1–2.6 (SPX) standard errors on one effective
+observation. But the full-day means are flat (0.0% / −1.0% / +4.4%) while
+the afternoons are lower, so sessions labeled long gamma at noon had
+**bigger mornings** (35–59% more range before noon): the label co-varies
+with the morning's realized path, a within-day budget confound distinct from
+day direction and IV level. On QQQ the full-day median is as much lower
+(18%) as the afternoon (20%), the quiet-tape proxy G3 is meant to test. The
+re-run prints the 09:30–12:00 range beside the afternoon's. Thesis direction,
+not yet evidence about dealer hedging.
+
+**G — the straddle, 51 sessions per symbol per slot, 14:30 added.** Pooled
+paid/charged 0.851 / 0.897 / 0.710 / 0.701 at 10:30 / 12:00 / 13:30 / 14:30;
+seller's gross edge at bid 5.6 / 2.8 / 5.9 / 5.4 bps of spot. Three things:
+
+1. **The afternoon edge is a ratio effect, not more dollars.** The seller
+   banks about the same bps at 10:30 and 14:30; the ratio falls because the
+   straddle is half the size (charged ~35 → ~17.5 bps of spot). The case for
+   the afternoon is cost structure: wings and slippage scale with the
+   straddle, so ~15% of a 35-bp straddle consumes the whole 10:30 edge
+   while ~15% of a 17.5-bp straddle leaves ~2.8 bps. Fixed commissions cut
+   the other way. The mechanism is an implied intraday variance profile
+   flatter than the realized U-shape (F: the afternoon holds 0.57–0.62 of
+   the day's range against 0.78 under a flat profile), not theta.
+2. **Two slots are a third of a replication.** 13:30 and 14:30 are the same
+   sessions settling to the same 15:55 print and share ~57% of their
+   variance; 14:30 inherits about half of 13:30's best-of-three selection
+   optimism, and the pre-committed "≤ 0.75" rule had only 30–48% power to
+   reject the one-slot-fluctuation alternative it was written to exclude.
+   The afternoon average (0.706) sits 2.5–3.1 SE below the published 0.875
+   and the morning-vs-afternoon contrast is ~2.4 SE; net of selection, call
+   the afternoon richness suggestive at 1.5–2 SE, on one vol regime.
+3. **The gate did not carry from 13:30 to 14:30.** Long-vs-all margins
+   0.131 / 0.109 / 0.067 (SPY / SPX / QQQ) at 13:30 became 0.054 / 0.014 /
+   0.029 at 14:30 on nearly identical labels (SPY 21/30 → 20/31 long/short,
+   SPX 32/19 → 32/19, QQQ 27/24 → 30/21); long-minus-short z fell from
+   −1.8 / −2.0 / −1.0 to −0.8 / −0.3 / −0.5, and SPY's 14:30 median and bps
+   favor short gamma. A positioning effect real at 13:30 should have shown
+   in the 57% of variance the two slots share; it did not. Over all twelve
+   symbol × slot cells the mean long-vs-all margin is −0.023. By §8's letter
+   the gate is insufficient; the weight of evidence leans "diagnostic".
+
+**Fly economics, corrected by the market-maker review.** The straddle is
+18–23% smaller at 14:30 than at 13:30; the seller's bps are flat on SPY and
+QQQ and a third lower on SPX (within ~1 SE). An ungated SPX fly held to 15:55
+with harness fills computes to about +1.4 bps (~$105 per contract at the
+table-implied ~7,400 spot) at 13:30 and +0.8 bps (~$60) at 14:30, before
+$6–10 of commissions, each under 1.5 SE from zero; SPY at 14:30 about +3
+bps (~$23 gross; the $1 grid rounds its wing to $2 = 1.24σ at that straddle,
+not to one strike). The harness fills each leg at bid × 0.98 / ask × 1.02,
+about 8–9% of the credit off package mid, where a desk would fill a routine
+SPX 0DTE ATM fly near mid minus $0.10–0.25: the harness overstates entry
+friction by ~0.7–0.9 bps, the size of the computed edge, so the screen
+cannot resolve PF 1.0 from 1.15. **The 15:40 time stop was the fly's most
+expensive exit:** from 14:30 it buys back 45–60% of a still-ATM straddle's
+value plus four legs of friction, and on a pinned tape the 50% credit take
+cannot fire before ~15:45, so the time stop was the winning exit and cost
+1.2–2.3 bps on the 14:30 row, more than the edge. Neither G (15:55 print)
+nor the harness (15:55 cap) measures the settlement move (0.4–1.1 bps).
+
+**What changed in the branch because of the second run.**
+
+- The fly's default window is 13:00–14:30 ET. This is an in-sample choice of
+  which arm to paper-trade first and reverses item 6 of the first-run
+  reading; the morning window is the `gated/morning` arm, and the forward
+  test is afternoon vs morning paid/charged on the same live sessions (§9).
+- Both flies hold to the harness cap; `gated/flat15:40` and `gated/exit15:05`
+  are the earlier exits.
+- `afternoon_iron_fly` (§3.1b): the tape-only twin as its own entry, because
+  it is the best-supported hypothesis and the gated fly is the test of the
+  gate.
+- The momentum bot's fade arm, with `any/fade` and `any/fade/up_days` as its
+  controls; the complement arm's conviction fixed so `positive` can trade.
+- Pre-screen: E2 (day direction), F's morning range, G's 13:00 slot (the new
+  window's start was not measured), straddle set built once.
+
+**Pre-committed readings for the third run.**
+
+- E2: a long-gamma reversal that lives only in the up-day rows means the
+  label reads the day; the fade's hypothesis then becomes "fade up days" and
+  `any/fade/up_days` is the arm to read.
+- G2: the long-gamma advantage must appear inside both day-direction rows at
+  13:30 (and persist at 14:30) to be read as dealer hedging; G3: the cheap
+  half matching the long-gamma rows makes the gate a quiet-tape proxy.
+- G 13:00: a pooled ratio ≤ 0.80 with seller bps ≥ 4 keeps 13:00 as the
+  window's start; otherwise the default window starts at 13:30.
+- F: long-gamma mornings larger than short-gamma mornings (am_ratio) confirm
+  the afternoon compression is partly a within-day budget effect.
