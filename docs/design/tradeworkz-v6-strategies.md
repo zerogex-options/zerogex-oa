@@ -465,11 +465,14 @@ this branch and run in seconds to a minute.
   this tape, gate or no gate. A long-gamma advantage that appears only in
   the up-day rows of G2, or that the cheap-straddle half of G3 matches,
   retires the mechanism reading: the gate is then a proxy for day direction
-  or a quiet tape. **Status after two runs (§10): insufficient, leaning
-  "diagnostic"** — the 13:30 margins (0.13 / 0.11 / 0.07) shrank to 0.05 /
-  0.01 / 0.03 at 14:30 on the same sessions and nearly identical labels, no
-  split row has 40 sessions, and the mean long-vs-all margin over all twelve
-  symbol × slot cells is −0.02.
+  or a quiet tape. **Status after three runs (§10): the mechanism reading
+  failed its pre-commitment; the gate's information is a stand-down.** The
+  long-gamma advantage at 13:30 lives only inside down days (SPX 0.19, QQQ
+  0.13 below the down-day row; SPY on 6 sessions) and not inside up days
+  (0.00–0.03), and it vanishes at 14:30. Every losing afternoon cell is
+  short gamma on a down day. The sweep's `gated/any_positive` and
+  `twin/tail_only/no_short_down` arms test that form; the top-quartile
+  selection is not supported.
 - **Long-gamma fly, on the screen:** `no-edge` (n ≥ 20, PF < 1.0) retires the
   gamma-gated hypothesis for this tuning generation. The tape-only twin
   within 0.1 PF of the gated bot on the paired sessions means the gate adds
@@ -488,6 +491,10 @@ this branch and run in seconds to a minute.
   not met. On the screen, the negative-gamma arm must beat the `"any"` arm
   by ≥ 0.1 PF or the Baltussen conditioning is not present on this data; the
   fade arms are read the same way against `any/fade` and `any/fade/up_days`.
+  **Status after the third run (§10): the fade is not a gamma effect.** The
+  last-hour reversal is an up-day effect (3 of 25 up days continued, −9.7
+  bps; 16 of 28 down days continued), inside both gamma signs.
+  `any/fade/up_days` is the arm to read; `positive/fade` is a proxy for it.
 - **Gradient re-screen:** `insufficient` on 90 days means the regime the
   pattern's 33 trades came from is episodic; that is a sample statement, not
   a verdict. `no-edge` on n ≥ 20 for the fidelity run is a verdict on the bot
@@ -886,3 +893,55 @@ the holdout that can actually run.
   holdout at or above 0.85 says the main window was one quiet quarter.
 - No further default or window change from G2/G3/E2. The gate decision
   belongs to the screen's paired twin comparison and to live paper trading.
+
+### Third run (2026-10-13): E2, G2, G3 and the 13:00 slot, against the rules above
+
+Read by the author against the pre-committed rules; an adversarial check of
+this reading was running when it was written and its corrections, if any,
+follow in a later commit. This run predates the within-root pairing fix, so
+SPX third-Friday rows may move slightly on the next run.
+
+- **E2 — the fade is not a gamma effect.** Up days continued 3 of 25 times
+  (12%, −9.7 bps in the day's direction; SPY 0 of 8, SPX 1 of 9, QQQ 2 of 8);
+  down days continued 16 of 28 (57%, 0.0 bps). Inside up days both gamma
+  signs reverse (long 2 of 20, short 1 of 5); inside down days both continue
+  (long 7 of 11, short 9 of 17). The rule required long-gamma continuation
+  ≤ 40% in both direction rows: failed. SPY and SPX share days, so the up-day
+  reversal is ~13 effectively independent days with 1–3 continuations, a
+  2.5–3 SE sign test, about 2 SE on the mean against a 55-minute sigma of
+  15–20 bps, post-hoc and one quarter. QQQ reverses on down days too, so
+  "fade up days into the close" is an S&P statement. `any/fade/up_days` is
+  the arm to read.
+- **G 13:00 — stays as the window's start, barely.** Pooled 0.778 ≤ 0.80
+  with 4.9 bps ≥ 4. The SPX short-gamma cell at 13:00 (1.078, −2.4 bps, 4
+  of 19 beyond the wing) is the same loser as at 12:00.
+- **G2 — the mechanism test failed; the gate is a stand-down.** The
+  long-gamma advantage seen in G at 13:30 lives only in the down-day rows
+  (long vs direction-all: SPX 0.185 on 14 sessions, QQQ 0.134 on 12, SPY
+  0.254 on 6, under the 10-session floor) and is 0.00–0.03 inside up days;
+  at 14:30 it is gone in both directions. What the gate actually does is
+  keep the seller out of short-gamma down days, the only cells where the
+  afternoon seller loses: SPX down/short 1.091 at 12:00, 1.248 at 13:00,
+  1.044 at 13:30 (−2.7 / −5.3 / −1.0 bps; 4 of 10, 4 of 11, 2 of 11 beyond
+  the wing), QQQ down/short 0.930 / 0.897, SPY 0.773 / 0.859. Direction
+  alone carries most of it (down-all vs up-all at 13:30: SPX 0.809 vs 0.600,
+  SPY 0.779 vs 0.595, QQQ 0.782 vs 0.702); inside down days the gamma sign
+  adds the rest (SPX 0.624 vs 1.044 on 14 vs 11, about 2 SE). That is the
+  one gamma effect the research record confirmed with the clock and tape
+  adjusted — short gamma travels 1.08× — read from the seller's side: do not
+  sell the afternoon straddle on a short-gamma down day. The sweep gained
+  `gated/any_positive` (any long gamma, not the top quartile) and
+  `twin/tail_only/no_short_down` (the tape-only fly with
+  `stand_down_short_gamma_down_days`). No default changed.
+- **G3 — not merely a quiet-tape proxy.** At 13:30 the cheap half's seller
+  bps (SPX 5.6, SPY 5.6) sit under the long-gamma rows (6.4, 6.9) and the
+  cheap half is 54–69% long gamma, under the 70% "one cut" line; the
+  richness cut is mixed across symbols (SPX cheap better, QQQ rich better,
+  SPY flat).
+
+**Pre-committed reading for the sweep.** `twin/tail_only/no_short_down`
+against `twin/tail_only` on the same sessions is the stand-down question;
+`gated/any_positive` against `gated/default` is whether the top quartile
+ever added anything over "not short". A stand-down arm that does not beat
+its twin by 0.1 PF on ≥ 20 paired trades leaves `afternoon_iron_fly` as the
+lead with no gamma input at all.

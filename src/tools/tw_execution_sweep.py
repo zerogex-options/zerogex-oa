@@ -114,7 +114,10 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
       stop (the wing is the stop);
     * the WINDOW axis — the morning (10:30-13:30 ET) and afternoon
       (13:00-14:30) entry windows, each gated and tape-only, so the two flies
-      are compared on both windows in one pass.
+      are compared on both windows in one pass;
+    * the STAND-DOWN axis — any positive gamma, and the tape-only twin that
+      skips short-gamma down days (the third pre-screen's reading of where
+      the gate's information lives).
     """
     grid: List[Tuple[str, Dict[str, Any]]] = [
         ("gated/default", {}),
@@ -152,6 +155,18 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
     grid.append(("twin/tail_only_morning", {**morning, "required_regimes": "any"}))
     grid.append(("gated/afternoon", dict(afternoon)))
     grid.append(("twin/tail_only_afternoon", {**afternoon, "required_regimes": "any"}))
+    # The stand-down form of the gate (third pre-screen, G2): the seller's
+    # losing afternoon cells were all short gamma on down days, and the
+    # long-gamma advantage lived only inside down days. Two arms: any
+    # positive gamma (not just the top quartile), and the tape-only twin
+    # that merely skips short-gamma down days.
+    grid.append(("gated/any_positive", {"required_regimes": ["positive_weak", "positive_strong"]}))
+    grid.append(
+        (
+            "twin/tail_only/no_short_down",
+            {"required_regimes": "any", "stand_down_short_gamma_down_days": True},
+        )
+    )
     # The one pre-screen cell where a richer straddle still underpriced the
     # move was SPX short gamma at 12:00 (second run: 1.056 paid/charged,
     # 5 of 18 beyond the wing). The mechanism says this arm loses there.
