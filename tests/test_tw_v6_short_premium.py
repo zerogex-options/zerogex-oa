@@ -34,10 +34,12 @@ from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import OpenPosition
 from src.tradeworkz.registry import DEFAULT_ROSTER, get_bot_class, known_specs
 
-# Thursday 2026-08-06.
-MID_12ET = datetime(2026, 8, 6, 16, 0, tzinfo=timezone.utc)  # 12:00 ET: 150 in, 240 to go
+# Thursday 2026-08-06. The catalog window is 13:00-14:30 ET entries.
+PM_1330ET = datetime(2026, 8, 6, 17, 30, tzinfo=timezone.utc)  # 13:30 ET: 240 in, 150 to go
+MID_12ET = datetime(2026, 8, 6, 16, 0, tzinfo=timezone.utc)  # 12:00 ET: before the window
 OPEN_0945ET = datetime(2026, 8, 6, 13, 45, tzinfo=timezone.utc)  # 09:45 ET
-LATE_1430ET = datetime(2026, 8, 6, 18, 30, tzinfo=timezone.utc)  # 14:30 ET: 90 to go
+LATE_1430ET = datetime(2026, 8, 6, 18, 30, tzinfo=timezone.utc)  # 14:30 ET: 90 to go, last entry
+LATE_1435ET = datetime(2026, 8, 6, 18, 35, tzinfo=timezone.utc)  # 14:35 ET: 85 to go, too late
 
 BOT_ID = "long_gamma_iron_fly"
 
@@ -52,10 +54,10 @@ def _bot(bot_id: str = BOT_ID, **param_over):
 def _quiet_closes(spot: float, bps: float = 1.0, n: int = 31) -> list[float]:
     """Closes alternating +/- ``bps`` around spot: a low, steady realized sigma.
 
-    Against the $3.00 straddle in :func:`_snap` (sigma $3.76) the realized
-    move projected over the rest of the day reads about 0.29 of the straddle
-    at 1 bp, 0.59 at 2 bps, 0.73 at 2.5 bps, 0.88 at 3 bps (over the 0.85
-    cap) and 5.9 at 20 bps.
+    Against the $3.00 straddle in :func:`_snap` (sigma $3.76) at 13:30 ET the
+    realized move projected over the rest of the day reads about 0.26 of the
+    straddle at 1 bp, 0.52 at 2 bps, 0.65 at 2.5 bps, 0.78 at 3 bps, 0.91 at
+    3.5 bps (over the 0.85 cap) and 5.2 at 20 bps.
     """
     step = spot * bps / 10_000.0
     return [spot + (step if i % 2 else 0.0) for i in range(n)]
@@ -66,10 +68,10 @@ def _msi(magnitude: float) -> dict:
 
 
 def _snap(**over) -> MarketSnapshot:
-    """A clean long-gamma, quiet-tape, midday SPY setup."""
+    """A clean long-gamma, quiet-tape, early-afternoon SPY setup."""
     base = dict(
         underlying="SPY",
-        timestamp=MID_12ET,
+        timestamp=PM_1330ET,
         spot=656.0,
         net_gex=2.0e9,
         net_gex_pctile=85.0,
@@ -161,23 +163,30 @@ def test_fires_an_atm_iron_butterfly_with_sigma_wings():
 def test_time_stop_never_reaches_the_settlement_window():
     from src.tradeworkz.bots import base as bot_base
 
-    bot_base.set_backtest_clock(lambda: MID_12ET)
+    bot_base.set_backtest_clock(lambda: PM_1330ET)
     try:
         sig = _bot().open_criteria(_snap())
     finally:
         bot_base.set_backtest_clock(None)
     assert sig is not None
-    # max_hold 150 < (240 to close - 20 buffer) = 220 -> 14:30 ET
-    assert sig.time_stop_at == MID_12ET + timedelta(minutes=150)
-    # late in the day the buffer binds instead
+    # (150 to close - 20 buffer) = 130 < max_hold 150 -> flat at 15:40 ET
+    assert sig.time_stop_at == PM_1330ET + timedelta(minutes=130)
+    # the last entry of the window holds 70 minutes to the same 15:40
     bot_base.set_backtest_clock(lambda: LATE_1430ET)
     try:
-        bot = _bot(min_minutes_to_close=60)
+        bot = _bot()
         sig = bot.open_criteria(_snap(timestamp=LATE_1430ET))
     finally:
         bot_base.set_backtest_clock(None)
     assert sig is not None, bot.miss_reasons
     assert sig.time_stop_at == LATE_1430ET + timedelta(minutes=90 - 20)
+    # an earlier entry with a long hold allowed still never reaches 15:40
+    bot_base.set_backtest_clock(lambda: PM_1330ET)
+    try:
+        sig = _bot(max_hold_minutes=400).open_criteria(_snap())
+    finally:
+        bot_base.set_backtest_clock(None)
+    assert sig is not None and sig.time_stop_at == PM_1330ET + timedelta(minutes=130)
 
 
 def test_spx_snaps_to_the_five_point_grid_and_scales_wings():
@@ -235,7 +244,9 @@ def _miss(bot, snap) -> str:
 
 def test_window_gates_both_ends():
     assert _miss(_bot(), _snap(timestamp=OPEN_0945ET)) == "window"  # 15 min in
-    assert _miss(_bot(), _snap(timestamp=LATE_1430ET)) == "window"  # 90 to close < 150
+    assert _miss(_bot(), _snap(timestamp=MID_12ET)) == "window"  # 150 in < 210
+    assert _miss(_bot(), _snap(timestamp=LATE_1435ET)) == "window"  # 85 to close < 90
+    assert _bot().open_criteria(_snap(timestamp=LATE_1430ET)) is not None  # 90 is the edge
 
 
 def test_needs_the_straddle_priced():
@@ -275,8 +286,8 @@ def test_magnitude_band_gate_is_off_by_default_and_a_sweep_axis():
 def test_realized_over_straddle_tail_gate():
     # Busy tape: +/- 20 bps a minute projects to ~6x what the straddle charges.
     assert _miss(_bot(), _snap(recent_closes=_quiet_closes(656.0, bps=20.0))) == "tail_realized"
-    # Just over the 0.85 cap (3 bps -> 0.88).
-    assert _miss(_bot(), _snap(recent_closes=_quiet_closes(656.0, bps=3.0))) == "tail_realized"
+    # Just over the 0.85 cap (3.5 bps -> 0.91).
+    assert _miss(_bot(), _snap(recent_closes=_quiet_closes(656.0, bps=3.5))) == "tail_realized"
     assert _miss(_bot(), _snap(recent_closes=[656.0] * 4)) == "no_history"
     # The gate is a dollar ratio, so the ATM IV level alone never trips it.
     assert _bot().open_criteria(_snap(atm_iv_front=0.60)) is not None
@@ -349,8 +360,8 @@ def test_conviction_floor_is_reachable_on_a_typical_setup_and_binds_on_a_margina
     bot = _bot()
     sig = bot.open_criteria(_snap())
     assert sig is not None and sig.conviction >= bot.confidence_threshold()
-    # Boundary regime (pctile 75) with realized inside the cap but close to
-    # it (2.5 bps -> ~0.73 of the straddle): passes every gate, dies at conviction.
+    # Boundary regime (pctile 75) with realized inside the cap but well up
+    # it (2.5 bps -> ~0.65 of the straddle): passes every gate, dies at conviction.
     marginal = _snap(net_gex_pctile=75.0, recent_closes=_quiet_closes(656.0, bps=2.5))
     assert 0.6 < marginal.realized_over_straddle() <= 0.85
     assert _miss(_bot(), marginal) == "conviction"
@@ -456,6 +467,8 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
         "gated/uniform_gates",
         "gated/no_stop",
         "gated/hold_to_settle",
+        "gated/morning",
+        "twin/tail_only_morning",
     } <= set(labels)
     specs = build_specs(base, grid)
     assert len({s.id for s in specs}) == len(specs)
@@ -472,14 +485,13 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
     cls = get_bot_class(base.strategy_class)
     assert cls(by["twin/clock_only"], ml_state=None).open_criteria(busy) is not None
     assert cls(by["gated/default"], ml_state=None).open_criteria(busy) is None
-    # The afternoon arms (first pre-screen, section G): entries 13:00-14:00
-    # ET only, gated and tape-only, so a 12:00 ET setup is a window miss there.
-    assert by["gated/afternoon"].params["min_minutes_since_open"] == 210
-    assert by["twin/tail_only_afternoon"].params["required_regimes"] == "any"
-    pm = cls(by["gated/afternoon"], ml_state=None)
-    assert _miss(pm, _snap()) == "window"
-    at_1300 = _snap(timestamp=datetime(2026, 8, 6, 17, 0, tzinfo=timezone.utc))
-    assert pm.open_criteria(at_1300) is not None, pm.miss_reasons
+    # The morning arms run the designers' original 10:30-13:30 ET window,
+    # gated and tape-only; the default (13:00-14:30) is a window miss at noon.
+    assert by["gated/morning"].params["min_minutes_since_open"] == 60
+    assert by["twin/tail_only_morning"].params["required_regimes"] == "any"
+    am = cls(by["gated/morning"], ml_state=None)
+    assert am.open_criteria(_snap(timestamp=MID_12ET)) is not None, am.miss_reasons
+    assert _miss(cls(by["gated/default"], ml_state=None), _snap(timestamp=MID_12ET)) == "window"
     # Every config keeps the shared defaults it did not override.
     assert all(s.params["credit_stop_mult"] in (0.5, 0) for s in specs)
     assert all(s.params["premium_stop_grace_seconds"] == 600 for s in specs)

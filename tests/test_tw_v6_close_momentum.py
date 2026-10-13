@@ -162,7 +162,15 @@ def test_gamma_sign_is_the_papers_condition_and_a_param():
     assert _miss(_bot(), _snap(net_gex=1.5e9, net_gex_pctile=80.0)) == "regime"
     assert _miss(_bot(), _snap(net_gex=None)) == "no_net_gex"
     assert _bot(required_gamma_sign="any").open_criteria(_snap(net_gex=1.5e9)) is not None
-    assert _bot(required_gamma_sign="positive").open_criteria(_snap(net_gex=1.5e9)) is not None
+    # The complement arm's conviction rewards ITS condition (deep positive
+    # gamma), so it can actually trade; the first draft penalized it for it.
+    pos = _bot(required_gamma_sign="positive")
+    hi = pos.open_criteria(_snap(net_gex=1.5e9, net_gex_pctile=90.0))
+    assert hi is not None, pos.miss_reasons
+    lo = _bot(required_gamma_sign="positive").open_criteria(
+        _snap(net_gex=1.5e9, net_gex_pctile=60.0)
+    )
+    assert lo is not None and lo.conviction < hi.conviction
     assert _miss(_bot(required_gamma_sign="positive"), _snap()) == "regime"
     # negative_strong only, by percentile
     assert _miss(_bot(max_net_gex_pctile=25.0), _snap(net_gex_pctile=40.0)) == "regime"
@@ -214,6 +222,33 @@ def test_conviction_floor_is_reachable_and_binds_on_a_half_sigma_day():
 # ======================================================================
 
 
+def test_fade_arm_trades_against_the_day_and_books_on_the_cross_back():
+    # Up day (+1%), long gamma: the fade sells the move -> bear put debit vertical.
+    bot = _bot(required_gamma_sign="positive", trade_direction="fade")
+    sig = bot.open_criteria(_snap(net_gex=1.5e9, net_gex_pctile=80.0))
+    assert sig is not None, bot.miss_reasons
+    assert sig.direction == "bearish" and sig.strategy_type == "BEAR_PUT_DEBIT_SPREAD"
+    assert sig.components_at_entry["trade_direction"] == "fade"
+    assert sig.rationale.startswith("fade:")
+    # A down day fades bullish.
+    sig = bot.open_criteria(_snap(spot=643.5, net_gex=1.5e9, net_gex_pctile=80.0))
+    assert sig is not None and sig.direction == "bullish"
+    assert sig.strategy_type == "BULL_CALL_DEBIT_SPREAD"
+    # The fade is short the day's move, so a cross back through the open is
+    # the move fully given back: book it, under its own reason.
+    pos = _pos("bearish")
+    pos.components_at_entry["trade_direction"] = "fade"
+    dec = bot.exit_criteria(_snap(spot=649.8), pos)
+    assert dec.should_close and dec.reason == "fade_complete"
+    assert not bot.exit_criteria(_snap(spot=655.0), pos).should_close
+    pos = _pos("bullish", cash_open=660.0)
+    pos.components_at_entry["trade_direction"] = "fade"
+    dec = bot.exit_criteria(_snap(spot=660.5), pos)
+    assert dec.should_close and dec.reason == "fade_complete"
+    # The default never reads as a fade.
+    assert _bot().open_criteria(_snap()).components_at_entry["trade_direction"] == "continuation"
+
+
 def test_momentum_lost_closes_on_a_cross_back_through_the_open():
     dec = _bot().exit_criteria(_snap(spot=649.8), _pos("bullish"))
     assert dec.should_close and dec.reason == "momentum_lost"
@@ -261,6 +296,11 @@ def test_sweep_grid_is_the_gamma_sign_experiment():
     by = {s.display_name: s for s in specs}
     assert by["positive/credit"].params["structure"] == "credit_vertical"
     assert by["negative/debit/fhh"].params["require_first_half_hour_agreement"] is True
+    # The fade arms (pre-screen section E, 2026-10-12): against the day,
+    # under long gamma and unconditionally.
+    assert by["positive/fade"].params["trade_direction"] == "fade"
+    assert by["positive/fade"].params["required_gamma_sign"] == "positive"
+    assert by["any/fade"].params["required_gamma_sign"] == "any"
     # A wall bot still gets the wall grid.
     from src.tools.tw_execution_sweep import wall_execution_grid
 

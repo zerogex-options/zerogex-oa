@@ -1147,8 +1147,8 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
             "Dealers long gamma must sell rallies and buy dips, which compresses "
             "realized range — the one effect this platform's own data confirms "
             "at every horizon — while 0DTE buyers pay for the move regardless. "
-            "Sells a defined-risk ATM iron butterfly midday, only when dealer "
-            "gamma is in the symbol's top "
+            "Sells a defined-risk ATM iron butterfly in the early afternoon, only "
+            "when dealer gamma is in the symbol's top "
             "quartile and the trailing realized move, projected over the rest of "
             "the day, is under what the ATM straddle charges for it; wings and "
             "exits are multiples of the straddle's own remaining move. The "
@@ -1158,8 +1158,13 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
         bot_class="LongGammaIronFly",
         params={
             **_SHORT_PREMIUM_PARAMS,
-            "min_minutes_since_open": 60,
-            "min_minutes_to_close": 150,
+            # Entries 13:00-14:30 ET, flat by 15:40. The designers chose
+            # 10:30-13:30; the pre-screen's straddle table (section G, two
+            # runs) put the 0DTE premium at 13:30 and 14:30 and left the
+            # 10:30 and 12:00 straddles at or above fair pricing, so the
+            # morning window is a sweep arm (gated/morning) instead.
+            "min_minutes_since_open": 210,
+            "min_minutes_to_close": 90,
             "max_hold_minutes": 150,
             "required_regimes": ["positive_strong"],
             "regime_fail_closed": True,
