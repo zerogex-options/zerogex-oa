@@ -857,10 +857,61 @@ as it stands). Two independent blockers on the same symbol.
 
 It does not change the position on SPY, QQQ or SPX.
 
-### Status
+### Status — RESOLVED 2026-10-13
 
-Raised with ThetaData 2026-10-12; Anthony confirmed he is looking into it. Open, alongside the
-credit outstanding from 28 September.
+ThetaData restored the entitlement; Anthony said it had been switched off by
+mistake. Both halves are reachable, and the options chain question this finding
+left open is answered with them.
+
+Probe at 16:30 ET on 2026-10-13, `$NDXP.X` on `thetadata_mv`:
+
+| | NDX | SPX (control) |
+|---|---|---|
+| index level (spot) | **30,569.49** | 7,805.44 |
+| contracts returned | **240 of 240, 100%** | 240 of 240, 100% |
+| two-sided quotes | 204 | 201 |
+| with open interest | 142 (59.2%) | 238 (99.2%) |
+
+**The NDX options chain is entitled too.** This finding recorded that as unknown,
+because the spot failure stopped the run before the chain was ever asked for.
+It is not a second problem; it was only ever unmeasured.
+
+NDX's 59.2% open-interest coverage is **not** a finding: production's own NDX
+chain read 59.7% on 2026-10-12. That is what this chain looks like.
+
+### The restart was not required, and that is worth knowing
+
+The vendor's instruction was to restart the terminal. The **pre-restart** probe,
+at 16:30:11, already returned a live NDX index level and a full chain; the
+terminal did not restart until 16:30:22. So the entitlement is evaluated
+server-side per request, not read once into the terminal at startup.
+
+Recorded because the next entitlement change will come with the same
+instruction, and a restart kills the account's single MDDS session — which on a
+rehearsal day would end the run. **Probe first; restart only if the probe still
+fails.**
+
+The restart did no harm: the post-restart probe matched, and SPX was unaffected
+either side of it.
+
+The auth response on all three logins still reads `"isProfessional": false,
+"isRetail": false`, unchanged from 2026-10-08 and consistent with F9.
+
+### What this does NOT clear
+
+**NDX is still not shippable on the tick test**, on F12's evidence: 63.8% sign
+agreement and 29.1% of session imbalance in flipped buckets, the worst of the
+four symbols. The entitlement was one of two independent blockers and only that
+one is now gone.
+
+That judgement is also due a re-measurement rather than a re-reading. F15
+established that a single day's bucket-level figure carries roughly ±8 points,
+and NDX's 29.1% is a single day — the same band that turned F14's SPY alarm into
+nothing. NDX could not be re-measured while it was unentitled. It can be now.
+
+**The pipeline is unproven.** A probe establishes that the data is reachable; it
+does not establish that NDX ingests end to end into a rehearsal database. That
+needs a session.
 
 A standing re-check, read for `spot_error` rather than pass/fail:
 
@@ -1309,10 +1360,20 @@ afterwards and append the result here rather than holding the cutover for it.
   starts in the morning, so its row counts are not comparable between the two and
   must never be read as polling density. That mistake produced and then had to
   retract F14's first explanation. The cash-session query is in F14.
-- **NDX is unentitled on ThetaData (F13) — OPEN, raised 2026-10-12.** The NASDAQ GIDS index
-  level is refused, so there is no NDX spot and therefore no NDX chain. Absent, not degraded.
-  The NDX options chain has never been reached, so its entitlement is still unknown. Stacks on
-  F12, which already judged NDX not shippable on the tick test. SPY / QQQ / SPX unaffected.
+- **NDX entitlement — CLOSED 2026-10-13 (F13).** ThetaData restored it; switched off by
+  mistake. Index level and options chain both reachable, 240 of 240 contracts at 100%
+  coverage, and the chain's entitlement — recorded as unknown because the spot failure
+  stopped the run first — is answered with it. **The terminal restart the vendor asked for
+  was not required**: the pre-restart probe already passed, so entitlements are evaluated
+  server-side per request. Probe before restarting next time; a restart kills the single
+  MDDS session and would end a rehearsal mid-day.
+- **NDX on the tick test — STILL OPEN, and now re-measurable.** F12 put it at 63.8% sign
+  agreement and 29.1% of session imbalance flipped, the worst of the four, and judged it not
+  shippable. That rests on a single day, and F15 established that a single day carries about
+  ±8 points on this figure — the same band that dissolved F14's SPY alarm. NDX could not be
+  re-measured while unentitled; it can be now, and should be before the judgement stands.
+- **NDX ingestion is unproven end to end.** The probe shows the data is reachable; no
+  rehearsal has yet written an NDX row from ThetaData. Needs one session.
 - **Per-symbol reachability is a probe question, and belongs in the cutover gate.** `feed-compare`
   passes `spot_hint=incumbent.spot` as a deliberate control, so it can never ask the candidate for
   an index level. `feed-probe` can, and did on 2026-09-25 — seventeen days before F13 surfaced in
