@@ -1013,21 +1013,42 @@ the tick test:
 make shadow-pgpass SHADOW_DB=zerogex_shadow_ts
 make shadow-create SHADOW_DB=zerogex_shadow_ts
 
-# TradeStation arm (method only) -- repeats arm B
+# TradeStation arm (method only) -- repeats arm B. SPY ONLY, see below.
 SHADOW_LOG=~/shadow-ts-$(date +%F).log make shadow-run \
-    SHADOW_DB=zerogex_shadow_ts SHADOW_PROVIDER=tradestation FLOW_CLASSIFIER=tick
+    SHADOW_DB=zerogex_shadow_ts SHADOW_PROVIDER=tradestation \
+    FLOW_CLASSIFIER=tick SHADOW_UNDERLYINGS=SPY
 
 # ThetaData arm (method + feed) -- repeats arm C
 SHADOW_LOG=~/shadow-td-$(date +%F).log make shadow-run \
     SHADOW_DB=zerogex_shadow FLOW_CLASSIFIER=tick
 ```
 
-Then `make shadow-compare-flow SHADOW_DB=...` once per rehearsal database. The
-difference between the two results is the feed, with the day held fixed. This is
-within the single ThetaData MDDS connection — only one consumer of that feed —
-and the TradeStation side is the same two-consumer arrangement arm B already
-ran. `make shadow-stop SHADOW_DB=...` stops one arm without touching the other,
-since it selects on `DB_NAME`.
+Then `make shadow-compare-flow SHADOW_DB=<db> UNDERLYING=SPY` once per
+rehearsal database. The difference between the two results is the feed, with the
+day held fixed. `make shadow-stop SHADOW_DB=<db>` stops one arm without touching
+the other, since it selects on `DB_NAME`.
+
+**Why the TradeStation arm is SPY only.** TradeStation caps concurrent streams
+per account at nominally 10, and production alone approaches it — roughly two
+chunked option streams per underlying plus the underlying bar stream plus VIX
+(`docs/design/api-gateway-architecture.md`). Cap exhaustion is **not**
+header-observable on a standard key; its only fingerprint is a stream that
+connects 200 OK and then dies inside 30 seconds, which is the 2026-06 incident.
+Arm B ran production plus one four-symbol TradeStation engine and survived, but
+this adds a THIRD TradeStation consumer, because the ThetaData arm's VIX / VXN /
+futures ingesters still call TradeStation directly. A one-symbol arm costs two
+to three streams instead of roughly ten, and the open question is SPY anyway.
+
+The risk being managed is not a failed rehearsal. It is production losing a
+stream it cannot reopen because a rehearsal is holding the slot.
+
+**`INGEST_UNDERLYINGS=SPY make shadow-run` does not work, and does not say so.**
+`shadow-run` re-reads `.env` in the shell and `export`s every key
+unconditionally, so a value already in the environment is overwritten: the run
+comes up on all four symbols while the banner's own "Underlyings:" line prints
+the full list and nobody looks twice. `SHADOW_UNDERLYINGS` is applied after that
+loader, which is the only place it can win, and the banner marks the list as
+narrowed whenever it is set.
 
 ### Status
 
