@@ -444,8 +444,6 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo  milliseconds). Nothing is written to the schema.
 \echo
 
-DROP TABLE IF EXISTS pg_temp.tw_v6_straddles;
-
 CREATE TEMP TABLE tw_v6_straddles AS
 WITH slots AS (
     SELECT unnest(ARRAY['10:30', '12:00', '13:00', '13:30', '14:30']::time[]) AS slot
