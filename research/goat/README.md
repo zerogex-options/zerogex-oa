@@ -183,4 +183,8 @@ testable rather than load-bearing — but they are worth settling with him.
 5. **Lot 2 target.** The trail is implemented. The predrawn-level branch is
    not: a backtest fetching levels per bar over HTTP would be unusable, and the
    level question is better answered by joining the exported trade list to our
-   stored history afterwards.
+   stored history afterwards. Breakeven (Jim's ask, 2026-10-10) is in:
+   `BreakevenTriggerTicks` moves both stops to entry + `BreakevenPlusTicks`
+   once price has gone that far the trade's way, and holds lot 2's trail
+   until then. Off at 0. Stops only ever tighten, and are never placed
+   through the market. A rejected stop would stop the strategy.
