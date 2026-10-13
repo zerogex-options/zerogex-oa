@@ -876,11 +876,19 @@ one starts.
 
 ---
 
-## F14 — the feed costs a few points of flow agreement, most of it on SPY
+## F14 — a cross-day feed comparison, superseded by F15
 
 *Added 2026-10-12, revised the same evening on full-session data. Arm C:
 ThetaData Market Value + tick test, against production.*
 
+> **SUPERSEDED 2026-10-13 by F15, which measured both arms on the same day.**
+> This finding's SPY result — ThetaData 23.7% of flipped flow against the
+> TradeStation arm's 16.5% — compared two different market days, and F15 shows
+> that this measurement swings **+7.9 points between two days on the same feed**.
+> The +7.2pp gap recorded here is inside that band and is not evidence of
+> anything about the vendor. Read F15 for the answer; this finding is kept for
+> the record of how it was reached.
+>
 > **REVISED TWICE on 2026-10-12, both times downward in confidence about my own
 > reading.** First version: written on the truncated morning window (see the
 > correction at the top of F12), it reported SPY's share of flipped flow going
@@ -1056,9 +1064,8 @@ narrowed whenever it is set.
   few points of flipped flow per symbol with overall sign agreement unchanged is
   a small effect, but it is measured across two different days with no estimate
   of how much this figure moves day-to-day, so its size is not established.
-- **SPY: open.** +7.2pp on the most liquid symbol, which is the wrong shape for
-  the carried-direction story. Density is ruled out. Feed and day are
-  unseparated.
+- **SPY: CLOSED 2026-10-13 by F15.** The +7.2pp was the day, not the feed. A
+  same-day comparison puts the feed's cost at −0.4pp on the decision number.
 - QQQ +3.4pp, SPX +2.9pp: small, and SPX's sign agreement did not move at all.
 - NDX: no data (F13).
 - First full-session end-to-end run of ThetaData through the production write
@@ -1070,6 +1077,108 @@ narrowed whenever it is set.
 
 One session per arm. No OPEX. The published signal, as in F12 — this is the
 input to `order_flow_imbalance` and `tape_flow_bias`, not the rendered figure.
+
+---
+
+## F15 — the feed is cleared on flow for SPY; the day was the variable all along
+
+*Added 2026-10-13. Both arms run simultaneously against the same market, which
+is what F14 said was missing. It resolves F14's open SPY question against my own
+reading of it.*
+
+### Design
+
+Two rehearsal databases, same session, same classifier, same symbol, both
+compared against production:
+
+| arm | database | feed | classifier | symbols |
+|---|---|---|---|---|
+| method only | `zerogex_shadow_ts` | TradeStation | tick | SPY |
+| method + feed | `zerogex_shadow` | ThetaData MV | tick | SPY, SPX, QQQ, NDX |
+
+Production runs the quote test on TradeStation in both comparisons, so the
+baseline is identical — confirmed in the output, where both runs report the same
+`mean |production net|` of 3,239. The TradeStation arm was narrowed to SPY with
+`SHADOW_UNDERLYINGS` to keep it clear of TradeStation's concurrent-stream cap;
+see F14's plan block. Production stayed healthy throughout: 12 of 12 streams
+fresh at 09:36 and 09:50, zero cap warnings in either log, zero session kicks.
+
+**Coverage is complete on both: 390 of 390 buckets, nothing missing either
+side.**
+
+### The feed costs nothing on the number that decides this
+
+| | TradeStation + tick | ThetaData + tick | feed cost |
+|---|---|---|---|
+| net imbalance sign agrees | 70.8% (276/390) | 67.7% (264/390) | **−3.1pp** |
+| **share of session imbalance flipped** | **24.4%** | **24.0%** | **−0.4pp** |
+| rehearsal net higher | 50.0% (195/390) | 50.8% (198/390) | — |
+| mean \|difference\| vs scale | 2,717 / 3,239 = 83.9% | 3,022 / 3,239 = 93.3% | — |
+| flips: near-zero / typical / large | 45 / 38 / **31** | 55 / 40 / **31** | — |
+
+**The decision number is 24.0% against 24.4% — a 0.4 point difference, in
+ThetaData's favour.** On the figure that answers "would a subscriber notice",
+the feed is indistinguishable from the incumbent.
+
+Sign agreement is 3.1 points worse on ThetaData, and the flip bands say exactly
+where that goes: 12 extra flips, of which **ten land on near-zero buckets and
+two on typical ones. Large-bucket flips are identical, 31 against 31.** The
+extra disagreement falls entirely on minutes where the site read "roughly
+balanced" either way.
+
+Both arms are unbiased — 50.0% and 50.8% of buckets reading higher is a coin
+flip either way.
+
+The one place the feed is visible: its typical disagreement runs at 93.3% of the
+typical production reading against the incumbent arm's 83.9%. The Market Value
+randomisation adds noise, as F10 and F11 imply it should. It does not reach the
+published decision.
+
+### The day-to-day variance estimate, which is what F14 was actually missing
+
+The TradeStation arm is a repeat of F12's arm B on a different day, with feed,
+method and symbol all held constant. That is the first measurement of how much
+this figure moves on its own:
+
+| TradeStation + tick vs production, SPY | sign agrees | share of flow flipped |
+|---|---|---|
+| Friday 2026-10-09 | 76.2% | 16.5% |
+| Tuesday 2026-10-13 | 70.8% | **24.4%** |
+| **day-to-day swing** | **−5.4pp** | **+7.9pp** |
+
+**That settles F14.** The gap I flagged on Monday as a possible feed problem —
+ThetaData 23.7% against Friday's TradeStation 16.5%, +7.2pp — is *smaller* than
+the +7.9pp this measurement moves between two days on the same feed. It was the
+day, not the vendor.
+
+Both of today's arms also sit near 24% against Friday's 16.5%, which is the same
+statement from the other side: Tuesday was a harder day for the tick test than
+Friday, equally for both feeds.
+
+### What this closes, and what it does not
+
+**Closed.** F14's open SPY question. The feed does not meaningfully change
+published flow on SPY. F11's snapshot finding holds at the aggregation the site
+publishes, measured the only way that can show it.
+
+**Also closed, as a methodological matter.** A single day's bucket-level figure
+carries roughly ±8 points of noise on the share-of-flow number. No future
+finding should read a difference of that size between two single-day runs as
+anything at all. F12, F14 and this finding should all be read with that band
+around them.
+
+**Not closed.** The METHOD still costs what it costs: switching the quote test
+for the tick test flips the sign on 16–24% of SPY's session imbalance depending
+on the day, and that is a deliberate product change, not a measurement artefact.
+Nothing here softens it.
+
+**Not covered.** QQQ and SPX were not in the TradeStation arm today — it was
+narrowed to SPY for the stream cap — so the feed is cleared for **SPY
+specifically**. Their only evidence remains cross-day, which this finding has
+just shown is worth about ±8 points. NDX remains blocked outright (F13).
+
+**Still one day.** A same-day comparison removes the day as a confound; it does
+not make one session into many.
 
 ---
 
@@ -1171,8 +1280,17 @@ afterwards and append the result here rather than holding the cutover for it.
   the rehearsal database. Coverage turned out complete on both. The morning
   window had overstated SPY's arm-B-to-arm-C degradation by 2.6x, which is the
   one conclusion it materially changed.
-- **SPY's share-of-flow under the feed change (F14) — OPEN, and the blocker is a
-  market day.** 16.5% to 23.7% between arm B and arm C, sign agreement down 6.7
+- **SPY's share-of-flow under the feed change — CLOSED 2026-10-13 (F15).** Both
+  arms were run simultaneously against the same market: the feed's cost on the
+  share-of-flow decision number is **−0.4pp** (24.0% ThetaData against 24.4%
+  TradeStation), and the 12 extra sign flips land entirely on near-zero and
+  typical buckets with large-bucket flips identical at 31 apiece. The +7.2pp
+  that prompted this entry was day-to-day variation: the same measurement moves
+  +7.9pp between two days with the feed held constant. **The feed is cleared on
+  flow for SPY.** QQQ and SPX still have only cross-day evidence, and NDX
+  remains blocked (F13). Superseded detail below, kept for the record:
+- ~~**SPY's share-of-flow under the feed change (F14) — OPEN, and the blocker is a
+  market day.**~~ 16.5% to 23.7% between arm B and arm C, sign agreement down 6.7
   points, against +3.4pp on QQQ and +2.9pp on SPX. Polling density was raised as
   the cause and is **refuted**: inside the cash session every symbol on both days
   polled within 1.2% of production, and arm C polled SPY 1.6% more densely than
@@ -1181,6 +1299,11 @@ afterwards and append the result here rather than holding the cutover for it.
   them apart. **Next step: one session running both arms simultaneously into two
   rehearsal databases** (commands in F14), which holds the day fixed and fits
   inside the single ThetaData connection.
+- **A single day's bucket-level figure carries about ±8 points of noise.**
+  Measured 2026-10-13 (F15): TradeStation + tick vs production on SPY moved from
+  16.5% to 24.4% of flipped flow between 10-09 and 10-13, with feed, method and
+  symbol all held constant. No finding should read a difference of that size
+  between two single-day runs as a result. F12, F14 and F15 all carry this band.
 - **Row counts must come from a bounded window.** `make shadow-compare` starts at
   midnight ET with no upper bound, and production runs 24×5 while a rehearsal
   starts in the morning, so its row counts are not comparable between the two and
