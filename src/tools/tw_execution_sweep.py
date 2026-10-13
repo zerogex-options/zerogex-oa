@@ -155,6 +155,14 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
     grid.append(("twin/tail_only_morning", {**morning, "required_regimes": "any"}))
     grid.append(("gated/afternoon", dict(afternoon)))
     grid.append(("twin/tail_only_afternoon", {**afternoon, "required_regimes": "any"}))
+    # 13:30 start: the 13:00 slot passed the pooled rule by 0.02 but SPX
+    # alone failed both halves (third pre-screen), and SPX is the instrument.
+    grid.append(
+        (
+            "twin/tail_only_afternoon/start13:30",
+            {**afternoon, "required_regimes": "any", "min_minutes_since_open": 240},
+        )
+    )
     # The stand-down form of the gate (third pre-screen, G2): the seller's
     # losing afternoon cells were all short gamma on down days, and the
     # long-gamma advantage lived only inside down days. Two arms: any

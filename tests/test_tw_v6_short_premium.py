@@ -524,6 +524,7 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
         "twin/negative_gamma_morning",
         "gated/any_positive",
         "twin/tail_only/no_short_down",
+        "twin/tail_only_afternoon/start13:30",
     } <= set(labels)
     specs = build_specs(base, grid)
     assert len({s.id for s in specs}) == len(specs)
@@ -533,6 +534,8 @@ def test_sweep_grid_resolves_to_the_short_premium_twins():
         "positive_strong",
     ]
     assert by["twin/tail_only/no_short_down"].params["stand_down_short_gamma_down_days"] is True
+    late = by["twin/tail_only_afternoon/start13:30"].params
+    assert late["min_minutes_since_open"] == 240 and late["min_minutes_to_close"] == 90
     assert by["twin/tail_only"].params["required_regimes"] == "any"
     assert by["twin/clock_only"].params["max_realized_over_straddle"] == 0
     assert by["gated/band"].params["allowed_magnitude_bands"] == [
