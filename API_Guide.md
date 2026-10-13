@@ -606,8 +606,28 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
 - `strikes` (optional): number of strikes nearest to spot to include in the
   gamma profile, aggregated across expirations. Min `1`, max `200`,
   default `40`.
+- `expiration` (optional): which expirations the levels describe.
+  - `all` (default) — the whole chain, exactly as above.
+  - `0dte` — the nearest expiration that has not settled: today's until
+    16:00 ET, then the next one listed. So an ES or NQ chart in the evening
+    session, or on a weekend, gets the expiry that settles next.
+  - `YYYY-MM-DD` — that one expiration. Must be listed and not already past.
 
-**Returns `404`** when no snapshot exists for the symbol yet.
+  A scoped request recomputes `call_wall`, `put_wall`, `gamma_flip` and the
+  `profile` from that expiration's gamma alone, by the same rules as the
+  website's Expiry selector, and `max_pain` is that expiration's own
+  settlement. The flip under a scope is the cumulative net-GEX crossing (the
+  spot-shift curve cannot be rebuilt for part of the chain), so
+  `gamma_flip_reason` is always `null` there and an unresolved flip reads
+  `"Flip unresolved"` in `gamma_flip_label`. `net_gex_at_spot` is `null`
+  under a scope for the same reason. `pin_strike` is 0DTE by construction and
+  is never scoped. The top-level `expiration` field echoes the date the
+  levels describe (`null` for `all`).
+
+**Returns `404`** when no snapshot exists for the symbol yet, or when the
+`expiration` asked for is not listed, has expired, or carries no positioning
+(the `detail` says which). **Returns `400`** for an `expiration` that is none
+of the three forms.
 
 **Example response:**
 ```json
@@ -620,6 +640,7 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   "data_as_of": "2026-07-06T19:30:41Z",
   "computed_at": "2026-07-06T19:30:45Z",
   "net_gex_at_spot": -1200000000.0,
+  "expiration": null,
   "levels": {
     "gamma_flip": 675.0,
     "call_wall": 680.0,
