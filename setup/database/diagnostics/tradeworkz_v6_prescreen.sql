@@ -15,6 +15,23 @@
 \pset pager off
 \pset border 2
 
+-- The window is ANCHORED, not rolling. Two runs a day apart with a rolling
+-- NOW() - 95 days window differed by one session, and that one session was
+-- the whole change in the 13:30 gamma margin. Defaults below reproduce the
+-- 2026-10-12 run; override from make with START=YYYY-MM-DD END=YYYY-MM-DD
+-- (END is exclusive). The archive reaches back to 2026-04-20, so
+-- START=2026-04-20 END=2026-07-10 is a holdout no reading here has seen.
+\if :{?start_ts}
+\else
+\set start_ts 2026-07-10
+\endif
+\if :{?end_ts}
+\else
+\set end_ts 2026-10-13
+\endif
+\echo
+\echo  window: :start_ts (inclusive) -> :end_ts (exclusive)
+
 \echo
 \echo ============================================================
 \echo  A. Option-chain coverage per symbol (the screen window)
@@ -103,7 +120,7 @@ ORDER BY underlying;
 
 \echo
 \echo ============================================================
-\echo  D. Dealer-gamma sign base rates, RTH, last 90 days
+\echo  D. Dealer-gamma sign base rates, RTH, over the window
 \echo ============================================================
 \echo  The fly needs positive gamma midday (then the top quartile by
 \echo  gex_historical_stats, which this probe cannot rank cheaply); the
@@ -115,7 +132,7 @@ WITH g AS (
            (timestamp AT TIME ZONE 'America/New_York')::time AS et
     FROM gex_summary
     WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-      AND timestamp >= NOW() - INTERVAL '90 days'
+      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
       AND net_gex_at_spot IS NOT NULL
 )
 SELECT underlying,
@@ -135,8 +152,8 @@ ORDER BY underlying;
 \echo  The hedging_demand_close_momentum hypothesis before any option is
 \echo  priced: on sessions where the 09:30 -> 15:00 cash return is at least
 \echo  half the daily sigma implied by the prior-session ATM IV (daily_atm_iv;
-\echo  the earlier VIX join clamped this to ~29 sessions, the cash bars allow
-\echo  ~63 in the 95-day window), how often does 15:00 -> 15:55 go the
+\echo  the earlier VIX join clamped this to ~29 sessions; the default window
+\echo  holds ~63), how often does 15:00 -> 15:55 go the
 \echo  same way, and how many bps does it travel in the direction of the day? Split
 \echo  by the dealer-gamma sign at 15:00. Baltussen et al. say the short-gamma
 \echo  row should carry the effect and the long-gamma row should not. With
@@ -156,7 +173,7 @@ WITH bars AS (
            (timestamp AT TIME ZONE 'America/New_York')::time AS et
     FROM underlying_quotes
     WHERE symbol IN ('SPY', 'QQQ', 'SPX')
-      AND timestamp >= NOW() - INTERVAL '95 days'
+      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
 ),
 opens AS (
     SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_open
@@ -182,7 +199,7 @@ gamma_1500 AS (
                  (timestamp AT TIME ZONE 'America/New_York')::time AS et
           FROM gex_summary
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-            AND timestamp >= NOW() - INTERVAL '95 days') g
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz) g
     WHERE et BETWEEN '14:00' AND '15:00' AND net_gex_at_spot IS NOT NULL
     ORDER BY underlying, sess, timestamp DESC
 ),
@@ -239,7 +256,7 @@ WITH bars AS (
            (timestamp AT TIME ZONE 'America/New_York')::time AS et
     FROM underlying_quotes
     WHERE symbol IN ('SPY', 'QQQ', 'SPX')
-      AND timestamp >= NOW() - INTERVAL '95 days'
+      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
 ),
 opens AS (
     SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_open
@@ -265,7 +282,7 @@ gamma_1500 AS (
                  (timestamp AT TIME ZONE 'America/New_York')::time AS et
           FROM gex_summary
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-            AND timestamp >= NOW() - INTERVAL '95 days') g
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz) g
     WHERE et BETWEEN '14:00' AND '15:00' AND net_gex_at_spot IS NOT NULL
     ORDER BY underlying, sess, timestamp DESC
 ),
@@ -331,7 +348,7 @@ WITH bars AS (
            (timestamp AT TIME ZONE 'America/New_York')::time AS et
     FROM underlying_quotes
     WHERE symbol IN ('SPY', 'QQQ', 'SPX')
-      AND timestamp >= NOW() - INTERVAL '95 days'
+      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
 ),
 opens AS (
     SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_open
@@ -355,7 +372,7 @@ gamma_1200 AS (
                  (timestamp AT TIME ZONE 'America/New_York')::time AS et
           FROM gex_summary
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-            AND timestamp >= NOW() - INTERVAL '95 days') g
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz) g
     WHERE et BETWEEN '11:00' AND '12:00' AND net_gex_at_spot IS NOT NULL
     ORDER BY underlying, sess, timestamp DESC
 ),
@@ -439,7 +456,7 @@ bars AS (
            (timestamp AT TIME ZONE 'America/New_York')::time AS et
     FROM underlying_quotes
     WHERE symbol IN ('SPY', 'QQQ', 'SPX')
-      AND timestamp >= NOW() - INTERVAL '95 days'
+      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
 ),
 opens AS (
     SELECT DISTINCT ON (symbol, sess) symbol, sess, close AS px_open
@@ -467,7 +484,7 @@ gamma_at AS (
                  (timestamp AT TIME ZONE 'America/New_York')::time AS et
           FROM gex_summary
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
             AND net_gex_at_spot IS NOT NULL) g
     CROSS JOIN slots s
     WHERE g.et > s.slot - INTERVAL '60 minutes' AND g.et <= s.slot
@@ -481,7 +498,7 @@ chain AS (
     FROM (SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
           FROM option_chains
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
@@ -492,7 +509,7 @@ chain AS (
           SELECT underlying, timestamp, strike, expiration, option_type, bid, ask, mid
           FROM option_chains_archive
           WHERE underlying IN ('SPY', 'QQQ', 'SPX')
-            AND timestamp >= NOW() - INTERVAL '95 days'
+            AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
             AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
             AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
                  OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'

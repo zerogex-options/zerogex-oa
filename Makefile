@@ -4402,9 +4402,9 @@ tradeworkz-review: ## Show scale-out ladder activity for the latest session (arm
 	@$(PSQL) -f setup/database/diagnostics/tradeworkz_scale_review.sql
 
 .PHONY: tradeworkz-v6-prescreen
-tradeworkz-v6-prescreen: ## v6 pre-screen: forecast skill, gamma base rates, raw last-hour momentum, realized-vs-normal range, straddle charged vs paid by gamma sign (read-only SQL)
+tradeworkz-v6-prescreen: ## v6 pre-screen over an anchored window (START=YYYY-MM-DD END=YYYY-MM-DD, END exclusive; defaults in the SQL): forecast skill, gamma base rates, last-hour momentum, realized range, straddle charged vs paid (read-only SQL)
 	@echo "$(BLUE)=== TradeWorkz v6 pre-screen (read-only) ===$(NC)"
-	@$(PSQL) -f setup/database/diagnostics/tradeworkz_v6_prescreen.sql
+	@$(PSQL) $(if $(START),-v start_ts=$(START)) $(if $(END),-v end_ts=$(END)) -f setup/database/diagnostics/tradeworkz_v6_prescreen.sql
 
 .PHONY: tradeworkz-backtest
 tradeworkz-backtest: ## Replay bots over history to screen for entry edge (args: ARGS="--days 5 --interval-min 5 --bots id1,id2 --json")

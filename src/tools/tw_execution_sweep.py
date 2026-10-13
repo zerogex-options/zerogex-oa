@@ -150,6 +150,15 @@ def short_premium_grid() -> List[Tuple[str, Dict[str, Any]]]:
     morning = {"min_minutes_since_open": 60, "min_minutes_to_close": 150}
     grid.append(("gated/morning", dict(morning)))
     grid.append(("twin/tail_only_morning", {**morning, "required_regimes": "any"}))
+    # The one pre-screen cell where a richer straddle still underpriced the
+    # move was SPX short gamma at 12:00 (second run: 1.056 paid/charged,
+    # 5 of 18 beyond the wing). The mechanism says this arm loses there.
+    grid.append(
+        (
+            "twin/negative_gamma_morning",
+            {**morning, "required_regimes": ["negative_weak", "negative_strong"]},
+        )
+    )
     return grid
 
 
