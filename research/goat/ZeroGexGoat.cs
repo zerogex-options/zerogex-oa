@@ -67,6 +67,11 @@
 //       above the midband. Jim, 2026-10-09: "I would still like to enter at
 //       or below the midband." Off by default (-1).
 //
+//  DEAD ZONES: up to three time windows where no new trade opens (open
+//  trades are still managed). Jim, 2026-10-13: "a LOT of chop between 2:40
+//  and 3:10", and "the first 10 minutes of the day session is crazy".
+//  HHMM, 24-hour, in the time zone the chart shows. Off when from == to.
+//
 //  EXITS — two lots:
 //    Lot 1 ("GOAT1") exits on the first opposite-closing bar.
 //    Lot 2 ("GOAT2") trails by TrailTicks.
@@ -285,6 +290,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 				TrailTicks = 8;
 				BreakevenTriggerTicks = 0;   // 0 == off
 				BreakevenPlusTicks = 1;
+
+				// --- dead zones (from == to is off) ---
+				DeadZone1From = 0;
+				DeadZone1To = 0;
+				DeadZone2From = 0;
+				DeadZone2To = 0;
+				DeadZone3From = 0;
+				DeadZone3To = 0;
 			}
 			else if (State == State.Configure)
 			{
@@ -334,8 +347,39 @@ namespace NinjaTrader.NinjaScript.Strategies
 			UpdatePinch();
 			ManageOpenPosition();
 
-			if (Position.MarketPosition == MarketPosition.Flat)
+			if (Position.MarketPosition == MarketPosition.Flat && !InDeadZone())
 				LookForEntry();
+		}
+
+		/// <summary>
+		/// True when this bar's time falls in one of the dead zones, where no
+		/// new trade opens. Open trades are still managed. The pinch keeps
+		/// updating through a dead zone, so a setup that forms inside one can
+		/// still be taken just after it ends.
+		/// </summary>
+		private bool InDeadZone()
+		{
+			int now = Time[0].Hour * 60 + Time[0].Minute;
+			return InWindow(now, DeadZone1From, DeadZone1To)
+				|| InWindow(now, DeadZone2From, DeadZone2To)
+				|| InWindow(now, DeadZone3From, DeadZone3To);
+		}
+
+		/// <summary>
+		/// Whether a time (minutes after midnight) is inside [from, to), both
+		/// given as HHMM. from == to means off; from after to wraps past
+		/// midnight, so 2300 to 0100 covers the two hours around it.
+		/// </summary>
+		private static bool InWindow(int nowMinutes, int fromHhmm, int toHhmm)
+		{
+			if (fromHhmm == toHhmm)
+				return false;
+
+			int from = fromHhmm / 100 * 60 + fromHhmm % 100;
+			int to = toHhmm / 100 * 60 + toHhmm % 100;
+			return from < to
+				? nowMinutes >= from && nowMinutes < to
+				: nowMinutes >= from || nowMinutes < to;
 		}
 
 		// --------------------------------------------------------------
@@ -936,6 +980,36 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(0, int.MaxValue)]
 		[Display(Name = "Breakeven: stop at entry plus (ticks)", Order = 9, GroupName = "5. Sizing and exits")]
 		public int BreakevenPlusTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 2359)]
+		[Display(Name = "Zone 1 from (HHMM, 24h; same as 'to' = off)", Order = 1, GroupName = "6. Dead zones (no new trades)")]
+		public int DeadZone1From { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 2359)]
+		[Display(Name = "Zone 1 to (HHMM, 24h)", Order = 2, GroupName = "6. Dead zones (no new trades)")]
+		public int DeadZone1To { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 2359)]
+		[Display(Name = "Zone 2 from (HHMM, 24h; same as 'to' = off)", Order = 3, GroupName = "6. Dead zones (no new trades)")]
+		public int DeadZone2From { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 2359)]
+		[Display(Name = "Zone 2 to (HHMM, 24h)", Order = 4, GroupName = "6. Dead zones (no new trades)")]
+		public int DeadZone2To { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 2359)]
+		[Display(Name = "Zone 3 from (HHMM, 24h; same as 'to' = off)", Order = 5, GroupName = "6. Dead zones (no new trades)")]
+		public int DeadZone3From { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 2359)]
+		[Display(Name = "Zone 3 to (HHMM, 24h)", Order = 6, GroupName = "6. Dead zones (no new trades)")]
+		public int DeadZone3To { get; set; }
 
 		#endregion
 	}
