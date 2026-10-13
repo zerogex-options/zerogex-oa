@@ -72,6 +72,10 @@
 //    Lot 2 ("GOAT2") trails by TrailTicks.
 //    Both carry an initial stop of the entry bar's range + StopExtraTicks,
 //    which on a 3-range chart is a 4-tick stop.
+//    Breakeven (BreakevenTriggerTicks, off at 0): once price has gone that
+//    many ticks the trade's way, both stops move to entry +
+//    BreakevenPlusTicks, and lot 2's trail only starts from there. Jim,
+//    2026-10-10: "a big trailing stop AFTER we get to BE".
 //    When the opposite-closing bar leaves price within StopRaceGuardTicks of
 //    lot 1's stop, lot 1 is left to that stop instead of being sent a
 //    separate market exit. Live, the two filling together traded one
@@ -194,8 +198,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private int signalStopTicks;
 		//: Initial stop price, held so the lot 2 trail can never widen it.
 		private double initialStopPrice;
-		//: Best price reached since entry, which the lot 2 trail hangs off.
+		//: Best price reached since entry, which breakeven and the lot 2 trail
+		//: measure from.
 		private double runExtreme;
+		//: Entry price, fixed on the first bar in position.
+		private double entryPrice;
+		//: Where each lot's stop sits now. Stops only ever tighten, so MoveStop
+		//: compares against these instead of re-sending every bar.
+		private double lot1Stop;
+		private double lot2Stop;
+		//: Set once price has gone BreakevenTriggerTicks the trade's way.
+		private bool breakevenDone;
 		//: Direction of the trade last entered. A position on the other side
 		//: can only come from an exit that overfilled, never from an entry.
 		private MarketPosition tradeDirection = MarketPosition.Flat;
@@ -270,6 +283,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				Target1Mode = GoatTarget1Mode.FirstOppositeCloseBar;
 				Target1Ticks = 8;
 				TrailTicks = 8;
+				BreakevenTriggerTicks = 0;   // 0 == off
+				BreakevenPlusTicks = 1;
 			}
 			else if (State == State.Configure)
 			{
@@ -553,6 +568,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			initialStopPrice = double.NaN;
 			runExtreme = double.NaN;
 			target1Done = false;
+			breakevenDone = false;
 		}
 
 		private void ManageOpenPosition()
@@ -564,14 +580,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 
 			AnchorStops();
+			UpdateRunExtreme();
+			ApplyBreakeven();
 			ExitTarget1();
 			TrailLot2();
 		}
 
 		/// <summary>
-		/// Fix the initial stop price and the trail's starting extreme on the
-		/// first bar in position. Runs before ExitTarget1, which needs the stop
-		/// price on that very bar.
+		/// Fix the entry, the initial stop price and the trail's starting
+		/// extreme on the first bar in position. Runs before ExitTarget1, which
+		/// needs the stop price on that very bar.
 		/// </summary>
 		private void AnchorStops()
 		{
@@ -579,12 +597,57 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 
 			bool isLong = Position.MarketPosition == MarketPosition.Long;
-			double entry = Position.AveragePrice;
+			entryPrice = Position.AveragePrice;
 
 			initialStopPrice = isLong
-				? entry - signalStopTicks * TickSize
-				: entry + signalStopTicks * TickSize;
+				? entryPrice - signalStopTicks * TickSize
+				: entryPrice + signalStopTicks * TickSize;
+			lot1Stop = initialStopPrice;
+			lot2Stop = initialStopPrice;
 			runExtreme = isLong ? High[0] : Low[0];
+		}
+
+		/// <summary>Best price reached since entry.</summary>
+		private void UpdateRunExtreme()
+		{
+			runExtreme = Position.MarketPosition == MarketPosition.Long
+				? Math.Max(runExtreme, High[0])
+				: Math.Min(runExtreme, Low[0]);
+		}
+
+		/// <summary>
+		/// Move both stops to entry + BreakevenPlusTicks once price has gone
+		/// BreakevenTriggerTicks the trade's way: Jim's manual setup, "when
+		/// price goes my way N ticks (usually 8-10) it auto moves to BE plus
+		/// 1". Measured off the best price since entry, so it fires on the bar
+		/// that reached the trigger even when that bar closes back below it.
+		/// Lot 2 gets the same floor in TrailLot2.
+		/// </summary>
+		private void ApplyBreakeven()
+		{
+			if (BreakevenTriggerTicks <= 0)
+				return;
+
+			bool isLong = Position.MarketPosition == MarketPosition.Long;
+			if (!breakevenDone)
+			{
+				double excursion = isLong ? runExtreme - entryPrice : entryPrice - runExtreme;
+				if (excursion.ApproxCompare(BreakevenTriggerTicks * TickSize) < 0)
+					return;
+				breakevenDone = true;
+			}
+
+			// Every bar after the trigger, not just the first: if price was
+			// already back through the breakeven level, MoveStop only gets part
+			// of the way and a later bar finishes the move.
+			MoveStop("GOAT1", ref lot1Stop, BreakevenStop(isLong), isLong);
+		}
+
+		private double BreakevenStop(bool isLong)
+		{
+			return isLong
+				? entryPrice + BreakevenPlusTicks * TickSize
+				: entryPrice - BreakevenPlusTicks * TickSize;
 		}
 
 		/// <summary>
@@ -614,14 +677,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			if (Position.MarketPosition == MarketPosition.Long && Close[0] <= Open[0])
 			{
-				if (ExitSidePrice(true) - initialStopPrice <= guard)
+				if (ExitSidePrice(true) - lot1Stop <= guard)
 					return;
 				ExitLong(LotSize, "X1", "GOAT1");
 				target1Done = true;
 			}
 			else if (Position.MarketPosition == MarketPosition.Short && Close[0] > Open[0])
 			{
-				if (initialStopPrice - ExitSidePrice(false) <= guard)
+				if (lot1Stop - ExitSidePrice(false) <= guard)
 					return;
 				ExitShort(LotSize, "X1", "GOAT1");
 				target1Done = true;
@@ -643,26 +706,63 @@ namespace NinjaTrader.NinjaScript.Strategies
 		}
 
 		/// <summary>
-		/// Trail lot 2 by TrailTicks off the best price seen since entry,
-		/// never looser than the initial entry-bar stop.
+		/// Trail lot 2 by TrailTicks off the best price seen since entry, never
+		/// looser than its stop so far. With breakeven on, the trail waits for
+		/// it: until then lot 2 keeps the initial stop and has room to breathe,
+		/// and from then on it trails from breakeven at worst. With breakeven
+		/// off, the trail runs from entry as it always has.
 		/// </summary>
 		private void TrailLot2()
 		{
 			bool isLong = Position.MarketPosition == MarketPosition.Long;
+			double stop = initialStopPrice;
 
-			runExtreme = isLong
-				? Math.Max(runExtreme, High[0])
-				: Math.Min(runExtreme, Low[0]);
+			if (breakevenDone)
+				stop = Tighter(stop, BreakevenStop(isLong), isLong);
 
-			double trail = isLong
-				? runExtreme - TrailTicks * TickSize
-				: runExtreme + TrailTicks * TickSize;
+			if (BreakevenTriggerTicks <= 0 || breakevenDone)
+			{
+				double trail = isLong
+					? runExtreme - TrailTicks * TickSize
+					: runExtreme + TrailTicks * TickSize;
+				stop = Tighter(stop, trail, isLong);
+			}
 
-			double stop = isLong
-				? Math.Max(initialStopPrice, trail)
-				: Math.Min(initialStopPrice, trail);
+			MoveStop("GOAT2", ref lot2Stop, stop, isLong);
+		}
 
-			SetStopLoss("GOAT2", CalculationMode.Price, stop, false);
+		/// <summary>The tighter of two stop prices for the trade's side.</summary>
+		private static double Tighter(double a, double b, bool isLong)
+		{
+			return isLong ? Math.Max(a, b) : Math.Min(a, b);
+		}
+
+		/// <summary>
+		/// Move a lot's stop toward <paramref name="target"/>: only ever
+		/// tighter, and never through the market. A sell stop at or above the
+		/// bid (a buy stop at or below the ask) is rejected, and under
+		/// RealtimeErrorHandling.StopCancelClose a rejected order stops the
+		/// strategy and flattens it. Breakeven makes that reachable, since it
+		/// fires on the bar that touched the trigger and price may be back
+		/// through the breakeven level by the close. So the stop goes no closer
+		/// than one tick inside the current price. Nothing is sent when nothing
+		/// would change.
+		/// </summary>
+		private void MoveStop(string fromEntrySignal, ref double current, double target, bool isLong)
+		{
+			double price = ExitSidePrice(isLong);
+			double capped = isLong
+				? Math.Min(target, price - TickSize)
+				: Math.Max(target, price + TickSize);
+
+			bool tighter = isLong
+				? capped.ApproxCompare(current) > 0
+				: capped.ApproxCompare(current) < 0;
+			if (!tighter)
+				return;
+
+			current = capped;
+			SetStopLoss(fromEntrySignal, CalculationMode.Price, capped, false);
 		}
 
 		/// <summary>
@@ -824,8 +924,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name = "Lot 2 trail (ticks)", Order = 7, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 2 trail (ticks; waits for breakeven when it's on)", Order = 7, GroupName = "5. Sizing and exits")]
 		public int TrailTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Breakeven: after ticks in profit (0=off)", Order = 8, GroupName = "5. Sizing and exits")]
+		public int BreakevenTriggerTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Breakeven: stop at entry plus (ticks)", Order = 9, GroupName = "5. Sizing and exits")]
+		public int BreakevenPlusTicks { get; set; }
 
 		#endregion
 	}
