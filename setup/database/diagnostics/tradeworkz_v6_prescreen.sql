@@ -19,8 +19,10 @@
 -- NOW() - 95 days window differed by one session, and that one session was
 -- the whole change in the 13:30 gamma margin. Defaults below reproduce the
 -- 2026-10-12 run; override from make with START=YYYY-MM-DD END=YYYY-MM-DD
--- (END is exclusive). The archive reaches back to 2026-04-20, so
--- START=2026-04-20 END=2026-07-10 is a holdout no reading here has seen.
+-- (END is exclusive). The archive reaches back to 2026-04-20, but the cash
+-- bars and gex_summary are pruned at 90 days, so on START=2026-04-20
+-- END=2026-07-10 sections E-G see ~8 sessions and only section H (archive
+-- only, spot by put-call parity) is the holdout.
 \if :{?start_ts}
 \else
 \set start_ts 2026-07-10
@@ -444,8 +446,6 @@ ORDER BY symbol NULLS LAST, 2 NULLS LAST;
 \echo  milliseconds). Nothing is written to the schema.
 \echo
 
-DROP TABLE IF EXISTS pg_temp.tw_v6_straddles;
-
 CREATE TEMP TABLE tw_v6_straddles AS
 WITH slots AS (
     SELECT unnest(ARRAY['10:30', '12:00', '13:00', '13:30', '14:30']::time[]) AS slot
@@ -618,6 +618,144 @@ GROUP BY symbol, slot, richness
 ORDER BY symbol, slot, richness;
 
 DROP TABLE IF EXISTS pg_temp.tw_v6_straddles;
+
+\echo
+\echo ============================================================
+\echo  H. The straddle test from the chain ARCHIVE alone (holdout-capable)
+\echo ============================================================
+\echo  underlying_quotes and gex_summary are pruned at DATA_RETENTION_DAYS
+\echo  (90), so sections E-G can only see ~63 sessions; the 2026-04-20 to
+\echo  2026-07-10 run found 8. option_chains_archive is retention-exempt and
+\echo  dense back to 2026-04-20, so this section rebuilds section G without
+\echo  the cash bars: spot at each slot and at 15:55 is read off the 0DTE
+\echo  chain itself by put-call parity (the strike where |call - put| is
+\echo  smallest; spot = strike + call - put, exact to a tick with hours to
+\echo  expiry and no carry). No gamma sign is available this far back, so H
+\echo  tests the UNCONDITIONAL premium by slot (afternoon_iron_fly) and the
+\echo  straddle-richness cut (H2), not the gate. Run it on the default window
+\echo  first: if H agrees with G there, H on the holdout is credible.
+\echo
+
+CREATE TEMP TABLE tw_v6_arch AS
+WITH slots AS (
+    SELECT unnest(ARRAY['10:30', '12:00', '13:00', '13:30', '14:30', '15:55']::time[]) AS slot
+),
+rows AS (
+    SELECT underlying AS symbol, timestamp, strike, option_type, bid, ask,
+           COALESCE(mid, (bid + ask) / 2.0) AS mid,
+           (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+           (timestamp AT TIME ZONE 'America/New_York')::time AS et
+    FROM option_chains_archive
+    WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
+      AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+      AND bid > 0 AND ask > 0
+      AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '15:45' AND '15:55')
+    UNION
+    SELECT underlying AS symbol, timestamp, strike, option_type, bid, ask,
+           COALESCE(mid, (bid + ask) / 2.0) AS mid,
+           (timestamp AT TIME ZONE 'America/New_York')::date AS sess,
+           (timestamp AT TIME ZONE 'America/New_York')::time AS et
+    FROM option_chains
+    WHERE underlying IN ('SPY', 'QQQ', 'SPX')
+      AND timestamp >= :'start_ts'::timestamptz AND timestamp < :'end_ts'::timestamptz
+      AND expiration = (timestamp AT TIME ZONE 'America/New_York')::date
+      AND bid > 0 AND ask > 0
+      AND ((timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '10:20' AND '10:30'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '11:50' AND '12:00'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '12:50' AND '13:00'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '13:20' AND '13:30'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '14:20' AND '14:30'
+           OR (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '15:45' AND '15:55')
+),
+stamped AS (
+    SELECT r.*, s.slot
+    FROM rows r
+    JOIN slots s ON r.et > s.slot - INTERVAL '10 minutes' AND r.et <= s.slot
+),
+latest AS (
+    SELECT symbol, sess, slot, MAX(timestamp) AS ts
+    FROM stamped
+    GROUP BY symbol, sess, slot
+),
+pairs AS (
+    -- call and put at the same strike on the latest stamp before the slot
+    SELECT c.symbol, c.sess, c.slot, c.strike,
+           c.mid AS c_mid, p.mid AS p_mid,
+           c.mid + p.mid AS straddle_mid,
+           c.bid + p.bid AS straddle_bid
+    FROM stamped c
+    JOIN latest l ON l.symbol = c.symbol AND l.sess = c.sess AND l.slot = c.slot AND l.ts = c.timestamp
+    JOIN stamped p ON p.symbol = c.symbol AND p.timestamp = c.timestamp AND p.slot = c.slot
+                  AND p.strike = c.strike AND p.option_type = 'P'
+    WHERE c.option_type = 'C'
+),
+atm AS (
+    -- the strike where |call - put| is smallest is the ATM strike, and
+    -- strike + call - put is spot by parity
+    SELECT DISTINCT ON (symbol, sess, slot) symbol, sess, slot, strike,
+           straddle_mid, straddle_bid,
+           strike + c_mid - p_mid AS spot_est
+    FROM pairs
+    ORDER BY symbol, sess, slot, ABS(c_mid - p_mid), strike
+)
+SELECT a.symbol, a.sess, a.slot, a.spot_est AS spot, a.strike, a.straddle_mid, a.straddle_bid,
+       ABS(f.spot_est - a.strike) AS paid,
+       NTILE(2) OVER (PARTITION BY a.symbol, a.slot ORDER BY a.straddle_mid / a.spot_est) AS richness
+FROM atm a
+JOIN atm f ON f.symbol = a.symbol AND f.sess = a.sess AND f.slot = '15:55'
+WHERE a.slot <> '15:55' AND a.straddle_mid > 0 AND a.spot_est > 0;
+
+\echo
+\echo  H1. Coverage, then the unconditional straddle by symbol x slot and pooled.
+\echo
+
+SELECT symbol, COUNT(DISTINCT sess) AS sessions_with_a_settle_print,
+       MIN(sess) AS first_sess, MAX(sess) AS last_sess
+FROM tw_v6_arch
+GROUP BY symbol
+ORDER BY symbol;
+
+SELECT symbol,
+       slot AS entry_et,
+       COUNT(*) AS sessions,
+       ROUND(AVG(straddle_mid)::numeric, 2) AS mean_straddle_mid,
+       ROUND(AVG(paid / straddle_mid)::numeric, 3) AS mean_paid_over_charged,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (paid / straddle_mid)::float8)::numeric, 3)
+           AS median_paid_over_charged,
+       ROUND((10000 * AVG(paid / spot))::numeric, 1) AS mean_paid_bps_of_spot,
+       ROUND(100.0 * AVG((paid < straddle_bid)::int), 1) AS seller_win_pct_at_bid,
+       ROUND((10000 * AVG((straddle_bid - paid) / spot))::numeric, 1) AS seller_bps_of_spot,
+       SUM((paid > 1.25 * straddle_mid / SQRT(2.0 / PI()))::int) AS beyond_1p25_sigma_wing_n
+FROM tw_v6_arch
+GROUP BY GROUPING SETS ((symbol, slot), (slot))
+ORDER BY symbol NULLS LAST, slot;
+
+\echo
+\echo  H2. The same straddles by richness half (straddle mid / spot, above or
+\echo  below the symbol-slot median). The cheap half paying the seller as well
+\echo  as the rich half says the quiet-tape gate adds nothing here.
+\echo
+
+SELECT symbol, slot AS entry_et,
+       CASE richness WHEN 1 THEN 'cheap half' ELSE 'rich half' END AS straddle_richness,
+       COUNT(*) AS sessions,
+       ROUND(AVG(straddle_mid)::numeric, 2) AS mean_straddle_mid,
+       ROUND(AVG(paid / straddle_mid)::numeric, 3) AS mean_paid_over_charged,
+       ROUND((10000 * AVG(paid / spot))::numeric, 1) AS mean_paid_bps_of_spot,
+       ROUND((10000 * AVG((straddle_bid - paid) / spot))::numeric, 1) AS seller_bps_of_spot,
+       SUM((paid > 1.25 * straddle_mid / SQRT(2.0 / PI()))::int) AS beyond_1p25_sigma_wing_n
+FROM tw_v6_arch
+WHERE slot >= '13:00'
+GROUP BY symbol, slot, richness
+ORDER BY symbol, slot, richness;
+
+DROP TABLE IF EXISTS pg_temp.tw_v6_arch;
 
 \echo
 \echo  Done. Next: python -m src.tools.tw_edge_field_probe --days 90 for the
