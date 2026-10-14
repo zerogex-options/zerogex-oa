@@ -420,8 +420,9 @@ class TechnicalsQueriesMixin:
                     CASE
                         WHEN q.close > orb.orb_high THEN '🚀 ORB Breakout (Long)'
                         WHEN q.close < orb.orb_low THEN '💥 ORB Breakdown (Short)'
-                        WHEN q.close >= orb.orb_high * 0.998 THEN '⚡ Near ORB High'
-                        WHEN q.close <= orb.orb_low * 1.002 THEN '⚡ Near ORB Low'
+                        -- Near = the outer fifth of the range, not a share of price: 0.2 percent of ES is ~15 points, wider than many opening ranges.
+                        WHEN q.close >= orb.orb_high - 0.2 * (orb.orb_high - orb.orb_low) THEN '⚡ Near ORB High'
+                        WHEN q.close <= orb.orb_low + 0.2 * (orb.orb_high - orb.orb_low) THEN '⚡ Near ORB Low'
                         ELSE '⏸️ Inside ORB'
                     END AS orb_status,
                     (q.up_volume + q.down_volume) AS volume
@@ -1245,8 +1246,9 @@ class TechnicalsQueriesMixin:
                         WHEN c.timestamp < $6 THEN NULL
                         WHEN c.close > ow.orb_high THEN '🚀 ORB Breakout (Long)'
                         WHEN c.close < ow.orb_low THEN '💥 ORB Breakdown (Short)'
-                        WHEN c.close >= ow.orb_high * 0.998 THEN '⚡ Near ORB High'
-                        WHEN c.close <= ow.orb_low * 1.002 THEN '⚡ Near ORB Low'
+                        -- Near = the outer fifth of the range, not a share of price: 0.2 percent of ES is ~15 points, wider than many opening ranges.
+                        WHEN c.close >= ow.orb_high - 0.2 * (ow.orb_high - ow.orb_low) THEN '⚡ Near ORB High'
+                        WHEN c.close <= ow.orb_low + 0.2 * (ow.orb_high - ow.orb_low) THEN '⚡ Near ORB Low'
                         ELSE '⏸️ Inside ORB'
                     END AS orb_status,
                     c.volume AS current_volume,

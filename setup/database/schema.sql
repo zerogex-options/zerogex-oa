@@ -1484,8 +1484,8 @@ SELECT
     CASE
         WHEN q.close > orb.orb_high THEN '🚀 ORB Breakout (Long)'
         WHEN q.close < orb.orb_low THEN '💥 ORB Breakdown (Short)'
-        WHEN q.close >= orb.orb_high * 0.998 THEN '⚡ Near ORB High'
-        WHEN q.close <= orb.orb_low * 1.002 THEN '⚡ Near ORB Low'
+        WHEN q.close >= orb.orb_high - 0.2 * (orb.orb_high - orb.orb_low) THEN '⚡ Near ORB High'
+        WHEN q.close <= orb.orb_low + 0.2 * (orb.orb_high - orb.orb_low) THEN '⚡ Near ORB Low'
         ELSE '⏸️ Inside ORB'
     END AS orb_status,
     COALESCE(q.volume, q.up_volume + q.down_volume) AS volume
