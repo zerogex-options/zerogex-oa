@@ -3779,3 +3779,132 @@ BEGIN
         FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
     END IF;
 END $$;
+
+-- =============================================================================
+-- Wall alerts — member alerts on Call/Put Wall hits, breaks and holds
+-- =============================================================================
+-- See docs/design/wall-alerts.md.  The detector service
+-- (src/alerts/wall_alert_engine.py, unit zerogex-oa-wall-alerts) reads
+-- gex_summary + underlying_quotes and writes only these four tables:
+--
+--   wall_alert_rules           what each member asked for: symbol, side, which
+--                              events, minimum wall strength, sensitivity,
+--                              channels.  Owned by the member through
+--                              /api/alerts/walls/rules.
+--   wall_alert_events          every event the detector found, whether or not
+--                              anyone was subscribed: the record behind every
+--                              delivery, and the history the sensitivity
+--                              profiles are tuned against.
+--   wall_alert_deliveries      the outbox, one row per (event, member, channel).
+--                              in_app rows are born 'sent' (the feed IS the
+--                              delivery); email / sms rows are born 'queued' and
+--                              a worker drains them through
+--                              /api/alerts/walls/internal/*.
+--   wall_alert_detector_state  per-(symbol, profile) detector state, so a
+--                              restart mid-session neither drops an open test
+--                              nor re-alerts a hit.
+
+CREATE TABLE IF NOT EXISTS wall_alert_rules (
+    id                  BIGSERIAL    PRIMARY KEY,
+    end_user            VARCHAR(128) NOT NULL,
+    underlying          VARCHAR(10)  NOT NULL,
+    -- 'call' | 'put' | 'both'
+    side                VARCHAR(8)   NOT NULL,
+    -- Which events of a wall test to alert: {"hit": bool, "break": bool, "hold": bool}.
+    events              JSONB        NOT NULL DEFAULT '{"hit": true, "break": true, "hold": false}'::jsonb,
+    -- Alert only when the wall's size percentile (vs the symbol's own 30-day,
+    -- time-of-day-bucketed history, gex_historical_stats) is at least this.
+    -- 0 = any wall.  A wall whose percentile is unknown never satisfies a
+    -- floor above 0.
+    min_strength_pctile SMALLINT     NOT NULL DEFAULT 0,
+    -- Sensitivity profile: src/alerts/wall_detector.py PROFILES.
+    profile             VARCHAR(16)  NOT NULL DEFAULT 'balanced',
+    -- {"in_app": bool, "email": bool, "sms": bool}; see src/alerts/config.py CHANNELS.
+    channels            JSONB        NOT NULL DEFAULT '{"in_app": true}'::jsonb,
+    enabled             BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    last_triggered_at   TIMESTAMPTZ,
+    CONSTRAINT wall_alert_rules_side_chk CHECK (side IN ('call', 'put', 'both')),
+    CONSTRAINT wall_alert_rules_pctile_chk CHECK (min_strength_pctile BETWEEN 0 AND 100),
+    CONSTRAINT wall_alert_rules_profile_chk
+        CHECK (profile IN ('responsive', 'balanced', 'conservative'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_wall_alert_rules_user
+    ON wall_alert_rules(end_user, created_at);
+-- The fan-out lookup: enabled rules for one (symbol, profile).
+CREATE INDEX IF NOT EXISTS idx_wall_alert_rules_match
+    ON wall_alert_rules(underlying, profile) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS wall_alert_events (
+    id               BIGSERIAL        PRIMARY KEY,
+    underlying       VARCHAR(10)      NOT NULL,
+    session_date     DATE             NOT NULL,
+    profile          VARCHAR(16)      NOT NULL,
+    side             VARCHAR(8)       NOT NULL,
+    -- 'hit' | 'break' | 'hold'
+    event_type       VARCHAR(8)       NOT NULL,
+    wall_strike      NUMERIC(12, 4)   NOT NULL,
+    -- Which test of this wall today (1 = first); with the rest of the key it
+    -- makes a re-run of the same tape a no-op instead of a second alert.
+    test_ordinal     SMALLINT         NOT NULL,
+    -- Start of the 1-minute bar the event fired on.
+    bar_ts           TIMESTAMPTZ      NOT NULL,
+    price            DOUBLE PRECISION NOT NULL,
+    strength         DOUBLE PRECISION,
+    strength_pctile  DOUBLE PRECISION,
+    -- Everything a channel renders from: src/alerts/wall_payload.py.
+    payload          JSONB            NOT NULL,
+    detected_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    CONSTRAINT wall_alert_events_uq
+        UNIQUE (underlying, session_date, profile, side, wall_strike, test_ordinal, event_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wall_alert_events_symbol_detected
+    ON wall_alert_events(underlying, detected_at DESC);
+-- Retention prune.
+CREATE INDEX IF NOT EXISTS idx_wall_alert_events_detected
+    ON wall_alert_events(detected_at);
+
+CREATE TABLE IF NOT EXISTS wall_alert_deliveries (
+    id          BIGSERIAL    PRIMARY KEY,
+    event_id    BIGINT       NOT NULL REFERENCES wall_alert_events(id) ON DELETE CASCADE,
+    rule_id     BIGINT       REFERENCES wall_alert_rules(id) ON DELETE SET NULL,
+    end_user    VARCHAR(128) NOT NULL,
+    -- 'in_app' | 'email' | 'sms'
+    channel     VARCHAR(16)  NOT NULL,
+    -- 'queued' | 'sent' | 'failed' | 'cancelled'
+    status      VARCHAR(16)  NOT NULL,
+    error       TEXT,
+    attempts    SMALLINT     NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    sent_at     TIMESTAMPTZ,
+    -- in_app only: when the member saw it. Server-side, so the unread count
+    -- agrees across every device and tab.
+    read_at     TIMESTAMPTZ,
+    CONSTRAINT wall_alert_deliveries_uq UNIQUE (event_id, end_user, channel),
+    CONSTRAINT wall_alert_deliveries_status_chk
+        CHECK (status IN ('queued', 'sent', 'failed', 'cancelled'))
+);
+
+-- The in-app feed: one member's rows on one channel, newest first.
+CREATE INDEX IF NOT EXISTS idx_wall_alert_deliveries_feed
+    ON wall_alert_deliveries(end_user, channel, created_at DESC);
+-- The delivery workers' queue scan.
+CREATE INDEX IF NOT EXISTS idx_wall_alert_deliveries_queue
+    ON wall_alert_deliveries(channel, created_at) WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS idx_wall_alert_deliveries_event
+    ON wall_alert_deliveries(event_id);
+
+CREATE TABLE IF NOT EXISTS wall_alert_detector_state (
+    underlying    VARCHAR(10)  NOT NULL,
+    profile       VARCHAR(16)  NOT NULL,
+    session_date  DATE         NOT NULL,
+    state         JSONB        NOT NULL,
+    -- Rewritten whenever the state changes, which during the session is at
+    -- least once a minute: a stale updated_at mid-session means the service
+    -- is not running.
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, profile)
+);

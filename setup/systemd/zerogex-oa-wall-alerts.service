@@ -1,0 +1,59 @@
+[Unit]
+Description=ZeroGEX Wall Alerts (Call/Put Wall hit / break / hold detector)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target zerogex-oa-analytics.service
+Wants=network-online.target
+
+# Operator hook for active alerting — same wiring as the other services: a
+# crash that systemd gives up on emails/pages through zerogex-alert@.service.
+OnFailure=zerogex-alert@%n.service
+
+# A crash loop on a bad deploy latches instead of flapping forever. Same
+# bound as the API unit.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Reads gex_summary + underlying_quotes every WALL_ALERTS_POLL_SECONDS during
+# the cash session and writes only the wall_alert_* tables. Idles (sleeping in
+# slices so SIGTERM is honored at once) outside the session. A second copy
+# started by hand stands by on the advisory lock instead of double-alerting.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.alerts.wall_alert_engine
+
+Restart=always
+RestartSec=10
+
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+SendSIGKILL=yes
+
+# Small: a handful of symbols' state and a few rows per tick. The cap is far
+# above the steady state (~60-90 MB) and far below anything that would crowd
+# the ingestion / analytics / API budgets on the m5.large.
+MemoryMax=256M
+CPUQuota=50%
+# Below the API (400) and the engines (80): alerting yields to everything that
+# serves or computes the product.
+CPUWeight=60
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-wall-alerts
+
+[Install]
+WantedBy=multi-user.target

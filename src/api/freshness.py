@@ -526,6 +526,10 @@ ENDPOINT_CADENCE: Tuple[Tuple[str, CadenceProfile], ...] = (
     ("/api/replay/*", HISTORICAL),
     ("/api/backtest/*", HISTORICAL),
     ("/api/tradeworkz/*", SIGNALS_CYCLE),
+    # Wall alerts: /live reads the published walls; everything else is a
+    # member's own rules and feed, with no upstream feed to fall behind.
+    ("/api/alerts/walls/live", ANALYTICS_CYCLE),
+    ("/api/alerts/*", ON_DEMAND),
     ("/api/admin/*", ON_DEMAND),
 )
 

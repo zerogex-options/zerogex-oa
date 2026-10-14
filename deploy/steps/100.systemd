@@ -30,6 +30,10 @@ SERVICES=(
     "zerogex-oa-ingestion"
     "zerogex-oa-analytics"
     "zerogex-oa-signals"
+    # Members' Call/Put Wall alerts (src/alerts/wall_alert_engine.py). Reads
+    # gex_summary + underlying_quotes, writes only the wall_alert_* tables, so
+    # it needs schema.sql applied (step 020) before it starts.
+    "zerogex-oa-wall-alerts"
 )
 
 # Copy systemd service files

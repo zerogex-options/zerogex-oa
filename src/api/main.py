@@ -96,6 +96,7 @@ from .routers.levels import router as levels_router
 from .routers.admin_api_keys import router as admin_api_keys_router
 from .routers.admin_xpost import router as admin_xpost_router
 from .routers.news import router as news_router
+from .routers.wall_alerts import router as wall_alerts_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -616,6 +617,13 @@ app.include_router(forced_flow_router, dependencies=[_scope_flow])
 # Router-level guard is the SIGNALS scope; the /admin/* sub-endpoints add
 # an additional require_scopes check inline.
 app.include_router(tradeworkz_router, dependencies=[_scope_signals])
+
+# Wall alerts — members' alerts on Call/Put Wall hits, breaks and holds
+# (src/alerts/, docs/design/wall-alerts.md). The data behind /live is
+# GEX-derived, so the router rides the GEX scope; member endpoints additionally
+# need an end-user token and the /internal/* outbox needs the admin token (see
+# the router docstring), because the bare API key is held by every integrator.
+app.include_router(wall_alerts_router, dependencies=[_scope_gex])
 
 # Admin key-administration surface — mints/revokes the per-user API keys
 # behind the website's self-service "Generate API Key" button. NOT scope-
