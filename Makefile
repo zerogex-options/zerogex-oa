@@ -1119,7 +1119,7 @@ help: ## Show this help message
 	@echo "  make symbol-add        - Upsert one row into required symbols table"
 	@echo "    SYMBOL=<sym> NAME=<name> ASSET_TYPE=<EQUITY|INDEX|ETF> IS_ACTIVE=<true|false>"
 	@echo "  make pull               - git pull --ff-only + schema-apply (use after updating)"
-	@echo "  make schema-apply       - Apply/update setup/database/schema.sql"
+	@echo "  make schema-apply       - Apply/update setup/database/schema.sql (lock waits capped: SCHEMA_LOCK_TIMEOUT=5s)"
 	@echo "  make schema-verify      - Verify schema components exist"
 	@echo "  make schema-backup      - Backup current schema to file"
 	@echo ""
@@ -3331,29 +3331,74 @@ symbol-add: ## Upsert into symbols table (required: SYMBOL; optional: NAME, ASSE
 			updated_at = NOW();"; \
 	echo "$(GREEN)✅ Upserted symbol $$SYMBOL_UPPER$(NC)"
 
+# schema.sql is full of `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` on hot
+# tables (underlying_quotes, option_chains, gex_summary, ...).  The IF NOT
+# EXISTS does not spare the lock: every one of them takes ACCESS EXCLUSIVE
+# even when the column is already there.  If any open transaction has read
+# the table, the ALTER waits -- and every query that arrives after it queues
+# behind the waiting ALTER, readers and the ingestion INSERTs alike.  On
+# 14 Oct a tradeworkz transaction 80 minutes old held underlying_quotes, and
+# the apply froze ingestion and the API for nine minutes until cancelled.
+#
+# Two guards:
+#   * lock_timeout bounds each statement's lock wait, so the worst a busy
+#     table costs production is SCHEMA_LOCK_TIMEOUT of queueing, after which
+#     the apply aborts and names the holders.  Statements before the failing
+#     one are committed (psql runs autocommit) and schema.sql is idempotent,
+#     so rerunning is safe.  SCHEMA_LOCK_TIMEOUT=0 disables the bound.
+#   * the pre-flight also refuses on any transaction open longer than
+#     SCHEMA_XACT_MAX_AGE, active or idle in transaction -- the holder that
+#     the old "query running >5s" test could not see, because each of its
+#     statements is short.  Aborted transactions hold no locks and have a
+#     NULL xact_start, so they do not trip it.
+SCHEMA_LOCK_TIMEOUT ?= 5s
+SCHEMA_XACT_MAX_AGE ?= 30 seconds
+SCHEMA_BUSY_WHERE = datname = current_database() AND pid <> pg_backend_pid() \
+	AND ((state = 'active' AND now() - query_start > interval '5 seconds') \
+	  OR (wait_event_type = 'Lock' AND now() - query_start > interval '1 second') \
+	  OR (now() - xact_start > interval '$(SCHEMA_XACT_MAX_AGE)'))
+SCHEMA_SESSIONS = SELECT pid, state, wait_event_type, now() - xact_start AS xact_age, \
+	now() - query_start AS query_age, application_name, client_addr, backend_start, \
+	substr(regexp_replace(query, '\s+', ' ', 'g'), 1, 100) AS query FROM pg_stat_activity
+SCHEMA_BUSY_LIST = $(SCHEMA_SESSIONS) WHERE $(SCHEMA_BUSY_WHERE) ORDER BY xact_start NULLS LAST
+# After a lock timeout the holder can be any open transaction, however young.
+SCHEMA_OPEN_XACTS = $(SCHEMA_SESSIONS) WHERE datname = current_database() \
+	AND pid <> pg_backend_pid() AND xact_start IS NOT NULL ORDER BY xact_start
+
 .PHONY: schema-apply
-schema-apply: ## Apply schema (idempotent; aborts on DB contention — pass FORCE=yes to override)
+schema-apply: ## Apply schema (idempotent; aborts on DB contention, lock waits capped at SCHEMA_LOCK_TIMEOUT — FORCE=yes skips the pre-flight only)
 	@echo "$(BLUE)=== Applying Database Schema ===$(NC)"
-	@echo "$(YELLOW)Pre-flight: checking for long-running queries / lock waits...$(NC)"
-	@BUSY_COUNT=$$($(PSQL) -tA -c "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND ((state = 'active' AND now() - query_start > interval '5 seconds') OR (wait_event_type = 'Lock' AND now() - query_start > interval '1 second'))" | tr -d '[:space:]'); \
+	@echo "$(YELLOW)Pre-flight: checking for long-running queries, old transactions, lock waits...$(NC)"
+	@BUSY_COUNT=$$($(PSQL) -tA -c "SELECT COUNT(*) FROM pg_stat_activity WHERE $(SCHEMA_BUSY_WHERE)" | tr -d '[:space:]'); \
 	if [ -z "$$BUSY_COUNT" ]; then \
 		echo "$(RED)❌ Pre-flight check could not query pg_stat_activity (DB unreachable?). Aborting.$(NC)"; \
 		exit 1; \
 	fi; \
 	if [ "$$BUSY_COUNT" -gt 0 ]; then \
-		echo "$(RED)❌ $$BUSY_COUNT query/queries are active >5s or waiting on locks >1s:$(NC)"; \
-		$(PSQL) -c "SELECT pid, now() - query_start AS duration, state, wait_event_type, substr(query, 1, 100) AS query FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND ((state = 'active' AND now() - query_start > interval '5 seconds') OR (wait_event_type = 'Lock' AND now() - query_start > interval '1 second')) ORDER BY query_start;"; \
+		echo "$(RED)❌ $$BUSY_COUNT session(s) active >5s, waiting on locks >1s, or in a transaction older than $(SCHEMA_XACT_MAX_AGE):$(NC)"; \
+		$(PSQL) -P pager=off -c "$(SCHEMA_BUSY_LIST);"; \
 		if [ "$$FORCE" = "yes" ]; then \
-			echo "$(YELLOW)⚠️  Proceeding anyway because FORCE=yes was passed.$(NC)"; \
+			echo "$(YELLOW)⚠️  Proceeding anyway because FORCE=yes was passed (lock waits still capped at $(SCHEMA_LOCK_TIMEOUT)).$(NC)"; \
 		else \
-			echo "$(YELLOW)Wait for the queries above to drain, or rerun with: make schema-apply FORCE=yes$(NC)"; \
+			echo "$(YELLOW)Wait for the sessions above to finish, or rerun with: make schema-apply FORCE=yes$(NC)"; \
 			exit 1; \
 		fi; \
 	else \
-		echo "$(GREEN)✓ No long-running queries or lock waits — proceeding.$(NC)"; \
+		echo "$(GREEN)✓ No long-running queries, old transactions or lock waits — proceeding.$(NC)"; \
 	fi
-	@echo "$(YELLOW)Running schema.sql on $(DB_HOST)...$(NC)"
-	@PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -v ON_ERROR_STOP=1 -f setup/database/schema.sql
+	@echo "$(YELLOW)Running schema.sql on $(DB_HOST) (lock_timeout=$(SCHEMA_LOCK_TIMEOUT))...$(NC)"
+	@if PGOPTIONS='-c lock_timeout=$(SCHEMA_LOCK_TIMEOUT)' PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -v ON_ERROR_STOP=1 -f setup/database/schema.sql; then \
+		:; \
+	else \
+		echo ""; \
+		echo "$(RED)❌ schema.sql stopped at the error above.$(NC)"; \
+		echo "$(YELLOW)If it says 'canceling statement due to lock timeout', another session holds that table.$(NC)"; \
+		echo "$(YELLOW)Open transactions, oldest first (the holder is usually the top row):$(NC)"; \
+		$(PSQL) -P pager=off -c "$(SCHEMA_OPEN_XACTS);"; \
+		echo "$(YELLOW)Everything before the failing statement is committed and schema.sql is idempotent:$(NC)"; \
+		echo "$(YELLOW)rerun make schema-apply once the holder finishes (or restart the service that owns it).$(NC)"; \
+		exit 1; \
+	fi
 	@echo ""
 	@echo "$(GREEN)✅ Schema applied successfully$(NC)"
 	@echo ""
