@@ -23,6 +23,36 @@ quote test and then adds tick-test deltas to them. The day's published flow
 would be a blend of two methods with no way to separate them afterwards. The
 same applies to a rollback: **roll back before an open, or finish the day.**
 
+## TradeStation does NOT go away on Monday
+
+The ES / NQ futures ingester (`src/ingestion/futures_underlying_ingester.py`)
+builds a `TradeStationClient` directly. It has **no provider seam at all** — no
+`configured_provider_name`, no `get_provider`, nothing to point elsewhere. It
+may also run under a second TradeStation username carrying the real-time CME
+entitlement (`futures_tradestation_credentials()`).
+
+So after cutover:
+
+| | feed after Monday |
+|---|---|
+| option chains, SPY / QQQ / SPX / NDX | ThetaData |
+| underlying bars for those four | ThetaData |
+| VIX / VXN | ThetaData (verified on a full session, 2026-10-13) |
+| **ES / NQ futures quotes** | **TradeStation, still** |
+
+**The TradeStation subscription cannot be cancelled on Monday.** Whether it can
+be downgraded to whatever tier serves @ES and @NQ is a billing question worth
+asking before assuming the double-paying ends.
+
+This does not undermine the licensing objective. The exposure this migration
+exists to retire is OPRA / CTA / UTP / CGIF / GIDS — options and index data.
+CME futures sit in a different licensing regime, and keeping them on
+TradeStation does not reinstate the options exposure.
+
+Porting futures to ThetaData is separate work: a provider seam that does not
+exist yet, plus whatever ThetaData charges for CME. Not a cutover blocker, and
+not a reason to delay Monday.
+
 ## What actually changes
 
 Two lines in `.env`, and nothing else:
@@ -33,10 +63,13 @@ FLOW_CLASSIFIER=tick
 ```
 
 No schema change, no migration, no code deploy. `VOLATILITY_INDEX_PROVIDER`
-stays unset, so VIX and VXN follow the deployment to ThetaData — their coverage
-was verified operationally on 2026-09-28 (live pre-open VIX agreeing with the
-incumbent to within a penny) and no override is needed. See the open question
-below before assuming that is settled contractually.
+stays unset, so VIX and VXN follow the deployment to ThetaData. That is not a
+prediction: the 2026-10-13 rehearsal ran both on `thetadata_mv` for a full
+session — `VIX feed: thetadata_mv` and `VXN feed: thetadata_mv` in its log — and
+the bars agreed with production's TradeStation feed to within 1-5 cents on the
+day's low and high closes, with zero off-grid bars and 77 / 74 RTH bars against
+an expected ~78. Availability is settled. See the open question below before
+assuming the same of the licensing.
 
 ## Go / no-go, checked the Friday before
 
