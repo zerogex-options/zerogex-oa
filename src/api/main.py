@@ -86,6 +86,7 @@ from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
 from .routers.spread_liquidity import router as spread_liquidity_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
+from .routers.gamma_surface import router as gamma_surface_router
 from .routers.gamma_shift import router as gamma_shift_router
 from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
@@ -577,6 +578,9 @@ app.include_router(premium_surface_router, dependencies=[_scope_market_raw])
 # correct answer for a surface whose entire subject is the vendor's quotes.
 app.include_router(spread_liquidity_router, dependencies=[_scope_market_raw])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
+# Gamma Surface — dealer gamma across price and time to settlement, for a
+# chosen set of expirations. Derived GEX, like the flip surfaces above it.
+app.include_router(gamma_surface_router, dependencies=[_scope_gex])
 # Gamma Regime Shift — the derivative of the dealer-gamma surface (what
 # CHANGED between two snapshots, what expires next, and the classified read
 # stored per session). Same derived-GEX scope as the surfaces it differences.
