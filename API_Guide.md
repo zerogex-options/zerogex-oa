@@ -356,13 +356,13 @@ upstream can change.
 | `realtime_quote` | `/api/market/quote` and the rest of `/api/market/*` | 60 s | 60 s (not cash indexes) | — |
 | `option_chain` | `/api/option/*`, `/api/market/open-interest` | 60 s | 60 s (to 16:15 only) | — |
 | `volatility_bar` | `/api/market/volatility` (VIX, VXN) | 5 min | 5 min | — |
-| `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*` | 60 s | 60 s (not cash indexes) | — |
+| `analytics_cycle` | `/api/gex/*`, `/api/v1/levels`, `/api/max-pain/*`, `/api/forced-flow/*`, `/api/technicals*`, `/api/alerts/walls/live` | 60 s | 60 s (not cash indexes) | — |
 | `flow_aggregate` | `/api/flow/*` | 5 min | — | — |
 | `signals_cycle` | `/api/signals/*` (incl. `trades-live`), `/api/tradeworkz/*` | 60 s | 60 s (not cash indexes) | — |
 | `daily_cycle` | `/api/forecast*`, `/api/scorecard*`, `/api/news*`, session closes & levels | one per trading session | | |
 | `cone_cycle` | `/api/cone/session/*`, `/api/cone/latest` | 15 min (09:45–15:30 ET only) | — | — |
 | `historical` | `/api/replay/*`, `/api/backtest/*`, `/api/cone/reliability`, `/api/gex/historical`, `/api/market/historical`, `/api/signals/trades-history`, `/api/signals/{signal_name}/events` | — | — | — |
-| `on_demand` | `/api/tools/*`, `/api/health*` | — | — | — |
+| `on_demand` | `/api/tools/*`, `/api/health*`, `/api/alerts/*` (a member's own rules and feed) | — | — | — |
 
 A dash means no update is expected, which surfaces as
 `freshness_status: session_closed` (feed-backed profiles) or `static`
@@ -1418,6 +1418,96 @@ than `static`.
 
 Returns `404` when a signal has no row yet for the symbol. Weight is `0.0`
 for all Advanced and Basic Signals (they do not contribute to the MSI).
+
+---
+
+## Wall Alerts
+
+Members' alerts on Call/Put Wall **hits**, **breaks** and **holds**, with the
+chop filtered out. Detection runs in its own service
+(`zerogex-oa-wall-alerts`); these endpoints manage what a member asked for and
+serve what they were sent. Methodology, sensitivity profiles and the channel
+model are in `docs/design/wall-alerts.md`.
+
+**Who can call what.** Member endpoints act for the end user named by the
+website's `X-End-User-Token` (see *End-user attribution*); without one, reads
+return an empty result with `"signed_in": false` and writes return `401`. A
+rule id that belongs to another member is a `404`. The website gates the whole
+prefix at the Basic tier. `/internal/*` is for delivery workers and requires
+`X-Admin-Token` on top of the API key; it is not mirrored to `/api/v2`.
+
+### GET /api/alerts/walls/config
+What the alert form is built from: `symbols`, `sides`, `events`
+(`hit`/`break`/`hold`), `profiles` (each sensitivity's thresholds),
+`default_profile`, `channels` (`{id, available, delivery}` — SMS reads
+`available: false` until it is switched on), `strength_tiers`,
+`max_strength_floor` (95), `max_rules`, `daily_cap`.
+
+### GET /api/alerts/walls/rules
+The caller's rules, oldest first.
+
+### POST /api/alerts/walls/rules
+Create a rule. `422` with a readable `detail` on a bad field; `409` past the
+per-member limit.
+
+```json
+{
+  "symbol": "SPX",
+  "side": "put",
+  "events": {"hit": true, "break": true, "hold": false},
+  "min_strength_pctile": 75,
+  "profile": "balanced",
+  "channels": {"in_app": true, "email": true, "sms": false},
+  "enabled": true
+}
+```
+
+- `side` — `call`, `put` or `both`.
+- `min_strength_pctile` — 0–95. Alert only when the wall's dollar gamma is at
+  least this percentile of the symbol's own 30-day history **at the same time
+  of day** (`gex_historical_stats`). A wall whose percentile is unknown never
+  satisfies a floor above 0.
+- `profile` — `responsive`, `balanced` or `conservative` (the noise filter).
+
+### PATCH /api/alerts/walls/rules/{rule_id}
+Partial update with the same fields. Switching a channel (or the rule) off
+also cancels that rule's not-yet-sent queued alerts on it.
+
+### DELETE /api/alerts/walls/rules/{rule_id}
+Delete a rule and cancel its queued alerts.
+
+### GET /api/alerts/walls/feed
+The caller's in-app alerts, newest first (`limit` ≤ 100, default 30):
+`entries[]` (`id`, `kind`, `symbol`, `side`, `wall`, `price`, `read`,
+`created_at`, `payload`) and `unread` (last 7 days). `payload` is the full
+alert as stored (`src/alerts/wall_payload.py`): strength and tier, dealer
+gamma `regime`, `distance`, the confirmation parameters, the published break
+odds when reportable, and `current_wall` (after a break, the next wall out).
+
+### POST /api/alerts/walls/feed/read
+Mark read: `{"ids": [..]}`, or `{}` for everything.
+
+### DELETE /api/alerts/walls/feed
+Delete the caller's in-app alerts (queued email is untouched).
+
+### GET /api/alerts/walls/live
+Today's walls per symbol (`symbols=SPX,SPY`, default all) with each wall's
+strength, percentile, tier and distance from price — what a strength filter
+would see right now. `stale: true` when the walls row is older than the
+detector's own freshness bound.
+
+### Internal (delivery workers)
+- `GET /api/alerts/walls/internal/queued?channel=email|sms&limit=&max_age_seconds=` —
+  expires queued rows older than `max_age_seconds` (default 1200), cancels rows
+  whose rule was deleted, disabled or had the channel switched off, then
+  returns what is left, oldest first.
+- `POST /api/alerts/walls/internal/mark` — `{"ids": [..], "status":
+  "sent"|"failed"|"cancelled"|"retry", "error"?}`. Only `queued` rows move;
+  `retry` keeps a row queued until its third attempt.
+- `POST /api/alerts/walls/internal/disable-channel` — `{"end_user", "channel"}`:
+  one-click unsubscribe, the channel off on every rule the member has.
+- `POST /api/alerts/walls/internal/purge-user` — `{"end_user"}`: a deleted
+  account's rules and alert rows.
 
 ---
 

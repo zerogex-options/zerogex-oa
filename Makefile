@@ -40,6 +40,9 @@ INGESTION_SERVICE = zerogex-oa-ingestion
 ANALYTICS_SERVICE = zerogex-oa-analytics
 API_SERVICE = zerogex-oa-api
 SIGNALS_SERVICE = zerogex-oa-signals
+# Not in the bulk services-* lists below (those are the four core services and
+# their health gates); managed with the wall-alerts-* targets instead.
+WALL_ALERTS_SERVICE = zerogex-oa-wall-alerts
 
 # Bulk-service ordering. Data flows ingestion → analytics → signals → api,
 # so start in that order and stop in reverse (matches db-maintain-managed).
@@ -161,6 +164,7 @@ $(eval $(call SERVICE_TARGETS,ingestion,INGESTION_SERVICE,Ingestion))
 $(eval $(call SERVICE_TARGETS,analytics,ANALYTICS_SERVICE,Analytics))
 $(eval $(call SERVICE_TARGETS,api,API_SERVICE,API))
 $(eval $(call SERVICE_TARGETS,signals,SIGNALS_SERVICE,Signals))
+$(eval $(call SERVICE_TARGETS,wall-alerts,WALL_ALERTS_SERVICE,Wall Alerts))
 
 # DB_TAIL: show 20 most recent rows from a table with optional UNDERLYING filter
 # $(1) = target suffix   (e.g. option-chains)
@@ -6412,3 +6416,67 @@ api-health-assert: ## Assert API is active AND serving /api/health/live — exit
 		echo "  Inspect: sudo journalctl -u $(API_SERVICE) -n 50 --no-pager"; \
 		exit 1; \
 	fi
+
+# =============================================================================
+# Wall alerts — members' Call/Put Wall hit / break / hold alerts
+# =============================================================================
+# The detector (src/alerts/wall_alert_engine.py) is its own always-on service,
+# zerogex-oa-wall-alerts, so a fault in it can never cost the product its GEX
+# numbers or its API. Start/stop/restart/logs come from SERVICE_TARGETS above
+# (make wall-alerts-restart etc.). It is NOT restarted by services-restart:
+# after pulling a change under src/alerts/, run make wall-alerts-restart.
+# Design and runbook: docs/design/wall-alerts.md.
+
+.PHONY: wall-alerts-install
+wall-alerts-install: ## Install + start the wall-alert detector service (run AFTER make schema-apply)
+	@echo "$(BLUE)=== Installing Wall Alerts service ===$(NC)"
+	@HAS=$$($(PSQL) -tAc "SELECT to_regclass('public.wall_alert_detector_state') IS NOT NULL" | tr -d '[:space:]'); \
+	if [ "$$HAS" != "t" ]; then \
+		echo "$(RED)✖ The wall_alert_* tables are missing. Run make schema-apply first.$(NC)"; \
+		exit 1; \
+	fi
+	@sudo cp setup/systemd/$(WALL_ALERTS_SERVICE).service /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now $(WALL_ALERTS_SERVICE)
+	@sleep 3
+	@sudo systemctl status $(WALL_ALERTS_SERVICE) --no-pager -l | head -15
+	@echo "$(GREEN)✅ Wall alerts service installed and started$(NC)"
+	@echo "$(YELLOW)Health: make wall-alerts-health    Logs: make wall-alerts-logs$(NC)"
+
+.PHONY: wall-alerts-health
+wall-alerts-health: ## Wall alerts: service state, per-symbol heartbeat, today's alerts, the outbox, member rules
+	@echo "$(GREEN)Wall Alerts Health Check$(NC)"
+	@echo "========================"
+	@if systemctl is-active --quiet $(WALL_ALERTS_SERVICE); then echo "Status: $(GREEN)ACTIVE$(NC)"; else echo "Status: $(RED)INACTIVE$(NC)"; fi
+	@echo ""
+	@echo "Heartbeat (state is rewritten at least once a minute during the session):"
+	@$(PSQL) -P pager=off -c "SELECT underlying, profile, session_date, to_char(updated_at AT TIME ZONE 'America/New_York', 'MM-DD HH24:MI:SS') AS updated_et, date_trunc('second', NOW() - updated_at) AS age FROM wall_alert_detector_state ORDER BY underlying, profile;"
+	@echo "Today's events (every profile, subscribed or not):"
+	@$(PSQL) -P pager=off -c "SELECT underlying, profile, event_type, COUNT(*) AS n, to_char(MAX(detected_at) AT TIME ZONE 'America/New_York', 'HH24:MI:SS') AS last_et FROM wall_alert_events WHERE session_date = (NOW() AT TIME ZONE 'America/New_York')::date GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;"
+	@echo "Deliveries, last 24h:"
+	@$(PSQL) -P pager=off -c "SELECT channel, status, COUNT(*) AS n, MAX(error) FILTER (WHERE status IN ('failed', 'cancelled')) AS sample_error FROM wall_alert_deliveries WHERE created_at > NOW() - interval '24 hours' GROUP BY 1, 2 ORDER BY 1, 2;"
+	@echo "Member rules:"
+	@$(PSQL) -P pager=off -c "SELECT COUNT(*) AS rules, COUNT(*) FILTER (WHERE enabled) AS enabled, COUNT(DISTINCT end_user) AS members, COUNT(*) FILTER (WHERE enabled AND (channels ->> 'email')::boolean) AS with_email FROM wall_alert_rules;"
+	@echo "Recent errors / warnings:"
+	@sudo journalctl -u $(WALL_ALERTS_SERVICE) -n 500 --no-pager | grep -E " - (ERROR|WARNING) - " | tail -10 || echo "None"
+
+.PHONY: wall-alerts-replay
+wall-alerts-replay: ## What wall alerts a stored session would have produced, per sensitivity. SYMBOL=SPX DATE=2026-10-13 [PROFILE=balanced] [JSON=1]. Read-only
+	@if [ -z "$(SYMBOL)" ]; then echo "$(RED)Usage: make wall-alerts-replay SYMBOL=SPX [DATE=YYYY-MM-DD] [PROFILE=balanced]$(NC)"; exit 2; fi
+	@$(PY) -m src.alerts.wall_alert_engine --replay $(SYMBOL) \
+		$(if $(DATE),--date $(DATE)) \
+		$(if $(PROFILE),--profile $(PROFILE)) \
+		$(if $(JSON),--json)
+
+.PHONY: wall-alerts-db-test
+wall-alerts-db-test: ## Run the wall-alert SQL harness (store, service tick, API). WRITES DATA — requires WALL_ALERTS_TEST_DSN=... (a scratch DB)
+	@if [ -z "$(WALL_ALERTS_TEST_DSN)" ]; then \
+		echo "$(RED)Refusing to run: WALL_ALERTS_TEST_DSN is not set.$(NC)"; \
+		echo "$(YELLOW)This harness writes and deletes rows, so it never inherits the .env database."; \
+		echo "Point it at a scratch database with schema.sql applied:"; \
+		echo "  make wall-alerts-db-test WALL_ALERTS_TEST_DSN=postgresql://user@host:5432/scratch$(NC)"; \
+		exit 1; \
+	fi
+	@PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
+		WALL_ALERTS_TEST_DSN="$(WALL_ALERTS_TEST_DSN)" \
+		$(PY) -m pytest tests/test_wall_alerts_db.py -m integration --no-cov -q
