@@ -6477,13 +6477,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         return result
 
     @staticmethod
-    def _session_window_for_date(session_date: date) -> Tuple[datetime, datetime]:
-        """The 5-minute window for one ET trading date, in UTC.
+    def _session_window_for_date(
+        session_date: date, bar_seconds: int = 300
+    ) -> Tuple[datetime, datetime]:
+        """The window for one ET trading date, in UTC.
 
         09:30 ET through 16:15 ET, with the end capped at now() floored to the
         grid — identical arithmetic to the ``current`` branch below, which is
         what makes ``date=<today>`` behave exactly like ``session=current``
-        instead of reaching past the last bar that exists.
+        instead of reaching past the last bar that exists. ``bar_seconds`` is
+        the grid: 300 for the 5-minute series, 60 for ``timeframe=1min``.
         """
         session_start_et = datetime(
             session_date.year, session_date.month, session_date.day, 9, 30, tzinfo=_ET
@@ -6491,7 +6494,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         session_start_utc = session_start_et.astimezone(timezone.utc)
         session_close_utc = session_start_utc + timedelta(hours=6, minutes=45)
         now_utc = datetime.now(timezone.utc)
-        now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+        now_floor_epoch = int(now_utc.timestamp() // bar_seconds) * bar_seconds
         now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
         session_end_utc = min(now_floored, session_close_utc)
         if session_end_utc < session_start_utc:
@@ -6555,7 +6558,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )
             if not known:
                 return None
-            start, end = self._session_window_for_date(session_date)
+            start, end = self._session_window_for_date(session_date, bar_seconds)
             return start, end, True
 
         exists = await conn.fetchval(
@@ -6634,6 +6637,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         expirations: Optional[List[date]] = None,
         intervals: Optional[int] = None,
         timeframe: str = "5min",
+        session_date: Optional[date] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Return pre-accumulated 5-minute flow series rows for a session.
 
@@ -6649,12 +6653,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         ``timeframe="1min"`` returns the same rows on a 1-minute grid instead;
         see :meth:`_get_flow_series_1min`.
+
+        ``session_date`` names an explicit ET trading day and overrides
+        ``session``; see :meth:`_resolve_flow_series_session`.
         """
         if timeframe == "1min":
             return await self._get_flow_series_1min(
-                symbol, session, strikes, expirations, intervals
+                symbol, session, strikes, expirations, intervals, session_date
             )
         symbol = symbol.upper()
+        # A dated read is keyed by its date, not by the `session` it overrides,
+        # so `date=X` can never be served the `current` series cached under
+        # the same session name.
+        session_key = session_date.isoformat() if session_date else session
 
         # Cache only full-series fetches. Incremental (intervals=N) polls
         # bypass the cache so the tail row reflects the newest DB state.
@@ -6663,7 +6674,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if use_cache:
             strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
             exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
-            cache_key = f"flow_series:{symbol}:{session}:{strikes_key}:{exps_key}"
+            cache_key = f"flow_series:{symbol}:{session_key}:{strikes_key}:{exps_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached  # type: ignore[no-any-return]
@@ -6674,7 +6685,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
                 if resolved is None:
                     return None
                 session_start, session_end, has_session_data = resolved
@@ -6718,8 +6731,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # that is NOT an engine fault. Tolerate exactly that
                     # lag for live ('current') sessions; closed ('prior')
                     # sessions have no such race and stay strict so a real
-                    # gap still alerts.
-                    lag_tolerance = 1 if session == "current" else 0
+                    # gap still alerts. A dated read is live only when it
+                    # names today.
+                    if session_date is not None:
+                        is_live = session_date == datetime.now(_ET).date()
+                    else:
+                        is_live = session == "current"
+                    lag_tolerance = 1 if is_live else 0
                     if 0 < len(rows) < expected - lag_tolerance:
                         # A shortfall beyond the structural cadence lag
                         # means the Analytics Engine actually missed
@@ -6731,7 +6749,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "flow_series_5min shortfall for %s %s: %d rows, "
                             "expected up to %d for window [%s, %s]",
                             symbol,
-                            session,
+                            session_key,
                             len(rows),
                             expected,
                             session_start.isoformat(),
@@ -6770,6 +6788,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         strikes: Optional[List[float]],
         expirations: Optional[List[date]],
         intervals: Optional[int],
+        session_date: Optional[date] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """One-minute bars for ``get_flow_series(timeframe="1min")``.
 
@@ -6790,7 +6809,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol = symbol.upper()
         strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
         exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
-        cache_key = f"flow_series_1min:{symbol}:{session}:{strikes_key}:{exps_key}"
+        session_key = session_date.isoformat() if session_date else session
+        cache_key = f"flow_series_1min:{symbol}:{session_key}:{strikes_key}:{exps_key}"
         result: Optional[List[Dict[str, Any]]] = self._cache_get(cache_key)
         if result is None:
             strikes_arg = [float(s) for s in strikes] if strikes else None
@@ -6799,7 +6819,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 async with self._acquire_connection() as conn:
                     await self._refresh_flow_cache(conn, symbol)
                     resolved = await self._resolve_flow_series_session(
-                        conn, symbol, session, bar_seconds=60
+                        conn, symbol, session, session_date, bar_seconds=60
                     )
                     if resolved is None:
                         return None
@@ -7157,16 +7177,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self,
         symbol: str = "SPY",
         session: str = "current",
+        session_date: Optional[date] = None,
     ) -> Optional[Dict[str, List[Any]]]:
         """Return the distinct strikes and expirations that traded in a session.
 
         Returns ``None`` when the symbol has never appeared in flow_by_contract
         (caller surfaces 404). Otherwise a dict with ``strikes`` (ascending
         floats) and ``expirations`` (ascending ISO dates). Empty lists are
-        returned when the resolved session has no data.
+        returned when the resolved session has no data. ``session_date``
+        overrides ``session`` exactly as it does for :meth:`get_flow_series`.
         """
         symbol = symbol.upper()
-        cache_key = f"flow_contracts:{symbol}:{session}"
+        session_key = session_date.isoformat() if session_date else session
+        cache_key = f"flow_contracts:{symbol}:{session_key}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -7174,7 +7197,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
                 if resolved is None:
                     return None
                 session_start, session_end, has_session_data = resolved
@@ -7229,11 +7254,87 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Flow contracts query timed out for {symbol}, returning empty")
             return {"strikes": [], "expirations": []}
 
+    async def get_flow_sessions(self, symbol: str = "SPY", limit: int = 7) -> Optional[List[date]]:
+        """The most recent ET trading days with flow for ``symbol``, newest first.
+
+        The index behind the Session pickers on Flow Analysis and Smart Money:
+        a list of days that HAVE data rather than a calendar, so a reader is
+        never offered a holiday or an outage as an empty session. The first
+        entry is the day ``session=current`` resolves to; every entry is a
+        valid ``date=`` for the flow endpoints.
+
+        Read off ``flow_by_contract`` -- the table ``current`` and ``prior``
+        already resolve against -- one index probe per day: each step asks
+        for the newest row strictly before the previous day's ET midnight.
+        The bound is on the raw timestamp, so it stays on
+        ``(symbol, timestamp)`` instead of scanning the whole day it skips.
+
+        Returns ``None`` for a symbol with no flow at all (404), else up to
+        ``limit`` dates.
+        """
+        symbol = symbol.upper()
+        cache_key = f"flow_sessions:{symbol}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH RECURSIVE days(session_date) AS (
+                SELECT (MAX(timestamp) AT TIME ZONE 'America/New_York')::date
+                FROM flow_by_contract
+                WHERE symbol = $1
+                UNION ALL
+                SELECT (
+                    SELECT (MAX(f.timestamp) AT TIME ZONE 'America/New_York')::date
+                    FROM flow_by_contract f
+                    WHERE f.symbol = $1
+                      AND f.timestamp
+                          < (days.session_date::timestamp AT TIME ZONE 'America/New_York')
+                )
+                FROM days
+                WHERE days.session_date IS NOT NULL
+            )
+            SELECT session_date
+            FROM days
+            WHERE session_date IS NOT NULL
+            LIMIT $2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(conn, query, symbol, limit, timeout=10.0),
+                    timeout=10.0,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(f"Flow sessions query timed out for {symbol}")
+            raise
+        if not rows:
+            return None
+        result = [row["session_date"] for row in rows]
+        self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
+        return result
+
     async def get_smart_money_flow(
-        self, symbol: str = "SPY", session: str = "current", limit: int = 50
+        self,
+        symbol: str = "SPY",
+        session: str = "current",
+        limit: int = 50,
+        session_date: Optional[date] = None,
     ) -> List[Dict[str, Any]]:
-        """Get smart-money events from canonical flow_contract_facts."""
-        session_start, session_end = _get_flow_session_bounds(session)
+        """Get smart-money events from canonical flow_contract_facts.
+
+        ``session_date`` names an explicit ET trading day (09:30–16:15 ET) and
+        overrides ``session``.
+        """
+        if session_date is not None:
+            session_start = datetime(
+                session_date.year, session_date.month, session_date.day, 9, 30, tzinfo=_ET
+            )
+            session_end = datetime(
+                session_date.year, session_date.month, session_date.day, 16, 15, tzinfo=_ET
+            )
+        else:
+            session_start, session_end = _get_flow_session_bounds(session)
         limit = max(1, min(int(limit), 50))
         query = """
             WITH
@@ -7244,7 +7345,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     option_symbol AS contract,
                     strike,
                     expiration,
-                    (expiration - CURRENT_DATE)::int AS dte,
+                    -- Days to expiry as of the print's own ET session day, not
+                    -- today: on a past session a 0DTE block must still read 0.
+                    (expiration - (timestamp AT TIME ZONE 'America/New_York')::date)::int AS dte,
                     option_type,
                     volume_delta AS flow,
                     premium_delta::numeric AS notional,

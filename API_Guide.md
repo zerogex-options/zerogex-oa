@@ -787,6 +787,7 @@ Server-accumulated flow series — one row per 5-minute bar, or per 1-minute bar
 **Parameters:**
 - `symbol` (required): `[A-Z.]{1,10}`
 - `session` (optional): `current` | `prior`, default `current`
+- `date` (optional): an ET trading day, `YYYY-MM-DD`; overrides `session`. See `/api/flow/sessions` for the days that have data
 - `strikes` (optional): comma-separated strikes to include; omit for all
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
 - `timeframe` (optional): `5min` | `1min`, default `5min`
@@ -872,12 +873,22 @@ A flip requires the series to **establish** itself outside a flat band around ze
 
 **Basis — binding on any consumer.** This series is AGGRESSOR-INFERRED. It assumes the passive side of each classified print was a market maker; that assumption is under test and not established (see `docs/design/aggressor-inferred-positioning-experiment.md`). Surfaces rendering it must carry the `disclosure` through: it is *estimated hedging pressure*, never "observed dealer flow" or "dealer positioning". Note also that `classified_ratio` reports how much of a bar's volume carried an aggressor classification — a low value means a thin sample behind that bar.
 
+### GET /api/flow/sessions
+The most recent trading days that have flow, newest first. The first entry is the day `session=current` resolves to; each entry is a valid `date` for `/api/flow/series`, `/api/flow/contracts` and `/api/flow/smart-money`. Holidays and other days without data are never listed.
+
+**Parameters:**
+- `symbol` (required): `[A-Z.]{1,10}`
+- `limit` (optional): `1`–`60`, default `7`
+
+**Response:** `{"symbol": "SPY", "count": 7, "sessions": [{"date": "2026-10-14"}, ...]}`. Unknown symbols return 404.
+
 ### GET /api/flow/contracts
 Distinct strikes and expirations that traded in the resolved session (powers the Flow-page filter chips).
 
 **Parameters:**
 - `symbol` (required): `[A-Z.]{1,10}`
 - `session` (optional): `current` | `prior`, default `current`
+- `date` (optional): an ET trading day, `YYYY-MM-DD`; overrides `session`
 
 ### GET /api/flow/smart-money
 Unusual-activity / smart-money flow — 1-minute intervals (session 07:15–16:15 ET).
@@ -885,7 +896,10 @@ Unusual-activity / smart-money flow — 1-minute intervals (session 07:15–16:1
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `session` (optional): `current` | `prior`, default `current`
+- `date` (optional): an ET trading day, `YYYY-MM-DD`; overrides `session` and reads 09:30–16:15 ET on that day
 - `limit` (optional): max `50`, default `50`
+
+`dte` is counted from the day of the print, so a 0DTE block on a past session still reads `0`.
 
 
 **Ranked, not chronological.** This returns the largest-notional prints of

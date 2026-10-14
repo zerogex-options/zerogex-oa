@@ -40,6 +40,7 @@ from .models import (
     FlowPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
+    FlowSessionList,
     HedgingFlowResponse,
     HedgingFlowSessionList,
     GammaRegimeSeriesResponse,
@@ -1305,6 +1306,13 @@ async def get_market_tide_history(
 async def get_flow_series(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "`/api/flow/sessions` lists the days that have data."
+        ),
+    ),
     strikes: Optional[str] = Query(
         default=None,
         description="Comma-separated strikes to include. Empty/missing = all strikes.",
@@ -1347,6 +1355,7 @@ async def get_flow_series(
 
     ``session=current`` is the most recent ET trading day that has any data
     for the symbol; ``session=prior`` is the ET day immediately before that.
+    ``date=YYYY-MM-DD`` names any other day and overrides ``session``.
     Unknown symbols return 404; symbols that exist but have no data for the
     requested session return 200 with ``[]``.
     """
@@ -1359,6 +1368,7 @@ async def get_flow_series(
 
     strikes_list = _parse_flow_strikes(strikes)
     expirations_list = _parse_flow_expirations(expirations)
+    session_date = _parse_session_date(date)
 
     rows = await _db().get_flow_series(
         symbol=normalized,
@@ -1367,6 +1377,7 @@ async def get_flow_series(
         expirations=expirations_list,
         intervals=intervals,
         timeframe=timeframe,
+        session_date=session_date,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
@@ -2179,6 +2190,39 @@ async def get_gamma_weather_series(
 
 
 @app.get(
+    "/api/flow/sessions",
+    response_model=FlowSessionList,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/sessions")
+async def get_flow_sessions(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    limit: int = Query(default=7, ge=1, le=60),
+):
+    """The most recent trading days that have flow, newest first.
+
+    The index behind ``date=`` on ``/api/flow/series``, ``/api/flow/contracts``
+    and ``/api/flow/smart-money``. The first entry is the day
+    ``session=current`` resolves to. Days without data (holidays, outages)
+    are never listed. Bounded by the DATA_RETENTION_DAYS prune window, so one
+    page of up to 60 holds everything there is. Unknown symbols return 404.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    days = await _db().get_flow_sessions(symbol=normalized, limit=limit)
+    if days is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    sessions = [{"date": d.isoformat()} for d in days]
+    return FlowSessionList(symbol=normalized, count=len(sessions), sessions=sessions)
+
+
+@app.get(
     "/api/flow/contracts",
     response_model=FlowContractsResponse,
     tags=["Options Flow"],
@@ -2188,6 +2232,13 @@ async def get_gamma_weather_series(
 async def get_flow_contracts(
     symbol: str = Query(..., min_length=1, max_length=10),
     session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "`/api/flow/sessions` lists the days that have data."
+        ),
+    ),
 ):
     """Distinct strikes and expirations that traded in the resolved session.
 
@@ -2202,7 +2253,10 @@ async def get_flow_contracts(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    result = await _db().get_flow_contracts(symbol=normalized, session=session)
+    session_date = _parse_session_date(date)
+    result = await _db().get_flow_contracts(
+        symbol=normalized, session=session, session_date=session_date
+    )
     if result is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     return FlowContractsResponse(**result)
@@ -2219,6 +2273,14 @@ async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
     limit: int = Query(default=50, ge=1, le=50),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`; the window is "
+            "09:30-16:15 ET on that day. "
+            "`/api/flow/sessions` lists the days that have data."
+        ),
+    ),
 ):
     """Get legacy ``smart-money`` premium-flow fields — 1-min intervals.
 
@@ -2226,9 +2288,13 @@ async def get_smart_money_flow(
     premium and quote-side classification do not establish opening/closing
     status, ultimate ownership, strategy, or information advantage.
     Session runs 07:15–16:15 ET. session=current returns today's open session
-    (or most recent if closed); session=prior returns the previous full session.
+    (or most recent if closed); session=prior returns the previous full session;
+    date=YYYY-MM-DD returns that day's session.
     """
-    data = await _db().get_smart_money_flow(symbol, session, min(limit, 50))
+    session_date = _parse_session_date(date)
+    data = await _db().get_smart_money_flow(
+        symbol, session, min(limit, 50), session_date=session_date
+    )
     return [SmartMoneyFlowPoint(**row) for row in data]
 
 

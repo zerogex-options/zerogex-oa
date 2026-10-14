@@ -880,6 +880,20 @@ class FlowContractsResponse(BaseModel):
     expirations: list[str]
 
 
+class FlowSession(BaseModel):
+    """One trading day that has flow; a valid ``date=`` for the flow endpoints."""
+
+    date: str
+
+
+class FlowSessionList(BaseModel):
+    """Recent trading days with flow, newest first, from /api/flow/sessions."""
+
+    symbol: str
+    count: int
+    sessions: List[FlowSession]
+
+
 class SmartMoneyFlowPoint(BaseModel):
     timestamp: datetime
     symbol: str

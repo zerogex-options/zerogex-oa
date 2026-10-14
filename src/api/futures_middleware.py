@@ -99,6 +99,7 @@ _PROJECTABLE_PREFIXES = (
     "/api/replay/",
     "/api/flow/buying-pressure",
     "/api/flow/series",
+    "/api/flow/sessions",  # dates only; no price fields to project
     "/api/flow/market-tide",
 )
 
