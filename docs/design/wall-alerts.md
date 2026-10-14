@@ -122,7 +122,10 @@ without its deliveries, never lost, and never sent twice.
   SPY walls often fire together), checks the member is verified, not deleted
   and still Basic or above, sends through Resend with one-click unsubscribe,
   and marks the rows. Rows older than 20 minutes expire unsent — a wall alert
-  is only worth sending while it is news.
+  is only worth sending while it is news. The worker records each accepted
+  send before marking it, so a mark that fails is retried as a mark, never as
+  a second email. It reports its own failures at most hourly (an unreachable
+  outbox only after 5 minutes), because the timer fires every 20 seconds.
 
 The queue endpoints re-check opt-in at delivery time: a row whose rule was
 deleted, disabled or had the channel switched off is cancelled, never sent.
