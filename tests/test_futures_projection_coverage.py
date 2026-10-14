@@ -58,6 +58,7 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "put_premium_cum",
         "net_premium_cum",
         # --- contract counts and volumes ----------------------------------
+        "count",  # FlowSessionList: how many session dates are listed
         "call_oi",
         "put_oi",
         "total_call_oi",

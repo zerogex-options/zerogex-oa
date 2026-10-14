@@ -421,9 +421,12 @@ def test_the_flow_bar_constant_matches_what_the_queries_actually_floor_to():
         "get_flow no longer floors to FLOW_BAR_SECONDS — the advertised flow "
         "cadence and the stored bucket grid have come apart"
     )
-    assert src.count(f"// {FLOW_BAR_SECONDS}) * {FLOW_BAR_SECONDS}") >= 2, (
-        "get_flow_series no longer floors its bar boundaries to " "FLOW_BAR_SECONDS"
+    # The floors take the bar as a parameter where a 1-minute grid shares the
+    # code; its default is then the 5-minute bar, and counts the same.
+    floors = src.count(f"// {FLOW_BAR_SECONDS}) * {FLOW_BAR_SECONDS}") + src.count(
+        f"bar_seconds: int = {FLOW_BAR_SECONDS}"
     )
+    assert floors >= 2, "get_flow_series no longer floors its bar boundaries to FLOW_BAR_SECONDS"
 
 
 def test_the_signal_score_cannot_outrun_the_bucket_it_reads():
