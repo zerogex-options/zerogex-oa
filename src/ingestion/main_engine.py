@@ -1863,16 +1863,27 @@ class IngestionEngine:
             acc.last_mid = (acc.last_bid + acc.last_ask) / 2.0
         if quote_seen and snap.get("timestamp") is not None:
             acc.last_quote_ts = snap.get("timestamp")
-        # Advance the tick test's prior trade on EVERY snapshot, not only
-        # ones that classified. A contract whose volume did not move can
+        # Advance the tick test's prior trade PRICE on EVERY snapshot, not
+        # only ones that classified. A contract whose volume did not move can
         # still print a new last between polls, and the harness that
         # measured this method advances its state before every early skip
         # for the same reason -- a tick sequence with a hole in it carries
         # the wrong direction forward from there on.
+        #
+        # The TIMESTAMP is different, and conflating the two made
+        # FLOW_TICK_MAX_CARRY_SECONDS inert. `last` is the last TRADED price
+        # and it persists in every later snapshot, so a contract that has not
+        # traded for an hour still reports one. Stamping the observation time
+        # on each of those made the carry look one poll old forever, and the
+        # guard -- whose whole job is to notice a direction set minutes ago --
+        # could never fire at any threshold. Stamp the moment the price
+        # MOVED, so the age measures how long the carried direction has stood
+        # unconfirmed, which is what "stale" means here.
         snap_last = _to_db_float(snap.get("last"))
         if snap_last is not None and snap_last > 0:
+            if acc.last_trade_price is None or snap_last != acc.last_trade_price:
+                acc.last_trade_ts = snap.get("timestamp")
             acc.last_trade_price = snap_last
-            acc.last_trade_ts = snap.get("timestamp")
 
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False
