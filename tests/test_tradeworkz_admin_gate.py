@@ -15,11 +15,16 @@ So any of those reached ``POST /api/tradeworkz/admin/reset-fleet``. The gate
 is now ``require_admin`` (a matching ``X-Admin-Token``, fail-closed 503 when
 unprovisioned) with the scope kept underneath as defence in depth.
 
-The first test is the one that matters long-term: it walks the router's real
-route table, so an ``/admin`` route added later cannot quietly ship on the
-data-plane scope. It asserts against the mounted app's dependency graph
-rather than the source text, so renaming or restructuring the gate keeps it
-honest.
+The ``/internal/*`` worker routes get the same gate. They hand out every
+follower's queued notifications (member ids, trade payloads) and mark any row
+sent, and the scope check alone let any API key reach them, including the
+keys Pro members mint for themselves. Their one caller, the website's
+notification worker, sends the admin token.
+
+The route-walking tests are the ones that matter long-term: an ``/admin`` or
+``/internal`` route added later cannot quietly ship on the data-plane scope.
+They assert against the mounted app's dependency graph rather than the source
+text, so renaming or restructuring the gate keeps them honest.
 """
 
 from __future__ import annotations
@@ -82,24 +87,32 @@ def test_the_destructive_routes_are_covered():
         assert expected in paths, f"{expected} is gone from the router"
 
 
-def test_internal_routes_are_not_admin_gated():
-    """``/internal/*`` is called by the notification job, not an operator.
+def test_every_internal_route_requires_the_admin_token():
+    """``/internal/*`` serves the notification worker and nobody else.
 
-    Pinned because the two surfaces sit in one router and are easy to sweep
-    together — doing so would break the notification pipeline, which has no
-    admin token to send.
+    The queue it reads holds every follower's notifications, and the mark
+    route can flip any row to sent (so a member's alert never goes out). A
+    plain API key must not reach either.
     """
     internal = [
         r
         for r in tradeworkz_router.routes
         if getattr(r, "path", "").startswith("/api/tradeworkz/internal")
     ]
-    assert internal, "no /internal routes found — has the router moved?"
-    for route in internal:
-        assert require_admin not in _dependency_callables(route), (
-            f"{route.path} was swept into the admin gate; the notification "
-            "job cannot send an admin token"
-        )
+    paths = {r.path for r in internal}
+    assert {
+        "/api/tradeworkz/internal/queued-notifications",
+        "/api/tradeworkz/internal/mark-notification",
+    } <= paths, f"the worker routes have moved: {sorted(paths)}"
+    unguarded = [
+        f"{sorted(r.methods)} {r.path}"
+        for r in internal
+        if require_admin not in _dependency_callables(r)
+    ]
+    assert not unguarded, (
+        "these /internal routes do not require the admin token and are "
+        f"reachable by any API key: {unguarded}"
+    )
 
 
 class TestGateBehaviour:
