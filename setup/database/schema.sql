@@ -1356,7 +1356,13 @@ CREATE VIEW underlying_daily_volume AS
 SELECT
     symbol,
     DATE(timestamp AT TIME ZONE 'America/New_York') AS trade_date_et,
-    SUM(COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS cumulative_daily_volume
+    -- Prefers the measured `volume` column, falling back to the tick-test
+    -- split and counting a missing side as zero, so pre-column history keeps
+    -- adding up. Must stay identical to the LATERAL in
+    -- DatabaseManager.get_latest_quote -- tests/test_latest_quote_daily_volume.py
+    -- asserts the two agree.
+    SUM(COALESCE(volume, COALESCE(up_volume, 0) + COALESCE(down_volume, 0)))::bigint
+        AS cumulative_daily_volume
 FROM underlying_quotes
 GROUP BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York');
 

@@ -22,6 +22,14 @@ spelling either one out again:
     The total. Prefers the measured column and falls back to the split's
     sum, so rows written before the column existed keep reading.
 
+``TOTAL_VOLUME_LENIENT``
+    The same total, for reads that SUM a whole day. Identical to
+    ``TOTAL_VOLUME`` except that when it does fall back to the split it
+    counts a missing side as zero, so one dropped ``UpVolume`` cannot void
+    a day's volume. ``TOTAL_VOLUME`` is the right one per bar, where half a
+    split is not a total; this one is the right one under ``SUM``, where the
+    pre-column history must keep adding up exactly as it did.
+
 ``UPTICK_SHARE_PCT``
     The classification's share, as a percentage -- and ``NULL`` when there
     is no classification to take a share of.
@@ -48,6 +56,13 @@ from typing import Final
 #: Total volume traded during the bar, for an unprefixed ``underlying_quotes``.
 TOTAL_VOLUME: Final[str] = "COALESCE(volume, up_volume + down_volume)"
 
+#: Total volume for a day-sum read: prefers the measured column, and when it
+#: falls back to the split counts a missing side as zero. See the module
+#: docstring for why this differs from :data:`TOTAL_VOLUME`.
+TOTAL_VOLUME_LENIENT: Final[str] = (
+    "COALESCE(volume, COALESCE(up_volume, 0) + COALESCE(down_volume, 0))"
+)
+
 #: Uptick share of classified volume, or NULL when the feed cannot classify.
 UPTICK_SHARE_PCT: Final[str] = (
     "CASE WHEN up_volume IS NULL OR down_volume IS NULL THEN NULL "
@@ -60,6 +75,11 @@ UPTICK_SHARE_PCT: Final[str] = (
 def total_volume(prefix: str = "") -> str:
     """:data:`TOTAL_VOLUME` qualified by a table alias, e.g. ``total_volume("q.")``."""
     return _qualify(TOTAL_VOLUME, prefix)
+
+
+def total_volume_lenient(prefix: str = "") -> str:
+    """:data:`TOTAL_VOLUME_LENIENT` qualified by a table alias."""
+    return _qualify(TOTAL_VOLUME_LENIENT, prefix)
 
 
 def uptick_share_pct(prefix: str = "") -> str:

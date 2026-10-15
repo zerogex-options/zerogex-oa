@@ -1702,3 +1702,76 @@ reject that in the first second rather than failing slowly.
 
 Persisted runs land in `feed_comparisons`, `option_chains_shadow` and `underlying_quotes_shadow`
 (`setup/database/shadow_tables.sql`), keyed by `provider`.
+
+## F18 — three day-volume reads the 2026-09 sweep missed, found by a liveness check
+
+*Added 2026-10-15, from the Thursday rehearsal's `make shadow-compare` at
+09:44 ET. Not what the session was run for.*
+
+### What showed it
+
+`shadow-compare`'s `underlying_quotes` block reports `no_updown`, the count of
+bars whose tick-test split is absent. Fifteen minutes into the session:
+
+| | production `no_updown` | rehearsal `no_updown` | rehearsal bars |
+|---|---|---|---|
+| NDX | 0 | 15 | 15 |
+| QQQ | 0 | 29 | 29 |
+| SPX | 0 | 15 | 15 |
+| SPY | 0 | 29 | 29 |
+
+Every rehearsal bar, none in production. That is expected and documented —
+`src/ingestion/providers/thetadata.py` returns `up_volume=None` outright,
+because Market Value reports a bar's total and cannot sign it. The 2026-09
+sweep anticipated exactly this and introduced
+`src/underlying_volume_sql.py` so that total-volume reads prefer the measured
+`volume` column and only fall back to the split.
+
+### What it found
+
+Three reads still spelled the split's sum out by hand, so the sweep's search
+for its own fragments did not match them:
+
+| Read | Would have served on Monday |
+|---|---|
+| `DatabaseManager.get_latest_quote` | `cumulative_daily_volume` = **0** |
+| `DatabaseManager.get_historical_quotes` | `volume` = **NULL** on every bar |
+| view `underlying_daily_volume` | `cumulative_daily_volume` = **0** |
+
+The first is the live quote endpoint and the second backs
+`/api/market/historical` — both customer-facing, on all four underlyings, for
+the whole session, silently. Neither would have raised an error.
+
+The view is read by no application code; it survives only as the reference
+`tests/test_latest_quote_daily_volume.py` checks the endpoint against, so it
+moves with the endpoint or that parity check stops meaning anything.
+
+### The fix
+
+`TOTAL_VOLUME_LENIENT` beside the existing `TOTAL_VOLUME`: the same
+preference for the measured column, but when it does fall back to the split it
+counts a missing side as zero. The distinction is not cosmetic. Under `SUM`,
+the strict fragment voids a whole day's volume if one bar dropped an
+`UpVolume`, and `ZZQE` in that test file has pinned the lenient behavior since
+2026-09. Per bar, half a split is not a total and the strict one is right.
+
+Two futures reads look identical and are deliberately left alone:
+`get_latest_future_quote` and `get_historical_futures` read `futures_quotes`,
+which never gained a `volume` column, and @ES/@NQ have no provider seam.
+
+### What this does NOT fix, and is a decision rather than a defect
+
+The **classification** does go dark on Monday, by design. `buy_pct` and
+`period_buy_pct` return NULL and the momentum label reads `⚪ No Tick Data` on
+every bar of every symbol. The 2026-09 sweep chose that deliberately over
+answering a confident 50. It is correct and it is also a visible change to a
+customer-facing column, so it should be a decision taken knowingly, not a
+surprise on Monday afternoon.
+
+One inconsistency is left open rather than settled quietly: `up_volume` and
+`down_volume` come back NULL from `get_historical_quotes` but
+`get_underlying_candles_for_session` coalesces the same two columns to 0.
+Before the cutover both served real numbers, so Monday is the first day the
+two disagree. `src/api/routers/replay.py` already defends with
+`if ... is not None else 0`; whether the API should be uniform is a call worth
+making on purpose.

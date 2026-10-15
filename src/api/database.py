@@ -55,7 +55,10 @@ from src.opening_range import (
     opening_range_window,
 )
 from src.symbols import is_cash_index
-from src.underlying_volume_sql import total_volume as _total_volume
+from src.underlying_volume_sql import (
+    total_volume as _total_volume,
+    total_volume_lenient as _total_volume_lenient,
+)
 from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
 
 logger = logging.getLogger(__name__)
@@ -7619,7 +7622,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.asset_type
             FROM latest_quote lq
             LEFT JOIN LATERAL (
-                SELECT SUM(COALESCE(v.up_volume, 0) + COALESCE(v.down_volume, 0))::bigint
+                SELECT SUM({_total_volume_lenient('v.')})::bigint
                            AS cumulative_daily_volume
                 FROM underlying_quotes v
                 WHERE v.symbol = lq.symbol
@@ -8751,6 +8754,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     close,
                     up_volume,
                     down_volume,
+                    volume,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp ASC) as rn_open,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn_close
                 FROM underlying_quotes
@@ -8766,7 +8770,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 MAX(close) FILTER (WHERE rn_close = 1) as close,
                 SUM(up_volume)::bigint as up_volume,
                 SUM(down_volume)::bigint as down_volume,
-                (SUM(up_volume) + SUM(down_volume))::bigint as volume
+                SUM({_total_volume_lenient()})::bigint as volume
             FROM base
             GROUP BY bucket_ts, symbol
             ORDER BY timestamp DESC

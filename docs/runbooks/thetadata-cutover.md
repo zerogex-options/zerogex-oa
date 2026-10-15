@@ -116,11 +116,15 @@ make shadow-status SHADOW_DB=zerogex_shadow_ts     # both must read 0
 cp .env ~/.env.pre-thetadata-$(date +%F)
 grep -E "^(MARKET_DATA_PROVIDER|FLOW_CLASSIFIER|VOLATILITY_INDEX_PROVIDER)=" .env
 
-# 3. ONLY IF the gate 0 fix widened a column: apply the schema change FIRST
+# 3. apply the schema change FIRST
 #    make schema-apply
-#    Schema changes are applied by hand and must land BEFORE the services
-#    restart. The other way round, writes fail against the old column — which
-#    is the failure this fix exists to stop.
+#    There IS one as of 2026-10-15: F18 redefines the underlying_daily_volume
+#    view. Nothing reads that view, so this is consistency rather than a
+#    customer fix and a miss here breaks nothing — but if the gate 0 fix
+#    widened a column, this step is the whole ballgame. Schema changes are
+#    applied by hand and must land BEFORE the services restart; the other way
+#    round, writes fail against the old column, which is the failure that fix
+#    exists to stop.
 
 # 4. make the change (edit by hand, two lines)
 #    MARKET_DATA_PROVIDER=thetadata_mv

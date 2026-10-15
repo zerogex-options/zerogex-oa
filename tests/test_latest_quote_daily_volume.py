@@ -51,6 +51,10 @@ class _RecordingConn:
         self.queries.append(query)
         return None
 
+    async def fetch(self, query, *args):
+        self.queries.append(query)
+        return []
+
 
 def _install_conn(db, conn):
     @asynccontextmanager
@@ -82,6 +86,42 @@ def test_day_volume_is_a_ranged_read_not_the_aggregate_view():
     assert "v.timestamp <" in sql
 
 
+def test_day_volume_prefers_the_measured_column_over_the_tick_split():
+    """A feed that cannot classify still reports a total; read that.
+
+    ThetaData supplies ``volume`` and cannot supply the split, so summing
+    ``COALESCE(up,0) + COALESCE(down,0)`` returns a confident 0 for every
+    symbol on every day -- the live quote's day volume silently reading
+    zero. Found on 2026-10-15 in the cutover rehearsal, where every
+    rehearsal bar had a NULL split and a populated total.
+    """
+    db = _new_db()
+    conn = _RecordingConn()
+    _install_conn(db, conn)
+    asyncio.run(db.get_latest_quote("SPY"))
+    sql = conn.queries[0]
+
+    assert "COALESCE(v.volume," in sql
+    assert "SUM(COALESCE(v.up_volume, 0) + COALESCE(v.down_volume, 0))" not in sql
+
+
+def test_bucketed_history_volume_prefers_the_measured_column():
+    """Same conflation, same consequence, in the bucketed history read.
+
+    ``(SUM(up_volume) + SUM(down_volume))`` is NULL rather than 0 when the
+    split is absent, so ``/api/market/historical`` would have served a null
+    volume on every bar of every symbol after the cutover.
+    """
+    db = _new_db()
+    conn = _RecordingConn()
+    _install_conn(db, conn)
+    asyncio.run(db.get_historical_quotes("SPY"))
+    sql = conn.queries[0]
+
+    assert "COALESCE(volume," in sql
+    assert "(SUM(up_volume) + SUM(down_volume))" not in sql
+
+
 # ── Against a real server ────────────────────────────────────────────────────
 
 # Verbatim from setup/database/schema.sql: the definition the read replaced,
@@ -91,22 +131,25 @@ CREATE VIEW underlying_daily_volume AS
 SELECT
     symbol,
     DATE(timestamp AT TIME ZONE 'America/New_York') AS trade_date_et,
-    SUM(COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS cumulative_daily_volume
+    SUM(COALESCE(volume, COALESCE(up_volume, 0) + COALESCE(down_volume, 0)))::bigint
+        AS cumulative_daily_volume
 FROM underlying_quotes
 GROUP BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York');
 """
 
-# symbol -> (asset_type, [(ET bar start, up_volume, down_volume)], expected day volume
-# for the newest bar). Throwaway symbols; the schema is dropped afterwards.
+# symbol -> (asset_type, [(ET bar start, up_volume, down_volume, volume)], expected
+# day volume for the newest bar). Throwaway symbols; the schema is dropped
+# afterwards. A None volume is a pre-2026-09 bar, written before the column
+# existed; a None split is a bar from a feed that cannot classify.
 _CASES = {
     # A plain EST session; the prior day's bar is not today's volume.
     "ZZQA": (
         "ETF",
         [
-            (_et(2026, 3, 5, 15, 59), 1000, 1000),
-            (_et(2026, 3, 6, 9, 30), 10, 5),
-            (_et(2026, 3, 6, 12, 0), 20, 5),
-            (_et(2026, 3, 6, 15, 59), 1, 1),
+            (_et(2026, 3, 5, 15, 59), 1000, 1000, None),
+            (_et(2026, 3, 6, 9, 30), 10, 5, None),
+            (_et(2026, 3, 6, 12, 0), 20, 5, None),
+            (_et(2026, 3, 6, 15, 59), 1, 1, None),
         ],
         42,
     ),
@@ -114,9 +157,9 @@ _CASES = {
     "ZZQB": (
         "ETF",
         [
-            (_et(2026, 3, 6, 15, 59), 500, 500),
-            (_et(2026, 3, 9, 4, 0), 3, 4),
-            (_et(2026, 3, 9, 9, 30), 7, 8),
+            (_et(2026, 3, 6, 15, 59), 500, 500, None),
+            (_et(2026, 3, 9, 4, 0), 3, 4, None),
+            (_et(2026, 3, 9, 9, 30), 7, 8, None),
         ],
         22,
     ),
@@ -124,11 +167,11 @@ _CASES = {
     "ZZQC": (
         "INDEX",
         [
-            (_et(2026, 3, 7, 23, 59), 100, 100),
-            (_et(2026, 3, 8, 0, 0), 1, 2),
-            (_et(2026, 3, 8, 1, 59), 3, 4),
-            (_et(2026, 3, 8, 3, 0), 5, 6),
-            (_et(2026, 3, 8, 23, 59), 7, 8),
+            (_et(2026, 3, 7, 23, 59), 100, 100, None),
+            (_et(2026, 3, 8, 0, 0), 1, 2, None),
+            (_et(2026, 3, 8, 1, 59), 3, 4, None),
+            (_et(2026, 3, 8, 3, 0), 5, 6, None),
+            (_et(2026, 3, 8, 23, 59), 7, 8, None),
         ],
         36,
     ),
@@ -137,9 +180,9 @@ _CASES = {
     "ZZQD": (
         "ETF",
         [
-            (_et(2026, 11, 1, 0, 0), 50, 50),
-            (_et(2026, 11, 1, 23, 59), 60, 60),
-            (_et(2026, 11, 2, 0, 0), 2, 3),
+            (_et(2026, 11, 1, 0, 0), 50, 50, None),
+            (_et(2026, 11, 1, 23, 59), 60, 60, None),
+            (_et(2026, 11, 2, 0, 0), 2, 3, None),
         ],
         5,
     ),
@@ -147,10 +190,39 @@ _CASES = {
     "ZZQE": (
         "ETF",
         [
-            (_et(2026, 9, 25, 9, 30), None, 7),
-            (_et(2026, 9, 25, 9, 31), 4, None),
+            (_et(2026, 9, 25, 9, 30), None, 7, None),
+            (_et(2026, 9, 25, 9, 31), 4, None, None),
         ],
         11,
+    ),
+    # A feed that reports the total and cannot classify: the whole day is
+    # the measured column. Read as the split's sum this is a confident 0.
+    "ZZQF": (
+        "ETF",
+        [
+            (_et(2026, 10, 15, 9, 30), None, None, 1_000_000),
+            (_et(2026, 10, 15, 9, 31), None, None, 234_567),
+        ],
+        1_234_567,
+    ),
+    # A cash index on that same feed: no volume to report at all, and 0
+    # rather than NULL is what the endpoint must still serve.
+    "ZZQG": (
+        "INDEX",
+        [
+            (_et(2026, 10, 15, 9, 30), None, None, None),
+        ],
+        0,
+    ),
+    # One ET day spanning both vendors, which is what the backfill leaves
+    # behind: split-only bars and total-only bars summed together.
+    "ZZQH": (
+        "ETF",
+        [
+            (_et(2026, 10, 14, 9, 30), 10, 5, None),
+            (_et(2026, 10, 14, 9, 31), None, None, 100),
+        ],
+        115,
     ),
 }
 
@@ -172,6 +244,10 @@ async def _connect_scratch_schema():
             close NUMERIC(12, 4) NOT NULL,
             up_volume BIGINT DEFAULT 0,
             down_volume BIGINT DEFAULT 0,
+            -- NULL, no DEFAULT: matches setup/database/schema.sql, where an
+            -- absent volume is unknown and a zero volume is a bar in which
+            -- nothing traded.
+            volume BIGINT,
             PRIMARY KEY (symbol, timestamp)
         );
         """)
@@ -189,14 +265,15 @@ def test_day_volume_matches_the_view_across_clock_changes_and_midnight():
                 await conn.execute("INSERT INTO symbols VALUES ($1, $2)", symbol, asset_type)
                 await conn.executemany(
                     "INSERT INTO underlying_quotes (symbol, timestamp, open, high, low, close,"
-                    " up_volume, down_volume) VALUES ($1, $2, 100, 101, 99, 100.5, $3, $4)",
-                    [(symbol, ts, up, down) for ts, up, down in bars],
+                    " up_volume, down_volume, volume)"
+                    " VALUES ($1, $2, 100, 101, 99, 100.5, $3, $4, $5)",
+                    [(symbol, ts, up, down, vol) for ts, up, down, vol in bars],
                 )
 
             db = _new_db()
             _install_conn(db, conn)
             for symbol, (asset_type, bars, expected) in _CASES.items():
-                newest = max(ts for ts, _, _ in bars)
+                newest = max(ts for ts, _, _, _ in bars)
                 row = await db.get_latest_quote(symbol)
                 assert row is not None, symbol
                 assert row["timestamp"] == newest, symbol

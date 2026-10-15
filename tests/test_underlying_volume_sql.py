@@ -18,8 +18,10 @@ import pytest
 
 from src.underlying_volume_sql import (
     TOTAL_VOLUME,
+    TOTAL_VOLUME_LENIENT,
     UPTICK_SHARE_PCT,
     total_volume,
+    total_volume_lenient,
     uptick_share_pct,
 )
 
@@ -43,6 +45,80 @@ def test_the_total_still_falls_back_to_the_split():
     split beside it. Dropping the fallback would blank every historical bar
     -- charts, backfills and the VWAP's own session accumulation."""
     assert "up_volume + down_volume" in TOTAL_VOLUME
+
+
+def test_the_lenient_total_also_prefers_the_measured_column():
+    assert TOTAL_VOLUME_LENIENT.startswith("COALESCE(volume,")
+
+
+def test_the_lenient_total_counts_a_missing_side_as_zero():
+    """Under SUM, the strict fragment voids a whole day's volume when one
+    bar dropped an UpVolume: NULL + anything is NULL. The day-sum reads
+    keep the pre-column history adding up exactly as it did, which is what
+    tests/test_latest_quote_daily_volume.py's ZZQE case pins."""
+    assert "COALESCE(up_volume, 0) + COALESCE(down_volume, 0)" in TOTAL_VOLUME_LENIENT
+
+
+def test_the_two_totals_differ_only_in_that_leniency():
+    """Not an alias. If these ever collapse into one, the day-sum reads go
+    NULL on a half-classified bar and the per-bar reads start publishing a
+    half split as a total -- opposite faults from the same edit."""
+    assert TOTAL_VOLUME != TOTAL_VOLUME_LENIENT
+
+
+def test_lenient_qualification_does_not_mangle_the_prefixed_columns():
+    assert total_volume_lenient("v") == (
+        "COALESCE(v.volume, COALESCE(v.up_volume, 0) + COALESCE(v.down_volume, 0))"
+    )
+    assert total_volume_lenient() == TOTAL_VOLUME_LENIENT
+    assert "up_v.volume" not in total_volume_lenient("v")
+
+
+def _func_src(path: str, name: str) -> str:
+    """The source of one function, so an assertion about it cannot be
+    satisfied -- or broken -- by an identical line in a different one."""
+    src = Path(path).read_text()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return ast.get_source_segment(src, node) or ""
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def test_the_day_sum_reads_use_the_lenient_fragment():
+    """The two reads the 2026-09 sweep missed, found on 2026-10-15 in the
+    cutover rehearsal: every rehearsal bar carried a populated total and a
+    NULL split, so get_latest_quote's day volume read 0 and the bucketed
+    history's read NULL. Both spelled the split's sum out by hand, which is
+    why neither showed up in the sweep's search for the fragments."""
+    latest = _func_src("src/api/database.py", "get_latest_quote")
+    assert "SUM({_total_volume_lenient('v.')})" in latest
+    assert "COALESCE(v.up_volume, 0) + COALESCE(v.down_volume, 0)" not in latest
+
+    history = _func_src("src/api/database.py", "get_historical_quotes")
+    assert "SUM({_total_volume_lenient()})" in history
+    assert "(SUM(up_volume) + SUM(down_volume))" not in history
+
+
+def test_the_futures_reads_are_deliberately_left_on_the_split():
+    """Not an oversight, and not to be swept with the others: these read
+    futures_quotes, which never gained a `volume` column, so the fragment
+    would name a column that does not exist. @ES/@NQ also have no provider
+    seam -- they stay on TradeStation, which does supply the split."""
+    for name in ("get_latest_future_quote", "get_historical_futures"):
+        src = _func_src("src/api/database.py", name)
+        assert "up_volume" in src and "down_volume" in src, name
+        assert "_total_volume" not in src, name
+
+
+def test_the_daily_volume_view_agrees_with_the_endpoint():
+    """The view is the reference tests/test_latest_quote_daily_volume.py
+    checks get_latest_quote against, so a fix to one is a fix to both. It
+    is a VIEW, so it reaches production through `make schema-apply`, not a
+    service restart."""
+    schema = Path("setup/database/schema.sql").read_text()
+    view = schema.split("CREATE VIEW underlying_daily_volume AS")[1]
+    view = view.split("GROUP BY")[0]
+    assert "COALESCE(volume, COALESCE(up_volume, 0) + COALESCE(down_volume, 0))" in view
 
 
 def test_qualification_does_not_mangle_the_prefixed_columns():
