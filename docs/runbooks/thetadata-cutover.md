@@ -202,7 +202,15 @@ to subscribers is a separate decision that does not depend on the cutover date.
 ## Open before Monday
 
 **VIX / VXN CGIF coverage, contractually.** Operationally they are fine on
-ThetaData and no override is needed. Whether they sit inside the existing CGIF
+ThetaData and no override is needed — MEASURED 2026-10-15, not assumed. The
+rehearsal's `vix_bars` / `vxn_bars` carried `off_grid = 0` on both indices,
+which is the thing that could have broken: Market Value sends a mark every few
+seconds and the ingester has to fold each one into its 5-minute bucket, and a
+single off-grid row would mean it was instead filling the table one row per
+poll. 77 RTH bars against production's 78 and 77, and closes agreeing to
+within three cents (VIX 16.33–17.98 against 16.35–17.96; VXN 22.88–25.10
+against 22.89–25.07) — penny randomization, nothing more. So what is left here
+is only the contract, not the pipe. Whether they sit inside the existing CGIF
 coverage in the executed agreement is still unanswered, and the whole point of
 this migration is to retire redistribution exposure rather than relocate it.
 Leaving them pinned to TradeStation with `VOLATILITY_INDEX_PROVIDER=tradestation`
