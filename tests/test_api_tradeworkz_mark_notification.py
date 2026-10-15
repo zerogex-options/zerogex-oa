@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 _STATIC_KEY = "static-integration-key"
+_ADMIN_TOKEN = "unit-test-admin-token"
 
 
 class _FakeConn:
@@ -59,6 +60,7 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("API_KEY", _STATIC_KEY)
     monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("KEY_ADMIN_TOKEN", _ADMIN_TOKEN)
 
     for mod in list(sys.modules):
         if mod.startswith("src.api"):
@@ -78,16 +80,20 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     return main_mod
 
 
-def _headers() -> dict:
-    return {"X-API-Key": _STATIC_KEY}
+def _headers(admin_token: str | None = _ADMIN_TOKEN) -> dict:
+    # The worker's credentials: the bearer key plus the admin token.
+    h = {"X-API-Key": _STATIC_KEY}
+    if admin_token:
+        h["X-Admin-Token"] = admin_token
+    return h
 
 
-def _mark(main_mod, conn, body):
+def _mark(main_mod, conn, body, headers=None):
     with TestClient(main_mod.app) as client:
         main_mod.db_manager.pool = _FakePool(conn)
         return client.post(
             "/api/tradeworkz/internal/mark-notification",
-            headers=_headers(),
+            headers=headers if headers is not None else _headers(),
             json=body,
         )
 
@@ -133,3 +139,13 @@ def test_mark_notification_rejects_non_int_id(monkeypatch: pytest.MonkeyPatch):
     r = _mark(main_mod, conn, {"id": "42", "status": "sent"})
     assert r.status_code == 400, r.text
     assert conn.calls == []
+
+
+def test_mark_notification_refuses_a_key_without_the_admin_token(monkeypatch: pytest.MonkeyPatch):
+    """Marking a member's row sent would stop their alert going out: not for a plain API key."""
+    main_mod = _build_app(monkeypatch)
+    conn = _FakeConn()
+    for headers in (_headers(admin_token=None), _headers(admin_token="wrong")):
+        r = _mark(main_mod, conn, {"id": 42, "status": "sent"}, headers=headers)
+        assert r.status_code == 403, r.text
+    assert conn.calls == [], "a row was updated without the admin token"

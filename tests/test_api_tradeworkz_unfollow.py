@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient
 
 _STATIC_KEY = "static-integration-key"
 _SECRET = "unit-test-secret"
+_ADMIN_TOKEN = "unit-test-admin-token"
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +116,7 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("API_KEY", _STATIC_KEY)
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("END_USER_TOKEN_SECRET", _SECRET)
+    monkeypatch.setenv("KEY_ADMIN_TOKEN", _ADMIN_TOKEN)
 
     for mod in list(sys.modules):
         if mod.startswith("src.api"):
@@ -246,7 +248,8 @@ def test_queued_notifications_filters_on_current_optin(monkeypatch: pytest.Monke
         _inject_pool(main_mod, conn)
         r = client.get(
             "/api/tradeworkz/internal/queued-notifications?channel=email&limit=10",
-            headers=_headers(),  # scope dep is a no-op for the static key
+            # The worker's credentials: the bearer key plus the admin token.
+            headers={**_headers(), "X-Admin-Token": _ADMIN_TOKEN},
         )
     assert r.status_code == 200, r.text
     fetches = [c for c in conn.calls if c[0] == "fetch"]
@@ -257,3 +260,19 @@ def test_queued_notifications_filters_on_current_optin(monkeypatch: pytest.Monke
     assert "EXISTS" in sql
     assert "tw_bot_followers" in sql
     assert "->> n.channel" in sql
+
+
+def test_queued_notifications_refuse_a_key_without_the_admin_token(monkeypatch: pytest.MonkeyPatch):
+    """Every follower's queued notifications: not for a plain API key."""
+    main_mod = _build_app(monkeypatch)
+    conn = _FakeConn(fetch_rows=[])
+    with TestClient(main_mod.app) as client:
+        _inject_pool(main_mod, conn)
+        for headers in (_headers(), {**_headers(), "X-Admin-Token": "wrong"}):
+            r = client.get(
+                "/api/tradeworkz/internal/queued-notifications?channel=email&limit=10",
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+    fetches = [c for c in conn.calls if c[0] == "fetch"]
+    assert not fetches, "the queue was read without the admin token"

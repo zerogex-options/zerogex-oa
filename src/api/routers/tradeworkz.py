@@ -48,10 +48,15 @@ router = APIRouter(prefix="/api/tradeworkz", tags=["TradeWorkz"])
 # missing — an admin surface "must not ride on the lenient data-plane
 # scopes".
 #
-# The scope check stays underneath as defence in depth. Note this deliberately
-# does NOT cover ``/internal/*`` on this router: those are called by the
-# notification job, which has no admin token to send.
-# ``tests/test_tradeworkz_admin_gate.py`` asserts both halves of that.
+# The scope check stays underneath as defence in depth.
+#
+# The same gate covers ``/internal/*``. Those two routes hand out every
+# follower's queued email and webhook notifications (member ids and trade
+# payloads) and mark any row sent, so a plain API key, which every Pro member
+# can mint for themselves, must not reach them. Their only caller is the
+# website's notification worker (frontend/scripts/tradeworkz-notify-deliver.mts),
+# which sends ZEROGEX_ADMIN_TOKEN alongside its bearer key.
+# ``tests/test_tradeworkz_admin_gate.py`` asserts both surfaces.
 _ADMIN_GATE = [Depends(require_admin), Depends(require_scopes(SIGNALS))]
 
 
@@ -1846,7 +1851,7 @@ def _explain_no_signal(bot: "BaseBot", snap: "MarketSnapshot") -> str:  # noqa: 
 
 @router.get(
     "/internal/queued-notifications",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def internal_queued_notifications(
     limit: int = Query(default=100, ge=1, le=1000),
@@ -1917,7 +1922,7 @@ async def internal_queued_notifications(
 
 @router.post(
     "/internal/mark-notification",
-    dependencies=[Depends(require_scopes(SIGNALS))],
+    dependencies=_ADMIN_GATE,
 )
 async def internal_mark_notification(
     body: Dict[str, Any] = Body(...),
