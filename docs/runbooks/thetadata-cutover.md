@@ -76,12 +76,20 @@ assuming the same of the licensing.
 All six must hold — gate 0 was added on 2026-10-14, after the list was first
 written. Any one failing moves the date; none of them is a judgement call.
 
-0. **The NDX write overflow is identified and fixed.** ADDED 2026-10-14 and the
-   hardest of these. NDX stopped persisting nine minutes before the close with
-   "numeric field overflow", and every retry failed the same way (F16). NDX
-   expires daily, so in production this recurs at the end of every expiry day —
-   silently, in the part of the session its flow matters most. **Do not cut over
-   with this open.**
+0. **The NDX write overflow cannot silently void a symbol's session.** ADDED
+   2026-10-14, REFRAMED 2026-10-15. As written this asked for the overflow to be
+   "identified and fixed", and that turned out to be the wrong test: the 10-15
+   rehearsal did not reproduce it, so no amount of waiting reliably names the
+   value. What the 10-14 failure actually was is a **poison pill** — one
+   out-of-range value fails the whole batch statement, rolls back the
+   `option_chains_latest` cache with it, and is then retained and re-sent, so
+   the symbol stops persisting until restart (F16, amended). That is latent in
+   production on TradeStation too; the vendor change only raises the odds.
+   **What clears this gate is the quarantine fix being deployed** — the write
+   drops the rows Postgres cannot store, names them, and writes the rest.
+   Confirm `_quarantine_numeric_overflow` is in `src/ingestion/main_engine.py`
+   on the box. The triggering value is still unnamed and the diagnostic stays
+   in place to catch it; that is a data-quality question now, not a blocker.
 1. ~~**Wednesday's rehearsal wrote NDX rows from ThetaData.**~~ **MET
    2026-10-14** — 547,453 rows, 2,444 contracts, 8 expirations, through the full
    path. The pipeline works; see gate 0 for what it then did.

@@ -1272,13 +1272,14 @@ alias, strike selection, flow accumulation and the DB write.
 The pipeline works. The row shortfall is the nine minutes it lost at the end —
 see below, that is its own finding.
 
-### NDX's second tick-test reading agrees with its first
+### NDX's three tick-test readings span 22.2% to 29.1%
 
 | | sign agreement | share of flow flipped |
 |---|---|---|
 | Fri 2026-10-09, TradeStation + tick | 63.8% | 29.1% |
 | Wed 2026-10-14, ThetaData + tick | **63.3%** | **27.8%** |
-| difference | −0.5pp | −1.3pp |
+| Thu 2026-10-15, ThetaData + tick | **65.4%** | **22.2%** |
+| spread across the three | 2.1pp | 6.9pp |
 
 Different days, different feeds, agreeing to 1.3 points. F15 put the noise band
 on a single day's share-of-flipped-flow at about ±8 points, so this is not two
@@ -1345,12 +1346,13 @@ IVs already on this record it clears 10,000. SPY never approaches it, which is
 consistent with this surfacing only once NDX was ingesting. The next session
 will name the column; until it does this is reasoning, not evidence.
 
-### SPX option volume runs 5.0% higher on ThetaData, twice
+### SPX option volume runs 4.5–5.0% higher on ThetaData, three sessions running
 
 | | rehearsal | production | difference |
 |---|---|---|---|
 | SPX, 2026-10-12 full session | 2,961,720 | 2,821,582 | **+4.97%** |
 | SPX, 2026-10-14 full session | 5,163,130 | 4,917,997 | **+4.98%** |
+| SPX, 2026-10-15 full session | 4,369,934 | 4,180,517 | **+4.53%** |
 | SPY, 2026-10-14 | 12,826,992 | 12,833,038 | −0.05% |
 | QQQ, 2026-10-14 | 8,507,476 | 8,516,930 | −0.11% |
 
@@ -1364,9 +1366,77 @@ difference propagates into SPX's published flow — and SPX is the symbol whose
 feed evidence is weakest, having been left out of F15's same-day arm to stay
 clear of the stream cap. Raise with ThetaData.
 
+### AMENDED 2026-10-15: the write failure is a poison pill, and is fixed without knowing the column
+
+The 10-15 rehearsal was run to make the overflow fire with the diagnostic
+deployed. **It did not fire.** Same feed, same four symbols, same defaults, and
+NDX persisted to 15:59 on both arms. So it is not a property of every expiry
+day, and waiting for it is not a plan: it has appeared once in NDX's three
+sessions.
+
+Reading the write path instead of waiting for the log turned out to be the
+better move, because the mechanism is worse than a lost row and does not depend
+on which column overflows:
+
+1. `execute_values` sends the batch as ONE statement, so an out-of-range value
+   fails the statement, not its row.
+2. The `option_chains` and `option_chains_latest` upserts share one
+   transaction with a single `commit()` — by design, so the cache cannot drift
+   from history. The bad row therefore rolls back every good row beside it AND
+   freezes the latest-per-contract cache.
+3. `_retain_failed_option_rows` then puts the bad row into the pending buffer,
+   and the next flush re-sends it.
+
+That is a poison pill, not a retry. The only thing that could ever evict the
+row was the buffer's 20,000-row cap; on 10-14 the buffer reached 14,281 and the
+session ended first. Nine minutes of NDX, at the end of an expiry day.
+
+**It is also not specific to NDX, to expiry days, or to ThetaData.** It is
+latent in production on TradeStation today. The vendor change raises the odds
+of tripping it — randomized bid/ask, zero-DTE greeks on a 30,000-point index —
+but did not create it.
+
+**Fixed by quarantine, not by diagnosis.** On a numeric overflow the write now
+splits the batch against `OPTION_ROW_NUMERIC_BOUNDS`, drops the rows that
+cannot be stored, logs the contract and column, and writes the rest. The loss
+becomes one contract for one minute instead of every contract until restart,
+whatever the column turns out to be. It deliberately refuses to salvage when it
+is not sure: a different error, no identifiable offender (the bounds table is
+maintained by hand and can fall behind `schema.sql`), nothing left to keep,
+more than 25 rows or 1% of the batch, or a second overflow inside its own
+retry. In all of those the write fails loudly and retains, exactly as before.
+
+Rows are DROPPED, not clamped — Michael's call on 2026-10-15. A clamped theta
+is a fabricated number feeding GEX; a missing contract-minute is honest and
+shows up in the log with a running total.
+
+The root cause is still unnamed, and the diagnostic stays in place to name it
+the first time it recurs. That is now a question about data quality rather than
+a cutover blocker.
+
+### Thursday 2026-10-15, the full session, all four symbols
+
+| symbol | buckets | sign agrees | flips near0 / typ / large | share of flow flipped |
+|---|---|---|---|---|
+| SPY | 390 | 76.2% | 43 / 37 / 13 | 13.7% |
+| QQQ | 390 | 74.1% | 41 / 34 / 26 | 19.3% |
+| SPX | 390 | 73.1% | 42 / 37 / 26 | 20.7% |
+| **NDX** | 390 | **65.4%** | 42 / 59 / 34 | **22.2%** |
+
+Every symbol came in at or better than 10-14. Coverage was intact on all four,
+full 390-bucket sessions, and NDX wrote 561,875 rows against production's
+560,900.
+
+One difference worth not misreading: the rehearsal saw MORE contracts than
+production on the indices (NDX 2,356 vs 2,164; SPX 1,728 vs 1,638) and so its
+`traded_pct` is lower (NDX 44.5% vs 53.4%). Option volume is within 0.1% on
+NDX, SPY and QQQ, so the extra contracts are thin strikes that did not trade.
+They do not move flow.
+
 ### What this does not cover
 
-One session. No OPEX. The overflow is diagnosed but not identified.
+Three sessions now, still no OPEX. The overflow's MECHANISM is identified and
+contained; the value that triggers it is not.
 
 ---
 
