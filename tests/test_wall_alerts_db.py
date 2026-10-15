@@ -92,8 +92,9 @@ def _rule(conn, user: str, **kw: Any) -> int:
     cur.execute(
         """
         INSERT INTO wall_alert_rules
-            (end_user, underlying, side, events, min_strength_pctile, profile, channels, enabled)
-        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s)
+            (end_user, underlying, side, events, min_strength_pctile, profile, channels, enabled,
+             touch_bp)
+        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s)
         RETURNING id
         """,
         (
@@ -105,13 +106,21 @@ def _rule(conn, user: str, **kw: Any) -> int:
             kw.get("profile", "balanced"),
             json.dumps(kw.get("channels", {"in_app": True})),
             kw.get("enabled", True),
+            kw.get("touch_bp"),
         ),
     )
     conn.commit()
     return cur.fetchone()[0]
 
 
-def _event(kind: str = "hit", *, wall: float = 100.0, ordinal: int = 1, side: str = "call"):
+def _event(
+    kind: str = "hit",
+    *,
+    wall: float = 100.0,
+    ordinal: int = 1,
+    side: str = "call",
+    touch_bp: int = 5,
+):
     from src.alerts.wall_detector import WallEvent
 
     bar_ts = _et(10, 15)
@@ -138,6 +147,7 @@ def _event(kind: str = "hit", *, wall: float = 100.0, ordinal: int = 1, side: st
         peak=99.97,
         alerted_hit=True,
         approach_number=1,
+        touch_bp=touch_bp,
     )
 
 
@@ -203,6 +213,48 @@ def test_fan_out_matches_filters_and_dedupes(pg):
     pg.commit()
     assert again.duplicate is True
     assert len(_deliveries(pg)) == 2
+
+
+def test_each_event_reaches_only_the_rules_on_its_touch_tolerance(pg):
+    """Auto means the profile's own band (balanced: 5 bp), so an Auto rule and
+    an explicit 0.05% rule share a stream; a 0.10% rule hears only its own."""
+    from src.alerts.wall_store import record_and_fan_out
+
+    u1, u2, u3, u4 = USERS
+    _rule(pg, u1)  # Auto
+    _rule(pg, u2, touch_bp=5)
+    _rule(pg, u3, touch_bp=10)
+    _rule(pg, u4, touch_bp=25)
+
+    def fan(touch_bp: int, ordinal: int) -> List[str]:
+        res = record_and_fan_out(
+            pg,
+            _event(ordinal=ordinal, touch_bp=touch_bp),
+            strength_pctile=None,
+            net_gex_at_spot=None,
+            current_wall=100.0,
+            odds=[],
+            now=datetime.now(timezone.utc),
+        )
+        pg.commit()
+        cur = pg.cursor()
+        cur.execute(
+            "SELECT end_user FROM wall_alert_deliveries WHERE event_id = %s ORDER BY end_user",
+            (res.event_id,),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+    assert fan(5, 1) == [u1, u2]
+    assert fan(10, 2) == [u3]
+    assert fan(1, 3) == []
+    # The same test on two streams is two events, not a duplicate.
+    assert fan(25, 1) == [u4]
+    cur = pg.cursor()
+    cur.execute(
+        "SELECT payload ->> 'touch_bp' FROM wall_alert_events WHERE underlying = %s ORDER BY id",
+        (SYMBOL,),
+    )
+    assert [r[0] for r in cur.fetchall()] == ["5", "10", "1", "25"]
 
 
 def test_unknown_strength_never_satisfies_a_floor(pg):
@@ -278,9 +330,17 @@ def test_sms_is_never_queued_while_disabled(pg):
 def test_states_round_trip_and_prune(pg):
     from src.alerts.wall_store import load_states, prune, record_and_fan_out, save_states
 
-    save_states(pg, SYMBOL, SESSION, {"balanced": {"version": 1, "x": [1, 2]}})
+    save_states(
+        pg,
+        SYMBOL,
+        SESSION,
+        {("balanced", 5): {"version": 2, "x": [1, 2]}, ("balanced", 25): {"version": 2}},
+    )
     pg.commit()
-    assert load_states(pg, SYMBOL, SESSION) == {"balanced": {"version": 1, "x": [1, 2]}}
+    assert load_states(pg, SYMBOL, SESSION) == {
+        ("balanced", 5): {"version": 2, "x": [1, 2]},
+        ("balanced", 25): {"version": 2},
+    }
     assert load_states(pg, SYMBOL, SESSION + timedelta(days=1)) == {}
 
     _rule(pg, USERS[0])
@@ -369,12 +429,18 @@ def test_service_tick_alerts_once_and_survives_a_restart(pg, monkeypatch):
     restarted.tick(_et(10, 15, 50))
     assert len(_deliveries(pg)) == 2
     cur.execute(
-        "SELECT profile, event_type FROM wall_alert_events WHERE underlying = %s ORDER BY profile",
+        "SELECT profile, touch_bp, event_type FROM wall_alert_events WHERE underlying = %s"
+        " ORDER BY profile, touch_bp",
         (SYMBOL,),
     )
     rows = cur.fetchall()
-    assert ("balanced", "hit") in rows
+    assert ("balanced", 5, "hit") in rows
+    # 99.98 is 0.02 short: inside every band but the 0.01% one.
+    assert ("balanced", 1, "hit") not in rows and ("balanced", 25, "hit") in rows
     assert len(rows) == len(set(rows))
+    # Every stream's state was saved under its own key.
+    cur.execute("SELECT COUNT(*) FROM wall_alert_detector_state WHERE underlying = %s", (SYMBOL,))
+    assert cur.fetchone()[0] == len(service.streams)
 
 
 def test_service_skips_a_symbol_whose_walls_are_stale(pg, monkeypatch):
@@ -514,6 +580,21 @@ def test_api_rule_lifecycle_and_ownership(api, pg):
     )
     assert patched.status_code == 200 and patched.json()["cancelled_queued"] == 1
     assert sorted(_deliveries(pg)) == [(u1, "email", "cancelled"), (u1, "in_app", "sent")]
+
+    # A touch tolerance is saved, returned, and can go back to Auto.
+    assert rule["touch_bp"] is None
+    widened = api.patch(
+        f"/api/alerts/walls/rules/{rule['id']}", json={"touch_bp": 10}, headers=_as(u1)
+    )
+    assert widened.status_code == 200 and widened.json()["rule"]["touch_bp"] == 10
+    refused = api.patch(
+        f"/api/alerts/walls/rules/{rule['id']}", json={"touch_bp": 3}, headers=_as(u1)
+    )
+    assert refused.status_code == 422
+    reset = api.patch(
+        f"/api/alerts/walls/rules/{rule['id']}", json={"touch_bp": None}, headers=_as(u1)
+    )
+    assert reset.status_code == 200 and reset.json()["rule"]["touch_bp"] is None
 
     deleted = api.delete(f"/api/alerts/walls/rules/{rule['id']}", headers=_as(u1))
     assert deleted.status_code == 200

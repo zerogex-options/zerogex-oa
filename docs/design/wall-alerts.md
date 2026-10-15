@@ -7,9 +7,9 @@ Website: `/account/alerts`, the header bell, and the
 `zerogex-web-wall-alerts-notify` email worker.
 
 **What a member gets:** "tell me when the SPX put wall is hit — but only when
-it is a strong wall, without the chop — in the app and by email." Three things
-are configurable per alert: which events, how strong a wall must be, and how
-hard noise is filtered.
+it is a strong wall, without the chop — in the app and by email." Four things
+are configurable per alert: which events, how strong a wall must be, how hard
+noise is filtered, and how close counts as a touch.
 
 ---
 
@@ -79,6 +79,37 @@ data to retune them against. `make wall-alerts-replay SYMBOL=SPX DATE=…` runs
 the detectors over any stored session offline (read-only) and prints each
 profile's alerts.
 
+### Touch tolerance
+
+The touch band decides how close counts as a hit. A member may keep it on
+**Auto** (the profile's own band above) or choose 0.01%, 0.05%, 0.10% or
+0.25% of the wall (`TOUCH_OPTIONS_BP`; `wall_alert_rules.touch_bp`, NULL =
+Auto). On a 772 SPY wall that is about 8¢, 39¢, 77¢ or $1.93.
+
+Each (profile, tolerance) pair is its own detector **stream**
+(`stream_profiles`): 14 per symbol, keyed by the tolerance in effect, so
+"Balanced, Auto" and "Balanced, 0.05%" are one stream. Every stream runs
+whether or not anyone listens, like the profiles. A rule hears only the stream
+its profile and tolerance resolve to (`COALESCE(touch_bp, profile default)`),
+so one member's tolerance never changes another's alerts. Events and saved
+state carry the stream's `touch_bp`.
+
+A tolerance moves the hit, and with it the re-arm and hold distances (both stay
+at least twice the band, or a wide band would re-fire on itself). It never
+moves the break threshold, which stays on the profile's own band
+(`SensitivityProfile.break_floor`). A wide tolerance is a proximity alert: at
+0.25% a wall price spends the morning near is one test, and it re-arms only
+after price backs well off.
+
+### Explain
+
+`make wall-alerts-replay SYMBOL=SPY DATE=… EXPLAIN=1` prints every decision
+each stream made, in order: when each wall was published and armed, every test
+with the reason its hit did or did not alert (not armed since…, opening grace,
+cooldown), touches blocked by an open test or a spent wall, near misses
+outside the band, and each break, hold or lapse. Add `TOUCH=0.10` to replay at
+a member's tolerance. It is the answer to "why didn't that fire?".
+
 ## 4. Wall strength
 
 "How strong a wall" is the wall's dollar gamma as a **percentile of the
@@ -101,10 +132,10 @@ yet, or a nightly refresh that has not run).
 
 | Table | Holds |
 |---|---|
-| `wall_alert_rules` | Each member's alerts: symbol, side, events, strength floor, profile, channels, enabled. |
-| `wall_alert_events` | Every event, unique on `(symbol, session, profile, side, wall, test, kind)`, so re-running a tape is a no-op. `payload` is everything a channel renders (`wall_payload.py`). |
+| `wall_alert_rules` | Each member's alerts: symbol, side, events, strength floor, profile, touch tolerance (NULL = Auto), channels, enabled. |
+| `wall_alert_events` | Every event, unique on `(symbol, session, profile, touch, side, wall, test, kind)`, so re-running a tape is a no-op. `payload` is everything a channel renders (`wall_payload.py`). Rows from before touch tolerance carry `touch_bp` 0. |
 | `wall_alert_deliveries` | The outbox, unique per `(event, member, channel)`. `in_app` rows are born `sent` (the feed is the delivery, with server-side `read_at`); `email` / `sms` rows are born `queued`. |
-| `wall_alert_detector_state` | Per-(symbol, profile) detector state, rewritten when it changes (≥ once a minute in session — the heartbeat). |
+| `wall_alert_detector_state` | Per-stream (symbol, profile, touch) detector state, rewritten when it changes (≥ once a minute in session — the heartbeat). |
 
 An event and its deliveries are written in one transaction, and the detector's
 in-memory state is rewound if that write fails, so an alert is never recorded
@@ -157,8 +188,13 @@ from the same payload (`wallAlertSmsText` in `frontend/core/wallAlerts.ts`,
 
 * Install: `make schema-apply` (tables first), then `make wall-alerts-install`,
   then restart the API so the router loads.
-* Health: `make wall-alerts-health` — service state, per-symbol heartbeat,
-  today's events per profile, the outbox by status, rule counts.
+* Health: `make wall-alerts-health` — service state, per-symbol heartbeat
+  (streams saved, newest and oldest), today's events per stream, the outbox by
+  status, rule counts.
+* "Why didn't it fire?": `make wall-alerts-replay SYMBOL=SPY DATE=… EXPLAIN=1`
+  (add `PROFILE=` / `TOUCH=` to match the member's rule). If the replay shows
+  the alert, the cause is the rule (symbol, side, events, strength floor) or
+  delivery; if it shows the test with a reason, that reason is the cause.
 * After pulling a change under `src/alerts/`: `make wall-alerts-restart` (the
   bulk `services-restart` does not touch this unit).
 * Kill switch: `WALL_ALERTS_ENABLED=false` + restart. Rules are untouched.

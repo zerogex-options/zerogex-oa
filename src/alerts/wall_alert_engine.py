@@ -4,8 +4,10 @@ Run as ``python -m src.alerts.wall_alert_engine`` (systemd unit
 ``zerogex-oa-wall-alerts``). Every ``WALL_ALERTS_POLL_SECONDS`` during the
 regular session it reads, per symbol, the newest 1-minute bars (including the
 minute still forming) and the published walls, steps one
-:class:`~src.alerts.wall_detector.WallAlertDetector` per sensitivity profile,
-and records each event with its deliveries in one transaction.
+:class:`~src.alerts.wall_detector.WallAlertDetector` per stream (each
+sensitivity profile at its own touch band and at each touch tolerance a member
+may choose, :func:`~src.alerts.wall_detector.stream_profiles`), and records
+each event with its deliveries in one transaction.
 
 A separate process, not a hook in the analytics engine or the API, on
 purpose: a bug or a slow query here must never cost the product its GEX
@@ -17,7 +19,7 @@ Operational guarantees:
 * **One instance.** A Postgres advisory lock is held for the life of the
   process; a second copy (a manual run beside the service) waits idle rather
   than double-alerting. The events' unique key backs this up.
-* **Restart-safe.** Detector state is saved per (symbol, profile) whenever it
+* **Restart-safe.** Detector state is saved per (symbol, stream) whenever it
   changes, so a restart resumes open tests and cooldowns instead of losing
   them or re-alerting. With no saved state it warms up from the last
   ``WALL_ALERTS_WARMUP_MINUTES`` of tape with delivery suppressed.
@@ -29,7 +31,11 @@ Operational guarantees:
 ``--replay SYMBOL --date YYYY-MM-DD`` runs the same detectors over a past
 session offline and prints what each profile would have alerted. It writes
 nothing; it is how the profiles are tuned and how an operator checks the noise
-level before trusting a change.
+level before trusting a change. ``--touch 0.10`` replays at a member's touch
+tolerance instead of each profile's own band, and ``--explain`` prints every
+decision behind the alerts: when each wall armed, every test and why its hit
+did or did not alert, near misses outside the band, and each outcome. It is
+the answer to "why didn't that fire?".
 """
 
 from __future__ import annotations
@@ -48,9 +54,13 @@ from src.alerts import config as alerts_config
 from src.alerts.wall_detector import (
     ET,
     PROFILES,
+    SensitivityProfile,
+    StreamKey,
+    TraceEntry,
     WallAlertDetector,
     WallEvent,
     session_date_for,
+    stream_profiles,
 )
 from src.alerts.wall_payload import strength_tier
 from src.alerts.wall_store import (
@@ -97,8 +107,11 @@ class WallAlertService:
     def __init__(self, symbols: Optional[Tuple[str, ...]] = None) -> None:
         self.symbols = tuple(symbols or alerts_config.symbols())
         self.session: Optional[date] = None
-        self.detectors: Dict[str, Dict[str, WallAlertDetector]] = {}
-        self._saved: Dict[Tuple[str, str], str] = {}
+        self.streams: Dict[StreamKey, SensitivityProfile] = stream_profiles(
+            alerts_config.TOUCH_OPTIONS_BP
+        )
+        self.detectors: Dict[str, Dict[StreamKey, WallAlertDetector]] = {}
+        self._saved: Dict[Tuple[str, StreamKey], str] = {}
         self._restored: Dict[str, bool] = {}
         self._skip_reason: Dict[str, str] = {}
         self._symbol_errors: Dict[str, int] = {}
@@ -112,8 +125,9 @@ class WallAlertService:
 
     def _start_session(self, session: date) -> None:
         self.session = session
+        self.streams = stream_profiles(alerts_config.TOUCH_OPTIONS_BP)
         self.detectors = {
-            sym: {name: WallAlertDetector(sym, prof) for name, prof in PROFILES.items()}
+            sym: {key: WallAlertDetector(sym, prof) for key, prof in self.streams.items()}
             for sym in self.symbols
         }
         self._saved = {}
@@ -122,28 +136,31 @@ class WallAlertService:
         self._symbol_errors = {}
         self._pctile_cache = {}
         logger.info(
-            "Wall alerts: session %s, watching %s under %s",
+            "Wall alerts: session %s, watching %s under %d streams (%s, touch tolerances %s bp)",
             session.isoformat(),
             ",".join(self.symbols),
+            len(self.streams),
             ",".join(PROFILES),
+            ",".join(str(bp) for bp in alerts_config.TOUCH_OPTIONS_BP),
         )
 
     def _restore(self, conn: Any, symbol: str, session: date) -> bool:
-        """Load today's saved state for ``symbol``; True if every profile restored."""
+        """Load today's saved state for ``symbol``; True if every stream restored."""
         saved = load_states(conn, symbol, session)
         restored = 0
-        for name, det in self.detectors[symbol].items():
-            state = saved.get(name)
+        for key, det in self.detectors[symbol].items():
+            state = saved.get(key)
             if state and det.restore(state):
-                self._saved[(symbol, name)] = json.dumps(state, sort_keys=True)
+                self._saved[(symbol, key)] = json.dumps(state, sort_keys=True)
                 restored += 1
         if restored == len(self.detectors[symbol]):
             logger.info("Wall alerts: restored %s state from %s", symbol, session.isoformat())
             return True
-        # Partial restores would leave the profiles stepping different tapes;
+        # Partial restores would leave the streams stepping different tapes;
         # start them all fresh from the warm-up window instead.
-        for name, prof in PROFILES.items():
-            self.detectors[symbol][name] = WallAlertDetector(symbol, prof)
+        for key, prof in self.streams.items():
+            self.detectors[symbol][key] = WallAlertDetector(symbol, prof)
+            self._saved.pop((symbol, key), None)
         return False
 
     def acquire_lock(self) -> bool:
@@ -302,7 +319,7 @@ class WallAlertService:
                 if not det.restore(checkpoint[name]):
                     # A detector that had seen nothing yet has no session to
                     # restore; rewinding it means starting it fresh.
-                    dets[name] = WallAlertDetector(symbol, PROFILES[name])
+                    dets[name] = WallAlertDetector(symbol, self.streams[name])
             # A failed save left _saved claiming a state the database does not
             # have; forget it so the next tick writes again.
             for name in dets:
@@ -356,13 +373,14 @@ class WallAlertService:
         summary.events += 1
         summary.delivered += result.deliveries
         logger.info(
-            "Wall alert %s %s %s wall %.2f (%s, test %d) price %.2f strength %s"
+            "Wall alert %s %s %s wall %.2f (%s %dbp, test %d) price %.2f strength %s"
             " → %d rule(s), %d delivery row(s)%s",
             event.symbol,
             event.side,
             event.kind,
             event.wall,
             event.profile,
+            event.touch_bp,
             event.ordinal,
             event.price,
             "n/a" if pctile is None else f"p{pctile:.0f}",
@@ -399,7 +417,7 @@ class WallAlertService:
         return rows
 
     def _save(self, conn: Any, symbol: str, session: date) -> None:
-        changed: Dict[str, Dict[str, Any]] = {}
+        changed: Dict[StreamKey, Dict[str, Any]] = {}
         for name, det in self.detectors[symbol].items():
             state = det.to_state()
             blob = json.dumps(state, sort_keys=True)
@@ -496,14 +514,33 @@ class WallAlertService:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class ReplayStream:
+    """What one stream did over a replayed session."""
+
+    profile: str
+    touch_bp: int
+    events: List[WallEvent]
+    trace: List[TraceEntry] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return f"{self.profile} · touch {self.touch_bp / 100:.2f}%"
+
+
 def replay(
     symbol: str,
     session: date,
     profiles: Optional[List[str]] = None,
     *,
+    touch_bps: Optional[List[int]] = None,
     publish_lag_minutes: float = 0.0,
-) -> Dict[str, List[WallEvent]]:
+    explain: bool = False,
+) -> List[ReplayStream]:
     """Run the detectors over one stored session. Read-only.
+
+    Each profile runs at its own touch band, or at each of ``touch_bps`` when
+    given. With ``explain`` every stream also records why it did what it did.
 
     Each bar is judged against the walls row stamped at or before it. Live,
     that row can still be the previous minute's for the first seconds of a
@@ -518,59 +555,106 @@ def replay(
     with db_connection() as conn:
         bars = load_bars(conn, symbol, open_ts, close_ts)
         walls_rows = load_walls(conn, symbol, open_ts - timedelta(minutes=30), close_ts)
-    out: Dict[str, List[WallEvent]] = {}
+    out: List[ReplayStream] = []
     for name in names:
-        det = WallAlertDetector(symbol, PROFILES[name])
-        events: List[WallEvent] = []
-        for tape in bars:
-            row = walls_at(walls_rows, tape.bar.ts - timedelta(minutes=publish_lag_minutes))
-            if row is None:
-                continue
-            events.extend(det.observe(tape.bar, row.walls, complete=True))
-        out[name] = events
+        base = PROFILES[name]
+        variants = [base] if not touch_bps else [base.with_touch_bp(bp) for bp in touch_bps]
+        for prof in variants:
+            det = WallAlertDetector(symbol, prof)
+            if explain:
+                det.trace = []
+            events: List[WallEvent] = []
+            for tape in bars:
+                row = walls_at(walls_rows, tape.bar.ts - timedelta(minutes=publish_lag_minutes))
+                if row is None:
+                    continue
+                events.extend(det.observe(tape.bar, row.walls, complete=True))
+            det.flush_trace()
+            trace = sorted(det.trace or [], key=lambda t: t.ts)
+            out.append(ReplayStream(prof.name, prof.touch_bp, events, trace))
     return out
 
 
+def _hhmm(ts: datetime) -> str:
+    return ts.astimezone(ET).strftime("%H:%M")
+
+
 def _print_replay(
-    symbol: str, session: date, results: Dict[str, List[WallEvent]], as_json: bool
+    symbol: str,
+    session: date,
+    results: List[ReplayStream],
+    as_json: bool,
+    explain: bool = False,
 ) -> None:
     if as_json:
-        print(
-            json.dumps(
-                {
-                    name: [
-                        {
-                            "time": e.bar_ts.astimezone(ET).strftime("%H:%M"),
-                            "side": e.side,
-                            "kind": e.kind,
-                            "wall": e.wall,
-                            "price": e.price,
-                            "test": e.ordinal,
-                            "alerted_hit": e.alerted_hit,
-                        }
-                        for e in events
-                    ]
-                    for name, events in results.items()
-                },
-                indent=2,
-            )
-        )
+        out: Dict[str, Any] = {}
+        for stream in results:
+            entry: Dict[str, Any] = {
+                "profile": stream.profile,
+                "touch_bp": stream.touch_bp,
+                "alerts": [
+                    {
+                        "time": _hhmm(e.bar_ts),
+                        "side": e.side,
+                        "kind": e.kind,
+                        "wall": e.wall,
+                        "price": e.price,
+                        "test": e.ordinal,
+                        "alerted_hit": e.alerted_hit,
+                    }
+                    for e in stream.events
+                ],
+            }
+            if explain:
+                entry["explain"] = [
+                    {"time": _hhmm(t.ts), "side": t.side, "wall": t.wall, "text": t.text}
+                    for t in stream.trace
+                ]
+            out[stream.label] = entry
+        print(json.dumps(out, indent=2, ensure_ascii=False))
         return
     print(f"Wall-alert replay — {symbol} {session.isoformat()}")
-    for name, events in results.items():
+    for stream in results:
+        events = stream.events
         counts = {k: sum(1 for e in events if e.kind == k) for k in ("hit", "break", "hold")}
         print(
-            f"\n[{name}] {len(events)} alert(s): "
+            f"\n[{stream.label}] {len(events)} alert(s): "
             f"{counts['hit']} hit · {counts['break']} broke · {counts['hold']} held"
         )
+        if explain:
+            if not stream.trace:
+                print("  (no walls published for this session)")
+            for t in stream.trace:
+                print(f"  {_hhmm(t.ts)}  {t.side:4}  {t.wall:>10.2f}  {t.text}")
+            continue
         for e in events:
             extra = ""
             if e.kind != "hit":
                 extra = f"  ({e.minutes_since_hit:.0f} min after test opened)"
             print(
-                f"  {e.bar_ts.astimezone(ET).strftime('%H:%M')}  {e.side:4}  {e.kind:5}  "
+                f"  {_hhmm(e.bar_ts)}  {e.side:4}  {e.kind:5}  "
                 f"wall {e.wall:>10.2f}  price {e.price:>10.2f}  test #{e.ordinal}{extra}"
             )
+
+
+def _parse_touch(raw: Optional[List[str]]) -> Optional[List[int]]:
+    """``--touch 0.10`` (percent of the wall, repeatable or comma-separated) → bp."""
+    if not raw:
+        return None
+    out: List[int] = []
+    for chunk in raw:
+        for part in chunk.split(","):
+            part = part.strip().rstrip("%")
+            if not part:
+                continue
+            bp = int(round(float(part) * 100))
+            if not 1 <= bp <= 100:
+                raise argparse.ArgumentTypeError(
+                    f"--touch {part}: expected a percent between 0.01 and 1.00"
+                )
+            if bp not in out:
+                out.append(bp)
+    return out or None
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -579,14 +663,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--replay", metavar="SYMBOL", help="Replay a stored session offline.")
     parser.add_argument("--date", help="Session date for --replay (YYYY-MM-DD, default today).")
     parser.add_argument("--profile", action="append", choices=sorted(PROFILES))
+    parser.add_argument(
+        "--touch",
+        action="append",
+        metavar="PCT",
+        help="--replay at this touch tolerance (percent of the wall, e.g. 0.10) instead of "
+        "each profile's own band. Repeatable or comma-separated.",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="--replay: print every decision (arming, tests and why each hit did or did not "
+        "alert, near misses, outcomes).",
+    )
     parser.add_argument("--json", action="store_true", help="--replay output as JSON.")
     args = parser.parse_args(argv)
 
     if args.replay:
         session = date.fromisoformat(args.date) if args.date else datetime.now(ET).date()
         symbol = args.replay.upper()
-        results = replay(symbol, session, args.profile)
-        _print_replay(symbol, session, results, args.json)
+        try:
+            touch_bps = _parse_touch(args.touch)
+        except (argparse.ArgumentTypeError, ValueError) as exc:
+            parser.error(str(exc))
+        results = replay(symbol, session, args.profile, touch_bps=touch_bps, explain=args.explain)
+        _print_replay(symbol, session, results, args.json, args.explain)
         return 0
 
     service = WallAlertService()

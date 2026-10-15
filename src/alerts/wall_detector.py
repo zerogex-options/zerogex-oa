@@ -58,6 +58,21 @@ Hits are checked on the in-progress minute (its running high/low), so an alert
 goes out within seconds of the print; outcomes and arming use completed
 closes only, so a single wick can neither confirm a break nor re-arm a wall.
 
+**Touch tolerance.**  How close price must come for a hit to count is the
+profile's touch band, unless the member chose their own
+(:meth:`SensitivityProfile.with_touch_bp`).  Each tolerance in use is its own
+detector stream, so one member's choice never changes what another receives.
+A custom tolerance moves where a hit counts and, with it, how far price must
+back off to re-arm or to count as a hold (both stay at least twice the band,
+or a wide band would re-fire on itself); it never moves the break threshold,
+which stays on the profile's own band.
+
+**Explain.**  Setting :attr:`WallAlertDetector.trace` to a list makes the
+detector record every decision in plain words (each wall it started watching,
+each arming, each test and why its hit did or did not alert, each near miss
+outside the band, each outcome).  ``wall_alert_engine --replay --explain``
+prints it; live, ``trace`` stays ``None`` and costs nothing.
+
 Everything here is pure: no database, no clock, no configuration.  The same
 sequence of bars and walls always produces the same events, which is what lets
 ``wall_alert_engine --replay`` reproduce a past session exactly and lets the
@@ -66,9 +81,9 @@ service persist and restore its state across restarts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from src.analytics.walls import wall_break_buffer
@@ -86,7 +101,8 @@ EVENT_TYPES: Tuple[str, ...] = (EVENT_HIT, EVENT_BREAK, EVENT_HOLD)
 
 #: Bumped whenever the serialized state shape changes; a stored state with a
 #: different version is discarded (the service then warms up from the tape).
-STATE_VERSION = 1
+#: 2: states are per (profile, touch tolerance) stream and carry ``touch_bp``.
+STATE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -116,14 +132,39 @@ class SensitivityProfile:
     resolution_minutes: float
     #: No hit alerts this soon after the cash open.
     open_grace_minutes: float
+    #: The profile's own touch band as a fraction, when a member's tolerance
+    #: replaced ``touch_pct``; the break buffer's floor stays on it.
+    break_floor_pct: Optional[float] = None
 
     def touch_band(self, wall: float) -> float:
         return max(abs(float(wall)) * self.touch_pct, self.touch_min)
+
+    @property
+    def touch_bp(self) -> int:
+        """The touch tolerance in basis points (0.01% each): the stream's key."""
+        return int(round(self.touch_pct * 10_000))
+
+    def break_floor(self, wall: float) -> float:
+        """Floor under the break buffer: the profile's OWN touch band.
+
+        A member's tolerance changes where a hit counts, not what a break is,
+        so a wide tolerance never makes a break harder to confirm.
+        """
+        pct = self.touch_pct if self.break_floor_pct is None else self.break_floor_pct
+        return max(abs(float(wall)) * pct, self.touch_min)
+
+    def with_touch_bp(self, touch_bp: int) -> "SensitivityProfile":
+        """This profile with a member-chosen touch tolerance, in basis points."""
+        if int(touch_bp) == self.touch_bp:
+            return self
+        base = self.touch_pct if self.break_floor_pct is None else self.break_floor_pct
+        return replace(self, touch_pct=int(touch_bp) / 10_000, break_floor_pct=base)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "touch_pct": self.touch_pct,
+            "touch_bp": self.touch_bp,
             "arm_buffers": self.arm_buffers,
             "cooldown_minutes": self.cooldown_minutes,
             "confirm_minutes": self.confirm_minutes,
@@ -179,6 +220,32 @@ PROFILES: Dict[str, SensitivityProfile] = {
 }
 
 DEFAULT_PROFILE = "balanced"
+
+#: A detector stream: a profile name and the touch tolerance it runs at (bp).
+StreamKey = Tuple[str, int]
+
+
+def stream_profiles(touch_options_bp: Sequence[int]) -> Dict[StreamKey, SensitivityProfile]:
+    """Every stream the service runs: each profile at its own touch band, and at
+    each tolerance a member may choose instead.
+
+    Keyed by the tolerance actually in effect, so "Balanced, Auto" and
+    "Balanced, 0.05%" are one stream, not two that always agree.
+    """
+    out: Dict[StreamKey, SensitivityProfile] = {}
+    for name, profile in PROFILES.items():
+        out[(name, profile.touch_bp)] = profile
+        for bp in touch_options_bp:
+            variant = profile.with_touch_bp(int(bp))
+            out.setdefault((name, variant.touch_bp), variant)
+    return out
+
+
+def stream_for(profile: str, touch_bp: Optional[int]) -> StreamKey:
+    """The stream a rule listens to: its profile at its tolerance, or the
+    profile's own band when the rule leaves the tolerance on Auto (None)."""
+    base = PROFILES[profile]
+    return (profile, base.touch_bp if touch_bp is None else int(touch_bp))
 
 
 @dataclass(frozen=True)
@@ -255,11 +322,32 @@ class WallEvent:
     #: price, or price that never left it). Distinct from ``ordinal``, which
     #: counts every test and keys the event.
     approach_number: Optional[int] = None
+    #: The stream's touch tolerance in basis points: the profile's own, or the
+    #: one a member chose. With ``profile`` it names the stream.
+    touch_bp: int = 0
 
     @property
-    def key(self) -> Tuple[str, str, str, float, int, str]:
+    def key(self) -> Tuple[str, str, int, str, float, int, str]:
         """Identity of the event within a session — the store's uniqueness key."""
-        return (self.symbol, self.profile, self.side, self.wall, self.ordinal, self.kind)
+        return (
+            self.symbol,
+            self.profile,
+            self.touch_bp,
+            self.side,
+            self.wall,
+            self.ordinal,
+            self.kind,
+        )
+
+
+@dataclass(frozen=True)
+class TraceEntry:
+    """One decision the detector made, in words, for ``--explain`` replays."""
+
+    ts: datetime
+    side: str
+    wall: float
+    text: str
 
 
 @dataclass
@@ -348,6 +436,11 @@ class WallAlertDetector:
         self.profile = profile
         self._clock = _Clock()
         self._walls: Dict[Tuple[str, float], _WallState] = {}
+        #: Set to a list to record every decision (``--explain``); None live.
+        self.trace: Optional[List[TraceEntry]] = None
+        self._trace_inside: Dict[Tuple[str, float], bool] = {}
+        self._trace_near: Dict[Tuple[str, float], Tuple[float, datetime, float, float]] = {}
+        self._trace_disarm: Dict[Tuple[str, float], str] = {}
 
     # ------------------------------------------------------------------ API
 
@@ -382,6 +475,9 @@ class WallAlertDetector:
     def _reset(self, session: date) -> None:
         self._clock = _Clock(session_date=session)
         self._walls = {}
+        self._trace_inside = {}
+        self._trace_near = {}
+        self._trace_disarm = {}
 
     def _state(self, side: str, strike: float) -> _WallState:
         key = (side, _round_strike(strike))
@@ -422,27 +518,33 @@ class WallAlertDetector:
             # sitting at is a relabel, not an arrival.
             last_close = self._clock.last_close
             if state.test is None and not state.spent and last_close is not None:
-                buffer = break_buffer_for(walls, last_close, self.profile.touch_band(strike))
-                state.armed = self._approach_distance(side, strike, last_close) >= (
-                    self._arm_distance(strike, buffer)
-                )
+                buffer = break_buffer_for(walls, last_close, self.profile.break_floor(strike))
+                arm = self._arm_distance(strike, buffer)
+                gap = self._approach_distance(side, strike, last_close)
+                state.armed = gap >= arm
             else:
                 state.armed = False
+            if self.trace is not None:
+                self._trace_published(walls, state, previous, last_close)
 
     def _check_hits(self, bar: Bar, walls: WallsInForce) -> List[WallEvent]:
         events: List[WallEvent] = []
         session_open = _session_open(self._clock.session_date or session_date_for(bar.ts))
-        in_grace = bar.ts < session_open + timedelta(minutes=self.profile.open_grace_minutes)
+        grace_end = session_open + timedelta(minutes=self.profile.open_grace_minutes)
+        in_grace = bar.ts < grace_end
         for side in SIDES:
             strike = self._clock.published.get(side)
             if strike is None:
                 continue
             state = self._state(side, strike)
-            if state.spent or state.test is not None:
-                continue
             band = self.profile.touch_band(strike)
             extreme = float(bar.high) if side == SIDE_CALL else float(bar.low)
-            if self._approach_distance(side, strike, extreme) > band:
+            distance = self._approach_distance(side, strike, extreme)
+            if self.trace is not None:
+                self._trace_approach(bar, state, extreme, distance, band)
+            if state.spent or state.test is not None:
+                continue
+            if distance > band:
                 continue
 
             approached = state.armed
@@ -450,11 +552,13 @@ class WallAlertDetector:
                 state.last_hit_alert_ts + timedelta(minutes=self.profile.cooldown_minutes)
             )
             alert = approached and not in_grace and not cooling
+            buffer = break_buffer_for(walls, float(bar.close), self.profile.break_floor(strike))
+            if self.trace is not None:
+                self._trace_test(bar, state, extreme, distance, band, buffer, in_grace, grace_end)
             state.tests += 1
             if approached:
                 state.approaches += 1
             state.armed = False
-            buffer = break_buffer_for(walls, float(bar.close), band)
             state.test = _Test(
                 ordinal=state.tests,
                 hit_ts=bar.ts,
@@ -491,18 +595,46 @@ class WallAlertDetector:
             test.run = test.run + 1 if past > test.break_buffer else 0
             if test.run >= self.profile.confirm_minutes:
                 events.append(self._event(EVENT_BREAK, state, bar, price=close))
+                if self.trace is not None:
+                    self._note(
+                        bar.ts,
+                        state,
+                        f"BROKE: test #{test.ordinal} confirmed by {test.run} closes more "
+                        f"than {test.break_buffer:.2f} through the wall (close {close:.2f}) "
+                        "-> break alert; the wall stays quiet for the rest of the day",
+                    )
                 state.test = None
                 state.spent = True
                 state.armed = False
                 continue
 
-            if self._approach_distance(side, wall, close) >= self._hold_distance(test, wall):
+            hold = self._hold_distance(test, wall)
+            if self._approach_distance(side, wall, close) >= hold:
                 if test.alerted_hit:
                     events.append(self._event(EVENT_HOLD, state, bar, price=close))
+                if self.trace is not None:
+                    self._note(
+                        bar.ts,
+                        state,
+                        f"HELD: test #{test.ordinal} closed {close:.2f}, at least {hold:.2f} back "
+                        "off the wall -> "
+                        + (
+                            "hold alert"
+                            if test.alerted_hit
+                            else "no alert (its hit was not alerted)"
+                        ),
+                    )
                 state.test = None
                 continue
 
             if bar.ts - test.hit_ts >= timedelta(minutes=self.profile.resolution_minutes):
+                if self.trace is not None:
+                    self._note(
+                        bar.ts,
+                        state,
+                        f"test #{test.ordinal} lapsed after "
+                        f"{self.profile.resolution_minutes:.0f} min with no break or hold",
+                    )
                 state.test = None
         return events
 
@@ -515,9 +647,19 @@ class WallAlertDetector:
             state = self._state(side, strike)
             if state.armed or state.spent or state.test is not None:
                 continue
-            buffer = break_buffer_for(walls, close, self.profile.touch_band(strike))
-            if self._approach_distance(side, strike, close) >= self._arm_distance(strike, buffer):
+            buffer = break_buffer_for(walls, close, self.profile.break_floor(strike))
+            arm = self._arm_distance(strike, buffer)
+            gap = self._approach_distance(side, strike, close)
+            if gap >= arm:
                 state.armed = True
+                if self.trace is not None:
+                    self._trace_disarm.pop((side, strike), None)
+                    self._note(
+                        bar.ts,
+                        state,
+                        f"armed: close {close:.2f} is {gap:.2f} {_side_word(side)} the wall "
+                        f"(needs {arm:.2f})",
+                    )
 
     def _event(self, kind: str, state: _WallState, bar: Bar, *, price: float) -> WallEvent:
         test = state.test
@@ -545,7 +687,163 @@ class WallAlertDetector:
             peak=test.peak,
             alerted_hit=test.alerted_hit,
             approach_number=test.approach_number,
+            touch_bp=self.profile.touch_bp,
         )
+
+    # -------------------------------------------------------------- explain
+
+    def flush_trace(self) -> None:
+        """Record near misses still in progress when the tape ended."""
+        if self.trace is None:
+            return
+        for key in list(self._trace_near):
+            self._emit_near(key)
+
+    def _note(self, ts: datetime, state: _WallState, text: str) -> None:
+        assert self.trace is not None
+        self.trace.append(TraceEntry(ts=ts, side=state.side, wall=state.strike, text=text))
+
+    def _trace_published(
+        self,
+        walls: WallsInForce,
+        state: _WallState,
+        previous: Optional[float],
+        last_close: Optional[float],
+    ) -> None:
+        moved = f" (was {previous:.2f})" if previous is not None else ""
+        side, strike = state.side, state.strike
+        if state.spent:
+            status = "it already broke today, so it stays quiet"
+        elif state.test is not None:
+            status = f"test #{state.test.ordinal} on it is still open"
+        elif last_close is None:
+            status = "not armed until a completed minute closes clearly away from it"
+            self._trace_disarm[(side, strike)] = (
+                f"since it became the wall at {_hhmm(walls.ts)}"
+                if walls.ts
+                else "since it became the wall"
+            )
+        elif state.armed:
+            status = "armed"
+        else:
+            buffer = break_buffer_for(walls, last_close, self.profile.break_floor(strike))
+            arm = self._arm_distance(strike, buffer)
+            gap = self._approach_distance(side, strike, last_close)
+            status = (
+                f"not armed: price is {gap:.2f} from it and a close {arm:.2f} "
+                f"{_side_word(side)} arms it"
+            )
+            self._trace_disarm[(side, strike)] = (
+                f"since it became the wall at {_hhmm(self._clock.last_bar_ts)}"
+                if self._clock.last_bar_ts
+                else "since it became the wall"
+            )
+        ts = self._clock.last_bar_ts or walls.ts
+        if ts is None:
+            return
+        self.trace.append(  # type: ignore[union-attr]
+            TraceEntry(
+                ts=ts,
+                side=side,
+                wall=strike,
+                text=f"{side} wall is now {strike:.2f}{moved}; {status}",
+            )
+        )
+
+    def _trace_approach(
+        self, bar: Bar, state: _WallState, extreme: float, distance: float, band: float
+    ) -> None:
+        """Near misses outside the band, and touches a test or a break blocked."""
+        key = (state.side, state.strike)
+        inside = distance <= band
+        was_inside = self._trace_inside.get(key, False)
+        self._trace_inside[key] = inside
+        if inside:
+            # An approach that reached the band is a test (or a blocked one).
+            self._trace_near.pop(key, None)
+            if was_inside:
+                return
+            if state.spent:
+                self._note(
+                    bar.ts,
+                    state,
+                    f"{_extreme_word(state.side)} {extreme:.2f} is within the touch band, but "
+                    "this wall already broke today and stays quiet",
+                )
+            elif state.test is not None:
+                self._note(
+                    bar.ts,
+                    state,
+                    f"{_extreme_word(state.side)} {extreme:.2f} is back within the touch band "
+                    f"while test #{state.test.ordinal} (opened "
+                    f"{_hhmm(state.test.hit_ts)}) is still open: no new test until that one "
+                    "breaks, holds or lapses",
+                )
+            return
+        if distance <= 3.0 * band:
+            near = self._trace_near.get(key)
+            if near is None or distance < near[0]:
+                self._trace_near[key] = (distance, bar.ts, extreme, band)
+            return
+        self._emit_near(key)
+
+    def _emit_near(self, key: Tuple[str, float]) -> None:
+        near = self._trace_near.pop(key, None)
+        state = self._walls.get(key)
+        if near is None or state is None:
+            return
+        distance, ts, extreme, band = near
+        self._note(
+            ts,
+            state,
+            f"near miss: {_extreme_word(state.side)} {extreme:.2f} stopped {distance:.2f} "
+            f"{_side_word(state.side)} the wall, outside the {band:.2f} touch band "
+            f"({self.profile.touch_bp / 100:.2f}%)",
+        )
+
+    def _trace_test(
+        self,
+        bar: Bar,
+        state: _WallState,
+        extreme: float,
+        distance: float,
+        band: float,
+        buffer: float,
+        in_grace: bool,
+        grace_end: datetime,
+    ) -> None:
+        side, strike = state.side, state.strike
+        if distance > 0:
+            where = f"{distance:.2f} {_side_word(side)} the wall"
+        elif distance == 0:
+            where = "at the wall"
+        else:
+            where = f"{-distance:.2f} through the wall"
+        reasons: List[str] = []
+        if not state.armed:
+            arm = self._arm_distance(strike, buffer)
+            why = self._trace_disarm.get((side, strike), "since the session began")
+            reasons.append(
+                f"not armed: no 1-minute close at least {arm:.2f} {_side_word(side)} "
+                f"the wall {why}"
+            )
+        if in_grace:
+            reasons.append(f"opening grace until {_hhmm(grace_end)}")
+        if state.last_hit_alert_ts is not None and bar.ts < (
+            state.last_hit_alert_ts + timedelta(minutes=self.profile.cooldown_minutes)
+        ):
+            reasons.append(
+                f"cooldown: last hit alert on this wall at {_hhmm(state.last_hit_alert_ts)}, "
+                f"{self.profile.cooldown_minutes:.0f} min between hits"
+            )
+        outcome = "hit alert" if not reasons else "no hit alert: " + "; ".join(reasons)
+        self._note(
+            bar.ts,
+            state,
+            f"TEST #{state.tests + 1}: {_extreme_word(side)} {extreme:.2f} is {where} "
+            f"(touch band {band:.2f}) -> {outcome}",
+        )
+        self._trace_disarm[(side, strike)] = f"since test #{state.tests + 1} at {_hhmm(bar.ts)}"
 
     # -------------------------------------------------------- serialization
 
@@ -556,6 +854,7 @@ class WallAlertDetector:
             "version": STATE_VERSION,
             "symbol": self.symbol,
             "profile": self.profile.name,
+            "touch_bp": self.profile.touch_bp,
             "session_date": clock.session_date.isoformat() if clock.session_date else None,
             "last_bar_ts": _iso(clock.last_bar_ts),
             "last_close": clock.last_close,
@@ -569,6 +868,8 @@ class WallAlertDetector:
             if int(state.get("version", 0)) != STATE_VERSION:
                 return False
             if state.get("profile") != self.profile.name:
+                return False
+            if int(state.get("touch_bp", -1)) != self.profile.touch_bp:
                 return False
             session = date.fromisoformat(state["session_date"])
             clock = _Clock(
@@ -588,6 +889,22 @@ class WallAlertDetector:
         self._clock = clock
         self._walls = walls
         return True
+
+
+def _hhmm(ts: datetime) -> str:
+    """Wall-clock ET minute of a bar timestamp, for explain lines."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(ET).strftime("%H:%M")
+
+
+def _side_word(side: str) -> str:
+    """Where price sits on a wall's approach side: below a call wall, above a put wall."""
+    return "below" if side == SIDE_CALL else "above"
+
+
+def _extreme_word(side: str) -> str:
+    return "high" if side == SIDE_CALL else "low"
 
 
 def _iso(ts: Optional[datetime]) -> Optional[str]:

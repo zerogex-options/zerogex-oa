@@ -6450,22 +6450,24 @@ wall-alerts-health: ## Wall alerts: service state, per-symbol heartbeat, today's
 	@if systemctl is-active --quiet $(WALL_ALERTS_SERVICE); then echo "Status: $(GREEN)ACTIVE$(NC)"; else echo "Status: $(RED)INACTIVE$(NC)"; fi
 	@echo ""
 	@echo "Heartbeat (state is rewritten at least once a minute during the session):"
-	@$(PSQL) -P pager=off -c "SELECT underlying, profile, session_date, to_char(updated_at AT TIME ZONE 'America/New_York', 'MM-DD HH24:MI:SS') AS updated_et, date_trunc('second', NOW() - updated_at) AS age FROM wall_alert_detector_state ORDER BY underlying, profile;"
+	@$(PSQL) -P pager=off -c "SELECT underlying, COUNT(*) AS streams, MAX(session_date) AS session_date, to_char(MAX(updated_at) AT TIME ZONE 'America/New_York', 'MM-DD HH24:MI:SS') AS newest_et, date_trunc('second', NOW() - MIN(updated_at)) AS oldest_age FROM wall_alert_detector_state GROUP BY underlying ORDER BY underlying;"
 	@echo "Today's events (every profile, subscribed or not):"
-	@$(PSQL) -P pager=off -c "SELECT underlying, profile, event_type, COUNT(*) AS n, to_char(MAX(detected_at) AT TIME ZONE 'America/New_York', 'HH24:MI:SS') AS last_et FROM wall_alert_events WHERE session_date = (NOW() AT TIME ZONE 'America/New_York')::date GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;"
+	@$(PSQL) -P pager=off -c "SELECT underlying, profile, to_char(touch_bp / 100.0, 'FM0.00') || '%' AS touch, event_type, COUNT(*) AS n, to_char(MAX(detected_at) AT TIME ZONE 'America/New_York', 'HH24:MI:SS') AS last_et FROM wall_alert_events WHERE session_date = (NOW() AT TIME ZONE 'America/New_York')::date GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4;"
 	@echo "Deliveries, last 24h:"
 	@$(PSQL) -P pager=off -c "SELECT channel, status, COUNT(*) AS n, MAX(error) FILTER (WHERE status IN ('failed', 'cancelled')) AS sample_error FROM wall_alert_deliveries WHERE created_at > NOW() - interval '24 hours' GROUP BY 1, 2 ORDER BY 1, 2;"
 	@echo "Member rules:"
-	@$(PSQL) -P pager=off -c "SELECT COUNT(*) AS rules, COUNT(*) FILTER (WHERE enabled) AS enabled, COUNT(DISTINCT end_user) AS members, COUNT(*) FILTER (WHERE enabled AND (channels ->> 'email')::boolean) AS with_email FROM wall_alert_rules;"
+	@$(PSQL) -P pager=off -c "SELECT COUNT(*) AS rules, COUNT(*) FILTER (WHERE enabled) AS enabled, COUNT(DISTINCT end_user) AS members, COUNT(*) FILTER (WHERE enabled AND (channels ->> 'email')::boolean) AS with_email, COUNT(*) FILTER (WHERE enabled AND touch_bp IS NOT NULL) AS custom_touch FROM wall_alert_rules;"
 	@echo "Recent errors / warnings:"
 	@sudo journalctl -u $(WALL_ALERTS_SERVICE) -n 500 --no-pager | grep -E " - (ERROR|WARNING) - " | tail -10 || echo "None"
 
 .PHONY: wall-alerts-replay
-wall-alerts-replay: ## What wall alerts a stored session would have produced, per sensitivity. SYMBOL=SPX DATE=2026-10-13 [PROFILE=balanced] [JSON=1]. Read-only
-	@if [ -z "$(SYMBOL)" ]; then echo "$(RED)Usage: make wall-alerts-replay SYMBOL=SPX [DATE=YYYY-MM-DD] [PROFILE=balanced]$(NC)"; exit 2; fi
+wall-alerts-replay: ## What wall alerts a stored session would have produced, per sensitivity. SYMBOL=SPX DATE=2026-10-13 [PROFILE=balanced] [TOUCH=0.10] [EXPLAIN=1] [JSON=1]. Read-only
+	@if [ -z "$(SYMBOL)" ]; then echo "$(RED)Usage: make wall-alerts-replay SYMBOL=SPX [DATE=YYYY-MM-DD] [PROFILE=balanced] [TOUCH=0.10] [EXPLAIN=1]$(NC)"; exit 2; fi
 	@$(PY) -m src.alerts.wall_alert_engine --replay $(SYMBOL) \
 		$(if $(DATE),--date $(DATE)) \
 		$(if $(PROFILE),--profile $(PROFILE)) \
+		$(if $(TOUCH),--touch $(TOUCH)) \
+		$(if $(EXPLAIN),--explain) \
 		$(if $(JSON),--json)
 
 .PHONY: wall-alerts-db-test

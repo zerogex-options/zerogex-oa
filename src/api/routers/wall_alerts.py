@@ -8,9 +8,9 @@ Mounted at ``/api/alerts/walls``. Three audiences:
   Every rule query is scoped to the token's end user; a rule id belonging to
   someone else is a 404, never a 403, so ids cannot be probed. The website
   gates the whole prefix at the Basic tier (``frontend/core/api/apiTierGate.ts``).
-* **Anyone**: ``/config`` — the symbols, sensitivity profiles, channels and
-  limits the form is built from, so the website never hard-codes a number the
-  detector owns.
+* **Anyone**: ``/config`` — the symbols, sensitivity profiles, touch
+  tolerances, channels and limits the form is built from, so the website
+  never hard-codes a number the detector owns.
 * **Delivery workers** (``/internal/*``): drain the email / SMS outbox and
   apply one-click unsubscribes. These carry other members' alerts, so they
   require the admin token on top of the API key (:func:`require_admin`) —
@@ -144,6 +144,25 @@ def _validate_channels(raw: Any) -> Dict[str, bool]:
     return channels
 
 
+def _validate_touch(raw: Any) -> Optional[int]:
+    """A rule's touch tolerance in basis points, or None for Auto (the noise
+    filter's own touch band). Only the offered options: each one is a detector
+    stream the service runs (src/alerts/config.py TOUCH_OPTIONS_BP)."""
+    if raw is None:
+        return None
+    options = alerts_config.TOUCH_OPTIONS_BP
+    choices = ", ".join(str(bp) for bp in options)
+    if isinstance(raw, bool):
+        raise _bad(f"touch_bp must be one of {choices}, or null for Auto")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise _bad(f"touch_bp must be one of {choices}, or null for Auto")
+    if not value.is_integer() or int(value) not in options:
+        raise _bad(f"touch_bp must be one of {choices}, or null for Auto")
+    return int(value)
+
+
 def validate_rule(body: Dict[str, Any], *, partial: bool = False) -> Dict[str, Any]:
     """Normalize a rule body; raises 422 with a member-readable reason.
 
@@ -184,6 +203,8 @@ def validate_rule(body: Dict[str, Any], *, partial: bool = False) -> Dict[str, A
         if profile not in PROFILES:
             raise _bad(f"profile must be one of {', '.join(PROFILES)}")
         out["profile"] = profile
+    if "touch_bp" in body or not partial:
+        out["touch_bp"] = _validate_touch(body.get("touch_bp"))
     if "channels" in body or not partial:
         out["channels"] = _validate_channels(body.get("channels", {"in_app": True}))
     if "enabled" in body or not partial:
@@ -205,6 +226,7 @@ def _rule_out(row: Any) -> Dict[str, Any]:
         "events": {k: bool(_json(row["events"]).get(k, False)) for k in EVENT_TYPES},
         "min_strength_pctile": int(row["min_strength_pctile"]),
         "profile": row["profile"],
+        "touch_bp": None if row["touch_bp"] is None else int(row["touch_bp"]),
         "channels": {k: bool(channels.get(k, False)) for k in alerts_config.CHANNELS},
         "enabled": bool(row["enabled"]),
         "created_at": _iso(row["created_at"]),
@@ -214,7 +236,7 @@ def _rule_out(row: Any) -> Dict[str, Any]:
 
 
 _RULE_COLUMNS = (
-    "id, underlying, side, events, min_strength_pctile, profile, channels, "
+    "id, underlying, side, events, min_strength_pctile, profile, touch_bp, channels, "
     "enabled, created_at, updated_at, last_triggered_at"
 )
 
@@ -233,6 +255,9 @@ async def wall_alert_config() -> Dict[str, Any]:
         "events": list(EVENT_TYPES),
         "profiles": [PROFILES[name].as_dict() for name in PROFILES],
         "default_profile": DEFAULT_PROFILE,
+        # Touch tolerances a rule may choose instead of its profile's own band
+        # (each profile's is its "touch_bp" above). null on a rule = Auto.
+        "touch_options_bp": list(alerts_config.TOUCH_OPTIONS_BP),
         "channels": [
             {
                 "id": name,
@@ -292,8 +317,8 @@ async def create_rule(
             f"""
             INSERT INTO wall_alert_rules
                 (end_user, underlying, side, events, min_strength_pctile, profile,
-                 channels, enabled)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8)
+                 channels, enabled, touch_bp)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8, $9)
             RETURNING {_RULE_COLUMNS}
             """,
             user,
@@ -304,6 +329,7 @@ async def create_rule(
             rule["profile"],
             json.dumps(rule["channels"]),
             rule["enabled"],
+            rule["touch_bp"],
         )
     return {"rule": _rule_out(row)}
 
@@ -325,6 +351,7 @@ async def update_rule(
         "events": ("events", "jsonb"),
         "min_strength_pctile": ("min_strength_pctile", None),
         "profile": ("profile", None),
+        "touch_bp": ("touch_bp", None),
         "channels": ("channels", "jsonb"),
         "enabled": ("enabled", None),
     }

@@ -60,6 +60,13 @@ MAX_EVENT_AGE_SECONDS: int = _getenv_int("WALL_ALERTS_MAX_EVENT_AGE_SECONDS", 15
 # arming and any open test, short enough to stay cheap.
 WARMUP_MINUTES: int = _getenv_int("WALL_ALERTS_WARMUP_MINUTES", 90, min=0, max=390)
 
+# Touch tolerances a member may choose instead of their noise filter's own
+# touch band, in basis points of the wall (1 = 0.01%). Each one runs as its own
+# detector stream beside the profiles' defaults (see wall_detector.stream_
+# profiles), so the list is also what the service computes every tick: keep it
+# short. The website reads it from /api/alerts/walls/config.
+TOUCH_OPTIONS_BP: Tuple[int, ...] = (1, 5, 10, 25)
+
 # ---------------------------------------------------------------------------
 # Member limits
 # ---------------------------------------------------------------------------

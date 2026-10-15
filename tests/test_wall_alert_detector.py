@@ -28,6 +28,8 @@ from src.alerts.wall_detector import (
     WallAlertDetector,
     WallEvent,
     WallsInForce,
+    stream_for,
+    stream_profiles,
 )
 
 SESSION = date(2026, 10, 13)  # a Tuesday
@@ -378,3 +380,148 @@ def test_event_keys_are_unique_within_a_session():
     _, events = run(tape)
     assert [e.kind for e in events] == [EVENT_HIT, EVENT_HOLD, EVENT_HIT, EVENT_HOLD]
     assert len({e.key for e in events}) == len(events)
+
+
+# --------------------------------------------------------------------------
+# Touch tolerance
+# --------------------------------------------------------------------------
+
+
+def touch(bp: int, profile: str = "balanced") -> WallAlertDetector:
+    return WallAlertDetector("SPY", PROFILES[profile].with_touch_bp(bp))
+
+
+def test_a_near_miss_inside_the_touch_band_is_a_hit():
+    """A rejection that stops cents short of the wall is a hit: the balanced
+    band on a 772 SPY call wall is 0.386, so 9 cents short is well inside."""
+    spy = WallsInForce(OPEN, 772.0, 760.0, break_buffer=0.80)
+    tape = [flat(5 + i, 769.0) for i in range(3)] + [bar(8, 771.91, 771.20, 771.40)]
+    _, events = run(tape, walls=spy)
+    assert kinds(events) == [("hit", "call", 772.0, 8)]
+    assert events[0].price == pytest.approx(771.91)
+    assert events[0].touch_band == pytest.approx(0.386)
+    assert events[0].touch_bp == 5
+
+
+def test_a_tighter_tolerance_waits_for_the_wall_and_a_wider_one_fires_sooner():
+    near_miss = approach_call(5) + [bar(8, 99.96, 99.80, 99.90)]  # 0.04 short
+    _, tight = run(near_miss, detector=touch(1))  # band 0.01
+    assert tight == []
+    _, default = run(near_miss)  # band 0.05
+    assert kinds(default) == [("hit", "call", 100.0, 8)]
+
+    early = approach_call(5) + [bar(8, 99.92, 99.80, 99.90)]  # 0.08 short
+    _, default = run(early)
+    assert default == []
+    _, wide = run(early, detector=touch(10))  # band 0.10
+    assert kinds(wide) == [("hit", "call", 100.0, 8)]
+    assert wide[0].touch_bp == 10 and wide[0].profile == "balanced"
+
+
+def test_a_wide_tolerance_never_moves_the_break_threshold():
+    """25 bp puts the touch band at 0.25, wider than the 0.20 break buffer;
+    the break must still confirm on closes past 0.20, not 0.25."""
+    tape = approach_call(5) + [bar(8, 99.80, 99.60, 99.70)]  # 0.20 short: inside 0.25
+    tape += [flat(9 + i, 100.22) for i in range(5)]  # past 0.20, short of 0.25
+    _, events = run(tape, detector=touch(25))
+    assert kinds(events) == [("hit", "call", 100.0, 8), ("break", "call", 100.0, 13)]
+    assert events[1].break_buffer == pytest.approx(0.20)
+
+
+def test_a_wide_tolerance_needs_price_further_off_to_arm():
+    """Re-arming stays at least twice the band, or a wide band would re-fire on
+    itself: 0.40 below arms the default (0.30) but not 25 bp (0.50)."""
+    hover = [flat(5 + i, 99.60) for i in range(3)] + [bar(8, 99.80, 99.60, 99.70)]
+    det = touch(25)
+    det.trace = []
+    _, events = run(hover, detector=det)
+    assert events == []
+    tests = [t.text for t in det.trace if t.text.startswith("TEST #1")]
+    assert tests and "not armed" in tests[0] and "0.50" in tests[0]
+
+
+def test_streams_cover_every_profile_and_option_once():
+    streams = stream_profiles((1, 5, 10, 25))
+    assert ("balanced", 5) in streams and streams[("balanced", 5)] is PROFILES["balanced"]
+    # Balanced's own band is 5 bp, so "Auto" and "0.05%" are one stream.
+    assert sum(1 for name, _ in streams if name == "balanced") == 4
+    assert sum(1 for name, _ in streams if name == "responsive") == 5
+    assert len(streams) == 14
+    assert stream_for("balanced", None) == ("balanced", 5)
+    assert stream_for("conservative", None) == ("conservative", 3)
+    assert stream_for("responsive", 25) == ("responsive", 25)
+    # The variant keeps everything but the band.
+    wide = streams[("conservative", 25)]
+    assert wide.confirm_minutes == PROFILES["conservative"].confirm_minutes
+    assert wide.break_floor(100.0) == pytest.approx(PROFILES["conservative"].touch_band(100.0))
+
+
+def test_state_restores_only_into_its_own_stream():
+    det, _ = run(approach_call(5), detector=touch(10))
+    state = det.to_state()
+    assert state["touch_bp"] == 10
+    assert touch(10).restore(state) is True
+    assert WallAlertDetector("SPY", PROFILES["balanced"]).restore(state) is False
+    assert touch(10).restore({**state, "version": 1}) is False
+
+
+# --------------------------------------------------------------------------
+# Explain: every decision, in words
+# --------------------------------------------------------------------------
+
+
+def explained(tape: Iterable[Bar], detector: Optional[WallAlertDetector] = None) -> List[str]:
+    det = detector or WallAlertDetector("SPY", PROFILES["balanced"])
+    det.trace = []
+    run(tape, detector=det)
+    det.flush_trace()
+    return [t.text for t in sorted(det.trace, key=lambda t: t.ts)]
+
+
+def test_explain_names_the_reason_a_hit_did_not_alert():
+    # Price opens pressed against the call wall: the wall cannot arm.
+    lines = explained([flat(i, 99.90) for i in range(3)] + [bar(3, 99.97, 99.85, 99.90)])
+    assert any(line.startswith("call wall is now 100.00") for line in lines)
+    test = next(line for line in lines if line.startswith("TEST #1"))
+    assert "no hit alert" in test and "not armed" in test
+
+
+def test_explain_reports_the_opening_grace_and_a_blocked_retest():
+    lines = explained(
+        [flat(0, 99.0), bar(1, 99.98, 99.90, 99.95)]  # inside the 3-minute opening grace
+        + [flat(2, 99.60), flat(3, 99.60)]  # back off: hold, then re-armed
+        + [bar(4, 99.98, 99.90, 99.95)]  # hit alerted
+        + [flat(5, 99.90), bar(6, 99.99, 99.90, 99.95)]  # back in while test #2 is open
+    )
+    assert any("opening grace until 09:33" in line for line in lines)
+    assert any(line.startswith("TEST #2") and "-> hit alert" in line for line in lines)
+    assert any("still open" in line for line in lines)
+
+
+def test_explain_reports_a_cooldown():
+    lines = explained(
+        approach_call(5)
+        + [bar(8, 99.98, 99.90, 99.95)]  # hit alerted
+        + [flat(9, 99.60), flat(10, 99.60)]  # held, then re-armed
+        + [bar(11, 99.98, 99.90, 99.95)]  # back 3 minutes later
+    )
+    second = next(line for line in lines if line.startswith("TEST #2"))
+    assert "cooldown: last hit alert on this wall at 09:38, 20 min between hits" in second
+
+
+def test_explain_reports_a_near_miss_outside_the_band():
+    lines = explained(approach_call(5) + [bar(8, 99.90, 99.80, 99.85), flat(9, 99.0)])
+    near = [line for line in lines if line.startswith("near miss")]
+    assert len(near) == 1
+    assert "99.90" in near[0] and "0.10 below" in near[0] and "0.05" in near[0]
+
+
+def test_tracing_never_changes_the_alerts():
+    tape = approach_call(5) + [bar(8, 99.98, 99.90, 99.95), flat(9, 99.60), flat(10, 99.60)]
+    tape += [flat(11 + i, 99.60) for i in range(20)] + [bar(31, 100.1, 99.9, 100.05)]
+    tape += [flat(32 + i, 100.3) for i in range(5)]
+    _, plain = run(tape)
+    traced = WallAlertDetector("SPY", PROFILES["balanced"])
+    traced.trace = []
+    _, with_trace = run(tape, detector=traced)
+    assert kinds(plain) == kinds(with_trace)

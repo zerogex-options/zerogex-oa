@@ -1438,8 +1438,9 @@ prefix at the Basic tier. `/internal/*` is for delivery workers and requires
 
 ### GET /api/alerts/walls/config
 What the alert form is built from: `symbols`, `sides`, `events`
-(`hit`/`break`/`hold`), `profiles` (each sensitivity's thresholds),
-`default_profile`, `channels` (`{id, available, delivery}` — SMS reads
+(`hit`/`break`/`hold`), `profiles` (each sensitivity's thresholds, including
+its own `touch_bp`), `default_profile`, `touch_options_bp` (the touch
+tolerances a rule may choose), `channels` (`{id, available, delivery}` — SMS reads
 `available: false` until it is switched on), `strength_tiers`,
 `max_strength_floor` (95), `max_rules`, `daily_cap`.
 
@@ -1457,6 +1458,7 @@ per-member limit.
   "events": {"hit": true, "break": true, "hold": false},
   "min_strength_pctile": 75,
   "profile": "balanced",
+  "touch_bp": null,
   "channels": {"in_app": true, "email": true, "sms": false},
   "enabled": true
 }
@@ -1468,6 +1470,9 @@ per-member limit.
   of day** (`gex_historical_stats`). A wall whose percentile is unknown never
   satisfies a floor above 0.
 - `profile` — `responsive`, `balanced` or `conservative` (the noise filter).
+- `touch_bp` — how close price must come to the wall for a hit, in basis
+  points of the wall: one of `touch_options_bp` (1, 5, 10, 25 = 0.01%–0.25%),
+  or `null` for Auto, the profile's own band (8 / 5 / 3 bp).
 
 ### PATCH /api/alerts/walls/rules/{rule_id}
 Partial update with the same fields. Switching a channel (or the rule) off

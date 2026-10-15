@@ -209,9 +209,30 @@ def test_a_minimal_rule_gets_the_defaults():
         "events": {"hit": True, "break": True, "hold": False},
         "min_strength_pctile": 0,
         "profile": "balanced",
+        "touch_bp": None,
         "channels": {"in_app": True, "email": False, "sms": False},
         "enabled": True,
     }
+
+
+def test_a_touch_tolerance_is_one_of_the_offered_options_or_auto():
+    rule = _validate({"symbol": "SPY", "side": "call", "touch_bp": 10})
+    assert rule["touch_bp"] == 10
+    assert _validate({"symbol": "SPY", "side": "call", "touch_bp": 25.0})["touch_bp"] == 25
+    assert _validate({"symbol": "SPY", "side": "call", "touch_bp": None})["touch_bp"] is None
+    # A PATCH can switch a rule back to Auto, and leaves it alone when absent.
+    assert _validate({"touch_bp": None}, partial=True) == {"touch_bp": None}
+    assert "touch_bp" not in _validate({"enabled": False}, partial=True)
+
+
+@pytest.mark.parametrize("raw", [3, 0, 7.5, "wide", True, -1, 101])
+def test_any_other_touch_tolerance_is_refused(raw):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as err:
+        _validate({"symbol": "SPY", "side": "call", "touch_bp": raw})
+    assert err.value.status_code == 422
+    assert "touch_bp must be one of 1, 5, 10, 25" in err.value.detail
 
 
 @pytest.mark.parametrize(
@@ -369,3 +390,9 @@ def test_config_is_served_without_a_database(app_module):
         "sms": False,
     }
     assert cfg["max_strength_floor"] == 95
+    assert cfg["touch_options_bp"] == [1, 5, 10, 25]
+    assert {p["name"]: p["touch_bp"] for p in cfg["profiles"]} == {
+        "responsive": 8,
+        "balanced": 5,
+        "conservative": 3,
+    }

@@ -20,7 +20,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from psycopg2.extras import execute_values
 
 from src.alerts import config as alerts_config
-from src.alerts.wall_detector import ET, Bar, WallEvent, WallsInForce
+from src.alerts.wall_detector import (
+    ET,
+    PROFILES,
+    Bar,
+    StreamKey,
+    WallEvent,
+    WallsInForce,
+)
 from src.alerts.wall_payload import build_payload, reportable_odds
 
 logger = logging.getLogger(__name__)
@@ -166,31 +173,31 @@ def load_odds(conn: Any, symbol: str, side: str) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def load_states(conn: Any, symbol: str, session: date) -> Dict[str, Dict[str, Any]]:
-    """Saved detector state per profile for ``symbol``, today's only."""
+def load_states(conn: Any, symbol: str, session: date) -> Dict[StreamKey, Dict[str, Any]]:
+    """Saved detector state per (profile, touch tolerance) stream, today's only."""
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT profile, state
+        SELECT profile, touch_bp, state
         FROM wall_alert_detector_state
         WHERE underlying = %s AND session_date = %s
         """,
         (symbol, session),
     )
-    out: Dict[str, Dict[str, Any]] = {}
-    for profile, state in cur.fetchall():
+    out: Dict[StreamKey, Dict[str, Any]] = {}
+    for profile, touch_bp, state in cur.fetchall():
         if isinstance(state, str):
             try:
                 state = json.loads(state)
             except ValueError:
                 continue
         if isinstance(state, dict):
-            out[str(profile)] = state
+            out[(str(profile), int(touch_bp))] = state
     return out
 
 
 def save_states(
-    conn: Any, symbol: str, session: date, states: Mapping[str, Dict[str, Any]]
+    conn: Any, symbol: str, session: date, states: Mapping[StreamKey, Dict[str, Any]]
 ) -> None:
     if not states:
         return
@@ -198,18 +205,19 @@ def save_states(
     execute_values(
         cur,
         """
-        INSERT INTO wall_alert_detector_state (underlying, profile, session_date, state, updated_at)
+        INSERT INTO wall_alert_detector_state
+            (underlying, profile, touch_bp, session_date, state, updated_at)
         VALUES %s
-        ON CONFLICT (underlying, profile) DO UPDATE SET
+        ON CONFLICT (underlying, profile, touch_bp) DO UPDATE SET
             session_date = EXCLUDED.session_date,
             state = EXCLUDED.state,
             updated_at = EXCLUDED.updated_at
         """,
         [
-            (symbol, profile, session, json.dumps(state), datetime.now(tz=ET))
-            for profile, state in states.items()
+            (symbol, profile, int(touch_bp), session, json.dumps(state), datetime.now(tz=ET))
+            for (profile, touch_bp), state in states.items()
         ],
-        template="(%s, %s, %s, %s::jsonb, %s)",
+        template="(%s, %s, %s, %s, %s::jsonb, %s)",
     )
 
 
@@ -312,9 +320,9 @@ def record_and_fan_out(
     cur.execute(
         """
         INSERT INTO wall_alert_events
-            (underlying, session_date, profile, side, event_type, wall_strike,
+            (underlying, session_date, profile, touch_bp, side, event_type, wall_strike,
              test_ordinal, bar_ts, price, strength, strength_pctile, payload, detected_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
         ON CONFLICT ON CONSTRAINT wall_alert_events_uq DO NOTHING
         RETURNING id
         """,
@@ -322,6 +330,7 @@ def record_and_fan_out(
             event.symbol,
             event.session_date,
             event.profile,
+            event.touch_bp,
             event.side,
             event.kind,
             event.wall,
@@ -340,6 +349,8 @@ def record_and_fan_out(
     event_id = int(row[0])
     result = FanOutResult(event_id=event_id)
 
+    # The rules listening to this event's stream: same profile, and a touch
+    # tolerance that resolves to the stream's (Auto = the profile's own band).
     cur.execute(
         """
         SELECT id, end_user, channels, min_strength_pctile
@@ -347,11 +358,19 @@ def record_and_fan_out(
         WHERE enabled
           AND underlying = %s
           AND profile = %s
+          AND COALESCE(touch_bp, %s) = %s
           AND side IN (%s, 'both')
           AND COALESCE((events ->> %s)::boolean, false)
         ORDER BY id
         """,
-        (event.symbol, event.profile, event.side, event.kind),
+        (
+            event.symbol,
+            event.profile,
+            PROFILES[event.profile].touch_bp,
+            event.touch_bp,
+            event.side,
+            event.kind,
+        ),
     )
     rules = cur.fetchall()
     result.rules_matched = len(rules)

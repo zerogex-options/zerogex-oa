@@ -3806,9 +3806,13 @@ END $$;
 --                              delivery); email / sms rows are born 'queued' and
 --                              a worker drains them through
 --                              /api/alerts/walls/internal/*.
---   wall_alert_detector_state  per-(symbol, profile) detector state, so a
+--   wall_alert_detector_state  per-(symbol, stream) detector state, so a
 --                              restart mid-session neither drops an open test
 --                              nor re-alerts a hit.
+--
+-- A stream is a sensitivity profile at one touch tolerance (touch_bp, basis
+-- points of the wall): each profile at its own band, plus each tolerance a
+-- member may choose instead (src/alerts/config.py TOUCH_OPTIONS_BP).
 
 CREATE TABLE IF NOT EXISTS wall_alert_rules (
     id                  BIGSERIAL    PRIMARY KEY,
@@ -3825,6 +3829,9 @@ CREATE TABLE IF NOT EXISTS wall_alert_rules (
     min_strength_pctile SMALLINT     NOT NULL DEFAULT 0,
     -- Sensitivity profile: src/alerts/wall_detector.py PROFILES.
     profile             VARCHAR(16)  NOT NULL DEFAULT 'balanced',
+    -- Touch tolerance in basis points of the wall (how close price must come
+    -- for a hit), or NULL for Auto: the profile's own touch band.
+    touch_bp            SMALLINT,
     -- {"in_app": bool, "email": bool, "sms": bool}; see src/alerts/config.py CHANNELS.
     channels            JSONB        NOT NULL DEFAULT '{"in_app": true}'::jsonb,
     enabled             BOOLEAN      NOT NULL DEFAULT TRUE,
@@ -3834,7 +3841,8 @@ CREATE TABLE IF NOT EXISTS wall_alert_rules (
     CONSTRAINT wall_alert_rules_side_chk CHECK (side IN ('call', 'put', 'both')),
     CONSTRAINT wall_alert_rules_pctile_chk CHECK (min_strength_pctile BETWEEN 0 AND 100),
     CONSTRAINT wall_alert_rules_profile_chk
-        CHECK (profile IN ('responsive', 'balanced', 'conservative'))
+        CHECK (profile IN ('responsive', 'balanced', 'conservative')),
+    CONSTRAINT wall_alert_rules_touch_chk CHECK (touch_bp IS NULL OR touch_bp BETWEEN 1 AND 100)
 );
 
 CREATE INDEX IF NOT EXISTS idx_wall_alert_rules_user
@@ -3848,6 +3856,9 @@ CREATE TABLE IF NOT EXISTS wall_alert_events (
     underlying       VARCHAR(10)      NOT NULL,
     session_date     DATE             NOT NULL,
     profile          VARCHAR(16)      NOT NULL,
+    -- The stream's touch tolerance in basis points. 0 on rows written before
+    -- touch tolerances existed (each was its profile's own band).
+    touch_bp         SMALLINT         NOT NULL DEFAULT 0,
     side             VARCHAR(8)       NOT NULL,
     -- 'hit' | 'break' | 'hold'
     event_type       VARCHAR(8)       NOT NULL,
@@ -3864,7 +3875,8 @@ CREATE TABLE IF NOT EXISTS wall_alert_events (
     payload          JSONB            NOT NULL,
     detected_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
     CONSTRAINT wall_alert_events_uq
-        UNIQUE (underlying, session_date, profile, side, wall_strike, test_ordinal, event_type)
+        UNIQUE (underlying, session_date, profile, touch_bp, side, wall_strike, test_ordinal,
+                event_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_wall_alert_events_symbol_detected
@@ -3906,11 +3918,57 @@ CREATE INDEX IF NOT EXISTS idx_wall_alert_deliveries_event
 CREATE TABLE IF NOT EXISTS wall_alert_detector_state (
     underlying    VARCHAR(10)  NOT NULL,
     profile       VARCHAR(16)  NOT NULL,
+    touch_bp      SMALLINT     NOT NULL DEFAULT 0,
     session_date  DATE         NOT NULL,
     state         JSONB        NOT NULL,
     -- Rewritten whenever the state changes, which during the session is at
     -- least once a minute: a stale updated_at mid-session means the service
     -- is not running.
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (underlying, profile)
+    PRIMARY KEY (underlying, profile, touch_bp)
 );
+
+-- Touch tolerances (2026-10): installs created before them get the column on
+-- each table and the stream in the keys. Apply BEFORE restarting the service
+-- and the API, or rule writes and event inserts fail against the old shape.
+ALTER TABLE wall_alert_rules ADD COLUMN IF NOT EXISTS touch_bp SMALLINT;
+ALTER TABLE wall_alert_events ADD COLUMN IF NOT EXISTS touch_bp SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE wall_alert_detector_state
+    ADD COLUMN IF NOT EXISTS touch_bp SMALLINT NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'wall_alert_rules_touch_chk') THEN
+        ALTER TABLE wall_alert_rules
+            ADD CONSTRAINT wall_alert_rules_touch_chk
+            CHECK (touch_bp IS NULL OR touch_bp BETWEEN 1 AND 100);
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wall_alert_events_uq'
+          AND conrelid = 'wall_alert_events'::regclass
+          AND array_length(conkey, 1) = 7
+    ) THEN
+        ALTER TABLE wall_alert_events DROP CONSTRAINT wall_alert_events_uq;
+        ALTER TABLE wall_alert_events
+            ADD CONSTRAINT wall_alert_events_uq
+            UNIQUE (underlying, session_date, profile, touch_bp, side, wall_strike, test_ordinal,
+                    event_type);
+    END IF;
+
+    -- A pre-tolerance state row cannot be resumed by a stream detector (its
+    -- version and key differ), so drop those with the old key; the service
+    -- warms its streams up from the tape instead.
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wall_alert_detector_state_pkey'
+          AND conrelid = 'wall_alert_detector_state'::regclass
+          AND array_length(conkey, 1) = 2
+    ) THEN
+        DELETE FROM wall_alert_detector_state WHERE touch_bp = 0;
+        ALTER TABLE wall_alert_detector_state DROP CONSTRAINT wall_alert_detector_state_pkey;
+        ALTER TABLE wall_alert_detector_state
+            ADD CONSTRAINT wall_alert_detector_state_pkey
+            PRIMARY KEY (underlying, profile, touch_bp);
+    END IF;
+END $$;

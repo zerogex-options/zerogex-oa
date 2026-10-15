@@ -101,6 +101,9 @@ def build_payload(
         "approach_number": event.approach_number,
         "alerted_hit": event.alerted_hit,
         "profile": event.profile,
+        # The touch tolerance this alert's stream ran at, in basis points: the
+        # profile's own band, or the one the member chose.
+        "touch_bp": event.touch_bp,
         "touch_band": event.touch_band,
         "break_buffer": event.break_buffer,
         "hold_distance": event.hold_distance,
