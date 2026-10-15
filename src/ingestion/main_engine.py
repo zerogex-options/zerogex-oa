@@ -201,6 +201,45 @@ OPTION_ROW_NUMERIC_BOUNDS: Dict[str, float] = {
 }
 
 
+def _row_numeric_offences(row: Dict[str, Any]) -> List[Tuple[str, float, float]]:
+    """``(column, value, bound)`` for each value in one row that cannot fit.
+
+    Shared by the diagnostic and by the write path's quarantine, so the rows
+    the log names are exactly the rows the write drops. A row with no offences
+    is one this module believes Postgres will accept.
+
+    The skip rules matter as much as the check. An unreadable value or a NaN
+    is a DIFFERENT fault, with a different Postgres message, so neither is
+    reported here and neither is quarantined -- dropping them would turn a
+    loud unknown failure into a silent one.
+    """
+    offences: List[Tuple[str, float, float]] = []
+    for column, bound in OPTION_ROW_NUMERIC_BOUNDS.items():
+        raw = row.get(column)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value != value:  # NaN never overflows; it fails differently
+            continue
+        if abs(value) >= bound:
+            offences.append((column, value, bound))
+    return offences
+
+
+#: How much of a batch may be dropped to get the rest of it written.
+#:
+#: A handful of absurd greeks on expiring contracts is the case this exists
+#: for. Thousands of them is not that case -- it is a unit error, a bad
+#: migration or a feed fault, and discarding it quietly would destroy real
+#: data and hide the cause. Above these limits the write fails as it did
+#: before, loudly, with the rows retained.
+_OVERFLOW_QUARANTINE_MAX_ROWS: int = 25
+_OVERFLOW_QUARANTINE_MAX_SHARE: float = 0.01
+
+
 def _numeric_overflow_offenders(
     rows: Sequence[Dict[str, Any]], limit: int = 10
 ) -> List[Tuple[str, str, float, float]]:
@@ -218,18 +257,8 @@ def _numeric_overflow_offenders(
     offenders: List[Tuple[str, str, float, float]] = []
     for row in rows:
         symbol = str(row.get("option_symbol", "?"))
-        for column, bound in OPTION_ROW_NUMERIC_BOUNDS.items():
-            raw = row.get(column)
-            if raw is None:
-                continue
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if value != value:  # NaN never overflows; it fails differently
-                continue
-            if abs(value) >= bound:
-                offenders.append((symbol, column, value, bound))
+        for column, value, bound in _row_numeric_offences(row):
+            offenders.append((symbol, column, value, bound))
     # Worst first by how far past the bound, so a truncated list still carries
     # the row most likely to be the cause.
     offenders.sort(key=lambda o: abs(o[2]) / o[3], reverse=True)
@@ -2413,6 +2442,13 @@ class IngestionEngine:
                         logger.debug("API-call window flush skipped: %s", flush_err)
 
         except Exception as e:
+            # Before counting a failure: if a few rows carry values no NUMERIC
+            # column can hold, drop those and write the rest. Deliberately
+            # ahead of the breaker -- a salvaged write is not an outage, and
+            # tripping the breaker here would skip the next flush too.
+            if self._quarantine_numeric_overflow(e, rows):
+                return
+
             self._db_consecutive_failures += 1
             self.errors_count += 1
             backoff = _compute_db_backoff_seconds(self._db_consecutive_failures)
@@ -2452,6 +2488,95 @@ class IngestionEngine:
                 exc_info=True,
             )
             self._log_numeric_overflow_detail(e, rows)
+
+    def _quarantine_numeric_overflow(
+        self, error: BaseException, rows: List[Dict[str, Any]]
+    ) -> bool:
+        """Drop the rows Postgres cannot store, write the rest, report True.
+
+        Without this, one out-of-bounds value stops writing the WHOLE table.
+        ``execute_values`` sends the batch as one statement, and the history
+        and ``option_chains_latest`` upserts share one transaction, so the bad
+        row rolls back every good row beside it; then
+        ``_retain_failed_option_rows`` puts the bad row into the pending
+        buffer and the next flush re-sends it. That is a poison pill, not a
+        retry: on 2026-10-14 it held NDX down for the last nine minutes of the
+        session, and only the 20,000-row cap could ever have evicted it -- the
+        buffer reached 14,281.
+
+        So the fix is not to guess which column overflows. It is to stop one
+        row taking the batch with it. Whatever the column turns out to be, the
+        loss becomes one contract for one minute instead of every contract
+        until restart.
+
+        Returns False, leaving the caller's normal failure handling to run, on
+        anything it is not sure about: a different error, no identifiable
+        offender (the bounds table can fall behind schema.sql), nothing left
+        to write, too much of the batch, or a second overflow inside its own
+        retry. Never raises -- a salvage attempt must not become a new failure
+        on top of the one it is salvaging.
+        """
+        try:
+            if getattr(self, "_in_overflow_quarantine", False):
+                return False  # the retry overflowed too; fail normally
+            if "numeric field overflow" not in str(error).lower():
+                return False
+            if not rows:
+                return False
+
+            kept: List[Dict[str, Any]] = []
+            offending: List[Dict[str, Any]] = []
+            for row in rows:
+                (offending if _row_numeric_offences(row) else kept).append(row)
+
+            if not offending:
+                return False  # bounds table stale; the detail log says so
+            if not kept:
+                return False  # nothing to salvage, so nothing to gain
+
+            allowed = max(
+                _OVERFLOW_QUARANTINE_MAX_ROWS,
+                int(len(rows) * _OVERFLOW_QUARANTINE_MAX_SHARE),
+            )
+            if len(offending) > allowed:
+                logger.error(
+                    "[CIRCUIT-BREAKER] numeric field overflow in %d of %d rows, "
+                    "over the %d this write may drop. NOT quarantining: that "
+                    "many is a systemic fault, not a stray greek. Failing the "
+                    "batch and retaining it.",
+                    len(offending),
+                    len(rows),
+                    allowed,
+                )
+                return False
+
+            self._log_numeric_overflow_detail(error, offending)
+            quarantined_before = getattr(self, "_overflow_quarantined_rows", 0)
+            self._overflow_quarantined_rows = quarantined_before + len(offending)
+            logger.error(
+                "[CIRCUIT-BREAKER] Quarantining %d of %d rows that Postgres "
+                "cannot store, and writing the remaining %d. Those contracts "
+                "have no row for this bucket; every other contract persists. "
+                "%d row(s) quarantined since start. Contracts: %s",
+                len(offending),
+                len(rows),
+                len(kept),
+                self._overflow_quarantined_rows,
+                ", ".join(str(r.get("option_symbol", "?")) for r in offending[:10]),
+            )
+
+            self._in_overflow_quarantine = True
+            try:
+                # The real write path, so the kept rows get the same upsert,
+                # the same accounting and -- if THIS fails -- the same
+                # retain-and-back-off they would have had.
+                self._write_option_rows(kept)
+            finally:
+                self._in_overflow_quarantine = False
+            return True
+        except Exception:  # pragma: no cover - salvage never raises
+            logger.debug("overflow quarantine failed", exc_info=True)
+            return False
 
     def _log_numeric_overflow_detail(
         self, error: BaseException, rows: Sequence[Dict[str, Any]]
