@@ -76,20 +76,27 @@ assuming the same of the licensing.
 All five must hold. Any one failing moves the date; none of them is a judgement
 call.
 
-1. **Wednesday's rehearsal wrote NDX rows from ThetaData.** Not "the probe
-   passed" — rows in `option_chains` for NDX in `zerogex_shadow`, through the
-   full path: symbol resolution, the `$NDXP.X` alias, strike selection, flow
-   accumulation, the DB write.
+0. **The NDX write overflow is identified and fixed.** ADDED 2026-10-14 and the
+   hardest of these. NDX stopped persisting nine minutes before the close with
+   "numeric field overflow", and every retry failed the same way (F16). NDX
+   expires daily, so in production this recurs at the end of every expiry day —
+   silently, in the part of the session its flow matters most. **Do not cut over
+   with this open.**
+1. ~~**Wednesday's rehearsal wrote NDX rows from ThetaData.**~~ **MET
+   2026-10-14** — 547,453 rows, 2,444 contracts, 8 expirations, through the full
+   path. The pipeline works; see gate 0 for what it then did.
 2. **Friday's OPEX rehearsal completed** and its coverage is intact: 390
    buckets per symbol, production-only and rehearsal-only near zero.
 3. **No regression on the three settled symbols.** SPY, QQQ and SPX land inside
    the band already recorded for them. A single day carries about ±8 points on
    share-of-flipped-flow (F15), so only a move well outside that is a signal.
 4. **NDX's own number is a decision you have made, not one you are discovering
-   on Monday.** F12 put it at 29.1% of session imbalance flipped, worst of the
-   four, and judged it not shippable on the tick test. Wednesday and Friday give
-   it two more readings. If it stays that bad, cutting over ships it anyway,
-   because the switch is all-or-nothing.
+   on Monday.** **Now settled, and settled badly**: two independent readings,
+   29.1% on 2026-10-09 and 27.8% on 2026-10-14, agreeing to 1.3 points against a
+   ±8-point single-day band (F16). It is not noise. The switch is all-or-nothing,
+   so cutting over publishes NDX at that figure. The one lever anyone had in mind
+   — the staleness guard — is refuted as NDX's fix (F17), so there is nothing
+   left to try before Monday. **This is a decision, not a measurement.**
 5. **Production healthy through both rehearsals**: `make
    ingestion-freshness-healthcheck` returning 0, no concurrent-stream cap
    warnings.

@@ -768,6 +768,23 @@ two things at once teaches nothing. **This is a hypothesis with an obvious
 test, not a measured cause**, and it must not be written up as the latter
 until a session with the guard on is compared against one with it off.
 
+> **REFUTED 2026-10-14. See F17.** The test was never needed: the data already
+> in the rehearsal database settles it. Zero-tick volume is **1.1% of NDX's
+> traded volume** against SPY's 14.5%, so at a 300-second threshold the guard
+> would reroute about 60 contracts out of NDX's 88,793 — 0.067% of its session
+> volume, against a symbol flipping 28% of its flow. And the carry ages run the
+> other way: NDX's p90 is 180 seconds, SPY's is 1,080.
+>
+> The reasoning above slid from one fact to a different one. NDX contracts do
+> trade rarely. But a zero tick needs a REPEATED PRICE, and NDX options are
+> high-priced and wide-ticked, so consecutive trades almost never land on the
+> same price. Rarity of trading and rarity of a repeated price are not the same
+> thing.
+>
+> NDX's cause is open again. F17 records what the data suggests instead, as a
+> hypothesis, and the lesson: measure the mechanism's footprint before building
+> the fix.
+
 ### What this does not cover
 
 One day, no OPEX. The published SIGNAL was not compared — `shadow-run` runs
@@ -1233,6 +1250,223 @@ not make one session into many.
 
 ---
 
+## F16 — NDX ingests end to end, is confirmed not shippable, and breaks the write
+
+*Added 2026-10-14. Rehearsal 1 of 2 before the cutover. ThetaData + tick, all
+four symbols, against production.*
+
+### NDX ingests, which is what this session was for
+
+NDX had never written a row from ThetaData: its entitlement was off for the
+whole rehearsal programme and was only restored on 2026-10-13 (F13). A probe
+proves data is reachable; it does not prove symbol resolution, the `$NDXP.X`
+alias, strike selection, flow accumulation and the DB write.
+
+| | rehearsal (ThetaData) | production (TradeStation) |
+|---|---|---|
+| rows | 547,453 | 559,613 |
+| contracts | 2,444 | 2,386 |
+| expirations | 8 | 8 |
+| open-interest coverage | 48.4% | 49.0% |
+
+The pipeline works. The row shortfall is the nine minutes it lost at the end —
+see below, that is its own finding.
+
+### NDX's second tick-test reading agrees with its first
+
+| | sign agreement | share of flow flipped |
+|---|---|---|
+| Fri 2026-10-09, TradeStation + tick | 63.8% | 29.1% |
+| Wed 2026-10-14, ThetaData + tick | **63.3%** | **27.8%** |
+| difference | −0.5pp | −1.3pp |
+
+Different days, different feeds, agreeing to 1.3 points. F15 put the noise band
+on a single day's share-of-flipped-flow at about ±8 points, so this is not two
+noisy readings that happen to be close — it is the same number twice.
+
+**NDX genuinely flips sign on roughly 28% of its published flow under the tick
+test.** F12's "not shippable" judgement is confirmed rather than merely
+repeated, and it is now a decision rather than an open question:
+`MARKET_DATA_PROVIDER` is deployment-wide, so a cutover ships NDX at that
+figure whatever is decided about it.
+
+### The full session, all four symbols
+
+Coverage 1,551 of 1,560 buckets. The 9 production-only buckets are NDX's lost
+minutes; rehearsal-only is zero.
+
+| symbol | buckets | sign agrees | flips near0 / typ / large | share of flow flipped |
+|---|---|---|---|---|
+| SPY | 390 | 74.4% | 41 / 43 / 16 | 17.0% |
+| QQQ | 390 | 73.3% | 41 / 42 / 21 | 19.1% |
+| SPX | 390 | 70.0% | 46 / 41 / 30 | 23.8% |
+| **NDX** | **381** | **63.3%** | 49 / 49 / **42** | **27.8%** |
+
+All-symbol 70.3% / 19.0%. The ordering is the same as every prior session, and
+the stability by symbol is worth recording: across the readings taken so far
+SPY spans 7.9 points and QQQ 6.0, while SPX spans 2.9 and NDX 1.3. **The two
+worst symbols are also the two steadiest.** Their figures are not bad luck.
+
+VIX moved 15.17 to 16.94 on the day, against Monday's 15.11 to 15.54 — a much
+more volatile session than the days it is being compared with, which is a live
+alternative explanation for any difference and is why the per-symbol stability
+above carries more weight than the all-symbol number.
+
+### The write that fails: NDX stops persisting at 15:50
+
+```
+15:51:05  [CIRCUIT-BREAKER] DB write failed (2747 rows, 1440 unique symbols,
+          underlyings=['NDX'], attempt #1): numeric field overflow
+...
+15:59:42  [CIRCUIT-BREAKER] DB write failed (14281 rows, 1486 unique symbols,
+          underlyings=['NDX'], attempt #5): numeric field overflow
+```
+
+Every retry resubmitted the same poisoned batch and failed identically, so NDX
+persisted nothing for the last nine minutes of the session while the retained
+buffer grew from 2,747 rows to 14,281. Production, on TradeStation, wrote NDX
+to 15:59 without trouble. NDX's underlying bars show the same shape: 383 of 390
+RTH minutes.
+
+**This is a cutover blocker.** NDX expires daily and the end of the session is
+when its flow matters most, so in production this would recur, silently, every
+expiry day.
+
+Postgres's message names no column, no row and no value, and the handler logged
+only that. A diagnostic now logs psycopg2's `diag.message_detail` — which
+carries the precision and scale refused — and scans the retained batch against
+the declared bounds of all twelve constrained NUMERIC columns an option row
+writes, naming the contract, the field and the value.
+
+**Hypothesis, not a finding.** `theta` is `NUMERIC(10,6)`, so per-day theta must
+stay under 10,000. For an at-the-money option minutes from expiry on a
+30,000-point index it runs to hundreds, and with one of the 250%-plus solved
+IVs already on this record it clears 10,000. SPY never approaches it, which is
+consistent with this surfacing only once NDX was ingesting. The next session
+will name the column; until it does this is reasoning, not evidence.
+
+### SPX option volume runs 5.0% higher on ThetaData, twice
+
+| | rehearsal | production | difference |
+|---|---|---|---|
+| SPX, 2026-10-12 full session | 2,961,720 | 2,821,582 | **+4.97%** |
+| SPX, 2026-10-14 full session | 5,163,130 | 4,917,997 | **+4.98%** |
+| SPY, 2026-10-14 | 12,826,992 | 12,833,038 | −0.05% |
+| QQQ, 2026-10-14 | 8,507,476 | 8,516,930 | −0.11% |
+
+Two full sessions, the same figure to two decimal places, SPX alone. ThetaData
+also sees more SPX contracts trading (1,516 against 1,482). That reads like
+ThetaData capturing tape TradeStation misses rather than inflating anything,
+but the direction cannot be established without a third source.
+
+It matters because volume is the base of the flow calculation, so an SPX volume
+difference propagates into SPX's published flow — and SPX is the symbol whose
+feed evidence is weakest, having been left out of F15's same-day arm to stay
+clear of the stream cap. Raise with ThetaData.
+
+### What this does not cover
+
+One session. No OPEX. The overflow is diagnosed but not identified.
+
+---
+
+## F17 — the staleness guard is the wrong lever for NDX, and F12's cause is refuted
+
+*Added 2026-10-14. Written while preparing a session to test
+`FLOW_TICK_MAX_CARRY_SECONDS`, which is now not worth spending a session on.*
+
+### What F12 proposed
+
+F12 offered a cause for NDX's figures, carefully labelled a hypothesis: NDX
+contracts print rarely and in size, so a zero tick inherits a direction set
+minutes ago, and on a high-premium contract one inherited call moves a lot of
+imbalance. `FLOW_TICK_MAX_CARRY_SECONDS` was built to expire that carry. It
+defaults to 0 and had never been exercised.
+
+F12 said it "must not be written up as a measured cause until a session with
+the guard on is compared against one with it off." It does not need that
+session. The data already in the rehearsal database settles it.
+
+### First: the guard could not have fired
+
+Driven through the accumulator for the first time, at 0, 60 and 120 seconds a
+chunk arriving **ten minutes** after the last price change produced identical
+output — 1,100 contracts to ask every time, never mid.
+
+`last` is the last TRADED price and it persists in every later snapshot, so a
+contract that has not traded since 10:00 still reports one at 15:00. The
+accumulator stamped `last_trade_ts` on every snapshot carrying a positive
+`last`, so the carry always looked about one poll old and no threshold could
+ever be exceeded. Fixed: the stamp now moves only when the price moves.
+
+Recorded because of what it nearly cost. The planned session would have run
+with the guard on, shown no change, and been read as "the guard does not help
+NDX" — a negative result from an inert feature, which is worse than no result.
+
+### Then: measured against the data, the guard cannot matter for NDX
+
+The guard touches exactly one case: a zero tick, where a chunk trades at an
+unchanged price. Measured over the 2026-10-14 session in `zerogex_shadow`:
+
+| | zero-tick volume | as a share of the symbol's traded volume |
+|---|---|---|
+| **NDX** | 978 contracts | **1.1%** |
+| SPY | 1,858,609 contracts | **14.5%** |
+
+**NDX has almost no zero-tick volume at all.** At a 300-second threshold the
+guard would reroute 6.1% of that 978 — about **60 contracts out of NDX's
+88,793**, 0.067% of its session volume. Against a symbol flipping 28% of its
+flow, that is a rounding error, not a small effect.
+
+### And the hypothesis runs backwards
+
+| carry age at a zero tick | NDX | SPY |
+|---|---|---|
+| p50 | 60s | 120s |
+| p90 | **180s** | **1,080s** |
+
+**SPY's carried directions are six times staler than NDX's at p90.** The
+hypothesis predicted the opposite.
+
+The mechanism is visible once stated: NDX options are high-priced and
+wide-ticked, so consecutive trades rarely land on exactly the same price and a
+zero tick is rare. SPY's options are penny-wide and cheap, so repeated prints
+at one price are routine. Rarity of TRADING and rarity of a REPEATED PRICE are
+different things, and F12 reasoned from the first to the second.
+
+The measurement is conservative in the right direction. `option_chains` holds
+one-minute buckets, so intra-minute price moves are invisible and zero ticks
+are **overstated**. At runtime the accumulator sees every snapshot and would
+find fewer still.
+
+### What this means
+
+**The guard is not NDX's answer, and no session should be spent testing it as
+one.** It stays in the codebase: it was genuinely broken, a feature that
+silently does nothing is worse than one that is absent, and on the measurement
+above it is SPY — not NDX — where it could ever reach enough volume to matter.
+That is a question for after the cutover, not before it.
+
+**NDX's cause is now open again.** The shape of the data suggests thinness
+rather than staleness: NDX traded 88,793 contracts across 1,075 contract
+symbols on 2026-10-14, roughly 83 contracts per symbol across a whole session.
+The tick test gets one price comparison per one-minute bucket, and for NDX a
+bucket is often a single trade. There may simply not be enough sequence in
+NDX's tape for a tick test to read — which, if true, is not fixable by any
+threshold and would make NDX a product decision rather than a tuning problem.
+**That is a hypothesis too, and it is recorded as one.**
+
+### The lesson worth keeping
+
+F12's hypothesis was reasonable, specific, and labelled as a hypothesis — and
+it was still wrong, in a way one query against data already on disk could have
+shown at any point in the six days since. The guard was built, shipped, carried
+through four findings and nearly given a market session before anyone asked
+whether the thing it acts on was actually present in the symbol it was built
+for. **Measure the mechanism's footprint before building the fix**, not after.
+
+---
+
 ## Findings that turned out not to be about the feed
 
 Recorded because each cost investigation time and each looked like a vendor problem first.
@@ -1367,6 +1601,31 @@ afterwards and append the result here rather than holding the cutover for it.
   was not required**: the pre-restart probe already passed, so entitlements are evaluated
   server-side per request. Probe before restarting next time; a restart kills the single
   MDDS session and would end a rehearsal mid-day.
+- **The NDX write overflow (F16) — OPEN, and a CUTOVER BLOCKER.** NDX stopped
+  persisting at 15:50 on 2026-10-14 with "numeric field overflow" and every retry
+  failed identically, losing nine minutes while the buffer grew to 14,281 rows.
+  Production on TradeStation was unaffected. NDX expires daily, so in production
+  this would recur silently at the end of every expiry day. A diagnostic now names
+  the column, the contract and the value; the next session with NDX running will
+  identify it. `theta` at NUMERIC(10,6) is the leading candidate and is reasoning,
+  not evidence.
+- **SPX option volume reads +5.0% on ThetaData (F16) — OPEN.** Two full sessions,
+  +4.97% and +4.98%, SPX alone; SPY and QQQ agree within 0.11%. ThetaData also
+  sees more SPX contracts trading. Volume is the base of the flow calculation, and
+  SPX is the symbol with the weakest feed evidence, having been left out of F15's
+  same-day arm. Raise with ThetaData.
+- **FLOW_TICK_MAX_CARRY_SECONDS — NOT the fix for NDX (F17), and do not spend a
+  session testing it as one.** Zero-tick volume is 1.1% of NDX's traded volume
+  against SPY's 14.5%, so the guard would move about 60 of NDX's 88,793 contracts.
+  Carry ages run backwards from F12's hypothesis too: NDX p90 180s, SPY p90
+  1,080s. The guard was also inert until 2026-10-14 — it aged the observation time
+  rather than the last price change — and that is fixed. It stays, defaulted off.
+  If it is ever worth measuring it is on SPY, after the cutover.
+- **NDX's actual cause is open again (F17).** The data suggests thinness rather
+  than staleness: 88,793 contracts across 1,075 symbols, roughly 83 per symbol per
+  session, with one price comparison per one-minute bucket. If NDX's tape simply
+  has too little sequence for a tick test, no threshold fixes it and NDX becomes a
+  product decision. Hypothesis, recorded as one.
 - **NDX on the tick test — STILL OPEN, and now re-measurable.** F12 put it at 63.8% sign
   agreement and 29.1% of session imbalance flipped, the worst of the four, and judged it not
   shippable. That rests on a single day, and F15 established that a single day carries about
