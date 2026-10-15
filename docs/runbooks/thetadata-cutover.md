@@ -73,8 +73,8 @@ assuming the same of the licensing.
 
 ## Go / no-go, checked the Friday before
 
-All five must hold. Any one failing moves the date; none of them is a judgement
-call.
+All six must hold — gate 0 was added on 2026-10-14, after the list was first
+written. Any one failing moves the date; none of them is a judgement call.
 
 0. **The NDX write overflow is identified and fixed.** ADDED 2026-10-14 and the
    hardest of these. NDX stopped persisting nine minutes before the close with
@@ -116,14 +116,20 @@ make shadow-status SHADOW_DB=zerogex_shadow_ts     # both must read 0
 cp .env ~/.env.pre-thetadata-$(date +%F)
 grep -E "^(MARKET_DATA_PROVIDER|FLOW_CLASSIFIER|VOLATILITY_INDEX_PROVIDER)=" .env
 
-# 3. make the change (edit by hand, two lines)
+# 3. ONLY IF the gate 0 fix widened a column: apply the schema change FIRST
+#    make schema-apply
+#    Schema changes are applied by hand and must land BEFORE the services
+#    restart. The other way round, writes fail against the old column — which
+#    is the failure this fix exists to stop.
+
+# 4. make the change (edit by hand, two lines)
 #    MARKET_DATA_PROVIDER=thetadata_mv
 #    FLOW_CLASSIFIER=tick
 
-# 4. read it back BEFORE restarting anything
+# 5. read it back BEFORE restarting anything
 grep -E "^(MARKET_DATA_PROVIDER|FLOW_CLASSIFIER|VOLATILITY_INDEX_PROVIDER)=" .env
 
-# 5. restart, one service at a time, health-checked between each
+# 6. restart, one service at a time, health-checked between each
 make services-restart
 ```
 
