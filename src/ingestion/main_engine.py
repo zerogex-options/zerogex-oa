@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import multiprocessing
 from multiprocessing import Process
 from datetime import datetime, date as _date, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Sequence, Tuple
 from collections import defaultdict
 import pytz
 from psycopg2.extras import execute_values
@@ -171,6 +171,69 @@ def _tick_carry_age_seconds(acc: "_FlowAccumulator", snap: Dict[str, Any]) -> Op
         # guard that abstains.
         return None
     return max((now - prior).total_seconds(), 0.0)
+
+
+#: Declared precision/scale of every constrained NUMERIC column an option row
+#: writes, from setup/database/schema.sql. A value overflows when its absolute
+#: value reaches 10^(precision - scale), so these bounds are exactly what
+#: Postgres enforces -- NUMERIC(10,6) refuses anything at or above 10^4.
+#:
+#: Here because "numeric field overflow" names no column and no row. On
+#: 2026-10-14 an NDX batch on ThetaData hit it at 15:51 and every retry failed
+#: on the same poisoned row, so NDX stopped persisting for the last nine
+#: minutes of the session while the buffer grew from 2,747 rows to 14,281. The
+#: message alone could not say which of eleven numeric columns, which contract,
+#: or what value -- and an expiry-day greek on a 30,000-point index is a
+#: perfectly ordinary thing to blow a bound that SPY never approaches.
+OPTION_ROW_NUMERIC_BOUNDS: Dict[str, float] = {
+    "strike": 1e8,  # NUMERIC(12, 4)
+    "last": 1e8,
+    "bid": 1e8,
+    "ask": 1e8,
+    "mid": 1e8,
+    "implied_volatility": 1e2,  # NUMERIC(8, 6)
+    "delta": 1e2,
+    "gamma": 1e2,  # NUMERIC(10, 8)
+    "theta": 1e4,  # NUMERIC(10, 6)
+    "vega": 1e4,
+    "charm": 1e8,  # NUMERIC(16, 8)
+    "vanna": 1e8,
+}
+
+
+def _numeric_overflow_offenders(
+    rows: Sequence[Dict[str, Any]], limit: int = 10
+) -> List[Tuple[str, str, float, float]]:
+    """Rows carrying a value too large for its NUMERIC column.
+
+    Returns ``(option_symbol, column, value, bound)``, worst first, so the log
+    names the contract and the field rather than leaving eleven candidates.
+
+    Diagnostic only: it never raises and never alters the write. A value it
+    cannot read as a float is skipped rather than reported, because a
+    non-numeric in a numeric column is a different fault with a different
+    Postgres message, and guessing at it here would send the next reader after
+    the wrong thing.
+    """
+    offenders: List[Tuple[str, str, float, float]] = []
+    for row in rows:
+        symbol = str(row.get("option_symbol", "?"))
+        for column, bound in OPTION_ROW_NUMERIC_BOUNDS.items():
+            raw = row.get(column)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value != value:  # NaN never overflows; it fails differently
+                continue
+            if abs(value) >= bound:
+                offenders.append((symbol, column, value, bound))
+    # Worst first by how far past the bound, so a truncated list still carries
+    # the row most likely to be the cause.
+    offenders.sort(key=lambda o: abs(o[2]) / o[3], reverse=True)
+    return offenders[:limit]
 
 
 def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
@@ -1800,16 +1863,27 @@ class IngestionEngine:
             acc.last_mid = (acc.last_bid + acc.last_ask) / 2.0
         if quote_seen and snap.get("timestamp") is not None:
             acc.last_quote_ts = snap.get("timestamp")
-        # Advance the tick test's prior trade on EVERY snapshot, not only
-        # ones that classified. A contract whose volume did not move can
+        # Advance the tick test's prior trade PRICE on EVERY snapshot, not
+        # only ones that classified. A contract whose volume did not move can
         # still print a new last between polls, and the harness that
         # measured this method advances its state before every early skip
         # for the same reason -- a tick sequence with a hole in it carries
         # the wrong direction forward from there on.
+        #
+        # The TIMESTAMP is different, and conflating the two made
+        # FLOW_TICK_MAX_CARRY_SECONDS inert. `last` is the last TRADED price
+        # and it persists in every later snapshot, so a contract that has not
+        # traded for an hour still reports one. Stamping the observation time
+        # on each of those made the carry look one poll old forever, and the
+        # guard -- whose whole job is to notice a direction set minutes ago --
+        # could never fire at any threshold. Stamp the moment the price
+        # MOVED, so the age measures how long the carried direction has stood
+        # unconfirmed, which is what "stale" means here.
         snap_last = _to_db_float(snap.get("last"))
         if snap_last is not None and snap_last > 0:
+            if acc.last_trade_price is None or snap_last != acc.last_trade_price:
+                acc.last_trade_ts = snap.get("timestamp")
             acc.last_trade_price = snap_last
-            acc.last_trade_ts = snap.get("timestamp")
 
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False
@@ -2377,6 +2451,52 @@ class IngestionEngine:
                 ts_max,
                 exc_info=True,
             )
+            self._log_numeric_overflow_detail(e, rows)
+
+    def _log_numeric_overflow_detail(
+        self, error: BaseException, rows: Sequence[Dict[str, Any]]
+    ) -> None:
+        """Name the column and the contract behind a numeric field overflow.
+
+        Postgres reports "numeric field overflow" with no column and no row;
+        psycopg2 carries the precision and scale in ``diag.message_detail``,
+        and the offending value is in the batch we still hold. Logging both
+        turns a batch that retries forever into a named contract and field.
+
+        Diagnostic only, and deliberately total: anything that goes wrong in
+        here is swallowed, because a failure to EXPLAIN a write failure must
+        never become a second failure on top of it.
+        """
+        try:
+            if "numeric field overflow" not in str(error).lower():
+                return
+            detail = getattr(getattr(error, "diag", None), "message_detail", None)
+            offenders = _numeric_overflow_offenders(rows)
+            if not offenders:
+                # The bounds table is derived from schema.sql by hand, so it
+                # can fall behind a migration. Say so rather than implying the
+                # batch was clean.
+                logger.error(
+                    "[CIRCUIT-BREAKER] numeric field overflow, but no value in "
+                    "the batch exceeds OPTION_ROW_NUMERIC_BOUNDS. Postgres "
+                    "detail: %s. Either the bounds table is stale against "
+                    "schema.sql, or the overflow is in a column it does not "
+                    "cover.",
+                    detail or "(none)",
+                )
+                return
+            logger.error(
+                "[CIRCUIT-BREAKER] numeric field overflow — offending values "
+                "(worst first, max %d). Postgres detail: %s\n%s",
+                len(offenders),
+                detail or "(none)",
+                "\n".join(
+                    f"    {symbol}  {column}={value!r}  (column bound |v| < {bound:g})"
+                    for symbol, column, value, bound in offenders
+                ),
+            )
+        except Exception:  # pragma: no cover - diagnostics never raise
+            logger.debug("overflow diagnostic failed", exc_info=True)
 
     def _flush_option_bucket(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False

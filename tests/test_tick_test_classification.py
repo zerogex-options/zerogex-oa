@@ -13,11 +13,24 @@ whether the tick test is genuinely feed-insensitive.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+import threading
+from datetime import date, datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
+import pytz
 
-from src.ingestion.main_engine import IngestionEngine
+from src.ingestion import main_engine
+from src.ingestion.main_engine import IngestionEngine, _FlowAccumulator
+
+ET = pytz.timezone("US/Eastern")
+
+
+def _engine() -> IngestionEngine:
+    """A bare engine: these tests drive the accumulator, not a live session."""
+    return IngestionEngine.__new__(IngestionEngine)
+
+
 from src.ingestion.providers.base import OptionQuote
 from src.tools.feed_compare import FeedSample, compare_tick_test, new_tick_state
 
@@ -216,3 +229,206 @@ def test_an_unmatched_contract_is_counted_not_skipped():
     out = compare_tick_test(inc, cand, state)
     assert out["contracts_unmatched"] == 1
     assert out["contracts_compared"] == 0
+
+
+# --- FLOW_TICK_MAX_CARRY_SECONDS, end to end -------------------------------
+#
+# The guard was built on 2026-10-09 for F12's NDX hypothesis: a contract that
+# prints rarely credits a whole chunk to a direction set minutes ago. It was
+# never exercised through the accumulator, only as a parameter handed straight
+# to the classifier -- and through the accumulator it could not fire AT ALL.
+#
+# `last` is the last TRADED price and it persists in every later snapshot, so a
+# contract that has not traded since 10:00 still reports one at 15:00. The
+# accumulator stamped the observation time on each of those, so the carry
+# always looked one poll old and no threshold could ever be exceeded. A session
+# run with the guard on would have shown no change and been read as "the guard
+# does not help NDX".
+#
+# These drive the real path: an uptick, a long quiet stretch of unchanged
+# prices, then a large zero-tick chunk.
+
+
+def _quiet_then_big_chunk(carry_seconds: float) -> _FlowAccumulator:
+    """Uptick, ten minutes of unchanged price, then 1,000 contracts."""
+    engine = _engine()
+    engine._option_flow = {}
+    engine._option_flow_lock = threading.Lock()
+    bucket = ET.localize(datetime(2026, 10, 14, 10, 0))
+    acc = _FlowAccumulator(
+        session_date=date(2026, 10, 14),
+        last_volume_cum=0,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=0,
+    )
+    t0 = ET.localize(datetime(2026, 10, 14, 10, 0, 0))
+    quote = {"bid": 10.9, "ask": 11.1, "mid": 11.0}
+    with (
+        patch.object(main_engine, "FLOW_CLASSIFIER", "tick"),
+        patch.object(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", carry_seconds),
+    ):
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 100, "last": 10.0, "bid": 9.9, "ask": 10.1, "mid": 10.0, "timestamp": t0},
+            bucket,
+        )
+        # Uptick -> buyer-initiated, direction carried from here.
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 200, "last": 11.0, **quote, "timestamp": t0 + timedelta(seconds=5)},
+            bucket,
+        )
+        # Ten minutes of polls at an unchanged price and unchanged volume.
+        t = t0 + timedelta(seconds=5)
+        for _ in range(120):
+            t += timedelta(seconds=5)
+            engine._ingest_snapshot_into_accumulator(
+                acc,
+                {"volume": 200, "last": 11.0, **quote, "timestamp": t},
+                bucket,
+            )
+        # A big zero-tick chunk, ten minutes after the price last moved.
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 1200, "last": 11.0, **quote, "timestamp": t + timedelta(seconds=5)},
+            bucket,
+        )
+    return acc
+
+
+def test_the_guard_fires_through_the_accumulator():
+    """A chunk ten minutes past the last price change must route to mid."""
+    acc = _quiet_then_big_chunk(60.0)
+    assert acc.mid_cum == 1100, (
+        "the stale chunk inherited its direction instead of routing to mid; "
+        "FLOW_TICK_MAX_CARRY_SECONDS is not reaching the classifier"
+    )
+    assert acc.ask_cum == 100  # only the original uptick
+
+
+def test_disabled_is_the_behaviour_measured_on_2026_10_09():
+    """0 means carry forever -- the configuration F12 and F16 were measured on."""
+    acc = _quiet_then_big_chunk(0.0)
+    assert acc.ask_cum == 1100
+    assert acc.mid_cum == 100
+
+
+def test_the_timestamp_tracks_the_last_PRICE_CHANGE_not_the_last_observation():
+    """The bug, pinned directly.
+
+    `last` persists between trades, so stamping every snapshot that carries one
+    made the carry permanently one poll old and the guard unreachable.
+    """
+    engine = _engine()
+    engine._option_flow = {}
+    engine._option_flow_lock = threading.Lock()
+    bucket = ET.localize(datetime(2026, 10, 14, 10, 0))
+    acc = _FlowAccumulator(
+        session_date=date(2026, 10, 14),
+        last_volume_cum=0,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=0,
+    )
+    t0 = ET.localize(datetime(2026, 10, 14, 10, 0, 0))
+    quote = {"bid": 10.9, "ask": 11.1, "mid": 11.0}
+    with patch.object(main_engine, "FLOW_CLASSIFIER", "tick"):
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 100, "last": 11.0, **quote, "timestamp": t0},
+            bucket,
+        )
+        assert acc.last_trade_ts == t0
+        # Same price, five minutes later: the stamp must NOT move.
+        later = t0 + timedelta(minutes=5)
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 100, "last": 11.0, **quote, "timestamp": later},
+            bucket,
+        )
+        assert acc.last_trade_ts == t0, "an unchanged price refreshed the carry age"
+        # A NEW price does move it.
+        moved = t0 + timedelta(minutes=6)
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 150, "last": 11.5, **quote, "timestamp": moved},
+            bucket,
+        )
+        assert acc.last_trade_ts == moved
+        assert acc.last_trade_price == 11.5
+
+
+def test_a_prompt_zero_tick_still_inherits():
+    """The guard must not punish a contract that is simply trading flat."""
+    engine = _engine()
+    engine._option_flow = {}
+    engine._option_flow_lock = threading.Lock()
+    bucket = ET.localize(datetime(2026, 10, 14, 10, 0))
+    acc = _FlowAccumulator(
+        session_date=date(2026, 10, 14),
+        last_volume_cum=0,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=0,
+    )
+    t0 = ET.localize(datetime(2026, 10, 14, 10, 0, 0))
+    quote = {"bid": 10.9, "ask": 11.1, "mid": 11.0}
+    with (
+        patch.object(main_engine, "FLOW_CLASSIFIER", "tick"),
+        patch.object(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", 60.0),
+    ):
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 100, "last": 10.0, "bid": 9.9, "ask": 10.1, "mid": 10.0, "timestamp": t0},
+            bucket,
+        )
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 200, "last": 11.0, **quote, "timestamp": t0 + timedelta(seconds=5)},
+            bucket,
+        )
+        # Zero tick five seconds later -- well inside the window.
+        engine._ingest_snapshot_into_accumulator(
+            acc,
+            {"volume": 300, "last": 11.0, **quote, "timestamp": t0 + timedelta(seconds=10)},
+            bucket,
+        )
+    # 100 to mid (first chunk, no prior trade to compare against), 100 to ask
+    # on the uptick, and the prompt zero tick INHERITS that direction for
+    # another 100 -- which is the behaviour the guard must not disturb.
+    assert acc.ask_cum == 200, "a prompt zero tick was wrongly treated as stale"
+    assert acc.mid_cum == 100
+
+
+def test_the_threshold_boundary_is_exclusive():
+    """An age exactly equal to the threshold is NOT yet stale.
+
+    Pinned because it is the one part of the guard no behavioural test reaches:
+    both sides look identical in a session, and a silent flip to `>=` would
+    change which chunks route to mid at the margin with nothing to catch it.
+    """
+    engine = _engine()
+    with patch.object(main_engine, "FLOW_TICK_MAX_CARRY_SECONDS", 60.0):
+        at_the_boundary = engine._classify_volume_chunk_tick(
+            100,
+            last=11.0,
+            prev_last=11.0,
+            prev_direction=1,
+            prev_trade_age_seconds=60.0,
+        )
+        assert at_the_boundary == (
+            100,
+            0,
+            0,
+            1,
+        ), "an age equal to the threshold was treated as stale"
+
+        just_past = engine._classify_volume_chunk_tick(
+            100,
+            last=11.0,
+            prev_last=11.0,
+            prev_direction=1,
+            prev_trade_age_seconds=60.000001,
+        )
+        assert just_past == (0, 100, 0, 1), "an age past the threshold still inherited"
