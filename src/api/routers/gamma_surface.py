@@ -15,10 +15,10 @@ shared across expiration selections for ``_BOOK_TTL_SECONDS``, so switching the
 filter re-prices instead of re-reading the chain, and a response is cached only
 until the snapshot behind it turns that old.
 
-The Call/Put Walls are deliberately NOT in this payload. The chart reads them
-from the same sources every other chart uses for the same selection
-(/api/gex/summary for all, the strike-profile-timeseries bucket for a subset),
-so the ceiling and floor it draws can never disagree with the walls beside it.
+The Call/Put Walls and the Gamma Flip are deliberately NOT in this payload.
+The chart reads them from the same sources every other chart uses for the same
+selection (/api/gex/summary for all, the strike-profile-timeseries bucket for a
+subset), so the levels it draws can never disagree with the ones beside it.
 """
 
 from __future__ import annotations
