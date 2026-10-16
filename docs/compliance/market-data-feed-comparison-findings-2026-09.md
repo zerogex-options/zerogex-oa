@@ -223,9 +223,22 @@ so it inherits the derived characterisation. ThetaData confirmed by email that N
 Market Value, meaning no separate Nasdaq GIDS exchange fee falls to us under §3.1. Priced at
 +$250/month for months 1–6 and +$500/month for 7–12 (Exhibit B: $1,250 / $2,500).
 
-**Still to verify:** VIX and VXN sit inside the existing CGIF coverage. Asked three times, never
-answered. VXN is the one to check — a Cboe-published index on a Nasdaq underlying is exactly the
-shape that produced this finding.
+**ANSWERED 2026-10-16**, on the fourth ask. ThetaData, by email, on Exhibit A: *"VIX and VXN are
+included in your Market Value index coverage under the executed agreement, so index values for both
+are covered as things stand and there is nothing separate to license or pay for."*
+
+Quoted rather than paraphrased, because they answered a slightly different question than the one
+asked. The worry was whether VXN falls outside Exhibit A's **Cboe CGIF** line, VXN being a
+Cboe-published index on a Nasdaq underlying — the exact shape that produced this finding. They did
+not address that taxonomy. They said both index values sit inside the agreement's **Indices –
+Market Value** coverage, which is the same characterisation NDX was moved to above. That answers
+what actually matters — licensed, nothing further to pay — without settling which line of Exhibit A
+carries them. Do not write it up as "CGIF covers VXN"; that is not what they said. The email is the
+artifact: keep it with the agreement.
+
+Scope checked against what is actually ingested, because "index values" is narrower than "VIX":
+`src/ingestion/volatility_index_ingester.py` whitelists `vix_bars` and `vxn_bars` and nothing else,
+and no VIX option chain is ingested anywhere. The coverage they describe matches our use exactly.
 
 ---
 
@@ -1728,11 +1741,13 @@ afterwards and append the result here rather than holding the cutover for it.
   record they said they had set. Their correction is confirmed by their own client. To re-check,
   grep any run's output for `isProfessional`; no tooling is needed and none should be added
   (the removed probe failed because the fields are not client ATTRIBUTES, only log content).
-- **VIX / VXN CGIF coverage** — resolved 2026-09-28 for the operational question, not the
-  contractual one. A pre-open probe returned a live VIX at 08:44:46 ET agreeing with the incumbent
-  to within a penny while VIX was moving, so extended hours are served and no per-feed override is
-  needed. Whether VIX and VXN sit inside the existing CGIF coverage contractually is still
-  unanswered (F5).
+- **VIX / VXN coverage** — **RESOLVED, both halves.** Operationally, 2026-09-28: a pre-open probe
+  returned a live VIX at 08:44:46 ET agreeing with the incumbent to within a penny while VIX was
+  moving, so extended hours are served and no per-feed override is needed; measured again over a
+  full session on 2026-10-15 with `off_grid = 0` on both indices. Contractually, 2026-10-16:
+  ThetaData confirmed by email that both are inside the agreement's Market Value index coverage
+  with nothing separate to license or pay for — see F5 for their exact wording and for why it is
+  not the same statement as "CGIF covers VXN".
 - **F4's Exhibit A gap** — accepted; correspondence is the record.
 - **Signal components whose gates the ingested chain cannot reach.** Two turned up by accident
   during this comparison, so all six basic signals, all six registered MSI components and the three

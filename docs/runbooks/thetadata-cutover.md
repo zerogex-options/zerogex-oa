@@ -201,19 +201,24 @@ to subscribers is a separate decision that does not depend on the cutover date.
 
 ## Open before Monday
 
-**VIX / VXN CGIF coverage, contractually.** Operationally they are fine on
-ThetaData and no override is needed — MEASURED 2026-10-15, not assumed. The
-rehearsal's `vix_bars` / `vxn_bars` carried `off_grid = 0` on both indices,
-which is the thing that could have broken: Market Value sends a mark every few
-seconds and the ingester has to fold each one into its 5-minute bucket, and a
-single off-grid row would mean it was instead filling the table one row per
-poll. 77 RTH bars against production's 78 and 77, and closes agreeing to
-within three cents (VIX 16.33–17.98 against 16.35–17.96; VXN 22.88–25.10
-against 22.89–25.07) — penny randomization, nothing more. So what is left here
-is only the contract, not the pipe. Whether they sit inside the existing CGIF
-coverage in the executed agreement is still unanswered, and the whole point of
-this migration is to retire redistribution exposure rather than relocate it.
-Leaving them pinned to TradeStation with `VOLATILITY_INDEX_PROVIDER=tradestation`
-keeps that exposure where it is today; moving them without an answer takes it
-somewhere unanswered. **This needs an answer from ThetaData and has vendor lead
-time** — ask now, not Monday.
+**Nothing.** This section held one item for three weeks and it closed on
+2026-10-16. Kept rather than deleted, because what was open and how it closed is
+the part worth re-reading if the cutover is ever questioned.
+
+**VIX / VXN — CLOSED on both halves.**
+
+*Operationally*, measured 2026-10-15 rather than assumed. The rehearsal's
+`vix_bars` / `vxn_bars` carried `off_grid = 0` on both indices, which is the
+thing that could have broken: Market Value sends a mark every few seconds and
+the ingester has to fold each one into its 5-minute bucket, and a single
+off-grid row would mean it was instead filling the table one row per poll. 77
+RTH bars against production's 78 and 77, closes agreeing to within three cents.
+No `VOLATILITY_INDEX_PROVIDER` override is needed.
+
+*Contractually*, answered 2026-10-16: ThetaData confirmed by email that VIX and
+VXN index values are both inside the agreement's Market Value index coverage,
+with nothing separate to license or pay for. That removes the one reason this
+migration might have relocated redistribution exposure rather than retiring it.
+Their exact wording, and why it is not interchangeable with "CGIF covers VXN",
+is in F5 of the findings — the distinction is worth preserving even though the
+practical answer is yes.
