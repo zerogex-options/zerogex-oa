@@ -1860,3 +1860,101 @@ Before the cutover both served real numbers, so Monday is the first day the
 two disagree. `src/api/routers/replay.py` already defends with
 `if ... is not None else 0`; whether the API should be uniform is a call worth
 making on purpose.
+
+## F19 — monthly OPEX is a different regime for NDX, and only for NDX
+
+*Added 2026-10-16, the third and last rehearsal before the cutover. This is the
+session the OPEX gate existed to produce, and it produced a finding rather than
+a confirmation.*
+
+### The reading
+
+| symbol | sign agrees | flips near0 / typ / large | share of flow flipped |
+|---|---|---|---|
+| SPY | 71.5% | 49 / 42 / 20 | 19.2% |
+| QQQ | 76.4% | 37 / 32 / 23 | 16.8% |
+| SPX | 72.1% | 40 / 45 / 24 | 24.1% |
+| **NDX** | **58.5%** | 57 / 60 / **45** | **45.0%** |
+
+Full session, 390 buckets each, coverage intact on all four. NDX persisted to
+15:59 on both arms; no write failure and no quarantine line (see below).
+
+### NDX is outside its band, and it is not close
+
+| session | | share of flow flipped |
+|---|---|---|
+| Fri 2026-10-09 | weekly expiry | 29.1% |
+| Wed 2026-10-14 | ordinary | 27.8% |
+| Thu 2026-10-15 | ordinary | 22.2% |
+| **Fri 2026-10-16** | **monthly OPEX** | **45.0%** |
+
+The three ordinary readings mean 26.4% and span 22.2–29.1%. OPEX is **+15.9
+points above the highest of them** and **+18.6 above their mean**, against the
+±8-point single-day band F15 established. This is not noise and it is not the
+band being wide. It is a different regime.
+
+Sign agreement fell to 58.5%, its lowest of any session, and the **large**
+flip count — buckets where the sign change is a different claim about the
+session, not a rounding of "balanced" — rose to 45, also its highest.
+
+### The other three symbols are fine, which is what makes this NDX's finding
+
+| symbol | OPEX | ordinary range | verdict |
+|---|---|---|---|
+| SPY | 19.2% | 13.7–17.0% | +2.2 over, inside ±8 |
+| QQQ | 16.8% | 13.1–19.3% | inside the range entirely |
+| SPX | 24.1% | 20.7–23.8% | +0.3 over, inside ±8 |
+
+So monthly expiration did not degrade the tick test generally. It degraded it
+on the one symbol whose contracts already print rarely and in size — which is
+the same mechanism as every prior NDX finding, concentrated by a day that
+retires a large block of contracts at the open.
+
+### What this does NOT support
+
+**A weekly-Friday effect.** 2026-10-09 was a weekly expiry and read 29.1%
+against 27.8% on an ordinary Wednesday. That difference is nothing. Four
+readings do not separate "Fridays are worse" from "monthly OPEX is worse", and
+only the monthly reading is an outlier. Do not plan around a Friday effect that
+has not been measured.
+
+**A revised ordinary-day figure.** NDX on an ordinary session is still 22–29%.
+Today changes what is known about roughly twelve sessions a year, not about the
+other two hundred and forty.
+
+### One reading, and OPEX's own variance is unmeasured
+
+The ±8 band comes from ordinary days. Nothing here says what the spread of
+monthly-OPEX readings is, because there is exactly one. 45.0% could be the
+centre of that regime or the tail of it. The next monthly expiration is
+2026-11-20.
+
+### The write failure did not fire, on the heaviest day of the month
+
+Gate 0's original test — identify the value — is now refuted twice over. The
+overflow appeared once, on 2026-10-14, and did not recur on 10-15 or on OPEX
+itself with the full diagnostic deployed. The quarantine fix (F16, amended) ran
+its first live session today and was never invoked, which is the correct outcome
+for a safety net but leaves the triggering value unnamed. It stays unnamed.
+Gate 0 is met by containment, not diagnosis, and that was the right call: had
+the date depended on reproducing it, the cutover would have moved for a fault
+that does not reliably recur.
+
+### Side readings
+
+SPX option volume ran **+2.58%** higher on ThetaData, the fourth consecutive
+session in the same direction but the smallest gap yet (prior: +4.97%, +4.98%,
++4.53%). NDX −0.97%, QQQ −0.10%, SPY −0.09%.
+
+Contract coverage inverted from 10-15: today the rehearsal saw FEWER contracts
+than production on the indices (NDX 2,340 vs 2,526; SPX 1,648 vs 1,872) where
+yesterday it saw more. Traded share was nonetheless HIGHER in the rehearsal
+(NDX 42.4% vs 40.3%; SPX 85.0% vs 75.3%) and volumes agree to within 2.6%, so
+the difference is again in strikes that did not trade. It does not move flow,
+in either direction.
+
+`shadow-compare`'s `vix_bars` block printed no rows for either database again,
+as it did on 10-15, and again a direct re-run is what shows the data. The
+VIX/VXN path itself is verified (F5, measured 10-15); this is an intermittent
+fault in the comparison tool, not in the feed. Worth fixing after the cutover,
+not before.
