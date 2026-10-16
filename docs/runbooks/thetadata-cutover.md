@@ -76,6 +76,15 @@ assuming the same of the licensing.
 All six must hold — gate 0 was added on 2026-10-14, after the list was first
 written. Any one failing moves the date; none of them is a judgement call.
 
+**CHECKED 2026-10-16 after the OPEX rehearsal. All six met. The cutover is a
+go for Monday 2026-10-19** — with one finding that does not block it and must
+not be forgotten either: on monthly expiration NDX flips 45.0% of its flow,
+far outside its ordinary 22–29% band (F19). Monday is not an expiration-cluster
+day, so Monday publishes NDX in its ordinary range. What to do about the dozen
+monthly-OPEX sessions a year is a PRODUCT decision with five weeks on it — the
+next monthly expiration is 2026-11-20 — not a reason to keep paying two
+vendors.
+
 0. **The NDX write overflow cannot silently void a symbol's session.** ADDED
    2026-10-14, REFRAMED 2026-10-15. As written this asked for the overflow to be
    "identified and fixed", and that turned out to be the wrong test: the 10-15
@@ -93,21 +102,30 @@ written. Any one failing moves the date; none of them is a judgement call.
 1. ~~**Wednesday's rehearsal wrote NDX rows from ThetaData.**~~ **MET
    2026-10-14** — 547,453 rows, 2,444 contracts, 8 expirations, through the full
    path. The pipeline works; see gate 0 for what it then did.
-2. **Friday's OPEX rehearsal completed** and its coverage is intact: 390
-   buckets per symbol, production-only and rehearsal-only near zero.
-3. **No regression on the three settled symbols.** SPY, QQQ and SPX land inside
-   the band already recorded for them. A single day carries about ±8 points on
-   share-of-flipped-flow (F15), so only a move well outside that is a signal.
+2. ~~**Friday's OPEX rehearsal completed** and its coverage is intact.~~ **MET
+   2026-10-16** — 390 buckets on all four symbols, NDX persisting to 15:59 on
+   both arms, no write failure and no quarantine invoked.
+3. ~~**No regression on the three settled symbols.**~~ **MET 2026-10-16**, and
+   this is the result that localises F19. On OPEX, SPY read 19.2% against an
+   ordinary 13.7–17.0%, QQQ 16.8% inside 13.1–19.3%, SPX 24.1% against
+   20.7–23.8% — all inside the ±8-point single-day band (F15). Monthly
+   expiration did not degrade the tick test generally. It degraded it on NDX.
 4. **NDX's own number is a decision you have made, not one you are discovering
-   on Monday.** **Now settled, and settled badly**: two independent readings,
-   29.1% on 2026-10-09 and 27.8% on 2026-10-14, agreeing to 1.3 points against a
-   ±8-point single-day band (F16). It is not noise. The switch is all-or-nothing,
-   so cutting over publishes NDX at that figure. The one lever anyone had in mind
-   — the staleness guard — is refuted as NDX's fix (F17), so there is nothing
-   left to try before Monday. **This is a decision, not a measurement.**
-5. **Production healthy through both rehearsals**: `make
-   ingestion-freshness-healthcheck` returning 0, no concurrent-stream cap
-   warnings.
+   on Monday.** Four readings now, and they split into two regimes (F19):
+   **ordinary sessions 22.2–29.1%**, mean 26.4% — 29.1% on 2026-10-09, 27.8% on
+   10-14, 22.2% on 10-15 — and **monthly OPEX 45.0%**, measured once, on 10-16.
+   The switch is all-or-nothing, so cutting over publishes NDX at whichever
+   regime the day is in. The one lever anyone had in mind — the staleness guard
+   — is refuted as NDX's fix (F17), so there is nothing left to try, on either
+   regime. **This is a decision, not a measurement**, and it is now two
+   decisions: publishing NDX at ~26% on ordinary days, which was always the
+   question, and publishing it at ~45% on roughly twelve sessions a year, which
+   is new as of 10-16. The first is settled by proceeding. The second has until
+   2026-11-20 and is a product question — suppress NDX flow on monthly
+   expiration, label it, or publish it — not a cutover question.
+5. ~~**Production healthy through the rehearsals**~~ **MET** — 12 of 12 streams
+   fresh with zero outside their window on 2026-10-14, 10-15 and 10-16, and no
+   concurrent-stream cap, budget or session errors in any rehearsal log.
 
 ## Monday 19 October, before 09:30 ET
 
