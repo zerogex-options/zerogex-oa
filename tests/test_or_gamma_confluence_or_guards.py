@@ -8,6 +8,11 @@ range as his primary setting, which is how the assumptions surfaced.
 so every session was skipped and a 1-minute sweep returned an empty sample
 rather than an answer. Loud, but only once somebody ran it.
 
+Then ``min(2, minutes)`` broke the other end. At 60 minutes two bars is 3% of
+the window, so a session whose feed started late built its range from the
+last few minutes of the hour and passed. The derivation is now a coverage
+fraction (``MIN_OR_COVERAGE``), which means the same thing at every length.
+
 ``min_or_width_bp`` was a fixed 2.0, and the number was right for one reason
 nobody had written down: a ladder step is ``extension_step * R``, so a step
 narrower than the touch band makes adjacent rungs indistinguishable, and
@@ -15,9 +20,9 @@ narrower than the touch band makes adjacent rungs indistinguishable, and
 ``touch_tolerance_bp`` out to 5 bp -- kept a 2 bp floor where it needed 10,
 and measured rungs it could not tell apart. That one is silent.
 
-These tests pin the fix in both directions: the defaults must not move (the
-fingerprint is a run's identity), and the guards must now track the parameters
-they depend on.
+These tests pin the guards to the parameters they depend on. The width floor
+still resolves to its old value; ``min_or_bars`` deliberately does not, so the
+fingerprints of runs built before 2026-10 differ from a rebuild today.
 """
 
 from __future__ import annotations
@@ -49,18 +54,18 @@ def _tz(cfg: ResearchConfig):
 # --- the defaults must not move ------------------------------------------
 
 
-def test_the_shipped_defaults_resolve_to_the_values_they_replaced():
-    """These were hard-coded 2 and 2.0. A run's identity is its config
-    fingerprint, so a derived default that landed anywhere else would orphan
-    every cached dataset."""
+def test_the_shipped_defaults_resolve_to_the_values_pinned_here():
+    """The width floor is still the old hard-coded 2.0. ``min_or_bars`` moved
+    from 2 to 4 at five minutes when it became a coverage fraction, on
+    purpose: 2 of 60 bars passed a session with no first hour at all."""
     cfg = ResearchConfig()
-    assert cfg.min_or_bars == 2
+    assert cfg.min_or_bars == 4
     assert cfg.min_or_width_bp == 2.0
 
 
 def test_deriving_a_default_does_not_change_the_fingerprint():
     derived = ResearchConfig()
-    explicit = ResearchConfig(min_or_bars=2, min_or_width_bp=2.0)
+    explicit = ResearchConfig(min_or_bars=4, min_or_width_bp=2.0)
     assert derived.fingerprint() == explicit.fingerprint()
 
 
@@ -76,10 +81,32 @@ def test_a_zero_touch_band_does_not_dissolve_the_width_floor():
 
 @pytest.mark.parametrize(
     "minutes,expected",
-    [(1, 1), (2, 2), (5, 2), (15, 2), (30, 2)],
+    [(1, 1), (2, 2), (5, 4), (15, 12), (30, 24), (60, 48)],
 )
 def test_min_or_bars_never_exceeds_the_window_it_measures(minutes, expected):
     assert ResearchConfig(opening_range_minutes=minutes).min_or_bars == expected
+
+
+def test_a_sixty_minute_range_from_the_last_few_minutes_of_the_hour_is_refused():
+    """The 60-minute failure the coverage rule exists for: a feed that starts
+    at 10:20 holds ten bars of the hour. ``min(2, minutes)`` accepted that as a
+    60-minute opening range, a fraction of the real hour's width."""
+    cfg = ResearchConfig(opening_range_minutes=60)
+    late = [
+        Bar(b.ts + timedelta(minutes=50), b.open, b.high, b.low, b.close)
+        for b in _bars(10, 29600.0, 29500.0, _tz(cfg))
+    ]
+    orange, reason = build_opening_range(late, SESSION, "NQ", cfg)
+    assert orange is None
+    assert reason == "or_bars_below_min_48"
+
+
+def test_a_sixty_minute_range_with_a_few_missing_minutes_still_builds():
+    cfg = ResearchConfig(opening_range_minutes=60)
+    bars = [b for i, b in enumerate(_bars(60, 29600.0, 29500.0, _tz(cfg))) if i % 6]
+    assert len(bars) == 50
+    orange, reason = build_opening_range(bars, SESSION, "NQ", cfg)
+    assert reason is None and orange is not None and orange.n_bars == 50
 
 
 def test_a_one_minute_opening_range_actually_builds():

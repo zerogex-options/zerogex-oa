@@ -46,6 +46,9 @@ from research.or_gamma_confluence.events import (
 
 __all__ = [
     "MIN_REPORTABLE_N",
+    "MIN_TESTABLE_SESSIONS",
+    "NAMED_RUNGS",
+    "on_rung",
     "Cohort",
     "build_cohorts",
     "summarize",
@@ -62,6 +65,43 @@ __all__ = [
 #: suppression threshold — a null with n=14 is still worth printing, provided
 #: nobody mistakes it for a measurement.
 MIN_REPORTABLE_N = 30
+
+#: Fewest distinct calendar sessions a cohort must span before it is TESTED,
+#: i.e. before it gets a bootstrap interval and a p-value.
+#:
+#: The session-block bootstrap needs clusters to resample.  A cohort that lives
+#: in one or two sessions either appears in a resample or does not, so its
+#: bootstrap distribution collapses onto a single value and the p-value comes
+#: out at its floor: on synthetic data a two-touch, one-day cohort scored
+#: p=0.001 and survived Benjamini-Hochberg.  At a 60-minute range, where the
+#: deep and broken-ladder cohorts are a handful of touches, that is the normal
+#: case, not an edge case.  Below this (or below ``MIN_REPORTABLE_N``
+#: touches) the point estimate is still printed; the test is not run, and the
+#: cohort is left out of the multiplicity family rather than entering it with
+#: a p-value that means nothing.
+MIN_TESTABLE_SESSIONS = 10
+
+
+#: The rungs the customer's chart marks, in units of R beyond the range:
+#: -100%, -150% and -200% of the range width (and their mirrors above).  His
+#: follow-up said "the extremes for the 30 and 60 minutes can be juicy", so
+#: these are reported row by row rather than folded into a depth band, where
+#: 1.0R and 1.5R would share "1-2R" with each other and 2.0R would share
+#: "2-3R" with 2.5R.
+NAMED_RUNGS: tuple[float, ...] = (1.0, 1.5, 2.0)
+
+
+def on_rung(row: Mapping[str, Any], k: float, side: Optional[str] = None) -> bool:
+    """Is this touch exactly at ``|k|`` R, optionally on one ``side``?
+
+    Exact match on the stored multiple (the ladder writes ``i * step`` rounded
+    to 1e-10, so 1.5 is 1.5).  A step that does not land on ``k`` -- 1.5 on a
+    1.0R ladder -- simply matches nothing, and the report says so.
+    """
+    value = row.get("extension_k")
+    if value is None or abs(abs(float(value)) - k) > 1e-9:
+        return False
+    return side is None or row.get("side") == side
 
 
 def confluence_count(row: Mapping[str, Any], distance: float, *, kinds: bool = False) -> int:
@@ -122,6 +162,10 @@ class Cohort:
     label: str
     predicate: Callable[[Mapping[str, Any]], bool]
     description: str = ""
+    #: True when membership reads price fields only, so the same predicate
+    #: selects from the surrogate rows of :mod:`.null` and the cohort has a
+    #: measured mechanical null of its own.
+    price_only: bool = False
 
     def select(self, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
         return [r for r in rows if self.predicate(r)]
@@ -145,6 +189,7 @@ def build_cohorts(
             "1. All OR extension touches",
             lambda r: True,
             "The baseline every other cohort is measured against.",
+            price_only=True,
         ),
         Cohort(
             "no_confluence",
@@ -194,12 +239,14 @@ def build_cohorts(
             lambda r: (r.get("prior_extensions_touched") or 0) >= min_broken
             and (r.get("consecutive_extensions_broken") or 0) == 0,
             "Inner rungs produced a retrace before this touch.",
+            price_only=True,
         ),
         Cohort(
             "prior_broken",
             "11. Multiple prior extensions broken",
             lambda r: (r.get("consecutive_extensions_broken") or 0) >= min_broken,
             f"{min_broken}+ consecutive inner rungs sliced through without a retrace.",
+            price_only=True,
         ),
         # Not numbered in the brief, but the control its central claim needs:
         # if the effect only exists on levels that CHASE spot, it is probably
@@ -232,13 +279,60 @@ def build_cohorts(
             "extreme",
             f"13. Extension depth >= {min_extension:g}R",
             lambda r: abs(float(r.get("extension_k") or 0.0)) >= min_extension,
+            price_only=True,
         ),
         Cohort(
             "extreme_confluence",
             f"14. Depth >= {min_extension:g}R + confluence",
             lambda r: conf(r) and abs(float(r.get("extension_k") or 0.0)) >= min_extension,
         ),
+        *_named_rung_cohorts(),
     ]
+
+
+def _named_rung_cohorts() -> list[Cohort]:
+    """Cohorts 18-24: the customer's rungs pooled, each one, then his side.
+
+    Part of the cohort family on purpose, so Benjamini-Hochberg counts them.
+    Testing seven new rows outside the family would be seven free looks.
+    Cohort 18 pools all three rungs on both sides; it is the one the
+    pre-registered H1 verdict reads, because it is the claim ("the extremes
+    revert") at the only sample size that has a chance of resolving it.
+    """
+    n = len(NAMED_RUNGS)
+    marks = "/".join(f"{k * 100:g}" for k in NAMED_RUNGS)
+    out: list[Cohort] = [
+        Cohort(
+            "rung_named",
+            f"18. At any of ±{marks}% of R",
+            lambda r: any(on_rung(r, k) for k in NAMED_RUNGS),
+            "The customer's marked rungs, both sides pooled.",
+            price_only=True,
+        )
+    ]
+    for i, k in enumerate(NAMED_RUNGS):
+        pct = f"{k * 100:g}%"
+        out.append(
+            Cohort(
+                f"rung_{k * 100:g}",
+                f"{19 + i}. At ±{pct} of R (both sides)",
+                lambda r, k=k: on_rung(r, k),
+                f"Touches of the rung exactly {k:g}R beyond the range, above or below.",
+                price_only=True,
+            )
+        )
+    for i, k in enumerate(NAMED_RUNGS):
+        pct = f"{k * 100:g}%"
+        out.append(
+            Cohort(
+                f"rung_m{k * 100:g}",
+                f"{19 + n + i}. At -{pct} of R (below the range)",
+                lambda r, k=k: on_rung(r, k, "down"),
+                "The side the customer's chart marks.",
+                price_only=True,
+            )
+        )
+    return out
 
 
 #: Which option book a symbol's gamma comes from.  This is the only axis along
@@ -400,6 +494,10 @@ def compare_to_baseline(
     harder and more honest question ("does this beat the base rate?") than
     cohort-versus-complement.
 
+    A cohort under ``MIN_REPORTABLE_N`` touches or ``MIN_TESTABLE_SESSIONS``
+    sessions gets its point estimate and no test (``testable`` is False); see
+    :data:`MIN_TESTABLE_SESSIONS`.
+
     Reports BOTH a naive two-proportion test and the session-clustered
     bootstrap.  Keeping the naive number visible is deliberate: where the two
     disagree, the gap IS the clustering, and a reader who only ever sees the
@@ -426,8 +524,10 @@ def compare_to_baseline(
         stats.compare_proportions(k_a, n_a, k_b - k_a, n_b - n_a) if n_a and (n_b - n_a) > 0 else {}
     )
 
+    cohort_sessions = len({r.get("session") for r, flag in zip(resolved, in_bucket) if flag})
+    testable = n_a >= MIN_REPORTABLE_N and cohort_sessions >= MIN_TESTABLE_SESSIONS
     lo = hi = pval = None
-    if any(in_bucket) and not all(in_bucket):
+    if testable and any(in_bucket) and not all(in_bucket):
         values = [1.0 if r.get("outcome") == OUTCOME_REVERSAL else 0.0 for r in resolved]
         # Cluster on the CALENDAR session, not on (symbol, session). Pooling
         # SPY + SPX + ES over 59 days would otherwise present 177 clusters
@@ -451,4 +551,6 @@ def compare_to_baseline(
         "naive_p": naive.get("p_value"),
         "n": n_a,
         "n_baseline": n_b,
+        "cohort_sessions": cohort_sessions,
+        "testable": testable,
     }

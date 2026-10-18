@@ -40,6 +40,7 @@ Findings: [`docs/design/or-extension-gamma-confluence-findings.md`](../../docs/d
 | 4 — trade simulation | **not needed** — gross expectancy is algebraically zero |
 | 5 — TradeWorkz candidates | **not built, deliberately** — see the findings doc |
 | 6 — final report | **done** |
+| 60-minute follow-up | **harness ready, production run pending** — [`or-extension-gamma-confluence-60min-findings.md`](../../docs/design/or-extension-gamma-confluence-60min-findings.md) |
 
 ### Headline
 
@@ -82,6 +83,17 @@ python -m research.or_gamma_confluence.cli sweep NQ \
 
 `make orgc-selftest`, `orgc-coverage`, `orgc-dataset`, `orgc-analyze`,
 `orgc-sweep` wrap these.
+
+```bash
+# 5. Opening-range lengths side by side on ONE window, in one pass over the
+#    database, with the pre-registered build / defer / don't-build verdicts.
+make orgc-or60          # = coverage, then compare-or at 5 / 30 / 60 minutes
+```
+
+Every build now also writes `<dataset>.null.jsonl`: each session's post-range
+bars replayed with random direction through the identical event rule
+(`null.py`), so the mechanical null is measured on the real tape as well as
+derived, and each price-only cohort gets a null of its own.
 
 **Run `coverage` first.** It is the only thing that can tell you how much of
 this study is possible on a given deployment, and it checks an assumption the

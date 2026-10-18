@@ -1331,9 +1331,29 @@ orgc-sweep-lead: ## OR-gamma: gamma lead-time sweep, 5 cells (0/30/60/120/180s).
 		--or-minutes-grid 5 --step-grid 0.5 \
 		--lead-grid 0 30 60 120 180
 
+# The 60-minute follow-up (docs/design/or-extension-gamma-confluence-60min-findings.md).
+# Window defaults are the ones that doc describes; override to extend them.
+# FRESH_FROM is the first session after the September study's window, so H2 is
+# also tested on data it was not named on.
+ORGC_OR60_OUT ?= $(ORGC_OUT)/orgc_or60
+
+.PHONY: orgc-or60
+orgc-or60: ## OR-gamma: 60-min follow-up. Coverage, then OR 5/30/60 at 0.5R on ONE window in one DB pass, then comparison.md with the pre-registered verdicts. Read-only, ~20 min. Vars: [START=2026-06-29 END=2026-10-16 FRESH_FROM=2026-09-08 FAST=yes]
+	$(PY) -m research.or_gamma_confluence.cli coverage $(ORGC_SYMBOLS) --or-minutes 60 \
+		--fresh-from $(or $(FRESH_FROM),2026-09-08) \
+		--out $(ORGC_OR60_OUT)/coverage.json
+	$(PY) -m research.or_gamma_confluence.cli compare-or $(ORGC_SYMBOLS) \
+		--start $(or $(START),2026-06-29) --end $(or $(END),2026-10-16) \
+		--or-minutes-grid 5 30 60 \
+		--outdir $(ORGC_OR60_OUT) \
+		--fresh-from $(or $(FRESH_FROM),2026-09-08) \
+		--coverage $(ORGC_OR60_OUT)/coverage.json \
+		$(if $(filter yes,$(FAST)),--no-gex-ranks)
+
 .PHONY: orgc-test
 orgc-test: ## OR-gamma: run just this study's test suite
-	$(PY) -m pytest tests/test_or_gamma_confluence.py -q -o "addopts="
+	$(PY) -m pytest tests/test_or_gamma_confluence.py tests/test_or_gamma_confluence_or_guards.py \
+		tests/test_or_gamma_confluence_60min.py -q -o "addopts="
 
 .PHONY: mmgex-pipeline-check
 mmgex-pipeline-check: ## MM-GEX: synthetic end-to-end plumbing check (NOT a research result)

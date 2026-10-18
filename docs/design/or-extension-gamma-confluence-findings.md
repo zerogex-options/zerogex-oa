@@ -2,6 +2,13 @@
 
 **Status: complete through Phase 4. Recommendation: do not build the bots.**
 
+> **Corrected 2026-10-18** by the
+> [60-minute follow-up](./or-extension-gamma-confluence-60min-findings.md) §3:
+> SPY and QQQ had about 49 usable sessions, not 59 (`coverage` counted the
+> after-hours rows of each Friday as a Saturday), and H2's power was projected
+> from the pooled sample's curve. On H2's own interval, resolving a 6-point
+> effect needs about 300 sessions, not "~6 months" more. No result here moves.
+
 Two of the three hypotheses are falsified on a fair test. The third is
 underpowered rather than refuted. And the study's own headline number turned out
 to be an artefact of how the events were defined — which is the most useful
