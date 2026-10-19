@@ -639,6 +639,29 @@ def underlying_feed_expected(
     return open_t <= dt.time() <= close_t
 
 
+def cash_index_bar_in_session(bucket: datetime) -> bool:
+    """True when a cash index's 1-minute bar starting at ``bucket`` is a real print.
+
+    A cash index (SPX, NDX, …) prints only during the regular cash session,
+    so a bar outside it can only be a stale level re-stamped as current.
+    That is what a polling feed produces: ThetaData's Market Value index
+    endpoint answers ``market_price`` with no timestamp, the provider stamps
+    the poll's own time, and every minute after the close becomes a new bar
+    at the closing level — a fresh-looking SPX tick all night, fanned out to
+    the WebSocket and accepted by the Greeks freshness gate. TradeStation's
+    stream simply went quiet, and this keeps that true whatever the feed.
+
+    The window is ``[09:30, close]`` ET on a trading day, the close minute
+    INCLUDED (13:00 on a half day): the bar stamped 16:00 carries the
+    post-auction settled level, which ``get_session_closes`` reads as the
+    index's close.
+    """
+    dt = _to_et(bucket)
+    if not is_trading_session(dt.date()):
+        return False
+    return time(9, 30) <= dt.time() <= regular_session_close(dt.date())
+
+
 def is_underlying_active_session(
     dt: Optional[datetime] = None, symbol: Optional[str] = None
 ) -> bool:

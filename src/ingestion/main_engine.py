@@ -47,6 +47,7 @@ from src.symbols import (
     is_cash_index,
     resolve_monthly_underlying,
 )
+from src.market_calendar import cash_index_bar_in_session
 from src.tools.cash_index_open_repair import repair_one_session_open
 from src.config import (
     configured_provider_name,
@@ -775,6 +776,13 @@ class IngestionEngine:
         # boundary to the prior 16:00 close and refused the first minute of GEX
         # cycles. A bar stamped mid-interval floors to its own minute unchanged.
         bucket = bucket_timestamp(timestamp - timedelta(seconds=1), AGGREGATION_BUCKET_SECONDS)
+
+        # A cash index only prints in the cash session. Outside it a polling
+        # feed (ThetaData) keeps re-stamping the closing level as a new bar
+        # every minute; storing one would also publish it to the WebSocket
+        # and refresh the price the Greeks gate trusts. Drop it.
+        if is_cash_index(self.db_symbol) and not cash_index_bar_in_session(bucket):
+            return
 
         payload = {
             "symbol": self.db_symbol,
