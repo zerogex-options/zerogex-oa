@@ -237,9 +237,12 @@ testable rather than load-bearing — but they are worth settling with him.
    `BreakevenTriggerTicks` moves both stops to entry + `BreakevenPlusTicks`
    once price has gone that far the trade's way, and holds lot 2's trail
    until then. Off at 0. Stops only ever tighten, and are never placed
-   through the market. A rejected stop would stop the strategy. Jim's
-   2026-10-15 ask for "three level targets on the second lot" is not built:
-   he has been asked what the three levels are.
+   through the market. A rejected stop would stop the strategy. Lot 2 can
+   also be split over three profit targets in ticks (Jim, 2026-10-19: "The
+   three targets for Lot 2 will be ticks for now"); its contracts are shared
+   out one at a time starting with target 1, and a target of 0 leaves that
+   contract on the trail. Fib-extension targets are out of scope: he uses
+   them on Wave 3s, not on GOATs.
 6. **The pumpkin.** Three readings of his words, each a setting. "Flat" is a
    pumpkin that moved less than `PumpkinFlatTicks` over
    `PumpkinSlopeLookback` bars (default 2 over 5; he gave no number).

@@ -77,9 +77,21 @@ GA trades two lots: lot 1 (GOAT1) and lot 2 (GOAT2).
 | Stop: fixed ticks (FixedTicks mode only) | The stop distance in FixedTicks mode. |
 | Target 1 mode | FirstOppositeCloseBar: lot 1 exits on the first bar that closes against the trade. FixedTicks: lot 1 exits at a set profit. |
 | Target 1: fixed ticks (FixedTicks mode only) | Lot 1's profit target. |
+| Lot 2 target 1 (ticks, 0=trail) | Splits lot 2 over up to three profit targets. Each target takes one contract (with 3 per lot), and a 0 leaves that contract on the trail. All three at 0 keeps lot 2 as one trailing lot. |
+| Lot 2 target 2 (ticks, 0=trail) | The second contract's target. |
+| Lot 2 target 3 (ticks, 0=trail) | The third contract's target. |
 | Lot 2 trail (ticks; waits for breakeven when it's on) | Lot 2's stop follows the best price since entry, this far behind, and never moves back. With breakeven on, the trail starts only once breakeven is reached. |
 | Breakeven: after ticks in profit (0=off) | **When** the stops move: once price has gone this far your way. 0 turns breakeven off. |
 | Breakeven: stop at entry plus (ticks) | **Where** they move to: your entry plus this many ticks. 1 or 2 is typical. |
+
+**Three targets on lot 2, with breakeven.** Set the three "Lot 2 target"
+boxes to the ticks you want, then set breakeven with its two boxes: "after
+ticks in profit" is when, "stop at entry plus" is where. For example, 40, 60
+and 0 take one contract off at 40 ticks and one at 60, and let the last one
+ride the trail. With breakeven at 15 and plus 1, every contract still open
+moves to entry plus 1 tick once price has gone 15 ticks your way. Contracts
+are handed out one at a time, starting with target 1: 4 per lot gives 2, 1 and
+1, and 2 per lot leaves target 3 without one.
 
 ## 6. Dead zones (no new trades)
 
