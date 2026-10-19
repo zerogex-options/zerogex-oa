@@ -1958,3 +1958,109 @@ as it did on 10-15, and again a direct re-run is what shows the data. The
 VIX/VXN path itself is verified (F5, measured 10-15); this is an intermittent
 fault in the comparison tool, not in the feed. Worth fixing after the cutover,
 not before.
+
+## F20 — cut over to ThetaData in production, 2026-10-19, clean
+
+*The point of everything above. Production ran its first full session on
+ThetaData's Market Value feed with the tick-test classifier, in front of paying
+customers, and nothing went wrong.*
+
+### What changed, and when
+
+Two lines in `.env`, applied at 08:58 ET with the market closed:
+`MARKET_DATA_PROVIDER=thetadata_mv` and `FLOW_CLASSIFIER=tick`. Both were
+*absent* beforehand, not set to something else — production had been running on
+`DEFAULT_PROVIDER = "tradestation"` and `FLOW_CLASSIFIER` defaulting to
+`"quote"`. Worth recording because it makes the rollback a deletion rather than
+an edit, which is what restoring `~/.env.pre-thetadata-2026-10-19` does.
+
+`VOLATILITY_INDEX_PROVIDER` was deliberately left absent. `config.py`'s
+`configured_provider_name` falls through to the deployment-wide setting when an
+override is unset, so VIX and VXN followed the feed without being named.
+
+`make schema-apply` ran before the restart, per the ordering rule: 71 tables, 10
+views, 201 indexes, and F18's `underlying_daily_volume` redefinition landed
+inside a transaction.
+
+### The full session
+
+| | rows | contracts | expirations | OI coverage | last write |
+|---|---|---|---|---|---|
+| NDX | 558,975 | 2,242 | 9 | 56.7% | **15:59** |
+| SPX | 560,775 | 1,692 | 9 | 97.6% | 15:59 |
+| SPY | 459,882 | 1,876 | 7 | 87.4% | 16:15 |
+| QQQ | 411,537 | 1,695 | 7 | 89.7% | 16:15 |
+
+Option volume: SPY 12,729,943 · QQQ 8,862,386 · SPX 3,762,057 · NDX 61,954 —
+all within ordinary day-to-day range of last week's TradeStation production
+(2026-10-15: SPY 12,227,447 · QQQ 8,754,571 · SPX 4,180,517 · NDX 81,250).
+
+**NDX wrote to 15:59.** On 2026-10-14 it stopped at 15:50 and never recovered
+(F16). That single cell is what five weeks of this document was about.
+
+### Every pre-close check, and what each one settled
+
+- **12 of 12 streams fresh**, zero outside their window, at 09:38 and again at
+  09:40. All four symbols present — a symbol absent would have been worse than
+  one reading oddly.
+- **Zero ERROR or CRITICAL log lines.** A first count of 34 came from a
+  case-insensitive grep for "error" matching `[DB-METRICS] … errors=0`. The
+  metric reporting no errors was the thing being counted.
+- **Write path healthy**: `avg_write_ms` 435–592 during the pre-open bulk
+  hydration (24–26 batches of ~35,000 rows), settling to **13–24ms** in session
+  (347–535 batches of ~10–12k), `total_stored` past 420,000 by 09:40,
+  `errors=0` throughout.
+- **F18 verified live**, which no rehearsal could do: `/api/market/quote`
+  returned SPY 2,409,865 and QQQ 4,170,523. `src/api/main.py` renames
+  `cumulative_daily_volume` to `volume` on the way out, so that *is* the read
+  F18 repaired; without it the LATERAL would have summed a split ThetaData
+  writes as NULL and served a confident `0`. Over the full day `total_volume`
+  reads 19,894,613 for SPY and 18,641,373 for QQQ.
+- **VIX / VXN `off_grid = 0`** on both, over a full production session, 77 and
+  76 RTH bars against the ~78 expected. The folding of per-second marks into
+  5-minute buckets works in production as it did in rehearsal (F5).
+- **Gate 0's quarantine deployed and never invoked.** No `numeric field
+  overflow` and no `Quarantining` line all day.
+
+### The split is gone, by design, and it is visible
+
+`no_updown` reads 477 of 772 bars for QQQ and 477 of 759 for SPY — the balance
+are premarket bars written by TradeStation before the 08:58 restart. From the
+restart on, every bar lacks the uptick/downtick split, so `buy_pct`,
+`period_buy_pct` and the momentum label return NULL and `⚪ No Tick Data`. That
+was chosen in the 2026-09 sweep over publishing a confident, permanently
+neutral 50, and it is a visible change for subscribers rather than a defect.
+
+One detail that landed better than expected: `UnderlyingQuote` marks
+`up_volume` / `down_volume` `Optional` and the endpoint sets
+`response_model_exclude_none=True`, so they are **absent** from the response
+rather than null. No frontend arithmetic meets a null. That resolves, on this
+endpoint at least, the inconsistency F18 left open.
+
+### What this retires, and what it does not
+
+**Retired**: the OPRA / CTA / UTP / CGIF / GIDS redistribution exposure this
+migration existed to escape. Options, underlying bars and both volatility
+indices now come from a Market Value feed under an executed agreement, with
+VIX and VXN confirmed inside its index coverage (F5, answered 2026-10-16).
+
+**Not retired**: TradeStation, which still serves @ES and @NQ and nothing else.
+The three end states are in `docs/runbooks/thetadata-cutover.md` — a
+futures-only tier, Databento `GLBX.MDP3`, or delayed CME, which costs nothing
+so long as the overnight display swap is given up. That third one reaches zero
+TradeStation spend and is a product decision, not a technical one.
+
+### What one clean day does not prove
+
+- **The monthly-OPEX regime is untouched.** F19 measured NDX at 45.0% of flow
+  flipped on monthly expiration against 22–29% on ordinary sessions. Today was
+  an ordinary session. The next monthly expiration is **2026-11-20**, and what
+  gets published for NDX that day is still open.
+- **The overflow's triggering value is still unnamed.** It has now been quiet
+  in three of four rehearsals and in the first production session. The
+  quarantine means it can no longer void a symbol's session, so this is a
+  data-quality question to answer when it next fires, not a blocker. The
+  diagnostic stays in place to name it.
+- **One day.** The post-cutover watchdog in the runbook — TradeStation into
+  `zerogex_shadow_ts` on SPY, compared each evening — is how the next fortnight
+  gets checked.
