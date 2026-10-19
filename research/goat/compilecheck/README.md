@@ -8,10 +8,12 @@ with the same signatures. Compiling the real file against it catches syntax
 errors, typos, wrong argument counts and unassigned locals before they reach
 his NinjaScript Editor:
 
-    mcs -target:library -out:/dev/null -warn:4 \
+    mcs -langversion:5 -target:library -out:/dev/null -warn:4 \
         research/goat/compilecheck/NtStub.cs research/goat/ZeroGexGoat.cs
 
 Clean exit means the file is syntactically valid and internally consistent.
+`-langversion:5` keeps the syntax to C# 5, which every NinjaTrader 8 release
+compiles, so a newer construct cannot slip in and fail only on his machine.
 
 It does NOT mean the NT8 API matches these stubs. Order-handling semantics,
 indicator behavior and anything that only shows up at runtime are still only

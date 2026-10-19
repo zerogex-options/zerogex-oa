@@ -98,11 +98,50 @@ Rules that keep live runs readable:
   position by hand leaves the strategy still believing it holds one.
 - **To get out of a trade, untick Enabled first,** then flatten from the
   SuperDOM.
+- **A strategy label that starts with (D) means GA is off on that chart.** A
+  disabled strategy draws no trades at all, past or present, so a chart in
+  that state cannot answer "why didn't it trade here?".
+- **Every distance setting is in ticks, and a tick is not the same size
+  everywhere.** On NQ it is 0.25 point, on YM a full point, so the same
+  number asks for four times the distance on YM. Jim raised the minimum slope
+  to 10 for NQ (2.5 points) and the same 10 on YM (10 points) filtered out
+  setups he wanted. Keep one saved template per instrument (the template link
+  at the bottom of the settings window).
 
 **Dead zones** (Jim's ask, 2026-10-13) are up to three time windows where no
 new trade opens; open trades are still managed. They are HHMM on the 24-hour
 clock, in whatever time zone the chart shows, and off while from equals to. A
 window whose from is after its to wraps past midnight.
+
+**The pumpkin line** (Jim's ask, 2026-10-15 and 10-17) is an HMA(100) he
+reads as an exhaustion line. With "Require pumpkin in sync" ticked, a trade
+is skipped when the pumpkin is flat or curling against it, unless the
+pumpkin sits at least "room" ticks beyond the entry in the trade's direction
+(above a long, below a short): far enough to reach breakeven before price
+meets it. Off by default; see open question 6 for the choices it makes.
+
+## Why didn't it take that trade?
+
+Tick **Label skipped setups (why GA passed)** and re-enable. On each near miss
+GA writes the rules the bar failed, one per line, under the bar for a long and
+over it for a short: `pinch 9 > 6` means the yellow line came no closer than 9
+ticks to the midband and the setting allows 6; `slope 8 < 10` means the
+midband moved 8 ticks over the lookback against a minimum of 10. The other
+codes are `width`, `EE`, `mid`, `pumpkin`, `break`, `flip` and `zone` (a dead
+zone).
+
+What counts as a near miss: a bar closing the way the midband points, in the
+entry bar color, that failed one to three rules. Bars in other colors, bars
+failing four or more rules, and bars within two of a previous label get none,
+which keeps a trending chart readable. The labels come from the same checks
+the entries use, so a label can never disagree with what GA did, and turning
+them on never changes a trade. Labels reuse 300 rolling tags, so the oldest
+disappear on a long chart.
+
+Before this existed, each "why not?" was answered by measuring a screenshot.
+Every one in Jim's 2026-10-15/17 batch came down to a setting: the pinch on
+three NQ shorts, the minimum slope on two YM longs and an NQ long, and a
+dead zone on a YM short at 8:30.
 
 ## Optimizing
 
@@ -123,6 +162,12 @@ filter.
 hundred combinations against a few hundred trades will produce an impressive
 best cell by arithmetic alone. Hold out a date range before optimizing, and
 check the winner on it afterwards.
+
+**Optimizations run before 2026-10-19 are slightly off.** The strategy reuses
+one instance across optimization passes, and until then it did not reset the
+pinch tracker between them. Each pass after the first could treat the last
+pass's final pinch as recent and take a few extra trades before the first
+real pinch. Single backtests were not affected.
 
 ## Bar colors
 
@@ -192,4 +237,13 @@ testable rather than load-bearing — but they are worth settling with him.
    `BreakevenTriggerTicks` moves both stops to entry + `BreakevenPlusTicks`
    once price has gone that far the trade's way, and holds lot 2's trail
    until then. Off at 0. Stops only ever tighten, and are never placed
-   through the market. A rejected stop would stop the strategy.
+   through the market. A rejected stop would stop the strategy. Jim's
+   2026-10-15 ask for "three level targets on the second lot" is not built:
+   he has been asked what the three levels are.
+6. **The pumpkin.** Three readings of his words, each a setting. "Flat" is a
+   pumpkin that moved less than `PumpkinFlatTicks` over
+   `PumpkinSlopeLookback` bars (default 2 over 5; he gave no number).
+   "Room" is measured from the entry bar's close to the pumpkin in the
+   trade's direction, as he measured it on his YM charts, so a pumpkin
+   behind price counts as no room and the trade is skipped. He said 18 to 20
+   ticks in one email and "15 minimum" on a chart; the default is 15.

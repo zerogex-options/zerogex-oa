@@ -1,0 +1,162 @@
+# GA Settings Guide
+
+*For the ZeroGexGoat version of October 19, 2026. Confidential: this
+describes Jim Edwards' GOAT method.*
+
+## Before you change anything
+
+- **Every distance is in ticks, and a tick is a different size on each
+  instrument.** On NQ a tick is a quarter point; on YM it is a full point. The
+  same number asks for four times the distance on YM. Keep one saved set of
+  settings for each instrument: the **template** link at the bottom of the
+  settings window saves and loads them.
+- **GA decides when a bar closes and enters at the open of the next bar.**
+- **GA trades one setup at a time.** While it is in a trade, it does not look
+  for another.
+- **When you re-enable GA, it replays the bars already on the chart** and
+  draws the trades it would have taken. That is the quickest way to see what a
+  setting change does.
+- **If the strategy label at the top of the chart starts with (D), GA is off**
+  on that chart and shows no trades at all.
+- **The stochastic settings must match the jeStochastics on the same chart.**
+  GA works out bar colors with its own copy of that math. If the numbers
+  differ, GA sees different colors than you do.
+
+## 1. Midband
+
+| Setting | What it does |
+|---|---|
+| Midband MA type | The kind of average used for the midband. Your charts use SMA. |
+| Midband period | How many bars the midband averages. Your charts use 55. |
+| Band std dev | How far out the upper and lower bands sit. Your charts use 2. |
+
+## 2. EE line (the yellow line)
+
+| Setting | What it does |
+|---|---|
+| EE line MA type | The kind of average used for the yellow line. Your charts use HMA. |
+| EE line period | How many bars it averages. Your charts use 22. |
+
+## 3. Stochastic (bar colors)
+
+| Setting | What it does |
+|---|---|
+| Stochastic %K period | Must match your jeStochastics. 3 on your YM chart. |
+| Stochastic %K smoothing | Must match your jeStochastics. 3 on your YM chart. |
+| Overbought (white/dark red above) | Above this, up bars are white and down bars dark red. 60. |
+| Oversold (dark green/black below) | Below this, up bars are dark green and down bars black. 40. |
+
+Between the two, up bars are lime (bright green) and down bars red.
+
+## 4. Setup filters
+
+| Setting | What it does |
+|---|---|
+| Slope lookback (bars) | How many bars back GA measures the midband's slope. |
+| Min slope over lookback (ticks) | The midband must have risen (for a long) or fallen (for a short) at least this much over the lookback. Raise it to trade only steeper trends. |
+| Pinch: max EE-to-mid (ticks) | How close the yellow line must come to the midband for a setup to count. |
+| Pinch: valid for (bars) | How many bars after that touch the entry may still come. Small numbers keep entries close to the touch. |
+| Require no midline break | When ticked, no bar may have closed through the midband against the trade since the pinch. |
+| Midline break tolerance (ticks) | How far past the midband a close may go before it counts as a break. |
+| Bypass break rule above slope (ticks, 0=off) | When the midband is sloping at least this steeply, the break rule is skipped. |
+| Require color flip (black->up / white->down) | When ticked, the bar before the entry bar must be black for a long or white for a short. |
+| Entry bar color | Any: any bar closing the right way. Bright: lime for a long, red for a short. Skip: white for a long, black for a short. BrightOrSkip: either. |
+| Entry close vs EE tolerance (ticks) | How far on the wrong side of the yellow line the entry bar may close: below it for a long, above it for a short. This is the snuggler-versus-reacher rule. |
+| Min band width (ticks, 0=off) | The distance between the upper and lower bands must be at least this much. It keeps GA out of tight, choppy markets. |
+| Entry: max ticks above midband (below for shorts, -1=off) | How far past the midband the entry bar may close. 0 means at or below the midband for a long. |
+
+## 5. Sizing and exits
+
+GA trades two lots: lot 1 (GOAT1) and lot 2 (GOAT2).
+
+| Setting | What it does |
+|---|---|
+| Contracts per lot | Contracts in each lot. 3 means 6 contracts in all. |
+| Stop mode | EntryBarRangePlusTicks: the stop is the entry bar's height plus the extra ticks in the next setting. FixedTicks: a set number of ticks. |
+| Stop: extra ticks beyond entry bar (range mode only) | Added to the entry bar's height. On a 5-range NQ chart the bar is 5 ticks, so 2 extra makes a 7-tick stop. |
+| Stop: fixed ticks (FixedTicks mode only) | The stop distance in FixedTicks mode. |
+| Target 1 mode | FirstOppositeCloseBar: lot 1 exits on the first bar that closes against the trade. FixedTicks: lot 1 exits at a set profit. |
+| Target 1: fixed ticks (FixedTicks mode only) | Lot 1's profit target. |
+| Lot 2 trail (ticks; waits for breakeven when it's on) | Lot 2's stop follows the best price since entry, this far behind, and never moves back. With breakeven on, the trail starts only once breakeven is reached. |
+| Breakeven: after ticks in profit (0=off) | **When** the stops move: once price has gone this far your way. 0 turns breakeven off. |
+| Breakeven: stop at entry plus (ticks) | **Where** they move to: your entry plus this many ticks. 1 or 2 is typical. |
+
+## 6. Dead zones (no new trades)
+
+Up to three windows where GA opens no new trades. Trades already open are
+still managed. Times are HHMM on the 24-hour clock in your chart's time zone,
+so 2:40 PM is 1440. A zone is off when its "from" and "to" are the same. A
+zone can run past midnight: 1550 to 200 covers 3:50 PM to 2:00 AM.
+
+## 7. Pumpkin line (new)
+
+Off until you tick the first setting.
+
+| Setting | What it does |
+|---|---|
+| Require pumpkin in sync (off = ignore it) | When ticked, GA skips a trade when the pumpkin is flat or curling against it, unless there is room (last setting). |
+| Pumpkin: HMA period | Your pumpkin is a 100 HMA. |
+| Pumpkin: slope lookback (bars) | How many bars back GA measures the pumpkin's direction. Short means it reacts quickly to a curl. Default 5. |
+| Pumpkin: min slope over lookback (ticks; less is flat) | How much the pumpkin must move over the lookback to count as heading somewhere. Less than this is flat. Default 2. |
+| Pumpkin: room to trade against it (ticks, 0=never) | A trade against a flat or curling pumpkin is still taken when the pumpkin sits at least this far beyond the entry, above a long or below a short. Default 15. 0 means never trade against it. |
+
+**Example on YM**, where a tick is a point. GA sees a long, the pumpkin is
+flat, and it sits 19 points above the entry bar's close. With room at 15,
+GA takes it, because price can reach breakeven before it meets the pumpkin.
+At 10 points above, GA passes and labels the bar "pumpkin 10 < 15". If the
+pumpkin is flat or falling and sits below price on a long, there is no room by
+this measure, so GA skips that one too. Setting the room at or a little above your breakeven trigger
+matches the idea of reaching breakeven first.
+
+## 8. Chart labels (new)
+
+| Setting | What it does |
+|---|---|
+| Label skipped setups (why GA passed) | When GA passes on a bar it could have used as an entry bar, it writes the reason on the chart in light blue: under the bar for a long, over it for a short. |
+
+A label lists each rule the bar failed, one per line. The first number is what
+GA measured and the second is your setting:
+
+| Label | Meaning | Setting to look at |
+|---|---|---|
+| zone | The bar was in a dead zone. | Dead zones |
+| pinch 9 > 6 | The yellow line came no closer than 9 ticks to the midband; you allow 6. | Pinch: max EE-to-mid, Pinch: valid for |
+| width 36 < 40 | The bands were 36 ticks apart; you require 40. | Min band width |
+| slope 8 < 10 | The midband moved 8 ticks over the lookback; you require 10. | Min slope over lookback, Slope lookback |
+| flip | The bar before wasn't black (long) or white (short). | Require color flip |
+| EE 5 > 4 | The bar closed 5 ticks on the wrong side of the yellow line; you allow 4. | Entry close vs EE tolerance |
+| mid 12 > 10 | The bar closed 12 ticks past the midband; you allow 10. | Entry: max ticks above midband |
+| break | A bar closed through the midband since the pinch. | Require no midline break, tolerance, bypass |
+| pumpkin 8 < 15 | The pumpkin was flat or against the trade, with only 8 ticks of room; you require 15. | Pumpkin settings |
+| pumpkin | The pumpkin was flat or against the trade and behind price, or room is set to 0. | Pumpkin settings |
+
+Labels go only on near misses: bars closing the way the midband points, in
+your entry bar color, that failed one to three rules. Bars failing four or
+more rules aren't really setups, so they get no label. To keep a chart
+readable, the two bars after a label get none either. Labels only explain;
+turning them on never changes a trade.
+
+## When GA passes on a trade you expected
+
+1. **Is GA on?** If the strategy label starts with (D), it's off.
+2. **Turn on "Label skipped setups"** and re-enable. If the bar has a label,
+   the table above says which setting stopped it.
+3. **No label on that bar?** Then one of these is true:
+   - GA doesn't see the bar in your entry bar color. Check that the
+     stochastic settings match your chart.
+   - The bar closed against the way the midband is pointing.
+   - It failed four or more rules.
+   - A label was drawn on one of the two bars before it. Look there.
+   - GA was already in a trade.
+   - The bar is among the first 100 or so on the chart, before GA has enough
+     history to start trading.
+4. **Moving settings between NQ and YM?** Remember a YM tick is four times
+   an NQ tick.
+
+## Installing a new version
+
+1. Untick Enabled on every copy of GA in the Control Center's Strategies tab.
+2. Save the new file over the old one in
+   Documents\NinjaTrader 8\bin\Custom\Strategies.
+3. Open the NinjaScript Editor and press F5. The error list should be empty.
+4. Check your settings (new ones start off), then re-enable one copy.
