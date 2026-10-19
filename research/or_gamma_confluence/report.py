@@ -27,22 +27,34 @@ from __future__ import annotations
 
 import csv
 import json
+import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from research.or_gamma_confluence.cohorts import (
     MIN_REPORTABLE_N,
+    MIN_TESTABLE_SESSIONS,
+    NAMED_RUNGS,
     book_of,
     kinds_agreeing,
     build_cohorts,
     compare_to_baseline,
     has_confluence,
+    on_rung,
     pooling_check,
     summarize,
 )
 from research.msi_regime_excursion import stats
 from research.or_gamma_confluence.config import ResearchConfig
+from research.or_gamma_confluence.events import (
+    OUTCOME_CENSORED,
+    OUTCOME_REVERSAL,
+    RESOLVED_OUTCOMES,
+)
+from research.or_gamma_confluence.instruments import spec
+from research.or_gamma_confluence.null import gamblers_ruin_null
+from research.or_gamma_confluence.power import power_report
 
 __all__ = ["split_chronological", "build_summary", "render_markdown", "write_csv"]
 
@@ -240,7 +252,7 @@ def _mechanical_null(rows: Sequence[Mapping[str, Any]], cfg: ResearchConfig) -> 
     if not offsets:
         return {"available": False}
     step = cfg.extension_step
-    per_event = [min(1.0, max(0.0, 0.5 + float(d) / (2.0 * step))) for d in offsets]
+    per_event = [gamblers_ruin_null(d, step) for d in offsets]
     return {
         "available": True,
         "n": len(per_event),
@@ -249,27 +261,439 @@ def _mechanical_null(rows: Sequence[Mapping[str, Any]], cfg: ResearchConfig) -> 
     }
 
 
+def _formula_null_rate(rows: Sequence[Mapping[str, Any]], step: float) -> Optional[float]:
+    """Mean gambler's-ruin null over a set of rows' RESOLVED touches.
+
+    Over resolved touches, so it is on the same footing as the reversal rate
+    it is compared with.  ``_mechanical_null`` averages over every touch with
+    a next rung instead, which is what September reported; the two differ
+    only by the censored touches.
+    """
+    vals = [
+        gamblers_ruin_null(r.get("touch_offset_r"), step)
+        for r in rows
+        if r.get("outcome") in RESOLVED_OUTCOMES
+        and r.get("next_exists")
+        and r.get("touch_offset_r") is not None
+    ]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def _surrogate_rate(
+    null_rows: Sequence[Mapping[str, Any]],
+    predicate: Callable[[Mapping[str, Any]], bool] = lambda r: True,
+) -> dict[str, Any]:
+    """Reversal-first rate among the surrogate touches a predicate selects.
+
+    ``se`` is binomial over surrogate touches: it is the Monte Carlo error of
+    the null itself, not the uncertainty of the real sample, and it is small
+    by construction because every session is replayed many times.
+    """
+    sel = [r for r in null_rows if predicate(r)]
+    resolved = [r for r in sel if r.get("outcome") in RESOLVED_OUTCOMES]
+    n = len(resolved)
+    if not n:
+        return {"rate": None, "n": 0, "se": None, "censored_share": None}
+    k = sum(1 for r in resolved if r.get("outcome") == OUTCOME_REVERSAL)
+    rate = k / n
+    return {
+        "rate": rate,
+        "n": n,
+        "se": (rate * (1.0 - rate) / n) ** 0.5,
+        "censored_share": sum(1 for r in sel if r.get("outcome") == OUTCOME_CENSORED) / len(sel),
+    }
+
+
+def _clustered_rate(
+    rows: Sequence[Mapping[str, Any]], *, iterations: int = 2000, seed: int = 20261018
+) -> dict[str, Any]:
+    """Reversal rate with a session-block bootstrap interval.
+
+    The interval a rate needs before it can be set against a null: touches on
+    one day share that day's path, so resampling touches would claim more
+    independent observations than there are days.
+    """
+    per: dict[str, list[int]] = {}
+    for r in rows:
+        if r.get("outcome") not in RESOLVED_OUTCOMES:
+            continue
+        cell = per.setdefault(_session_key(r), [0, 0])
+        cell[0] += 1 if r.get("outcome") == OUTCOME_REVERSAL else 0
+        cell[1] += 1
+    cells = list(per.values())
+    k = sum(c[0] for c in cells)
+    n = sum(c[1] for c in cells)
+    out: dict[str, Any] = {"rate": (k / n) if n else None, "n": n, "ci_low": None, "ci_high": None}
+    # Same floor as a cohort test, for the same reason: with a handful of
+    # sessions the resample collapses and the interval is a fiction.
+    if len(cells) < MIN_TESTABLE_SESSIONS or n < MIN_REPORTABLE_N:
+        return out
+    rng = random.Random(seed)
+    draws = []
+    m = len(cells)
+    for _ in range(iterations):
+        kk = nn = 0
+        for _ in range(m):
+            c = cells[rng.randrange(m)]
+            kk += c[0]
+            nn += c[1]
+        if nn:
+            draws.append(kk / nn)
+    draws.sort()
+    out["ci_low"] = draws[int(0.025 * (len(draws) - 1))]
+    out["ci_high"] = draws[int(0.975 * (len(draws) - 1))]
+    return out
+
+
+def _null_block(
+    rows: Sequence[Mapping[str, Any]],
+    null_rows: Sequence[Mapping[str, Any]],
+    cfg: ResearchConfig,
+    predicate: Callable[[Mapping[str, Any]], bool] = lambda r: True,
+) -> dict[str, Any]:
+    """Observed rate against BOTH nulls, for one price-only selection.
+
+    ``excess`` is measured against the surrogate null when there is one, and
+    against the formula otherwise.  The interval is the observed rate's
+    clustered interval shifted by the null, which is treated as known: its
+    Monte Carlo error is reported beside it and is several times smaller.
+    """
+    sel = [r for r in rows if predicate(r)]
+    obs = _clustered_rate(sel)
+    formula = _formula_null_rate(sel, cfg.extension_step)
+    sur = _surrogate_rate(null_rows, predicate) if null_rows else {"rate": None, "n": 0}
+    null = sur["rate"] if sur.get("rate") is not None else formula
+    out = {
+        "observed": obs["rate"],
+        "observed_ci_low": obs["ci_low"],
+        "observed_ci_high": obs["ci_high"],
+        "n": obs["n"],
+        "n_sessions": len({_session_key(r) for r in sel if r.get("outcome") in RESOLVED_OUTCOMES}),
+        "formula_null": formula,
+        "surrogate_null": sur.get("rate"),
+        "surrogate_n": sur.get("n"),
+        "surrogate_se": sur.get("se"),
+        "surrogate_censored_share": sur.get("censored_share"),
+        "null_used": "surrogate" if sur.get("rate") is not None else "formula",
+        "excess": None,
+        "excess_ci_low": None,
+        "excess_ci_high": None,
+    }
+    if obs["rate"] is not None and null is not None:
+        out["excess"] = obs["rate"] - null
+        if obs["ci_low"] is not None:
+            out["excess_ci_low"] = obs["ci_low"] - null
+            out["excess_ci_high"] = obs["ci_high"] - null
+    return out
+
+
+def _named_rung_table(
+    rows: Sequence[Mapping[str, Any]],
+    null_rows: Sequence[Mapping[str, Any]],
+    cfg: ResearchConfig,
+    cohort_by_key: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """The customer's rungs, one row per (rung, side), against their nulls.
+
+    ``on_ladder`` is False when the configured step does not land on the
+    rung (1.5R on a 1.0R ladder): then there is nothing to measure and the
+    row says so instead of printing an empty rate that reads like a result.
+    """
+    step = cfg.extension_step
+    out = []
+    for k in NAMED_RUNGS:
+        on_ladder = abs(round(k / step) * step - k) < 1e-9 and k <= cfg.max_extension + 1e-9
+        for side, label in (
+            (None, f"±{k * 100:g}%"),
+            ("down", f"-{k * 100:g}%"),
+            ("up", f"+{k * 100:g}%"),
+        ):
+
+            def pred(r: Mapping[str, Any], k: float = k, side: Optional[str] = side) -> bool:
+                return on_rung(r, k, side)
+
+            row: dict[str, Any] = {
+                "rung": label,
+                "k": k,
+                "side": side or "both",
+                "on_ladder": on_ladder,
+            }
+            if on_ladder:
+                row.update(_null_block(rows, null_rows, cfg, pred))
+                key = {None: f"rung_{k * 100:g}", "down": f"rung_m{k * 100:g}"}.get(side)
+                c = cohort_by_key.get(key) if key else None
+                if c is not None:
+                    row["clustered_p"] = c.get("clustered_p")
+                    row["bh_significant"] = c.get("bh_significant")
+            out.append(row)
+    return out
+
+
+def _depth_rho(rows: Sequence[Mapping[str, Any]], step: float) -> dict[str, Any]:
+    """H1 as one number: Spearman(depth, reversal), raw and net of the formula.
+
+    The net version correlates depth with ``outcome - formula null``, so a
+    tilt produced by the close-offset (shallow rungs have a narrower step in
+    points, so the same offset is a larger share of it) is taken out first.
+    """
+    res = [r for r in rows if r.get("outcome") in RESOLVED_OUTCOMES]
+    depth = [abs(float(r.get("extension_k") or 0.0)) for r in res]
+    hit = [1.0 if r.get("outcome") == OUTCOME_REVERSAL else 0.0 for r in res]
+    sess = [_session_key(r) for r in res]
+    raw = stats.spearman_block(depth, hit, sess).as_dict() if len(res) > 10 else None
+    resid = [
+        (h - n) if n is not None else None
+        for h, n in zip(
+            hit,
+            (
+                gamblers_ruin_null(r.get("touch_offset_r"), step) if r.get("next_exists") else None
+                for r in res
+            ),
+        )
+    ]
+    net = stats.spearman_block(depth, resid, sess).as_dict() if len(res) > 10 else None
+    return {"raw": raw, "net_of_formula_null": net}
+
+
+def _cost_hurdle(
+    rows: Sequence[Mapping[str, Any]], cfg: ResearchConfig, symbol: str = "NQ"
+) -> dict[str, Any]:
+    """The win-rate excess over the null a trade needs to pay for itself.
+
+    Enter at the touch bar's close, target the previous rung, stop at the
+    next.  With win ``s - d`` and loss ``s + d`` and a round-turn cost ``c``
+    in points, break-even is ``P = 0.5 + d/(2s) + c/(2s)``: the mechanical
+    null plus ``c / (2s)``.  ``s`` is ``extension_step * R``, and R is the
+    MEDIAN opening range of the symbol's sessions in this dataset, so the
+    hurdle falls as the range widens: a 60-minute range spreads the same
+    $14.50 over a wider step.
+    """
+    inst = spec(symbol)
+    widths: dict[str, float] = {}
+    for r in rows:
+        if r.get("symbol") == symbol and r.get("or_width"):
+            widths[_session_key(r)] = float(r["or_width"])
+    if not widths or not inst.point_value or not inst.tick:
+        return {"available": False, "symbol": symbol}
+    median_r = stats.describe(list(widths.values())).median
+    step_pts = cfg.extension_step * median_r
+    cost_pts = cfg.commission_round_turn / inst.point_value + 2.0 * cfg.slippage_ticks * inst.tick
+    return {
+        "available": True,
+        "symbol": symbol,
+        "sessions": len(widths),
+        "median_or_width_pts": median_r,
+        "step_pts": step_pts,
+        "cost_pts": cost_pts,
+        "cost_dollars": cost_pts * inst.point_value,
+        "hurdle": cost_pts / (2.0 * step_pts) if step_pts > 0 else None,
+    }
+
+
+#: The cohort each hypothesis is judged on, and the direction it claims.
+#: ``+1`` claims MORE reversion than the null; ``-1`` claims less (that is,
+#: continuation).  Fixed here, before the 60-minute data was read, so the
+#: verdict cannot drift toward whichever cohort happens to look best.
+HYPOTHESES: dict[str, dict[str, Any]] = {
+    "H1": {
+        "cohort": "rung_named",
+        "sign": 1,
+        "claim": "the customer's marked rungs (±100/150/200% of R) revert more",
+    },
+    "H2": {
+        "cohort": "prior_broken",
+        "sign": -1,
+        "claim": "after 2+ broken rungs, price continues more",
+    },
+    "H3": {
+        "cohort": "confluence",
+        "sign": 1,
+        "claim": "a pre-existing gamma level at the rung raises reversion",
+    },
+}
+
+
+def _hypothesis_stats(
+    rows: Sequence[Mapping[str, Any]],
+    null_rows: Sequence[Mapping[str, Any]],
+    cfg: ResearchConfig,
+    cohorts: Sequence[Any],
+    cohort_by_key: Mapping[str, Mapping[str, Any]],
+    oos: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The numbers the pre-registered verdict reads, one block per hypothesis.
+
+    Two different comparisons, because the verdict needs both:
+
+    * against the BASELINE (``vs_baseline``, from the cohort table): does the
+      cohort behave differently from the average touch?  That is the claim,
+      and it is what the multiplicity correction is applied to;
+    * against its OWN NULL (``own_null``): is the cohort's rate far enough
+      from what the event rule produces on a directionless tape to pay the
+      cost of a trade?  That is what the cost hurdle is compared with.
+    """
+    by_key = {c.key: c for c in cohorts}
+    out: dict[str, Any] = {}
+    for name, h in HYPOTHESES.items():
+        c = by_key[h["cohort"]]
+        stat = cohort_by_key[h["cohort"]]
+        splits = {
+            split: {
+                "n": (part.get("cohorts", {}).get(c.key) or {}).get("n_resolved", 0),
+                "excess_vs_column": (part.get("cohorts", {}).get(c.key) or {}).get(
+                    "excess_vs_column"
+                ),
+            }
+            for split, part in oos.items()
+        }
+        out[name] = {
+            **h,
+            "label": stat.get("label"),
+            "n": stat.get("n_resolved"),
+            "n_sessions": stat.get("n_sessions"),
+            "vs_baseline": {
+                k: stat.get(k)
+                for k in (
+                    "clustered_diff",
+                    "clustered_ci_low",
+                    "clustered_ci_high",
+                    "clustered_p",
+                    "bh_significant",
+                    "null_shift",
+                    "net_of_null_diff",
+                    "testable",
+                    "cohort_sessions",
+                )
+            },
+            "own_null": _null_block(rows, null_rows if c.price_only else [], cfg, c.predicate),
+            "oos": splits,
+            "pooling": pooling_check(list(rows), c.predicate).get("verdict"),
+        }
+    return out
+
+
+#: The H2 effect the September findings reported, as a rate difference.  Kept
+#: as a power scenario so every run says how far it is from resolving THAT.
+SEPTEMBER_H2_EFFECT = -0.060
+
+
+def _h2_block(
+    rows: Sequence[Mapping[str, Any]],
+    null_rows: Sequence[Mapping[str, Any]],
+    cfg: ResearchConfig,
+    broken_predicate: Callable[[Mapping[str, Any]], bool],
+    fresh_from: Optional[str],
+) -> dict[str, Any]:
+    """H2 -- broken ladders -> continuation -- with its power, twice over.
+
+    Once on the whole window (the best current estimate), and once on the
+    sessions from ``fresh_from`` on.  The second is the only clean test: the
+    hypothesis was named after looking at the September window, so a test that
+    re-uses those sessions is partly grading its own homework.
+    """
+
+    def one(subset: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        cmp = compare_to_baseline(subset, broken_predicate)
+        n_cal = len({_session_key(r) for r in subset if r.get("outcome") in RESOLVED_OUTCOMES})
+        shift = None
+        if null_rows:
+            keep = {_session_key(r) for r in subset}
+            nsub = [r for r in null_rows if _session_key(r) in keep]
+            a = _surrogate_rate(nsub, broken_predicate)["rate"]
+            b = _surrogate_rate(nsub)["rate"]
+            shift = (a - b) if (a is not None and b is not None) else None
+        if shift is None:
+            fa = _formula_null_rate([r for r in subset if broken_predicate(r)], cfg.extension_step)
+            fb = _formula_null_rate(subset, cfg.extension_step)
+            shift = (fa - fb) if (fa is not None and fb is not None) else None
+        diff = cmp.get("clustered_diff")
+        adj = (diff - shift) if (diff is not None and shift is not None) else diff
+        lo, hi = cmp.get("clustered_ci_low"), cmp.get("clustered_ci_high")
+        out = {
+            **cmp,
+            "n_calendar_sessions": n_cal,
+            "cohort_sessions": len(
+                {
+                    _session_key(r)
+                    for r in subset
+                    if broken_predicate(r) and r.get("outcome") in RESOLVED_OUTCOMES
+                }
+            ),
+            "null_shift": shift,
+            "adjusted_diff": adj,
+            "adjusted_ci_low": (lo - shift) if (lo is not None and shift is not None) else lo,
+            "adjusted_ci_high": (hi - shift) if (hi is not None and shift is not None) else hi,
+        }
+        out["power"] = power_report(adj, lo, hi, n_cal, effects={"september": SEPTEMBER_H2_EFFECT})
+        return out
+
+    block = {"whole_window": one(rows), "fresh_from": fresh_from, "fresh": None}
+    if fresh_from:
+        fresh = [r for r in rows if _session_key(r) >= fresh_from]
+        if fresh:
+            block["fresh"] = one(fresh)
+    return block
+
+
 def build_summary(
     rows: Sequence[Mapping[str, Any]],
     cfg: ResearchConfig,
     meta: Optional[Mapping[str, Any]] = None,
     *,
     confluence_distance: float = 10.0,
+    null_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    fresh_from: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Every number the Markdown report prints, as JSON."""
+    """Every number the Markdown report prints, as JSON.
+
+    ``null_rows`` are the dataset's surrogate touches (``dataset.read_null``);
+    without them every null falls back to the gambler's-ruin formula and the
+    report says which one it used.  ``fresh_from`` (ISO date) adds the H2 test
+    on sessions from that date only.
+    """
+    null_rows = list(null_rows or [])
     cohorts = build_cohorts(
         confluence_distance=confluence_distance,
         min_extension=cfg.min_extension_for_reversion,
         min_broken=cfg.min_failed_extensions_for_continuation,
     )
     baseline = list(rows)
+    formula_all = _formula_null_rate(baseline, cfg.extension_step)
+    surrogate_all = _surrogate_rate(null_rows)["rate"] if null_rows else None
     cohort_stats: list[dict[str, Any]] = []
     for c in cohorts:
         sel = c.select(rows)
-        stat = {"key": c.key, "label": c.label, "description": c.description}
+        stat = {
+            "key": c.key,
+            "label": c.label,
+            "description": c.description,
+            "price_only": c.price_only,
+        }
         stat.update(summarize(sel))
         if c.key != "all":
             stat.update(compare_to_baseline(baseline, c.predicate))
+        # How much of a cohort's gap to the baseline the measurement itself
+        # explains. Every cohort gets the formula's answer, from its own
+        # touches' close-offsets; a price-only cohort also gets the
+        # surrogates', which carry the bell as well.
+        f = _formula_null_rate(sel, cfg.extension_step)
+        stat["formula_null_shift"] = (
+            (f - formula_all) if (f is not None and formula_all is not None) else None
+        )
+        stat["surrogate_null_shift"] = None
+        if c.price_only and surrogate_all is not None:
+            sr = _surrogate_rate(null_rows, c.predicate)["rate"]
+            stat["surrogate_null_shift"] = (sr - surrogate_all) if sr is not None else None
+        shift = (
+            stat["surrogate_null_shift"]
+            if stat["surrogate_null_shift"] is not None
+            else stat["formula_null_shift"]
+        )
+        diff = stat.get("clustered_diff")
+        stat["null_shift"] = shift
+        stat["net_of_null_diff"] = (
+            (diff - shift) if (diff is not None and shift is not None) else None
+        )
         cohort_stats.append(stat)
 
     # Multiplicity. Fourteen cohorts times several thresholds is a machine for
@@ -290,13 +714,24 @@ def build_summary(
     }
 
     splits = split_chronological(rows, cfg)
-    oos = {
-        name: {
+    oos = {}
+    for name, part in splits.items():
+        per = {c.key: summarize(c.select(part)) for c in cohorts}
+        base_rate = per["all"]["reversal_rate"]
+        for st in per.values():
+            # Against the SAME column's baseline: the baseline drifts across
+            # the split, so a raw rate compared across columns mixes the two.
+            st["excess_vs_column"] = (
+                st["reversal_rate"] - base_rate
+                if st["reversal_rate"] is not None and base_rate is not None
+                else None
+            )
+        oos[name] = {
             "sessions": len({_session_key(r) for r in part}),
-            "cohorts": {c.key: summarize(c.select(part)) for c in cohorts},
+            "first": min((_session_key(r) for r in part), default=None),
+            "last": max((_session_key(r) for r in part), default=None),
+            "cohorts": per,
         }
-        for name, part in splits.items()
-    }
 
     pooling = pooling_check(list(rows), lambda r: has_confluence(r, confluence_distance))
 
@@ -310,6 +745,20 @@ def build_summary(
         for sym in sorted({str(r.get("symbol")) for r in rows if r.get("symbol")})
     }
 
+    depth = _depth_table(rows, (0.5, 1.0, 2.0, 3.0, 5.0))
+    for band, (lo, hi) in zip(depth, ((0.5, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0), (5.0, None))):
+
+        def in_band(r: Mapping[str, Any], lo: float = lo, hi: Optional[float] = hi) -> bool:
+            k = abs(float(r.get("extension_k") or 0.0))
+            return k >= lo and (hi is None or k < hi)
+
+        band["null"] = _null_block(rows, null_rows, cfg, in_band)
+
+    cohort_by_key = {c["key"]: c for c in cohort_stats}
+    broken = next(c for c in cohorts if c.key == "prior_broken")
+    mech = _mechanical_null(rows, cfg)
+    mech["headline"] = _null_block(rows, null_rows, cfg)
+
     return {
         "generated_at": datetime.now().astimezone().isoformat(),
         "config_fingerprint": cfg.fingerprint(),
@@ -321,10 +770,16 @@ def build_summary(
         "by_book": by_book,
         "pooling_check": pooling,
         "cohorts": cohort_stats,
-        "depth_table": _depth_table(rows, (0.5, 1.0, 2.0, 3.0, 5.0)),
+        "depth_table": depth,
+        "depth_rho": _depth_rho(rows, cfg.extension_step),
+        "named_rungs": _named_rung_table(rows, null_rows, cfg, cohort_by_key),
+        "h2": _h2_block(rows, null_rows, cfg, broken.predicate, fresh_from),
+        "hypotheses": _hypothesis_stats(rows, null_rows, cfg, cohorts, cohort_by_key, oos),
+        "cost_hurdle": _cost_hurdle(rows, cfg),
         "distance_grid": _distance_grid(rows, cfg.confluence_buckets_pts),
         "discrimination": _discrimination(rows, cfg.confluence_buckets_pts),
-        "mechanical_null": _mechanical_null(rows, cfg),
+        "mechanical_null": mech,
+        "null_rows": len(null_rows),
         "out_of_sample": oos,
         "multiplicity": bh,
         "min_reportable_n": MIN_REPORTABLE_N,
@@ -333,8 +788,9 @@ def build_summary(
 
 def _cohort_rows_md(cohorts: Sequence[Mapping[str, Any]]) -> list[str]:
     lines = [
-        "| cohort | n | sessions | reversal | 95% CI | vs baseline | clustered 95% CI | p | BH |",
-        "|---|---:|---:|---:|---|---:|---|---:|---|",
+        "| cohort | n | sessions | reversal | 95% CI | vs baseline | clustered 95% CI | p | BH "
+        "| null shift | net of null |",
+        "|---|---:|---:|---:|---|---:|---|---:|---|---:|---:|",
     ]
     for c in cohorts:
         ci = (
@@ -352,9 +808,15 @@ def _cohort_rows_md(cohorts: Sequence[Mapping[str, Any]]) -> list[str]:
         pval = "—" if c.get("clustered_p") is None else f"{c['clustered_p']:.3f}"
         bh = {True: "**yes**", False: "no", None: "—"}[c.get("bh_significant")]
         thin = " ⚠︎thin" if c.get("thin") else ""
+        shift = c.get("null_shift")
+        tag = "ˢ" if c.get("surrogate_null_shift") is not None else ""
+        shift_txt = "—" if shift is None or c.get("key") == "all" else f"{shift * 100:+.1f}{tag}"
+        net = c.get("net_of_null_diff")
+        net_txt = "—" if net is None else f"{net * 100:+.1f} pts"
         lines.append(
             f"| {c['label']}{thin} | {c['n_resolved']} | {c['n_sessions']} | "
-            f"{_pct(c.get('reversal_rate'))} | {ci} | {eff} | {band} | {pval} | {bh} |"
+            f"{_pct(c.get('reversal_rate'))} | {ci} | {eff} | {band} | {pval} | {bh} | "
+            f"{shift_txt} | {net_txt} |"
         )
     return lines
 
@@ -443,9 +905,52 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
                     "Any cohort must be read against this number, never against "
                     "50%.\n"
                 )
+        head = mech.get("headline") or {}
+        if head.get("surrogate_null") is not None:
+            A(
+                "**The same null, measured.** The formula assumes every race "
+                "finishes; the surrogates replay each session's own post-range "
+                "bars with random direction through the identical rule, so the "
+                "bell and the unresolved touches are in it too.\n"
+            )
+            A("| | rate | n |")
+            A("|---|---:|---:|")
+            A(f"| observed (resolved touches) | {_pct(head.get('observed'))} | {head.get('n')} |")
+            A(
+                f"| formula null (same touches) | {_pct(head.get('formula_null'))} | "
+                f"{head.get('n')} |"
+            )
+            A(
+                f"| surrogate null | {_pct(head.get('surrogate_null'))} "
+                f"(±{_pct(head.get('surrogate_se'), 2)} MC) | {head.get('surrogate_n')} |"
+            )
+            A(
+                f"| surrogate touches unresolved at the bell | "
+                f"{_pct(head.get('surrogate_censored_share'))} | |"
+            )
+            A("")
+            if head.get("excess") is not None:
+                band = (
+                    f"[{head['excess_ci_low'] * 100:+.1f}, {head['excess_ci_high'] * 100:+.1f}]"
+                    if head.get("excess_ci_low") is not None
+                    else ""
+                )
+                A(
+                    f"- **Excess over the surrogate null: {head['excess'] * 100:+.1f} pts** "
+                    f"{band} (session-clustered).\n"
+                )
+        elif head:
+            A(
+                "> No surrogate rows were found beside this dataset, so every null "
+                "below is the formula alone. Rebuild with `null_replicas > 0` to "
+                "measure it.\n"
+            )
     A("## Q1 — Does extension distance predict reversion?\n")
-    A("| depth | n | sessions | reversal | 95% CI | median MFE (30m) | median MAE (30m) |")
-    A("|---|---:|---:|---:|---|---:|---:|")
+    A(
+        "| depth | n | sessions | reversal | 95% CI | null | excess | "
+        "median MFE (30m) | median MAE (30m) |"
+    )
+    A("|---|---:|---:|---:|---|---:|---:|---:|---:|")
     for band in summary["depth_table"]:
         ci = (
             f"[{_pct(band.get('reversal_ci_low'))} – {_pct(band.get('reversal_ci_high'))}]"
@@ -453,17 +958,69 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             else "—"
         )
         thin = " ⚠︎thin" if band.get("thin") else ""
+        nb = band.get("null") or {}
+        null = (
+            nb.get("surrogate_null")
+            if nb.get("surrogate_null") is not None
+            else nb.get("formula_null")
+        )
+        exc = nb.get("excess")
         A(
             f"| {band['band']}{thin} | {band['n_resolved']} | {band['n_sessions']} | "
-            f"{_pct(band.get('reversal_rate'))} | {ci} | "
+            f"{_pct(band.get('reversal_rate'))} | {ci} | {_pct(null)} | "
+            f"{'—' if exc is None else f'{exc * 100:+.1f}'} | "
             f"{_num(band.get('mfe_30_median'))} | {_num(band.get('mae_30_median'))} |"
         )
+    A("")
+    rho = summary.get("depth_rho") or {}
+    for label, key in (("raw", "raw"), ("net of the formula null", "net_of_formula_null")):
+        r = rho.get(key) or {}
+        if r.get("rho") is not None:
+            band = f" [{r['ci_lo']:+.3f}, {r['ci_hi']:+.3f}]" if r.get("ci_lo") is not None else ""
+            A(
+                f"- Spearman(depth, reversal), {label}: **{r['rho']:+.3f}**{band}, "
+                f"n={r['n']}, {r['n_sessions']} sessions"
+            )
     A("")
     A(
         "A monotone rise down this column is what the 'rubber band' claim predicts. "
         "A flat column falsifies it, and a rise that is inside the intervals is not "
         "a result.\n"
     )
+    rungs = summary.get("named_rungs") or []
+    if rungs:
+        A("### The customer's rungs: -100%, -150%, -200% of the range width\n")
+        A(
+            "Exact rungs, not bands. `-` is below the range, the side his chart "
+            "marks; `+` is the mirror above; `±` pools both. Each is set against "
+            "its OWN null, because the touches that reach a rung are not a random "
+            "draw of all touches. `p` and `BH` are the cohort test against the "
+            "baseline (cohorts 18-24).\n"
+        )
+        A("| rung | n | sessions | reversal | null | excess | clustered 95% CI | p | BH |")
+        A("|---|---:|---:|---:|---:|---:|---|---:|---|")
+        for r in rungs:
+            if not r.get("on_ladder"):
+                A(f"| {r['rung']} | — | — | not a rung at this step | | | | | |")
+                continue
+            null = r.get("surrogate_null")
+            if null is None:
+                null = r.get("formula_null")
+            exc = r.get("excess")
+            band = (
+                f"[{r['excess_ci_low'] * 100:+.1f}, {r['excess_ci_high'] * 100:+.1f}]"
+                if r.get("excess_ci_low") is not None
+                else "—"
+            )
+            pval = "—" if r.get("clustered_p") is None else f"{r['clustered_p']:.3f}"
+            bh = {True: "**yes**", False: "no", None: "—"}[r.get("bh_significant")]
+            thin = " ⚠︎thin" if (r.get("n") or 0) < MIN_REPORTABLE_N else ""
+            A(
+                f"| {r['rung']}{thin} | {r.get('n')} | {r.get('n_sessions')} | "
+                f"{_pct(r.get('observed'))} | {_pct(null)} | "
+                f"{'—' if exc is None else f'{exc * 100:+.1f}'} | {band} | {pval} | {bh} |"
+            )
+        A("")
 
     A("## Q2–Q7 — Cohorts\n")
     out.extend(_cohort_rows_md(summary["cohorts"]))
@@ -602,7 +1159,9 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         for name in ("discovery", "validation", "test"):
             st = (oos.get(name, {}).get("cohorts", {}) or {}).get(c["key"]) or {}
             nres = st.get("n_resolved", 0)
-            row += f" {_pct(st.get('reversal_rate'))} (n={nres}) |" if nres else " — |"
+            ex = st.get("excess_vs_column")
+            ex_txt = "" if ex is None or c["key"] == "all" else f", {ex * 100:+.1f}"
+            row += f" {_pct(st.get('reversal_rate'))} (n={nres}{ex_txt}) |" if nres else " — |"
         A(row)
     A("")
     A(
@@ -610,8 +1169,87 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         "these columns was fitted to the discovery period, whatever its p-value "
         "there. Note the BASELINE itself drifts across the columns, so read each "
         "cohort against the `All OR extension touches` row of the SAME column, "
-        "never against the pooled figure above.\n"
+        "never against the pooled figure above. The signed figure in each cell "
+        "is exactly that: points above or below its own column's baseline.\n"
     )
+
+    h2 = summary.get("h2") or {}
+    if h2.get("whole_window"):
+        A("## H2 — broken ladders: effect and power\n")
+        A(
+            "Cohort 11 against the baseline, then net of the mechanical null "
+            "(how much lower the null itself runs for broken-ladder touches). "
+            "Power is read off the cohort's own session-clustered interval; it "
+            "is not a textbook binomial, which would assume independent touches.\n"
+        )
+        A(
+            "| slice | n | cohort sessions | calendar sessions | vs baseline | null shift "
+            "| net of null | clustered 95% CI (net) | p | MDE (80%) |"
+        )
+        A("|---|---:|---:|---:|---:|---:|---:|---|---:|---:|")
+        for label, blk in (
+            ("whole window", h2.get("whole_window")),
+            (f"from {h2.get('fresh_from')}", h2.get("fresh")),
+        ):
+            if not blk:
+                continue
+
+            def f(v: Optional[float]) -> str:
+                return "—" if v is None else f"{v * 100:+.1f}"
+
+            band = (
+                f"[{blk['adjusted_ci_low'] * 100:+.1f}, {blk['adjusted_ci_high'] * 100:+.1f}]"
+                if blk.get("adjusted_ci_low") is not None
+                and blk.get("adjusted_ci_high") is not None
+                else "—"
+            )
+            pw = blk.get("power") or {}
+            pval = "—" if blk.get("clustered_p") is None else f"{blk['clustered_p']:.3f}"
+            mde = pw.get("mde")
+            A(
+                f"| {label} | {blk.get('n')} | {blk.get('cohort_sessions')} | "
+                f"{blk.get('n_calendar_sessions')} | {f(blk.get('clustered_diff'))} | "
+                f"{f(blk.get('null_shift'))} | {f(blk.get('adjusted_diff'))} | {band} | "
+                f"{pval} | {'—' if mde is None else f'{mde * 100:.1f}'} |"
+            )
+        A("")
+        A("| slice | true effect | power now | sessions for 80% | more sessions | ≈ months |")
+        A("|---|---:|---:|---:|---:|---:|")
+        for label, blk in (
+            ("whole window", h2.get("whole_window")),
+            (f"from {h2.get('fresh_from')}", h2.get("fresh")),
+        ):
+            for sc in ((blk or {}).get("power") or {}).get("scenarios", []):
+                name = {"observed": "as measured (net)", "september": "September's -6.0"}.get(
+                    sc["name"], sc["name"]
+                )
+                pw = sc.get("power_now")
+                months = sc.get("more_months")
+                A(
+                    f"| {label} | {name}: {sc['effect'] * 100:+.1f} | "
+                    f"{'—' if pw is None else f'{pw:.0%}'} | {sc.get('sessions_needed') or '—'} | "
+                    f"{sc.get('more_sessions') if sc.get('more_sessions') is not None else '—'} | "
+                    f"{'—' if months is None else f'{months:.0f}'} |"
+                )
+        A("")
+        A(
+            "Sessions scale the cohort's interval as 1/sqrt(sessions), which "
+            "assumes broken-ladder touches keep arriving at today's rate. The "
+            "fresh slice is the only clean test: the hypothesis was named after "
+            "looking at the September window.\n"
+        )
+
+    hurdle = summary.get("cost_hurdle") or {}
+    if hurdle.get("available"):
+        A("## Q10 — The NQ cost hurdle at this range length\n")
+        A(
+            f"Median NQ opening range **{hurdle['median_or_width_pts']:.1f} pts** over "
+            f"{hurdle['sessions']} sessions, so one step is {hurdle['step_pts']:.1f} pts. "
+            f"A round turn costs {hurdle['cost_pts']:.3f} pts "
+            f"(${hurdle['cost_dollars']:.2f}: commission plus one tick of slippage "
+            f"per side). Break-even needs the reversal rate to beat its mechanical "
+            f"null by **{hurdle['hurdle'] * 100:.2f} pts**.\n"
+        )
 
     A("## Pooling check — do the two option books agree?\n")
     pc = summary.get("pooling_check") or {}

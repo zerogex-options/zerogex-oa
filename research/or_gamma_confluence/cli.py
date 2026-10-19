@@ -23,6 +23,11 @@ no database at all.
     # 4. Parameter neighbourhoods, not a single winning value.
     python -m research.or_gamma_confluence.cli sweep NQ \\
         --start 2026-06-01 --end 2026-09-05
+
+    # 5. Opening-range lengths side by side on ONE window, one DB pass, with
+    #    the pre-registered build / defer / don't-build verdicts.
+    python -m research.or_gamma_confluence.cli compare-or \\
+        --start 2026-06-29 --end 2026-10-16 --or-minutes-grid 5 30 60
 """
 
 from __future__ import annotations
@@ -43,7 +48,16 @@ from research.or_gamma_confluence.config import (
     MODE_BOUNDARY,
     ResearchConfig,
 )
-from research.or_gamma_confluence.dataset import build_dataset, read_jsonl, read_meta, write_jsonl
+from research.or_gamma_confluence.compare import build_comparison, render_comparison
+from research.or_gamma_confluence.dataset import (
+    DatasetWriter,
+    build_dataset,
+    build_datasets,
+    read_jsonl,
+    read_meta,
+    read_null,
+    write_jsonl,
+)
 from research.or_gamma_confluence.features import TREND_FILTERS
 from research.or_gamma_confluence.instruments import DEFAULT_SYMBOLS, known_symbols
 from research.or_gamma_confluence.report import build_summary, render_markdown, write_csv
@@ -105,7 +119,7 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     cfg = _config_from_args(args)
     symbols = args.symbols or list(DEFAULT_SYMBOLS)
     with sources.research_connection() as conn:
-        payload = sources.coverage(conn, symbols, cfg)
+        payload = sources.coverage(conn, symbols, cfg, fresh_from=args.fresh_from)
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -151,24 +165,47 @@ def cmd_coverage(args: argparse.Namespace) -> int:
             f"{(c.get('lag_max_s') or 0):>10.1f}{c.get('negative_lag_rows', 0):>6}"
             f"{c.get('backfilled_pct', 0):>11.2f}  {verdict}"
         )
-    print("\n=== Usable window (what actually bounds the study) ===")
-    print(f"{'symbol':<7}{'gamma':>7}{'bars':>7}{'usable':>8}{'ranked':>8}  bound by")
+    fresh = args.fresh_from
+    print(
+        f"\n=== Usable sessions at OR={cfg.opening_range_minutes}m "
+        f"(what actually bounds the study) ==="
+    )
+    print(
+        f"{'symbol':<7}{'gamma':>7}{'bars':>7}{'usable':>8}"
+        f"{'new' if fresh else '':>6}{'ranked':>8}  window"
+    )
     for sym, block in payload["symbols"].items():
         tables = block["tables"]
-        gamma = (tables.get("gex_summary") or {}).get("sessions") or 0
         ranked = (tables.get("gex_by_strike") or {}).get("sessions") or 0
-        bar_table = (
-            "futures_quotes" if block["spec"]["bar_source"] == "futures" else "underlying_quotes"
+        u = block.get("sessions") or {}
+        if not u.get("available"):
+            print(f"{sym:<7}  session counts unavailable (see table errors above)")
+            continue
+        new_txt = str(u.get("usable_fresh", "")) if fresh else ""
+        flag = "  <-- THIN" if u["usable"] and u["usable"] < 40 else ""
+        print(
+            f"{sym:<7}{u['gamma_sessions']:>7}{u['bar_sessions']:>7}{u['usable']:>8}"
+            f"{new_txt:>6}{ranked:>8}  {u['first'] or '—'} .. {u['last'] or '—'}{flag}"
         )
-        bars = (tables.get(bar_table) or {}).get("sessions") or 0
-        usable = min(gamma, bars) if gamma and bars else 0
-        bound = "gamma frames" if gamma <= bars else "bars"
-        flag = "  <-- THIN" if usable and usable < 40 else ""
-        print(f"{sym:<7}{gamma:>7}{bars:>7}{usable:>8}{ranked:>8}  {bound}{flag}")
-
+    print(
+        f"\n  gamma  = ET dates with >= {cfg.min_session_frames} gex_summary frames "
+        f"inside 09:30-16:00"
+    )
+    print(
+        f"  bars   = ET dates with >= {cfg.min_or_bars} bars inside the "
+        f"{cfg.opening_range_minutes}-minute opening-range window"
+    )
+    print("  usable = dates in BOTH sets (an upper bound: the build's clock and")
+    print("           range-width gates can still drop a session, and say why)")
+    if fresh:
+        print(f"  new    = usable sessions on or after {fresh.isoformat()}")
+    print("  ranked = ET dates with any gex_by_strike row (all hours)")
     print("\nNotes:")
-    print("  * 'usable' is the intersection of gamma frames and bars — the real")
-    print("    ceiling on sessions. 'ranked' is the gex_by_strike window, which")
+    print("  * 'usable' is the intersection of gamma frames and bars by date — the")
+    print("    real ceiling on sessions. The 'sessions' column of the history")
+    print("    table counts every ET date with ANY row, pre/post-market included,")
+    print("    so it is history depth, not sample size. 'ranked' is the")
+    print("    gex_by_strike window, which")
     print("    caps the ranked-GEX ('GEX #4') confluence arm ONLY; every wall /")
     print("    flip / max-pain / pin cohort runs on the full 'usable' window.")
     print("    Run with --no-gex-ranks to use the long arm alone.")
@@ -245,7 +282,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             print(f"REFUSING: meta fingerprint {stored} not present in rows")
             return 2
 
-    summary = build_summary(rows, cfg, meta, confluence_distance=args.confluence_distance)
+    null_rows: list[dict[str, Any]] = []
+    for path in args.datasets:
+        null_rows.extend(read_null(path))
+    summary = build_summary(
+        rows,
+        cfg,
+        meta,
+        confluence_distance=args.confluence_distance,
+        null_rows=null_rows,
+        fresh_from=args.fresh_from.isoformat() if args.fresh_from else None,
+    )
     markdown = render_markdown(summary)
     print(markdown)
 
@@ -433,6 +480,100 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dataset_is_current(
+    path: Path, cfg: ResearchConfig, symbols: Sequence[str], start: date, end: date
+) -> bool:
+    """True when ``path`` was fully written under exactly this config and window.
+
+    The meta file is written last, so its presence means the build finished;
+    the fingerprint match means it measured what ``cfg`` describes.
+    """
+    meta = read_meta(path)
+    return bool(
+        meta
+        and meta.get("config_fingerprint") == cfg.fingerprint()
+        and meta.get("start") == start.isoformat()
+        and meta.get("end") == end.isoformat()
+        and list(meta.get("symbols") or []) == list(symbols)
+    )
+
+
+def cmd_compare_or(args: argparse.Namespace) -> int:
+    """Several opening-range lengths on ONE window, side by side.
+
+    One dataset per length, built in a single pass over the sessions (every
+    length reads the same rows), then each analyzed with the unchanged report
+    code, then laid out together with the pre-registered verdicts from
+    :mod:`.compare`.  A dataset already built under the same fingerprint and
+    window is reused rather than rebuilt; ``--rebuild`` forces it.
+    """
+    symbols = args.symbols or list(DEFAULT_SYMBOLS)
+    base = _config_from_args(args)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    fresh = args.fresh_from.isoformat() if args.fresh_from else None
+
+    cfgs = [base.variant(opening_range_minutes=m) for m in args.or_minutes_grid]
+    paths = [
+        outdir / f"orgc_or{c.opening_range_minutes}_s{c.extension_step:g}"
+        f"_l{c.gamma_min_lead_seconds}_{c.fingerprint()}.jsonl"
+        for c in cfgs
+    ]
+    todo = [
+        (c, p)
+        for c, p in zip(cfgs, paths)
+        if args.rebuild or not _dataset_is_current(p, c, symbols, args.start, args.end)
+    ]
+    print(f"symbols: {', '.join(symbols)}   window: {args.start} .. {args.end}")
+    for c, p in zip(cfgs, paths):
+        state = "build" if any(p == q for _, q in todo) else "reuse"
+        print(f"  {state:<6} {c.describe()}")
+    if todo:
+        print(f"\nBuilding {len(todo)} dataset(s) in one pass. Budget about one solo build.")
+        with sources.research_connection() as conn:
+            writers = [DatasetWriter(p, c) for c, p in todo]
+            build_datasets(conn, symbols, args.start, args.end, [c for c, _ in todo], writers)
+            for w in writers:
+                meta = w.close(symbols=symbols, start=args.start, end=args.end)
+                print(
+                    f"  OR={w.cfg.opening_range_minutes}m: {meta['rows']} events, "
+                    f"{meta['null_rows']} surrogate touches -> {w.path}"
+                )
+
+    summaries: dict[int, dict[str, Any]] = {}
+    for c, p in zip(cfgs, paths):
+        rows = read_jsonl(p)
+        summary = build_summary(
+            rows,
+            c,
+            read_meta(p),
+            confluence_distance=args.confluence_distance,
+            null_rows=read_null(p),
+            fresh_from=fresh,
+        )
+        stem = outdir / f"orgc_or{c.opening_range_minutes}_report"
+        Path(f"{stem}.md").write_text(render_markdown(summary), encoding="utf-8")
+        Path(f"{stem}.json").write_text(
+            json.dumps(summary, indent=2, default=str), encoding="utf-8"
+        )
+        summaries[c.opening_range_minutes] = summary
+
+    coverage = None
+    if args.coverage and Path(args.coverage).exists():
+        coverage = json.loads(Path(args.coverage).read_text(encoding="utf-8"))
+    cmp = build_comparison(summaries, coverage=coverage, fresh_from=fresh)
+    markdown = render_comparison(cmp)
+    (outdir / "comparison.md").write_text(markdown, encoding="utf-8")
+    (outdir / "comparison.json").write_text(
+        json.dumps(cmp, indent=2, default=str), encoding="utf-8"
+    )
+    print()
+    print(markdown)
+    print(f"\nwrote {outdir / 'comparison.md'} (send this file back for the findings doc)")
+    print(f"per-length reports: {outdir}/orgc_or*_report.md")
+    return 0
+
+
 def _add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--or-minutes",
@@ -527,6 +668,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"default: {' '.join(DEFAULT_SYMBOLS)}",
     )
     p.add_argument("--out", help="also write the full JSON here")
+    p.add_argument(
+        "--fresh-from",
+        type=_iso,
+        default=None,
+        help="also count usable sessions on or after this ET date (e.g. the day "
+        "after a previous study's window)",
+    )
     _add_config_args(p)
     p.set_defaults(func=cmd_coverage)
 
@@ -552,6 +700,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--force", action="store_true", help="analyse despite a config-fingerprint mismatch"
     )
+    p.add_argument(
+        "--fresh-from",
+        type=_iso,
+        default=None,
+        help="also test H2 on sessions from this ET date only",
+    )
     _add_config_args(p)
     p.set_defaults(func=cmd_analyze)
 
@@ -575,6 +729,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confluence-distance", type=float, default=10.0)
     _add_config_args(p)
     p.set_defaults(func=cmd_sweep)
+
+    p = sub.add_parser(
+        "compare-or",
+        help="opening-range lengths side by side on one window, with verdicts",
+    )
+    p.add_argument("symbols", nargs="*", choices=known_symbols() + [], default=None)
+    p.add_argument("--start", type=_iso, required=True)
+    p.add_argument("--end", type=_iso, required=True)
+    p.add_argument("--outdir", default="research_output/orgc_or60")
+    p.add_argument("--or-minutes-grid", type=int, nargs="+", default=(5, 30, 60))
+    p.add_argument("--confluence-distance", type=float, default=10.0)
+    p.add_argument(
+        "--fresh-from",
+        type=_iso,
+        default=None,
+        help="also test H2 on sessions from this ET date only (data the "
+        "hypothesis was not named on)",
+    )
+    p.add_argument("--coverage", help="a `coverage --out` JSON to embed in the report")
+    p.add_argument("--rebuild", action="store_true", help="rebuild even if a dataset is current")
+    _add_config_args(p)
+    p.set_defaults(func=cmd_compare_or)
 
     return parser
 
