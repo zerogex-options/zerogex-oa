@@ -2294,6 +2294,12 @@ async def get_gamma_weather_series(
                     "pending_state": weather.pending_state,
                     "pending_label": weather.pending_label,
                     "pending_bars": weather.pending_bars,
+                    # The four scan lights for this bar, by the rule the live
+                    # strip runs on its newest bar. Nothing stores them: like
+                    # the state, they are rebuilt from the stored components on
+                    # every read, so the Light history and the strip above it
+                    # cannot disagree about the bar they share.
+                    "lights": scan_lights(weather).as_dict(),
                 }
                 for bar_start, weather in zip(bar_starts, series)
             ],

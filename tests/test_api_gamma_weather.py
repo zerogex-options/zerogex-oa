@@ -458,3 +458,66 @@ def test_the_served_lights_are_the_module_s_own_verdict(monkeypatch: pytest.Monk
     )
 
     assert payload["lights"] == scan_lights(rebuilt).as_dict()
+
+
+def test_http_series_carries_the_four_lights_on_every_bar(monkeypatch: pytest.MonkeyPatch):
+    """The Light history draws one row per light across the session, so every
+    bar needs all four. A bar missing a key would draw as OFF, which is the
+    panel saying "this rule was not met" about a bar it never judged."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(12, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    for bar in payload["bars"]:
+        assert set(bar["lights"]) == {"agree", "heads_up", "fragile", "stand_down"}
+        assert all(isinstance(v, bool) for v in bar["lights"].values())
+
+
+def test_http_series_lights_are_the_module_s_verdict_for_each_bar(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Every bar's lights are scan_lights' answer for that bar's own reading,
+    not a copy of the newest bar's and not a second implementation."""
+    from src.analytics import gamma_weather as gw
+    from src.analytics.scan_lights import scan_lights
+
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(12, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        payload = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    for bar in payload["bars"]:
+        rebuilt = gw.Weather(
+            state=bar["state"],
+            label=bar["label"],
+            pressure=bar["pressure"],
+            structure=bar["structure"],
+            gamma_trend=bar["gamma_trend"],
+            lean_side=bar["lean_side"],
+            cushion=bar["cushion"],
+            sentence=bar["sentence"],
+            persistence=bar["persistence"],
+            cushion_band=bar["cushion_band"],
+        )
+        assert bar["lights"] == scan_lights(rebuilt).as_dict()
+
+
+def test_http_series_and_strip_agree_on_the_newest_bar(monkeypatch: pytest.MonkeyPatch):
+    """The strip shows the newest bar's lights and the history ends on that
+    same bar. If the two ever differed, the last segment of the history would
+    contradict the strip directly above it."""
+    app, mainmod = _build_app(monkeypatch)
+    flow, regime = _series(14, 5.0e8)
+
+    with TestClient(app) as client:
+        _attach(mainmod, flow, regime)
+        now = client.get("/api/gex/weather?symbol=SPY").json()
+        _attach(mainmod, flow, regime)
+        series = client.get("/api/gex/weather-series?symbol=SPY").json()
+
+    assert series["bars"][-1]["lights"] == now["lights"]

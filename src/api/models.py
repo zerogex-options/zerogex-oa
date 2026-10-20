@@ -798,6 +798,9 @@ class GammaWeatherBar(BaseModel):
     pending_state: Optional[str] = None
     pending_label: Optional[str] = None
     pending_bars: int = 0
+    #: The four scan lights on this bar, by the same rule as the current-state
+    #: read (src/analytics/scan_lights.py). What the Light history draws.
+    lights: Optional[Dict[str, bool]] = None
 
 
 class GammaWeatherChange(BaseModel):
