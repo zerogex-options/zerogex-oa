@@ -527,8 +527,16 @@ def test_nothing_joining_is_reported_rather_than_returned_empty(caplog):
         state = ThetaDataProvider(client).fetch_chain_state([symbol], include_open_interest=False)
 
     assert state.get(symbol, {}).get("bid") is None
-    assert "no strike / right column matched" in caplog.text
+    # Message reworded 2026-10-20: this is the JOINED-TO-NOTHING cause, and
+    # the old text blamed a misspelled column for it. The columns here are
+    # present and correctly spelled -- 650000 against a wanted 650.0 is the
+    # thousandths shape _normalise_strike documents, so the VALUE is the
+    # diagnosis and the spelling advice was a confident wrong instruction.
+    assert "JOINED TO NOTHING" in caplog.text
+    assert "Not a column-spelling problem" in caplog.text
+    assert "_FIELD_CANDIDATES" not in caplog.text
     assert "'strike'" in caplog.text, "the columns that arrived must be named"
+    assert "650000" in caplog.text, "the value is what identifies the units"
 
 
 def test_the_unmapped_warning_fires_once_per_shape(caplog):
@@ -546,7 +554,10 @@ def test_the_unmapped_warning_fires_once_per_shape(caplog):
                 [symbol], include_open_interest=False
             )
 
-    assert caplog.text.count("no strike / right column matched") == 1
+    # One cause, three polls, one line. The throttle also keys on the CAUSE
+    # as of 2026-10-20, so a different cause on the same columns still
+    # reports -- see tests/test_thetadata_unmapped_diagnostic.py.
+    assert caplog.text.count("JOINED TO NOTHING") == 1
 
 
 # ---------------------------------------------------------------------------

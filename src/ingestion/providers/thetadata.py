@@ -462,31 +462,83 @@ _REPORTED_SHAPES: set = set()
 _REPORTED_LOCK = threading.Lock()
 
 
-def report_unmapped(kind: str, rows: Sequence[Dict[str, Any]], fields: Sequence[str]) -> None:
-    """Warn, once per column shape, when rows arrive but nothing maps.
+def report_unmapped(
+    kind: str,
+    rows: Sequence[Dict[str, Any]],
+    fields: Sequence[str],
+    *,
+    unreadable: int = 0,
+    unmatched: int = 0,
+) -> None:
+    """Warn, once per cause per column shape, when rows arrive but nothing maps.
 
     This exists because the failure is otherwise invisible. If the server
     spells the strike column something :data:`_FIELD_CANDIDATES` does not
     list, every row is skipped and the chain comes back empty — which
-    reads exactly like a closed market or an unentitled symbol. Naming the
-    columns that actually arrived turns a silent zero into a one-line fix.
+    reads exactly like a closed market or an unentitled symbol.
+
+    ``matched == 0`` has **two distinguishable causes** and they need
+    different fixes, so the caller counts them separately:
+
+    ``unreadable``
+        The field could not be read from the row at all — a missing or
+        misspelled column, or a null value. The remedy is
+        :data:`_FIELD_CANDIDATES`, or asking the vendor why the column is
+        empty.
+    ``unmatched``
+        The fields read cleanly and then joined to nothing. The strike is
+        in the wrong units (the shape :func:`_normalise_strike` describes,
+        where an SPX 6500 arriving as 6.50 joins to no requested contract),
+        or the response covers a strike grid that does not include the
+        contracts this engine tracks. Naming the columns does not help
+        here; the VALUES do, which is why a sample is logged.
+
+    Reporting the counts and a sample rather than only the column names is
+    what makes the two separable in a log. ``_normalise_strike``'s
+    docstring has promised "the columns and values that arrived get logged"
+    since 2026-09; the values half was never implemented, and a 2026-10-19
+    production occurrence could not be diagnosed because of it.
+
+    The throttle key carries the cause, not just the columns. Keyed on
+    columns alone, one benign-looking occurrence silenced every later one
+    for the life of the process — so a real mapping failure arriving after
+    the first report was invisible.
     """
     if not rows:
         return
-    shape = (kind, frozenset(rows[0].keys()))
+    cause = "unreadable" if unreadable else "unmatched"
+    shape = (kind, cause, frozenset(rows[0].keys()))
     with _REPORTED_LOCK:
         if shape in _REPORTED_SHAPES:
             return
         _REPORTED_SHAPES.add(shape)
+    sample = {f: rows[0].get(f, "<column absent>") for f in fields}
+    if unreadable:
+        logger.warning(
+            "thetadata %s: %d row(s) returned, none mapped — %d row(s) could "
+            "not be READ for %s. Columns present: %s. Expected one of: %s. "
+            "First row's values: %r. A present column with a null value is "
+            "the vendor's problem; a missing one is _FIELD_CANDIDATES'.",
+            kind,
+            len(rows),
+            unreadable,
+            " / ".join(fields),
+            sorted(rows[0].keys()),
+            {f: _FIELD_CANDIDATES.get(f, ()) for f in fields},
+            sample,
+        )
+        return
     logger.warning(
-        "thetadata %s: %d row(s) returned but no %s column matched. "
-        "Columns present: %s. Expected one of: %s. "
-        "Add the real spelling to _FIELD_CANDIDATES.",
+        "thetadata %s: %d row(s) returned, none mapped — all %d read %s "
+        "cleanly and then JOINED TO NOTHING. Not a column-spelling problem: "
+        "the columns are present and readable. First row's values: %r. Either "
+        "the strike units are wrong (see _normalise_strike) or the response "
+        "covers a strike grid that excludes every contract requested.",
         kind,
         len(rows),
+        unmatched,
         " / ".join(fields),
-        sorted(rows[0].keys()),
-        {f: _FIELD_CANDIDATES.get(f, ()) for f in fields},
+        sample,
     )
 
 
@@ -1281,16 +1333,24 @@ class ThetaDataProvider(MarketDataProvider):
     ) -> None:
         rows = _rows(frame)
         matched = 0
+        # Counted apart because they need different fixes, and because the
+        # log could not tell them apart on 2026-10-19. See report_unmapped.
+        unreadable = 0
+        unmatched = 0
         for row in rows:
             strike = _normalise_strike(_pick(row, "strike"))
             right_raw = _pick(row, "right")
             if strike is None or right_raw is None:
+                unreadable += 1
                 continue
             right = "C" if str(right_raw).strip() in self._CALL_CODES else "P"
             symbol = wanted.get((root, expiration, round(strike, 4), right))
             if symbol is None:
                 # A contract outside the requested set. Expected whenever
-                # strike="*" returns the whole expiration; not an error.
+                # strike="*" returns the whole expiration; not an error on
+                # its own. It is only notable when NOTHING in the response
+                # matched, which is what the counter below reports.
+                unmatched += 1
                 continue
             # Counted here rather than above, so the "nothing mapped"
             # warning fires on a unit or key mismatch too -- not just on a
@@ -1347,7 +1407,13 @@ class ThetaDataProvider(MarketDataProvider):
             elif kind == "open_interest":
                 target["open_interest"] = _as_int(_pick(row, "open_interest"))
         if matched == 0:
-            report_unmapped(kind, rows, ("strike", "right"))
+            report_unmapped(
+                kind,
+                rows,
+                ("strike", "right"),
+                unreadable=unreadable,
+                unmatched=unmatched,
+            )
 
     def describe_columns(self, underlying: str = "SPY") -> Dict[str, Dict[str, Any]]:
         """One call per endpoint, reporting the columns the server actually sends.
