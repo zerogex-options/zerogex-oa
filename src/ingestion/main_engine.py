@@ -777,10 +777,10 @@ class IngestionEngine:
         # cycles. A bar stamped mid-interval floors to its own minute unchanged.
         bucket = bucket_timestamp(timestamp - timedelta(seconds=1), AGGREGATION_BUCKET_SECONDS)
 
-        # A cash index only prints in the cash session. Outside it a polling
-        # feed (ThetaData) keeps re-stamping the closing level as a new bar
-        # every minute; storing one would also publish it to the WebSocket
-        # and refresh the price the Greeks gate trusts. Drop it.
+        # A cash index stores bars for its cash session plus a few closing
+        # minutes, which is what TradeStation delivered. ThetaData answers
+        # beyond that, and storing such a bar would also publish it to the
+        # WebSocket and refresh the price the Greeks gate trusts. Drop it.
         if is_cash_index(self.db_symbol) and not cash_index_bar_in_session(bucket):
             return
 
