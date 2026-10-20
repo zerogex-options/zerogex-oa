@@ -50,6 +50,8 @@ __all__ = [
     "hma_series",
     "ema_series",
     "atr_series",
+    "touch_offset_r",
+    "prior_rung_respect",
     "build_features",
 ]
 
@@ -286,7 +288,24 @@ def _trend_reads(
     return out
 
 
-def _prior_rung_respect(
+def touch_offset_r(event: TouchEvent, r: float) -> Optional[float]:
+    """How far the touch bar CLOSED back inside the level, in units of R.
+
+    The event fires on the bar's extreme reaching the rung, but the forward
+    scan starts from its close -- so price begins the race to prev/next
+    already displaced toward prev by this much.  Under a driftless walk that
+    alone yields a reversal rate of ``0.5 + offset / (2 * step)``.  It is a
+    CONTROL, not a feature: see :mod:`.null`.  One definition, shared by the
+    real rows and the surrogate rows, so the two nulls cannot drift apart.
+    """
+    if r <= _EPS:
+        return None
+    if event.side == SIDE_UP:
+        return (event.level_price - event.spot_at_touch) / r
+    return (event.spot_at_touch - event.level_price) / r
+
+
+def prior_rung_respect(
     event: TouchEvent,
     prior: Sequence[TouchEvent],
     ctx: SessionContext,
@@ -378,24 +397,9 @@ def build_features(
         "direction_from_open": ("above" if event.level_price >= orange.open_price else "below"),
         "distance_from_open_pts": event.level_price - orange.open_price,
         "distance_from_open_r": ((event.level_price - orange.open_price) / r if r > _EPS else None),
-        # How far the touch bar CLOSED back inside the level, in units of R.
-        # The event fires on the bar's extreme reaching the rung, but the
-        # forward scan starts from its close — so price begins the race to
-        # prev/next already displaced toward prev by this much. Under a
-        # driftless walk that alone yields a reversal rate of
-        # 0.5 + offset/(2*step), which turns out to be essentially the whole
-        # observed baseline. It is a CONTROL, not a feature: see
-        # report._mechanical_null.
-        "touch_offset_r": (
-            (
-                (event.level_price - event.spot_at_touch)
-                if event.side == SIDE_UP
-                else (event.spot_at_touch - event.level_price)
-            )
-            / r
-            if r > _EPS
-            else None
-        ),
+        # A CONTROL, not a feature: the close-offset behind the mechanical
+        # null. See touch_offset_r and report._mechanical_null.
+        "touch_offset_r": touch_offset_r(event, r),
         # ── Clock ──
         "time_of_day_et": et.strftime("%H:%M:%S"),
         "minutes_since_open": (
@@ -449,7 +453,7 @@ def build_features(
         out["vwap_available"] = False
 
     # ── Prior ladder behaviour ──
-    out.update(_prior_rung_respect(event, prior, ctx, orange, cfg))
+    out.update(prior_rung_respect(event, prior, ctx, orange, cfg))
 
     # ── Gamma ──
     out["gamma_available"] = snapshot is not None

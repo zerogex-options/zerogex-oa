@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, replace
 from datetime import time
 from typing import Any, Optional
@@ -108,6 +109,17 @@ DEFAULT_CONFLUENCE_BUCKETS_BP: tuple[float, ...] = (1.0, 2.0, 3.5, 5.0, 7.0)
 #: track the touch band.
 MIN_OR_WIDTH_FLOOR_BP = 2.0
 
+#: Fraction of an opening-range window's minutes that must have a bar before
+#: the range counts as observed.  ``min_or_bars`` derives from it.
+#:
+#: The old derived default was a flat 2 bars, written for 5-minute ranges.  At
+#: 60 minutes that is 3% of the window: a session whose feed started at 10:25
+#: would build an "opening range" from five bars, report a range a fraction of
+#: the real hour's, and compress every rung toward the boundary -- a silent
+#: change of meaning rather than an error.  80% is "most of the window" at
+#: every length: 4 of 5 bars, 24 of 30, 48 of 60.
+MIN_OR_COVERAGE = 0.8
+
 
 def _round(value: float, places: int = 10) -> float:
     """Kill float noise so two configs that mean the same thing hash the same."""
@@ -132,7 +144,7 @@ class ResearchConfig:
 
     # ── Opening range ────────────────────────────────────────────────
     #: Length of the opening range in minutes, measured from ``session_start``.
-    #: Swept over 5 / 15 / 30.
+    #: Swept over 5 / 15 / 30; ``compare-or`` runs 5 / 30 / 60 on one window.
     opening_range_minutes: int = 5
     #: Minimum OR width, in basis points of the opening price, for a session to
     #: be usable.  A degenerate range makes every extension collapse onto the
@@ -159,14 +171,18 @@ class ResearchConfig:
     min_or_width_bp: Optional[float] = None
     #: Minimum bars required inside the OR window.
     #:
-    #: ``None`` (the default) DERIVES it as ``min(2, opening_range_minutes)``.
-    #: The old fixed 2 encoded "a 5-minute OR built from one bar is not an
-    #: opening range", which is true and which also made a ONE-minute opening
-    #: range impossible: the window holds exactly one minute bar, so every
-    #: session was skipped and the sweep returned an empty sample rather than
-    #: an answer.  A tester's primary setting is the 1-minute range, so that
-    #: was not a hypothetical.  Explicitly asking for more bars than the
-    #: window can hold raises rather than silently never matching.
+    #: ``None`` (the default) DERIVES it as
+    #: ``ceil(MIN_OR_COVERAGE * opening_range_minutes)``: 1 at one minute, 4 at
+    #: five, 24 at thirty, 48 at sixty.
+    #:
+    #: Two earlier versions each assumed a window length.  A fixed 2 made a
+    #: ONE-minute opening range impossible (the window holds exactly one bar,
+    #: so every session was skipped).  ``min(2, minutes)`` fixed that and broke
+    #: the other end: at 60 minutes two bars is 3% of the window, so a session
+    #: whose feed started late built its range from the last few minutes of
+    #: the hour and passed.  A coverage fraction means the same thing at every
+    #: length.  Explicitly asking for more bars than the window can hold raises
+    #: rather than silently never matching.
     min_or_bars: Optional[int] = None
 
     # ── Extension ladder ─────────────────────────────────────────────
@@ -292,6 +308,19 @@ class ResearchConfig:
     #: this fraction of a step before continuing.
     respect_retrace_frac: float = 0.5
 
+    # ── Mechanical null (measured, not assumed) ──────────────────────
+    #: Surrogate paths built per session for the measured null: the session's
+    #: own post-OR minute bars with each bar's direction flipped by a fair
+    #: coin (``null.py``).  The gambler's-ruin formula assumes every touch
+    #: resolves; at 60 minutes far more end at the bell.  The surrogates carry
+    #: that through the identical event rule on the real tape, and give each
+    #: price-only cohort a null of its own.  0 disables them.
+    null_replicas: int = 20
+    #: Base seed for the surrogates.  Each (symbol, session, replica) derives
+    #: its own stream from it, so a session's null does not depend on which
+    #: other sessions were in the run.
+    null_seed: int = 20261018
+
     # ── Out-of-sample split (chronological, never shuffled) ──────────
     discovery_frac: float = 0.6
     validation_frac: float = 0.2
@@ -316,9 +345,10 @@ class ResearchConfig:
         # Derived defaults first: the validation below reads them, and so does
         # every caller.  ``object.__setattr__`` because the dataclass is frozen
         # and these resolve exactly once, at construction, before the
-        # fingerprint can be taken.  With the shipped defaults they resolve to
-        # the previous hard-coded 2 and 2.0, so no existing run's fingerprint
-        # moves.
+        # fingerprint can be taken.  The width floor still resolves to the old
+        # hard-coded 2.0.  ``min_or_bars`` deliberately does not: the coverage
+        # rule resolves it to 4 at five minutes, not 2, so fingerprints moved
+        # when it was introduced (2026-10), along with ``null_replicas``.
         #
         # Which ones were derived is remembered so ``variant`` can re-derive
         # them.  It is a plain attribute rather than a field on purpose:
@@ -334,7 +364,11 @@ class ResearchConfig:
             ),
         )
         if self.min_or_bars is None:
-            object.__setattr__(self, "min_or_bars", min(2, self.opening_range_minutes))
+            object.__setattr__(
+                self,
+                "min_or_bars",
+                max(1, math.ceil(round(MIN_OR_COVERAGE * self.opening_range_minutes, 9))),
+            )
         if self.min_or_width_bp is None:
             object.__setattr__(
                 self,
@@ -387,6 +421,8 @@ class ResearchConfig:
             raise ValueError("discovery_frac + validation_frac must leave a non-empty holdout")
         if self.rearm_minutes is not None and self.rearm_minutes < 0:
             raise ValueError("rearm_minutes must not be negative")
+        if self.null_replicas < 0:
+            raise ValueError("null_replicas must not be negative")
         if not 0.0 <= self.max_rejected_frame_frac <= 1.0:
             raise ValueError("max_rejected_frame_frac must be in [0, 1]")
         # Production clamps silently; here it is an error, because a clamped

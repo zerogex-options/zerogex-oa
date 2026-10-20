@@ -639,6 +639,37 @@ def underlying_feed_expected(
     return open_t <= dt.time() <= close_t
 
 
+#: How long after the close a cash index's closing prints keep arriving.
+#: Measured on ThetaData: SPX's last print landed at 16:04 on 2026-10-16 and
+#: again on 2026-10-19, while TradeStation stored SPX through the 16:01 bar.
+#: NDX keeps printing until 17:15 on ThetaData, which TradeStation never
+#: stored; this cuts that tail off.
+CASH_INDEX_SETTLE_GRACE = timedelta(minutes=5)
+
+
+def cash_index_bar_in_session(bucket: datetime) -> bool:
+    """True when a cash index's 1-minute bar starting at ``bucket`` belongs to its session.
+
+    The window is ``[09:30, close + CASH_INDEX_SETTLE_GRACE]`` ET on a trading
+    day (16:05, or 13:05 on a half day). The close minute and the few after it
+    carry the closing prints: the bar stamped 16:00 is the one
+    ``get_session_closes`` reads as the index's close, and TradeStation stored
+    SPX through 16:01.
+
+    Outside it, nothing is stored. ThetaData keeps answering long after the
+    close (NDX to 17:15), and a snapshot that arrives without a timestamp is
+    stamped with the poll's own time, so a bar out there is either a tail
+    TradeStation never delivered or the closing level re-stamped as current.
+    Old prints the feed re-sends are a separate case, dropped at the provider
+    (see ``thetadata._INDEX_PRINT_MAX_AGE``).
+    """
+    dt = _to_et(bucket)
+    if not is_trading_session(dt.date()):
+        return False
+    close = datetime.combine(dt.date(), regular_session_close(dt.date()))
+    return time(9, 30) <= dt.time() <= (close + CASH_INDEX_SETTLE_GRACE).time()
+
+
 def is_underlying_active_session(
     dt: Optional[datetime] = None, symbol: Optional[str] = None
 ) -> bool:

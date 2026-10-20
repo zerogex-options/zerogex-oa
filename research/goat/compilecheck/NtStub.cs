@@ -137,6 +137,19 @@ namespace NinjaTrader.NinjaScript
     }
 }
 
+namespace NinjaTrader.NinjaScript.DrawingTools
+{
+    // The one Draw.Text overload the strategy uses: owner, tag, text,
+    // barsAgo, price, brush.
+    public class Text { }
+
+    public static class Draw
+    {
+        public static Text Text(NinjaScriptBase owner, string tag, string text, int barsAgo, double y,
+            System.Windows.Media.Brush textBrush) { return new Text(); }
+    }
+}
+
 namespace NinjaTrader.NinjaScript.Indicators
 {
     // Real NinjaScript puts indicators here; the strategy's `using` for it must
@@ -202,5 +215,17 @@ namespace System.ComponentModel.DataAnnotations
         public RangeAttribute(int minimum, int maximum) { }
         public RangeAttribute(double minimum, double maximum) { }
         public RangeAttribute(Type type, string minimum, string maximum) { }
+    }
+}
+
+// WPF is not in this mono install. Only the brush the strategy names.
+namespace System.Windows.Media
+{
+    public class Brush { }
+    public class SolidColorBrush : Brush { }
+
+    public static class Brushes
+    {
+        public static SolidColorBrush Cyan { get { return new SolidColorBrush(); } }
     }
 }

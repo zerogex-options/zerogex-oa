@@ -119,7 +119,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.ingestion.providers.base import (
@@ -215,6 +215,15 @@ _MV_STAGES = ("mv", "market_value", "marketvalue")
 def is_market_value_stage(stage: Optional[str]) -> bool:
     return (stage or "").strip().lower() in _MV_STAGES
 
+
+#: Oldest an index snapshot's own timestamp may be and still count as a new
+#: bar. Outside the session the index endpoint answers with the LAST print and
+#: that print's timestamp: before the open on 2026-10-19 it returned Friday's
+#: 16:04 SPX and 17:15 NDX prints on every poll, and ingestion kept rewriting
+#: those two rows up to 09:29:59, each rewrite broadcast as a live tick (the
+#: header flipping between ES and the SPX close). A live print is seconds old;
+#: five minutes leaves room for a slow index without letting a re-send through.
+_INDEX_PRINT_MAX_AGE = timedelta(minutes=5)
 
 #: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
 #: diagnostic covers the index endpoints too. VIX because it is one of the
@@ -1511,6 +1520,9 @@ class ThetaDataProvider(MarketDataProvider):
             if bar is None:
                 return None
             if index:
+                # A re-sent old print is not a new bar. See _INDEX_PRINT_MAX_AGE.
+                if bar.timestamp < datetime.now(timezone.utc) - _INDEX_PRINT_MAX_AGE:
+                    return None
                 # volume stays None: a cash index has no share volume of its
                 # own. Same reasoning as stream_index_bars.
                 return bar

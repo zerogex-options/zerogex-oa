@@ -66,15 +66,35 @@
 //    6. Optionally, the entry bar closes no more than EntryMaxTicksBeyondMid
 //       above the midband. Jim, 2026-10-09: "I would still like to enter at
 //       or below the midband." Off by default (-1).
+//    7. Optionally (RequirePumpkinSync), the PUMPKIN LINE, Jim's HMA(100),
+//       is heading the trade's way: up at least PumpkinFlatTicks over
+//       PumpkinSlopeLookback bars for a long. When it is flat or curling
+//       against the trade, the trade is still taken if the pumpkin sits at
+//       least PumpkinRoomTicks beyond the entry in the trade's direction
+//       (above a long, below a short), which leaves room to reach breakeven
+//       first. Jim, 2026-10-17: "eliminate most of the setups that go
+//       against the pumpkin line ... if there is enough room ... to meet our
+//       BE level." Off by default.
 //
 //  DEAD ZONES: up to three time windows where no new trade opens (open
 //  trades are still managed). Jim, 2026-10-13: "a LOT of chop between 2:40
 //  and 3:10", and "the first 10 minutes of the day session is crazy".
 //  HHMM, 24-hour, in the time zone the chart shows. Off when from == to.
 //
+//  SKIP LABELS (ShowSkipReasons): when GA passes on a bar it could have
+//  used as an entry bar, it writes on the chart which rules that bar
+//  failed, e.g. "pinch 9 > 6": the yellow line came no closer than 9 ticks
+//  to the midband, and the setting allows 6. Display only; a label never
+//  changes a trade.
+//
 //  EXITS — two lots:
 //    Lot 1 ("GOAT1") exits on the first opposite-closing bar.
 //    Lot 2 ("GOAT2") trails by TrailTicks.
+//    Lot 2 can instead be split over three profit targets
+//    (Lot2Target1Ticks to Lot2Target3Ticks). Its contracts are shared out
+//    one at a time, starting with target 1, and each leaves at its own
+//    target; a target of 0 leaves that contract on the trail. Jim,
+//    2026-10-19: "The three targets for Lot 2 will be ticks for now."
 //    Both carry an initial stop of the entry bar's range + StopExtraTicks,
 //    which on a 3-range chart is a 4-tick stop.
 //    Breakeven (BreakevenTriggerTicks, off at 0): once price has gone that
@@ -104,13 +124,17 @@
 
 #region Using declarations
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
+using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.NinjaScript.DrawingTools;
 using NinjaTrader.Core.FloatingPoint;
 #endregion
 
@@ -182,11 +206,49 @@ namespace NinjaTrader.NinjaScript.Strategies
 		// Midband and EE line. ISeries<double> so any MA family can back them.
 		private ISeries<double> mid;
 		private ISeries<double> ee;
+		// Jim's pumpkin line, an HMA. Read only by rule 7.
+		private ISeries<double> pumpkin;
 
 		// -- setup state ----------------------------------------------------
 		//: Bar index of the most recent qualifying pinch, or -1 when the EE
 		//: line has not been near the midband inside the lookback.
 		private int lastPinchBar = -1;
+
+		// -- skip labels ----------------------------------------------------
+		/// <summary>The entry rules, in the order Evaluate checks them.</summary>
+		private enum GoatRule { Zone, Pinch, Width, Slope, Direction, Flip, Color, Ee, Mid, Break, Pumpkin }
+
+		/// <summary>A rule a bar failed: what was measured, and the setting it missed.</summary>
+		private struct Miss
+		{
+			public GoatRule Rule;
+			public double Value;   // ticks, for the rules that measure something
+			public int Limit;      // the setting, in ticks
+
+			public Miss(GoatRule rule, double value, int limit)
+			{
+				Rule = rule;
+				Value = value;
+				Limit = limit;
+			}
+		}
+
+		//: Filled by Evaluate each flat bar. Kept, not reallocated, because
+		//: this runs on every bar of every optimization pass.
+		private readonly List<Miss> longMisses = new List<Miss>();
+		private readonly List<Miss> shortMisses = new List<Miss>();
+		private int lastSkipLabelBar = -1;
+		private int skipLabelCount;
+
+		//: A bar that failed more rules than this is not a near miss, and
+		//: labeling it would only bury the ones that are.
+		private const int SkipLabelMaxRules = 3;
+		//: At most one label per this many bars, so a run of candidates in a
+		//: pullback reads as one label rather than a pile.
+		private const int SkipLabelGapBars = 3;
+		//: Labels are drawn under rolling tags, so the oldest is reused once
+		//: this many exist. Thousands of drawn objects slow a chart down.
+		private const int SkipLabelMax = 300;
 
 		// -- trade state ----------------------------------------------------
 		//: Lot 1 exits once, on the first opposite-closing bar. Without this
@@ -217,6 +279,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 		//: Direction of the trade last entered. A position on the other side
 		//: can only come from an exit that overfilled, never from an entry.
 		private MarketPosition tradeDirection = MarketPosition.Flat;
+
+		//: How lot 2 enters: "GOAT2" as one trailing lot, or one signal per
+		//: target once Lot2Target*Ticks split it, each with its contracts and
+		//: target (0 = trail only). Planned in DataLoaded; the initial signal
+		//: keeps the exit code safe before that.
+		private string[] lot2Signals = { "GOAT2" };
+		private int[] lot2Quantities = new int[0];
+		private int[] lot2Targets = new int[0];
+		private static readonly string[] Lot2SplitSignals = { "GOAT2A", "GOAT2B", "GOAT2C" };
 
 		//: How close price may be to lot 1's stop before ExitTarget1 leaves the
 		//: exit to that stop. Order plumbing, not a trading judgment, so it is
@@ -288,6 +359,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 				Target1Mode = GoatTarget1Mode.FirstOppositeCloseBar;
 				Target1Ticks = 8;
 				TrailTicks = 8;
+				Lot2Target1Ticks = 0;        // all three 0 == lot 2 is one trailing lot
+				Lot2Target2Ticks = 0;
+				Lot2Target3Ticks = 0;
 				BreakevenTriggerTicks = 0;   // 0 == off
 				BreakevenPlusTicks = 1;
 
@@ -298,6 +372,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 				DeadZone2To = 0;
 				DeadZone3From = 0;
 				DeadZone3To = 0;
+
+				// --- pumpkin line (off until RequirePumpkinSync is ticked) ---
+				RequirePumpkinSync = false;
+				PumpkinPeriod = 100;
+				PumpkinSlopeLookback = 5;
+				PumpkinFlatTicks = 2;
+				PumpkinRoomTicks = 15;   // Jim: "15 ticks minimum is about right"
+
+				// --- chart labels ---
+				ShowSkipReasons = false;
 			}
 			else if (State == State.Configure)
 			{
@@ -307,6 +391,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 				BarsRequiredToTrade = Math.Max(
 					BarsRequiredToTrade,
 					Math.Max(MidPeriod, EePeriod) + PinchLookbackBars + 5);
+
+				// Only when the pumpkin is in use, so a run without it trades
+				// from the same bar it always has.
+				if (RequirePumpkinSync)
+					BarsRequiredToTrade = Math.Max(
+						BarsRequiredToTrade, PumpkinPeriod + PumpkinSlopeLookback);
+
+				// A split lot 2 enters under up to three signals besides lot
+				// 1's. A saved setting of 2 would quietly drop the last two,
+				// so this is raised here rather than left to the dialog.
+				if (Lot2IsSplit())
+					EntriesPerDirection = Math.Max(EntriesPerDirection, 4);
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -318,6 +414,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 				mid = MovingAverage(MidMaType, MidPeriod);
 				ee = MovingAverage(EeMaType, EePeriod);
+				pumpkin = HMA(PumpkinPeriod);
+
+				// IsInstantiatedOnEachOptimizationIteration is false, so one
+				// instance runs every optimization pass and state carried from
+				// bar to bar must start over here. A pinch left from the end of
+				// the last pass read as recent (CurrentBar minus a large bar
+				// index is negative) until the next real pinch replaced it.
+				lastPinchBar = -1;
+				lastSkipLabelBar = -1;
+				skipLabelCount = 0;
+
+				PlanLot2();
 			}
 		}
 
@@ -347,7 +455,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			UpdatePinch();
 			ManageOpenPosition();
 
-			if (Position.MarketPosition == MarketPosition.Flat && !InDeadZone())
+			if (Position.MarketPosition == MarketPosition.Flat)
 				LookForEntry();
 		}
 
@@ -355,7 +463,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// True when this bar's time falls in one of the dead zones, where no
 		/// new trade opens. Open trades are still managed. The pinch keeps
 		/// updating through a dead zone, so a setup that forms inside one can
-		/// still be taken just after it ends.
+		/// still be taken just after it ends. Checked as the first entry rule
+		/// in Evaluate, so a skip label can say "zone".
 		/// </summary>
 		private bool InDeadZone()
 		{
@@ -452,77 +561,242 @@ namespace NinjaTrader.NinjaScript.Strategies
 		// --------------------------------------------------------------
 		private void LookForEntry()
 		{
-			if (!HasRecentPinch())
-				return;
+			// With labels off, each side stops at its first failed rule, as
+			// the checks always have. With them on, every failed rule is
+			// collected so the label can show them all. Either way a side
+			// trades only when it fails nothing, so labels never change a
+			// trade.
+			bool all = ShowSkipReasons;
 
-			double slope = mid[0] - mid[MidSlopeLookback];
-			double slopeThreshold = MidSlopeMinTicks * TickSize;
-
-			// Jim: "Trouble comes with a flatter slope and narrow Bollinger
-			// bands." The slope half is MidSlopeMinTicks; this is the other
-			// half. 0 disables it.
-			if (MinBandWidthTicks > 0
-				&& 2.0 * BandStdDev * stdDev[0] < MinBandWidthTicks * TickSize)
-				return;
-
-			if (slope >= slopeThreshold && QualifiesLong(slope))
+			Evaluate(true, longMisses, all);
+			if (longMisses.Count == 0)
 			{
 				SetStops();
 				tradeDirection = MarketPosition.Long;
 				EnterLong(LotSize, "GOAT1");
-				EnterLong(LotSize, "GOAT2");
+				for (int i = 0; i < lot2Signals.Length; i++)
+					EnterLong(lot2Quantities[i], lot2Signals[i]);
+				return;
 			}
-			else if (slope <= -slopeThreshold && QualifiesShort(slope))
+
+			Evaluate(false, shortMisses, all);
+			if (shortMisses.Count == 0)
 			{
 				SetStops();
 				tradeDirection = MarketPosition.Short;
 				EnterShort(LotSize, "GOAT1");
-				EnterShort(LotSize, "GOAT2");
+				for (int i = 0; i < lot2Signals.Length; i++)
+					EnterShort(lot2Quantities[i], lot2Signals[i]);
+				return;
 			}
+
+			if (ShowSkipReasons)
+				LabelSkip();
 		}
 
-		private bool QualifiesLong(double slope)
+		/// <summary>
+		/// Every entry rule for one side, in order. The side qualifies when
+		/// nothing is added to <paramref name="misses"/>. With
+		/// <paramref name="all"/> false it stops at the first failed rule.
+		/// The comparisons are the ones the rules have always used; the
+		/// measured values only feed the labels.
+		/// </summary>
+		private void Evaluate(bool isLong, List<Miss> misses, bool all)
 		{
-			// Rule 4 — the entry bar closes up, after a black bar.
-			if (Close[0] <= Open[0])
-				return false;
-			if (RequireColorFlip && ColorOf(1) != GoatBarColor.Black)
-				return false;
-			if (!EntryBarAllowed(true))
-				return false;
+			misses.Clear();
+
+			if (InDeadZone())
+			{
+				misses.Add(new Miss(GoatRule.Zone, 0, 0));
+				if (!all)
+					return;
+			}
+
+			// Rule 2 — the pinch.
+			if (!HasRecentPinch())
+			{
+				misses.Add(new Miss(GoatRule.Pinch, all ? ClosestPinchTicks() : 0, PinchMaxTicks));
+				if (!all)
+					return;
+			}
+
+			// Jim: "Trouble comes with a flatter slope and narrow Bollinger
+			// bands." The slope half is rule 1; this is the other half. 0
+			// disables it.
+			double width = 2.0 * BandStdDev * stdDev[0];
+			if (MinBandWidthTicks > 0 && width < MinBandWidthTicks * TickSize)
+			{
+				misses.Add(new Miss(GoatRule.Width, width / TickSize, MinBandWidthTicks));
+				if (!all)
+					return;
+			}
+
+			// Rule 1 — the midband slopes the trade's way.
+			double slope = mid[0] - mid[MidSlopeLookback];
+			double slopeThreshold = MidSlopeMinTicks * TickSize;
+			if (isLong ? slope < slopeThreshold : slope > -slopeThreshold)
+			{
+				misses.Add(new Miss(GoatRule.Slope, (isLong ? slope : -slope) / TickSize, MidSlopeMinTicks));
+				if (!all)
+					return;
+			}
+
+			// Rule 4 — the entry bar closes the trade's way...
+			if (isLong ? Close[0] <= Open[0] : Close[0] > Open[0])
+			{
+				misses.Add(new Miss(GoatRule.Direction, 0, 0));
+				if (!all)
+					return;
+			}
+
+			// ...after a black bar for a long, a white one for a short...
+			if (RequireColorFlip
+				&& ColorOf(1) != (isLong ? GoatBarColor.Black : GoatBarColor.White))
+			{
+				misses.Add(new Miss(GoatRule.Flip, 0, 0));
+				if (!all)
+					return;
+			}
+
+			// ...in the color EntryBarColor asks for.
+			if (!EntryBarAllowed(isLong))
+			{
+				misses.Add(new Miss(GoatRule.Color, 0, 0));
+				if (!all)
+					return;
+			}
 
 			// Rule 5 — snuggler, not reacher.
-			if (Close[0] < ee[0] - EntryEeToleranceTicks * TickSize)
-				return false;
+			double eeTolerance = EntryEeToleranceTicks * TickSize;
+			if (isLong ? Close[0] < ee[0] - eeTolerance : Close[0] > ee[0] + eeTolerance)
+			{
+				double gap = isLong ? ee[0] - Close[0] : Close[0] - ee[0];
+				misses.Add(new Miss(GoatRule.Ee, gap / TickSize, EntryEeToleranceTicks));
+				if (!all)
+					return;
+			}
 
 			// Rule 6 — at the midband, not up and away from it. The pinch
 			// only says the EE line was near the midband within the last
 			// PinchLookbackBars; by the time a qualifying bar prints, price
-			// can be well above it.
+			// can be well past it.
+			double beyondLimit = EntryMaxTicksBeyondMid * TickSize;
 			if (EntryMaxTicksBeyondMid >= 0
-				&& Close[0] > mid[0] + EntryMaxTicksBeyondMid * TickSize)
-				return false;
+				&& (isLong ? Close[0] > mid[0] + beyondLimit : Close[0] < mid[0] - beyondLimit))
+			{
+				double beyond = isLong ? Close[0] - mid[0] : mid[0] - Close[0];
+				misses.Add(new Miss(GoatRule.Mid, beyond / TickSize, EntryMaxTicksBeyondMid));
+				if (!all)
+					return;
+			}
 
-			return !MidlineBrokenAgainst(true, slope);
+			// Rule 3 — no close through the midband since the pinch.
+			if (MidlineBrokenAgainst(isLong, slope))
+			{
+				misses.Add(new Miss(GoatRule.Break, 0, 0));
+				if (!all)
+					return;
+			}
+
+			// Rule 7 — the pumpkin heads the trade's way, or is far enough
+			// ahead of the entry to reach breakeven before price meets it.
+			// Ahead means above a long and below a short: a pumpkin behind
+			// price leaves no room by this measure.
+			if (RequirePumpkinSync)
+			{
+				double pumpkinSlope = pumpkin[0] - pumpkin[PumpkinSlopeLookback];
+				double flat = PumpkinFlatTicks * TickSize;
+				bool inSync = isLong ? pumpkinSlope >= flat : pumpkinSlope <= -flat;
+				double room = isLong ? pumpkin[0] - Close[0] : Close[0] - pumpkin[0];
+
+				if (!inSync && (PumpkinRoomTicks <= 0 || room < PumpkinRoomTicks * TickSize))
+					misses.Add(new Miss(GoatRule.Pumpkin, room / TickSize, PumpkinRoomTicks));
+			}
 		}
 
-		private bool QualifiesShort(double slope)
+		/// <summary>The nearest the EE line came to the midband in the pinch window, in ticks.</summary>
+		private double ClosestPinchTicks()
 		{
-			if (Close[0] > Open[0])
-				return false;
-			if (RequireColorFlip && ColorOf(1) != GoatBarColor.White)
-				return false;
-			if (!EntryBarAllowed(false))
-				return false;
+			double closest = double.MaxValue;
+			for (int i = 0; i <= PinchLookbackBars && i <= CurrentBar; i++)
+				closest = Math.Min(closest, Math.Abs(ee[i] - mid[i]));
+			return closest / TickSize;
+		}
 
-			if (Close[0] > ee[0] + EntryEeToleranceTicks * TickSize)
-				return false;
+		/// <summary>
+		/// Write on the chart why GA passed on a bar it might have taken, one
+		/// line per failed rule: under the bar for a long, over it for a
+		/// short. The side is the one the midband points to, and only a bar
+		/// that closes that way in the EntryBarColor color counts. Those are
+		/// the bars the rules would have used as the entry bar. A bar that
+		/// failed more than SkipLabelMaxRules rules is not a near miss and
+		/// gets no label.
+		/// </summary>
+		private void LabelSkip()
+		{
+			double slope = mid[0] - mid[MidSlopeLookback];
+			if (slope.ApproxCompare(0) == 0)
+				return;
 
-			if (EntryMaxTicksBeyondMid >= 0
-				&& Close[0] < mid[0] - EntryMaxTicksBeyondMid * TickSize)
-				return false;
+			bool isLong = slope > 0;
+			List<Miss> misses = isLong ? longMisses : shortMisses;
+			if (misses.Count == 0 || misses.Count > SkipLabelMaxRules)
+				return;
 
-			return !MidlineBrokenAgainst(false, slope);
+			string text = "";
+			foreach (Miss miss in misses)
+			{
+				if (miss.Rule == GoatRule.Direction || miss.Rule == GoatRule.Color)
+					return;
+				text += (text.Length > 0 ? "\n" : "") + Describe(miss);
+			}
+
+			if (lastSkipLabelBar >= 0 && CurrentBar - lastSkipLabelBar < SkipLabelGapBars)
+				return;
+
+			// Two bar heights clear of the bar, so the text never covers it.
+			double offset = 2 * Math.Max(High[0] - Low[0], 2 * TickSize);
+			double y = isLong ? Low[0] - offset : High[0] + offset;
+			Draw.Text(this, "GoatSkip" + (skipLabelCount % SkipLabelMax), text, 0, y, Brushes.Cyan);
+			skipLabelCount++;
+			lastSkipLabelBar = CurrentBar;
+		}
+
+		/// <summary>One label line: the rule, what was measured and the setting, in ticks.</summary>
+		private string Describe(Miss miss)
+		{
+			switch (miss.Rule)
+			{
+				case GoatRule.Zone:  return "zone";
+				case GoatRule.Flip:  return "flip";
+				case GoatRule.Break: return "break";
+				case GoatRule.Pinch: return "pinch " + Over(miss.Value) + " > " + miss.Limit;
+				case GoatRule.Width: return "width " + Under(miss.Value) + " < " + miss.Limit;
+				case GoatRule.Slope: return "slope " + Under(miss.Value) + " < " + miss.Limit;
+				case GoatRule.Ee:    return "EE " + Over(miss.Value) + " > " + miss.Limit;
+				case GoatRule.Mid:   return "mid " + Over(miss.Value) + " > " + miss.Limit;
+				case GoatRule.Pumpkin:
+					// With no room allowance, or the pumpkin behind price,
+					// a distance would only confuse.
+					return miss.Limit > 0 && miss.Value > 0
+						? "pumpkin " + Under(miss.Value) + " < " + miss.Limit
+						: "pumpkin";
+				default:
+					return miss.Rule.ToString();
+			}
+		}
+
+		// A measured value missed by being over its setting, rounded UP to a
+		// tenth so the label can never read "6 > 6". Under rounds down for the
+		// rules missed by being short of their setting.
+		private static string Over(double ticks)
+		{
+			return (Math.Ceiling(ticks * 10 - 1e-9) / 10).ToString("0.#", CultureInfo.InvariantCulture);
+		}
+
+		private static string Under(double ticks)
+		{
+			return (Math.Floor(ticks * 10 + 1e-9) / 10).ToString("0.#", CultureInfo.InvariantCulture);
 		}
 
 		/// <summary>
@@ -602,10 +876,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 			signalStopTicks = stopTicks;
 
 			SetStopLoss("GOAT1", CalculationMode.Ticks, stopTicks, false);
-			SetStopLoss("GOAT2", CalculationMode.Ticks, stopTicks, false);
+			foreach (string signal in lot2Signals)
+				SetStopLoss(signal, CalculationMode.Ticks, stopTicks, false);
 
 			if (Target1Mode == GoatTarget1Mode.FixedTicks)
 				SetProfitTarget("GOAT1", CalculationMode.Ticks, Target1Ticks);
+
+			// Lot 2's targets, when it is split. A target of 0 sets nothing,
+			// so that contract stays on the trail.
+			for (int i = 0; i < lot2Targets.Length; i++)
+				if (lot2Targets[i] > 0)
+					SetProfitTarget(lot2Signals[i], CalculationMode.Ticks, lot2Targets[i]);
 
 			// Entry fills on the next bar's open, so the stop price is not
 			// known yet; AnchorStops sets it on the first bar in position.
@@ -684,7 +965,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			// Every bar after the trigger, not just the first: if price was
 			// already back through the breakeven level, MoveStop only gets part
 			// of the way and a later bar finishes the move.
-			MoveStop("GOAT1", ref lot1Stop, BreakevenStop(isLong), isLong);
+			MoveStop(ref lot1Stop, BreakevenStop(isLong), isLong, "GOAT1");
 		}
 
 		private double BreakevenStop(bool isLong)
@@ -772,7 +1053,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 				stop = Tighter(stop, trail, isLong);
 			}
 
-			MoveStop("GOAT2", ref lot2Stop, stop, isLong);
+			// Every lot 2 contract shares one stop. One that has already left
+			// at its target has nothing for this to move; the value is stored
+			// for that signal's next entry, and SetStops resets it first.
+			MoveStop(ref lot2Stop, stop, isLong, lot2Signals);
 		}
 
 		/// <summary>The tighter of two stop prices for the trade's side.</summary>
@@ -792,7 +1076,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// than one tick inside the current price. Nothing is sent when nothing
 		/// would change.
 		/// </summary>
-		private void MoveStop(string fromEntrySignal, ref double current, double target, bool isLong)
+		private void MoveStop(ref double current, double target, bool isLong, params string[] fromEntrySignals)
 		{
 			double price = ExitSidePrice(isLong);
 			double capped = isLong
@@ -806,7 +1090,51 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 
 			current = capped;
-			SetStopLoss(fromEntrySignal, CalculationMode.Price, capped, false);
+			foreach (string signal in fromEntrySignals)
+				SetStopLoss(signal, CalculationMode.Price, capped, false);
+		}
+
+		// --------------------------------------------------------------
+		// Lot 2's three targets
+		// --------------------------------------------------------------
+		private bool Lot2IsSplit()
+		{
+			return Lot2Target1Ticks > 0 || Lot2Target2Ticks > 0 || Lot2Target3Ticks > 0;
+		}
+
+		/// <summary>
+		/// Plan lot 2's entries. Not split, it is the whole lot under "GOAT2"
+		/// with no target. Split, its contracts are shared out one at a time
+		/// starting with target 1: three per lot is one each, two leaves
+		/// target 3 without a contract, and a target with no contract is left
+		/// out rather than entered at zero.
+		/// </summary>
+		private void PlanLot2()
+		{
+			if (!Lot2IsSplit())
+			{
+				lot2Signals = new[] { "GOAT2" };
+				lot2Quantities = new[] { LotSize };
+				lot2Targets = new[] { 0 };
+				return;
+			}
+
+			int[] targets = { Lot2Target1Ticks, Lot2Target2Ticks, Lot2Target3Ticks };
+			List<string> signals = new List<string>();
+			List<int> quantities = new List<int>();
+			List<int> kept = new List<int>();
+			for (int i = 0; i < 3; i++)
+			{
+				int quantity = LotSize / 3 + (i < LotSize % 3 ? 1 : 0);
+				if (quantity == 0)
+					continue;
+				signals.Add(Lot2SplitSignals[i]);
+				quantities.Add(quantity);
+				kept.Add(targets[i]);
+			}
+			lot2Signals = signals.ToArray();
+			lot2Quantities = quantities.ToArray();
+			lot2Targets = kept.ToArray();
 		}
 
 		/// <summary>
@@ -873,12 +1201,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		[NinjaScriptProperty]
 		[Range(1.0, 100.0)]
-		[Display(Name = "Overbought (green/white above)", Order = 3, GroupName = "3. Stochastic")]
+		[Display(Name = "Overbought (white/dark red above)", Order = 3, GroupName = "3. Stochastic")]
 		public double StochOverbought { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0.0, 99.0)]
-		[Display(Name = "Oversold (red/black below)", Order = 4, GroupName = "3. Stochastic")]
+		[Display(Name = "Oversold (dark green/black below)", Order = 4, GroupName = "3. Stochastic")]
 		public double StochOversold { get; set; }
 
 		[NinjaScriptProperty]
@@ -968,18 +1296,33 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name = "Lot 2 trail (ticks; waits for breakeven when it's on)", Order = 7, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 2 trail (ticks; waits for breakeven when it's on)", Order = 10, GroupName = "5. Sizing and exits")]
 		public int TrailTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Breakeven: after ticks in profit (0=off)", Order = 8, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Breakeven: after ticks in profit (0=off)", Order = 11, GroupName = "5. Sizing and exits")]
 		public int BreakevenTriggerTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Breakeven: stop at entry plus (ticks)", Order = 9, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Breakeven: stop at entry plus (ticks)", Order = 12, GroupName = "5. Sizing and exits")]
 		public int BreakevenPlusTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Lot 2 target 1 (ticks, 0=trail)", Order = 7, GroupName = "5. Sizing and exits")]
+		public int Lot2Target1Ticks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Lot 2 target 2 (ticks, 0=trail)", Order = 8, GroupName = "5. Sizing and exits")]
+		public int Lot2Target2Ticks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Lot 2 target 3 (ticks, 0=trail)", Order = 9, GroupName = "5. Sizing and exits")]
+		public int Lot2Target3Ticks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, 2359)]
@@ -1010,6 +1353,34 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(0, 2359)]
 		[Display(Name = "Zone 3 to (HHMM, 24h)", Order = 6, GroupName = "6. Dead zones (no new trades)")]
 		public int DeadZone3To { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Require pumpkin in sync (off = ignore it)", Order = 1, GroupName = "7. Pumpkin line")]
+		public bool RequirePumpkinSync { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(2, int.MaxValue)]
+		[Display(Name = "Pumpkin: HMA period", Order = 2, GroupName = "7. Pumpkin line")]
+		public int PumpkinPeriod { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "Pumpkin: slope lookback (bars)", Order = 3, GroupName = "7. Pumpkin line")]
+		public int PumpkinSlopeLookback { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Pumpkin: min slope over lookback (ticks; less is flat)", Order = 4, GroupName = "7. Pumpkin line")]
+		public int PumpkinFlatTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Pumpkin: room to trade against it (ticks, 0=never)", Order = 5, GroupName = "7. Pumpkin line")]
+		public int PumpkinRoomTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Label skipped setups (why GA passed)", Order = 1, GroupName = "8. Chart labels")]
+		public bool ShowSkipReasons { get; set; }
 
 		#endregion
 	}

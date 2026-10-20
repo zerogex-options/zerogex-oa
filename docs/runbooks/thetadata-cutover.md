@@ -49,9 +49,37 @@ exists to retire is OPRA / CTA / UTP / CGIF / GIDS — options and index data.
 CME futures sit in a different licensing regime, and keeping them on
 TradeStation does not reinstate the options exposure.
 
-Porting futures to ThetaData is separate work: a provider seam that does not
-exist yet, plus whatever ThetaData charges for CME. Not a cutover blocker, and
-not a reason to delay Monday.
+Porting futures off TradeStation is separate work, and there are exactly three
+end states. ADDED 2026-10-16, because "cannot be cancelled" was being read as
+"never".
+
+**A — TradeStation, futures-only tier.** Zero code, zero risk. Ask what the
+cheapest plan serving @ES and @NQ costs. Do this first regardless, because it
+is the floor the other two have to beat.
+
+**B — Databento `GLBX.MDP3` for ES/NQ.** Real-time CME, keeps every current
+behaviour including the overnight display swap. Costs two pieces of work: wire
+`futures_underlying_ingester` to the provider seam (it builds a
+`TradeStationClient` directly today, and `ProviderBase.stream_futures_bars`
+exists with **zero callers** — the slot was declared and never adopted), then
+write the Databento provider. Note Databento cannot replace ThetaData, only sit
+beside it: its catalogue carries no index feed at all (`MAIN.CGIF` 404s), so it
+cannot serve SPX, VIX, VXN or NDX values at any price.
+
+**C — delayed CME, free.** `providers/thetadata.py` records that delayed CME
+"carries no exchange fee so long as nothing displays it". That qualifier decides
+it, because `futures_quotes` has two consumers and they differ exactly on
+display:
+
+| consumer | displays a futures price? | delayed data OK? |
+|---|---|---|
+| basis engine (`src.jobs.futures_projection`) | no — it measures a carry ratio | yes |
+| overnight display swap | **yes**, under the index label | **no** |
+
+So C reaches **zero TradeStation spend**, at the price of giving up the
+overnight display swap. That is a product decision, not a technical one.
+
+None of the three is a cutover blocker and none is a reason to delay Monday.
 
 ## What actually changes
 
@@ -208,6 +236,63 @@ is no clean third option, and that is worth knowing before you need it rather
 than at 11:00 on a Monday.
 
 The rows already written stay written. Nothing in the cutover is destructive.
+
+## After the cutover — running TradeStation as the watchdog
+
+ADDED 2026-10-16. The same rehearsal machinery, pointed the other way: once
+production is on ThetaData, run TradeStation into the rehearsal database and
+compare each evening. Independent daily confirmation, nothing touching the live
+site, and `shadow-stop` selects on `DB_NAME` so either arm stops alone.
+
+**SPY only.** TradeStation caps concurrent streams at nominally 10 per account.
+After Monday production's TradeStation usage drops to the futures streams
+alone, which frees a lot of room — but a shadow arm also consumes TradeStation
+quota for futures whatever its candidate feed is (the `shadow-run` banner says
+so), so the budget is production's futures plus the arm's futures plus the
+arm's option streams. SPY is comfortable, two symbols is tight, and the cap is
+**not header-observable**: its only symptom is a stream that connects 200 OK
+and dies silently inside 30 seconds, which is the 2026-06 incident. Measure
+before widening. Do not reason about it from arithmetic alone.
+
+First time only:
+
+```bash
+make shadow-pgpass SHADOW_DB=zerogex_shadow_ts
+make shadow-create  SHADOW_DB=zerogex_shadow_ts
+```
+
+Each morning, pre-open, after confirming nothing else holds a stream:
+
+```bash
+make shadow-status SHADOW_DB=zerogex_shadow_ts          # must be 0
+WID=$(tmux new-window -t shadow -P -F '#{window_id}')
+tmux send-keys -t "$WID" "cd ~/zerogex-oa && \
+  SHADOW_LOG=~/shadow-ts-$(date +%F).log make shadow-run \
+  SHADOW_DB=zerogex_shadow_ts SHADOW_PROVIDER=tradestation \
+  FLOW_CLASSIFIER=tick SHADOW_UNDERLYINGS=SPY" C-m
+```
+
+`FLOW_CLASSIFIER=tick` on purpose: production now runs tick, so holding the
+method fixed makes the **feed** the only variable. That is F15's design, and
+F15 measured the feed's own cost at **−0.4pp** on SPY against day-to-day
+variance of about ±8 points.
+
+After the close:
+
+```bash
+make shadow-stop SHADOW_DB=zerogex_shadow_ts
+make shadow-compare      SHADOW_DB=zerogex_shadow_ts 2>&1
+make shadow-compare-flow SHADOW_DB=zerogex_shadow_ts DAY=$(date +%F)
+```
+
+**What would be a real signal:** SPY's share-of-flipped-flow diverging by more
+than a couple of points from production, or a coverage gap on the ThetaData
+side that the TradeStation arm does not share. Anything inside ±8 on a single
+day is the band, not a finding (F15).
+
+**When to stop.** Two clean weeks is enough to retire the daily run; after
+that, re-run it when something looks wrong rather than on a schedule. Keep the
+rehearsal database — recreating it costs more than storing it.
 
 ## What this does NOT fix, and should not be expected to
 

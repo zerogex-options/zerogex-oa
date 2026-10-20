@@ -55,6 +55,7 @@ __all__ = [
     "fetch_strike_frames",
     "fetch_trade_bias",
     "coverage",
+    "usable_sessions",
     "SUMMARY_COLUMNS",
 ]
 
@@ -79,6 +80,16 @@ def session_bounds(session: date, cfg: ResearchConfig) -> tuple[datetime, dateti
     return start.astimezone(UTC), end.astimezone(UTC)
 
 
+_SESSIONS_SQL = """
+    SELECT DISTINCT (timestamp AT TIME ZONE 'America/New_York')::date AS d
+      FROM gex_summary
+     WHERE underlying = %(symbol)s
+       AND timestamp >= %(start)s
+       AND timestamp < %(end)s
+     ORDER BY d
+"""
+
+
 def fetch_sessions(conn: Any, gamma_symbol: str, start: date, end: date) -> list[date]:
     """ET session dates in ``[start, end]`` that have gamma frames.
 
@@ -86,19 +97,19 @@ def fetch_sessions(conn: Any, gamma_symbol: str, start: date, end: date) -> list
     asks for days the platform actually published: a holiday or an outage
     simply does not appear, instead of entering the sample as a session with no
     levels.
-    """
-    sql = """
-        SELECT DISTINCT (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::date AS d
-          FROM gex_summary
-         WHERE underlying = %(symbol)s
-           AND timestamp >= %(start)s
-           AND timestamp < %(end)s
-         ORDER BY d
+
+    ``timestamp`` is ``TIMESTAMPTZ``, so ``AT TIME ZONE 'America/New_York'``
+    alone yields the ET wall clock.  The earlier ``AT TIME ZONE 'UTC' AT TIME
+    ZONE 'America/New_York'`` is the idiom for a naive column; on a
+    ``TIMESTAMPTZ`` it shifts the instant a second time, so an ETF's
+    post-close frames landed on the NEXT date and every Friday produced a
+    Saturday "session".  Those were skipped downstream as ``no_bars``, so no
+    event was ever affected, but the same expression inflated ``coverage``.
     """
     lo = datetime.combine(start, time(0, 0), tzinfo=ET)
     hi = datetime.combine(end + timedelta(days=1), time(0, 0), tzinfo=ET)
     with conn.cursor() as cur:
-        cur.execute(sql, {"symbol": gamma_symbol.upper(), "start": lo, "end": hi})
+        cur.execute(_SESSIONS_SQL, {"symbol": gamma_symbol.upper(), "start": lo, "end": hi})
         return [r[0] for r in cur.fetchall() if r[0] is not None]
 
 
@@ -250,10 +261,25 @@ def _span(conn: Any, sql: str, params: Mapping[str, Any]) -> dict[str, Any]:
 
 _SPAN_SQL = """
     SELECT MIN(timestamp), MAX(timestamp), COUNT(*),
-           COUNT(DISTINCT (timestamp AT TIME ZONE 'UTC'
-                           AT TIME ZONE 'America/New_York')::date)
+           COUNT(DISTINCT (timestamp AT TIME ZONE 'America/New_York')::date)
       FROM {table}
      WHERE {column} = %(symbol)s
+"""
+
+#: Rows per ET date inside the cash session, and inside the opening-range
+#: window.  ``sessions`` in :data:`_SPAN_SQL` counts every ET date with ANY row,
+#: which includes pre- and post-market prints; this counts what the study can
+#: actually use.  Bounds are ET wall-clock times, so DST needs no handling.
+_RTH_SQL = """
+    SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+           COUNT(*),
+           COUNT(*) FILTER (
+               WHERE (timestamp AT TIME ZONE 'America/New_York')::time < %(or_end)s)
+      FROM {table}
+     WHERE {column} = %(symbol)s
+       AND (timestamp AT TIME ZONE 'America/New_York')::time >= %(start)s
+       AND (timestamp AT TIME ZONE 'America/New_York')::time < %(end)s
+     GROUP BY 1
 """
 
 #: Every table this study reads, with the column its symbol lives under.
@@ -330,16 +356,95 @@ def _publish_lag(
     }
 
 
+def _rth_counts(
+    conn: Any, table: str, column: str, symbol: str, cfg: ResearchConfig
+) -> Optional[dict[date, tuple[int, int]]]:
+    """``{ET date: (rows in the cash session, rows in the OR window)}``.
+
+    ``None`` when the read fails, so a missing table reads as unknown rather
+    than as zero sessions.  ``table`` and ``column`` come from
+    :data:`_COVERAGE_TABLES` only.
+    """
+    or_end = (
+        datetime.combine(date(2000, 1, 3), cfg.session_start)
+        + timedelta(minutes=cfg.opening_range_minutes)
+    ).time()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                _RTH_SQL.format(table=table, column=column),
+                {
+                    "symbol": symbol.upper(),
+                    "start": cfg.session_start,
+                    "end": cfg.session_end,
+                    "or_end": or_end,
+                },
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.debug("RTH count failed for %s.%s=%s", table, column, symbol, exc_info=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    return {d: (int(n or 0), int(n_or or 0)) for d, n, n_or in rows if d is not None}
+
+
+def usable_sessions(
+    gamma: Optional[Mapping[date, tuple[int, int]]],
+    bars: Optional[Mapping[date, tuple[int, int]]],
+    cfg: ResearchConfig,
+    *,
+    fresh_from: Optional[date] = None,
+) -> dict[str, Any]:
+    """The sessions a build could use: enough frames AND a covered OR window.
+
+    Pure, so the rule is testable without a database.  It mirrors the two
+    session-level gates in ``dataset.build_session`` that depend only on row
+    counts -- ``min_session_frames`` frames inside the cash session, and
+    ``min_or_bars`` bars inside the opening-range window -- and takes the
+    INTERSECTION by date.  The previous table took ``min(gamma, bars)`` of two
+    separate counts, which is only the intersection when the two sets happen
+    to nest.
+
+    It is still an upper bound: the publish-clock and range-width gates need
+    the rows themselves and are applied by the build, which reports what they
+    removed in its skip reasons.
+    """
+    if gamma is None or bars is None:
+        return {"available": False}
+    gamma_ok = {d for d, (n, _) in gamma.items() if n >= cfg.min_session_frames}
+    bars_ok = {d for d, (_, n_or) in bars.items() if n_or >= cfg.min_or_bars}
+    usable = sorted(gamma_ok & bars_ok)
+    out: dict[str, Any] = {
+        "available": True,
+        "opening_range_minutes": cfg.opening_range_minutes,
+        "gamma_sessions": len(gamma_ok),
+        "bar_sessions": len(bars_ok),
+        "usable": len(usable),
+        "first": usable[0].isoformat() if usable else None,
+        "last": usable[-1].isoformat() if usable else None,
+        "gamma_only": len(gamma_ok - bars_ok),
+        "bars_only": len(bars_ok - gamma_ok),
+    }
+    if fresh_from is not None:
+        out["fresh_from"] = fresh_from.isoformat()
+        out["usable_fresh"] = sum(1 for d in usable if d >= fresh_from)
+    return out
+
+
 def coverage(
     conn: Any,
     symbols: Sequence[str],
     cfg: ResearchConfig,
     *,
     lag_lookback_days: int = 120,
+    fresh_from: Optional[date] = None,
 ) -> dict[str, Any]:
     """How much usable history exists, per symbol and per table.
 
-    This is the read that bounds the whole study, and it answers three
+    This is the read that bounds the whole study, and it answers four
     questions the code cannot:
 
     * How far back does ``gex_summary`` go?  (retention-exempt, so possibly
@@ -348,15 +453,31 @@ def coverage(
       is capped here and only here)
     * Is ``created_at`` a usable publish clock, or has backfilling made it
       fiction?
+    * How many SESSIONS can a build at ``cfg.opening_range_minutes`` actually
+      use?  That is :func:`usable_sessions`, counted inside the cash session
+      only.  The per-table ``sessions`` figure counts every ET date with any
+      row at all, pre- and post-market included, and is kept for history
+      depth, not as a sample size.
     """
     out: dict[str, Any] = {
         "generated_at": datetime.now(tz=UTC).isoformat(),
         "availability_clock": cfg.availability_clock,
         "max_publish_lag_seconds": cfg.max_publish_lag_seconds,
+        "opening_range_minutes": cfg.opening_range_minutes,
+        "min_or_bars": cfg.min_or_bars,
+        "min_session_frames": cfg.min_session_frames,
+        "fresh_from": fresh_from.isoformat() if fresh_from else None,
         "symbols": {},
     }
     since = datetime.now(tz=UTC) - timedelta(days=lag_lookback_days)
     lag_cache: dict[str, dict[str, Any]] = {}
+    rth_cache: dict[tuple[str, str], Optional[dict[date, tuple[int, int]]]] = {}
+
+    def _rth(table: str, column: str, symbol: str):
+        key = (table, symbol.upper())
+        if key not in rth_cache:
+            rth_cache[key] = _rth_counts(conn, table, column, symbol, cfg)
+        return rth_cache[key]
 
     for symbol in symbols:
         inst = spec(symbol)
@@ -377,10 +498,17 @@ def coverage(
             }
         if inst.gamma_symbol not in lag_cache:
             lag_cache[inst.gamma_symbol] = _publish_lag(conn, inst.gamma_symbol, cfg, since)
+        gamma_days = _rth("gex_summary", "underlying", inst.gamma_symbol)
+        bar_days = (
+            _rth("futures_quotes", "index_symbol", inst.bar_symbol)
+            if inst.is_futures
+            else _rth("underlying_quotes", "symbol", inst.bar_symbol)
+        )
         out["symbols"][inst.key] = {
             "spec": inst.to_dict(),
             "tables": tables,
             "publish_clock": lag_cache[inst.gamma_symbol],
+            "sessions": usable_sessions(gamma_days, bar_days, cfg, fresh_from=fresh_from),
         }
     return out
 
