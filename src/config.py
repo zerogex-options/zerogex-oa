@@ -2073,6 +2073,25 @@ INGEST_EXPIRATIONS = _getenv_int("INGEST_EXPIRATIONS", 3)
 INGEST_MONTHLY_EXPIRATIONS = _getenv_int("INGEST_MONTHLY_EXPIRATIONS", 0)
 INGEST_STRIKE_COUNT_MAX = _getenv_int("INGEST_STRIKE_COUNT_MAX", 40)
 INGEST_STRIKE_PCT_RANGE = _getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0)
+# Per-symbol strike band, keyed by CANONICAL symbol, for an underlying whose
+# ordinary day is wider than the shared band. A single stock moves several
+# times as far in a session as SPY, so a band that spans a few of SPY's days
+# covers about one of NVDA's and leaves its round-number walls outside the
+# chain. JSON map, written UNQUOTED in .env so systemd, python-dotenv and the
+# Makefile's `-include .env` all read the same value (make keeps quotes as
+# literal characters): INGEST_STRIKE_PCT_RANGE_BY_SYMBOL={"NVDA": 8}. A symbol
+# not in the map uses INGEST_STRIKE_PCT_RANGE, and INGEST_STRIKE_COUNT_MAX
+# still caps the strikes either way.
+INGEST_STRIKE_PCT_RANGE_BY_SYMBOL = _parse_symbol_float_map(
+    "INGEST_STRIKE_PCT_RANGE_BY_SYMBOL", min=0.5, max=50.0
+)
+
+
+def resolve_strike_pct_range(symbol: str, default: float) -> float:
+    """Strike band (percent of spot) for ``symbol`` (canonical), or ``default``."""
+    return INGEST_STRIKE_PCT_RANGE_BY_SYMBOL.get((symbol or "").upper(), default)
+
+
 ANALYTICS_UNDERLYING = _getenv_str("ANALYTICS_UNDERLYING", "SPY")
 ANALYTICS_UNDERLYINGS = _getenv_str("ANALYTICS_UNDERLYINGS", "")
 ANALYTICS_INTERVAL = _getenv_int("ANALYTICS_INTERVAL", 60)

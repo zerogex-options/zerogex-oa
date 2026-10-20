@@ -24,7 +24,7 @@ from typing import Dict, Iterable, Optional
 
 import pytz
 
-from src.symbols import is_cash_index, resolve_index_future
+from src.symbols import is_cash_index, is_stock_symbol, resolve_index_future
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -564,8 +564,9 @@ def feed_session_window(
 
 # US options stop trading at the close; the ETF and index chains this
 # platform ingests run the 15-minute late session (SPY, QQQ, SPX, NDX all
-# close at 16:15 ET). Outside that, an option-chain row is only written when
-# a residual quote happens to tick, which is nothing like a bar feed.
+# close at 16:15 ET). A single stock's options do not: NVDA's close at 16:00.
+# Outside that, an option-chain row is only written when a residual quote
+# happens to tick, which is nothing like a bar feed.
 OPTION_CHAIN_CLOSE = time(16, 15)
 
 
@@ -585,14 +586,16 @@ def option_chain_feed_window(
 
     Cash indices close at 16:00 here rather than 16:15: their chains stop when
     the index stops printing, because Greeks are refused without an underlying
-    price (see ``collect_feeds``).
+    price (see ``collect_feeds``). Single stocks close at 16:00 too, because
+    equity options have no late session; graded to 16:15, a stock's chain
+    reads stale for the last quarter hour of every day.
     """
     open_t = time(9, 30)
     if day is not None and day in NYSE_HALF_DAYS:
         # Same conservative reading as NYSE_HALF_DAY_EXTENDED_END: the options
         # tape stops at the early close, so expect nothing after it.
         return open_t, NYSE_HALF_DAY_CLOSE
-    if symbol and is_cash_index(symbol):
+    if symbol and (is_cash_index(symbol) or is_stock_symbol(symbol)):
         return open_t, NYSE_REGULAR_CLOSE
     return open_t, OPTION_CHAIN_CLOSE
 

@@ -60,7 +60,7 @@ from src.underlying_volume_sql import (
     total_volume as _total_volume,
     total_volume_lenient as _total_volume_lenient,
 )
-from src.api.market_tide import calculate_market_tide, SUPPORTED_WINDOWS
+from src.api.market_tide import calculate_market_tide, market_tide_universe, SUPPORTED_WINDOWS
 
 logger = logging.getLogger(__name__)
 
@@ -6133,9 +6133,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 -- contract resolution but are not independently ingested
                 -- underlyings. Keep the Tide universe to active symbols
                 -- that actually have both source streams in retained history.
+                -- And to the ETFs and cash indexes ($3, market_tide_universe):
+                -- a single stock would otherwise take an equal share of what
+                -- is published as the index/ETF tide.
                 SELECT s.symbol
                 FROM symbols s
                 WHERE COALESCE(s.is_active, TRUE) = TRUE
+                  AND s.symbol = ANY($3::text[])
                   AND EXISTS (
                       SELECT 1 FROM option_chains oc
                       WHERE oc.underlying = s.symbol
@@ -6253,6 +6257,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             """,
             anchor,
             window_minutes,
+            market_tide_universe(),
         )
         return [dict(row) for row in rows]
 

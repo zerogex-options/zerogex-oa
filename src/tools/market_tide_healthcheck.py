@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, Sequence
 
-from src.api.market_tide import _inputs_are_fresh
+from src.api.market_tide import _inputs_are_fresh, market_tide_universe
 from src.database.connection import db_connection
 
 logger = logging.getLogger(__name__)
@@ -97,9 +97,11 @@ def _fetch(cur, window_minutes: int) -> tuple[datetime | None, list[tuple]]:
     cur.execute(
         """
         WITH active AS (
+            -- The same universe the Tide itself reads (market_tide_universe).
             SELECT s.symbol
             FROM symbols s
             WHERE COALESCE(s.is_active, TRUE) = TRUE
+              AND s.symbol = ANY(%s)
               AND EXISTS (
                   SELECT 1 FROM option_chains_latest ocl
                   WHERE ocl.underlying = s.symbol
@@ -140,6 +142,7 @@ def _fetch(cur, window_minutes: int) -> tuple[datetime | None, list[tuple]]:
         ORDER BY a.symbol
         """,
         (
+            market_tide_universe(),
             window_minutes,
             window_minutes,
             anchor,

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from src.api.market_tide import _capped_weights, calculate_market_tide
+from src.api.market_tide import _capped_weights, calculate_market_tide, market_tide_universe
 from src.api.database import DatabaseManager
 from src.api.models import MarketTideResponse, MarketTideHistoryResponse
 from src.tools.market_tide_healthcheck import _evaluate
@@ -183,7 +183,8 @@ def test_database_query_binds_window_as_integer_interval():
     assert "FROM component_normalizer_cache" in connection.query
     assert "FROM gex_historical_stats" in connection.query
     assert "PERCENTILE_CONT" not in connection.query
-    assert connection.args == (ANCHOR, 15)
+    assert connection.args == (ANCHOR, 15, market_tide_universe())
+    assert "s.symbol = ANY($3::text[])" in connection.query
     # The persisted snapshot is consulted first (frozen-at-close read).
     assert "FROM market_tide_snapshots" in connection.snapshot_query
 
@@ -425,3 +426,18 @@ def test_get_market_tide_history_intraday_reads_snapshots():
     assert out["points"][0]["flow_direction"] == 0.1  # parsed from JSON string
     assert out["points"][1]["gamma_regime"] == -0.7  # read from dict
     assert MarketTideHistoryResponse(**out).points[0].label == "bullish"
+
+
+def test_market_tide_universe_is_etfs_and_indexes_not_stocks(monkeypatch):
+    """A single stock (NVDA) is ingested like an ETF but kept out of the Tide.
+
+    Below seven names the Tide weights equally, so a stock in the universe
+    would take a fifth of the published index/ETF reading.
+    """
+    monkeypatch.delenv("ETF_SYMBOLS", raising=False)
+    monkeypatch.delenv("INDEX_VOLUME_PROXIES", raising=False)
+    universe = market_tide_universe()
+    for symbol in ("SPY", "QQQ", "SPX", "NDX"):
+        assert symbol in universe
+    for symbol in ("NVDA", "ES", "NQ"):
+        assert symbol not in universe

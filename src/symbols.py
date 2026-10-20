@@ -261,6 +261,70 @@ def round_to_tick(value: float, tick: float | None) -> float:
     return round(round(value / tick) * tick, 10)
 
 
+# ---------------------------------------------------------------------------
+# Asset classes
+# ---------------------------------------------------------------------------
+#
+# Every symbol is one of four classes:
+#
+#   INDEX   a cash index (SPX, NDX)          -- is_cash_index
+#   FUTURE  a first-class future (ES, NQ)    -- is_futures_symbol
+#   ETF     an exchange-traded fund (SPY, QQQ)
+#   STOCK   an individual stock (NVDA)       -- anything else
+#
+# ETFs and stocks are both listed securities and the pipeline treats them the
+# same way: their own share price and volume, their own equity option chain,
+# extended-hours bars. The split is for the ``symbols`` table, whose
+# ``asset_type`` records a stock as 'EQUITY', and for anything that has to tell
+# a fund from a single name.
+#
+# Override the fund list with ``ETF_SYMBOLS`` (comma-separated).
+_DEFAULT_ETF_SYMBOLS = ("SPY", "QQQ", "IWM", "DIA")
+
+
+def get_etf_symbols() -> frozenset[str]:
+    """Return the symbols treated as ETFs (env-overridable)."""
+    raw = os.getenv("ETF_SYMBOLS", "")
+    configured = {s.strip().upper() for s in raw.split(",") if s.strip()}
+    return frozenset(configured or _DEFAULT_ETF_SYMBOLS)
+
+
+def asset_class(symbol: str) -> str:
+    """``INDEX``, ``FUTURE``, ``ETF`` or ``STOCK`` for an ingested underlying.
+
+    Accepts the canonical symbol (``SPX``, ``NVDA``) or the TradeStation one,
+    whose ``$`` prefix marks a cash index and only a cash index (``$SPXW.X``).
+    VIX and VXN are not underlyings and are not classified here; they have
+    feeds and tables of their own.
+    """
+    normalized = (symbol or "").strip().upper()
+    if normalized.startswith("$") or is_cash_index(normalized):
+        return "INDEX"
+    if is_futures_symbol(normalized):
+        return "FUTURE"
+    if normalized in get_etf_symbols():
+        return "ETF"
+    return "STOCK"
+
+
+def is_stock_symbol(symbol: str) -> bool:
+    """True for an individual stock (NVDA) rather than an ETF, index or future."""
+    return bool((symbol or "").strip()) and asset_class(symbol) == "STOCK"
+
+
+def symbols_table_asset_type(symbol: str) -> str:
+    """The ``symbols.asset_type`` value for ``symbol``: INDEX, ETF or EQUITY.
+
+    The table's CHECK constraint names a stock ``EQUITY``. Futures never get a
+    ``symbols`` row (that table feeds option-chain ingestion, which they never
+    enter), so they have no value of their own here.
+    """
+    cls = asset_class(symbol)
+    if cls in ("INDEX", "ETF"):
+        return cls
+    return "EQUITY"
+
+
 def resolve_symbol(symbol_or_alias: str) -> str:
     """Resolve a symbol or alias (case-insensitive) to TradeStation symbol."""
     normalized = symbol_or_alias.strip().upper()

@@ -67,14 +67,26 @@ _REFRESH_CLOSE_GRACE = time(16, 20)
 #: Default symbol set.  Reuses the bulletin's ticker list (the symbols the
 #: site actually publishes reads for) so a new underlying does not need two
 #: separate config entries to show up on the Gamma Shift page.
+#:
+#: ``REGIME_SESSION_SYMBOLS``, when set, wins.  It exists for a symbol the
+#: Gamma Shift page should cover but the X-post review dropdown should not
+#: offer (a pilot stock): without it the only way to give that symbol a Gamma
+#: Shift history was to add it to the bulletin list.
+_OVERRIDE_SYMBOLS_ENV = "REGIME_SESSION_SYMBOLS"
 _DEFAULT_SYMBOLS_ENV = "BULLETIN_TWEET_SYMBOLS"
 _FALLBACK_SYMBOLS = ("SPY",)
 
 
+def _parse_symbols(raw: str) -> List[str]:
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
 def default_symbols() -> List[str]:
-    raw = os.getenv(_DEFAULT_SYMBOLS_ENV, "")
-    parsed = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    return parsed or list(_FALLBACK_SYMBOLS)
+    return (
+        _parse_symbols(os.getenv(_OVERRIDE_SYMBOLS_ENV, ""))
+        or _parse_symbols(os.getenv(_DEFAULT_SYMBOLS_ENV, ""))
+        or list(_FALLBACK_SYMBOLS)
+    )
 
 
 async def refresh_symbol(
@@ -254,7 +266,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--symbols",
         nargs="*",
         default=None,
-        help=f"Symbols to refresh (default: ${_DEFAULT_SYMBOLS_ENV} or SPY).",
+        help=(
+            f"Symbols to refresh (default: ${_OVERRIDE_SYMBOLS_ENV}, "
+            f"else ${_DEFAULT_SYMBOLS_ENV}, else SPY)."
+        ),
     )
     parser.add_argument(
         "--backfill",

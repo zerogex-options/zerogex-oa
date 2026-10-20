@@ -46,6 +46,7 @@ from src.symbols import (
     get_canonical_symbol,
     is_cash_index,
     resolve_monthly_underlying,
+    symbols_table_asset_type,
 )
 from src.market_calendar import cash_index_bar_in_session
 from src.tools.cash_index_open_repair import repair_one_session_open
@@ -69,6 +70,7 @@ from src.config import (
     FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS,
     SESSION_TEMPLATE,
     resolve_dividend_yield,
+    resolve_strike_pct_range,
 )
 
 logger = get_logger(__name__)
@@ -667,11 +669,7 @@ class IngestionEngine:
 
     def _infer_asset_type(self, symbol: str) -> str:
         """Infer a sensible asset type for symbols table bootstrap."""
-        if symbol.startswith("$"):
-            return "INDEX"
-        if symbol in {"SPY", "QQQ", "IWM", "DIA"}:
-            return "ETF"
-        return "EQUITY"
+        return symbols_table_asset_type(symbol)
 
     def _ensure_symbol_exists(self):
         """Ensure underlying exists in symbols table (required by FK on underlying_quotes)."""
@@ -3097,7 +3095,9 @@ def main():
             underlying=symbol,
             num_expirations=args.expirations,
             strike_count_max=args.strike_count_max,
-            strike_pct_range=args.strike_pct_range,
+            strike_pct_range=resolve_strike_pct_range(
+                get_canonical_symbol(symbol), args.strike_pct_range
+            ),
             num_monthly_expirations=args.monthly_expirations,
         )
         engine.run()

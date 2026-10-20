@@ -523,9 +523,25 @@ class TestRefreshSymbol:
 
 
 class TestDefaultSymbols:
+
+    @pytest.fixture(autouse=True)
+    def _no_override(self, monkeypatch):
+        monkeypatch.delenv("REGIME_SESSION_SYMBOLS", raising=False)
+
     def test_reads_the_bulletin_symbol_list(self, monkeypatch):
         monkeypatch.setenv("BULLETIN_TWEET_SYMBOLS", "spy, qqq ,SPX")
         assert tool.default_symbols() == ["SPY", "QQQ", "SPX"]
+
+    def test_its_own_list_wins_over_the_bulletin_list(self, monkeypatch):
+        # A pilot stock gets a Gamma Shift history without joining the X-post list.
+        monkeypatch.setenv("BULLETIN_TWEET_SYMBOLS", "SPY,QQQ")
+        monkeypatch.setenv("REGIME_SESSION_SYMBOLS", "SPY, qqq,NVDA")
+        assert tool.default_symbols() == ["SPY", "QQQ", "NVDA"]
+
+    def test_a_blank_override_falls_through_to_the_bulletin_list(self, monkeypatch):
+        monkeypatch.setenv("BULLETIN_TWEET_SYMBOLS", "SPY,QQQ")
+        monkeypatch.setenv("REGIME_SESSION_SYMBOLS", " , ")
+        assert tool.default_symbols() == ["SPY", "QQQ"]
 
     def test_falls_back_to_spy(self, monkeypatch):
         monkeypatch.delenv("BULLETIN_TWEET_SYMBOLS", raising=False)

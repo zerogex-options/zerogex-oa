@@ -41,7 +41,12 @@ from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
 from src.market_calendar import NYSE_HOLIDAYS
-from src.symbols import get_canonical_symbol, is_cash_index, resolve_symbol
+from src.symbols import (
+    get_canonical_symbol,
+    is_cash_index,
+    resolve_symbol,
+    symbols_table_asset_type,
+)
 
 logger = logging.getLogger("zerogex.session_levels")
 ET = ZoneInfo("America/New_York")
@@ -426,10 +431,7 @@ async def _run(args: argparse.Namespace) -> int:
                 continue
 
             try:
-                await db.ensure_symbol_row(
-                    db_symbol,
-                    "ETF" if db_symbol in {"SPY", "QQQ", "IWM", "DIA"} else "EQUITY",
-                )
+                await db.ensure_symbol_row(db_symbol, symbols_table_asset_type(db_symbol))
                 await db.upsert_session_levels(**payload)
             except Exception as exc:
                 logger.warning("session_levels: upsert failed for %s (%s)", db_symbol, exc)

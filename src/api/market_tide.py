@@ -7,6 +7,8 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
+from src.symbols import get_etf_symbols, get_index_volume_proxies
+
 _ET = ZoneInfo("America/New_York")
 
 # Directional-premium lookback windows (minutes) the Market Tide endpoint,
@@ -14,6 +16,18 @@ _ET = ZoneInfo("America/New_York")
 # so the API layer, the DatabaseManager, and the off-process tools share one
 # definition without importing the FastAPI app.
 SUPPORTED_WINDOWS: tuple[int, ...] = (5, 15, 30, 60)
+
+
+def market_tide_universe() -> list[str]:
+    """Symbols the Market Tide may include: the ETFs and the cash indexes.
+
+    A single stock is left out. Below seven names the Tide weights them
+    equally (``_capped_weights``), so one ingested stock would otherwise take
+    a fifth of what is published as the index/ETF tide. Read from the code's
+    classification (``src.symbols``) rather than ``symbols.asset_type``, which
+    only records what a row was first inserted as.
+    """
+    return sorted(get_etf_symbols() | set(get_index_volume_proxies()))
 
 
 def _inputs_are_fresh(
