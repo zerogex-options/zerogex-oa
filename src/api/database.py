@@ -29,6 +29,7 @@ from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, WALL_KEEP_PCT, _getenv_int, _getenv_float
+from src.flow_by_strike_sql import FLOW_BY_STRIKE_ASYNCPG
 from src.flow_series_sql import (
     FLOW_SERIES_1MIN_CTE_ASYNCPG,
     FLOW_SERIES_CTE_ASYNCPG,
@@ -875,6 +876,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # few seconds per open chart. See _get_flow_series_1min. <= 0 disables.
         self._flow_series_1min_cache_ttl_seconds: float = _getenv_float(
             "FLOW_SERIES_1MIN_CACHE_TTL_SECONDS", 5.0
+        )
+        # /api/flow/by-strike. Like the 1-minute series it reads
+        # flow_contract_facts on every miss, and its intervals=N tail is
+        # sliced from the cached full session, so the website's tail polls
+        # cost one read per TTL per filter set rather than one each. The
+        # strike ribbon is context drawn behind the price, not a number a
+        # trader acts on in seconds, so it takes a longer entry. <= 0
+        # disables.
+        self._flow_by_strike_cache_ttl_seconds: float = _getenv_float(
+            "FLOW_BY_STRIKE_CACHE_TTL_SECONDS", 10.0
         )
         # Phase-2 read switch for the flow_series_5min snapshot. When true,
         # unfiltered /api/flow/series reads the pre-aggregated snapshot
@@ -6854,6 +6865,95 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             # Newest-first; the leading N rows are the most recent N minutes.
             return result[:intervals]
         return result
+
+    async def get_flow_by_strike(
+        self,
+        symbol: str = "SPY",
+        session: str = "current",
+        strikes: Optional[List[float]] = None,
+        expirations: Optional[List[date]] = None,
+        intervals: Optional[int] = None,
+        session_date: Optional[date] = None,
+        band: float = 0.02,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Contracts bought and sold at each strike, per 5-minute bar.
+
+        Returns ``None`` when the symbol has never appeared in
+        flow_by_contract (the route answers 404). Otherwise a list, possibly
+        empty, of one row per (bar, strike) that traded: ``bar_start``,
+        ``strike``, ``call_bought``, ``call_sold``, ``put_bought``,
+        ``put_sold``. Newest bar first, strikes ascending within a bar.
+
+        Same session model, filters and 5-minute grid as
+        :meth:`get_flow_series`, so a strike's bar lines up with the series
+        bar of the same ``bar_start``. Strikes are limited to ``band`` (a
+        fraction of price) around the session's range; see
+        ``src/flow_by_strike_sql.py``.
+
+        ``intervals=N`` returns the rows of the last N bars of the window,
+        sliced from the cached full session as the 1-minute series does, so
+        tail polls never reach the database on their own. Concurrent misses
+        on one key share a single read.
+
+        A read that runs out of time raises ``asyncio.TimeoutError`` instead
+        of returning an empty list, which would read as "nothing traded at
+        any strike". Nothing is cached on failure.
+        """
+        symbol = symbol.upper()
+        strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
+        exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
+        session_key = session_date.isoformat() if session_date else session
+        cache_key = f"flow_by_strike:{symbol}:{session_key}:{strikes_key}:{exps_key}:{band:g}"
+
+        async def _read() -> Optional[Tuple[List[Dict[str, Any]], Optional[datetime]]]:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
+            strikes_arg = [float(s) for s in strikes] if strikes else None
+            expirations_arg = list(expirations) if expirations else None
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data or session_end < session_start:
+                    entry: Tuple[List[Dict[str, Any]], Optional[datetime]] = ([], None)
+                else:
+                    # session_end is the START of the newest bar (the one now()
+                    # sits in while the session is live), so the window runs
+                    # one bar past it.
+                    window_end = session_end + timedelta(minutes=5)
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            FLOW_BY_STRIKE_ASYNCPG,
+                            symbol,
+                            session_start,
+                            window_end,
+                            session_start,
+                            window_end,
+                            float(band),
+                            strikes_arg,
+                            expirations_arg,
+                            timeout=15.0,
+                        ),
+                        timeout=15.0,
+                    )
+                    entry = ([dict(row) for row in rows], session_end)
+            self._cache_set(cache_key, entry, self._flow_by_strike_cache_ttl_seconds)
+            return entry
+
+        read = await self._single_flight(cache_key, _read)
+        if read is None:
+            return None
+        rows, newest_bar = read
+        if intervals is not None and intervals > 0 and newest_bar is not None:
+            cutoff = newest_bar - timedelta(minutes=5 * (intervals - 1))
+            return [row for row in rows if row["bar_start"] >= cutoff]
+        return rows
 
     @staticmethod
     def _hedging_snapshot_scope(

@@ -462,6 +462,24 @@ class FlowSeriesPoint(BaseModel):
     is_synthetic: bool
 
 
+class FlowByStrikePoint(BaseModel):
+    """Contracts bought and sold at one strike in one 5-minute bar, from
+    /api/flow/by-strike.
+
+    Only (bar, strike) pairs that traded are listed. Bought is the
+    aggressor-classified buy side and sold the sell side, with mid prints
+    shared out as the flow series shares them, so bought plus sold is
+    everything that traded there.
+    """
+
+    timestamp: str
+    strike: float
+    call_bought: int
+    call_sold: int
+    put_bought: int
+    put_sold: int
+
+
 class HedgingFlowBar(BaseModel):
     """One 5-minute bar of estimated hedging pressure from /api/flow/hedging.
 

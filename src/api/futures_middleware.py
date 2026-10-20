@@ -99,6 +99,13 @@ _PROJECTABLE_PREFIXES = (
     "/api/replay/",
     "/api/flow/buying-pressure",
     "/api/flow/series",
+    # Per-STRIKE flow, not per-contract: one row per (bar, strike) summed over
+    # every expiration, like the /api/gex/ strike ladders. ``strike`` is a
+    # level on the price axis (PRICE_FIELDS) and is projected so the lanes sit
+    # on the ES / NQ price; the four bought/sold fields are contract counts and
+    # pass through. The handler builds its strike band from the index's own
+    # quotes, so no price ever arrives in the request to be mis-scaled.
+    "/api/flow/by-strike",
     "/api/flow/sessions",  # dates only; no price fields to project
     "/api/flow/market-tide",
 )

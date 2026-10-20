@@ -38,6 +38,7 @@ from .models import (
     GEXProfile,
     GEXHistoricalContext,
     FlowPoint,
+    FlowByStrikePoint,
     FlowSeriesPoint,
     FlowContractsResponse,
     FlowSessionList,
@@ -1395,6 +1396,117 @@ async def get_flow_series(
         raise HTTPException(status_code=404, detail="symbol not found")
     bar_minutes = 1 if timeframe == "1min" else 5
     return JSONResponse(content=[_format_flow_series_row(r, bar_minutes) for r in rows])
+
+
+def _format_flow_by_strike_row(row: dict) -> dict:
+    """A by-strike DB row as JSON: trailing-Z UTC bar start, float strike."""
+    bar_start: datetime = row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    return {
+        "timestamp": bar_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "strike": float(row["strike"]),
+        "call_bought": int(row.get("call_bought") or 0),
+        "call_sold": int(row.get("call_sold") or 0),
+        "put_bought": int(row.get("put_bought") or 0),
+        "put_sold": int(row.get("put_sold") or 0),
+    }
+
+
+@app.get(
+    "/api/flow/by-strike",
+    response_model=List[FlowByStrikePoint],
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/by-strike")
+async def get_flow_by_strike(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "`/api/flow/sessions` lists the days that have data."
+        ),
+    ),
+    strikes: Optional[str] = Query(
+        default=None,
+        description="Comma-separated strikes to include. Empty/missing = every strike in the band.",
+    ),
+    expirations: Optional[str] = Query(
+        default=None,
+        description="Comma-separated YYYY-MM-DD expirations to include. Empty/missing = all.",
+    ),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=82,
+        description=(
+            "If provided, return only the rows of the last N five-minute bars, "
+            "for cheap incremental polling. A full regular session is 82 bars."
+        ),
+    ),
+    band_pct: float = Query(
+        default=2.0,
+        ge=0.1,
+        le=10.0,
+        description=(
+            "How far beyond the session's price range to list strikes, in "
+            "percent of price. The range runs from the lower of the session "
+            "low and the last price before the open to the higher of the high "
+            "and that price."
+        ),
+    ),
+):
+    """Contracts bought and sold at each strike, one row per 5-minute bar.
+
+    For every strike that traded in a bar: calls bought, calls sold, puts
+    bought and puts sold, classified by which side crossed the spread the
+    same way as ``/api/flow/series`` (mid prints shared out pro rata, prints
+    with no side counted half each way). Summed across strikes, a bar's
+    figures equal how much the series cumulatives moved over the bar with the
+    same ``timestamp``, for the same ``strikes``/``expirations``, within the
+    band.
+
+    Strikes are limited to a band around the session's price range (see
+    ``band_pct``), so the payload stays the size of a chart's price window
+    rather than a whole index chain.
+
+    Rows are ordered newest bar first, strikes ascending within a bar. Only
+    (bar, strike) pairs that traded are listed. Same session resolution as
+    ``/api/flow/series``: unknown symbols return 404; a session with no data
+    returns 200 with ``[]``; a read that runs out of time returns 504 rather
+    than an empty list, which would read as "nothing traded".
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    strikes_list = _parse_flow_strikes(strikes)
+    expirations_list = _parse_flow_expirations(expirations)
+    session_date = _parse_session_date(date)
+
+    try:
+        rows = await _db().get_flow_by_strike(
+            symbol=normalized,
+            session=session,
+            strikes=strikes_list,
+            expirations=expirations_list,
+            intervals=intervals,
+            session_date=session_date,
+            band=band_pct / 100.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="flow by strike read timed out")
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    return JSONResponse(content=[_format_flow_by_strike_row(r) for r in rows])
 
 
 #: Public label for what this series is, carried in every payload. The

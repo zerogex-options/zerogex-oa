@@ -75,6 +75,11 @@ ACKNOWLEDGED_NON_PRICE: frozenset = frozenset(
         "raw_volume_cum",
         "call_position_cum",
         "put_position_cum",
+        # FlowByStrikePoint: contracts bought / sold at one strike in one bar
+        "call_bought",
+        "call_sold",
+        "put_bought",
+        "put_sold",
         "contract_count",
         "sample_size",
         "configured_symbols",
