@@ -811,6 +811,24 @@ The band runs from the lower of the session low and the last price before the op
 
 Summed across strikes, a bar's figures equal how much the `/api/flow/series` cumulatives moved over the same bar, for the same `strikes`/`expirations`, within the band. The full session is cached for `FLOW_BY_STRIKE_CACHE_TTL_SECONDS` (default 10) and an `intervals` tail is sliced from that entry, so polling the tail never reaches the database on its own. 404 for an unknown symbol, `[]` for a session with no data, and 504, not an empty list, when the read times out.
 
+### GET /api/flow/centroids
+Call and put centroids, one row per 5-minute bar, oldest first. A centroid is the average strike of the contracts traded on one side of the chain, weighted by how many traded at each strike. Calls trade mostly at and above the price and puts at and below it, so the two lines sit on either side of the price and move with it.
+
+- `call_centroid` / `put_centroid`: every contract traded from the open through the end of the bar.
+- `call_centroid_recent` / `put_centroid_recent`: only the last `window_minutes` through the end of the bar.
+- `call_volume` / `put_volume`: contracts traded in the session so far.
+
+A side with nothing traded in its span is `null`. Only bars where something traded are listed; `timestamp` is the bar start.
+
+**Parameters:**
+- `symbol` (required): `[A-Z.]{1,10}`
+- `session` (optional): `current` | `prior`, default `current`
+- `date` (optional): an ET trading day, `YYYY-MM-DD`; overrides `session`
+- `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
+- `window_minutes` (optional): how far back the `_recent` centroids look, a multiple of 5 from `5` to `60`, default `15`
+
+Read from `flow_contract_facts` on the same 5-minute grid as `/api/flow/series`, over every strike the feed carries (no price band). When a contract joins the ingested strike window mid-session, its volume so far lands in the minute it joins, so the `_recent` line can jump for one window. Cached for `FLOW_CENTROIDS_CACHE_TTL_SECONDS` (default 10). ES and NQ come back with the centroids projected onto the futures price. 404 for an unknown symbol, `[]` for a session with no data, and 504, not an empty list, when the read times out.
+
 ### GET /api/gex/weather
 The combined current-state read (Gamma Weather). Consolidates what is already on the Hedging Flow page into one sentence: whether estimated hedging pressure is persistently buying or selling, whether near-price dealer gamma is building or thinning, which side the book leans, and how much room is left before the gamma regime itself changes.
 

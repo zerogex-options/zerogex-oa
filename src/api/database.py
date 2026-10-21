@@ -30,6 +30,7 @@ from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, WALL_KEEP_PCT, _getenv_int, _getenv_float
 from src.flow_by_strike_sql import FLOW_BY_STRIKE_ASYNCPG
+from src.flow_centroids_sql import FLOW_CENTROIDS_ASYNCPG
 from src.flow_series_sql import (
     FLOW_SERIES_1MIN_CTE_ASYNCPG,
     FLOW_SERIES_CTE_ASYNCPG,
@@ -886,6 +887,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # disables.
         self._flow_by_strike_cache_ttl_seconds: float = _getenv_float(
             "FLOW_BY_STRIKE_CACHE_TTL_SECONDS", 10.0
+        )
+        # /api/flow/centroids reads flow_contract_facts on every miss too. The
+        # entry holds the per-bar sums, not the finished lines, so every
+        # window_minutes is served from one read. <= 0 disables.
+        self._flow_centroids_cache_ttl_seconds: float = _getenv_float(
+            "FLOW_CENTROIDS_CACHE_TTL_SECONDS", 10.0
         )
         # Phase-2 read switch for the flow_series_5min snapshot. When true,
         # unfiltered /api/flow/series reads the pre-aggregated snapshot
@@ -6959,6 +6966,68 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             cutoff = newest_bar - timedelta(minutes=5 * (intervals - 1))
             return [row for row in rows if row["bar_start"] >= cutoff]
         return rows
+
+    async def get_flow_centroids(
+        self,
+        symbol: str = "SPY",
+        session: str = "current",
+        expirations: Optional[List[date]] = None,
+        session_date: Optional[date] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Contracts traded and strike x contracts, per 5-minute bar and side.
+
+        Returns ``None`` when the symbol has never appeared in
+        flow_by_contract (the route answers 404). Otherwise a list, possibly
+        empty, of one row per (bar, option type) that traded: ``bar_start``,
+        ``option_type``, ``volume``, ``strike_volume``. Oldest bar first.
+        :func:`src.analytics.flow_centroids.build_centroid_series` turns them
+        into the call and put centroid lines.
+
+        Same session model, expiration filter and 5-minute grid as
+        :meth:`get_flow_by_strike`, and the same contract on failure: a read
+        that runs out of time raises ``asyncio.TimeoutError`` and nothing is
+        cached. Concurrent misses on one key share a single read.
+        """
+        symbol = symbol.upper()
+        exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
+        session_key = session_date.isoformat() if session_date else session
+        cache_key = f"flow_centroids:{symbol}:{session_key}:{exps_key}"
+
+        async def _read() -> Optional[List[Dict[str, Any]]]:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
+            expirations_arg = list(expirations) if expirations else None
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date
+                )
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data or session_end < session_start:
+                    entry: List[Dict[str, Any]] = []
+                else:
+                    # session_end is the START of the newest bar, so the
+                    # window runs one bar past it.
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            FLOW_CENTROIDS_ASYNCPG,
+                            symbol,
+                            session_start,
+                            session_end + timedelta(minutes=5),
+                            expirations_arg,
+                            timeout=15.0,
+                        ),
+                        timeout=15.0,
+                    )
+                    entry = [dict(row) for row in rows]
+            self._cache_set(cache_key, entry, self._flow_centroids_cache_ttl_seconds)
+            return entry
+
+        return await self._single_flight(cache_key, _read)
 
     @staticmethod
     def _hedging_snapshot_scope(

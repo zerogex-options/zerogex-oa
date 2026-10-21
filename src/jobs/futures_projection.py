@@ -136,6 +136,11 @@ PRICE_FIELDS: frozenset[str] = frozenset(
         "pivot",
         # per-strike profiles, ladders and price axes
         "strike",
+        # /api/flow/centroids: volume-weighted average strikes
+        "call_centroid",
+        "put_centroid",
+        "call_centroid_recent",
+        "put_centroid_recent",
         "strikes",
         "settlement_price",  # max-pain payoff curve x-axis
         "grid",  # flip-surface price axis

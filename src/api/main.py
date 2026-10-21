@@ -39,6 +39,7 @@ from .models import (
     GEXHistoricalContext,
     FlowPoint,
     FlowByStrikePoint,
+    FlowCentroidPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
     FlowSessionList,
@@ -67,6 +68,11 @@ from src.analytics import gamma_weather as gw
 from src.analytics.flip_cushion import DEFAULT_RATE_BARS as CUSHION_RATE_BARS
 from src.analytics.flip_cushion import build_series as build_cushion_series
 from src.analytics.flip_cushion import describe as describe_cushion
+from src.analytics.flow_centroids import (
+    BAR_MINUTES as CENTROID_BAR_MINUTES,
+    DEFAULT_WINDOW_MINUTES as CENTROID_DEFAULT_WINDOW_MINUTES,
+    build_centroid_series,
+)
 from src.analytics.scan_lights import scan_lights
 from src.analytics.hedging_flow import (
     DEFAULT_FLAT_BAND_RATIO,
@@ -1507,6 +1513,103 @@ async def get_flow_by_strike(
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     return JSONResponse(content=[_format_flow_by_strike_row(r) for r in rows])
+
+
+def _format_flow_centroid_row(row: dict) -> dict:
+    """A centroid bar as JSON: trailing-Z UTC bar start, strikes to the cent."""
+    bar_start: datetime = row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+
+    def _level(value: Optional[float]) -> Optional[float]:
+        return None if value is None else round(float(value), 2)
+
+    return {
+        "timestamp": bar_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "call_centroid": _level(row["call_centroid"]),
+        "put_centroid": _level(row["put_centroid"]),
+        "call_centroid_recent": _level(row["call_centroid_recent"]),
+        "put_centroid_recent": _level(row["put_centroid_recent"]),
+        "call_volume": int(row["call_volume"]),
+        "put_volume": int(row["put_volume"]),
+    }
+
+
+@app.get(
+    "/api/flow/centroids",
+    response_model=List[FlowCentroidPoint],
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
+@handle_api_errors("GET /api/flow/centroids")
+async def get_flow_centroids(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+    date: Optional[str] = Query(
+        default=None,
+        description=(
+            "An explicit ET trading day, YYYY-MM-DD. Overrides `session`. "
+            "`/api/flow/sessions` lists the days that have data."
+        ),
+    ),
+    expirations: Optional[str] = Query(
+        default=None,
+        description="Comma-separated YYYY-MM-DD expirations to include. Empty/missing = all.",
+    ),
+    window_minutes: int = Query(
+        default=CENTROID_DEFAULT_WINDOW_MINUTES,
+        ge=5,
+        le=60,
+        description=(
+            "How far back the `_recent` centroids look, in minutes, ending "
+            "with each bar. A multiple of 5."
+        ),
+    ),
+):
+    """Call and put centroids, one row per 5-minute bar, oldest first.
+
+    A centroid is the average strike of the contracts traded on one side of
+    the chain, weighted by how many traded at each strike. Calls trade mostly
+    at and above the price and puts at and below it, so the two lines
+    bracket the price and move with it. ``call_centroid`` / ``put_centroid``
+    cover the session from the open through the bar;
+    ``call_centroid_recent`` / ``put_centroid_recent`` cover only the last
+    ``window_minutes``. Only bars where something traded are listed.
+
+    Same session resolution as ``/api/flow/series``: unknown symbols return
+    404; a session with no data returns 200 with ``[]``; a read that runs
+    out of time returns 504 rather than an empty list.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+    if window_minutes % CENTROID_BAR_MINUTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"window_minutes must be a multiple of {CENTROID_BAR_MINUTES}",
+        )
+
+    expirations_list = _parse_flow_expirations(expirations)
+    session_date = _parse_session_date(date)
+
+    try:
+        rows = await _db().get_flow_centroids(
+            symbol=normalized,
+            session=session,
+            expirations=expirations_list,
+            session_date=session_date,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="flow centroids read timed out")
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    series = build_centroid_series(rows, window_minutes=window_minutes)
+    return JSONResponse(content=[_format_flow_centroid_row(r) for r in series])
 
 
 #: Public label for what this series is, carried in every payload. The
