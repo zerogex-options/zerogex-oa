@@ -106,6 +106,10 @@ _PROJECTABLE_PREFIXES = (
     # pass through. The handler builds its strike band from the index's own
     # quotes, so no price ever arrives in the request to be mis-scaled.
     "/api/flow/by-strike",
+    # Call / put centroids: volume-weighted average strikes summed over every
+    # contract, so levels on the price axis (PRICE_FIELDS), projected like
+    # ``strike``. The two volumes are contract counts and pass through.
+    "/api/flow/centroids",
     "/api/flow/sessions",  # dates only; no price fields to project
     "/api/flow/market-tide",
 )

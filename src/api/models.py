@@ -480,6 +480,26 @@ class FlowByStrikePoint(BaseModel):
     put_sold: int
 
 
+class FlowCentroidPoint(BaseModel):
+    """Call and put centroids at one 5-minute bar, from /api/flow/centroids.
+
+    A centroid is the average strike of the contracts traded on that side of
+    the chain, weighted by contracts traded. ``call_centroid`` and
+    ``put_centroid`` cover the session from the open through this bar; the
+    ``_recent`` pair covers only the last ``window_minutes`` through this bar.
+    A side with nothing traded in its span is null. ``call_volume`` and
+    ``put_volume`` are the session's contracts traded so far.
+    """
+
+    timestamp: str
+    call_centroid: Optional[float] = None
+    put_centroid: Optional[float] = None
+    call_centroid_recent: Optional[float] = None
+    put_centroid_recent: Optional[float] = None
+    call_volume: int
+    put_volume: int
+
+
 class HedgingFlowBar(BaseModel):
     """One 5-minute bar of estimated hedging pressure from /api/flow/hedging.
 
