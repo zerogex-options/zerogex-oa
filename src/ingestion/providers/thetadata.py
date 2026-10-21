@@ -236,11 +236,12 @@ _INDEX_PRINT_MAX_AGE = timedelta(minutes=5)
 _MAX_MARK_SPREAD = 0.001
 
 #: Furthest one poll may move a stock mark from the last stored one before a
-#: second poll has to agree. SPY's 2026-10-21 pre-market candle dropped to
-#: 760.36 while SPY traded near 770, 1.3% away. 0.5% is ~$3.85 on SPY in one
-#: poll interval (a second in production): a real move that size is still
-#: there on the next poll and a bad print is not. A real jump pays one poll
-#: of delay.
+#: NEWER quote has to agree. SPY's 19:59 ET bar on 2026-10-20, written at
+#: 20:00:05 as the after-hours book closed, ended at 760.36 against 770.8,
+#: 1.3% away, and was still the live price at 08:30 the next morning. 0.5% is
+#: ~$3.85 on SPY in one poll interval (a second in production): a real move
+#: that size is still there on the next quote and a bad print is not. A real
+#: jump pays one poll of delay.
 _MAX_UNCONFIRMED_MARK_MOVE = 0.005
 
 #: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
@@ -918,8 +919,11 @@ class _StockMarkFilter:
       nothing to test and passes.
     * **How far it moved.** A mark more than
       :data:`_MAX_UNCONFIRMED_MARK_MOVE` from the last stored one is held
-      until the next poll lands on the same side of it. A bad print rarely
-      survives two polls; a real move always does.
+      until a NEWER quote lands on the same side of it. A bad print rarely
+      survives two quotes; a real move always does. Newer, not merely the
+      next poll: once the session ends the snapshot re-serves its final quote
+      on every poll all night, so a bad final quote would confirm itself a
+      second later.
 
     A refused poll is simply not a bar: the last stored mark stands and the
     next good poll carries the minute on. The first refusal of a run is
@@ -931,11 +935,13 @@ class _StockMarkFilter:
     def __init__(self, db_symbol: str) -> None:
         self._db_symbol = db_symbol
         self._stored: Optional[float] = None
-        #: +1 or -1 while a jump in that direction waits for a second poll.
+        #: +1 or -1 while a jump in that direction waits for a newer quote,
+        #: and the time of the quote that is waiting.
         self._pending_side = 0
+        self._pending_at: Optional[datetime] = None
         self._refused = 0
 
-    def admit(self, row: Dict[str, Any], price: float) -> bool:
+    def admit(self, row: Dict[str, Any], price: float, at: datetime) -> bool:
         if not math.isfinite(price):
             return self._refuse("mark is %s", price)
         bid = _finite(_as_float(_pick(row, "bid")))
@@ -956,13 +962,16 @@ class _StockMarkFilter:
                 side = 1 if move > 0 else -1
                 if side != self._pending_side:
                     self._pending_side = side
+                    self._pending_at = at
                     return self._refuse(
                         "mark %.2f is %+.2f%% from the last stored %.2f; "
-                        "waiting for the next poll to agree",
+                        "waiting for a newer quote to agree",
                         price,
                         move * 100,
                         self._stored,
                     )
+                if self._pending_at is not None and at <= self._pending_at:
+                    return self._refuse("the held quote again, not a newer one")
 
         if self._refused:
             logger.info(
@@ -973,6 +982,7 @@ class _StockMarkFilter:
             )
             self._refused = 0
         self._pending_side = 0
+        self._pending_at = None
         self._stored = price
         return True
 
@@ -1699,7 +1709,7 @@ class ThetaDataProvider(MarketDataProvider):
 
             # Before the volume call: a refused mark is no bar, and the
             # volume it would have carried rolls into the next one that is.
-            if not mark_filter.admit(rows[0], bar.close):
+            if not mark_filter.admit(rows[0], bar.close, bar.timestamp):
                 return None
 
             # Volume comes from stock_snapshot_ohlc either way. On the
