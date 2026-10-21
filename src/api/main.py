@@ -1449,11 +1449,16 @@ async def get_flow_by_strike(
     intervals: Optional[int] = Query(
         default=None,
         ge=1,
-        le=82,
+        le=406,
         description=(
-            "If provided, return only the rows of the last N five-minute bars, "
-            "for cheap incremental polling. A full regular session is 82 bars."
+            "If provided, return only the rows of the last N bars, for cheap "
+            "incremental polling. A full regular session is 82 five-minute bars "
+            "or 406 one-minute bars (09:30 through 16:15 ET, both ends included)."
         ),
+    ),
+    timeframe: Literal["5min", "1min"] = Query(
+        default="5min",
+        description="Bar size: '5min' (default) or '1min', the same bars as /api/flow/series.",
     ),
     band_pct: float = Query(
         default=2.0,
@@ -1467,7 +1472,8 @@ async def get_flow_by_strike(
         ),
     ),
 ):
-    """Contracts bought and sold at each strike, one row per 5-minute bar.
+    """Contracts bought and sold at each strike, one row per 5-minute bar, or
+    per 1-minute bar with ``timeframe=1min``.
 
     For every strike that traded in a bar: calls bought, calls sold, puts
     bought and puts sold, classified by which side crossed the spread the
@@ -1507,6 +1513,7 @@ async def get_flow_by_strike(
             intervals=intervals,
             session_date=session_date,
             band=band_pct / 100.0,
+            timeframe=timeframe,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="flow by strike read timed out")

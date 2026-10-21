@@ -1,15 +1,18 @@
 """The /api/flow/by-strike aggregation: who crossed the spread, strike by strike.
 
-One row per (5-minute bar, strike) with the contracts bought and sold on each
-side of the chain at that strike, read straight from ``flow_contract_facts``.
-Facts are per-bucket deltas whose buy/sell split already sums to the bucket's
-volume (mid prints are shared out pro rata; a print with no side to go on
-counts half each way), so a bar's per-strike figures add up to the bought and
-sold totals the 5-minute flow series carries for the same contracts.
+One row per (bar, strike) with the contracts bought and sold on each side of
+the chain at that strike, read straight from ``flow_contract_facts``, in
+5-minute bars (``FLOW_BY_STRIKE_ASYNCPG``) or 1-minute bars
+(``FLOW_BY_STRIKE_1MIN_ASYNCPG``). Facts are per-bucket deltas whose buy/sell
+split already sums to the bucket's volume (mid prints are shared out pro rata;
+a print with no side to go on counts half each way), so a bar's per-strike
+figures add up to the bought and sold totals the flow series carries for the
+same contracts.
 
-The 5-minute bucket is formed exactly as the series forms it (hour plus whole
-5-minute steps), so a strike's bar lines up with the series bar of the same
-``bar_start``.
+Each bucket is formed exactly as the series of the same bar size forms it: the
+5-minute one as the hour plus whole 5-minute steps, the 1-minute one as the
+minute. So a strike's bar lines up with the series bar of the same
+``bar_start``, and the two queries differ in that expression alone.
 
 Strikes are limited to a band around the price: from the lower of the
 session's low and its reference price (the last quote before the open) to the
@@ -31,7 +34,7 @@ Parameters (asyncpg):
 
 from __future__ import annotations
 
-FLOW_BY_STRIKE_ASYNCPG = """
+_FLOW_BY_STRIKE_TEMPLATE = """
     WITH session_range AS (
         SELECT MIN(low)::float8 AS lo, MAX(high)::float8 AS hi
         FROM underlying_quotes
@@ -54,9 +57,7 @@ FLOW_BY_STRIKE_ASYNCPG = """
         FROM session_range r
     )
     SELECT
-        (date_trunc('hour', f.timestamp)
-         + FLOOR(EXTRACT(MINUTE FROM f.timestamp)::int / 5)
-           * INTERVAL '5 minutes') AS bar_start,
+        {bar_start} AS bar_start,
         f.strike,
         COALESCE(SUM(f.buy_volume)  FILTER (WHERE f.option_type = 'C'), 0)::bigint AS call_bought,
         COALESCE(SUM(f.sell_volume) FILTER (WHERE f.option_type = 'C'), 0)::bigint AS call_sold,
@@ -75,3 +76,11 @@ FLOW_BY_STRIKE_ASYNCPG = """
     HAVING SUM(f.volume_delta) > 0
     ORDER BY 1 DESC, 2 ASC
 """
+
+_BAR_START_5MIN = """(date_trunc('hour', f.timestamp)
+         + FLOOR(EXTRACT(MINUTE FROM f.timestamp)::int / 5)
+           * INTERVAL '5 minutes')"""
+_BAR_START_1MIN = "date_trunc('minute', f.timestamp)"
+
+FLOW_BY_STRIKE_ASYNCPG = _FLOW_BY_STRIKE_TEMPLATE.format(bar_start=_BAR_START_5MIN)
+FLOW_BY_STRIKE_1MIN_ASYNCPG = _FLOW_BY_STRIKE_TEMPLATE.format(bar_start=_BAR_START_1MIN)

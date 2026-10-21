@@ -796,7 +796,7 @@ Server-accumulated flow series — one row per 5-minute bar, or per 1-minute bar
 Both timeframes carry the same session-cumulative fields, so a 1-minute bar reads the same totals as the 5-minute bar it closes: the 10:04 bar matches the 10:00 five-minute bar. `bar_end` is one bar after `bar_start`. On 1-minute bars `contract_count` is the number of contracts that traded in that minute and `is_synthetic` marks a minute with no trades. On 5-minute bars `contract_count` counts every contract traded so far in the session.
 
 ### GET /api/flow/by-strike
-Contracts bought and sold at each strike, one row per 5-minute bar: `call_bought`, `call_sold`, `put_bought`, `put_sold`, classified by which side crossed the spread exactly as `/api/flow/series` classifies them (mid prints shared out pro rata, prints with no side counted half each way). Only `(bar, strike)` pairs that traded are listed. Rows are newest bar first, strikes ascending within a bar; `timestamp` is the bar start.
+Contracts bought and sold at each strike, one row per 5-minute bar (or per 1-minute bar with `timeframe=1min`): `call_bought`, `call_sold`, `put_bought`, `put_sold`, classified by which side crossed the spread exactly as `/api/flow/series` classifies them (mid prints shared out pro rata, prints with no side counted half each way). Only `(bar, strike)` pairs that traded are listed. Rows are newest bar first, strikes ascending within a bar; `timestamp` is the bar start.
 
 **Parameters:**
 - `symbol` (required): `[A-Z.]{1,10}`
@@ -804,12 +804,13 @@ Contracts bought and sold at each strike, one row per 5-minute bar: `call_bought
 - `date` (optional): an ET trading day, `YYYY-MM-DD`; overrides `session`
 - `strikes` (optional): comma-separated strikes to include; omit for every strike in the band
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
-- `intervals` (optional): only the rows of the last N five-minute bars, `1`–`82`
+- `intervals` (optional): only the rows of the last N bars, `1`–`406` (a full session is 82 five-minute or 406 one-minute bars)
+- `timeframe` (optional): `5min` | `1min`, default `5min`; the same bars as `/api/flow/series`
 - `band_pct` (optional): how far beyond the session's price range to list strikes, in percent of price, `0.1`–`10`, default `2`
 
 The band runs from the lower of the session low and the last price before the open to the higher of the high and that price, widened by `band_pct` on each side. It keeps the payload to a chart's price window instead of a whole index chain, and it is computed from the index's own quotes, so ES and NQ requests come back with the strikes projected onto the futures price like the GEX strike ladders.
 
-Summed across strikes, a bar's figures equal how much the `/api/flow/series` cumulatives moved over the same bar, for the same `strikes`/`expirations`, within the band. The full session is cached for `FLOW_BY_STRIKE_CACHE_TTL_SECONDS` (default 10) and an `intervals` tail is sliced from that entry, so polling the tail never reaches the database on its own. 404 for an unknown symbol, `[]` for a session with no data, and 504, not an empty list, when the read times out.
+Summed across strikes, a bar's figures equal how much the `/api/flow/series` cumulatives moved over the same bar, for the same `strikes`/`expirations`, within the band. The full session is cached for `FLOW_BY_STRIKE_CACHE_TTL_SECONDS` (default 10), one entry per bar size, and an `intervals` tail is sliced from that entry, so polling the tail never reaches the database on its own. A 1-minute read scans the same facts as a 5-minute one, grouped finer, so it returns several times the rows. 404 for an unknown symbol, `[]` for a session with no data, and 504, not an empty list, when the read times out.
 
 ### GET /api/flow/centroids
 Call and put centroids, one row per 5-minute bar, oldest first. A centroid is the average strike of the contracts traded on one side of the chain, weighted by how many traded at each strike. Calls trade mostly at and above the price and puts at and below it, so the two lines sit on either side of the price and move with it.

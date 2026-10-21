@@ -29,7 +29,7 @@ from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, WALL_KEEP_PCT, _getenv_int, _getenv_float
-from src.flow_by_strike_sql import FLOW_BY_STRIKE_ASYNCPG
+from src.flow_by_strike_sql import FLOW_BY_STRIKE_1MIN_ASYNCPG, FLOW_BY_STRIKE_ASYNCPG
 from src.flow_centroids_sql import FLOW_CENTROIDS_ASYNCPG
 from src.flow_series_sql import (
     FLOW_SERIES_1MIN_CTE_ASYNCPG,
@@ -1012,14 +1012,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._read_cache.move_to_end(key)
         return payload
 
-    def _cache_set(self, key: str, payload: Any, ttl_seconds: float) -> None:
-        """Store a value in the short-lived, bounded in-memory read cache."""
+    def _cache_set(
+        self, key: str, payload: Any, ttl_seconds: float, units: Optional[int] = None
+    ) -> None:
+        """Store a value in the short-lived, bounded in-memory read cache.
+
+        ``units`` overrides ``_cache_weight``'s estimate, for an entry whose
+        rows sit one level down where the sampler does not look: a
+        ``(rows, newest_bar)`` pair would otherwise weigh 2 however many rows
+        it holds, and slip past the content bound.
+        """
         if ttl_seconds <= 0:
             return
         now = time_module.monotonic()
         # Replacing an existing key must not double-count its units.
         self._cache_drop(key)
-        units = _cache_weight(payload)
+        units = _cache_weight(payload) if units is None else max(1, units)
         self._read_cache[key] = (now + ttl_seconds, payload, units)
         self._read_cache_units += units
         if (
@@ -6887,8 +6895,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         intervals: Optional[int] = None,
         session_date: Optional[date] = None,
         band: float = 0.02,
+        timeframe: str = "5min",
     ) -> Optional[List[Dict[str, Any]]]:
-        """Contracts bought and sold at each strike, per 5-minute bar.
+        """Contracts bought and sold at each strike, per 5-minute bar, or per
+        1-minute bar with ``timeframe="1min"``.
 
         Returns ``None`` when the symbol has never appeared in
         flow_by_contract (the route answers 404). Otherwise a list, possibly
@@ -6896,9 +6906,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         ``strike``, ``call_bought``, ``call_sold``, ``put_bought``,
         ``put_sold``. Newest bar first, strikes ascending within a bar.
 
-        Same session model, filters and 5-minute grid as
-        :meth:`get_flow_series`, so a strike's bar lines up with the series
-        bar of the same ``bar_start``. Strikes are limited to ``band`` (a
+        Same session model, filters and grid as :meth:`get_flow_series` at
+        the same ``timeframe``, so a strike's bar lines up with the series bar
+        of the same ``bar_start``. Strikes are limited to ``band`` (a
         fraction of price) around the session's range; see
         ``src/flow_by_strike_sql.py``.
 
@@ -6915,7 +6925,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
         exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
         session_key = session_date.isoformat() if session_date else session
-        cache_key = f"flow_by_strike:{symbol}:{session_key}:{strikes_key}:{exps_key}:{band:g}"
+        bar_minutes = 1 if timeframe == "1min" else 5
+        query = FLOW_BY_STRIKE_1MIN_ASYNCPG if bar_minutes == 1 else FLOW_BY_STRIKE_ASYNCPG
+        cache_key = (
+            f"flow_by_strike:{symbol}:{session_key}:{bar_minutes}m:"
+            f"{strikes_key}:{exps_key}:{band:g}"
+        )
 
         async def _read() -> Optional[Tuple[List[Dict[str, Any]], Optional[datetime]]]:
             cached = self._cache_get(cache_key)
@@ -6926,7 +6941,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 resolved = await self._resolve_flow_series_session(
-                    conn, symbol, session, session_date
+                    conn, symbol, session, session_date, bar_seconds=60 * bar_minutes
                 )
                 if resolved is None:
                     return None
@@ -6937,11 +6952,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # session_end is the START of the newest bar (the one now()
                     # sits in while the session is live), so the window runs
                     # one bar past it.
-                    window_end = session_end + timedelta(minutes=5)
+                    window_end = session_end + timedelta(minutes=bar_minutes)
                     rows = await asyncio.wait_for(
                         self._fetch_timed(
                             conn,
-                            FLOW_BY_STRIKE_ASYNCPG,
+                            query,
                             symbol,
                             session_start,
                             window_end,
@@ -6955,7 +6970,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         timeout=15.0,
                     )
                     entry = ([dict(row) for row in rows], session_end)
-            self._cache_set(cache_key, entry, self._flow_by_strike_cache_ttl_seconds)
+            self._cache_set(
+                cache_key, entry, self._flow_by_strike_cache_ttl_seconds, units=len(entry[0]) + 1
+            )
             return entry
 
         read = await self._single_flight(cache_key, _read)
@@ -6963,7 +6980,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return None
         rows, newest_bar = read
         if intervals is not None and intervals > 0 and newest_bar is not None:
-            cutoff = newest_bar - timedelta(minutes=5 * (intervals - 1))
+            cutoff = newest_bar - timedelta(minutes=bar_minutes * (intervals - 1))
             return [row for row in rows if row["bar_start"] >= cutoff]
         return rows
 

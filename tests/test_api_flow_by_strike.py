@@ -1,11 +1,12 @@
 """Tests for /api/flow/by-strike.
 
-Contracts bought and sold at each strike, per 5-minute bar, read from
-``flow_contract_facts`` (``src/flow_by_strike_sql.py``). The SQL itself only
-runs against a real Postgres; these drive the connection with canned rows to
-pin the parts that live in Python: the window arithmetic, the tail sliced from
-the cached full session, single-flight, the timeout contract, the response
-shape, and the futures projection of the strike axis.
+Contracts bought and sold at each strike, per 5-minute or 1-minute bar, read
+from ``flow_contract_facts`` (``src/flow_by_strike_sql.py``). The SQL itself
+only runs against a real Postgres; these drive the connection with canned rows
+to pin the parts that live in Python: the window arithmetic on either grid, the
+tail sliced from the cached full session, single-flight, what the cached entry
+weighs, the timeout contract, the response shape, and the futures projection
+of the strike axis.
 """
 
 from __future__ import annotations
@@ -197,6 +198,97 @@ def test_filters_and_band_get_their_own_cache_entries():
     assert len(conn.fetch_calls) == 3
 
 
+# 1-minute bars: the same read on the minute grid.
+_FULL_SESSION_1MIN = [
+    _row(LAST_BAR_UTC, 709.0),
+    _row(LAST_BAR_UTC - timedelta(minutes=1), 710.0),
+    _row(LAST_BAR_UTC - timedelta(minutes=2), 710.0),
+    _row(LAST_BAR_UTC - timedelta(minutes=5), 711.0),
+]
+
+
+def test_one_minute_bars_read_the_minute_grid_one_minute_past_the_newest_bar():
+    from src.flow_by_strike_sql import FLOW_BY_STRIKE_1MIN_ASYNCPG
+
+    conn = _CannedConn(fetchval_sequence=list(_KNOWN_SYMBOL), fetch_rows=_FULL_SESSION_1MIN)
+    db = _make_db(conn)
+
+    rows = asyncio.run(
+        db.get_flow_by_strike(symbol="SPY", session_date=SESSION_DATE, timeframe="1min")
+    )
+
+    assert rows == _FULL_SESSION_1MIN
+    query, args = conn.fetch_calls[0]
+    assert query == FLOW_BY_STRIKE_1MIN_ASYNCPG
+    # The newest 1-minute bar starts at 20:15, so the window ends at 20:16.
+    window_end = LAST_BAR_UTC + timedelta(minutes=1)
+    assert args[:5] == ("SPY", SESSION_START_UTC, window_end, SESSION_START_UTC, window_end)
+
+
+def test_one_minute_tail_counts_minutes_not_five_minute_bars():
+    conn = _CannedConn(fetchval_sequence=list(_KNOWN_SYMBOL), fetch_rows=_FULL_SESSION_1MIN)
+    db = _make_db(conn)
+
+    async def _both():
+        await db.get_flow_by_strike(symbol="SPY", session_date=SESSION_DATE, timeframe="1min")
+        return await db.get_flow_by_strike(
+            symbol="SPY", session_date=SESSION_DATE, timeframe="1min", intervals=3
+        )
+
+    tail = asyncio.run(_both())
+
+    # The last three minutes: 20:15, 20:14 and 20:13, not 20:10.
+    assert tail == _FULL_SESSION_1MIN[:3]
+    assert len(conn.fetch_calls) == 1
+
+
+def test_the_two_bar_sizes_query_and_cache_apart():
+    from src.flow_by_strike_sql import FLOW_BY_STRIKE_1MIN_ASYNCPG, FLOW_BY_STRIKE_ASYNCPG
+
+    conn = _CannedConn(fetchval_sequence=list(_KNOWN_SYMBOL) * 2, fetch_rows=_FULL_SESSION)
+    db = _make_db(conn)
+
+    async def _both():
+        await db.get_flow_by_strike(symbol="SPY", session_date=SESSION_DATE)
+        await db.get_flow_by_strike(symbol="SPY", session_date=SESSION_DATE, timeframe="1min")
+
+    asyncio.run(_both())
+
+    assert [q for q, _ in conn.fetch_calls] == [FLOW_BY_STRIKE_ASYNCPG, FLOW_BY_STRIKE_1MIN_ASYNCPG]
+
+
+def test_each_bucket_is_the_flow_series_bucket_of_the_same_bar_size():
+    # A strike's bar has to land on the chart's bar of the same bar_start.
+    import re
+
+    from src import flow_by_strike_sql as by_strike
+    from src import flow_series_sql as series
+
+    def flat(sql: str) -> str:
+        return re.sub(r"\s+", " ", sql.replace("f.timestamp", "timestamp"))
+
+    assert flat(by_strike._BAR_START_5MIN) in flat(series.FLOW_SERIES_CTE_ASYNCPG)
+    assert flat(by_strike._BAR_START_1MIN) in flat(series.FLOW_SERIES_1MIN_CTE_ASYNCPG)
+    # And that expression is all the two by-strike queries differ in.
+    assert by_strike.FLOW_BY_STRIKE_ASYNCPG.replace(
+        by_strike._BAR_START_5MIN, "?"
+    ) == by_strike.FLOW_BY_STRIKE_1MIN_ASYNCPG.replace(by_strike._BAR_START_1MIN, "?")
+
+
+def test_the_cached_session_counts_its_rows_against_the_memory_bound():
+    rows = [
+        _row(LAST_BAR_UTC - timedelta(minutes=i), 700.0 + k) for i in range(40) for k in range(25)
+    ]
+    conn = _CannedConn(fetchval_sequence=list(_KNOWN_SYMBOL), fetch_rows=rows)
+    db = _make_db(conn)
+
+    asyncio.run(db.get_flow_by_strike(symbol="SPY", session_date=SESSION_DATE, timeframe="1min"))
+
+    # A (rows, newest bar) pair, weighed by its 1,000 rows rather than as two
+    # items, so a big session cannot slip past READ_CACHE_MAX_UNITS.
+    assert db._read_cache_units >= len(rows)
+
+
 def test_concurrent_misses_share_one_read():
     async def _scenario():
         gate = asyncio.Event()
@@ -323,6 +415,20 @@ def test_http_forwards_filters_session_and_band_as_a_fraction(monkeypatch: pytes
     assert kwargs["expirations"] == [date(2026, 4, 24)]
     assert kwargs["intervals"] == 2
     assert kwargs["band"] == pytest.approx(0.025)
+    assert kwargs["timeframe"] == "5min"
+
+
+def test_http_forwards_one_minute_bars_and_a_one_minute_tail(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        db = _attach(mainmod, return_value=[])
+        response = client.get("/api/flow/by-strike?symbol=SPY&timeframe=1min&intervals=406")
+
+    assert response.status_code == 200, response.text
+    kwargs = db.get_flow_by_strike.call_args.kwargs
+    assert kwargs["timeframe"] == "1min"
+    assert kwargs["intervals"] == 406
 
 
 def test_http_unknown_symbol_is_404(monkeypatch: pytest.MonkeyPatch):
@@ -352,7 +458,8 @@ def test_http_timeout_is_504_not_an_empty_list(monkeypatch: pytest.MonkeyPatch):
         "symbol=SPY&band_pct=0",  # below the band floor
         "symbol=SPY&band_pct=25",  # past the band ceiling
         "symbol=SPY&intervals=0",
-        "symbol=SPY&intervals=83",  # longer than a session
+        "symbol=SPY&intervals=407",  # longer than a 1-minute session
+        "symbol=SPY&timeframe=15min",
         "symbol=SPY&date=2026-4-24",
     ],
 )

@@ -463,8 +463,8 @@ class FlowSeriesPoint(BaseModel):
 
 
 class FlowByStrikePoint(BaseModel):
-    """Contracts bought and sold at one strike in one 5-minute bar, from
-    /api/flow/by-strike.
+    """Contracts bought and sold at one strike in one bar (5-minute, or
+    1-minute with ``timeframe=1min``), from /api/flow/by-strike.
 
     Only (bar, strike) pairs that traded are listed. Bought is the
     aggressor-classified buy side and sold the sell side, with mid prints
