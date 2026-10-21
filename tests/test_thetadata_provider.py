@@ -1310,6 +1310,101 @@ def test_market_value_bars_fetch_volume_from_the_realtime_endpoint():
     assert stream._fetch().volume == 250
 
 
+# ---------------------------------------------------------------------------
+# Bad stock marks: SPY pre-market, 2026-10-21
+# ---------------------------------------------------------------------------
+class _SpyMarks:
+    """Serves one Market Value row per poll, in order."""
+
+    def __init__(self, quotes):
+        self._quotes = list(quotes)
+        self.ohlc_calls = 0
+
+    def stock_snapshot_market_value(self, **kw):
+        bid, ask = self._quotes.pop(0)
+        mid = None if bid is None or ask is None else (bid + ask) / 2
+        return [
+            {
+                "market_bid": bid,
+                "market_ask": ask,
+                "market_price": mid if mid is not None else (bid or ask),
+                "symbol": "SPY",
+                "timestamp": _et(8, 30, day=21),
+            }
+        ]
+
+    def stock_snapshot_ohlc(self, **kw):
+        self.ohlc_calls += 1
+        return [{"close": 770.0, "volume": 1_000_000, "timestamp": _et(8, 30, day=21)}]
+
+
+def _closes(quotes):
+    client = _SpyMarks(quotes)
+    stream = ThetaDataProvider(client, stage="mv", market_value_endpoints=True)
+    stream = stream.stream_underlying_bars("SPY")
+    out = []
+    for _ in quotes:
+        bar = stream._fetch()
+        out.append(None if bar is None else bar.close)
+    return out, client
+
+
+def test_a_mark_from_a_wide_quote_is_not_stored():
+    """A Market Value stock mark is the midpoint of ONE venue's quote (F8).
+    When that book thins to a side resting far away, the midpoint is a
+    price nobody dealt at -- 750 x 770.72 marks 760.36, the low of the
+    phantom SPY candle on 2026-10-21. It must not reach a candle, where
+    LEAST(low) keeps it for good."""
+    closes, client = _closes([(770.79, 770.81), (750.00, 770.72), (770.78, 770.80)])
+    assert closes == [pytest.approx(770.80), None, pytest.approx(770.79)]
+    assert client.ohlc_calls == 2, "a refused mark must not spend the volume call"
+
+
+def test_crossed_and_one_sided_quotes_are_not_marks():
+    closes, _ = _closes([(770.79, 770.81), (770.90, 770.70), (None, 770.80), (770.79, 770.81)])
+    assert closes[1] is None, "crossed"
+    assert closes[2] is None, "one-sided"
+    assert closes[3] == pytest.approx(770.80)
+
+
+def test_a_one_poll_jump_waits_for_the_next_poll():
+    """A tight quote can still be wrong for a poll. Held, then dropped when
+    the next poll is back where it was: the candle never sees it."""
+    closes, _ = _closes([(770.79, 770.81), (760.35, 760.37), (770.78, 770.80)])
+    assert closes == [pytest.approx(770.80), None, pytest.approx(770.79)]
+
+
+def test_a_real_jump_is_stored_one_poll_late():
+    """A real move is still there on the next poll. Refusing it outright
+    would freeze the price at the old level through a gap."""
+    closes, _ = _closes([(770.79, 770.81), (760.35, 760.37), (760.30, 760.32), (760.20, 760.22)])
+    assert closes == [
+        pytest.approx(770.80),
+        None,
+        pytest.approx(760.31),
+        pytest.approx(760.21),
+    ]
+
+
+def test_ordinary_ticks_pass_untouched():
+    quotes = [(770.79 + i * 0.05, 770.81 + i * 0.05) for i in range(20)]
+    closes, _ = _closes(quotes)
+    assert None not in closes
+
+
+def test_a_row_with_no_quote_is_not_held_to_one():
+    """The realtime OHLC row's close is a trade and carries no bid or ask.
+    Nothing to test, so it passes -- only the jump check applies."""
+    from src.ingestion.providers.thetadata import _StockMarkFilter
+
+    f = _StockMarkFilter("SPY")
+    assert f.admit({"close": 770.0}, 770.0)
+    assert f.admit({"close": 770.5}, 770.5)
+    assert not f.admit({"close": 760.36}, 760.36)
+    assert not f.admit({"market_bid": float("nan"), "market_ask": 770.5}, 770.5)
+    assert not f.admit({}, float("nan"))
+
+
 def test_index_bars_report_no_volume_at_all():
     """A cash index is a calculation over its constituents, not something
     that trades. None is the fact here, not a gap -- index VWAP comes from

@@ -112,6 +112,7 @@ re-runs that check against a live terminal at any time.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
@@ -224,6 +225,23 @@ def is_market_value_stage(stage: Optional[str]) -> bool:
 #: header flipping between ES and the SPX close). A live print is seconds old;
 #: five minutes leaves room for a slow index without letting a re-send through.
 _INDEX_PRINT_MAX_AGE = timedelta(minutes=5)
+
+#: Widest quote, as a fraction of the mark, that a stock mark may come from
+#: and still be stored. A Market Value stock mark is the midpoint of Nasdaq
+#: Basic's bid and ask: one venue, not the consolidated market (F8 in the
+#: feed findings). Outside the cash session that one book can thin to a side
+#: resting far from where the stock trades, and the midpoint of such a quote
+#: is a price nobody dealt at. SPY quotes a cent or two wide; 0.1% is ~$0.77
+#: there, so this refuses only a quote that has come apart.
+_MAX_MARK_SPREAD = 0.001
+
+#: Furthest one poll may move a stock mark from the last stored one before a
+#: second poll has to agree. SPY's 2026-10-21 pre-market candle dropped to
+#: 760.36 while SPY traded near 770, 1.3% away. 0.5% is ~$3.85 on SPY in one
+#: poll interval (a second in production): a real move that size is still
+#: there on the next poll and a bad print is not. A real jump pays one poll
+#: of delay.
+_MAX_UNCONFIRMED_MARK_MOVE = 0.005
 
 #: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
 #: diagnostic covers the index endpoints too. VIX because it is one of the
@@ -884,6 +902,91 @@ class _SessionVolumeDelta:
             )
             return None
         return volume
+
+
+class _StockMarkFilter:
+    """Decides whether one polled stock mark is fit to store.
+
+    Every stored mark becomes part of a candle, and the upsert keeps the
+    minute's LEAST low and GREATEST high, so one bad poll paints a wick that
+    no later poll can take back. It also becomes the spot the Greeks and the
+    gamma levels are computed against. Two tests, both cheap:
+
+    * **The quote it came from.** A mark from a crossed, one-sided or wide
+      quote (:data:`_MAX_MARK_SPREAD`) is refused. A row carrying no quote at
+      all -- the realtime OHLC endpoint, whose close is a trade -- has
+      nothing to test and passes.
+    * **How far it moved.** A mark more than
+      :data:`_MAX_UNCONFIRMED_MARK_MOVE` from the last stored one is held
+      until the next poll lands on the same side of it. A bad print rarely
+      survives two polls; a real move always does.
+
+    A refused poll is simply not a bar: the last stored mark stands and the
+    next good poll carries the minute on. The first refusal of a run is
+    logged with its numbers, and the run's length when it ends, so a book
+    that stays wide for minutes is one pair of lines rather than one a
+    second.
+    """
+
+    def __init__(self, db_symbol: str) -> None:
+        self._db_symbol = db_symbol
+        self._stored: Optional[float] = None
+        #: +1 or -1 while a jump in that direction waits for a second poll.
+        self._pending_side = 0
+        self._refused = 0
+
+    def admit(self, row: Dict[str, Any], price: float) -> bool:
+        if not math.isfinite(price):
+            return self._refuse("mark is %s", price)
+        bid = _finite(_as_float(_pick(row, "bid")))
+        ask = _finite(_as_float(_pick(row, "ask")))
+        if bid is not None or ask is not None:
+            if bid is None or ask is None:
+                return self._refuse("one-sided quote (bid %s, ask %s)", bid, ask)
+            if ask < bid:
+                return self._refuse("crossed quote %.2f x %.2f", bid, ask)
+            if ask - bid > _MAX_MARK_SPREAD * price:
+                return self._refuse(
+                    "quote %.2f x %.2f is %.2f wide, mark %.2f", bid, ask, ask - bid, price
+                )
+
+        if self._stored is not None:
+            move = (price - self._stored) / self._stored
+            if abs(move) > _MAX_UNCONFIRMED_MARK_MOVE:
+                side = 1 if move > 0 else -1
+                if side != self._pending_side:
+                    self._pending_side = side
+                    return self._refuse(
+                        "mark %.2f is %+.2f%% from the last stored %.2f; "
+                        "waiting for the next poll to agree",
+                        price,
+                        move * 100,
+                        self._stored,
+                    )
+
+        if self._refused:
+            logger.info(
+                "%s: storing marks again at %.2f after %d refused poll(s)",
+                self._db_symbol,
+                price,
+                self._refused,
+            )
+            self._refused = 0
+        self._pending_side = 0
+        self._stored = price
+        return True
+
+    def _refuse(self, why: str, *args: Any) -> bool:
+        if self._refused == 0:
+            logger.warning("%s: not storing this mark: " + why, self._db_symbol, *args)
+        self._refused += 1
+        return False
+
+
+def _finite(value: Optional[float]) -> Optional[float]:
+    """``value`` unless it is NaN or infinite, which a pandas frame uses for
+    an empty cell and which every comparison above would quietly pass."""
+    return value if value is not None and math.isfinite(value) else None
 
 
 class _PollingBarStream(BarStream):
@@ -1571,8 +1674,9 @@ class ThetaDataProvider(MarketDataProvider):
         index = is_index_symbol(symbol)
         root = index_symbol_for(symbol) if index else option_root_for(symbol)
 
-        # Built unconditionally; the index path returns before using it.
+        # Built unconditionally; the index path returns before using them.
         volume_delta = _SessionVolumeDelta(resolved)
+        mark_filter = _StockMarkFilter(resolved)
 
         def fetch() -> Optional[Bar]:
             if index:
@@ -1592,6 +1696,11 @@ class ThetaDataProvider(MarketDataProvider):
                 # volume stays None: a cash index has no share volume of its
                 # own. Same reasoning as stream_index_bars.
                 return bar
+
+            # Before the volume call: a refused mark is no bar, and the
+            # volume it would have carried rolls into the next one that is.
+            if not mark_filter.admit(rows[0], bar.close):
+                return None
 
             # Volume comes from stock_snapshot_ohlc either way. On the
             # Market Value path the primary call above is
