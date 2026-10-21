@@ -326,8 +326,89 @@ def shared_client(factory: Any, key: Tuple[Any, ...], adopt: Any = None) -> Any:
         return client
 
 
+#: How long every call may keep failing for a dead session before this
+#: process reports it lost (see :meth:`ThetaDataProvider.session_lost`).
+#: Two minutes rides out a blip and still has pre-market moving again within
+#: about three. On 2026-10-21 nothing reported it and the feed stayed dead
+#: from 00:00 to 08:44 ET.
+SESSION_LOST_RELOGIN_SECONDS = 120.0
+
+#: Monotonic time of the first call refused for a dead session since the
+#: last call that succeeded, else None. Per PROCESS, like the session itself.
+_SESSION_LOST_SINCE: Optional[float] = None
+_SESSION_LOCK = threading.Lock()
+
+
+def _is_session_error(error: BaseException) -> bool:
+    """The refusal ThetaData gives once another login replaced this one:
+    UNAUTHENTICATED, "Invalid session ID. This can occur if more than one
+    terminal is running." Read from the text because the gRPC status object
+    sits on a private class, and the text is what the journal showed.
+
+    That exact phrase and nothing broader. A refusal a fresh login cannot
+    fix -- an unentitled symbol (F13: INVALID_ARGUMENT, "without proper
+    permissions"), rejected credentials -- would otherwise restart the unit
+    every few minutes for nothing."""
+    return "Invalid session ID" in str(error)
+
+
+def session_lost_for() -> Optional[float]:
+    """Seconds every call in this process has been refused for a dead
+    session; ``None`` while the session works."""
+    with _SESSION_LOCK:
+        since = _SESSION_LOST_SINCE
+    return None if since is None else time.monotonic() - since
+
+
+def _note_call(error: Optional[BaseException]) -> None:
+    global _SESSION_LOST_SINCE
+    with _SESSION_LOCK:
+        if error is None:
+            _SESSION_LOST_SINCE = None
+        elif _SESSION_LOST_SINCE is None and _is_session_error(error):
+            _SESSION_LOST_SINCE = time.monotonic()
+            logger.error(
+                'ThetaData answered "Invalid session ID": another login on this '
+                "account has replaced ours. If every call keeps failing for %.0fs "
+                "this worker exits so the unit can log in again.",
+                SESSION_LOST_RELOGIN_SECONDS,
+            )
+
+
+class _SessionWatch:
+    """The client, with every call reporting whether the session still works.
+
+    One choke point instead of a check at each of the dozen call sites, any
+    one of which may be the only thing running at a given hour.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._watched = client
+
+    def __getattr__(self, name: str) -> Any:
+        # A missing endpoint still raises AttributeError, so _endpoint's
+        # getattr(..., None) and describe_columns' hasattr keep working.
+        attr = getattr(self._watched, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                out = attr(*args, **kwargs)
+            except Exception as e:
+                _note_call(e)
+                raise
+            _note_call(None)
+            return out
+
+        return call
+
+
 def reset_shared_clients() -> None:
     """Drop the cache. For tests, and for a deliberate reconnect."""
+    global _SESSION_LOST_SINCE
+    with _SESSION_LOCK:
+        _SESSION_LOST_SINCE = None
     with _CLIENTS_LOCK:
         _CLIENTS.clear()
 
@@ -1140,7 +1221,7 @@ class ThetaDataProvider(MarketDataProvider):
         market_value_endpoints: bool = False,
         max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
     ):
-        self._client = client
+        self._client = _SessionWatch(client)
         self.stage = stage
         # Per-INSTANCE, not the class attribute. Both stages reporting
         # "thetadata" made a realtime vs Market Value comparison
@@ -1257,9 +1338,14 @@ class ThetaDataProvider(MarketDataProvider):
     def capabilities(self) -> ProviderCapabilities:
         return self._CAPABILITIES
 
+    def session_lost(self) -> bool:
+        lost_for = session_lost_for()
+        return lost_for is not None and lost_for >= SESSION_LOST_RELOGIN_SECONDS
+
     @property
     def client(self) -> Any:
-        return self._client
+        """The vendor client itself, not the session watch around it."""
+        return self._client._watched
 
     # -- chain fetch -------------------------------------------------------
 

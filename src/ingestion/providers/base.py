@@ -56,6 +56,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 
 __all__ = [
     "Bar",
+    "FeedSessionLost",
     "MarketDataProvider",
     "OptionQuote",
     "OptionBarStream",
@@ -73,6 +74,20 @@ class ProviderCapabilityError(RuntimeError):
     family with no data behind it produces empty tables, which surfaces
     hours later as "why is VIX stale" instead of at startup as "this
     vendor has no index feed".
+    """
+
+
+class FeedSessionLost(RuntimeError):
+    """The feed refuses every call because this unit's login was replaced.
+
+    ThetaData keeps one session per account and a second login ends the
+    first. Every call then fails with "Invalid session ID" until the unit
+    logs in again, and the session is shared by every worker, so no worker
+    can log in alone without ending everyone else's. On 2026-10-21 that left
+    ingestion writing nothing from 00:00 to 08:44 ET, until a manual restart.
+
+    Raised out of the worker; the supervisor answers it by restarting the
+    unit, which logs in once and lets every worker adopt the new session.
     """
 
 
@@ -438,6 +453,15 @@ class MarketDataProvider(abc.ABC):
         """
 
     # -- lifecycle ---------------------------------------------------------
+
+    def session_lost(self) -> bool:
+        """True once the feed has refused this process's login long enough
+        that only a fresh one will help. See :class:`FeedSessionLost`.
+
+        Default ``False``: a feed whose sessions cannot be replaced from
+        elsewhere never needs this.
+        """
+        return False
 
     def close(self) -> None:
         """Release any shared connections. Default is a no-op."""

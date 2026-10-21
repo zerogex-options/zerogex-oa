@@ -27,8 +27,9 @@ from collections import defaultdict
 import pytz
 from psycopg2.extras import execute_values
 
+from src.ingestion.providers.base import FeedSessionLost
 from src.ingestion.tradestation_client import TradeStationClient
-from src.ingestion.stream_manager import StreamManager
+from src.ingestion.stream_manager import StreamManager, _feed_session_lost
 from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
@@ -335,6 +336,13 @@ WORKER_RESTART_BACKOFF_MAX_SECONDS = _getenv_float(
 # Mirrors the stream watchdog's slow re-attempt
 # (UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS in stream_manager).
 WORKER_ABANDON_RETRY_SECONDS = _getenv_int("INGEST_WORKER_ABANDON_RETRY_SECONDS", 900)
+
+#: A worker's exit code for "the feed's login was replaced" (EX_TEMPFAIL).
+#: Not a crash, and a respawn cannot fix it: the respawned worker adopts the
+#: same dead session. The supervisor answers it by restarting the unit, which
+#: logs in once and lets every worker adopt the new session. See
+#: FeedSessionLost.
+FEED_SESSION_LOST_EXIT_CODE = 75
 
 
 def _authenticate_shared_feed_session() -> None:
@@ -2703,6 +2711,15 @@ class IngestionEngine:
         window_closed = False
         try:
             if not stream_manager.initialize():
+                # A dead session fails initialize() too, and retrying it
+                # reuses the same session forever. Weekend restarts start
+                # here rather than in stream(), so this is the only place
+                # that would ever notice.
+                if _feed_session_lost(getattr(self, "provider", None)):
+                    raise FeedSessionLost(
+                        f"{self.underlying}: initialize() failed and the feed has "
+                        "refused this unit's login for every call"
+                    )
                 # run() retries this immediately -- self.running is still
                 # True, so the while loop comes straight back round. With no
                 # delay a persistent failure (a feed outage, a symbol the
@@ -2761,6 +2778,11 @@ class IngestionEngine:
 
         except KeyboardInterrupt:
             logger.info("\n⚠️  Stream interrupted by user")
+        except FeedSessionLost:
+            # Not a streaming error to log and retry: retrying reuses the
+            # dead session. run() turns it into the exit code the
+            # supervisor restarts the unit on.
+            raise
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
         finally:
@@ -2821,6 +2843,14 @@ class IngestionEngine:
                     else:
                         break
 
+        except FeedSessionLost as e:
+            logger.error(
+                "%s -- exiting with code %d so the supervisor restarts the unit "
+                "and logs in again.",
+                e,
+                FEED_SESSION_LOST_EXIT_CODE,
+            )
+            sys.exit(FEED_SESSION_LOST_EXIT_CODE)
         except Exception as e:
             logger.error(f"Fatal error in main engine: {e}", exc_info=True)
             sys.exit(1)
@@ -2916,6 +2946,23 @@ def supervise_workers(
                 # ValueError on a closed Process, and the caller's final join
                 # walks this dict. Its absence below means "awaiting respawn".
                 processes.pop(name, None)
+
+                if exitcode == FEED_SESSION_LOST_EXIT_CODE:
+                    # Every worker shares the one session, so every worker
+                    # is as dead as this one, and none can log in alone
+                    # without ending the others'. Stop them all and exit;
+                    # Restart=always brings the unit back, and its one login
+                    # before the fork is what each worker then adopts.
+                    logger.error(
+                        "Ingestion worker %s reports the feed's login was replaced "
+                        "by another login on the account, so no worker can read "
+                        "anything. Restarting the whole unit to log in again.",
+                        name,
+                    )
+                    for other in processes.values():
+                        if other.is_alive():
+                            other.terminate()
+                    return FEED_SESSION_LOST_EXIT_CODE
 
                 now = time.monotonic()
                 history = [
@@ -3242,6 +3289,7 @@ def main():
                 pass
         raise
 
+    relogin = exit_code == FEED_SESSION_LOST_EXIT_CODE
     for proc in processes.values():
         try:
             proc.join()
@@ -3250,10 +3298,15 @@ def main():
         if proc.exitcode not in (0, None):
             exit_code = 1
 
-    if signalled.is_set():
+    if signalled.is_set() or relogin:
         # Planned stop: we terminated the children ourselves, so their
         # -SIGTERM exits are expected, not a fault. Any degradation on the way
         # down was already logged at ERROR and alerted by the freshness check.
+        #
+        # A relogin exits cleanly for the same reason. Restart=always restarts
+        # on a clean exit too, and a failed unit would page at midnight for
+        # something already fixing itself; the supervisor's ERROR line says
+        # what happened.
         exit_code = 0
 
     sys.exit(exit_code)
