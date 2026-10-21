@@ -46,9 +46,10 @@ history and wall alerts (step 3).
 
 - **Signals and trade ideas** (the signal pages, Trade Bias, Composite Score,
   the Playbook cards). The playbook names a "0DTE" expiry as today's date and
-  rounds strikes to $1. NVDA lists Friday weeklies only, so Monday to Thursday
-  every card would name an expiration that does not exist. The signal pages say
-  so for NVDA and offer a one-click switch to QQQ.
+  rounds strikes to $1. NVDA does not list an expiration every weekday, and its
+  strikes near the money are $2.50 apart (both seen on the 2026-10-20 probe), so
+  cards would name expirations and strikes that do not exist. The signal pages
+  say so for NVDA and offer a one-click switch to QQQ.
 - **Forecast, intraday cone, signal scorecard.** The range model prices NVDA
   off VIX. The web pickers on those pages leave NVDA out.
 - **The free levels product**: no `/nvda-gamma-levels` page, so NVDA is kept
@@ -59,6 +60,10 @@ history and wall alerts (step 3).
 None of these block the pilot. Each is its own follow-up.
 
 ## Step 1 — Prove ThetaData serves NVDA (no DB writes)
+
+**PASSED 2026-10-20** (after the close): spot 219.74, 30 of 30 contracts with
+two-sided quotes and open interest, chain 0.3s per poll. Re-run it only when
+onboarding the next stock.
 
 Run this after the close or before 09:00 ET, so the probe does not compete with
 production for the terminal's request budget.
@@ -134,8 +139,10 @@ python-dotenv and make.
 Why 8%: the shared band (`INGEST_STRIKE_PCT_RANGE`, 3% by default) is sized so
 SPY's chain spans a few of its days.
 NVDA moves several times as far in a session, so ±3% covers about one NVDA day
-and leaves its round-number walls outside the chain. `INGEST_STRIKE_COUNT_MAX`
-(40) still caps the strikes, and SPY / QQQ / SPX / NDX are untouched.
+and leaves its round-number walls outside the chain. Measured on the
+2026-10-20 probe: at $219.74, ±3% held **5 strikes per expiration** ($2.50
+apart). ±8% holds about 14. `INGEST_STRIKE_COUNT_MAX` (40) still caps the
+strikes, and SPY / QQQ / SPX / NDX are untouched.
 
 ### Optional, each independent
 
@@ -291,9 +298,18 @@ updating.
 
 ## Known differences worth knowing, none blocking
 
-- `INGEST_EXPIRATIONS=3` means the nearest three expirations. For SPY that is
-  about three days. For NVDA it is the next three Fridays, about three weeks.
-  NVDA's GEX is a longer-dated book than SPY's for that reason alone.
+- `INGEST_EXPIRATIONS=3` means the nearest three expirations, whatever their
+  spacing. For SPY that is about three days. NVDA does not list every weekday
+  (the probe showed a Wednesday 2026-10-21 expiry), so its three reach further
+  out, about a week, and its GEX is a longer-dated book than SPY's. See the
+  actual set once it ingests:
+
+  ```sql
+  SELECT DISTINCT expiration, to_char(expiration, 'Dy') AS weekday
+  FROM option_chains
+  WHERE underlying = 'NVDA' AND timestamp > now() - interval '1 hour'
+  ORDER BY 1;
+  ```
 - Nothing knows NVDA's earnings dates. Expect its levels to move hard around
   them.
 - The Spread Monitor needs 100 contracts within 7 DTE and ±5%, a floor sized for
