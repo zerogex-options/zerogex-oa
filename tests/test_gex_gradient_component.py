@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.signals.components.base import MarketContext
+from src.signals.basic import gex_gradient
 from src.signals.basic.gex_gradient import GexGradientComponent
 
 
@@ -30,6 +31,15 @@ def _ctx(rows=None, net_gex=-1.4e9, **overrides) -> MarketContext:
 
 
 comp = GexGradientComponent()
+
+
+@pytest.fixture(autouse=True)
+def _reset_wing_reports():
+    """The unreachable-wing warning is throttled in module state; start each
+    test with nothing reported so order doesn't decide what logs."""
+    gex_gradient._REPORTED_WING_UNREACHABLE.clear()
+    yield
+    gex_gradient._REPORTED_WING_UNREACHABLE.clear()
 
 
 def test_no_rows_is_neutral():
@@ -168,3 +178,61 @@ def test_the_damper_still_bites_when_the_wings_are_real():
     assert comp.context_values(_ctx(rows=_chain(500.0, 0.06)))["wing_fraction"] > 0
     assert comp.context_values(_ctx(rows=_chain(500.0, 0.03)))["wing_fraction"] == 0
     assert isinstance(narrow, float) and isinstance(wide, float)
+
+
+def _wing_warnings(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and "wing window" in r.getMessage()
+    ]
+
+
+def test_the_unreachable_warning_names_the_underlying(caplog):
+    with caplog.at_level("WARNING", logger="src.signals.basic.gex_gradient"):
+        comp.compute(_ctx(rows=_chain(500.0, 0.03), underlying="SPX"))
+    (message,) = _wing_warnings(caplog)
+    assert message.startswith("gex_gradient[SPX]:")
+
+
+def test_repeated_unreachable_cycles_warn_once(caplog):
+    """Production scores about once a second; the same condition must not
+    fill Recent Warnings with copies of one line."""
+    with caplog.at_level("WARNING", logger="src.signals.basic.gex_gradient"):
+        for _ in range(50):
+            comp.compute(_ctx(rows=_chain(500.0, 0.0389)))
+    assert len(_wing_warnings(caplog)) == 1
+
+
+def test_unreachable_is_tracked_per_underlying(caplog):
+    with caplog.at_level("WARNING", logger="src.signals.basic.gex_gradient"):
+        for _ in range(3):
+            comp.compute(_ctx(rows=_chain(500.0, 0.03), underlying="SPY"))
+            comp.compute(_ctx(rows=_chain(500.0, 0.03), underlying="QQQ"))
+    messages = _wing_warnings(caplog)
+    assert len(messages) == 2
+    assert {m.split(":")[0] for m in messages} == {"gex_gradient[SPY]", "gex_gradient[QQQ]"}
+
+
+def test_a_meaningful_move_in_the_widest_strike_warns_again(caplog):
+    with caplog.at_level("WARNING", logger="src.signals.basic.gex_gradient"):
+        comp.compute(_ctx(rows=_chain(500.0, 0.0389)))
+        comp.compute(_ctx(rows=_chain(500.0, 0.0385)))  # 0.04pp: noise
+        comp.compute(_ctx(rows=_chain(500.0, 0.0300)))  # 0.89pp: meaningful
+        comp.compute(_ctx(rows=_chain(500.0, 0.0300)))
+    messages = _wing_warnings(caplog)
+    assert len(messages) == 2
+    assert "3.89% from spot" in messages[0]
+    assert "3.00% from spot" in messages[1]
+
+
+def test_recovery_logs_once_and_rearms_the_warning(caplog):
+    with caplog.at_level("INFO", logger="src.signals.basic.gex_gradient"):
+        comp.compute(_ctx(rows=_chain(500.0, 0.03)))
+        comp.compute(_ctx(rows=_chain(500.0, 0.06)))
+        comp.compute(_ctx(rows=_chain(500.0, 0.06)))
+        comp.compute(_ctx(rows=_chain(500.0, 0.03)))
+    recoveries = [r for r in caplog.records if "reachable again" in r.getMessage()]
+    assert len(recoveries) == 1
+    assert recoveries[0].levelname == "INFO"
+    assert len(_wing_warnings(caplog)) == 2, "the condition returning is a new start"

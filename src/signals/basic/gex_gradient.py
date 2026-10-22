@@ -23,6 +23,7 @@ degrades gracefully when the data isn't present.
 from __future__ import annotations
 
 import os
+import threading
 
 from src.signals.components.base import ComponentBase, MarketContext
 from src.utils import get_logger
@@ -46,6 +47,50 @@ _LONG_GAMMA_DAMPING = max(
     0.0,
     min(1.0, float(os.getenv("SIGNAL_GEX_GRADIENT_LONG_GAMMA_DAMPING", "0.40"))),
 )
+
+#: How far (as a fraction of spot) the widest strike must move before an
+#: already-reported unreachable wing window is reported again.
+_WING_REREPORT_DELTA = 0.0025
+
+#: Underlying -> widest-strike distance last reported as unreachable, so the
+#: condition warns once per underlying rather than once per scoring cycle.
+_REPORTED_WING_UNREACHABLE: dict[str, float] = {}
+_REPORTED_LOCK = threading.Lock()
+
+
+def _report_wing_unreachable(underlying: str, max_distance: float, wing_confidence: float) -> None:
+    """Warn when the wing window becomes unreachable for ``underlying``, and
+    again only if the widest strike moves by ``_WING_REREPORT_DELTA``."""
+    with _REPORTED_LOCK:
+        last = _REPORTED_WING_UNREACHABLE.get(underlying)
+        if last is not None and abs(max_distance - last) < _WING_REREPORT_DELTA:
+            return
+        _REPORTED_WING_UNREACHABLE[underlying] = max_distance
+    logger.warning(
+        "gex_gradient[%s]: wing window (>=%.1f%%) unreachable -- widest strike "
+        "is %.2f%% from spot, so wing_fraction=0 means UNMEASURED, not empty, "
+        "and the wing confidence damper is inert at %.2f (reported once; "
+        "again only on recovery or a widest-strike move of %.2f%%)",
+        underlying,
+        100 * _WING_WINDOW_PCT,
+        100 * max_distance,
+        wing_confidence,
+        100 * _WING_REREPORT_DELTA,
+    )
+
+
+def _report_wing_reachable(underlying: str, max_distance: float) -> None:
+    """Note, once, that a previously unreachable wing window is measured again."""
+    with _REPORTED_LOCK:
+        if _REPORTED_WING_UNREACHABLE.pop(underlying, None) is None:
+            return
+    logger.info(
+        "gex_gradient[%s]: wing window (>=%.1f%%) reachable again -- widest strike "
+        "is %.2f%% from spot, wing confidence damper active",
+        underlying,
+        100 * _WING_WINDOW_PCT,
+        100 * max_distance,
+    )
 
 
 class GexGradientComponent(ComponentBase):
@@ -84,15 +129,11 @@ class GexGradientComponent(ComponentBase):
             # dangerous one. Widening the score's own behaviour here would
             # change published signals, so say so and leave the number
             # alone; the fix is a config decision, not this function's.
-            logger.warning(
-                "gex_gradient[%s]: wing window (>=%.1f%%) unreachable -- widest strike "
-                "is %.2f%% from spot, so wing_fraction=0 means UNMEASURED, not empty, "
-                "and the wing confidence damper is inert at %.2f",
-                getattr(ctx, "symbol", "?"),
-                100 * _WING_WINDOW_PCT,
-                100 * buckets["max_strike_distance_pct"],
-                wing_confidence,
+            _report_wing_unreachable(
+                ctx.underlying, buckets["max_strike_distance_pct"], wing_confidence
             )
+        else:
+            _report_wing_reachable(ctx.underlying, buckets["max_strike_distance_pct"])
 
         # Replace the previous hard cutoff at _MIN_TOTAL_GAMMA with a soft
         # confidence ramp so thin-OI snapshots taper toward zero rather
