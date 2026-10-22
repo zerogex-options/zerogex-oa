@@ -231,9 +231,16 @@ _INDEX_PRINT_MAX_AGE = timedelta(minutes=5)
 #: Basic's bid and ask: one venue, not the consolidated market (F8 in the
 #: feed findings). Outside the cash session that one book can thin to a side
 #: resting far from where the stock trades, and the midpoint of such a quote
-#: is a price nobody dealt at. SPY quotes a cent or two wide; 0.1% is ~$0.77
-#: there, so this refuses only a quote that has come apart.
-_MAX_MARK_SPREAD = 0.001
+#: is a price nobody dealt at. The 2026-10-20 SPY phantom came from 750 x
+#: 770.72, 2.7% wide.
+#:
+#: 0.5%, not the 0.1% this started at. 0.1% was sized on SPY, which quotes a
+#: cent or two even after hours, and it refused ordinary NVDA after-hours
+#: books: 218.99 x 219.31 on 2026-10-21 18:38 ET is 0.15% wide and marks
+#: 219.15, a perfectly good price. At 0.5% a stored mark is at most 0.25%
+#: from either side of its quote, inside what the jump check below already
+#: lets through unconfirmed, and SPY's broken quote is still five times over.
+_MAX_MARK_SPREAD = 0.005
 
 #: Furthest one poll may move a stock mark from the last stored one before a
 #: NEWER quote has to agree. SPY's 19:59 ET bar on 2026-10-20, written at
@@ -488,6 +495,9 @@ def report_unmapped(
     *,
     unreadable: int = 0,
     unmatched: int = 0,
+    root: Optional[str] = None,
+    expiration: Optional[date] = None,
+    requested_strikes: Sequence[float] = (),
 ) -> None:
     """Warn, once per cause per column shape, when rows arrive but nothing maps.
 
@@ -522,11 +532,18 @@ def report_unmapped(
     columns alone, one benign-looking occurrence silenced every later one
     for the life of the process — so a real mapping failure arriving after
     the first report was invisible.
+
+    ``root``, ``expiration`` and ``requested_strikes`` say which chain it
+    was and what it was matched against. The 2026-10-21 occurrence (487
+    ohlc rows, first strike 31750.0 CALL) logged a sample but no chain, so
+    it still could not say whether 31750 was the right units for the wrong
+    chain or the wrong units for the right one. They are also in the
+    throttle key, so one failing expiration does not hide another.
     """
     if not rows:
         return
     cause = "unreadable" if unreadable else "unmatched"
-    shape = (kind, cause, frozenset(rows[0].keys()))
+    shape = (kind, cause, frozenset(rows[0].keys()), root, expiration)
     with _REPORTED_LOCK:
         if shape in _REPORTED_SHAPES:
             return
@@ -548,17 +565,70 @@ def report_unmapped(
         )
         return
     logger.warning(
-        "thetadata %s: %d row(s) returned, none mapped — all %d read %s "
+        "thetadata %s %s %s: %d row(s) returned, none mapped — all %d read %s "
         "cleanly and then JOINED TO NOTHING. Not a column-spelling problem: "
-        "the columns are present and readable. First row's values: %r. Either "
-        "the strike units are wrong (see _normalise_strike) or the response "
-        "covers a strike grid that excludes every contract requested.",
+        "the columns are present and readable. First row's values: %r. %s",
         kind,
+        root or "?",
+        expiration or "?",
         len(rows),
         unmatched,
         " / ".join(fields),
         sample,
+        _compare_strikes(rows, requested_strikes),
     )
+
+
+def _compare_strikes(rows: Sequence[Dict[str, Any]], requested: Sequence[float]) -> str:
+    """What the response's strikes have in common with the requested ones.
+
+    Each answer points at a different fix, so the log line states which:
+    shared strikes mean the rights did not line up; overlapping ranges with
+    nothing shared mean a different strike grid; disjoint ranges mean the
+    units, or a different chain than the one asked for.
+    """
+    got = sorted(
+        {
+            round(s, 4)
+            for s in (_normalise_strike(_pick(r, "strike")) for r in rows)
+            if s is not None
+        }
+    )
+    rights = sorted({str(_pick(r, "right")) for r in rows})
+    expirations = sorted({str(_pick(r, "expiration")) for r in rows})
+    if len(expirations) > 3:
+        expirations = expirations[:3] + [f"... {len(expirations)} in all"]
+    response = (
+        f"Response: {len(got)} strike(s) {got[0]:g}..{got[-1]:g}, rights {rights}, "
+        f"expirations {expirations}."
+        if got
+        else "Response: no readable strike."
+    )
+    wanted = sorted({round(s, 4) for s in requested})
+    if not wanted:
+        return response + (
+            " Either the strike units are wrong (see _normalise_strike) or the "
+            "response covers a strike grid that excludes every contract requested."
+        )
+    shared = len(set(got) & set(wanted))
+    requested_text = f" Requested: {len(wanted)} strike(s) {wanted[0]:g}..{wanted[-1]:g}."
+    if shared:
+        verdict = (
+            f" {shared} requested strike(s) ARE in the response, so the strikes "
+            "agree and the right did not line up (see _CALL_CODES)."
+        )
+    elif got and got[0] <= wanted[-1] and wanted[0] <= got[-1]:
+        verdict = (
+            " The ranges overlap but share no strike: the response is on a "
+            "different strike grid from the one option_list_strikes gave."
+        )
+    else:
+        verdict = (
+            " The ranges do not overlap: either the strike units are wrong "
+            "(see _normalise_strike) or the response is a different chain "
+            "from the one requested."
+        )
+    return response + requested_text + verdict
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -1526,6 +1596,9 @@ class ThetaDataProvider(MarketDataProvider):
                 ("strike", "right"),
                 unreadable=unreadable,
                 unmatched=unmatched,
+                root=root,
+                expiration=expiration,
+                requested_strikes=[k[2] for k in wanted if k[0] == root and k[1] == expiration],
             )
 
     def describe_columns(self, underlying: str = "SPY") -> Dict[str, Dict[str, Any]]:

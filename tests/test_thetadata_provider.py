@@ -1413,6 +1413,16 @@ def test_a_bad_closing_quote_cannot_confirm_itself():
     assert closes[6] == pytest.approx(770.50)
 
 
+def test_an_ordinary_after_hours_single_stock_book_is_stored():
+    """NVDA at 18:38 ET on 2026-10-21: 218.99 x 219.31, 0.15% wide, refused
+    by the 0.1% cap that was sized on SPY. Its mark is a good price."""
+    from src.ingestion.providers.thetadata import _StockMarkFilter
+
+    f = _StockMarkFilter("NVDA")
+    row = {"market_bid": 218.99, "market_ask": 219.31, "market_price": 219.15}
+    assert f.admit(row, 219.15, _et(18, 38, 42, day=21))
+
+
 def test_ordinary_ticks_pass_untouched():
     quotes = [(770.79 + i * 0.05, 770.81 + i * 0.05) for i in range(20)]
     closes, _ = _closes(quotes)
