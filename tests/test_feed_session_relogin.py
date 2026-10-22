@@ -10,8 +10,8 @@ and 08:40 -- until a human restarted the unit at 08:44.
 
 These tests pin the chain that now does what that restart did:
 
-  * the provider notices a dead session on ANY call, and forgets it on the
-    next call that works;
+  * the provider notices a dead session on ANY call, and forgets it only
+    after a quiet minute -- not on the next call that happens to work;
   * after the grace period the worker's stream loop, or its failing
     initialize(), raises FeedSessionLost instead of retrying the same dead
     session forever;
@@ -81,20 +81,58 @@ def test_a_replaced_login_is_reported_once_the_grace_period_has_passed(monkeypat
     assert provider.session_lost()
 
 
-def test_one_call_that_works_means_the_session_works(monkeypatch):
-    monkeypatch.setattr(td, "SESSION_LOST_RELOGIN_SECONDS", 0.0)
+class _Clock:
+    """Stands in for the provider module's ``time``: monotonic() is ours."""
+
+    def __init__(self):
+        self.now = 1_000.0
+
+    def monotonic(self):
+        return self.now
+
+
+def test_a_call_that_works_does_not_restart_the_clock(monkeypatch):
+    """2026-10-22: the session replaced at 09:16:16 kept answering some calls
+    for minutes while refusing the rest. Each worker logged a fresh refusal
+    every few seconds, and resetting on every success pushed the relogin from
+    about 09:18 to about 09:21."""
+    clock = _Clock()
+    monkeypatch.setattr(td, "time", clock)
+    client = _Client()
+    provider = _provider(client)
+
+    for _ in range(13):  # a refusal and a success every 10s, for two minutes
+        client.fail = _SESSION_GONE
+        with pytest.raises(RuntimeError):
+            provider.get_option_expirations("SPY")
+        client.fail = None
+        provider.get_option_expirations("SPY")
+        clock.now += 10.0
+
+    assert td.session_lost_for() == pytest.approx(130.0)
+    assert provider.session_lost()
+
+
+def test_a_quiet_minute_means_the_session_works(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(td, "time", clock)
     client = _Client()
     provider = _provider(client)
 
     client.fail = _SESSION_GONE
     with pytest.raises(RuntimeError):
         provider.get_option_expirations("SPY")
-    assert provider.session_lost()
+    clock.now += td.SESSION_ERROR_QUIET_SECONDS - 1
+    assert td.session_lost_for() is not None, "still inside the episode"
 
-    client.fail = None
-    provider.get_option_expirations("SPY")
-    assert not provider.session_lost()
+    clock.now += 2
     assert td.session_lost_for() is None
+    assert not provider.session_lost()
+
+    # The next refusal starts a NEW episode; the old one's age does not carry.
+    with pytest.raises(RuntimeError):
+        provider.get_option_expirations("SPY")
+    assert td.session_lost_for() == 0.0
 
 
 def test_other_failures_are_not_a_lost_session(monkeypatch):

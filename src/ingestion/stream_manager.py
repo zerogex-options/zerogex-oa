@@ -2519,8 +2519,8 @@ class StreamManager:
                 # stream. See FeedSessionLost.
                 if _feed_session_lost(getattr(self, "provider", None)):
                     raise FeedSessionLost(
-                        f"{self.underlying}: the feed has refused this unit's login "
-                        "for every call; another login replaced it"
+                        f"{self.underlying}: the feed has been refusing this unit's "
+                        "login for two minutes; another login replaced it"
                     )
 
                 # Get current market session for dynamic polling

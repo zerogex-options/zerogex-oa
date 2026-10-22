@@ -333,16 +333,26 @@ def shared_client(factory: Any, key: Tuple[Any, ...], adopt: Any = None) -> Any:
         return client
 
 
-#: How long every call may keep failing for a dead session before this
+#: How long calls may keep being refused for a dead session before this
 #: process reports it lost (see :meth:`ThetaDataProvider.session_lost`).
 #: Two minutes rides out a blip and still has pre-market moving again within
 #: about three. On 2026-10-21 nothing reported it and the feed stayed dead
 #: from 00:00 to 08:44 ET.
 SESSION_LOST_RELOGIN_SECONDS = 120.0
 
-#: Monotonic time of the first call refused for a dead session since the
-#: last call that succeeded, else None. Per PROCESS, like the session itself.
-_SESSION_LOST_SINCE: Optional[float] = None
+#: A gap this long with no "Invalid session ID" ends an episode: the session
+#: works again. A call that SUCCEEDS does not end it. On 2026-10-22 a session
+#: replaced at 09:16:16 kept answering some calls for minutes while refusing
+#: the rest; each worker logged a fresh refusal every few seconds, and when
+#: one success reset the clock the relogin came at about 09:21 instead of
+#: 09:18. A dead session refuses at least every bar-poll backoff (16s at
+#: most), so a quiet minute means it is genuinely back.
+SESSION_ERROR_QUIET_SECONDS = 60.0
+
+#: Monotonic times of the first and the latest "Invalid session ID" in the
+#: current episode, else None. Per PROCESS, like the session itself.
+_SESSION_ERROR_FIRST: Optional[float] = None
+_SESSION_ERROR_LAST: Optional[float] = None
 _SESSION_LOCK = threading.Lock()
 
 
@@ -360,30 +370,41 @@ def _is_session_error(error: BaseException) -> bool:
 
 
 def session_lost_for() -> Optional[float]:
-    """Seconds every call in this process has been refused for a dead
-    session; ``None`` while the session works."""
+    """Seconds this process's calls have been refused for a dead session,
+    counted from the first refusal of the episode; ``None`` once
+    :data:`SESSION_ERROR_QUIET_SECONDS` pass without one."""
     with _SESSION_LOCK:
-        since = _SESSION_LOST_SINCE
-    return None if since is None else time.monotonic() - since
+        first, last = _SESSION_ERROR_FIRST, _SESSION_ERROR_LAST
+    now = time.monotonic()
+    if first is None or last is None or now - last > SESSION_ERROR_QUIET_SECONDS:
+        return None
+    return now - first
 
 
-def _note_call(error: Optional[BaseException]) -> None:
-    global _SESSION_LOST_SINCE
+def _note_session_error(error: BaseException) -> None:
+    global _SESSION_ERROR_FIRST, _SESSION_ERROR_LAST
+    if not _is_session_error(error):
+        return
+    now = time.monotonic()
     with _SESSION_LOCK:
-        if error is None:
-            _SESSION_LOST_SINCE = None
-        elif _SESSION_LOST_SINCE is None and _is_session_error(error):
-            _SESSION_LOST_SINCE = time.monotonic()
-            logger.error(
-                'ThetaData answered "Invalid session ID": another login on this '
-                "account has replaced ours. If every call keeps failing for %.0fs "
-                "this worker exits so the unit can log in again.",
-                SESSION_LOST_RELOGIN_SECONDS,
-            )
+        new_episode = (
+            _SESSION_ERROR_LAST is None or now - _SESSION_ERROR_LAST > SESSION_ERROR_QUIET_SECONDS
+        )
+        if new_episode:
+            _SESSION_ERROR_FIRST = now
+        _SESSION_ERROR_LAST = now
+    if new_episode:
+        logger.error(
+            'ThetaData answered "Invalid session ID": another login on this '
+            "account has replaced ours. If calls keep being refused for %.0fs "
+            "this worker exits so the unit can log in again.",
+            SESSION_LOST_RELOGIN_SECONDS,
+        )
 
 
 class _SessionWatch:
-    """The client, with every call reporting whether the session still works.
+    """The client, with every call that fails reporting whether the session
+    was refused.
 
     One choke point instead of a check at each of the dozen call sites, any
     one of which may be the only thing running at a given hour.
@@ -401,21 +422,19 @@ class _SessionWatch:
 
         def call(*args: Any, **kwargs: Any) -> Any:
             try:
-                out = attr(*args, **kwargs)
+                return attr(*args, **kwargs)
             except Exception as e:
-                _note_call(e)
+                _note_session_error(e)
                 raise
-            _note_call(None)
-            return out
 
         return call
 
 
 def reset_shared_clients() -> None:
     """Drop the cache. For tests, and for a deliberate reconnect."""
-    global _SESSION_LOST_SINCE
+    global _SESSION_ERROR_FIRST, _SESSION_ERROR_LAST
     with _SESSION_LOCK:
-        _SESSION_LOST_SINCE = None
+        _SESSION_ERROR_FIRST = _SESSION_ERROR_LAST = None
     with _CLIENTS_LOCK:
         _CLIENTS.clear()
 

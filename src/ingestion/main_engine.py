@@ -2718,7 +2718,7 @@ class IngestionEngine:
                 if _feed_session_lost(getattr(self, "provider", None)):
                     raise FeedSessionLost(
                         f"{self.underlying}: initialize() failed and the feed has "
-                        "refused this unit's login for every call"
+                        "been refusing this unit's login for two minutes"
                     )
                 # run() retries this immediately -- self.running is still
                 # True, so the while loop comes straight back round. With no
