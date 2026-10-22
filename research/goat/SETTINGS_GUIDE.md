@@ -75,8 +75,10 @@ GA trades two lots: lot 1 (GOAT1) and lot 2 (GOAT2).
 | Stop mode | EntryBarRangePlusTicks: the stop is the entry bar's height plus the extra ticks in the next setting. FixedTicks: a set number of ticks. |
 | Stop: extra ticks beyond entry bar (range mode only) | Added to the entry bar's height. On a 5-range NQ chart the bar is 5 ticks, so 2 extra makes a 7-tick stop. |
 | Stop: fixed ticks (FixedTicks mode only) | The stop distance in FixedTicks mode. |
-| Target 1 mode | FirstOppositeCloseBar: lot 1 exits on the first bar that closes against the trade. FixedTicks: lot 1 exits at a set profit. |
-| Target 1: fixed ticks (FixedTicks mode only) | Lot 1's profit target. |
+| Lot 1 exit mode | FirstOppositeCloseBar: lot 1 exits on the first bar that closes against the trade. FixedTicks: lot 1 exits at set profit targets. |
+| Lot 1 target 1 (ticks; FixedTicks mode only) | Lot 1's profit target. With targets 2 and 3 at 0, all of lot 1 exits here. |
+| Lot 1 target 2 (ticks, 0=off) | Splits lot 1 over more targets (FixedTicks mode only). Its contracts are shared over the targets that are set, so 20, 30 and 40 is one contract each with 3 per lot. |
+| Lot 1 target 3 (ticks, 0=off) | The third target for lot 1. |
 | Lot 2 target 1 (ticks, 0=trail) | Splits lot 2 over up to three profit targets. Each target takes one contract (with 3 per lot), and a 0 leaves that contract on the trail. All three at 0 keeps lot 2 as one trailing lot. |
 | Lot 2 target 2 (ticks, 0=trail) | The second contract's target. |
 | Lot 2 target 3 (ticks, 0=trail) | The third contract's target. |
@@ -84,14 +86,21 @@ GA trades two lots: lot 1 (GOAT1) and lot 2 (GOAT2).
 | Breakeven: after ticks in profit (0=off) | **When** the stops move: once price has gone this far your way. 0 turns breakeven off. |
 | Breakeven: stop at entry plus (ticks) | **Where** they move to: your entry plus this many ticks. 1 or 2 is typical. |
 
-**Three targets on lot 2, with breakeven.** Set the three "Lot 2 target"
-boxes to the ticks you want, then set breakeven with its two boxes: "after
-ticks in profit" is when, "stop at entry plus" is where. For example, 40, 60
-and 0 take one contract off at 40 ticks and one at 60, and let the last one
-ride the trail. With breakeven at 15 and plus 1, every contract still open
-moves to entry plus 1 tick once price has gone 15 ticks your way. Contracts
-are handed out one at a time, starting with target 1: 4 per lot gives 2, 1 and
-1, and 2 per lot leaves target 3 without one.
+**Three targets per lot, with breakeven.** Each lot can take profit at up to
+three levels. For lot 1, set "Lot 1 exit mode" to FixedTicks and fill in its
+three targets. For lot 2, fill in its three targets; a 0 there leaves that
+contract on the trail. Then set breakeven with its two boxes: "after ticks in
+profit" is when, "stop at entry plus" is where.
+
+For example, with 3 contracts per lot: lot 1 at 20, 30 and 40 takes one
+contract off at each. Lot 2 at 60, 80 and 0 takes one off at 60 and one at 80,
+and lets the last ride the trail. With breakeven at 15 and plus 1, every
+contract still open moves to entry plus 1 tick once price has gone 15 ticks
+your way.
+
+Contracts are handed out one at a time, starting with target 1: 4 per lot over
+three targets gives 2, 1 and 1, and 2 per lot leaves the third target without
+one.
 
 ## 6. Dead zones (no new trades)
 
@@ -164,6 +173,14 @@ turning them on never changes a trade.
      history to start trading.
 4. **Moving settings between NQ and YM?** Remember a YM tick is four times
    an NQ tick.
+
+## If a stop disappears in a fast market
+
+When price jumps past a stop before GA's change to it arrives, the market
+rejects the change. NinjaTrader then switches GA off, cancels its orders and
+closes its position at market, which can look like a stop vanishing. Check the
+Strategies tab to see whether GA is still enabled, and the Log tab (Control
+Center) for a "rejected" entry at that time.
 
 ## Installing a new version
 

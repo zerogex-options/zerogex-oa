@@ -88,7 +88,11 @@
 //  changes a trade.
 //
 //  EXITS — two lots:
-//    Lot 1 ("GOAT1") exits on the first opposite-closing bar.
+//    Lot 1 ("GOAT1") exits on the first opposite-closing bar, or at a fixed
+//    target. With fixed targets it can be split over up to three
+//    (Target1Ticks, Lot1Target2Ticks, Lot1Target3Ticks): its contracts are
+//    shared out over the targets in use, one at a time from target 1. Jim,
+//    2026-10-21: "three targets for the first lot ... 20, 30, 40".
 //    Lot 2 ("GOAT2") trails by TrailTicks.
 //    Lot 2 can instead be split over three profit targets
 //    (Lot2Target1Ticks to Lot2Target3Ticks). Its contracts are shared out
@@ -280,13 +284,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 		//: can only come from an exit that overfilled, never from an entry.
 		private MarketPosition tradeDirection = MarketPosition.Flat;
 
-		//: How lot 2 enters: "GOAT2" as one trailing lot, or one signal per
-		//: target once Lot2Target*Ticks split it, each with its contracts and
-		//: target (0 = trail only). Planned in DataLoaded; the initial signal
-		//: keeps the exit code safe before that.
+		//: How each lot enters: one signal for the whole lot, or one per
+		//: target once its targets split it, each with its contracts and
+		//: profit target (0 = none: lot 1 then has only its stop, a lot 2
+		//: contract trails). Planned in DataLoaded; the initial signals keep
+		//: the exit code safe before that.
+		private string[] lot1Signals = { "GOAT1" };
+		private int[] lot1Quantities = new int[0];
+		private int[] lot1Targets = new int[0];
 		private string[] lot2Signals = { "GOAT2" };
 		private int[] lot2Quantities = new int[0];
 		private int[] lot2Targets = new int[0];
+		private static readonly string[] Lot1SplitSignals = { "GOAT1A", "GOAT1B", "GOAT1C" };
 		private static readonly string[] Lot2SplitSignals = { "GOAT2A", "GOAT2B", "GOAT2C" };
 
 		//: How close price may be to lot 1's stop before ExitTarget1 leaves the
@@ -358,6 +367,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				StopFixedTicks = 8;
 				Target1Mode = GoatTarget1Mode.FirstOppositeCloseBar;
 				Target1Ticks = 8;
+				Lot1Target2Ticks = 0;        // both 0 == lot 1 has one target
+				Lot1Target3Ticks = 0;
 				TrailTicks = 8;
 				Lot2Target1Ticks = 0;        // all three 0 == lot 2 is one trailing lot
 				Lot2Target2Ticks = 0;
@@ -398,11 +409,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 					BarsRequiredToTrade = Math.Max(
 						BarsRequiredToTrade, PumpkinPeriod + PumpkinSlopeLookback);
 
-				// A split lot 2 enters under up to three signals besides lot
-				// 1's. A saved setting of 2 would quietly drop the last two,
-				// so this is raised here rather than left to the dialog.
-				if (Lot2IsSplit())
-					EntriesPerDirection = Math.Max(EntriesPerDirection, 4);
+				// A split lot enters under up to three signals instead of one,
+				// so a trade can need up to six entries. A saved setting of 2
+				// would quietly drop the rest, so this is raised here rather
+				// than left to the dialog.
+				int entries = (Lot1IsSplit() ? 3 : 1) + (Lot2IsSplit() ? 3 : 1);
+				if (entries > 2)
+					EntriesPerDirection = Math.Max(EntriesPerDirection, entries);
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -425,7 +438,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				lastSkipLabelBar = -1;
 				skipLabelCount = 0;
 
-				PlanLot2();
+				PlanLots();
 			}
 		}
 
@@ -573,7 +586,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				SetStops();
 				tradeDirection = MarketPosition.Long;
-				EnterLong(LotSize, "GOAT1");
+				for (int i = 0; i < lot1Signals.Length; i++)
+					EnterLong(lot1Quantities[i], lot1Signals[i]);
 				for (int i = 0; i < lot2Signals.Length; i++)
 					EnterLong(lot2Quantities[i], lot2Signals[i]);
 				return;
@@ -584,7 +598,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				SetStops();
 				tradeDirection = MarketPosition.Short;
-				EnterShort(LotSize, "GOAT1");
+				for (int i = 0; i < lot1Signals.Length; i++)
+					EnterShort(lot1Quantities[i], lot1Signals[i]);
 				for (int i = 0; i < lot2Signals.Length; i++)
 					EnterShort(lot2Quantities[i], lot2Signals[i]);
 				return;
@@ -875,15 +890,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 			stopTicks = Math.Max(1, stopTicks);
 			signalStopTicks = stopTicks;
 
-			SetStopLoss("GOAT1", CalculationMode.Ticks, stopTicks, false);
+			foreach (string signal in lot1Signals)
+				SetStopLoss(signal, CalculationMode.Ticks, stopTicks, false);
 			foreach (string signal in lot2Signals)
 				SetStopLoss(signal, CalculationMode.Ticks, stopTicks, false);
 
-			if (Target1Mode == GoatTarget1Mode.FixedTicks)
-				SetProfitTarget("GOAT1", CalculationMode.Ticks, Target1Ticks);
-
-			// Lot 2's targets, when it is split. A target of 0 sets nothing,
-			// so that contract stays on the trail.
+			// Profit targets as planned. A target of 0 sets nothing: lot 1
+			// on its first-opposite-close exit, or a lot 2 contract left on
+			// the trail.
+			for (int i = 0; i < lot1Targets.Length; i++)
+				if (lot1Targets[i] > 0)
+					SetProfitTarget(lot1Signals[i], CalculationMode.Ticks, lot1Targets[i]);
 			for (int i = 0; i < lot2Targets.Length; i++)
 				if (lot2Targets[i] > 0)
 					SetProfitTarget(lot2Signals[i], CalculationMode.Ticks, lot2Targets[i]);
@@ -965,7 +982,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			// Every bar after the trigger, not just the first: if price was
 			// already back through the breakeven level, MoveStop only gets part
 			// of the way and a later bar finishes the move.
-			MoveStop(ref lot1Stop, BreakevenStop(isLong), isLong, "GOAT1");
+			MoveStop(ref lot1Stop, BreakevenStop(isLong), isLong, lot1Signals);
 		}
 
 		private double BreakevenStop(bool isLong)
@@ -1095,46 +1112,86 @@ namespace NinjaTrader.NinjaScript.Strategies
 		}
 
 		// --------------------------------------------------------------
-		// Lot 2's three targets
+		// Splitting a lot over up to three targets
 		// --------------------------------------------------------------
+		/// <summary>Lot 1 splits only on fixed targets, and only once target 2 or 3 is set.</summary>
+		private bool Lot1IsSplit()
+		{
+			return Target1Mode == GoatTarget1Mode.FixedTicks
+				&& (Lot1Target2Ticks > 0 || Lot1Target3Ticks > 0);
+		}
+
 		private bool Lot2IsSplit()
 		{
 			return Lot2Target1Ticks > 0 || Lot2Target2Ticks > 0 || Lot2Target3Ticks > 0;
 		}
 
 		/// <summary>
-		/// Plan lot 2's entries. Not split, it is the whole lot under "GOAT2"
-		/// with no target. Split, its contracts are shared out one at a time
-		/// starting with target 1: three per lot is one each, two leaves
-		/// target 3 without a contract, and a target with no contract is left
-		/// out rather than entered at zero.
+		/// Plan both lots' entries. Unsplit, a lot is one signal for all its
+		/// contracts. Lot 1 split uses only the targets that are set, so 20, 0
+		/// and 40 is two targets. Lot 2 split keeps all three, a 0 being a
+		/// contract left on the trail.
 		/// </summary>
-		private void PlanLot2()
+		private void PlanLots()
 		{
-			if (!Lot2IsSplit())
+			if (Lot1IsSplit())
+			{
+				int[] ticks = { Target1Ticks, Lot1Target2Ticks, Lot1Target3Ticks };
+				List<string> names = new List<string>();
+				List<int> used = new List<int>();
+				for (int i = 0; i < ticks.Length; i++)
+				{
+					if (ticks[i] <= 0)
+						continue;
+					names.Add(Lot1SplitSignals[i]);
+					used.Add(ticks[i]);
+				}
+				PlanSplit(names.ToArray(), used.ToArray(), out lot1Signals, out lot1Quantities, out lot1Targets);
+			}
+			else
+			{
+				lot1Signals = new[] { "GOAT1" };
+				lot1Quantities = new[] { LotSize };
+				lot1Targets = new[] { Target1Mode == GoatTarget1Mode.FixedTicks ? Target1Ticks : 0 };
+			}
+
+			if (Lot2IsSplit())
+			{
+				PlanSplit(Lot2SplitSignals, new[] { Lot2Target1Ticks, Lot2Target2Ticks, Lot2Target3Ticks },
+					out lot2Signals, out lot2Quantities, out lot2Targets);
+			}
+			else
 			{
 				lot2Signals = new[] { "GOAT2" };
 				lot2Quantities = new[] { LotSize };
 				lot2Targets = new[] { 0 };
-				return;
 			}
+		}
 
-			int[] targets = { Lot2Target1Ticks, Lot2Target2Ticks, Lot2Target3Ticks };
-			List<string> signals = new List<string>();
-			List<int> quantities = new List<int>();
-			List<int> kept = new List<int>();
-			for (int i = 0; i < 3; i++)
+		/// <summary>
+		/// Hand a lot's contracts out over its slots one at a time, starting
+		/// with the first: three over three is one each, four is 2, 1 and 1,
+		/// two leaves the third slot without one. A slot with no contract is
+		/// left out rather than entered at zero.
+		/// </summary>
+		private void PlanSplit(string[] slots, int[] slotTargets,
+			out string[] signals, out int[] quantities, out int[] targets)
+		{
+			List<string> signalList = new List<string>();
+			List<int> quantityList = new List<int>();
+			List<int> targetList = new List<int>();
+			for (int i = 0; i < slots.Length; i++)
 			{
-				int quantity = LotSize / 3 + (i < LotSize % 3 ? 1 : 0);
+				int quantity = LotSize / slots.Length + (i < LotSize % slots.Length ? 1 : 0);
 				if (quantity == 0)
 					continue;
-				signals.Add(Lot2SplitSignals[i]);
-				quantities.Add(quantity);
-				kept.Add(targets[i]);
+				signalList.Add(slots[i]);
+				quantityList.Add(quantity);
+				targetList.Add(slotTargets[i]);
 			}
-			lot2Signals = signals.ToArray();
-			lot2Quantities = quantities.ToArray();
-			lot2Targets = kept.ToArray();
+			signals = signalList.ToArray();
+			quantities = quantityList.ToArray();
+			targets = targetList.ToArray();
 		}
 
 		/// <summary>
@@ -1286,42 +1343,52 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public int StopFixedTicks { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Target 1 mode", Order = 5, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 1 exit mode", Order = 5, GroupName = "5. Sizing and exits")]
 		public GoatTarget1Mode Target1Mode { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name = "Target 1: fixed ticks (FixedTicks mode only)", Order = 6, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 1 target 1 (ticks; FixedTicks mode only)", Order = 6, GroupName = "5. Sizing and exits")]
 		public int Target1Ticks { get; set; }
 
 		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Lot 1 target 2 (ticks, 0=off)", Order = 7, GroupName = "5. Sizing and exits")]
+		public int Lot1Target2Ticks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name = "Lot 1 target 3 (ticks, 0=off)", Order = 8, GroupName = "5. Sizing and exits")]
+		public int Lot1Target3Ticks { get; set; }
+
+		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name = "Lot 2 trail (ticks; waits for breakeven when it's on)", Order = 10, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 2 trail (ticks; waits for breakeven when it's on)", Order = 12, GroupName = "5. Sizing and exits")]
 		public int TrailTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Breakeven: after ticks in profit (0=off)", Order = 11, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Breakeven: after ticks in profit (0=off)", Order = 13, GroupName = "5. Sizing and exits")]
 		public int BreakevenTriggerTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Breakeven: stop at entry plus (ticks)", Order = 12, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Breakeven: stop at entry plus (ticks)", Order = 14, GroupName = "5. Sizing and exits")]
 		public int BreakevenPlusTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Lot 2 target 1 (ticks, 0=trail)", Order = 7, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 2 target 1 (ticks, 0=trail)", Order = 9, GroupName = "5. Sizing and exits")]
 		public int Lot2Target1Ticks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Lot 2 target 2 (ticks, 0=trail)", Order = 8, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 2 target 2 (ticks, 0=trail)", Order = 10, GroupName = "5. Sizing and exits")]
 		public int Lot2Target2Ticks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, int.MaxValue)]
-		[Display(Name = "Lot 2 target 3 (ticks, 0=trail)", Order = 9, GroupName = "5. Sizing and exits")]
+		[Display(Name = "Lot 2 target 3 (ticks, 0=trail)", Order = 11, GroupName = "5. Sizing and exits")]
 		public int Lot2Target3Ticks { get; set; }
 
 		[NinjaScriptProperty]

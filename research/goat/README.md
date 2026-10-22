@@ -98,6 +98,16 @@ Rules that keep live runs readable:
   position by hand leaves the strategy still believing it holds one.
 - **To get out of a trade, untick Enabled first,** then flatten from the
   SuperDOM.
+- **A stop that vanishes mid-trade usually means NinjaTrader switched GA
+  off.** Under `RealtimeErrorHandling.StopCancelClose`, a rejected order
+  stops the strategy, cancels its working orders and sends one close order
+  per position. In a fast market a stop change can arrive after price has
+  already passed it and be rejected; lot 2's trailing stop moves the most, so
+  it is the likeliest one. Jim, 2026-10-21: in a news spike, "the first lot
+  was stopped but the second lot's stop disappeared". His Log tab from that
+  moment has been asked for. If it shows the rejection, the fix is to handle
+  rejections in `OnOrderUpdate` (exit that lot at market and keep running),
+  as NinjaTrader support recommends, rather than shutting GA down.
 - **A strategy label that starts with (D) means GA is off on that chart.** A
   disabled strategy draws no trades at all, past or present, so a chart in
   that state cannot answer "why didn't it trade here?".
@@ -241,8 +251,10 @@ testable rather than load-bearing — but they are worth settling with him.
    also be split over three profit targets in ticks (Jim, 2026-10-19: "The
    three targets for Lot 2 will be ticks for now"); its contracts are shared
    out one at a time starting with target 1, and a target of 0 leaves that
-   contract on the trail. Fib-extension targets are out of scope: he uses
-   them on Wave 3s, not on GOATs.
+   contract on the trail. Lot 1 can be split the same way in FixedTicks
+   mode (Jim, 2026-10-21: "20, 30, 40"), over the targets that are set.
+   Fib-extension targets are out of scope: he uses them on Wave 3s, not on
+   GOATs.
 6. **The pumpkin.** Three readings of his words, each a setting. "Flat" is a
    pumpkin that moved less than `PumpkinFlatTicks` over
    `PumpkinSlopeLookback` bars (default 2 over 5; he gave no number).
