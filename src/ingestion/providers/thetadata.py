@@ -497,7 +497,7 @@ def report_unmapped(
     unmatched: int = 0,
     root: Optional[str] = None,
     expiration: Optional[date] = None,
-    requested_strikes: Sequence[float] = (),
+    requested_contracts: Sequence[Tuple[float, str]] = (),
 ) -> None:
     """Warn, once per cause per column shape, when rows arrive but nothing maps.
 
@@ -533,12 +533,16 @@ def report_unmapped(
     for the life of the process — so a real mapping failure arriving after
     the first report was invisible.
 
-    ``root``, ``expiration`` and ``requested_strikes`` say which chain it
+    ``root``, ``expiration`` and ``requested_contracts`` say which chain it
     was and what it was matched against. The 2026-10-21 occurrence (487
     ohlc rows, first strike 31750.0 CALL) logged a sample but no chain, so
     it still could not say whether 31750 was the right units for the wrong
     chain or the wrong units for the right one. They are also in the
     throttle key, so one failing expiration does not hide another.
+
+    Once they were logged, every ohlc occurrence turned out to be expected
+    (see :func:`_compare_contracts`), so that one case is logged at INFO.
+    Everything else stays a WARNING.
     """
     if not rows:
         return
@@ -564,6 +568,18 @@ def report_unmapped(
             sample,
         )
         return
+    comparison, expected = _compare_contracts(kind, rows, requested_contracts)
+    if expected:
+        logger.info(
+            "thetadata %s %s %s: none of the requested contracts is among the "
+            "%d row(s) returned. %s",
+            kind,
+            root or "?",
+            expiration or "?",
+            len(rows),
+            comparison,
+        )
+        return
     logger.warning(
         "thetadata %s %s %s: %d row(s) returned, none mapped — all %d read %s "
         "cleanly and then JOINED TO NOTHING. Not a column-spelling problem: "
@@ -575,17 +591,42 @@ def report_unmapped(
         unmatched,
         " / ".join(fields),
         sample,
-        _compare_strikes(rows, requested_strikes),
+        comparison,
     )
 
 
-def _compare_strikes(rows: Sequence[Dict[str, Any]], requested: Sequence[float]) -> str:
-    """What the response's strikes have in common with the requested ones.
+#: Rights spellings the join understands. Anything else is read as a put by
+#: _merge_frame, so a new spelling would silently join calls to nothing.
+_KNOWN_RIGHTS = {"C", "CALL", "P", "PUT"}
 
-    Each answer points at a different fix, so the log line states which:
-    shared strikes mean the rights did not line up; overlapping ranges with
-    nothing shared mean a different strike grid; disjoint ranges mean the
-    units, or a different chain than the one asked for.
+#: Endpoints that list only contracts that have TRADED. Verified from
+#: production 2026-10-22: SPY's 2026-11-03 ohlc snapshot returned 142 rows
+#: over 118 strikes, so many strikes carried only a call or only a put,
+#: where the quote snapshot lists both sides of every strike.
+_TRADED_ONLY_KINDS = ("ohlc",)
+
+
+def _compare_contracts(
+    kind: str,
+    rows: Sequence[Dict[str, Any]],
+    requested: Sequence[Tuple[float, str]],
+) -> Tuple[str, bool]:
+    """What the response has in common with the requested contracts, and
+    whether finding none of them is expected.
+
+    Expected in exactly one case: an endpoint in :data:`_TRADED_ONLY_KINDS`,
+    with the rights spelled as the join reads them and the strikes on the
+    same scale as the request. The contracts are simply not listed because
+    they have never traded, and that is what most requests for them are: on
+    a stream restart ``seed_new_symbols`` fetches only the contracts that
+    carried no open interest and no volume. No row means no last trade and
+    nothing traded, which the stream already records as absent. Every
+    2026-10-21/22 occurrence was this, on SPY, SPXW, QQQ, NDXP and NVDA.
+
+    The cases that are NOT expected each point at a different fix: a right
+    spelled some other way (:data:`_KNOWN_RIGHTS`); strike ranges that do not
+    overlap (the units, see :func:`_normalise_strike`, or a different
+    chain); or missing contracts on an endpoint that lists every contract.
     """
     got = sorted(
         {
@@ -599,36 +640,50 @@ def _compare_strikes(rows: Sequence[Dict[str, Any]], requested: Sequence[float])
     if len(expirations) > 3:
         expirations = expirations[:3] + [f"... {len(expirations)} in all"]
     response = (
-        f"Response: {len(got)} strike(s) {got[0]:g}..{got[-1]:g}, rights {rights}, "
-        f"expirations {expirations}."
+        f"Response: {len(rows)} contract(s) on {len(got)} strike(s) "
+        f"{got[0]:g}..{got[-1]:g}, rights {rights}, expirations {expirations}."
         if got
         else "Response: no readable strike."
     )
-    wanted = sorted({round(s, 4) for s in requested})
-    if not wanted:
-        return response + (
-            " Either the strike units are wrong (see _normalise_strike) or the "
-            "response covers a strike grid that excludes every contract requested."
+    unknown = [r for r in rights if r.strip().upper() not in _KNOWN_RIGHTS]
+    if unknown:
+        return (
+            response + f" Right(s) {unknown} are not a spelling the join reads "
+            "(see _KNOWN_RIGHTS and _CALL_CODES).",
+            False,
         )
-    shared = len(set(got) & set(wanted))
-    requested_text = f" Requested: {len(wanted)} strike(s) {wanted[0]:g}..{wanted[-1]:g}."
-    if shared:
-        verdict = (
-            f" {shared} requested strike(s) ARE in the response, so the strikes "
-            "agree and the right did not line up (see _CALL_CODES)."
+    contracts = sorted({(round(k, 4), r) for k, r in requested})
+    if not contracts:
+        return (
+            response + " Either the strike units are wrong (see _normalise_strike) "
+            "or the response covers a strike grid that excludes every contract "
+            "requested.",
+            False,
         )
-    elif got and got[0] <= wanted[-1] and wanted[0] <= got[-1]:
-        verdict = (
-            " The ranges overlap but share no strike: the response is on a "
-            "different strike grid from the one option_list_strikes gave."
+    wanted = sorted({k for k, _ in contracts})
+    response += (
+        f" Requested: {len(contracts)} contract(s) on {len(wanted)} strike(s) "
+        f"{wanted[0]:g}..{wanted[-1]:g}."
+    )
+    if not got or got[0] > wanted[-1] or wanted[0] > got[-1]:
+        return (
+            response + " The ranges do not overlap: either the strike units are "
+            "wrong (see _normalise_strike) or the response is a different chain "
+            "from the one requested.",
+            False,
         )
-    else:
-        verdict = (
-            " The ranges do not overlap: either the strike units are wrong "
-            "(see _normalise_strike) or the response is a different chain "
-            "from the one requested."
+    if kind in _TRADED_ONLY_KINDS:
+        return (
+            response + f" Expected: {kind} lists only contracts that have "
+            "traded, so these have no last trade and no volume yet.",
+            True,
         )
-    return response + requested_text + verdict
+    return (
+        response + f" {kind} lists every contract, so the requested ones should "
+        "be here: a different strike grid from option_list_strikes, or "
+        "contracts the vendor no longer lists.",
+        False,
+    )
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -1598,7 +1653,9 @@ class ThetaDataProvider(MarketDataProvider):
                 unmatched=unmatched,
                 root=root,
                 expiration=expiration,
-                requested_strikes=[k[2] for k in wanted if k[0] == root and k[1] == expiration],
+                requested_contracts=[
+                    (k[2], k[3]) for k in wanted if k[0] == root and k[1] == expiration
+                ],
             )
 
     def describe_columns(self, underlying: str = "SPY") -> Dict[str, Dict[str, Any]]:

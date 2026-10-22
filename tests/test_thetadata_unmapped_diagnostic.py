@@ -114,59 +114,88 @@ def test_no_rows_reports_nothing(caplog):
 
 
 # ---------------------------------------------------------------------------
-# Which chain, and what it was matched against: 2026-10-21
+# Which chain, and what it was matched against: 2026-10-21/22
 # ---------------------------------------------------------------------------
 #
 # 487 ohlc rows, first one {'strike': 31750.0, 'right': 'CALL'}, and no way to
 # tell from the line which chain it was or what 31750 had been compared with.
+# Once the line said, every ohlc occurrence was the same expected thing: the
+# endpoint lists only contracts that have traded, and the restart seed asks
+# for exactly the contracts that have not.
 
-EXP = td.date(2026, 10, 23)
+EXP = td.date(2026, 11, 3)
 
 
-def _priced(strikes, right="CALL"):
-    return [{"strike": k, "right": right, "expiration": "2026-10-23"} for k in strikes]
+def _listed(contracts):
+    return [{"strike": k, "right": r, "expiration": "2026-11-03"} for k, r in contracts]
 
 
-def _report(rows, requested):
+def _report(kind, rows, requested):
     td.report_unmapped(
-        "ohlc",
+        kind,
         rows,
         ("strike", "right"),
         unmatched=len(rows),
-        root="NDXP",
+        root="SPY",
         expiration=EXP,
-        requested_strikes=requested,
+        requested_contracts=requested,
     )
 
 
-def test_the_line_names_the_chain_and_both_strike_ranges(caplog):
-    with caplog.at_level(logging.WARNING, logger=td.logger.name):
-        _report(_priced([31750.0, 31800.0]), [28000.0, 28010.0, 28020.0])
+def _levels(caplog):
+    return [r.levelname for r in caplog.records]
+
+
+def test_untraded_contracts_missing_from_ohlc_are_info_not_a_warning(caplog):
+    """SPY 2026-11-03, 07:24 on 10-22: 63 requested strikes, all of them on
+    the response's grid, and not one requested contract listed. The 771 PUT
+    traded; the 771 CALL the seed asked for had not."""
+    rows = _listed([(771.0, "PUT"), (772.0, "CALL"), (550.0, "PUT"), (865.0, "CALL")])
+    with caplog.at_level(logging.INFO, logger=td.logger.name):
+        _report("ohlc", rows, [(771.0, "C"), (772.0, "P")])
+    assert _levels(caplog) == ["INFO"]
     text = caplog.text
-    assert "ohlc NDXP 2026-10-23" in text
-    assert "2 strike(s) 31750..31800" in text
-    assert "3 strike(s) 28000..28020" in text
-    assert "ranges do not overlap" in text
-    assert "_normalise_strike" in text
+    assert "ohlc SPY 2026-11-03" in text
+    assert "4 contract(s) on 4 strike(s) 550..865" in text
+    assert "2 contract(s) on 2 strike(s) 771..772" in text
+    assert "only contracts that have traded" in text
+    assert "JOINED TO NOTHING" not in text
 
 
-def test_shared_strikes_point_at_the_right_not_the_units(caplog):
-    with caplog.at_level(logging.WARNING, logger=td.logger.name):
-        _report(_priced([28000.0, 28010.0], right="X"), [28000.0, 28010.0])
-    assert "2 requested strike(s) ARE in the response" in caplog.text
-    assert "_CALL_CODES" in caplog.text
+def test_the_same_shape_on_the_quote_endpoint_is_still_a_warning(caplog):
+    """The quote snapshot lists both sides of every strike, so a requested
+    contract missing from it is a real gap."""
+    rows = _listed([(771.0, "PUT"), (772.0, "CALL")])
+    with caplog.at_level(logging.INFO, logger=td.logger.name):
+        _report("quote", rows, [(771.0, "C")])
+    assert _levels(caplog) == ["WARNING"]
+    assert "lists every contract" in caplog.text
 
 
-def test_interleaved_strikes_are_called_a_different_grid(caplog):
-    with caplog.at_level(logging.WARNING, logger=td.logger.name):
-        _report(_priced([28005.0, 28015.0]), [28000.0, 28010.0, 28020.0])
-    assert "different strike grid" in caplog.text
+def test_disjoint_ranges_are_a_warning_even_on_ohlc(caplog):
+    """The units bug _normalise_strike documents must never read as routine."""
+    rows = _listed([(6.50, "CALL"), (6.55, "PUT")])
+    with caplog.at_level(logging.INFO, logger=td.logger.name):
+        _report("ohlc", rows, [(6500.0, "C"), (6550.0, "P")])
+    assert _levels(caplog) == ["WARNING"]
+    assert "ranges do not overlap" in caplog.text
+    assert "_normalise_strike" in caplog.text
 
 
-def test_each_failing_expiration_reports_once(caplog):
-    rows = _priced([31750.0])
-    with caplog.at_level(logging.WARNING, logger=td.logger.name):
-        for expiration in (EXP, EXP, td.date(2026, 10, 30)):
+def test_an_unknown_right_spelling_is_a_warning_even_on_ohlc(caplog):
+    """_merge_frame reads any unknown right as a put, so a new spelling
+    would join every call to nothing while looking like untraded contracts."""
+    rows = _listed([(771.0, "Call"), (771.0, "X")])
+    with caplog.at_level(logging.INFO, logger=td.logger.name):
+        _report("ohlc", rows, [(771.0, "C")])
+    assert _levels(caplog) == ["WARNING"]
+    assert "['X']" in caplog.text
+
+
+def test_each_expiration_reports_once(caplog):
+    rows = _listed([(31750.0, "CALL")])
+    with caplog.at_level(logging.INFO, logger=td.logger.name):
+        for expiration in (EXP, EXP, td.date(2026, 11, 6)):
             td.report_unmapped(
                 "ohlc",
                 rows,
@@ -174,6 +203,25 @@ def test_each_failing_expiration_reports_once(caplog):
                 unmatched=1,
                 root="NDXP",
                 expiration=expiration,
-                requested_strikes=[28000.0],
+                requested_contracts=[(29410.0, "C")],
             )
-    assert caplog.text.count("JOINED TO NOTHING") == 2
+    assert len(caplog.records) == 2
+
+
+def test_the_restart_seed_path_logs_info_end_to_end(caplog):
+    """Through fetch_chain_state, the way seed_new_symbols calls it: the
+    contract asked for is not listed by ohlc, its other side is."""
+    from tests.test_thetadata_provider import _FakeClient
+
+    symbol = td.build_occ_symbol("SPY", EXP, 771.0, "C")
+    client = _FakeClient(
+        quote_rows=[{"strike": 771.0, "right": "CALL", "bid": 1.2, "ask": 1.3}],
+        ohlc_rows=[{"strike": 771.0, "right": "PUT", "close": 2.0, "volume": 5}],
+    )
+    with caplog.at_level(logging.INFO, logger=td.logger.name):
+        state = td.ThetaDataProvider(client).fetch_chain_state(
+            [symbol], include_open_interest=False
+        )
+    assert state[symbol]["bid"] == 1.2
+    assert "last" not in state[symbol]
+    assert [r.levelname for r in caplog.records if "ohlc" in r.getMessage()] == ["INFO"]
