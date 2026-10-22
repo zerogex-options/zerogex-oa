@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Optional
 from src.ingestion.providers.base import (
     Bar,
     BarStream,
+    FeedSessionLost,
     MarketDataProvider,
     OptionQuote,
     OptionQuoteStream,
@@ -26,6 +27,7 @@ from src.ingestion.providers.base import (
 __all__ = [
     "Bar",
     "BarStream",
+    "FeedSessionLost",
     "MarketDataProvider",
     "OptionQuote",
     "OptionQuoteStream",
