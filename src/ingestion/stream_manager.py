@@ -25,6 +25,7 @@ from typing import Generator, List, Dict, Any, Optional, Set
 import pytz
 import requests as _requests
 
+from src.ingestion.providers.base import FeedSessionLost
 from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
 from src.validation import (
@@ -441,6 +442,14 @@ def _stale_thresholds_for_session(session: str) -> tuple[int, int]:
         UNDERLYING_STREAM_STALE_WARN_SECONDS,
         UNDERLYING_STREAM_STALE_RESTART_SECONDS,
     )
+
+
+def _feed_session_lost(provider: Any) -> bool:
+    """``provider.session_lost()``, strictly: only a real ``True`` counts, so a
+    provider without the method (or a test double answering a mock) never
+    reads as a lost session."""
+    check = getattr(provider, "session_lost", None)
+    return check is not None and check() is True
 
 
 def _bar_timestamp_advanced(bar_ts: Any, last_fresh_ts: Optional[datetime]) -> bool:
@@ -2503,6 +2512,16 @@ class StreamManager:
         try:
             while not self._stop_event.is_set():
                 iteration += 1
+
+                # A replaced login fails every call, and nothing this loop can
+                # do brings it back: restarting a stream reuses the dead
+                # session. Outside the per-iteration try, so it ends the
+                # stream. See FeedSessionLost.
+                if _feed_session_lost(getattr(self, "provider", None)):
+                    raise FeedSessionLost(
+                        f"{self.underlying}: the feed has refused this unit's login "
+                        "for every call; another login replaced it"
+                    )
 
                 # Get current market session for dynamic polling
                 session = get_market_session()

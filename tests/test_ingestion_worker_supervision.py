@@ -528,3 +528,83 @@ def test_planned_shutdown_exits_zero(monkeypatch):
         signal_mod.signal(signal_mod.SIGINT, prev_int)
 
     assert exit_info.value.code == 0, "a planned stop is not a unit failure"
+
+
+def test_a_lost_feed_session_restarts_the_unit_instead_of_the_worker(monkeypatch):
+    """Every worker shares the one feed login, so a worker reporting it
+    replaced is reporting everyone dead. Respawning that worker would adopt
+    the same dead session; respawning all of them would too. Only the unit
+    can log in again, once, before the fork -- so stop every worker and
+    hand the unit back to systemd. 2026-10-21: 00:00 to 08:44 ET dark."""
+    specs, processes, history, spawns = _harness(
+        ["ingest-SPY", "ingest-QQQ", "ingest-vix"], monkeypatch
+    )
+    shutting_down = threading.Event()
+    reporter = processes["ingest-SPY"]
+    others = [processes["ingest-QQQ"], processes["ingest-vix"]]
+    reporter.die(exitcode=main_engine.FEED_SESSION_LOST_EXIT_CODE)
+
+    exit_code = main_engine.supervise_workers(
+        specs, processes, history, shutting_down, lambda *a: pytest.fail("respawned")
+    )
+
+    assert exit_code == main_engine.FEED_SESSION_LOST_EXIT_CODE
+    assert spawns == []
+    assert all(p.terminated for p in others), "every worker holds the dead session"
+    assert history["ingest-SPY"] == [], "not a crash: no restart budget spent"
+
+
+def test_a_lost_feed_session_exits_the_unit_cleanly(monkeypatch):
+    """Restart=always restarts the unit on a clean exit too, which is the
+    point: a failed unit would page at midnight for something that has
+    already started fixing itself."""
+    import signal as signal_mod
+    import sys
+
+    monkeypatch.setenv("INGEST_UNDERLYINGS", "SPY,QQQ")
+    monkeypatch.setenv("INGEST_VIX_ENABLED", "false")
+    monkeypatch.setenv("INGEST_VXN_ENABLED", "false")
+    monkeypatch.setenv("INGEST_FUTURES_ENABLED", "false")
+    monkeypatch.setattr(sys, "argv", ["main_engine"])
+
+    class _TerminatedProcess:
+        """A child the supervisor terminated: exitcode -SIGTERM."""
+
+        def __init__(self, target=None, args=(), name=None):
+            self.name = name
+            self.exitcode = -signal_mod.SIGTERM
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+        def terminate(self):
+            return None
+
+    import src.ingestion.api_call_tracker as api_call_tracker
+
+    monkeypatch.setattr(api_call_tracker, "attach_db_writer", lambda *a, **k: None)
+    monkeypatch.setattr(main_engine, "TradeStationClient", lambda *a, **k: object())
+    monkeypatch.setattr(main_engine, "IngestionEngine", lambda **k: None)
+    monkeypatch.setattr(main_engine, "Process", _TerminatedProcess)
+    monkeypatch.setattr(
+        main_engine,
+        "supervise_workers",
+        lambda *a, **k: main_engine.FEED_SESSION_LOST_EXIT_CODE,
+    )
+
+    prev_term = signal_mod.getsignal(signal_mod.SIGTERM)
+    prev_int = signal_mod.getsignal(signal_mod.SIGINT)
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            main_engine.main()
+    finally:
+        signal_mod.signal(signal_mod.SIGTERM, prev_term)
+        signal_mod.signal(signal_mod.SIGINT, prev_int)
+
+    assert exit_info.value.code == 0
