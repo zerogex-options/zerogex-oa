@@ -112,13 +112,14 @@ re-runs that check against a live terminal at any time.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -870,6 +871,9 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
         self._dirty: set = set()
         self._lock = threading.Lock()
         self._running = False
+        #: Set by stop(). Not ``not self._running``: the seed poll in start()
+        #: runs before that flag is raised, and its failures are real.
+        self._stopped = False
         self._thread: Optional[threading.Thread] = None
         self._updates_received = 0
         self._last_oi_poll = 0.0
@@ -958,6 +962,7 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
         self._thread.start()
 
     def stop(self) -> None:
+        self._stopped = True
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=10)
@@ -995,7 +1000,8 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
                 consecutive_failures = 0
             except Exception as e:  # noqa: BLE001 - a poller must not die
                 consecutive_failures += 1
-                logger.warning(
+                logger.log(
+                    _failure_level(e, stopping=self._stopped),
                     "thetadata poll failed (%d consecutive): %s",
                     consecutive_failures,
                     e,
@@ -1008,7 +1014,9 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
 
     def _poll(self, *, include_open_interest: bool) -> None:
         fetched = self._provider.fetch_chain_state(
-            self._symbols, include_open_interest=include_open_interest
+            self._symbols,
+            include_open_interest=include_open_interest,
+            stopping=lambda: self._stopped,
         )
         if not fetched:
             return
@@ -1302,7 +1310,12 @@ class _PollingBarStream(BarStream):
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 self.last_error = f"{type(e).__name__}: {e}"
-                logger.warning("thetadata bar poll for %s failed: %s", self._db_symbol, e)
+                logger.log(
+                    _failure_level(e, stopping=not self._running),
+                    "thetadata bar poll for %s failed: %s",
+                    self._db_symbol,
+                    e,
+                )
             delay = self._poll_interval * min(2**failures, 16)
             elapsed = time.monotonic() - started
             self._wake.wait(max(0.0, min(delay, 60.0) - elapsed))
@@ -1313,8 +1326,51 @@ class _PollingBarStream(BarStream):
 # ---------------------------------------------------------------------------
 
 
-def _log_snapshot_failure(kind: str, root: str, expiration: date, error: Exception) -> None:
-    logger.warning("thetadata %s snapshot failed for %s %s: %s", kind, root, expiration, error)
+def _is_cancelled(error: BaseException) -> bool:
+    """True for a call that was cancelled rather than one that failed.
+
+    A gRPC error exposes its status through ``code()``; the name is compared
+    rather than ``grpc.StatusCode.CANCELLED`` so this module still imports
+    without grpc. The text is the fallback for an error that wraps one,
+    because ``StatusCode.CANCELLED`` is what its string carries.
+    """
+    if isinstance(error, CancelledError):
+        return True
+    code = getattr(error, "code", None)
+    if callable(code):
+        try:
+            if getattr(code(), "name", None) == "CANCELLED":
+                return True
+        except Exception:  # noqa: BLE001 - a diagnostic must not raise
+            pass
+    return "StatusCode.CANCELLED" in str(error)
+
+
+def _failure_level(error: BaseException, *, stopping: bool) -> int:
+    """WARNING for a failed call, DEBUG for one cut off by shutdown.
+
+    Every deploy used to lead "Recent Warnings" with the in-flight calls of
+    the process being stopped -- an ohlc snapshot, a bar poll -- cancelled
+    as it went down. Nothing was wrong with the feed. A call is quiet when
+    its owner is stopping, or when gRPC says it was CANCELLED: the status
+    is set by whoever abandoned the call, so it names a teardown even when
+    it lands before the stop flag does. A dead terminal or a refused login
+    answers with some other status and stays a WARNING.
+    """
+    return logging.DEBUG if stopping or _is_cancelled(error) else logging.WARNING
+
+
+def _log_snapshot_failure(
+    kind: str, root: str, expiration: date, error: Exception, *, stopping: bool = False
+) -> None:
+    logger.log(
+        _failure_level(error, stopping=stopping),
+        "thetadata %s snapshot failed for %s %s: %s",
+        kind,
+        root,
+        expiration,
+        error,
+    )
 
 
 class ThetaDataProvider(MarketDataProvider):
@@ -1388,6 +1444,8 @@ class ThetaDataProvider(MarketDataProvider):
         # (which tests do constantly) starts no threads.
         self._executor: Optional[ThreadPoolExecutor] = None
         self._executor_lock = threading.Lock()
+        #: Set by close(), so the calls it waits out log as shutdown.
+        self._closed = False
         # Which mechanism selects the Market Value feed. For the snapshot
         # path this module uses, that is the dedicated *_market_value
         # endpoints on a single terminal; the terminal "stage" selects it
@@ -1494,7 +1552,11 @@ class ThetaDataProvider(MarketDataProvider):
     # -- chain fetch -------------------------------------------------------
 
     def fetch_chain_state(
-        self, option_symbols: Sequence[str], *, include_open_interest: bool = True
+        self,
+        option_symbols: Sequence[str],
+        *,
+        include_open_interest: bool = True,
+        stopping: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Current state for ``option_symbols``, joined across endpoints.
 
@@ -1505,6 +1567,9 @@ class ThetaDataProvider(MarketDataProvider):
 
         Open interest is fetched on its own slower cadence: it settles once
         daily, so polling it at quote frequency spends calls for nothing.
+
+        ``stopping`` is the caller's own shutdown flag, so a call cut off
+        while the caller stops logs at DEBUG; see :func:`_failure_level`.
         """
         groups: Dict[Tuple[str, date], List[str]] = defaultdict(list)
         wanted: Dict[Tuple[str, date, float, str], str] = {}
@@ -1538,7 +1603,7 @@ class ThetaDataProvider(MarketDataProvider):
                 units.append((kind, fn, kwargs, root, expiration))
 
         out: Dict[str, Dict[str, Any]] = defaultdict(dict)
-        for frame, kind, root, expiration in self._gather(units):
+        for frame, kind, root, expiration in self._gather(units, stopping=stopping):
             # Merged on THIS thread, not in the workers. The parallelism
             # that pays is the network wait; merging concurrently would buy
             # microseconds and cost every shared-state guarantee in
@@ -1560,6 +1625,8 @@ class ThetaDataProvider(MarketDataProvider):
     def _gather(
         self,
         units: Sequence[Tuple[str, Callable[..., Any], Dict[str, Any], str, date]],
+        *,
+        stopping: Optional[Callable[[], bool]] = None,
     ) -> List[Tuple[Any, str, str, date]]:
         """Run the snapshot calls, up to ``max_concurrency`` at a time.
 
@@ -1578,6 +1645,11 @@ class ThetaDataProvider(MarketDataProvider):
         if not units:
             return []
 
+        def shutting_down() -> bool:
+            # Asked at failure time, not up front: what matters is whether
+            # the stop came before the call failed.
+            return self._closed or (stopping is not None and stopping())
+
         results: List[Tuple[Any, str, str, date]] = []
 
         if self._max_concurrency <= 1 or len(units) == 1:
@@ -1587,7 +1659,7 @@ class ThetaDataProvider(MarketDataProvider):
                 try:
                     results.append((fn(**kwargs), kind, root, expiration))
                 except Exception as e:  # noqa: BLE001 - see docstring
-                    _log_snapshot_failure(kind, root, expiration, e)
+                    _log_snapshot_failure(kind, root, expiration, e, stopping=shutting_down())
             return results
 
         pool = self._executor_for()
@@ -1600,7 +1672,7 @@ class ThetaDataProvider(MarketDataProvider):
             try:
                 results.append((future.result(), kind, root, expiration))
             except Exception as e:  # noqa: BLE001 - see docstring
-                _log_snapshot_failure(kind, root, expiration, e)
+                _log_snapshot_failure(kind, root, expiration, e, stopping=shutting_down())
         return results
 
     def close(self) -> None:
@@ -1610,6 +1682,7 @@ class ThetaDataProvider(MarketDataProvider):
         provider on the same terminal, and closing it out from under a
         still-running comparison would fail the other side.
         """
+        self._closed = True
         with self._executor_lock:
             executor, self._executor = self._executor, None
         if executor is not None:

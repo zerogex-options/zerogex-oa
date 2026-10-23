@@ -283,7 +283,7 @@ def test_sticky_open_interest_and_volume_survive_a_zero():
         def __init__(self):
             self.n = 0
 
-        def fetch_chain_state(self, symbols, include_open_interest=True):
+        def fetch_chain_state(self, symbols, include_open_interest=True, stopping=None):
             self.n += 1
             if self.n == 1:
                 return {call: {"bid": 1.0, "ask": 1.1, "volume": 500, "open_interest": 8000}}
@@ -308,7 +308,7 @@ def test_drain_is_edge_triggered():
     call = build_occ_symbol("SPY", EXP, 650.0, "C")
 
     class _Static:
-        def fetch_chain_state(self, symbols, include_open_interest=True):
+        def fetch_chain_state(self, symbols, include_open_interest=True, stopping=None):
             return {call: {"bid": 1.0, "ask": 1.1}}
 
     stream = _PollingOptionQuoteStream(_Static(), [call], poll_interval=0.01, oi_poll_interval=0.01)
