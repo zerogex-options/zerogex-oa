@@ -163,6 +163,39 @@ deleted, disabled or had the channel switched off is cancelled, never sent.
 They require `X-Admin-Token` because the API key alone is held by every
 external integrator and the website BFF forwards browser calls with its own.
 
+### The API stream
+
+Code that wants alerts without a saved rule (a bot, a chat relay) reads them
+from `wall_alert_events` directly: `GET /api/alerts/walls/events` pages them
+by id, `GET /api/alerts/walls/stream` pushes them as Server-Sent Events. The
+filter on the query string has a rule's fields and meaning, so it is not a
+channel and writes no delivery rows. `src/api/wall_alert_stream.py`:
+
+* One **tail** per API worker polls the table for ids past its cursor every
+  second, only while a stream is open on that worker, and offers each row to
+  every open stream. One query a second per worker, whatever the stream count.
+* **Polling, not NOTIFY**, because a second of latency is invisible at a few
+  alerts an hour, and polling needs no detector change, cannot lose an alert
+  to a dropped listener, and resumes from an id.
+* **The id is a safe cursor** because the detector is the only writer and
+  commits each event before the next, so ids become visible in order. A
+  second writer would break that.
+* **Resume.** Each alert's SSE `id` is its row id; a reconnect with
+  `Last-Event-ID` replays up to 500 matching alerts before going live, and
+  says `gap` if it is further behind.
+* **Limits.** 5 open streams per caller per worker, 500 per worker
+  (`WALL_ALERTS_STREAM_MAX_*`); a stream 1,000 alerts behind is closed, and
+  one that stops checking in is dropped after a minute.
+* **Restarts.** uvicorn's graceful shutdown waits for open responses to
+  finish, and a stream never does, so a restart with one open would sit out
+  systemd's 60 s stop timeout with the API down. The router's tail chains a
+  SIGTERM / SIGINT handler in front of uvicorn's that ends every stream at
+  once; clients reconnect to the new process and resume from their last id.
+* **Proxies.** The response carries `X-Accel-Buffering: no` and
+  `Cache-Control: no-store`, so the API host's nginx passes each event through
+  unbuffered and never caches it; a keepalive comment every 15 s keeps nginx's
+  120 s read timeout from closing a quiet stream.
+
 ### Wiring SMS
 
 Everything but the last mile is in place: rules, the outbox and the internal

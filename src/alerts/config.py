@@ -79,6 +79,18 @@ MAX_RULES_PER_USER: int = _getenv_int("WALL_ALERTS_MAX_RULES_PER_USER", 25, min=
 DAILY_CAP_PER_USER: int = _getenv_int("WALL_ALERTS_DAILY_CAP_PER_USER", 60, min=1, max=10000)
 
 # ---------------------------------------------------------------------------
+# The alert stream (GET /api/alerts/walls/stream)
+# ---------------------------------------------------------------------------
+# Open streams one caller may hold on one API worker (uvicorn runs two, so the
+# effective ceiling is twice this). A caller is the API key's owner, or the
+# member when the website proxies the request. A bot needs one stream; this
+# leaves room for a few filters and a reconnect that overlaps the old socket.
+STREAM_MAX_PER_CALLER: int = _getenv_int("WALL_ALERTS_STREAM_MAX_PER_CALLER", 5, min=1, max=100)
+# Open streams per API worker, whoever holds them: each is an idle socket and
+# a queue, so this bounds the memory a flood of connections can take.
+STREAM_MAX_PER_WORKER: int = _getenv_int("WALL_ALERTS_STREAM_MAX_PER_WORKER", 500, min=1, max=20000)
+
+# ---------------------------------------------------------------------------
 # Delivery channels
 # ---------------------------------------------------------------------------
 # Channel -> how a delivery row starts life.

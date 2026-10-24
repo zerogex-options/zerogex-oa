@@ -1,6 +1,6 @@
 """Wall alerts HTTP API — members' rules, their in-app feed, and the outbox.
 
-Mounted at ``/api/alerts/walls``. Three audiences:
+Mounted at ``/api/alerts/walls``. Four audiences:
 
 * **Members**, through the website BFF with an ``X-End-User-Token``: manage
   their rules (``/rules``), read and clear their in-app alerts (``/feed``),
@@ -11,6 +11,10 @@ Mounted at ``/api/alerts/walls``. Three audiences:
 * **Anyone**: ``/config`` — the symbols, sensitivity profiles, touch
   tolerances, channels and limits the form is built from, so the website
   never hard-codes a number the detector owns.
+* **Integrations**, with an API key and no saved rule: ``/events`` (a cursor
+  page) and ``/stream`` (Server-Sent Events) serve every recorded alert that
+  matches a filter given on the query string. See
+  ``src/api/wall_alert_stream.py``.
 * **Delivery workers** (``/internal/*``): drain the email / SMS outbox and
   apply one-click unsubscribes. These carry other members' alerts, so they
   require the admin token on top of the API key (:func:`require_admin`) —
@@ -30,12 +34,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
+from fastapi.responses import StreamingResponse
 
 from src.alerts import config as alerts_config
 from src.alerts.wall_detector import DEFAULT_PROFILE, EVENT_TYPES, PROFILES
 from src.alerts.wall_payload import STRENGTH_TIERS, regime_for, strength_tier
+from src.api import wall_alert_stream as stream
 from src.api.database import DatabaseManager
-from src.api.identity import ANONYMOUS, resolve_end_user
+from src.api.identity import ANONYMOUS, current_identity, resolve_end_user
 from src.api.security import require_admin
 
 logger = logging.getLogger(__name__)
@@ -682,6 +688,164 @@ async def live_walls(
         )
     out.sort(key=lambda r: wanted.index(r["symbol"]))
     return {"as_of": _iso(now), "symbols": out}
+
+
+# ---------------------------------------------------------------------------
+# Events and the stream — every alert, filtered on the query string
+# ---------------------------------------------------------------------------
+
+#: One tail per API worker, shared by every open stream on it.
+_tail = stream.WallAlertTail(end_on_shutdown=True)
+
+
+def _csv(raw: Optional[str]) -> List[str]:
+    return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
+def event_filter(
+    symbols: Optional[str] = Query(
+        default=None,
+        description="Comma-separated, e.g. `SPY,SPX`. Default: every alertable symbol "
+        "(see /config). For ES / NQ use SPX / NDX.",
+    ),
+    side: str = Query(default="both", description="`call`, `put` or `both`."),
+    events: Optional[str] = Query(
+        default=None,
+        description="Comma-separated subset of `hit`, `break`, `hold`. Default: all three.",
+    ),
+    profile: str = Query(
+        default=DEFAULT_PROFILE,
+        description="Noise filter: `responsive`, `balanced` or `conservative`.",
+    ),
+    touch_bp: Optional[str] = Query(
+        default=None,
+        description="Touch tolerance in basis points of the wall, one of /config "
+        "`touch_options_bp`; omit (or `auto`) for the profile's own band.",
+    ),
+    min_strength_pctile: int = Query(
+        default=0,
+        ge=0,
+        le=MAX_STRENGTH_FLOOR,
+        description="Only walls at least this strong (percentile of the symbol's own "
+        "30-day history at the same time of day). A wall whose strength is unknown "
+        "never passes a floor above 0.",
+    ),
+) -> stream.EventFilter:
+    """The query-string filter ``/events`` and ``/stream`` share.
+
+    Each field means what the same field on a rule means, and the profile and
+    tolerance pick exactly one detector stream, so a filter hears the alerts
+    a rule set the same way would.
+    """
+    allowed = alerts_config.symbols()
+    wanted = [s.upper() for s in _csv(symbols)] or list(allowed)
+    unknown = [s for s in wanted if s not in allowed]
+    if unknown:
+        raise _bad(
+            f"symbols must be among {', '.join(allowed)}"
+            + (" (for ES / NQ, use SPX / NDX)" if any(s in ("ES", "NQ") for s in unknown) else "")
+        )
+    side = side.strip().lower()
+    if side not in SIDES:
+        raise _bad("side must be call, put or both")
+    kinds = [k.lower() for k in _csv(events)] or list(EVENT_TYPES)
+    bad_kinds = sorted(set(kinds) - set(EVENT_TYPES))
+    if bad_kinds:
+        raise _bad(f"unknown event(s): {', '.join(bad_kinds)}")
+    profile = profile.strip().lower()
+    if profile not in PROFILES:
+        raise _bad(f"profile must be one of {', '.join(PROFILES)}")
+    raw_touch = None if touch_bp is None or touch_bp.strip().lower() in ("", "auto") else touch_bp
+    chosen = _validate_touch(raw_touch)
+    return stream.EventFilter(
+        symbols=tuple(dict.fromkeys(wanted)),
+        sides=("call", "put") if side == "both" else (side,),
+        kinds=tuple(k for k in EVENT_TYPES if k in kinds),
+        profile=profile,
+        touch_bp=PROFILES[profile].touch_bp if chosen is None else chosen,
+        auto_touch=chosen is None,
+        min_strength_pctile=min_strength_pctile,
+    )
+
+
+@router.get("/events")
+async def list_events(
+    flt: stream.EventFilter = Depends(event_filter),
+    after_id: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Return alerts recorded after this id, oldest first. Omit for the "
+        "newest `limit` alerts.",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: DatabaseManager = Depends(get_db),
+) -> Dict[str, Any]:
+    """Recorded wall alerts matching the filter, oldest first.
+
+    Poll with ``after_id=<next_after_id>`` from the previous response to see
+    each alert once; ``has_more`` means call again straight away. The same
+    filter on ``/stream`` pushes the alerts instead.
+    """
+    async with db.pool.acquire() as conn:
+        page = await stream.fetch_page(conn, flt, after_id=after_id, limit=limit)
+    return {
+        "events": page.entries,
+        "next_after_id": page.next_after_id,
+        "has_more": page.has_more,
+        "filter": flt.as_dict(),
+    }
+
+
+def _resume_cursor(header: Optional[str], after_id: Optional[int]) -> Optional[int]:
+    """Where a stream resumes: ``Last-Event-ID`` (what an SSE client sends on
+    reconnect, newer than the URL it reconnects to) wins over ``after_id``."""
+    raw = (header or "").strip()
+    if not raw:
+        return after_id
+    if not (raw.isascii() and raw.isdigit()):
+        raise _bad("Last-Event-ID must be an id this stream sent")
+    return int(raw)
+
+
+@router.get("/stream", response_class=StreamingResponse)
+async def stream_events(
+    request: Request,
+    flt: stream.EventFilter = Depends(event_filter),
+    after_id: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Replay alerts recorded after this id before going live. "
+        "A Last-Event-ID header takes precedence.",
+    ),
+    db: DatabaseManager = Depends(get_db),
+) -> StreamingResponse:
+    """Wall alerts as Server-Sent Events, the moment each is recorded.
+
+    Events: ``wall_alert`` (the same entry as ``/events``, with ``id``);
+    ``ready`` once replay is done and the stream is live; ``gap`` when a
+    reconnect was too far behind to replay; ``: keepalive`` comments every
+    15 seconds. Reconnect with ``Last-Event-ID`` (a browser ``EventSource``
+    does this on its own) and nothing recorded in between is missed. Streams
+    also end when the API restarts. ``429`` when the caller already holds the
+    most streams allowed.
+    """
+    cursor = _resume_cursor(request.headers.get("Last-Event-ID"), after_id)
+    subject = current_identity(request).subject
+    try:
+        sub = await _tail.subscribe(flt, subject, lambda: db.pool)
+    except stream.StreamLimit as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "60"})
+    except stream.StreamUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "5"})
+    return StreamingResponse(
+        stream.serve(_tail, sub, lambda: db.pool, cursor),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            # nginx: pass each event through as it is written, and never cache.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

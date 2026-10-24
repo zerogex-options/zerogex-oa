@@ -1470,6 +1470,8 @@ return an empty result with `"signed_in": false` and writes return `401`. A
 rule id that belongs to another member is a `404`. The website gates the whole
 prefix at the Basic tier. `/internal/*` is for delivery workers and requires
 `X-Admin-Token` on top of the API key; it is not mirrored to `/api/v2`.
+`/events` and `/stream` need only an API key: they serve every recorded alert
+that matches a filter on the query string, with no saved rule.
 
 ### GET /api/alerts/walls/config
 What the alert form is built from: `symbols`, `sides`, `events`
@@ -1535,6 +1537,93 @@ Today's walls per symbol (`symbols=SPX,SPY`, default all) with each wall's
 strength, percentile, tier and distance from price — what a strength filter
 would see right now. `stale: true` when the walls row is older than the
 detector's own freshness bound.
+
+### The alert filter (`/events` and `/stream`)
+Both serve rows of `wall_alert_events`, the record of every alert the
+detector found, whether or not anyone had a rule for it. The query string is
+the subscription, and each field means what it means on a rule:
+
+| Parameter | Default | |
+|---|---|---|
+| `symbols` | every alertable symbol | Comma-separated, e.g. `SPY,SPX`. ES / NQ: use SPX / NDX. |
+| `side` | `both` | `call`, `put` or `both`. |
+| `events` | `hit,break,hold` | Comma-separated subset. |
+| `profile` | `balanced` | The noise filter. |
+| `touch_bp` | Auto | One of `touch_options_bp`; omit (or `auto`) for the profile's own band. |
+| `min_strength_pctile` | `0` | 0–95. A wall whose strength is unknown never passes a floor above 0. |
+
+The profile and tolerance pick exactly one detector stream (each fires its
+own copy of an alert), so a filter set like a rule hears that rule's alerts.
+A stream has no daily cap; that is a per-member delivery guard.
+
+Each alert:
+
+```json
+{
+  "id": 48211,
+  "detected_at": "2026-10-23T14:05:02.118+00:00",
+  "symbol": "SPY", "side": "put", "kind": "hit",
+  "wall": 772.0, "price": 772.31,
+  "profile": "balanced", "touch_bp": 5,
+  "strength_pctile": 81.25,
+  "payload": { "...": "the full alert, as on /feed" }
+}
+```
+
+`id` is unique and increases in the order alerts are recorded, so it is the
+cursor for both endpoints and the key to deduplicate on.
+
+### GET /api/alerts/walls/events
+A page of alerts matching the filter, oldest first. `after_id` returns the
+alerts recorded after it (`limit` ≤ 500, default 100); without it, the newest
+`limit`. Response: `events`, `has_more` (call again straight away),
+`next_after_id` (pass it as the next `after_id`; when nothing more matched it
+is the newest id in the table, so a quiet filter does not rescan old rows) and
+`filter` (yours, normalized). Poll every few seconds with
+`after_id=<next_after_id>` and each alert arrives once.
+
+### GET /api/alerts/walls/stream
+The same alerts as **Server-Sent Events**, pushed the moment each is recorded
+(within about a second). Same filter; `after_id` (or a `Last-Event-ID`
+header, which wins) replays what was recorded after it first.
+
+```
+retry: 5000
+
+id: 48210
+event: ready
+data: {"after_id":48210,"filter":{...}}
+
+id: 48211
+event: wall_alert
+data: {"id":48211,"symbol":"SPY","side":"put","kind":"hit",...}
+
+: keepalive
+```
+
+- `wall_alert` — one alert, the entry above; its SSE `id` is the alert id.
+- `ready` — sent once, after any replay: the stream is live. It carries an
+  `id` too, so a client that reconnects before any alert arrives still
+  resumes from where it joined.
+- `gap` — on a reconnect more than 500 alerts behind, or when the replay
+  failed: those alerts were not replayed (`after_id` to `resumed_after_id`);
+  page them from `/events`. The stream continues live.
+- `: keepalive` — a comment line every 15 s; ignore it.
+
+Reconnect with `Last-Event-ID` and nothing recorded in between is missed. The
+browser's `EventSource` does that on its own; with any other client, keep the
+last `id` you saw and send it when you reconnect. The server ends a stream
+when the API restarts and when it falls 1,000 alerts behind; reconnecting
+catches up from the table.
+
+`429` once a caller holds 5 open streams on one API worker
+(`WALL_ALERTS_STREAM_MAX_PER_CALLER`, `…_PER_WORKER` for the total); `503`
+with `Retry-After` when the alerts table cannot be read.
+
+```bash
+curl -N -H "Authorization: Bearer $ZEROGEX_API_KEY" \
+  "https://api.zerogex.io/api/alerts/walls/stream?symbols=SPY&side=put&events=hit,break"
+```
 
 ### Internal (delivery workers)
 - `GET /api/alerts/walls/internal/queued?channel=email|sms&limit=&max_age_seconds=` —

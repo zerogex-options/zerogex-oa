@@ -25,7 +25,7 @@ import json
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -809,3 +809,130 @@ def test_api_config_lists_profiles_and_channels(api):
     assert [p["name"] for p in cfg["profiles"]] == ["responsive", "balanced", "conservative"]
     channels = {c["id"]: c["available"] for c in cfg["channels"]}
     assert channels == {"in_app": True, "email": True, "sms": False}
+
+
+# --------------------------------------------------------------------------
+# Events page and stream
+# --------------------------------------------------------------------------
+
+
+def _record(pg, *, pctile: Any = 91.0, profile: str = "balanced", **kw: Any) -> int:
+    """Record one event the way the service does; returns its id."""
+    import dataclasses
+
+    from src.alerts.wall_store import record_and_fan_out
+
+    result = record_and_fan_out(
+        pg,
+        dataclasses.replace(_event(**kw), profile=profile),
+        strength_pctile=pctile,
+        net_gex_at_spot=-1.0,
+        current_wall=100.0,
+        odds=[],
+        now=datetime.now(timezone.utc),
+    )
+    pg.commit()
+    assert result.event_id is not None
+    return result.event_id
+
+
+def _ids(body: Dict[str, Any]) -> List[int]:
+    return [e["id"] for e in body["events"]]
+
+
+def test_api_events_filter_like_a_rule(api, pg):
+    hit = _record(pg, ordinal=1)
+    put_break = _record(pg, kind="break", side="put", ordinal=2)
+    weak = _record(pg, ordinal=3, pctile=40.0)
+    unrated = _record(pg, ordinal=4, pctile=None)
+    wide = _record(pg, ordinal=5, touch_bp=25)
+    other_profile = _record(pg, ordinal=6, profile="responsive", touch_bp=8)
+    # A row from before touch tolerances: it ran at the profile's own band.
+    legacy = _record(pg, ordinal=7, touch_bp=0)
+
+    base = f"/api/alerts/walls/events?symbols={SYMBOL}"
+    body = api.get(base).json()
+    assert _ids(body) == [hit, put_break, weak, unrated, legacy]
+    assert body["filter"] == {
+        "symbols": [SYMBOL],
+        "side": "both",
+        "events": ["hit", "break", "hold"],
+        "profile": "balanced",
+        "touch_bp": None,
+        "min_strength_pctile": 0,
+    }
+    entry = body["events"][0]
+    assert entry["kind"] == "hit" and entry["wall"] == 100.0 and entry["touch_bp"] == 5
+    assert entry["strength_pctile"] == 91.0
+    assert entry["payload"]["strength_tier"] == "very_strong"
+
+    assert _ids(api.get(f"{base}&side=put").json()) == [put_break]
+    assert _ids(api.get(f"{base}&events=break").json()) == [put_break]
+    # A floor never passes an unknown strength.
+    assert _ids(api.get(f"{base}&min_strength_pctile=50").json()) == [hit, put_break, legacy]
+    assert _ids(api.get(f"{base}&touch_bp=25").json()) == [wide]
+    assert _ids(api.get(f"{base}&profile=responsive").json()) == [other_profile]
+
+
+def test_api_events_page_with_a_cursor(api, pg):
+    first, second, third = (_record(pg, ordinal=n) for n in (1, 2, 3))
+    noise = _record(pg, ordinal=4, profile="conservative", touch_bp=3)
+    base = f"/api/alerts/walls/events?symbols={SYMBOL}"
+
+    # No cursor: the newest alerts, oldest first, and a cursor at the head.
+    newest = api.get(f"{base}&limit=2").json()
+    assert _ids(newest) == [second, third]
+    assert newest["has_more"] is False and newest["next_after_id"] == noise
+
+    page = api.get(f"{base}&after_id={first - 1}&limit=2").json()
+    assert _ids(page) == [first, second] and page["has_more"] is True
+    assert page["next_after_id"] == second
+    page = api.get(f"{base}&after_id={page['next_after_id']}&limit=2").json()
+    assert _ids(page) == [third] and page["has_more"] is False
+    # Nothing more matched, so the cursor skips the rows that did not.
+    assert page["next_after_id"] == noise
+    page = api.get(f"{base}&after_id={page['next_after_id']}").json()
+    assert page["events"] == [] and page["next_after_id"] == noise
+
+
+def test_stream_replays_from_the_table_then_goes_live(pg):
+    import asyncio
+
+    import asyncpg
+
+    from src.api import wall_alert_stream as stream
+    from src.api.routers.wall_alerts import event_filter
+
+    missed = [_record(pg, ordinal=n) for n in (1, 2)]
+    _record(pg, ordinal=3, side="put")
+    flt = event_filter(
+        symbols=SYMBOL,
+        side="call",
+        events=None,
+        profile="balanced",
+        touch_bp=None,
+        min_strength_pctile=0,
+    )
+
+    async def scenario() -> Tuple[List[str], int]:
+        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=2)
+        tail = stream.WallAlertTail(poll_seconds=0.05)
+        try:
+            sub = await tail.subscribe(flt, "caller:test", lambda: pool)
+            gen = stream.serve(tail, sub, lambda: pool, cursor=missed[0] - 1)
+            frames = [await gen.__anext__() for _ in range(4)]
+            # Recorded after the stream went live.
+            live = await asyncio.to_thread(_record, pg, ordinal=4)
+            frames.append(await asyncio.wait_for(gen.__anext__(), 5))
+            await gen.aclose()
+            assert tail.open_streams == 0
+            return frames, live
+        finally:
+            await pool.close()
+
+    frames, live = asyncio.run(scenario())
+    assert frames[0].startswith("retry:")
+    assert frames[1].startswith(f"id: {missed[0]}\nevent: wall_alert\n")
+    assert frames[2].startswith(f"id: {missed[1]}\nevent: wall_alert\n")
+    assert "\nevent: ready\n" in frames[3]
+    assert frames[4].startswith(f"id: {live}\nevent: wall_alert\n")
