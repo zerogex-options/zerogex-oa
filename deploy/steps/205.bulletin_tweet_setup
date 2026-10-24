@@ -9,9 +9,11 @@
 #   * State + tmp directories under /var/lib/zerogex-oa and
 #     /var/log/playwright-browsers.
 #   * ffmpeg for MP4 transcoding of the replay clip.
-#   * Node.js 20 via NodeSource (for the frontend helpers).
+#   * Node.js 22 via NodeSource (for the frontend helpers), when there
+#     is no node at all.
 #   * A /usr/local/bin/node symlink so systemd (which runs with a
-#     stripped PATH) can find the nvm-installed binary.
+#     stripped PATH) can find the nvm-installed binary.  Re-pointed when
+#     node has been upgraded since.
 #   * The Chromium build the website's pinned playwright-core expects,
 #     in /var/log/playwright-browsers so root doesn't fill up.
 #     (playwright-core itself is a zerogex-web dependency, installed by
@@ -86,15 +88,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Node.js 20 via NodeSource
+# 3. Node.js 22 via NodeSource
+#
+#    Node 20 is end-of-life and gets no security fixes.  An existing node
+#    older than the last 22.x security release (22.23.4, the Oct 21 2026
+#    Brotli decoder RCE fix) stops the step instead: on this box node comes
+#    from nvm, and zerogex-web's deploy/steps/020.nodejs is what upgrades it.
 # ---------------------------------------------------------------------------
 
-log "  → Ensuring Node.js 20..."
-if command -v node >/dev/null && node --version | grep -qE '^v(20|22)\.'; then
-    log "     ✓ node $(node --version) already installed"
+# Load nvm's newest 22 first, so ``node`` below is the nvm install and not
+# the /usr/local/bin/node symlink step 4 is about to re-point.
+if [ -s "$HOME/.nvm/nvm.sh" ]; then
+    . "$HOME/.nvm/nvm.sh"
+    nvm use 22 >/dev/null 2>&1 || true
+fi
+
+NODE_MIN_PATCHED="22.23.4"
+log "  → Ensuring Node.js 22..."
+if command -v node >/dev/null; then
+    NODE_VERSION="$(node --version)"
+    NODE_VERSION="${NODE_VERSION#v}"
+    if [ "$(printf '%s\n' "$NODE_MIN_PATCHED" "$NODE_VERSION" | sort -V | head -n1)" != "$NODE_MIN_PATCHED" ]; then
+        log "     ✗ node $NODE_VERSION is older than $NODE_MIN_PATCHED, the last 22.x security release"
+        log "       Run zerogex-web's deploy/steps/020.nodejs, then this step again."
+        exit 1
+    fi
+    log "     ✓ node $NODE_VERSION already installed"
 else
-    log "     • Installing Node.js 20..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+    log "     • Installing Node.js 22..."
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
     sudo apt-get install -y -qq nodejs
     log "     ✓ node $(node --version) installed"
 fi
@@ -102,16 +124,19 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Symlink node into /usr/local/bin (systemd's PATH doesn't include
 #    nvm's ~/.nvm/versions/node/*/bin, so systemd services can't find
-#    a bare ``node`` — the ln here fixes it once).
+#    a bare ``node``).  The link names one exact nvm version, so a Node
+#    upgrade leaves it on the old binary until this re-points it.
 # ---------------------------------------------------------------------------
 
 log "  → Ensuring /usr/local/bin/node symlink..."
-if [ -e /usr/local/bin/node ] && [ -e /usr/local/bin/npm ]; then
+NODE_BIN="$(readlink -f "$(command -v node)")"
+NPM_BIN="$(readlink -f "$(command -v npm)")"
+if [ "$(readlink -f /usr/local/bin/node)" = "$NODE_BIN" ] && [ "$(readlink -f /usr/local/bin/npm)" = "$NPM_BIN" ]; then
     log "     ✓ symlinks already in place"
 else
-    sudo ln -sf "$(readlink -f "$(command -v node)")" /usr/local/bin/node
-    sudo ln -sf "$(readlink -f "$(command -v npm)")"  /usr/local/bin/npm
-    log "     ✓ /usr/local/bin/{node,npm} -> $(readlink -f "$(command -v node)")"
+    sudo ln -sf "$NODE_BIN" /usr/local/bin/node
+    sudo ln -sf "$NPM_BIN"  /usr/local/bin/npm
+    log "     ✓ /usr/local/bin/{node,npm} -> $NODE_BIN"
 fi
 
 # ---------------------------------------------------------------------------
