@@ -1,6 +1,6 @@
 # GA Settings Guide
 
-*For the ZeroGexGoat version of October 19, 2026. Confidential: this
+*For the ZeroGexGoat version of October 25, 2026. Confidential: this
 describes Jim Edwards' GOAT method.*
 
 ## Before you change anything
@@ -109,14 +109,18 @@ still managed. Times are HHMM on the 24-hour clock in your chart's time zone,
 so 2:40 PM is 1440. A zone is off when its "from" and "to" are the same. A
 zone can run past midnight: 1550 to 200 covers 3:50 PM to 2:00 AM.
 
-## 7. Pumpkin line (new)
+A zone ends at its "to" time: it covers the "from" minute up to, but not
+including, the "to" minute. So a zone ending at 829 leaves 8:29 to 8:30 open
+for new trades; end it at 830 to close that minute.
+
+## 7. Pumpkin line
 
 Off until you tick the first setting.
 
 | Setting | What it does |
 |---|---|
 | Require pumpkin in sync (off = ignore it) | When ticked, GA skips a trade when the pumpkin is flat or curling against it, unless there is room (last setting). |
-| Pumpkin: HMA period | Your pumpkin is a 100 HMA. |
+| Pumpkin: HMA period | Match it to the pumpkin on your chart: 80 on your latest charts. |
 | Pumpkin: slope lookback (bars) | How many bars back GA measures the pumpkin's direction. Short means it reacts quickly to a curl. Default 5. |
 | Pumpkin: min slope over lookback (ticks; less is flat) | How much the pumpkin must move over the lookback to count as heading somewhere. Less than this is flat. Default 2. |
 | Pumpkin: room to trade against it (ticks, 0=never) | A trade against a flat or curling pumpkin is still taken when the pumpkin sits at least this far beyond the entry, above a long or below a short. Default 15. 0 means never trade against it. |
@@ -129,11 +133,12 @@ pumpkin is flat or falling and sits below price on a long, there is no room by
 this measure, so GA skips that one too. Setting the room at or a little above your breakeven trigger
 matches the idea of reaching breakeven first.
 
-## 8. Chart labels (new)
+## 8. Chart labels
 
 | Setting | What it does |
 |---|---|
 | Label skipped setups (why GA passed) | When GA passes on a bar it could have used as an entry bar, it writes the reason on the chart in light blue: under the bar for a long, over it for a short. |
+| Labels to keep (newest; raise to go back further) | GA keeps only this many labels, the most recent ones; each new label past that replaces the oldest. 300 covers a few days on a 5-range NQ chart. To study a longer chart, raise it: try 5000 for 30 days. Each label is a drawing on the chart, so if the chart gets slow, lower it. |
 
 A label lists each rule the bar failed, one per line. The first number is what
 GA measured and the second is your setting:
@@ -154,7 +159,8 @@ GA measured and the second is your setting:
 Labels go only on near misses: bars closing the way the midband points, in
 your entry bar color, that failed one to three rules. Bars failing four or
 more rules aren't really setups, so they get no label. To keep a chart
-readable, the two bars after a label get none either. Labels only explain;
+readable, the two bars after a label get none either. If two labels still
+overlap, zoom in on the chart to spread the bars apart. Labels only explain;
 turning them on never changes a trade.
 
 ## When GA passes on a trade you expected
@@ -168,6 +174,7 @@ turning them on never changes a trade.
    - The bar closed against the way the midband is pointing.
    - It failed four or more rules.
    - A label was drawn on one of the two bars before it. Look there.
+   - The bar is older than the oldest label kept. Raise "Labels to keep."
    - GA was already in a trade.
    - The bar is among the first 100 or so on the chart, before GA has enough
      history to start trading.
@@ -182,10 +189,18 @@ closes its position at market, which can look like a stop vanishing. Check the
 Strategies tab to see whether GA is still enabled, and the Log tab (Control
 Center) for a "rejected" entry at that time.
 
+In the Log, GA's orders carry its names: GOAT1A, GOAT2 and so on, with exits
+named "Stop loss" and "Profit target." Orders named Entry, Stop1 and Target1
+come from an ATM strategy, such as one placed from the SuperDOM, not from GA.
+NinjaTrader also saves each day's log as a text file in
+`Documents\NinjaTrader 8\log`, with the date in its name, ready to attach to
+an email.
+
 ## Installing a new version
 
 1. Untick Enabled on every copy of GA in the Control Center's Strategies tab.
 2. Save the new file over the old one in
-   Documents\NinjaTrader 8\bin\Custom\Strategies.
+   `Documents\NinjaTrader 8\bin\Custom\Strategies`.
 3. Open the NinjaScript Editor and press F5. The error list should be empty.
-4. Check your settings (new ones start off), then re-enable one copy.
+4. Check your settings (each new one starts out leaving GA as it was), then
+   re-enable one copy.
