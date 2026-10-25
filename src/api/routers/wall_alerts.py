@@ -928,7 +928,7 @@ async def stream_events(
 
 @router.get("/internal/queued", dependencies=_INTERNAL_GATE)
 async def internal_queued(
-    channel: str = Query(..., pattern="^(email|sms)$"),
+    channel: str = Query(..., pattern="^(email|webhook|sms)$"),
     limit: int = Query(default=200, ge=1, le=1000),
     max_age_seconds: int = Query(default=DEFAULT_QUEUE_MAX_AGE_SECONDS, ge=60, le=86400),
     db: DatabaseManager = Depends(get_db),
@@ -1072,7 +1072,7 @@ async def internal_disable_channel(
     if not isinstance(end_user, str) or not end_user.strip():
         raise _bad("end_user is required")
     if channel not in alerts_config.CHANNELS or channel == "in_app":
-        raise _bad("channel must be email or sms")
+        raise _bad("channel must be email, webhook or sms")
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             rules = await conn.execute(

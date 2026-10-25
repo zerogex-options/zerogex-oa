@@ -174,6 +174,16 @@ def test_targets_dedupe_per_member_and_channel_and_honor_the_floor():
     assert filtered == 1 and capped == []
 
 
+def test_a_webhook_is_queued_for_its_worker_like_email():
+    from src.alerts import config as alerts_config
+    from src.alerts.wall_store import deliverable_channels
+
+    assert alerts_config.CHANNELS["webhook"] == "queued"
+    assert "webhook" in deliverable_channels()
+    rule = _validate({"symbol": "SPY", "side": "put", "channels": {"webhook": True}})
+    assert rule["channels"] == {"in_app": False, "email": False, "webhook": True, "sms": False}
+
+
 def test_unknown_strength_only_reaches_rules_without_a_floor():
     rules = [(1, "alice", {"in_app": True}, 0), (2, "bob", {"in_app": True}, 25)]
     targets, filtered, _ = select_targets(
@@ -210,7 +220,7 @@ def test_a_minimal_rule_gets_the_defaults():
         "min_strength_pctile": 0,
         "profile": "balanced",
         "touch_bp": None,
-        "channels": {"in_app": True, "email": False, "sms": False},
+        "channels": {"in_app": True, "email": False, "webhook": False, "sms": False},
         "enabled": True,
         "today_only": False,
     }
@@ -470,6 +480,7 @@ def test_config_is_served_without_a_database(app_module):
     assert {c["id"]: c["available"] for c in cfg["channels"]} == {
         "in_app": True,
         "email": True,
+        "webhook": True,
         "sms": False,
     }
     assert cfg["max_strength_floor"] == 95

@@ -530,7 +530,7 @@ def test_api_rule_lifecycle_and_ownership(api, pg):
     assert created.status_code == 201, created.text
     rule = created.json()["rule"]
     assert rule["symbol"] == SYMBOL and rule["min_strength_pctile"] == 75
-    assert rule["channels"] == {"in_app": True, "email": True, "sms": False}
+    assert rule["channels"] == {"in_app": True, "email": True, "webhook": False, "sms": False}
 
     listed = api.get("/api/alerts/walls/rules", headers=_as(u1)).json()
     assert [r["id"] for r in listed["rules"]] == [rule["id"]]
@@ -745,6 +745,42 @@ def test_api_internal_outbox_requires_admin_and_rechecks_opt_in(api, pg):
     assert purged["rules_deleted"] == 1
 
 
+def test_api_webhook_rows_queue_apart_from_email(api, pg):
+    from src.alerts.wall_store import record_and_fan_out
+
+    hook, mail = USERS[:2]
+    _rule(pg, hook, channels={"in_app": True, "webhook": True})
+    _rule(pg, mail, channels={"email": True})
+    record_and_fan_out(
+        pg,
+        _event(),
+        strength_pctile=None,
+        net_gex_at_spot=None,
+        current_wall=None,
+        odds=[],
+        now=datetime.now(timezone.utc),
+    )
+    pg.commit()
+    assert _deliveries(pg) == [
+        (hook, "in_app", "sent"),
+        (hook, "webhook", "queued"),
+        (mail, "email", "queued"),
+    ]
+    admin = {"X-Admin-Token": ADMIN}
+    webhook = api.get("/api/alerts/walls/internal/queued?channel=webhook", headers=admin).json()
+    assert [(e["end_user"], e["channel"]) for e in webhook["entries"]] == [(hook, "webhook")]
+    email = api.get("/api/alerts/walls/internal/queued?channel=email", headers=admin).json()
+    assert [e["end_user"] for e in email["entries"]] == [mail]
+
+    # Turning the webhook off on every rule cancels what it had queued.
+    off = api.post(
+        "/api/alerts/walls/internal/disable-channel",
+        json={"end_user": hook, "channel": "webhook"},
+        headers=admin,
+    ).json()
+    assert off["rules_updated"] == 1 and off["cancelled_queued"] == 1
+
+
 def test_api_expires_stale_queue_rows(api, pg):
     from src.alerts.wall_store import record_and_fan_out
 
@@ -809,7 +845,7 @@ def test_api_config_lists_profiles_and_channels(api):
     assert SYMBOL in cfg["symbols"]
     assert [p["name"] for p in cfg["profiles"]] == ["responsive", "balanced", "conservative"]
     channels = {c["id"]: c["available"] for c in cfg["channels"]}
-    assert channels == {"in_app": True, "email": True, "sms": False}
+    assert channels == {"in_app": True, "email": True, "webhook": True, "sms": False}
 
 
 # --------------------------------------------------------------------------

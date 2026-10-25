@@ -6476,7 +6476,7 @@ wall-alerts-health: ## Wall alerts: service state, per-symbol heartbeat, today's
 	@echo "Deliveries, last 24h:"
 	@$(PSQL) -P pager=off -c "SELECT channel, status, COUNT(*) AS n, MAX(error) FILTER (WHERE status IN ('failed', 'cancelled')) AS sample_error FROM wall_alert_deliveries WHERE created_at > NOW() - interval '24 hours' GROUP BY 1, 2 ORDER BY 1, 2;"
 	@echo "Member rules:"
-	@$(PSQL) -P pager=off -c "SELECT COUNT(*) AS rules, COUNT(*) FILTER (WHERE enabled) AS enabled, COUNT(DISTINCT end_user) AS members, COUNT(*) FILTER (WHERE enabled AND (channels ->> 'email')::boolean) AS with_email, COUNT(*) FILTER (WHERE enabled AND touch_bp IS NOT NULL) AS custom_touch FROM wall_alert_rules;"
+	@$(PSQL) -P pager=off -c "SELECT COUNT(*) AS rules, COUNT(*) FILTER (WHERE enabled) AS enabled, COUNT(DISTINCT end_user) AS members, COUNT(*) FILTER (WHERE enabled AND (channels ->> 'email')::boolean) AS with_email, COUNT(*) FILTER (WHERE enabled AND (channels ->> 'webhook')::boolean) AS with_webhook, COUNT(*) FILTER (WHERE enabled AND touch_bp IS NOT NULL) AS custom_touch FROM wall_alert_rules;"
 	@echo "Recent errors / warnings:"
 	@sudo journalctl -u $(WALL_ALERTS_SERVICE) -n 500 --no-pager | grep -E " - (ERROR|WARNING) - " | tail -10 || echo "None"
 

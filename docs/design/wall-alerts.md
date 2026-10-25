@@ -167,6 +167,22 @@ without its deliveries, never lost, and never sent twice.
   send before marking it, so a mark that fails is retried as a mark, never as
   a second email. It reports its own failures at most hourly (an unreachable
   outbox only after 5 minutes), because the timer fires every 20 seconds.
+* **Discord / Slack** (`webhook`) — the member's own channel, through an
+  incoming-webhook address they paste on `/account/alerts`. The address is a
+  secret, so it lives with the account on the website (the
+  `wall_alert_webhooks` table in the auth DB, never sent back to a browser),
+  and this side only queues `webhook` rows. The website accepts only
+  `https://discord.com/api/webhooks/…` and `https://hooks.slack.com/services/…`
+  (no other host, port or redirect, so a member cannot aim the server at
+  anything else), and posts a test message before saving one.
+  `frontend/scripts/wall-alerts-webhooks.mts`, on its own 20-second timer so a
+  Discord outage never holds up email, posts up to 10 alerts per message with
+  the email's wording, under the same rules as email (Basic and up, not
+  deleted, sent-ledger before the mark). A 401 / 403 / 404 / 410 means the
+  webhook was deleted or revoked: the rows fail, the address is marked broken
+  and the page asks the member for a new one; until then their rows are
+  cancelled instead of posted to a dead address. 429, 5xx and network errors
+  retry on the next pass.
 
 The queue endpoints re-check opt-in at delivery time: a row whose rule was
 deleted, disabled or had the channel switched off is cancelled, never sent.

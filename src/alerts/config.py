@@ -100,9 +100,15 @@ STREAM_MAX_PER_WORKER: int = _getenv_int("WALL_ALERTS_STREAM_MAX_PER_WORKER", 50
 # Adding a channel is one line here plus a worker; nothing in the detector or
 # the fan-out changes. SMS is registered now so rules, the outbox and the
 # delivery endpoints already speak it — see SMS_ENABLED.
+#
+# webhook: the member's own Discord or Slack channel. The address lives with
+# the member's account on the website (it is a secret, and the website's
+# worker, frontend/scripts/wall-alerts-webhooks.mts, is what posts to it), so
+# this side only queues the rows, exactly as for email.
 CHANNELS: Dict[str, str] = {
     "in_app": "instant",
     "email": "queued",
+    "webhook": "queued",
     "sms": "queued",
 }
 

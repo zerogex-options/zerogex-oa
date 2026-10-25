@@ -1500,7 +1500,7 @@ per-member limit.
   "min_strength_pctile": 75,
   "profile": "balanced",
   "touch_bp": null,
-  "channels": {"in_app": true, "email": true, "sms": false},
+  "channels": {"in_app": true, "email": true, "webhook": false, "sms": false},
   "enabled": true,
   "today_only": false
 }
@@ -1515,6 +1515,9 @@ per-member limit.
 - `touch_bp` — how close price must come to the wall for a hit, in basis
   points of the wall: one of `touch_options_bp` (1, 5, 10, 25 = 0.01%–0.25%),
   or `null` for Auto, the profile's own band (8 / 5 / 3 bp).
+- `channels` — `in_app` (the header bell), `email`, `webhook` (the member's
+  Discord or Slack channel; the address is set on the website, not here) and
+  `sms` (refused until it is switched on).
 - `today_only` — `false` (default): the rule runs every trading day until it
   is paused or deleted. `true`: it runs for one session and then stops: today's
   until the close (13:00 ET on a half day), otherwise the next session's, so a
@@ -1637,7 +1640,7 @@ curl -N -H "Authorization: Bearer $ZEROGEX_API_KEY" \
 ```
 
 ### Internal (delivery workers)
-- `GET /api/alerts/walls/internal/queued?channel=email|sms&limit=&max_age_seconds=` —
+- `GET /api/alerts/walls/internal/queued?channel=email|webhook|sms&limit=&max_age_seconds=` —
   expires queued rows older than `max_age_seconds` (default 1200), cancels rows
   whose rule was deleted, disabled or had the channel switched off, then
   returns what is left, oldest first.
