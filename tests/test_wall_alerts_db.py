@@ -93,8 +93,8 @@ def _rule(conn, user: str, **kw: Any) -> int:
         """
         INSERT INTO wall_alert_rules
             (end_user, underlying, side, events, min_strength_pctile, profile, channels, enabled,
-             touch_bp)
-        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s)
+             touch_bp, expires_on)
+        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -107,6 +107,7 @@ def _rule(conn, user: str, **kw: Any) -> int:
             json.dumps(kw.get("channels", {"in_app": True})),
             kw.get("enabled", True),
             kw.get("touch_bp"),
+            kw.get("expires_on"),
         ),
     )
     conn.commit()
@@ -936,3 +937,64 @@ def test_stream_replays_from_the_table_then_goes_live(pg):
     assert frames[2].startswith(f"id: {missed[1]}\nevent: wall_alert\n")
     assert "\nevent: ready\n" in frames[3]
     assert frames[4].startswith(f"id: {live}\nevent: wall_alert\n")
+
+
+# --------------------------------------------------------------------------
+# "Today only"
+# --------------------------------------------------------------------------
+
+
+def test_a_today_only_rule_hears_its_session_and_none_after(pg):
+    from src.alerts.wall_store import record_and_fan_out
+
+    ended, today, every_day = USERS[:3]
+    _rule(pg, ended, expires_on=SESSION - timedelta(days=1))
+    _rule(pg, today, expires_on=SESSION)
+    _rule(pg, every_day)
+    record_and_fan_out(
+        pg,
+        _event(),
+        strength_pctile=91.0,
+        net_gex_at_spot=-1.0,
+        current_wall=100.0,
+        odds=[],
+        now=datetime.now(timezone.utc),
+    )
+    pg.commit()
+    assert [d[0] for d in _deliveries(pg)] == [today, every_day]
+
+
+def test_api_today_only_lifecycle(api, pg, monkeypatch):
+    from src.api.routers import wall_alerts
+
+    session = {"day": SESSION}
+    monkeypatch.setattr(wall_alerts, "today_only_session", lambda now: session["day"])
+    u1 = USERS[0]
+    body = {"symbol": SYMBOL, "side": "put", "today_only": True}
+    rule = api.post("/api/alerts/walls/rules", json=body, headers=_as(u1)).json()["rule"]
+    assert rule["today_only"] is True and rule["ended"] is False
+    assert rule["expires_on"] == SESSION.isoformat()
+    assert rule["ends_at"] == "2026-10-13T20:00:00+00:00"
+    assert api.get("/api/alerts/walls/config").json()["today_only"]["session"] == "2026-10-13"
+
+    # The next session: it has ended, and stays ended through an unrelated edit.
+    session["day"] = SESSION + timedelta(days=1)
+    (listed,) = api.get("/api/alerts/walls/rules", headers=_as(u1)).json()["rules"]
+    assert listed["ended"] is True
+    url = f"/api/alerts/walls/rules/{rule['id']}"
+    edited = api.patch(url, json={"min_strength_pctile": 50}, headers=_as(u1)).json()["rule"]
+    assert edited["ended"] is True and edited["expires_on"] == "2026-10-13"
+
+    # Turning it back on runs it for the session at hand.
+    on = api.patch(url, json={"enabled": True}, headers=_as(u1)).json()["rule"]
+    assert on["ended"] is False and on["expires_on"] == "2026-10-14"
+
+    # Saving it as today only again re-arms it too; switching it off makes it
+    # an every-day rule that turning on leaves alone.
+    session["day"] = SESSION + timedelta(days=3)
+    again = api.patch(url, json={"today_only": True}, headers=_as(u1)).json()["rule"]
+    assert again["expires_on"] == "2026-10-16"
+    every = api.patch(url, json={"today_only": False}, headers=_as(u1)).json()["rule"]
+    assert every["today_only"] is False and every["expires_on"] is None
+    every = api.patch(url, json={"enabled": True}, headers=_as(u1)).json()["rule"]
+    assert every["expires_on"] is None and every["ended"] is False

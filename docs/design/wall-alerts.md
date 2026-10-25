@@ -132,10 +132,20 @@ yet, or a nightly refresh that has not run).
 
 | Table | Holds |
 |---|---|
-| `wall_alert_rules` | Each member's alerts: symbol, side, events, strength floor, profile, touch tolerance (NULL = Auto), channels, enabled. |
+| `wall_alert_rules` | Each member's alerts: symbol, side, events, strength floor, profile, touch tolerance (NULL = Auto), channels, enabled, and `expires_on` (a today-only alert's last session; NULL = every day). |
 | `wall_alert_events` | Every event, unique on `(symbol, session, profile, touch, side, wall, test, kind)`, so re-running a tape is a no-op. `payload` is everything a channel renders (`wall_payload.py`). Rows from before touch tolerance carry `touch_bp` 0. |
 | `wall_alert_deliveries` | The outbox, unique per `(event, member, channel)`. `in_app` rows are born `sent` (the feed is the delivery, with server-side `read_at`); `email` / `sms` rows are born `queued`. |
 | `wall_alert_detector_state` | Per-stream (symbol, profile, touch) detector state, rewritten when it changes (≥ once a minute in session — the heartbeat). |
+
+A rule runs every trading day until the member pauses or deletes it. A
+**today-only** rule carries the one session it runs in (`expires_on`, an ET
+trading date): today's until the close, else the next session's, so one saved
+on Friday evening is for Monday (`today_only_session` in the router, from
+`src/market_calendar.py`). The fan-out matches it only for events of that
+session or earlier (`expires_on >= session_date`), which is exact: an event
+recorded a few seconds after the close for its last minute still belongs to
+that session. An ended rule is kept, shown as ended, and turning it back on
+re-arms it for the next session.
 
 An event and its deliveries are written in one transaction, and the detector's
 in-memory state is rewound if that write fails, so an alert is never recorded
