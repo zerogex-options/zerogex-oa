@@ -85,7 +85,9 @@
 //  used as an entry bar, it writes on the chart which rules that bar
 //  failed, e.g. "pinch 9 > 6": the yellow line came no closer than 9 ticks
 //  to the midband, and the setting allows 6. Display only; a label never
-//  changes a trade.
+//  changes a trade. Only the newest SkipLabelsToKeep labels stay on the
+//  chart. Jim: "Is there a way to take it back further? I am studying a
+//  chart looking back 30 days".
 //
 //  EXITS — two lots:
 //    Lot 1 ("GOAT1") exits on the first opposite-closing bar, or at a fixed
@@ -250,9 +252,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 		//: At most one label per this many bars, so a run of candidates in a
 		//: pullback reads as one label rather than a pile.
 		private const int SkipLabelGapBars = 3;
-		//: Labels are drawn under rolling tags, so the oldest is reused once
-		//: this many exist. Thousands of drawn objects slow a chart down.
-		private const int SkipLabelMax = 300;
 
 		// -- trade state ----------------------------------------------------
 		//: Lot 1 exits once, on the first opposite-closing bar. Without this
@@ -393,6 +392,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 				// --- chart labels ---
 				ShowSkipReasons = false;
+				// Labels are drawn under rolling tags, so once this many exist
+				// the oldest is reused. Each is a drawn object, and thousands
+				// of them slow a chart down.
+				SkipLabelsToKeep = 300;
 			}
 			else if (State == State.Configure)
 			{
@@ -772,7 +775,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			// Two bar heights clear of the bar, so the text never covers it.
 			double offset = 2 * Math.Max(High[0] - Low[0], 2 * TickSize);
 			double y = isLong ? Low[0] - offset : High[0] + offset;
-			Draw.Text(this, "GoatSkip" + (skipLabelCount % SkipLabelMax), text, 0, y, Brushes.Cyan);
+			Draw.Text(this, "GoatSkip" + (skipLabelCount % SkipLabelsToKeep), text, 0, y, Brushes.Cyan);
 			skipLabelCount++;
 			lastSkipLabelBar = CurrentBar;
 		}
@@ -1448,6 +1451,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty]
 		[Display(Name = "Label skipped setups (why GA passed)", Order = 1, GroupName = "8. Chart labels")]
 		public bool ShowSkipReasons { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "Labels to keep (newest; raise to go back further)", Order = 2, GroupName = "8. Chart labels")]
+		public int SkipLabelsToKeep { get; set; }
 
 		#endregion
 	}

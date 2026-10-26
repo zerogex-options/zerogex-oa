@@ -108,6 +108,12 @@ Rules that keep live runs readable:
   moment has been asked for. If it shows the rejection, the fix is to handle
   rejections in `OnOrderUpdate` (exit that lot at market and keep running),
   as NinjaTrader support recommends, rather than shutting GA down.
+  The first log he pasted (2026-10-23, 2:11 PM) is not a GA trade: it starts
+  with "Static SuperDOM submitting order with strategy 'Custom - 1'", and the
+  orders are named `Entry` and `Stop1`, which is an ATM strategy. GA's orders
+  carry its signal names (`GOAT1A`, `GOAT2`, ...), and its exits read "Stop
+  loss" and "Profit target". The paste stopped right after `Stop1` was
+  submitted, so the rest of it has been asked for.
 - **A strategy label that starts with (D) means GA is off on that chart.** A
   disabled strategy draws no trades at all, past or present, so a chart in
   that state cannot answer "why didn't it trade here?".
@@ -121,10 +127,12 @@ Rules that keep live runs readable:
 **Dead zones** (Jim's ask, 2026-10-13) are up to three time windows where no
 new trade opens; open trades are still managed. They are HHMM on the 24-hour
 clock, in whatever time zone the chart shows, and off while from equals to. A
-window whose from is after its to wraps past midnight.
+window whose from is after its to wraps past midnight. A window runs from its
+from minute up to, but not including, its to minute, so one ending at 829
+leaves 8:29 to 8:30 open.
 
-**The pumpkin line** (Jim's ask, 2026-10-15 and 10-17) is an HMA(100) he
-reads as an exhaustion line. With "Require pumpkin in sync" ticked, a trade
+**The pumpkin line** (Jim's ask, 2026-10-15 and 10-17) is an HMA(100), 80
+on his later charts, that he reads as an exhaustion line. With "Require pumpkin in sync" ticked, a trade
 is skipped when the pumpkin is flat or curling against it, unless the
 pumpkin sits at least "room" ticks beyond the entry in the trade's direction
 (above a long, below a short): far enough to reach breakeven before price
@@ -145,8 +153,11 @@ entry bar color, that failed one to three rules. Bars in other colors, bars
 failing four or more rules, and bars within two of a previous label get none,
 which keeps a trending chart readable. The labels come from the same checks
 the entries use, so a label can never disagree with what GA did, and turning
-them on never changes a trade. Labels reuse 300 rolling tags, so the oldest
-disappear on a long chart.
+them on never changes a trade. Only the newest **Labels to keep** (300 by
+default) stay on the chart: the tags roll over, so each new label past that
+replaces the oldest. On Jim's 5-range NQ chart 300 was a few days, and he
+studies 30, hence the setting. Each label is a drawn object, and thousands of
+them slow a chart down.
 
 Before this existed, each "why not?" was answered by measuring a screenshot.
 Every one in Jim's 2026-10-15/17 batch came down to a setting: the pinch on
