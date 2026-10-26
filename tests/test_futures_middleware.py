@@ -609,6 +609,48 @@ def test_rows_in_one_session_share_a_single_basis_read(monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "stamp, session",
+    [
+        # timeframe=1day buckets are labeled with midnight on the database's
+        # UTC clock, which is 20:00 ET (19:00 in winter) the evening BEFORE the
+        # session they hold. They must take their own session's basis, not
+        # the previous one's: under carry, a day early is ~4 NQ points high.
+        ("2026-10-23T00:00:00+00:00", "2026-10-23"),
+        ("2026-10-26T00:00:00+00:00", "2026-10-26"),  # Monday: Sunday evening ET
+        ("2026-12-01T00:00:00+00:00", "2026-12-01"),  # EST: 19:00 ET the night before
+        # Cash-session and late-session rows keep their own ET date.
+        ("2026-10-23T13:30:00+00:00", "2026-10-23"),  # 09:30 ET
+        ("2026-10-23T20:15:00+00:00", "2026-10-23"),  # 16:15 ET, the options close
+        ("2026-12-01T21:15:00+00:00", "2026-12-01"),  # 16:15 ET in winter
+    ],
+)
+def test_a_row_is_anchored_on_the_futures_trading_day_it_belongs_to(stamp, session):
+    anchor = fm._row_anchor({"timestamp": stamp})
+    assert anchor.astimezone(fm.ET).date().isoformat() == session
+    assert anchor.astimezone(fm.ET).hour == 16
+
+
+def test_a_daily_series_takes_each_session_s_own_basis(monkeypatch):
+    """End to end on the shape /api/gex/historical?timeframe=1day returns."""
+    ratios = {"2026-10-22": 1.0110, "2026-10-23": 1.0105}
+
+    async def by_anchor(db, symbol, **kwargs):
+        return _basis_at(ratios[kwargs["at"].astimezone(fm.ET).date().isoformat()])
+
+    monkeypatch.setattr(fm, "resolve_basis", by_anchor)
+    middleware = fm.FuturesProjectionMiddleware(app=None)
+    rows = [
+        {"timestamp": "2026-10-23T00:00:00+00:00", "call_wall": 6000.0},
+        {"timestamp": "2026-10-22T00:00:00+00:00", "call_wall": 6000.0},
+    ]
+    out = asyncio.run(middleware._transform(rows, "ES", "SPX", None))
+    assert [r["call_wall"] for r in out] == [
+        pytest.approx(6063.0, abs=0.25),
+        pytest.approx(6066.0, abs=0.25),
+    ]
+
+
 def test_a_row_without_a_timestamp_falls_back_to_the_request_anchor(monkeypatch):
     seen: list = []
 
