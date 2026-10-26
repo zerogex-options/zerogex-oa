@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode
 from zoneinfo import ZoneInfo
@@ -286,6 +286,10 @@ def _parse_asof(raw: str) -> Optional[datetime]:
 # Fields a time-series row carries its own instant in, most specific first.
 _ROW_TS_FIELDS = ("timestamp", "bucket_ts", "frame_ts", "ts", "date")
 
+# The CME equity-index trading day rolls at the 18:00 ET reopen: anything
+# stamped from then on belongs to the NEXT session.
+_FUTURES_SESSION_ROLL_ET = time(18, 0)
+
 
 def _row_anchor(row: Any) -> Optional[datetime]:
     """The basis anchor for one row of a series, or None if it carries no time.
@@ -297,6 +301,15 @@ def _row_anchor(row: Any) -> Optional[datetime]:
     within one session it moves ~0.003% — about 0.2 points on ES, which rounds
     away against the 0.25 tick. The months-scale drift this exists to remove is
     two orders of magnitude larger.
+
+    The session is the futures trading day, which rolls at the 18:00 ET
+    reopen, not the ET calendar date. ``timeframe=1day`` buckets are labeled
+    with midnight on the database's UTC clock, which is 20:00 ET (19:00 in
+    winter) the evening BEFORE the session the bucket holds. Read as an ET
+    date, every daily row took the previous session's basis: one day of
+    carry, about 4 points high on NQ. A row genuinely stamped in the evening
+    takes the next session's basis too, which is the trading day CME assigns
+    it to.
     """
     if not isinstance(row, dict):
         return None
@@ -306,7 +319,10 @@ def _row_anchor(row: Any) -> Optional[datetime]:
             continue
         parsed = _parse_asof(raw)
         if parsed is not None:
-            session = parsed.astimezone(ET).date()
+            local = parsed.astimezone(ET)
+            session = local.date()
+            if local.time() >= _FUTURES_SESSION_ROLL_ET:
+                session += timedelta(days=1)
             return datetime.combine(session, time(16, 0), tzinfo=ET).astimezone(timezone.utc)
     return None
 

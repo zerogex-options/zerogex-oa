@@ -17,10 +17,13 @@ import json
 import logging
 import math
 import statistics
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 from zoneinfo import ZoneInfo
+
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 
 from src.opening_range import OPENING_RANGE_SQL, opening_range_from_row, opening_range_window
 from src.symbols import is_cash_index
@@ -760,7 +763,14 @@ def _fetch_signal_state(
     * ``signal_scores`` — the MSI composite, its regime label, and the
       component payloads the playbook's MSI gates read.
     * ``signal_component_scores`` — one row per basic/advanced component,
-      ``DISTINCT ON`` the freshest per name.
+      the freshest per name. Not ``DISTINCT ON (component_name)``: without a
+      skip scan that reads and sorts every row the underlying has ever
+      written (~1 row/s/component), so its cost grew with the table on every
+      snapshot. Instead a recursive CTE walks the distinct names off
+      ``idx_signal_component_scores_component`` and a LATERAL ``LIMIT 1``
+      per name hits ``idx_signal_component_scores_component_underlying_ts``:
+      a few index probes per component, whatever the table's size. A name
+      with no row for this underlying by ``as_of`` yields nothing, as before.
 
     This is the bridge that lets a bot implement a *validated pattern's*
     thesis honestly: the pattern gates on measured signal scores, so the bot
@@ -813,11 +823,29 @@ def _fetch_signal_state(
         cur.execute("SAVEPOINT tw_components")
         cur.execute(
             """
-            SELECT DISTINCT ON (component_name)
-                   component_name, clamped_score, context_values
-            FROM signal_component_scores
-            WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
-            ORDER BY component_name, timestamp DESC
+            WITH RECURSIVE names(component_name) AS (
+                SELECT MIN(component_name) FROM signal_component_scores
+                UNION ALL
+                SELECT (
+                    SELECT MIN(s.component_name)
+                    FROM signal_component_scores s
+                    WHERE s.component_name > names.component_name
+                )
+                FROM names
+                WHERE names.component_name IS NOT NULL
+            )
+            SELECT n.component_name, latest.clamped_score, latest.context_values
+            FROM names n
+            CROSS JOIN LATERAL (
+                SELECT s.clamped_score, s.context_values
+                FROM signal_component_scores s
+                WHERE s.component_name = n.component_name
+                  AND s.underlying = %s
+                  AND s.timestamp <= COALESCE(%s::timestamptz, NOW())
+                ORDER BY s.timestamp DESC
+                LIMIT 1
+            ) latest
+            ORDER BY n.component_name
             """,
             (underlying, as_of),
         )
@@ -922,7 +950,73 @@ def _fetch_opening_range(
     return opening_range if opening_range is not None else (None, None)
 
 
+@contextmanager
+def _snapshot_transaction(conn: Any) -> Iterator[None]:
+    """Bound the snapshot's reads to a transaction of their own, where possible.
+
+    A snapshot is ~30 reads across underlying_quotes, gex_summary,
+    signal_component_scores and friends, and every table it reads stays
+    share-locked until the transaction ends. Left to the caller, that
+    transaction ran for as long as the caller kept the connection: the
+    engine tick shared one across every underlying, and a replay loop shared
+    one across every step of the run. On 14 Oct an 80-minute transaction
+    like that held underlying_quotes, so `make schema-apply`'s ALTER queued
+    behind it and every quote reader and the ingestion INSERTs queued behind
+    the ALTER.
+
+    * Connection idle (no transaction open): the snapshot's transaction is
+      ours, and it is ended on the way out.
+    * Autocommit connection (the backtest worker's): switched to a
+      transaction for the snapshot and restored after. Each read's SAVEPOINT
+      needs a transaction block; under autocommit every one of them errored
+      and the MSI, component, bias and opening-range fields came back empty.
+    * Caller already inside a transaction: left alone. That transaction is
+      the caller's to end, and a replay loop that wants bounded transactions
+      ends its own between steps.
+
+    The snapshot is read-only, so ending its transaction with a rollback
+    loses nothing and also clears an aborted state.
+    """
+    autocommit = getattr(conn, "autocommit", None) is True
+    if autocommit:
+        owned = True
+    else:
+        try:
+            owned = conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+        except Exception:  # not a psycopg2 connection (test doubles)
+            owned = False
+    if not owned:
+        yield
+        return
+    if autocommit:
+        conn.autocommit = False
+    try:
+        yield
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            logger.debug("build_snapshot: rollback failed", exc_info=True)
+        if autocommit:
+            try:
+                conn.autocommit = True
+            except Exception:
+                logger.debug("build_snapshot: could not restore autocommit", exc_info=True)
+
+
 def build_snapshot(
+    conn: Any, underlying: str, as_of: Optional[datetime] = None
+) -> Optional[MarketSnapshot]:
+    """Build the ``MarketSnapshot`` for ``underlying`` from the DB.
+
+    Runs in a transaction of its own when the connection has none open; see
+    :func:`_snapshot_transaction`.
+    """
+    with _snapshot_transaction(conn):
+        return _build_snapshot(conn, underlying, as_of)
+
+
+def _build_snapshot(
     conn: Any, underlying: str, as_of: Optional[datetime] = None
 ) -> Optional[MarketSnapshot]:
     """Build the ``MarketSnapshot`` for ``underlying`` from the DB.

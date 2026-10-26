@@ -800,6 +800,11 @@ def run_fleet_backtest(
     try:
         for i, t in enumerate(steps):
             _CLOCK["now"] = t
+            # End the previous step's reads (the runners' quote lookups) so
+            # no transaction outlives a step and each snapshot gets its own.
+            # The replay is read-only; a run spanning days must not hold
+            # share locks on the live tables for its whole duration.
+            conn.rollback()
             snaps = {u: build_snapshot(conn, u, as_of=t) for u in needed}
             if any(v is not None for v in snaps.values()):
                 priced_steps += 1

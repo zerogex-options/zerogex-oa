@@ -3835,6 +3835,9 @@ CREATE TABLE IF NOT EXISTS wall_alert_rules (
     -- {"in_app": bool, "email": bool, "sms": bool}; see src/alerts/config.py CHANNELS.
     channels            JSONB        NOT NULL DEFAULT '{"in_app": true}'::jsonb,
     enabled             BOOLEAN      NOT NULL DEFAULT TRUE,
+    -- A "today only" alert: the last session (ET trading date) it runs in.
+    -- NULL = every session until the member pauses or deletes it.
+    expires_on          DATE,
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     last_triggered_at   TIMESTAMPTZ,
@@ -3972,3 +3975,9 @@ BEGIN
             PRIMARY KEY (underlying, profile, touch_bp);
     END IF;
 END $$;
+
+-- "Today only" alerts (2026-10): installs created before them get the column.
+-- Apply BEFORE restarting the API and the wall-alerts service, or rule reads
+-- and the fan-out fail against the old shape. Existing rules stay NULL: on
+-- every day, as they always were.
+ALTER TABLE wall_alert_rules ADD COLUMN IF NOT EXISTS expires_on DATE;

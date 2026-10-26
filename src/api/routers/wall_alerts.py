@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
@@ -43,6 +43,7 @@ from src.api import wall_alert_stream as stream
 from src.api.database import DatabaseManager
 from src.api.identity import ANONYMOUS, current_identity, resolve_end_user
 from src.api.security import require_admin
+from src.market_calendar import ET, is_trading_session, regular_session_close
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,42 @@ def channel_available(channel: str) -> bool:
     if channel == "sms":
         return alerts_config.SMS_ENABLED
     return True
+
+
+# ---------------------------------------------------------------------------
+# "Today only"
+# ---------------------------------------------------------------------------
+
+
+def today_only_session(now: datetime) -> date:
+    """The session a "today only" alert set at ``now`` runs in.
+
+    Today's, until its close. After the close, or on a weekend or holiday,
+    the next session's: an alert set on Friday evening is for Monday, not for
+    a day that has already ended.
+    """
+    now_et = now.astimezone(ET)
+    day = now_et.date()
+    if is_trading_session(day) and now_et.time() < regular_session_close(day):
+        return day
+    # Bounded, as in freshness.next_session_close_after.
+    for _ in range(10):
+        day += timedelta(days=1)
+        if is_trading_session(day):
+            break
+    return day
+
+
+def session_close(day: date) -> datetime:
+    """When the regular session on ``day`` closes (13:00 ET on a half day)."""
+    close = regular_session_close(day)
+    return ET.localize(datetime(day.year, day.month, day.day, close.hour, close.minute)).astimezone(
+        timezone.utc
+    )
+
+
+def _current_session() -> date:
+    return today_only_session(datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
@@ -218,13 +255,20 @@ def validate_rule(body: Dict[str, Any], *, partial: bool = False) -> Dict[str, A
         if not isinstance(enabled, bool):
             raise _bad("enabled must be true or false")
         out["enabled"] = enabled
+    if "today_only" in body or not partial:
+        today_only = body.get("today_only", False)
+        if not isinstance(today_only, bool):
+            raise _bad("today_only must be true or false")
+        out["today_only"] = today_only
     if partial and not out:
         raise _bad("nothing to update")
     return out
 
 
-def _rule_out(row: Any) -> Dict[str, Any]:
+def _rule_out(row: Any, session: date) -> Dict[str, Any]:
+    """A rule as the API serves it; ``session`` is :func:`_current_session`."""
     channels = _json(row["channels"])
+    expires_on = row["expires_on"]
     return {
         "id": int(row["id"]),
         "symbol": row["underlying"],
@@ -235,6 +279,13 @@ def _rule_out(row: Any) -> Dict[str, Any]:
         "touch_bp": None if row["touch_bp"] is None else int(row["touch_bp"]),
         "channels": {k: bool(channels.get(k, False)) for k in alerts_config.CHANNELS},
         "enabled": bool(row["enabled"]),
+        # "Today only": the last session the rule runs in and when it closes.
+        # ``ended`` once that close has passed; turning the rule back on (or
+        # saving it with today_only) runs it for the next session again.
+        "today_only": expires_on is not None,
+        "expires_on": expires_on.isoformat() if expires_on is not None else None,
+        "ends_at": _iso(session_close(expires_on)) if expires_on is not None else None,
+        "ended": expires_on is not None and expires_on < session,
         "created_at": _iso(row["created_at"]),
         "updated_at": _iso(row["updated_at"]),
         "last_triggered_at": _iso(row["last_triggered_at"]),
@@ -243,7 +294,7 @@ def _rule_out(row: Any) -> Dict[str, Any]:
 
 _RULE_COLUMNS = (
     "id, underlying, side, events, min_strength_pctile, profile, touch_bp, channels, "
-    "enabled, created_at, updated_at, last_triggered_at"
+    "enabled, expires_on, created_at, updated_at, last_triggered_at"
 )
 
 
@@ -255,6 +306,7 @@ _RULE_COLUMNS = (
 @router.get("/config")
 async def wall_alert_config() -> Dict[str, Any]:
     """Everything the alert form is built from."""
+    session = _current_session()
     return {
         "symbols": list(alerts_config.symbols()),
         "sides": list(SIDES),
@@ -277,6 +329,9 @@ async def wall_alert_config() -> Dict[str, Any]:
         "max_rules": alerts_config.MAX_RULES_PER_USER,
         "daily_cap": alerts_config.DAILY_CAP_PER_USER,
         "session": "regular",
+        # The session a "today only" alert saved now would run in, and its
+        # close: today's until the close, then the next session's.
+        "today_only": {"session": session.isoformat(), "ends_at": _iso(session_close(session))},
     }
 
 
@@ -298,7 +353,8 @@ async def list_rules(request: Request, db: DatabaseManager = Depends(get_db)) ->
             """,
             user,
         )
-    return {"rules": [_rule_out(r) for r in rows], "signed_in": True}
+    session = _current_session()
+    return {"rules": [_rule_out(r, session) for r in rows], "signed_in": True}
 
 
 @router.post("/rules", status_code=201)
@@ -309,6 +365,7 @@ async def create_rule(
 ) -> Dict[str, Any]:
     user = _require_user(request)
     rule = validate_rule(body)
+    session = _current_session()
     async with db.pool.acquire() as conn:
         count = await conn.fetchval(
             "SELECT COUNT(*) FROM wall_alert_rules WHERE end_user = $1", user
@@ -323,8 +380,8 @@ async def create_rule(
             f"""
             INSERT INTO wall_alert_rules
                 (end_user, underlying, side, events, min_strength_pctile, profile,
-                 channels, enabled, touch_bp)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8, $9)
+                 channels, enabled, touch_bp, expires_on)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8, $9, $10)
             RETURNING {_RULE_COLUMNS}
             """,
             user,
@@ -336,8 +393,9 @@ async def create_rule(
             json.dumps(rule["channels"]),
             rule["enabled"],
             rule["touch_bp"],
+            session if rule["today_only"] else None,
         )
-    return {"rule": _rule_out(row)}
+    return {"rule": _rule_out(row, session)}
 
 
 @router.patch("/rules/{rule_id}")
@@ -361,10 +419,25 @@ async def update_rule(
         "channels": ("channels", "jsonb"),
         "enabled": ("enabled", None),
     }
+    session = _current_session()
     for key, value in patch.items():
+        if key == "today_only":
+            # Saving a today-only rule (re)arms it for the session it would
+            # run in now; switching it off makes it an every-day rule.
+            args.append(session if value else None)
+            sets.append(f"expires_on = ${len(args)}::date")
+            continue
         column, cast = columns[key]
         args.append(json.dumps(value) if cast == "jsonb" else value)
         sets.append(f"{column} = ${len(args)}{'::jsonb' if cast else ''}")
+    if patch.get("enabled") is True and "today_only" not in patch:
+        # Turning an ended today-only rule back on runs it for the next
+        # session; an every-day rule (NULL) and a live one are left alone.
+        args.append(session)
+        n = len(args)
+        sets.append(
+            f"expires_on = CASE WHEN expires_on < ${n}::date THEN ${n}::date ELSE expires_on END"
+        )
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
@@ -381,7 +454,7 @@ async def update_rule(
             # Switching a channel off — or the whole rule — must stop mail that
             # already queued from it, not only future events.
             cancelled = await _cancel_queued_for_rule(conn, row)
-    return {"rule": _rule_out(row), "cancelled_queued": cancelled}
+    return {"rule": _rule_out(row, session), "cancelled_queued": cancelled}
 
 
 async def _cancel_queued_for_rule(conn: Any, row: Any) -> int:
@@ -855,7 +928,7 @@ async def stream_events(
 
 @router.get("/internal/queued", dependencies=_INTERNAL_GATE)
 async def internal_queued(
-    channel: str = Query(..., pattern="^(email|sms)$"),
+    channel: str = Query(..., pattern="^(email|webhook|sms)$"),
     limit: int = Query(default=200, ge=1, le=1000),
     max_age_seconds: int = Query(default=DEFAULT_QUEUE_MAX_AGE_SECONDS, ge=60, le=86400),
     db: DatabaseManager = Depends(get_db),
@@ -999,7 +1072,7 @@ async def internal_disable_channel(
     if not isinstance(end_user, str) or not end_user.strip():
         raise _bad("end_user is required")
     if channel not in alerts_config.CHANNELS or channel == "in_app":
-        raise _bad("channel must be email or sms")
+        raise _bad("channel must be email, webhook or sms")
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             rules = await conn.execute(

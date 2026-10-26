@@ -11,7 +11,7 @@ mounted — in particular that the outbox is admin-gated and never mirrored to
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -174,6 +174,16 @@ def test_targets_dedupe_per_member_and_channel_and_honor_the_floor():
     assert filtered == 1 and capped == []
 
 
+def test_a_webhook_is_queued_for_its_worker_like_email():
+    from src.alerts import config as alerts_config
+    from src.alerts.wall_store import deliverable_channels
+
+    assert alerts_config.CHANNELS["webhook"] == "queued"
+    assert "webhook" in deliverable_channels()
+    rule = _validate({"symbol": "SPY", "side": "put", "channels": {"webhook": True}})
+    assert rule["channels"] == {"in_app": False, "email": False, "webhook": True, "sms": False}
+
+
 def test_unknown_strength_only_reaches_rules_without_a_floor():
     rules = [(1, "alice", {"in_app": True}, 0), (2, "bob", {"in_app": True}, 25)]
     targets, filtered, _ = select_targets(
@@ -210,8 +220,9 @@ def test_a_minimal_rule_gets_the_defaults():
         "min_strength_pctile": 0,
         "profile": "balanced",
         "touch_bp": None,
-        "channels": {"in_app": True, "email": False, "sms": False},
+        "channels": {"in_app": True, "email": False, "webhook": False, "sms": False},
         "enabled": True,
+        "today_only": False,
     }
 
 
@@ -251,6 +262,7 @@ def test_any_other_touch_tolerance_is_refused(raw):
         ({"symbol": "SPY", "side": "call", "min_strength_pctile": "high"}, "number"),
         ({"symbol": "SPY", "side": "call", "min_strength_pctile": -5}, "0 to 95"),
         ({"symbol": "SPY", "side": "call", "enabled": "yes"}, "true or false"),
+        ({"symbol": "SPY", "side": "call", "today_only": 1}, "today_only must be true or false"),
     ],
 )
 def test_bad_rules_are_refused_with_a_reason(body, needle):
@@ -270,9 +282,90 @@ def test_sms_is_accepted_once_the_flag_is_on(monkeypatch):
 
 def test_a_patch_validates_only_what_it_carries():
     assert _validate({"enabled": False}, partial=True) == {"enabled": False}
+    assert _validate({"today_only": True}, partial=True) == {"today_only": True}
     assert _validate({"min_strength_pctile": 74.6}, partial=True) == {"min_strength_pctile": 75}
     with pytest.raises(HTTPException):
         _validate({}, partial=True)
+
+
+# --------------------------------------------------------------------------
+# "Today only"
+# --------------------------------------------------------------------------
+
+
+def _et(*args: int) -> datetime:
+    from zoneinfo import ZoneInfo
+
+    return datetime(*args, tzinfo=ZoneInfo("America/New_York"))
+
+
+@pytest.mark.parametrize(
+    "now,session",
+    [
+        (_et(2026, 10, 23, 10, 0), date(2026, 10, 23)),  # Friday, in session
+        (_et(2026, 10, 23, 15, 59), date(2026, 10, 23)),
+        # From the close on, "today" has ended: the next session is Monday.
+        (_et(2026, 10, 23, 16, 0), date(2026, 10, 26)),
+        (_et(2026, 10, 24, 12, 0), date(2026, 10, 26)),  # Saturday
+        (_et(2026, 10, 26, 7, 0), date(2026, 10, 26)),  # Monday, before the open
+        (datetime(2026, 10, 23, 20, 30, tzinfo=timezone.utc), date(2026, 10, 26)),  # 16:30 ET
+    ],
+)
+def test_today_only_is_the_session_the_alert_will_next_run_in(now, session):
+    from src.api.routers.wall_alerts import today_only_session
+
+    assert today_only_session(now) == session
+
+
+def test_today_only_skips_holidays_and_honors_half_days(monkeypatch):
+    from src import market_calendar
+    from src.api.routers.wall_alerts import session_close, today_only_session
+
+    monkeypatch.setattr(market_calendar, "NYSE_HOLIDAYS", {date(2026, 11, 26)})
+    monkeypatch.setattr(market_calendar, "NYSE_HALF_DAYS", {date(2026, 11, 27)})
+    # Wednesday evening before Thanksgiving: Friday's half day is next.
+    assert today_only_session(_et(2026, 11, 25, 17, 0)) == date(2026, 11, 27)
+    # The half day closes at 13:00, so by 13:30 it is Monday's turn.
+    assert today_only_session(_et(2026, 11, 27, 12, 59)) == date(2026, 11, 27)
+    assert today_only_session(_et(2026, 11, 27, 13, 30)) == date(2026, 11, 30)
+    assert session_close(date(2026, 11, 27)) == datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc)
+    assert session_close(date(2026, 10, 23)) == datetime(2026, 10, 23, 20, 0, tzinfo=timezone.utc)
+
+
+def _rule_row(expires_on):
+    now = datetime(2026, 10, 23, 14, 0, tzinfo=timezone.utc)
+    return {
+        "id": 1,
+        "underlying": "SPY",
+        "side": "put",
+        "events": {"hit": True, "break": True, "hold": False},
+        "min_strength_pctile": 0,
+        "profile": "balanced",
+        "touch_bp": None,
+        "channels": {"in_app": True},
+        "enabled": True,
+        "expires_on": expires_on,
+        "created_at": now,
+        "updated_at": now,
+        "last_triggered_at": None,
+    }
+
+
+def test_a_today_only_rule_reports_when_it_ends_and_whether_it_has():
+    from src.api.routers.wall_alerts import _rule_out
+
+    friday, monday = date(2026, 10, 23), date(2026, 10, 26)
+    live = _rule_out(_rule_row(friday), friday)
+    assert (live["today_only"], live["expires_on"], live["ended"]) == (True, "2026-10-23", False)
+    assert live["ends_at"] == "2026-10-23T20:00:00+00:00"
+    assert _rule_out(_rule_row(friday), monday)["ended"] is True
+    every_day = _rule_out(_rule_row(None), monday)
+    assert (every_day["today_only"], every_day["expires_on"], every_day["ends_at"]) == (
+        False,
+        None,
+        None,
+    )
+    assert every_day["ended"] is False
 
 
 # --------------------------------------------------------------------------
@@ -387,9 +480,11 @@ def test_config_is_served_without_a_database(app_module):
     assert {c["id"]: c["available"] for c in cfg["channels"]} == {
         "in_app": True,
         "email": True,
+        "webhook": True,
         "sms": False,
     }
     assert cfg["max_strength_floor"] == 95
+    assert set(cfg["today_only"]) == {"session", "ends_at"}
     assert cfg["touch_options_bp"] == [1, 5, 10, 25]
     assert {p["name"]: p["touch_bp"] for p in cfg["profiles"]} == {
         "responsive": 8,

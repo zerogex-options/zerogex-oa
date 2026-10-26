@@ -132,10 +132,20 @@ yet, or a nightly refresh that has not run).
 
 | Table | Holds |
 |---|---|
-| `wall_alert_rules` | Each member's alerts: symbol, side, events, strength floor, profile, touch tolerance (NULL = Auto), channels, enabled. |
+| `wall_alert_rules` | Each member's alerts: symbol, side, events, strength floor, profile, touch tolerance (NULL = Auto), channels, enabled, and `expires_on` (a today-only alert's last session; NULL = every day). |
 | `wall_alert_events` | Every event, unique on `(symbol, session, profile, touch, side, wall, test, kind)`, so re-running a tape is a no-op. `payload` is everything a channel renders (`wall_payload.py`). Rows from before touch tolerance carry `touch_bp` 0. |
 | `wall_alert_deliveries` | The outbox, unique per `(event, member, channel)`. `in_app` rows are born `sent` (the feed is the delivery, with server-side `read_at`); `email` / `sms` rows are born `queued`. |
 | `wall_alert_detector_state` | Per-stream (symbol, profile, touch) detector state, rewritten when it changes (≥ once a minute in session — the heartbeat). |
+
+A rule runs every trading day until the member pauses or deletes it. A
+**today-only** rule carries the one session it runs in (`expires_on`, an ET
+trading date): today's until the close, else the next session's, so one saved
+on Friday evening is for Monday (`today_only_session` in the router, from
+`src/market_calendar.py`). The fan-out matches it only for events of that
+session or earlier (`expires_on >= session_date`), which is exact: an event
+recorded a few seconds after the close for its last minute still belongs to
+that session. An ended rule is kept, shown as ended, and turning it back on
+re-arms it for the next session.
 
 An event and its deliveries are written in one transaction, and the detector's
 in-memory state is rewound if that write fails, so an alert is never recorded
@@ -157,6 +167,22 @@ without its deliveries, never lost, and never sent twice.
   send before marking it, so a mark that fails is retried as a mark, never as
   a second email. It reports its own failures at most hourly (an unreachable
   outbox only after 5 minutes), because the timer fires every 20 seconds.
+* **Discord / Slack** (`webhook`) — the member's own channel, through an
+  incoming-webhook address they paste on `/account/alerts`. The address is a
+  secret, so it lives with the account on the website (the
+  `wall_alert_webhooks` table in the auth DB, never sent back to a browser),
+  and this side only queues `webhook` rows. The website accepts only
+  `https://discord.com/api/webhooks/…` and `https://hooks.slack.com/services/…`
+  (no other host, port or redirect, so a member cannot aim the server at
+  anything else), and posts a test message before saving one.
+  `frontend/scripts/wall-alerts-webhooks.mts`, on its own 20-second timer so a
+  Discord outage never holds up email, posts up to 10 alerts per message with
+  the email's wording, under the same rules as email (Basic and up, not
+  deleted, sent-ledger before the mark). A 401 / 403 / 404 / 410 means the
+  webhook was deleted or revoked: the rows fail, the address is marked broken
+  and the page asks the member for a new one; until then their rows are
+  cancelled instead of posted to a dead address. 429, 5xx and network errors
+  retry on the next pass.
 
 The queue endpoints re-check opt-in at delivery time: a row whose rule was
 deleted, disabled or had the channel switched off is cancelled, never sent.

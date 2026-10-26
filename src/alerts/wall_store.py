@@ -351,6 +351,7 @@ def record_and_fan_out(
 
     # The rules listening to this event's stream: same profile, and a touch
     # tolerance that resolves to the stream's (Auto = the profile's own band).
+    # A "today only" rule hears its own session and none after it.
     cur.execute(
         """
         SELECT id, end_user, channels, min_strength_pctile
@@ -361,6 +362,7 @@ def record_and_fan_out(
           AND COALESCE(touch_bp, %s) = %s
           AND side IN (%s, 'both')
           AND COALESCE((events ->> %s)::boolean, false)
+          AND (expires_on IS NULL OR expires_on >= %s)
         ORDER BY id
         """,
         (
@@ -370,6 +372,7 @@ def record_and_fan_out(
             event.touch_bp,
             event.side,
             event.kind,
+            event.session_date,
         ),
     )
     rules = cur.fetchall()

@@ -1479,10 +1479,14 @@ What the alert form is built from: `symbols`, `sides`, `events`
 its own `touch_bp`), `default_profile`, `touch_options_bp` (the touch
 tolerances a rule may choose), `channels` (`{id, available, delivery}` — SMS reads
 `available: false` until it is switched on), `strength_tiers`,
-`max_strength_floor` (95), `max_rules`, `daily_cap`.
+`max_strength_floor` (95), `max_rules`, `daily_cap`, and `today_only`
+(`{session, ends_at}`: the session a today-only rule saved now would run in,
+and its close).
 
 ### GET /api/alerts/walls/rules
-The caller's rules, oldest first.
+The caller's rules, oldest first. Each carries the fields below plus
+`today_only`, `expires_on` (its last session, or `null`), `ends_at` (that
+session's close) and `ended` (that close has passed).
 
 ### POST /api/alerts/walls/rules
 Create a rule. `422` with a readable `detail` on a bad field; `409` past the
@@ -1496,8 +1500,9 @@ per-member limit.
   "min_strength_pctile": 75,
   "profile": "balanced",
   "touch_bp": null,
-  "channels": {"in_app": true, "email": true, "sms": false},
-  "enabled": true
+  "channels": {"in_app": true, "email": true, "webhook": false, "sms": false},
+  "enabled": true,
+  "today_only": false
 }
 ```
 
@@ -1510,10 +1515,19 @@ per-member limit.
 - `touch_bp` — how close price must come to the wall for a hit, in basis
   points of the wall: one of `touch_options_bp` (1, 5, 10, 25 = 0.01%–0.25%),
   or `null` for Auto, the profile's own band (8 / 5 / 3 bp).
+- `channels` — `in_app` (the header bell), `email`, `webhook` (the member's
+  Discord or Slack channel; the address is set on the website, not here) and
+  `sms` (refused until it is switched on).
+- `today_only` — `false` (default): the rule runs every trading day until it
+  is paused or deleted. `true`: it runs for one session and then stops: today's
+  until the close (13:00 ET on a half day), otherwise the next session's, so a
+  rule saved on Friday evening is for Monday. An ended rule is kept.
 
 ### PATCH /api/alerts/walls/rules/{rule_id}
 Partial update with the same fields. Switching a channel (or the rule) off
-also cancels that rule's not-yet-sent queued alerts on it.
+also cancels that rule's not-yet-sent queued alerts on it. `today_only: true`
+(re)arms the rule for the session it would run in now, and `enabled: true` on
+an ended today-only rule does the same; other edits leave an ended rule ended.
 
 ### DELETE /api/alerts/walls/rules/{rule_id}
 Delete a rule and cancel its queued alerts.
@@ -1626,7 +1640,7 @@ curl -N -H "Authorization: Bearer $ZEROGEX_API_KEY" \
 ```
 
 ### Internal (delivery workers)
-- `GET /api/alerts/walls/internal/queued?channel=email|sms&limit=&max_age_seconds=` —
+- `GET /api/alerts/walls/internal/queued?channel=email|webhook|sms&limit=&max_age_seconds=` —
   expires queued rows older than `max_age_seconds` (default 1200), cancels rows
   whose rule was deleted, disabled or had the channel switched off, then
   returns what is left, oldest first.
