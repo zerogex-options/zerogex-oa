@@ -763,7 +763,14 @@ def _fetch_signal_state(
     * ``signal_scores`` — the MSI composite, its regime label, and the
       component payloads the playbook's MSI gates read.
     * ``signal_component_scores`` — one row per basic/advanced component,
-      ``DISTINCT ON`` the freshest per name.
+      the freshest per name. Not ``DISTINCT ON (component_name)``: without a
+      skip scan that reads and sorts every row the underlying has ever
+      written (~1 row/s/component), so its cost grew with the table on every
+      snapshot. Instead a recursive CTE walks the distinct names off
+      ``idx_signal_component_scores_component`` and a LATERAL ``LIMIT 1``
+      per name hits ``idx_signal_component_scores_component_underlying_ts``:
+      a few index probes per component, whatever the table's size. A name
+      with no row for this underlying by ``as_of`` yields nothing, as before.
 
     This is the bridge that lets a bot implement a *validated pattern's*
     thesis honestly: the pattern gates on measured signal scores, so the bot
@@ -816,11 +823,29 @@ def _fetch_signal_state(
         cur.execute("SAVEPOINT tw_components")
         cur.execute(
             """
-            SELECT DISTINCT ON (component_name)
-                   component_name, clamped_score, context_values
-            FROM signal_component_scores
-            WHERE underlying = %s AND timestamp <= COALESCE(%s::timestamptz, NOW())
-            ORDER BY component_name, timestamp DESC
+            WITH RECURSIVE names(component_name) AS (
+                SELECT MIN(component_name) FROM signal_component_scores
+                UNION ALL
+                SELECT (
+                    SELECT MIN(s.component_name)
+                    FROM signal_component_scores s
+                    WHERE s.component_name > names.component_name
+                )
+                FROM names
+                WHERE names.component_name IS NOT NULL
+            )
+            SELECT n.component_name, latest.clamped_score, latest.context_values
+            FROM names n
+            CROSS JOIN LATERAL (
+                SELECT s.clamped_score, s.context_values
+                FROM signal_component_scores s
+                WHERE s.component_name = n.component_name
+                  AND s.underlying = %s
+                  AND s.timestamp <= COALESCE(%s::timestamptz, NOW())
+                ORDER BY s.timestamp DESC
+                LIMIT 1
+            ) latest
+            ORDER BY n.component_name
             """,
             (underlying, as_of),
         )
