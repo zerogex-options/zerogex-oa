@@ -1,6 +1,6 @@
 # GA Settings Guide
 
-*For the ZeroGexGoat version of October 25, 2026. Confidential: this
+*For the ZeroGexGoat version of October 26, 2026. Confidential: this
 describes Jim Edwards' GOAT method.*
 
 ## Before you change anything
@@ -18,6 +18,12 @@ describes Jim Edwards' GOAT method.*
   setting change does.
 - **If the strategy label at the top of the chart starts with (D), GA is off**
   on that chart and shows no trades at all.
+- **Switch GA on only when the account is flat on that instrument.** GA
+  trades as if the account holds nothing but its own trades. It also waits
+  for the trades it replays from the chart to finish before it trades live,
+  even if Start behavior says "Immediately submit": on October 23 that
+  setting sent a replayed trade's stops to your account and left it 6
+  contracts short.
 - **The stochastic settings must match the jeStochastics on the same chart.**
   GA works out bar colors with its own copy of that math. If the numbers
   differ, GA sees different colors than you do.
@@ -121,7 +127,7 @@ Off until you tick the first setting.
 |---|---|
 | Require pumpkin in sync (off = ignore it) | When ticked, GA skips a trade when the pumpkin is flat or curling against it, unless there is room (last setting). |
 | Pumpkin: HMA period | Match it to the pumpkin on your chart: 80 on your latest charts. |
-| Pumpkin: slope lookback (bars) | How many bars back GA measures the pumpkin's direction. Short means it reacts quickly to a curl. Default 5. |
+| Pumpkin: slope lookback (bars) | How many bars back GA measures the pumpkin's direction: it compares the pumpkin now with this many bars ago. Short reacts quickly to a curl; long is steadier but slower to notice one. At 10, a pumpkin that topped out three bars ago can still count as rising. Default 5. |
 | Pumpkin: min slope over lookback (ticks; less is flat) | How much the pumpkin must move over the lookback to count as heading somewhere. Less than this is flat. Default 2. |
 | Pumpkin: room to trade against it (ticks, 0=never) | A trade against a flat or curling pumpkin is still taken when the pumpkin sits at least this far beyond the entry, above a long or below a short. Default 15. 0 means never trade against it. |
 
@@ -181,13 +187,28 @@ turning them on never changes a trade.
 4. **Moving settings between NQ and YM?** Remember a YM tick is four times
    an NQ tick.
 
-## If a stop disappears in a fast market
+## If the market rejects a stop
 
-When price jumps past a stop before GA's change to it arrives, the market
-rejects the change. NinjaTrader then switches GA off, cancels its orders and
-closes its position at market, which can look like a stop vanishing. Check the
-Strategies tab to see whether GA is still enabled, and the Log tab (Control
-Center) for a "rejected" entry at that time.
+GA places a stop as soon as an entry fills, and moves it when a bar closes.
+In a fast market, price can get past the stop level before the order
+arrives, and the market rejects it: a new stop outright, a moved one as
+"Unable to change order." Either way GA closes that lot at market, which is
+what the stop was there to do, and keeps trading. The Log tab (Control
+Center) shows a line starting "ZeroGexGoat: the market rejected", and the
+broker's own rejection message may still pop up.
+
+## If GA switches itself off
+
+Two things still switch GA off. Each first cancels GA's orders and closes
+its position, and the Log tab says which it was:
+
+- **"ZeroGexGoat: an exit overfilled."** A stop and a profit target both
+  filled, leaving an extra contract on the wrong side of the trade. GA
+  closes it at once.
+- **"ZeroGexGoat: ... failed."** Any other order problem, such as an entry
+  while the market is closed or on an expired contract.
+
+Check that the account is flat on that instrument, then re-enable GA.
 
 In the Log, GA's orders carry its names: GOAT1A, GOAT2 and so on, with exits
 named "Stop loss" and "Profit target." Orders named Entry, Stop1 and Target1

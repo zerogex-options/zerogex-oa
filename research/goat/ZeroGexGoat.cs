@@ -111,6 +111,13 @@
 //    lot 1's stop, lot 1 is left to that stop instead of being sent a
 //    separate market exit. Live, the two filling together traded one
 //    contract too many (see ExitTarget1).
+//    A stop the market refuses because price is already past it, newly
+//    placed or moved, closes that lot at market and GA keeps running (see
+//    OnOrderUpdate). Under NinjaTrader's default error handling each one
+//    switched GA off: four times on Jim's demo, 2026-10-23.
+//    A contract left on the wrong side of a trade, when a stop and a target
+//    both fill, closes GA's position and switches GA off (see
+//    OnPositionUpdate).
 //
 //  Jim's second target is also allowed to be a PREDRAWN LEVEL (opening range,
 //  ZeroGEX, Camarilla). That branch is deliberately NOT implemented here: a
@@ -282,6 +289,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 		//: Direction of the trade last entered. A position on the other side
 		//: can only come from an exit that overfilled, never from an entry.
 		private MarketPosition tradeDirection = MarketPosition.Flat;
+		//: Signals whose stop the market refused this trade. Each is already
+		//: being closed at market, so its stop is not moved again and a
+		//: second refusal does not close it twice.
+		private readonly HashSet<string> refusedStops = new HashSet<string>();
+		//: Set once GA has asked NinjaTrader to close it down.
+		private bool stopping;
 
 		//: How each lot enters: one signal for the whole lot, or one per
 		//: target once its targets split it, each with its contracts and
@@ -325,7 +338,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 				StartBehavior = StartBehavior.WaitUntilFlat;
 				TimeInForce = TimeInForce.Gtc;
 				TraceOrders = false;
-				RealtimeErrorHandling = RealtimeErrorHandling.StopCancelClose;
+				// Every order error goes to OnOrderUpdate, which keeps GA
+				// running through a refused stop and stops it for anything
+				// else. StopCancelCloseIgnoreRejects is not enough: it still
+				// switches GA off when a stop MOVE is refused ("Unable to
+				// change order").
+				RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
 				StopTargetHandling = StopTargetHandling.PerEntryExecution;
 				BarsRequiredToTrade = 100;
 				IsInstantiatedOnEachOptimizationIteration = false;
@@ -419,6 +437,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 				int entries = (Lot1IsSplit() ? 3 : 1) + (Lot2IsSplit() ? 3 : 1);
 				if (entries > 2)
 					EntriesPerDirection = Math.Max(EntriesPerDirection, entries);
+
+				// Again here, in case a copy saved by an older version carries
+				// StopCancelClose: with it, a refused stop would switch GA off
+				// before OnOrderUpdate could close the lot.
+				RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
+
+				// "Immediately submit" sends the stops and targets of whatever
+				// trade GA's chart history ends in, as if the account held it.
+				// On Jim's demo, 2026-10-23 13:34, GA was switched on while its
+				// history was 6 long and the account was flat: those stops
+				// filled and left the account 6 short, under every trade GA
+				// took after. Waiting until the history is flat keeps the
+				// account in step with GA.
+				if (StartBehavior == StartBehavior.ImmediatelySubmit)
+					StartBehavior = StartBehavior.WaitUntilFlat;
+				else if (StartBehavior == StartBehavior.ImmediatelySubmitSynchronizeAccount)
+					StartBehavior = StartBehavior.WaitUntilFlatSynchronizeAccount;
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -914,6 +949,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			runExtreme = double.NaN;
 			target1Done = false;
 			breakevenDone = false;
+			refusedStops.Clear();
 		}
 
 		private void ManageOpenPosition()
@@ -1088,13 +1124,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// <summary>
 		/// Move a lot's stop toward <paramref name="target"/>: only ever
 		/// tighter, and never through the market. A sell stop at or above the
-		/// bid (a buy stop at or below the ask) is rejected, and under
-		/// RealtimeErrorHandling.StopCancelClose a rejected order stops the
-		/// strategy and flattens it. Breakeven makes that reachable, since it
-		/// fires on the bar that touched the trigger and price may be back
-		/// through the breakeven level by the close. So the stop goes no closer
-		/// than one tick inside the current price. Nothing is sent when nothing
-		/// would change.
+		/// bid (a buy stop at or below the ask) is refused, and a refused stop
+		/// closes its lot at market (see OnOrderUpdate). Breakeven makes that
+		/// reachable, since it fires on the bar that touched the trigger and
+		/// price may be back through the breakeven level by the close. So the
+		/// stop goes no closer than one tick inside the current price; in a fast
+		/// market price can still pass it before the change arrives. Nothing is
+		/// sent when nothing would change, or for a lot already being closed
+		/// after a refusal.
 		/// </summary>
 		private void MoveStop(ref double current, double target, bool isLong, params string[] fromEntrySignals)
 		{
@@ -1111,7 +1148,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			current = capped;
 			foreach (string signal in fromEntrySignals)
-				SetStopLoss(signal, CalculationMode.Price, capped, false);
+				if (!refusedStops.Contains(signal))
+					SetStopLoss(signal, CalculationMode.Price, capped, false);
 		}
 
 		// --------------------------------------------------------------
@@ -1198,12 +1236,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 		}
 
 		/// <summary>
-		/// Backstop for the race ExitTarget1 guards against. Entries only happen
-		/// when flat and always in tradeDirection, so a position on the other
-		/// side can only be an exit that filled after the stops had already
-		/// closed the trade. Close it at once rather than leave it unprotected:
-		/// no stop is attached to it, and nothing else in this strategy would
-		/// ever exit it before the session close.
+		/// Backstop for the races ExitTarget1 and OnOrderUpdate guard against.
+		/// Entries only happen when flat and always in tradeDirection, so a
+		/// position on the other side can only be an exit that filled after
+		/// the trade was already closed: on Jim's demo, 2026-10-23, lot 1's
+		/// target filled one contract after its stop had, at 08:46 and 11:23.
+		/// No stop is attached to that contract, and an exit order cannot
+		/// close it, since it belongs to no entry: NinjaTrader ignored the one
+		/// GA sent both times, and the contract sat unprotected until Jim
+		/// closed it by hand, the second time nearly two hours later. GA takes
+		/// no new trade while it holds one, either. So CloseStrategy, which
+		/// works from the position itself, closes it and switches GA off, as
+		/// NinjaTrader's own error handling would.
 		/// </summary>
 		protected override void OnPositionUpdate(Cbi.Position position, double averagePrice,
 			int quantity, Cbi.MarketPosition marketPosition)
@@ -1214,14 +1258,94 @@ namespace NinjaTrader.NinjaScript.Strategies
 				|| marketPosition == tradeDirection)
 				return;
 
-			Log(string.Format(
-				"ZeroGexGoat: an exit overfilled and left {0} {1} against a {2} trade. Closing it.",
-				quantity, marketPosition, tradeDirection), LogLevel.Warning);
+			StopGa("Overfill", string.Format("an exit overfilled and left {0} {1} against a {2} trade",
+				quantity, marketPosition, tradeDirection));
+		}
 
-			if (marketPosition == MarketPosition.Short)
-				ExitShort("Overfill");
+		/// <summary>
+		/// Every order error lands here: GA runs with IgnoreAllErrors, so
+		/// NinjaTrader leaves the response to this method.
+		///
+		/// A stop the market refuses because price is already past it. A stop
+		/// is placed just after its entry fills and moved when a bar closes,
+		/// and in a fast market price can be through the level before the order
+		/// gets there. A new stop then comes back Rejected ("the current price
+		/// is outside the price limits"); a move comes back "Unable to change
+		/// order", with the stop left where it was. Either way price has passed
+		/// where GA wanted out, so that lot comes out at market, which is what
+		/// the stop was there to do, and GA keeps trading. On Jim's demo,
+		/// 2026-10-23, NinjaTrader's default handling switched GA off for this
+		/// four times between 09:01 and 10:24 (three new stops, one move), and
+		/// at 10:14 its closing order, sized while lot 1's stop was still
+		/// filling, sold one contract too many and left the account short.
+		///
+		/// Any other error (an entry, a target, an exit, a cancel) closes GA's
+		/// position, cancels its orders and switches it off, as NinjaTrader's
+		/// default handling did.
+		/// </summary>
+		protected override void OnOrderUpdate(Cbi.Order order, double limitPrice, double stopPrice,
+			int quantity, int filled, double averageFillPrice, Cbi.OrderState orderState,
+			DateTime time, Cbi.ErrorCode error, string comment)
+		{
+			if (State != State.Realtime || stopping
+				|| (error == ErrorCode.NoError && orderState != OrderState.Rejected))
+				return;
+
+			if (order.Name == "Stop loss" && IsOwnSignal(order.FromEntrySignal)
+				&& (orderState == OrderState.Rejected || error == ErrorCode.UnableToChangeOrder))
+			{
+				// A move can also fail because the stop has just filled or
+				// been cancelled, and then that lot is already out.
+				if (orderState != OrderState.Filled && orderState != OrderState.Cancelled)
+					CloseRefusedLot(order.FromEntrySignal, order.OrderAction, comment);
+				return;
+			}
+
+			StopGa("Order error", string.Format("{0} failed: {1} ({2})", order.Name, error, comment));
+		}
+
+		/// <summary>Close the lot whose stop the market refused, once per trade.</summary>
+		private void CloseRefusedLot(string signal, OrderAction stopAction, string comment)
+		{
+			if (!refusedStops.Add(signal))
+				return;
+
+			// Lot 1 may already be on its way out on its first opposite
+			// close, and a second exit would sell its contracts twice. Either
+			// way ExitTarget1 must not send one after this.
+			if (signal == "GOAT1")
+			{
+				if (target1Done)
+					return;
+				target1Done = true;
+			}
+
+			Log(string.Format("ZeroGexGoat: the market rejected {0}'s stop ({1}). Closing {0} at market.",
+				signal, comment), LogLevel.Warning);
+
+			if (stopAction == OrderAction.Sell)
+				ExitLong("Stop rejected", signal);
 			else
-				ExitLong("Overfill");
+				ExitShort("Stop rejected", signal);
+		}
+
+		/// <summary>
+		/// Close GA's position, cancel its orders and switch it off, as
+		/// NinjaTrader's default error handling does. Once: updates keep
+		/// arriving while it shuts down.
+		/// </summary>
+		private void StopGa(string signalName, string reason)
+		{
+			if (stopping)
+				return;
+			stopping = true;
+			Log("ZeroGexGoat: " + reason + ". Closing GA's position and switching GA off.", LogLevel.Error);
+			CloseStrategy(signalName);
+		}
+
+		private bool IsOwnSignal(string signal)
+		{
+			return Array.IndexOf(lot1Signals, signal) >= 0 || Array.IndexOf(lot2Signals, signal) >= 0;
 		}
 
 		#region Properties

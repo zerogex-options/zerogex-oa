@@ -31,6 +31,26 @@ namespace NinjaTrader.Cbi
         public double AveragePrice { get; set; }
         public int Quantity { get; set; }
     }
+
+    public enum OrderState
+    {
+        Initialized, Submitted, Accepted, TriggerPending, Working, ChangePending, ChangeSubmitted,
+        CancelPending, CancelSubmitted, Cancelled, PartFilled, Filled, Rejected, Unknown
+    }
+    public enum OrderAction { Buy, BuyToCover, Sell, SellShort }
+    public enum ErrorCode
+    {
+        LoginExpired, LogOnFailed, NoError, OrderRejected, OrderRejectedByRisk, Panic,
+        UnableToCancelOrder, UnableToChangeOrder, UnableToSubmitOrder, UserAbort
+    }
+
+    public class Order
+    {
+        public string Name { get; set; }
+        public string FromEntrySignal { get; set; }
+        public OrderAction OrderAction { get; set; }
+        public OrderState OrderState { get; set; }
+    }
 }
 
 namespace NinjaTrader.Data
@@ -54,9 +74,13 @@ namespace NinjaTrader.NinjaScript
     public enum State { SetDefaults, Configure, DataLoaded, Historical, Realtime, Terminated }
     public enum Calculate { OnBarClose, OnEachTick, OnPriceChange }
     public enum EntryHandling { AllEntries, UniqueEntries }
-    public enum StartBehavior { WaitUntilFlat, ImmediatelySubmit, AdoptAccountPosition }
+    public enum StartBehavior
+    {
+        AdoptAccountPosition, ImmediatelySubmit, ImmediatelySubmitSynchronizeAccount,
+        WaitUntilFlat, WaitUntilFlatSynchronizeAccount
+    }
     public enum TimeInForce { Day, Gtc }
-    public enum RealtimeErrorHandling { StopCancelClose, IgnoreAllErrors, TakeNoAction }
+    public enum RealtimeErrorHandling { StopCancelClose, StopCancelCloseIgnoreRejects, IgnoreAllErrors }
     public enum StopTargetHandling { PerEntryExecution, ByStrategyPosition }
     public enum CalculationMode { Currency, Percent, Pips, Ticks, Price }
 
@@ -182,10 +206,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected virtual void OnPositionUpdate(Position position, double averagePrice,
             int quantity, MarketPosition marketPosition) { }
 
+        protected virtual void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+            int quantity, int filled, double averageFillPrice, OrderState orderState,
+            DateTime time, ErrorCode error, string comment) { }
+
+        public virtual void CloseStrategy(string signalName) { }
+
         protected void EnterLong(int quantity, string signalName) { }
         protected void EnterShort(int quantity, string signalName) { }
         protected void ExitLong(string signalName) { }
         protected void ExitShort(string signalName) { }
+        protected void ExitLong(string signalName, string fromEntrySignal) { }
+        protected void ExitShort(string signalName, string fromEntrySignal) { }
         protected void ExitLong(int quantity, string signalName, string fromEntrySignal) { }
         protected void ExitShort(int quantity, string signalName, string fromEntrySignal) { }
 

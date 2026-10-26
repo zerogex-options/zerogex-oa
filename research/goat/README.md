@@ -85,7 +85,9 @@ lot 1's market exit both filled, so one contract too many traded, leaving
 an unprotected position on the wrong side that looked like a backwards entry.
 `ExitTarget1` now leaves lot 1 to its stop when price is that close to it, and
 `OnPositionUpdate` closes any wrong-side position as a backstop. The compile
-check cannot verify either; only a live sim session can.
+check cannot verify either; only a live sim session can. Jim's demo log of
+2026-10-23 showed the backstop's first version failing: it sent an
+`ExitLong`, NinjaTrader ignored it, and the contract stayed open (see below).
 
 Rules that keep live runs readable:
 
@@ -98,22 +100,47 @@ Rules that keep live runs readable:
   position by hand leaves the strategy still believing it holds one.
 - **To get out of a trade, untick Enabled first,** then flatten from the
   SuperDOM.
-- **A stop that vanishes mid-trade usually means NinjaTrader switched GA
-  off.** Under `RealtimeErrorHandling.StopCancelClose`, a rejected order
-  stops the strategy, cancels its working orders and sends one close order
-  per position. In a fast market a stop change can arrive after price has
-  already passed it and be rejected; lot 2's trailing stop moves the most, so
-  it is the likeliest one. Jim, 2026-10-21: in a news spike, "the first lot
-  was stopped but the second lot's stop disappeared". His Log tab from that
-  moment has been asked for. If it shows the rejection, the fix is to handle
-  rejections in `OnOrderUpdate` (exit that lot at market and keep running),
-  as NinjaTrader support recommends, rather than shutting GA down.
-  The first log he pasted (2026-10-23, 2:11 PM) is not a GA trade: it starts
-  with "Static SuperDOM submitting order with strategy 'Custom - 1'", and the
-  orders are named `Entry` and `Stop1`, which is an ATM strategy. GA's orders
-  carry its signal names (`GOAT1A`, `GOAT2`, ...), and its exits read "Stop
-  loss" and "Profit target". The paste stopped right after `Stop1` was
-  submitted, so the rest of it has been asked for.
+- **A stop the market refuses closes its lot at market, and GA keeps
+  running.** A stop is placed just after its entry fills and moved when a bar
+  closes, and in a fast market price can be through the level before the
+  order arrives. A new stop comes back `Rejected` ("Please check the order
+  price. The current price is outside the price limits set for this
+  product"); a move comes back "Unable to change order" (`InvalidPrice`),
+  with the stop left where it was. Under NinjaTrader's default,
+  `RealtimeErrorHandling.StopCancelClose`, either one switched GA off and
+  flattened it. Jim's full log of 2026-10-23 (NQ, 3 contracts per lot, on
+  his NinjaTrader demo account) has four: new stops at 09:01, 09:59 and
+  10:14, each sent within half a second of the entry fill, and a stop move
+  at 10:24. At 10:14 the default's own close order was sized while lot
+  1's stop was still filling, sold 4 when 3 were left, and left the account
+  1 short; GA was re-enabled on top of it. GA now runs with
+  `IgnoreAllErrors` (set again in Configure, so an older saved copy cannot
+  bring the default back) and answers every error in `OnOrderUpdate`: a
+  refused "Stop loss" exits that entry signal at market, once, and its stop
+  is not moved again; anything else calls `CloseStrategy`, which does what
+  the default did. `StopCancelCloseIgnoreRejects` is not enough, because it
+  still stops the strategy on "Unable to change order".
+- **A contract left against the trade closes GA's position and switches it
+  off.** The same log has lot 1's profit target filling one contract after
+  its stop had filled the lot, at 08:46 and 11:23: NinjaTrader shrank the
+  target to the one contract it thought was left instead of cancelling it.
+  `OnPositionUpdate` logged the overfill and sent `ExitLong("Overfill")`,
+  NinjaTrader never submitted it (most likely because the contract belongs
+  to no entry), and
+  the contract sat unprotected until Jim closed it by hand: 3 minutes the
+  first time, 1 hour 48 minutes the second, during which GA took no trades
+  because it was not flat. The backstop now calls `CloseStrategy`, which
+  closes the position itself and switches GA off.
+- **GA starts live only once its replayed trades are flat.** Jim's copy ran
+  with Start behavior "Immediately submit", which sends the stops and targets
+  of whatever trade the chart's history ends in. At 13:34 he enabled GA while
+  that history held 6 long and the account was flat: the stops filled and
+  left the account 6 short, under every GA trade until he closed it about 3
+  minutes later. Configure now turns either "Immediately submit" choice into
+  its "Wait until flat" counterpart. GA's default was always "Wait until
+  flat", so his saved copy carried the change.
+- His first pasted log was manual ATM trades on another account (orders
+  named `Entry` and `Stop1`), not GA.
 - **A strategy label that starts with (D) means GA is off on that chart.** A
   disabled strategy draws no trades at all, past or present, so a chart in
   that state cannot answer "why didn't it trade here?".
@@ -258,7 +285,7 @@ testable rather than load-bearing — but they are worth settling with him.
    `BreakevenTriggerTicks` moves both stops to entry + `BreakevenPlusTicks`
    once price has gone that far the trade's way, and holds lot 2's trail
    until then. Off at 0. Stops only ever tighten, and are never placed
-   through the market. A rejected stop would stop the strategy. Lot 2 can
+   through the market; one the market refuses anyway closes that lot. Lot 2 can
    also be split over three profit targets in ticks (Jim, 2026-10-19: "The
    three targets for Lot 2 will be ticks for now"); its contracts are shared
    out one at a time starting with target 1, and a target of 0 leaves that
@@ -273,3 +300,12 @@ testable rather than load-bearing — but they are worth settling with him.
    trade's direction, as he measured it on his YM charts, so a pumpkin
    behind price counts as no room and the trade is skipped. He said 18 to 20
    ticks in one email and "15 minimum" on a chart; the default is 15.
+   The slope is a net change over the lookback, so it lags a turn: a
+   pumpkin that topped three bars ago still reads as rising over 10. Jim's
+   "loser against the pumpkin" (2026-10-25) is that case: +5.6 ticks over 10
+   bars against his minimum of 5, but down 0.7 over the last 3. Measured
+   from his screenshots, a second check, "still moving the trade's way over
+   the last 3 bars", would have skipped 3 to 5 of 11 losers and 1 or 2 of 7
+   winners, with most readings within a fraction of a tick of the cutoff.
+   Not built; offered to him. The other losers had a pumpkin still heading
+   the trade's way, which no slope rule can tell from his winners.
