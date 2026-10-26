@@ -307,5 +307,11 @@ testable rather than load-bearing — but they are worth settling with him.
    from his screenshots, a second check, "still moving the trade's way over
    the last 3 bars", would have skipped 3 to 5 of 11 losers and 1 or 2 of 7
    winners, with most readings within a fraction of a tick of the cutoff.
-   Not built; offered to him. The other losers had a pumpkin still heading
-   the trade's way, which no slope rule can tell from his winners.
+   Not built: the settings already do it. Jim, 2026-10-26: "What I look for
+   is the pumpkin and midband slopes to be in sync (heading in the same
+   direction)". His copy then ran a 10-bar lookback, a 2-tick minimum and
+   room 18 on a 3-range NQ chart, and both longs he sent were taken as the
+   pumpkin rolled over, still up 2 ticks over 10 bars. Room 0 with a 3-bar
+   lookback and a 0 or 1 minimum is his rule; the guide's section 7 says
+   so. The other losers had a pumpkin still heading the trade's way, which
+   no slope rule can tell from his winners.

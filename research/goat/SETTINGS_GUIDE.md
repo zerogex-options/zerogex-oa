@@ -139,6 +139,22 @@ pumpkin is flat or falling and sits below price on a long, there is no room by
 this measure, so GA skips that one too. Setting the room at or a little above your breakeven trigger
 matches the idea of reaching breakeven first.
 
+**To trade only when the pumpkin and the midband head the same way.** GA
+already requires the midband to head the trade's way (group 4), so the
+pumpkin settings decide whether the two are in step:
+
+1. Set the room to 0, so GA never trades against a flat or turning pumpkin.
+2. Set the slope lookback to 3, so GA reads the pumpkin's last few bars, the
+   way your eye does. At 10 on a fast chart, a pumpkin that has just rolled
+   over is still higher than it was 10 bars ago, so it counts as rising.
+3. Set the min slope to 0 to start. Over 3 bars that asks only that the
+   pumpkin isn't moving against the trade. If losers still slip through as
+   it tops out, try 1, which asks that it is clearly moving with the trade.
+
+Expect fewer trades, including some winners where the pumpkin pauses. With
+"Label skipped setups" on, every trade this blocks is labeled "pumpkin," so
+you can see what it gives up.
+
 ## 8. Chart labels
 
 | Setting | What it does |
