@@ -17,10 +17,13 @@ import json
 import logging
 import math
 import statistics
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 from zoneinfo import ZoneInfo
+
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 
 from src.opening_range import OPENING_RANGE_SQL, opening_range_from_row, opening_range_window
 from src.symbols import is_cash_index
@@ -922,7 +925,73 @@ def _fetch_opening_range(
     return opening_range if opening_range is not None else (None, None)
 
 
+@contextmanager
+def _snapshot_transaction(conn: Any) -> Iterator[None]:
+    """Bound the snapshot's reads to a transaction of their own, where possible.
+
+    A snapshot is ~30 reads across underlying_quotes, gex_summary,
+    signal_component_scores and friends, and every table it reads stays
+    share-locked until the transaction ends. Left to the caller, that
+    transaction ran for as long as the caller kept the connection: the
+    engine tick shared one across every underlying, and a replay loop shared
+    one across every step of the run. On 14 Oct an 80-minute transaction
+    like that held underlying_quotes, so `make schema-apply`'s ALTER queued
+    behind it and every quote reader and the ingestion INSERTs queued behind
+    the ALTER.
+
+    * Connection idle (no transaction open): the snapshot's transaction is
+      ours, and it is ended on the way out.
+    * Autocommit connection (the backtest worker's): switched to a
+      transaction for the snapshot and restored after. Each read's SAVEPOINT
+      needs a transaction block; under autocommit every one of them errored
+      and the MSI, component, bias and opening-range fields came back empty.
+    * Caller already inside a transaction: left alone. That transaction is
+      the caller's to end, and a replay loop that wants bounded transactions
+      ends its own between steps.
+
+    The snapshot is read-only, so ending its transaction with a rollback
+    loses nothing and also clears an aborted state.
+    """
+    autocommit = getattr(conn, "autocommit", None) is True
+    if autocommit:
+        owned = True
+    else:
+        try:
+            owned = conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+        except Exception:  # not a psycopg2 connection (test doubles)
+            owned = False
+    if not owned:
+        yield
+        return
+    if autocommit:
+        conn.autocommit = False
+    try:
+        yield
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            logger.debug("build_snapshot: rollback failed", exc_info=True)
+        if autocommit:
+            try:
+                conn.autocommit = True
+            except Exception:
+                logger.debug("build_snapshot: could not restore autocommit", exc_info=True)
+
+
 def build_snapshot(
+    conn: Any, underlying: str, as_of: Optional[datetime] = None
+) -> Optional[MarketSnapshot]:
+    """Build the ``MarketSnapshot`` for ``underlying`` from the DB.
+
+    Runs in a transaction of its own when the connection has none open; see
+    :func:`_snapshot_transaction`.
+    """
+    with _snapshot_transaction(conn):
+        return _build_snapshot(conn, underlying, as_of)
+
+
+def _build_snapshot(
     conn: Any, underlying: str, as_of: Optional[datetime] = None
 ) -> Optional[MarketSnapshot]:
     """Build the ``MarketSnapshot`` for ``underlying`` from the DB.
