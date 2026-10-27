@@ -112,34 +112,44 @@ SendSIGKILL=yes
 # brings it back ~10s later — a self-healing flap whose only visible symptom
 # was a stream of alert emails.
 #
-# 2G of a box with 7.6G and no swap. The caps of everything that runs through
-# the cash session add up to most of it: ingestion 2G + api 2G + analytics 1G +
-# signals 1G + thetaterminal 1G + wall-alerts 256M = 7.25G. Raising any of them
-# is a box-level decision, so read `free -m` during a session first.
-# backtest-worker (2G) is excluded because its timer fires post-close at 17:30
-# ET, so it never overlaps.
-MemoryMax=2G
+# 5G of a 15.7G box with 4G of swap. The 2G this used to be was sized when the
+# box had 8 GiB; on 2026-10-27 the API's footprint measured about 3.7G and the
+# box had about 10G available. The caps of everything that runs through the
+# cash session: api 5G + ingestion 2G + analytics 1G + signals 1G +
+# thetaterminal 1G + wall-alerts 256M = 10.25G. Raising any of them is a
+# box-level decision, so read `free -m` during a session first. backtest-worker
+# (2G) is excluded because its timer fires post-close at 17:30 ET, so it never
+# overlaps.
+MemoryMax=5G
+# Never swap the API. With swap on the box, a unit at its memory limit is not
+# OOM-killed: the kernel moves its memory out to disk and keeps it running. A
+# Python worker touches its heap constantly, so it keeps paying disk reads to
+# bring it back, and every request slows. That is how the 2G cap failed on
+# 2026-10-27: the API held 1888M in RAM and 1882M in swap (all of the box's
+# swap was the API's). An hour after the MemoryHigh brake below came off,
+# memory.events read max 12922 (it had been 0) and oom_kill 0, and requests of
+# 5 s or more were 439 that hour against 467 the hour before.
+#
+# With MemorySwapMax=0, reaching MemoryMax means an OOM kill and a ~10 s restart
+# that OnFailure= reports, not a slowdown nothing reports. If that starts, cut
+# what each worker holds (the per-worker read caches and the widest responses;
+# one window_units=480 strike-profile request still peaks in the hundreds of
+# MB) before raising the cap again.
+MemorySwapMax=0
 # No MemoryHigh= soft brake, on purpose. One sat at 1800M from 2026-08-17, with
 # the instruction to remove it if reclaim stalls ever showed up before an actual
-# OOM. They did. memory.events on the box, 2026-10-27, since the unit started:
+# OOM. They did. memory.events on 2026-10-27, since the unit started:
 #
 #     high 14307   sock_throttled 414255   max 0   oom_kill 0
 #     memory.current 1774M   memory.peak 1821M
 #
-# A Python worker's heap is anonymous memory and the box has no swap, so reclaim
-# at the brake found little to free. The kernel slept the workers instead
-# (`high`) and throttled the unit's sockets (`sock_throttled`), which stalled
+# The kernel throttled the workers at the brake (`high`), moved their memory out
+# to swap, and throttled the unit's sockets (`sock_throttled`), which stalled
 # every request, not only the large ones. In that day's journal /api/gex/summary
 # had taken 5 s or more 15,657 times and /api/market/quote 12,859 times, and in
 # one stall requests to more than a dozen endpoints, some 20 s old, all finished
 # in the same second. Whenever a stall covered the liveness watchdog's 5 s
-# probe, it mailed "active but not serving". The hard cap was never reached.
-#
-# Without the brake the API runs up to MemoryMax, and only if it truly runs out
-# is it OOM-killed and restarted (~10 s, reported by OnFailure=). If those kills
-# start, cut what each worker holds: the per-worker read caches and the widest
-# responses. A single window_units=480 strike-profile request still peaks in
-# the hundreds of MB, dominated by serialising the finished payload.
+# probe, it mailed "active but not serving".
 
 # 2 uvicorn workers (one event loop each) → allow up to 2 cores. At 100% the two
 # workers shared a single core and CFS-throttled in bursts during the cash session,
