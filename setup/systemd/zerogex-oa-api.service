@@ -126,9 +126,9 @@ MemoryMax=5G
 # Python worker touches its heap constantly, so it keeps paying disk reads to
 # bring it back, and every request slows. That is how the 2G cap failed on
 # 2026-10-27: the API held 1888M in RAM and 1882M in swap (all of the box's
-# swap was the API's). An hour after the MemoryHigh brake below came off,
-# memory.events read max 12922 (it had been 0) and oom_kill 0, and requests of
-# 5 s or more were 439 that hour against 467 the hour before.
+# swap was the API's). After the MemoryHigh brake below came off, memory.events
+# went from max 0 to max 12922 with oom_kill still 0, and 439 requests in the
+# latest hour checked still took 5 s or more.
 #
 # With MemorySwapMax=0, reaching MemoryMax means an OOM kill and a ~10 s restart
 # that OnFailure= reports, not a slowdown nothing reports. If that starts, cut
