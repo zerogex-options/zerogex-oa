@@ -751,8 +751,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._pool_lock = asyncio.Lock()
         self._last_flow_refresh_by_symbol: Dict[str, float] = {}
         self._flow_refresh_min_seconds: float = _getenv_float("FLOW_CACHE_REFRESH_MIN_SECONDS", 15)
+        # Well under a second: the Gamma Terminal's price must move every
+        # second, and its HTTP fallback polls once a second (see .env.example).
         self._latest_quote_cache_ttl_seconds: float = _getenv_float(
-            "LATEST_QUOTE_CACHE_TTL_SECONDS", 1.5
+            "LATEST_QUOTE_CACHE_TTL_SECONDS", 0.1
         )
         self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
             "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
