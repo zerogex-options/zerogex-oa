@@ -107,6 +107,7 @@ def _bucket_floor_subquery(
     end_expr: str,
     limit_param: str,
     extra_filter: str = "",
+    step_expr: str | None = None,
 ) -> str:
     """Return a scalar SQL subquery that yields the start timestamp of
     the Nth most recent bucket in ``table``.
@@ -134,8 +135,19 @@ def _bucket_floor_subquery(
           predicate using the bare ``timestamp`` column) — interpolated
           literally, so the caller is responsible for keeping it on an
           allowlist.
+      ``step_expr``: optional ``INTERVAL`` literal for one bucket, from
+          ``_interval_expr``. Without it the DISTINCT reads the symbol's
+          whole history on every call — 70-80 ms for an ETF with three
+          months of 1-minute bars, and growing — which is too much for a
+          chart that asks for its last 3 bars every second. With it, the
+          floor is looked for in the last 2 x N buckets' worth of time,
+          then in the last 7 days, and only then in the whole history.
+          The answer is the same: every bucket expression is a floor of
+          ``timestamp``, so a window that holds N buckets holds the newest
+          N, and a window that holds fewer answers NULL and passes the
+          question on (tests/test_historical_bucket_floor_parity.py).
     """
-    return (
+    full = (
         "(SELECT MIN(bucket_ts) FROM ("
         f"SELECT DISTINCT {bucket_expr} AS bucket_ts "
         f"FROM {table} "
@@ -145,3 +157,22 @@ def _bucket_floor_subquery(
         f"LIMIT {limit_param}"
         ") recent_buckets)"
     )
+    if step_expr is None:
+        return full
+
+    def within(window: str) -> str:
+        return (
+            f"(SELECT CASE WHEN COUNT(*) = {limit_param} THEN MIN(bucket_ts) END FROM ("
+            f"SELECT DISTINCT {bucket_expr} AS bucket_ts "
+            f"FROM {table} "
+            f"WHERE {symbol_predicate} "
+            f"AND timestamp <= {end_expr} "
+            f"AND timestamp > {end_expr} - ({window}){extra_filter} "
+            f"ORDER BY bucket_ts DESC "
+            f"LIMIT {limit_param}"
+            ") recent_buckets)"
+        )
+
+    near = within(f"{limit_param}::int * 2 * {step_expr}")
+    week = within("INTERVAL '7 days'")
+    return f"COALESCE({near}, {week}, {full})"

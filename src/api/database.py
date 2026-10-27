@@ -408,6 +408,7 @@ from src.api.queries._sql_helpers import (  # noqa: E402
     _bucket_expr,
     _bucket_floor_subquery,
     _gex_by_strike_order_clause,
+    _interval_expr,
 )
 
 # option_chains rows are UPSERTed in 60-second buckets: every contract that
@@ -8919,6 +8920,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             symbol_predicate="symbol = $1",
             end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
             limit_param="$4",
+            # The chart asks for its last 3 bars every second: look near the
+            # end first instead of reading the symbol's whole history.
+            step_expr=_interval_expr(timeframe),
         )
         query = f"""
             WITH latest AS (
@@ -9001,6 +9005,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             symbol_predicate="index_symbol = $1",
             end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
             limit_param="$4",
+            step_expr=_interval_expr(timeframe),
         )
         query = f"""
             WITH latest AS (
