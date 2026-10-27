@@ -956,8 +956,10 @@ class TechnicalsQueriesMixin:
 
         ``intervals``: optional tail-window size in 5-minute bars (max
         192 = 16 hours). When provided, only the trailing N buckets are
-        returned and the rolling-stats lookback shrinks from a full
-        day to ~160 minutes — much faster for live polling.
+        returned, each identical to the same bar in the full read, so a
+        live poll downloads a few bars instead of the whole session. The
+        query still reads the whole ET day, because the VWAP is
+        cumulative from its start.
 
         ORB anchor: opening-range high/low is computed from the most
         recent ET date that has cash-session data (>= 09:30 ET), not
@@ -1077,14 +1079,14 @@ class TechnicalsQueriesMixin:
             else:
                 bar_window_start = session_start
 
-            # Lookback needs to span 30 prior 5-minute buckets (vol-sigma
-            # rolling window) plus 1 prior bucket (LAG-1 used for the
-            # 5-minute price-change in divergence) — 31 × 5 = 155 minutes,
-            # rounded up to 160. When the bar window starts at session
-            # open we span the overnight gap with a 1-day lookback so
-            # bar one of the session has stable rolling input.
-            if bar_window_start > session_start + timedelta(minutes=160):
-                lookback_start = bar_window_start - timedelta(minutes=160)
+            # Every window below is partitioned by ET day, and the VWAP is
+            # cumulative from the day's first bar, so a bar depends on every
+            # earlier bar of its day and on nothing before it. A tail reads
+            # from the start of the day: a lookback of 160 minutes, enough
+            # for the 30-bucket volume window, turned its VWAP into an average
+            # of the last ~3 hours (tests/test_technicals_tail_parity.py).
+            if intervals is not None:
+                lookback_start = datetime.combine(session_date, time(0, 0), tzinfo=_ET)
             else:
                 lookback_start = session_start - timedelta(days=1)
 
