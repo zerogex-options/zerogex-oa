@@ -797,6 +797,12 @@ cash-index-open-repair: ## One-time cleanup of already-stored cash-index 09:30 E
 		$(if $(END),--end $(END)) \
 		$(if $(filter yes,$(CONFIRM)),--execute)
 
+.PHONY: quote-cadence
+quote-cadence: ## How often each symbol's live price changes at the source: updates a minute, median and worst gap (read-only LISTEN). Optional: SECONDS=60
+	@echo "$(BLUE)=== Live price cadence (what the WebSocket can push) ===$(NC)"
+	@echo "$(YELLOW)Healthy in the regular session: about 60 a minute and a median gap near 1 s.$(NC)"
+	@$(PY) -m src.tools.quote_cadence --seconds $(or $(SECONDS),60)
+
 .PHONY: flow-explain
 flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)
 	@echo "$(BLUE)=== flow_by_contract Query Planner Diagnosis ===$(NC)"
