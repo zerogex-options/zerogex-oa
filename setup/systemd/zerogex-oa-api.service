@@ -112,26 +112,35 @@ SendSIGKILL=yes
 # brings it back ~10s later — a self-healing flap whose only visible symptom
 # was a stream of alert emails.
 #
-# 2G budget on the m5.large (8 GiB, deploy/README.md): during the cash session
-# the concurrent units are ingestion 2G + analytics 1G + signals 1G + api 2G =
-# 6G, leaving ~2 GiB for the OS and nginx. backtest-worker (2G) is excluded
-# because its timer fires post-close at 17:30 ET, so it never overlaps.
+# 2G of a box with 7.6G and no swap. The caps of everything that runs through
+# the cash session add up to most of it: ingestion 2G + api 2G + analytics 1G +
+# signals 1G + thetaterminal 1G + wall-alerts 256M = 7.25G. Raising any of them
+# is a box-level decision, so read `free -m` during a session first.
+# backtest-worker (2G) is excluded because its timer fires post-close at 17:30
+# ET, so it never overlaps.
 MemoryMax=2G
-# Soft brake: past this the kernel applies reclaim pressure and throttles
-# allocation instead of killing outright, which gives the allocator a chance to
-# return freed arenas. The band is deliberately narrow (200M) because the box
-# has no swap — a Python worker's memory is mostly anonymous, so sustained
-# throttling here would stall requests rather than free much. It should only
-# ever engage in the last stretch before the hard cap; idle/normal-load steady
-# state sits far below it. Remove this line if reclaim stalls ever show up
-# before an actual OOM.
+# No MemoryHigh= soft brake, on purpose. One sat at 1800M from 2026-08-17, with
+# the instruction to remove it if reclaim stalls ever showed up before an actual
+# OOM. They did. memory.events on the box, 2026-10-27, since the unit started:
 #
-# NOTE this is headroom, not a cure. A single window_units=480 strike-profile
-# request still peaks in the hundreds of MB — dominated by serialising the
-# finished payload, not by the query — so a burst of wide concurrent requests
-# can still reach 2G. If these alerts return, the fix is to shrink that
-# response (cap window_units, or stream it), not to keep raising this number.
-MemoryHigh=1800M
+#     high 14307   sock_throttled 414255   max 0   oom_kill 0
+#     memory.current 1774M   memory.peak 1821M
+#
+# A Python worker's heap is anonymous memory and the box has no swap, so reclaim
+# at the brake found little to free. The kernel slept the workers instead
+# (`high`) and throttled the unit's sockets (`sock_throttled`), which stalled
+# every request, not only the large ones. In that day's journal /api/gex/summary
+# had taken 5 s or more 15,657 times and /api/market/quote 12,859 times, and in
+# one stall requests to more than a dozen endpoints, some 20 s old, all finished
+# in the same second. Whenever a stall covered the liveness watchdog's 5 s
+# probe, it mailed "active but not serving". The hard cap was never reached.
+#
+# Without the brake the API runs up to MemoryMax, and only if it truly runs out
+# is it OOM-killed and restarted (~10 s, reported by OnFailure=). If those kills
+# start, cut what each worker holds: the per-worker read caches and the widest
+# responses. A single window_units=480 strike-profile request still peaks in
+# the hundreds of MB, dominated by serialising the finished payload.
+
 # 2 uvicorn workers (one event loop each) → allow up to 2 cores. At 100% the two
 # workers shared a single core and CFS-throttled in bursts during the cash session,
 # adding event-loop scheduling delay on top of DB reads. CPUWeight below still wins
