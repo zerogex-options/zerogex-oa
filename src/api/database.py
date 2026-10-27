@@ -8475,9 +8475,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
           more cash-session ticks arrive), so return True unconditionally
           here and let that path through.
 
-        Cached briefly (1s) per symbol.  During the lookup window between
-        16:00:00 ET and the moment the first AH bar lands, the worst case
-        is one DB hit per second per active symbol — negligible.
+        Cached briefly (1s) per symbol, and asked about once a second per
+        symbol per API process: the quote endpoint and every WebSocket tick
+        both consult it.  It reads only today's bars, so each lookup is an
+        index range of at most one day.
         """
         if asset_type == "INDEX":
             return True
@@ -8488,10 +8489,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return bool(cached)
 
+        # The first bound says what the date test below already says, as a
+        # range the (symbol, timestamp) index can seek. Without it, every
+        # lookup before 16:00 read the symbol's whole history to answer "no":
+        # 40 ms on three months of 1-minute bars, once a second per symbol per
+        # process, and in front of every WebSocket tick.
         query = """
             SELECT EXISTS(
                 SELECT 1 FROM underlying_quotes
                 WHERE symbol = $1
+                  AND timestamp >= (date_trunc('day', NOW() AT TIME ZONE 'America/New_York')
+                                    AT TIME ZONE 'America/New_York')
                   AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
                   AND (timestamp AT TIME ZONE 'America/New_York')::date
                       = (NOW() AT TIME ZONE 'America/New_York')::date
