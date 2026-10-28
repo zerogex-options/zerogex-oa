@@ -21,7 +21,7 @@ import random
 import threading
 import time
 from datetime import datetime, date, timezone
-from typing import Generator, List, Dict, Any, Optional, Set
+from typing import Callable, Generator, List, Dict, Any, Optional, Set
 import pytz
 import requests as _requests
 
@@ -1430,6 +1430,11 @@ class UnderlyingBarAccumulator:
 class StreamManager:
     """Manages streaming of real-time underlying and options data"""
 
+    # See set_underlying_listener. Class-level defaults, so they hold for a
+    # manager that never sets a listener however it was built.
+    _underlying_listener: Optional[Callable[[Dict[str, Any]], None]] = None
+    underlying_listener_attached: bool = False
+
     def __init__(
         self,
         client: TradeStationClient,
@@ -2255,6 +2260,7 @@ class StreamManager:
                 db_symbol=self.db_underlying,
                 wakeup=self._wakeup,
             )
+            self._attach_underlying_listener()
             self._underlying_accumulator.start()
 
         self._accumulator = self.provider.stream_option_quotes(
@@ -2321,7 +2327,51 @@ class StreamManager:
             db_symbol=self.db_underlying,
             wakeup=self._wakeup,
         )
+        self._attach_underlying_listener()
         self._underlying_accumulator.start()
+
+    def set_underlying_listener(self, listener: Optional[Callable[[Dict[str, Any]], None]]):
+        """Have each new underlying bar handed to ``listener`` as it lands.
+
+        :meth:`stream` drains the bar stream once per pass, and a pass also
+        drains the option chain and waits while the consumer stores it. On
+        2026-10-28 that took 17 to 39 seconds a pass for SPY, QQQ, SPX and
+        NDX, so the live price moved once a pass however often it was
+        polled. A listener runs on the bar stream's own thread and gets
+        every bar the moment it is polled, as the dict :meth:`stream`
+        yields. It is re-attached to every stream this manager opens,
+        restarts included.
+
+        While ``underlying_listener_attached`` is True the consumer must not
+        store the ``underlying`` items :meth:`stream` still yields (the
+        watchdog runs on them): the listener already stored them, and a
+        second store can land an older bar after a newer one. A provider
+        whose stream cannot take a listener leaves it False, and nothing
+        changes.
+        """
+        self._underlying_listener = listener
+        self._attach_underlying_listener()
+
+    def _attach_underlying_listener(self) -> None:
+        """Attach the listener to the current underlying stream, if any.
+
+        Call it before the stream's start() so its first bar is delivered.
+        """
+        stream = self._underlying_accumulator
+        listener = self._underlying_listener
+        set_listener = getattr(stream, "set_listener", None)
+        if set_listener is None or listener is None:
+            if set_listener is not None:
+                set_listener(None)
+            self.underlying_listener_attached = False
+            return
+
+        def deliver(bar: Any) -> None:
+            row = _bar_to_row(bar)
+            if row is not None:
+                listener(row)
+
+        self.underlying_listener_attached = bool(set_listener(deliver))
 
     def _yield_option_snapshot(self, state: Dict[str, Any]):
         """
@@ -2996,6 +3046,7 @@ class StreamManager:
             if self._underlying_accumulator is not None:
                 self._underlying_accumulator.stop()
                 self._underlying_accumulator = None
+            self.underlying_listener_attached = False
 
         logger.info("Stream stopped")
 
