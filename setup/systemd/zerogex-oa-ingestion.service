@@ -46,7 +46,13 @@ SendSIGKILL=yes
 
 # Resource limits
 MemoryMax=2G
-CPUQuota=150%
+# Up to 3 of the box's 8 cores, for one worker per symbol plus the VIX/VXN and
+# futures feeds. At 150% the unit sat pinned at its quota during the cash
+# session (2026-10-28) and a pass over the option chain took 17-19 s for SPY
+# and QQQ and 36-39 s for SPX and NDX. Not 400%: the API takes up to 4 cores,
+# and faster passes write more option rows to a 2-vCPU database it shares.
+# CPUWeight below still lets the API (400) win contention.
+CPUQuota=300%
 CPUWeight=100
 
 # Security
