@@ -54,11 +54,23 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 #
 # Drop this flag to get per-request lines back in the journal when debugging
 # something nginx's log cannot answer.
+#
+# --workers 4: a worker is one Python event loop, and a request's CPU work runs
+# on it, so the worker count is the API's CPU ceiling. At the 2026-10-28 open,
+# with 2 workers, both sat at ~100% CPU while the 8-core box was 46% idle:
+# 27,209 of 201,818 requests in 30 minutes took 5 s or more, /api/gex/summary
+# took 42 s, and the liveness watchdog kept mailing "active but not serving".
+# Two more workers added live (SIGTTIN) brought /api/gex/summary to 3 ms. 90%
+# of that traffic was the website BFF's key polling for its users, so no single
+# client was flooding the API. Each worker runs its own lifespan, so per-worker
+# state (read caches, the forced-flow warmer, DB pools) multiplies with the
+# count. The TradeWorkz scheduler is the exception: one worker ticks
+# (src/tradeworkz/scheduler.py).
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/uvicorn \
     src.api.main:app \
     --host 0.0.0.0 \
     --port 8000 \
-    --workers 2 \
+    --workers 4 \
     --no-access-log \
     --log-level info
 ExecReload=/bin/kill -HUP $MAINPID
@@ -104,7 +116,7 @@ SendSIGKILL=yes
 # Resource limits
 #
 # MemoryMax is enforced against the unit's whole cgroup — the uvicorn parent
-# AND both workers share this budget, it is not per-process. At 1G that gave
+# AND all of its workers share this budget, it is not per-process. At 1G that gave
 # each worker only ~500M, and a couple of concurrent large analytics reads
 # (strike-profile-timeseries / heatmap over a wide window) were enough to trip
 # the kernel OOM killer. One worker dying takes the whole unit down, systemd
@@ -112,15 +124,16 @@ SendSIGKILL=yes
 # brings it back ~10s later — a self-healing flap whose only visible symptom
 # was a stream of alert emails.
 #
-# 5G of a 15.7G box with 4G of swap. The 2G this used to be was sized when the
-# box had 8 GiB; on 2026-10-27 the API's footprint measured about 3.7G and the
-# box had about 10G available. The caps of everything that runs through the
-# cash session: api 5G + ingestion 2G + analytics 1G + signals 1G +
-# thetaterminal 1G + wall-alerts 256M = 10.25G. Raising any of them is a
-# box-level decision, so read `free -m` during a session first. backtest-worker
-# (2G) is excluded because its timer fires post-close at 17:30 ET, so it never
-# overlaps.
-MemoryMax=5G
+# 8G of a 15.7G box with 4G of swap: 4 workers at about 1.9G each, what each of
+# the 2 workers held on average on 2026-10-27 (3.7G between them). Earlier
+# sizes: 2G when the box had 8 GiB, then 5G for 2 workers on 2026-10-27. The
+# caps of everything that runs through the cash session: api 8G + ingestion 2G
+# + analytics 1G + signals 1G + thetaterminal 1G + wall-alerts 256M = 13.25G,
+# and the website's Next.js server (about 1.3G on 2026-10-28) runs on the same
+# box. Raising any of them is a box-level decision, so read `free -m` during a
+# session first. backtest-worker (2G) is excluded because its timer fires
+# post-close at 17:30 ET, so it never overlaps.
+MemoryMax=8G
 # Never swap the API. With swap on the box, a unit at its memory limit is not
 # OOM-killed: the kernel moves its memory out to disk and keeps it running. A
 # Python worker touches its heap constantly, so it keeps paying disk reads to
@@ -151,11 +164,12 @@ MemorySwapMax=0
 # in the same second. Whenever a stall covered the liveness watchdog's 5 s
 # probe, it mailed "active but not serving".
 
-# 2 uvicorn workers (one event loop each) → allow up to 2 cores. At 100% the two
-# workers shared a single core and CFS-throttled in bursts during the cash session,
-# adding event-loop scheduling delay on top of DB reads. CPUWeight below still wins
-# contention against the background workers.
-CPUQuota=200%
+# One core per worker: 4 uvicorn workers (one event loop each) → allow up to 4
+# of the box's 8 cores. When this was 100% for 2 workers, the two shared a single
+# core and CFS-throttled in bursts during the cash session, adding event-loop
+# scheduling delay on top of DB reads. CPUWeight below still wins contention
+# against the background workers.
+CPUQuota=400%
 # API wins contended cycles over background workers (ingestion=100, analytics/signals=80)
 CPUWeight=400
 
