@@ -1188,6 +1188,141 @@ def test_bars_can_poll_faster_than_chains(monkeypatch):
         assert stream._poll_interval == 1.0, "the bar stream must poll at the bar cadence"
 
 
+def test_bars_poll_every_second_when_the_env_does_not_say(monkeypatch):
+    """Production's .env predates THETADATA_BAR_POLL_SECONDS, so the default
+    is what it runs. The default used to be the chain's 5s, and on
+    2026-10-28 no symbol's price moved more than once in five seconds."""
+    import sys
+    import types
+
+    import src.ingestion.providers.thetadata as thetadata_provider
+
+    fake = types.ModuleType("thetadata")
+
+    class ThetaClient:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    fake.ThetaClient = ThetaClient
+    monkeypatch.setitem(sys.modules, "thetadata", fake)
+    monkeypatch.setattr(thetadata_provider, "shared_client", lambda factory, **kw: factory())
+    monkeypatch.setenv("THETADATA_POLL_SECONDS", "5")
+    monkeypatch.delenv("THETADATA_BAR_POLL_SECONDS", raising=False)
+
+    provider = ThetaDataProvider.from_env(stage="mv")
+    assert provider._poll_interval == 5.0, "the chain keeps its own cadence"
+    assert provider._bar_poll_interval == 1.0
+
+    monkeypatch.setenv("THETADATA_BAR_POLL_SECONDS", "2")
+    assert ThetaDataProvider.from_env(stage="mv")._bar_poll_interval == 2.0
+
+
+def _now_et():
+    return datetime.now(timezone(timedelta(hours=-4)))
+
+
+class _SteppingClient:
+    """Answers each spot poll with a mark a cent above the last."""
+
+    def __init__(self):
+        self.polls = 0
+
+    def stock_snapshot_ohlc(self, **kw):
+        self.polls += 1
+        return [{"close": 100.0 + self.polls / 100, "volume": 1000, "timestamp": _now_et()}]
+
+
+def test_each_polled_bar_reaches_the_listener_as_it_lands():
+    """The collector's loop drains the bar stream once per pass, and a pass
+    also stores the option chain: 17 to 39 seconds for SPY, QQQ, SPX and NDX
+    on 2026-10-28, so the live price moved once a pass. A listener gets every
+    bar on the poll thread instead, and the drained copy stays for the
+    watchdog."""
+    provider = ThetaDataProvider(_SteppingClient(), poll_interval=0.01)
+    stream = provider.stream_underlying_bars("SPY")
+    seen = []
+    three = threading.Event()
+
+    def listener(bar):
+        seen.append((threading.current_thread().name, bar.close))
+        if len(seen) >= 3:
+            three.set()
+
+    assert stream.set_listener(listener) is True
+    stream.start()
+    try:
+        assert three.wait(3), "the listener was not called"
+    finally:
+        stream.stop()
+
+    assert {name for name, _ in seen} == {"thetadata-bar-SPY"}
+    assert [close for _, close in seen[:3]] == pytest.approx([100.01, 100.02, 100.03])
+    assert stream.drain() is not None, "the watchdog's copy must still be there"
+
+
+def test_a_failing_listener_does_not_back_the_poller_off(caplog):
+    """A store that fails is not a failed poll. Counting it as one would back
+    the poller off to 16 times its interval and slow the very writes that are
+    failing, and it would log the failure every second."""
+    import logging
+
+    provider = ThetaDataProvider(_SteppingClient(), poll_interval=0.01)
+    stream = provider.stream_underlying_bars("SPY")
+    calls = []
+
+    def listener(bar):
+        calls.append(bar)
+        raise RuntimeError("database is down")
+
+    stream.set_listener(listener)
+    with caplog.at_level(logging.INFO):
+        started = time.monotonic()
+        stream.start()
+        try:
+            while len(calls) < 20 and time.monotonic() - started < 5:
+                time.sleep(0.005)
+            elapsed = time.monotonic() - started
+        finally:
+            stream.stop()
+
+    # Twenty polls at 10ms take about 0.2s. Backing off doubles each wait up
+    # to 16x, which puts twenty polls past 2.5s.
+    assert len(calls) >= 20 and elapsed < 1.5, f"{len(calls)} polls in {elapsed:.2f}s"
+    assert stream.last_error is None, "a listener failure was recorded as a feed failure"
+    failures = [r for r in caplog.records if "bar listener for SPY failed" in r.getMessage()]
+    assert len(failures) == 1, "logged once per run of failures, not once a poll"
+
+
+def test_a_stopped_stream_delivers_nothing_more():
+    """A poll in flight when its stream is replaced must not store its older
+    bar after the replacement has stored a newer one."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Slow:
+        def stock_snapshot_ohlc(self, **kw):
+            entered.set()
+            release.wait(5)
+            return [{"close": 100.0, "volume": 1000, "timestamp": _now_et()}]
+
+    provider = ThetaDataProvider(_Slow(), poll_interval=0.01)
+    stream = provider.stream_underlying_bars("SPY")
+    delivered = []
+    stream.set_listener(delivered.append)
+    stream.start()
+    assert entered.wait(3)
+
+    stopper = threading.Thread(target=stream.stop)
+    stopper.start()
+    deadline = time.monotonic() + 3
+    while stream._running and time.monotonic() < deadline:
+        time.sleep(0.005)
+    release.set()
+    stopper.join(5)
+
+    assert delivered == []
+
+
 # ---------------------------------------------------------------------------
 # Session volume: cumulative in, per-bar out
 # ---------------------------------------------------------------------------

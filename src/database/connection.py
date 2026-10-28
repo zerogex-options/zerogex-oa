@@ -15,8 +15,11 @@ from src.utils import get_logger
 
 logger = get_logger(__name__)
 
-# Connection pool
-_connection_pool: Optional[pool.SimpleConnectionPool] = None
+# Connection pool. Threaded, because an ingestion worker stores its underlying
+# bars on the bar stream's thread while the main loop writes option rows
+# (StreamManager.set_underlying_listener), and SimpleConnectionPool's
+# getconn/putconn are not safe to call from two threads at once.
+_connection_pool: Optional[pool.ThreadedConnectionPool] = None
 _pool_init_lock = threading.Lock()
 
 
@@ -38,7 +41,7 @@ def get_db_connection():
             if _connection_pool is None:
                 _initialize_connection_pool()
 
-    # Up to two getconn attempts: SimpleConnectionPool doesn't validate on
+    # Up to two getconn attempts: the pool doesn't validate on
     # checkout, so if the server (or an intermediary: RDS, PgBouncer, NAT)
     # silently killed an idle SSL connection, the conn psycopg2 hands back
     # may already be `closed`. Discard it and pull a fresh one rather than
@@ -81,8 +84,8 @@ def close_db_connection(conn):
         return
 
     # A connection that just failed (or was silently terminated by the
-    # server / a proxy) must NOT be re-parked in the pool. SimpleConnection-
-    # Pool.putconn defaults to close=False, so without explicit eviction the
+    # server / a proxy) must NOT be re-parked in the pool. The pool's
+    # putconn defaults to close=False, so without explicit eviction the
     # same dead conn gets handed out on the next getconn — producing the
     # tight flap pattern of "SSL connection has been closed unexpectedly"
     # → 2s circuit-breaker backoff → immediate recovery → fail again that
@@ -239,7 +242,7 @@ def _initialize_connection_pool():
     last_error = None
     for attempt in range(1, connect_retries + 1):
         try:
-            _connection_pool = pool.SimpleConnectionPool(**conn_params)
+            _connection_pool = pool.ThreadedConnectionPool(**conn_params)
 
             # Test the connection
             test_conn = _connection_pool.getconn()

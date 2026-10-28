@@ -1264,6 +1264,13 @@ class _PollingBarStream(BarStream):
         #: symbol with no entitlement) instead of burning its whole
         #: deadline. Cleared by a successful poll.
         self.last_error: Optional[str] = None
+        #: See set_listener. Called on this stream's poll thread.
+        self._listener: Optional[Callable[[Bar], None]] = None
+        self._listener_failures = 0
+
+    def set_listener(self, listener: Optional[Callable[[Bar], None]]) -> bool:
+        self._listener = listener
+        return True
 
     def start(self) -> None:
         self._running = True
@@ -1306,6 +1313,7 @@ class _PollingBarStream(BarStream):
                     if self._wakeup is not None:
                         self._wakeup.set()
                     self.last_error = None
+                    self._deliver(bar)
                 failures = 0
             except Exception as e:  # noqa: BLE001
                 failures += 1
@@ -1319,6 +1327,40 @@ class _PollingBarStream(BarStream):
             delay = self._poll_interval * min(2**failures, 16)
             elapsed = time.monotonic() - started
             self._wake.wait(max(0.0, min(delay, 60.0) - elapsed))
+
+    def _deliver(self, bar: Bar) -> None:
+        """Hand ``bar`` to the listener, if one is set. Never raises.
+
+        A listener's failure is not the feed's: counting it as a failed
+        poll would back the poller off and slow the very writes that are
+        failing. Skipped once stop() has been called, so a poll that was
+        in flight when this stream was replaced cannot store its older bar
+        after the replacement's newer one.
+        """
+        listener = self._listener
+        if listener is None or not self._running:
+            return
+        try:
+            listener(bar)
+        except Exception as e:  # noqa: BLE001 - see docstring
+            self._listener_failures += 1
+            # Once a minute at a 1s poll, not once a second.
+            if self._listener_failures == 1 or self._listener_failures % 60 == 0:
+                logger.error(
+                    "bar listener for %s failed (%d in a row): %s",
+                    self._db_symbol,
+                    self._listener_failures,
+                    e,
+                    exc_info=True,
+                )
+            return
+        if self._listener_failures:
+            logger.info(
+                "bar listener for %s working again after %d failure(s)",
+                self._db_symbol,
+                self._listener_failures,
+            )
+            self._listener_failures = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1523,11 +1565,12 @@ class ThetaDataProvider(MarketDataProvider):
             # different cadences. One underlying's bar is ONE call; its
             # chain is expirations x endpoints. Tying both to one knob
             # means either the candles are coarse or the chain polls
-            # overlap. Defaults to THETADATA_POLL_SECONDS so an unset
-            # deployment behaves exactly as before.
-            bar_poll_interval=float(
-                os.getenv("THETADATA_BAR_POLL_SECONDS") or os.getenv("THETADATA_POLL_SECONDS", "5")
-            ),
+            # overlap. Defaults to 1s, NOT to THETADATA_POLL_SECONDS: the
+            # live chart promises a price a second, and inheriting the
+            # chain's 5s is how production ran at 5s without anyone
+            # setting it (found 2026-10-28; the box's .env predates the
+            # setting).
+            bar_poll_interval=float(os.getenv("THETADATA_BAR_POLL_SECONDS") or "1"),
             oi_poll_interval=float(os.getenv("THETADATA_OI_POLL_SECONDS", "900")),
             strike_range=(
                 int(os.getenv("THETADATA_STRIKE_RANGE"))

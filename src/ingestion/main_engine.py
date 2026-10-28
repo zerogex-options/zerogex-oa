@@ -643,6 +643,10 @@ class IngestionEngine:
         self._pending_failed_option_rows: List[Dict[str, Any]] = []
         self._pending_failed_option_rows_max = _getenv_int("OPTION_FAILED_ROWS_RETAIN_MAX", 20000)
         self._last_underlying_signature: Optional[str] = None
+        # Underlying bars are stored on the bar stream's thread when it takes
+        # a listener (see _store_underlying_serialized), so every store goes
+        # through this lock.
+        self._underlying_store_lock = threading.Lock()
         # Cash-session date whose 09:30 ET open bar we've already de-phantomed
         # (see _repair_session_open_if_needed). None until the first post-open
         # bar of a session is written; reset implicitly by the date comparison.
@@ -763,6 +767,17 @@ class IngestionEngine:
 
         except Exception as e:
             logger.error(f"Error checking database: {e}", exc_info=True)
+
+    def _store_underlying_serialized(self, data: Dict[str, Any]):
+        """:meth:`_store_underlying`, one call at a time.
+
+        The bar stream's listener calls this on the stream's own thread
+        (StreamManager.set_underlying_listener), and a stream restart
+        briefly has two such threads. The lock keeps their stores, and the
+        signature and price state they update, from interleaving.
+        """
+        with self._underlying_store_lock:
+            self._store_underlying(data)
 
     def _store_underlying(self, data: Dict[str, Any]):
         """Store latest 1-minute underlying bar snapshot with upsert semantics."""
@@ -2750,6 +2765,15 @@ class IngestionEngine:
 
             self.running = True
 
+            # Store each underlying bar the moment it is polled, not once per
+            # pass of the loop below. A pass also stores the whole option
+            # chain, which on 2026-10-28 took 17 to 39 seconds for SPY, QQQ,
+            # SPX and NDX, so the live chart moved once a pass. Set before
+            # stream() opens the bar stream, so its first bar is delivered. A
+            # provider whose bar stream cannot take a listener keeps the old
+            # path.
+            stream_manager.set_underlying_listener(self._store_underlying_serialized)
+
             for item in stream_manager.stream(max_iterations=None):
                 if not self.running:
                     break
@@ -2760,7 +2784,11 @@ class IngestionEngine:
                     break
 
                 if item["type"] == "underlying":
-                    self._store_underlying(item["data"])
+                    # With a listener attached this bar is already stored, and
+                    # storing the drained copy too could put an older bar
+                    # after a newer one. The item still drives the watchdog.
+                    if not stream_manager.underlying_listener_attached:
+                        self._store_underlying_serialized(item["data"])
                 elif item["type"] == "option_batch":
                     self._store_option_batch(item["data"])
                 elif item["type"] == "flush_options":

@@ -52,7 +52,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 __all__ = [
     "Bar",
@@ -304,6 +304,19 @@ class BarStream(abc.ABC):
     @abc.abstractmethod
     def updates_received(self) -> int:
         """Monotonic count of merged bars, for staleness watchdogs."""
+
+    def set_listener(self, listener: Optional[Callable[[Bar], None]]) -> bool:
+        """Hand each new bar to ``listener`` on the reader's own thread.
+
+        For a consumer whose loop does other work between drains: the bar
+        is delivered the moment it lands instead of at the next drain.
+        Returns False when the stream cannot do that, which is the default,
+        and the caller keeps storing what it drains. The listener sees the
+        bars ``drain`` would, so a caller that attaches one must stop
+        storing the drained copies, or it writes each bar twice and can
+        land an older one after a newer one.
+        """
+        return False
 
 
 #: Alias kept for readability at call sites that stream option *bars*

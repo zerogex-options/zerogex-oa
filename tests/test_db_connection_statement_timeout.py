@@ -25,7 +25,7 @@ def reload_connection_module(monkeypatch):
 
 
 def _capture_pool_kwargs(monkeypatch, module):
-    """Patch SimpleConnectionPool to capture kwargs instead of connecting."""
+    """Patch ThreadedConnectionPool to capture kwargs instead of connecting."""
     captured: dict = {}
 
     class _FakePool:
@@ -56,7 +56,7 @@ def _capture_pool_kwargs(monkeypatch, module):
         def closeall(self):
             return None
 
-    monkeypatch.setattr(module.pool, "SimpleConnectionPool", _FakePool)
+    monkeypatch.setattr(module.pool, "ThreadedConnectionPool", _FakePool)
     monkeypatch.setattr(module, "get_db_password", lambda: "fake-password", raising=True)
     return captured
 
