@@ -30,6 +30,7 @@ from .security import api_key_auth, key_store, require_scopes
 from .usage import usage_meter
 from .quote_broadcaster import QuoteBroadcaster, set_broadcaster
 from src.analytics.pin_stability import build_pin_stability
+from src.market_calendar import first_live_expiration
 from .routers import websockets as ws_router
 from .models import (
     GEXSummary,
@@ -805,8 +806,19 @@ async def get_pin_stability(symbol: str = Query(default="SPY")):
     make every chart poll pay for a figure that changes at most once a minute.
     404 when the session carries no active pin at any point — the client then
     shows nothing rather than a zeroed record.
+
+    Also 404 once the session has closed.  From the close the Pin Strike rolls
+    to the expiration that settles next (see ``/api/gex/summary``), and the
+    closed session's path describes the pin of contracts that have expired,
+    not the one now on screen.
     """
     frames = await _db().get_pin_path_for_session(symbol)
+    last_ts = frames[-1].get("timestamp") if frames else None
+    if isinstance(last_ts, datetime):
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        if last_ts.astimezone(_ET).date() < first_live_expiration():
+            raise HTTPException(status_code=404, detail="No pin activity for this session")
     stability = build_pin_stability(frames)
     if stability is None:
         raise HTTPException(status_code=404, detail="No pin activity for this session")

@@ -86,7 +86,9 @@ def test_get_max_pain_current_caches_with_dedicated_ttl(monkeypatch):
     real_cache_set = db._cache_set
 
     def _spy_cache_set(key, payload, ttl_seconds):
-        if key == "max_pain_current:SPY":
+        # The key ends in the expiration cutoff (the headline rolls at the
+        # close), so match the endpoint's entry by its prefix.
+        if key.startswith("max_pain_current:SPY:"):
             captured_ttls.append(ttl_seconds)
         return real_cache_set(key, payload, ttl_seconds)
 

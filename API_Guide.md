@@ -756,13 +756,28 @@ have expired:
 strike-profile bucket list the dates they left out in `expired_excluded`
 (`[]` during the session, under a `/api/v1/levels` expiration scope, and on
 every historical bucket); `/api/gex/by-strike` simply has no rows for them.
-The fields the
-engine computes from the whole chain when it publishes a row (`gamma_flip`,
-`net_gex_at_spot`, `max_pain`, `pin_*`, `max_gamma_strike`, the OI totals) stay
-as published. Replay frames, `/api/gex/historical`, `/api/gex/heatmap` and the
-stored rows are history and are never changed. A delayed read
-(`delay_minutes`) judges expiry at its own moment, so a 15-minute-delayed view
-drops the day's contracts at 16:15 ET.
+
+The two levels that describe ONE expiration roll to the expiration that
+settles next, named in `rolled_to_expiration` on `/api/gex/summary` and
+`/api/v1/levels` (`null` during the session):
+
+- `max_pain` is that expiration's max pain, from the row's own per-expiration
+  breakdown. `/api/max-pain/current` rolls its headline `max_pain` and
+  `difference` the same way and leaves the settled expiration out of
+  `expirations`.
+- The Pin Strike (`pin_strike`, `pin_score`, `pin_confidence`,
+  `pin_strike_reason`) is priced by the engine's own model on that
+  expiration's contracts in the same snapshot, so it is the pin for the next
+  session's 0DTE as of the close. The newest strike-profile bucket carries the
+  same pin. `/api/gex/pin-stability` answers `404` after the close: its path
+  belongs to the pin of the contracts that expired.
+
+The fields the engine computes from the whole chain when it publishes a row
+(`gamma_flip`, `net_gex_at_spot`, `max_gamma_strike`, the OI totals) stay as
+published. Replay frames, `/api/gex/historical`, `/api/gex/heatmap`,
+`/api/max-pain/timeseries` and the stored rows are history and are never
+changed. A delayed read (`delay_minutes`) judges expiry at its own moment, so
+a 15-minute-delayed view drops the day's contracts at 16:15 ET.
 
 ### GET /api/gex/summary
 Get latest GEX summary with key metrics.
@@ -773,8 +788,8 @@ Get latest GEX summary with key metrics.
 Includes the nullable **Pin Strike** fields `pin_strike`, `pin_score`,
 `pin_confidence` and `pin_strike_reason` (same semantics as the
 `/api/v1/levels` fields above — hide, don't zero; a `REASON_*` code populates
-`pin_strike_reason` when there is no active pin), and `expired_excluded` (see
-above).
+`pin_strike_reason` when there is no active pin), and `expired_excluded` and
+`rolled_to_expiration` (see above).
 
 ### GET /api/gex/by-strike
 Get GEX breakdown by individual strikes. After the close, rows for expired

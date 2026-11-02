@@ -293,16 +293,22 @@ def test_the_whole_chain_names_the_expirations_it_left_out_after_the_close(monke
     """The walls and profile come from the summary and the latest strikes,
     which leave out the day's expired options after the close; the response
     says which dates.  A scope can only name a live expiration, so it is []."""
-    summary = _summary(expired_excluded=[date(2026, 10, 13)])
+    summary = _summary(
+        expired_excluded=[date(2026, 10, 13)], rolled_to_expiration=date(2026, 10, 14)
+    )
     client, _ = _build_app(monkeypatch, summary=summary)
     with client:
         whole = client.get("/api/v1/levels/SPX").json()
         scoped = client.get("/api/v1/levels/SPX?expiration=0dte").json()
     assert whole["expired_excluded"] == ["2026-10-13"]
+    # Max pain and the pin describe the next expiration, and say which.
+    assert whole["rolled_to_expiration"] == "2026-10-14"
     assert scoped["expired_excluded"] == []
+    assert scoped["rolled_to_expiration"] is None
     in_session, _ = _build_app(monkeypatch)
     with in_session:
-        assert in_session.get("/api/v1/levels/SPX").json()["expired_excluded"] == []
+        body = in_session.get("/api/v1/levels/SPX").json()
+    assert body["expired_excluded"] == [] and body["rolled_to_expiration"] is None
 
 
 def test_no_parameter_and_all_serve_the_whole_chain_untouched(monkeypatch):

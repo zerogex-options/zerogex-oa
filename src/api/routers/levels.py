@@ -188,6 +188,11 @@ class LevelsResponse(BaseModel):
     #: ``GEXSummary.expired_excluded``.  Always ``[]`` under an expiration
     #: scope, which can only name an expiration that is still trading.
     expired_excluded: List[date] = Field(default_factory=list)
+    #: After the close, the expiration ``levels.max_pain`` and the Pin Strike
+    #: describe: the one that settles next (``GEXSummary.rolled_to_expiration``).
+    #: Null during the session, and under an expiration scope, whose max pain
+    #: is its own (the pin is never scoped, so it rolls there too).
+    rolled_to_expiration: Optional[date] = None
 
 
 def _flip_label(
@@ -517,4 +522,5 @@ async def get_levels(
         pin_strike_reason=summary.get("pin_strike_reason"),
         profile=profile,
         expired_excluded=(summary.get("expired_excluded") or []) if scope == "all" else [],
+        rolled_to_expiration=summary.get("rolled_to_expiration") if scope == "all" else None,
     )

@@ -225,6 +225,147 @@ _SQRT_2PI = float(np.sqrt(2.0 * np.pi))
 ET = pytz.timezone("US/Eastern")
 
 
+def bs_gamma(S, K: float, T: float, r: float, sigma: float, q: float = 0.0):
+    """Black-Scholes-Merton gamma (identical for calls and puts).
+
+    ``γ = e^{-qT}·N'(d1) / (S·σ·√T)`` using the same ``d1`` form as
+    :meth:`AnalyticsEngine._calculate_vanna` / ``_calculate_charm``.  ``q`` is
+    the continuous dividend yield (0.0 = dividend-free model).
+
+    Accepts ``S`` as a scalar or a NumPy array of underlying prices —
+    the array form so the spot-shift gamma profile can re-price a
+    whole price grid in one vectorised call.  Snapshot gamma is gamma
+    at the *current* spot only; the zero-gamma level is where exposure
+    flips as spot moves, so it can only be found by re-pricing gamma
+    at each hypothetical spot (not by cumulating the fixed snapshot
+    value).  Returns 0 where inputs are degenerate.
+
+    The one Black-Scholes gamma in the codebase: the engine reaches it
+    through :meth:`AnalyticsEngine._calculate_bs_gamma`, and the API through
+    :func:`pin_strike_for_expiration`.
+    """
+    is_array = isinstance(S, np.ndarray)
+    if K <= 0 or T <= 0 or sigma <= 0:
+        return np.zeros_like(S, dtype=float) if is_array else 0.0
+    S_arr = np.asarray(S, dtype=float)
+    sqrt_T = np.sqrt(T)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d1 = (np.log(S_arr / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+        # Standard-normal pdf inline: bit-identical to scipy.stats.norm.pdf
+        # (verified Δ==0) but ~15× faster, and this is the gamma hot path —
+        # re-priced for every contract across the whole spot-shift grid in
+        # _gamma_exposure_profile (the live gamma-flip primitive).
+        pdf_d1 = np.exp(-0.5 * d1 * d1) / _SQRT_2PI
+        gamma = np.exp(-q * T) * pdf_d1 / (S_arr * sigma * sqrt_T)
+    gamma = np.where(S_arr > 0.0, gamma, 0.0)
+    return gamma if is_array else float(gamma)
+
+
+def pin_strike_for_expiration(
+    options: List[Dict[str, Any]],
+    *,
+    symbol: str,
+    spot: float,
+    timestamp: datetime,
+    expiration: Any,
+    risk_free_rate: float,
+    dividend_yield: float,
+    gamma_fn: Any = None,
+) -> "pin_strike_mod.PinStrikeResult":
+    """Pin Strike for ONE expiration's contracts, as of ``timestamp``.
+
+    The market-data adapter around the pure
+    :func:`src.analytics.pin_strike.calculate_pin_strike`: it keeps the
+    contracts dated ``expiration``, resolves each one's settlement-aware T and
+    the reachability horizon ``tau`` (``timestamp`` to that expiration's 16:00
+    ET settlement), takes a representative ATM IV, and delegates the modeling.
+
+    The engine calls it with the snapshot's own date (the same-day pin, see
+    :meth:`AnalyticsEngine._calculate_pin_strike`).  The API calls it after the
+    close with the expiration that settles next, from the closing snapshot's
+    chain, so the Pin rolls past the close on exactly the same model.
+
+    ``options`` rows need ``expiration``, ``strike``, ``option_type``,
+    ``open_interest``, ``implied_volatility`` and ``option_symbol``.  With no
+    contract for ``expiration`` the result is the inactive
+    ``NO_0DTE_EXPIRATION`` pin.  ``gamma_fn`` defaults to :func:`bs_gamma`.
+    """
+    gamma_fn = bs_gamma if gamma_fn is None else gamma_fn
+    target = [o for o in options if o.get("expiration") == expiration]
+    if not target:
+        return pin_strike_mod.calculate_pin_strike(
+            [],
+            spot=spot,
+            tau=0.0,
+            sigma=None,
+            gamma_fn=gamma_fn,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            expiration=None,
+            has_0dte=False,
+        )
+
+    # Representative reachability horizon tau: remaining time to the
+    # expiration's settlement.  0DTE index/ETF pins resolve at the 16:00 ET
+    # cash close (SPXW/ETF PM settlement); AM-settled SPX same-day rows are
+    # already dropped after 09:30 upstream, so the 16:00 close is the correct
+    # "into expiration" horizon here.  calculate_time_to_expiration returns
+    # the intraday-accurate remainder in years (not 1/365) and 0.0 once past
+    # the settlement instant, which the pure function reads as EXPIRED.
+    tau = calculate_time_to_expiration(timestamp, expiration, market_close_time="16:00:00")
+
+    # Representative ATM IV via the engine's established ±band policy
+    # (mirrors _store_daily_atm_iv): mean ATM call IV, calls preferred.
+    atm_contracts = [
+        {
+            "strike": o.get("strike"),
+            "option_type": o.get("option_type"),
+            "iv": o.get("implied_volatility"),
+        }
+        for o in target
+    ]
+    sigma = pin_strike_mod.representative_atm_iv(
+        atm_contracts, spot, band_pct=PIN_STRIKE_ATM_IV_BAND_PCT
+    )
+
+    # Normalize the contracts, resolving each contract's own settlement-aware
+    # T for the gamma re-pricing (SPX vs SPXW at a shared date get distinct
+    # closes — same keying the GEX-by-strike loop uses).
+    tte_cache: Dict = {}
+    contracts: List[Dict[str, Any]] = []
+    for o in target:
+        close_t = settlement_close_time_for_contract(symbol, o.get("option_symbol"), expiration)
+        T = tte_cache.get(close_t)
+        if T is None:
+            T = calculate_time_to_expiration(timestamp, expiration, market_close_time=close_t)
+            tte_cache[close_t] = T
+        contracts.append(
+            {
+                "strike": o.get("strike"),
+                "option_type": o.get("option_type"),
+                "open_interest": o.get("open_interest"),
+                "iv": o.get("implied_volatility"),
+                "T": T,
+            }
+        )
+
+    return pin_strike_mod.calculate_pin_strike(
+        contracts,
+        spot=spot,
+        tau=tau,
+        sigma=sigma,
+        gamma_fn=gamma_fn,
+        risk_free_rate=risk_free_rate,
+        dividend_yield=dividend_yield,
+        expiration=expiration,
+        has_0dte=True,
+        bandwidth_strike_mult=PIN_STRIKE_BANDWIDTH_STRIKE_MULT,
+        fallback_increment=default_strike_increment(symbol),
+        candidate_max_z=PIN_STRIKE_CANDIDATE_MAX_Z,
+        min_pin_score=PIN_STRIKE_MIN_SCORE,
+    )
+
+
 class AnalyticsEngine:
     """
     Independent analytics engine for GEX and second-order Greeks calculations
@@ -1377,33 +1518,10 @@ class AnalyticsEngine:
     def _calculate_bs_gamma(self, S, K: float, T: float, r: float, sigma: float, q: float = 0.0):
         """Black-Scholes-Merton gamma (identical for calls and puts).
 
-        ``γ = e^{-qT}·N'(d1) / (S·σ·√T)`` using the same ``d1`` form as
-        :meth:`_calculate_vanna` / :meth:`_calculate_charm`.  ``q`` is the
-        continuous dividend yield (0.0 = dividend-free model).
-
-        Accepts ``S`` as a scalar or a NumPy array of underlying prices —
-        the array form so the spot-shift gamma profile can re-price a
-        whole price grid in one vectorised call.  Snapshot gamma is gamma
-        at the *current* spot only; the zero-gamma level is where exposure
-        flips as spot moves, so it can only be found by re-pricing gamma
-        at each hypothetical spot (not by cumulating the fixed snapshot
-        value).  Returns 0 where inputs are degenerate.
+        The kernel is the module-level :func:`bs_gamma`, so the API can price
+        with exactly the same one (see :func:`pin_strike_for_expiration`).
         """
-        is_array = isinstance(S, np.ndarray)
-        if K <= 0 or T <= 0 or sigma <= 0:
-            return np.zeros_like(S, dtype=float) if is_array else 0.0
-        S_arr = np.asarray(S, dtype=float)
-        sqrt_T = np.sqrt(T)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            d1 = (np.log(S_arr / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
-            # Standard-normal pdf inline: bit-identical to scipy.stats.norm.pdf
-            # (verified Δ==0) but ~15× faster, and this is the gamma hot path —
-            # re-priced for every contract across the whole spot-shift grid in
-            # _gamma_exposure_profile (the live gamma-flip primitive).
-            pdf_d1 = np.exp(-0.5 * d1 * d1) / _SQRT_2PI
-            gamma = np.exp(-q * T) * pdf_d1 / (S_arr * sigma * sqrt_T)
-        gamma = np.where(S_arr > 0.0, gamma, 0.0)
-        return gamma if is_array else float(gamma)
+        return bs_gamma(S, K, T, r, sigma, q)
 
     def _dte_profile_weight(
         self,
@@ -2914,82 +3032,23 @@ class AnalyticsEngine:
         """
         # Same-day (0DTE) expiration in ET, matching the engine's existing
         # "today" convention (see _calculate_max_pain / the AM-settled SOQ drop).
+        # The adapter itself is module-level so the API can roll the Pin to the
+        # next expiration after the close on the same model.
         today_et = timestamp.astimezone(ET).date()
-        same_day = [o for o in options if o.get("expiration") == today_et]
-        if not same_day:
-            return pin_strike_mod.calculate_pin_strike(
-                [],
-                spot=underlying_price,
-                tau=0.0,
-                sigma=None,
-                gamma_fn=self._calculate_bs_gamma,
-                risk_free_rate=self.risk_free_rate,
-                dividend_yield=self.dividend_yield,
-                expiration=None,
-                has_0dte=False,
-            )
-
-        # Representative reachability horizon tau: remaining time to the 0DTE
-        # settlement.  0DTE index/ETF pins resolve at the 16:00 ET cash close
-        # (SPXW/ETF PM settlement); AM-settled SPX same-day rows are already
-        # dropped after 09:30 upstream, so the 16:00 close is the correct
-        # "into expiration" horizon here.  calculate_time_to_expiration returns
-        # the intraday-accurate remainder in years (not 1/365) and 0.0 once
-        # past the settlement instant, which the pure function reads as EXPIRED.
-        tau = calculate_time_to_expiration(timestamp, today_et, market_close_time="16:00:00")
-
-        # Representative ATM IV via the engine's established ±band policy
-        # (mirrors _store_daily_atm_iv): mean ATM call IV, calls preferred.
-        atm_contracts = [
-            {
-                "strike": o.get("strike"),
-                "option_type": o.get("option_type"),
-                "iv": o.get("implied_volatility"),
-            }
-            for o in same_day
-        ]
-        sigma = pin_strike_mod.representative_atm_iv(
-            atm_contracts, underlying_price, band_pct=PIN_STRIKE_ATM_IV_BAND_PCT
-        )
-
-        # Normalize the 0DTE contracts, resolving each contract's own
-        # settlement-aware T for the gamma re-pricing (SPX vs SPXW at a shared
-        # date get distinct closes — same keying the GEX-by-strike loop uses).
-        tte_cache: Dict = {}
-        contracts: List[Dict[str, Any]] = []
-        for o in same_day:
-            close_t = settlement_close_time_for_contract(
-                self.db_symbol, o.get("option_symbol"), today_et
-            )
-            T = tte_cache.get(close_t)
-            if T is None:
-                T = calculate_time_to_expiration(timestamp, today_et, market_close_time=close_t)
-                tte_cache[close_t] = T
-            contracts.append(
-                {
-                    "strike": o.get("strike"),
-                    "option_type": o.get("option_type"),
-                    "open_interest": o.get("open_interest"),
-                    "iv": o.get("implied_volatility"),
-                    "T": T,
-                }
-            )
-
-        result = pin_strike_mod.calculate_pin_strike(
-            contracts,
+        result = pin_strike_for_expiration(
+            options,
+            symbol=self.db_symbol,
             spot=underlying_price,
-            tau=tau,
-            sigma=sigma,
-            gamma_fn=self._calculate_bs_gamma,
+            timestamp=timestamp,
+            expiration=today_et,
             risk_free_rate=self.risk_free_rate,
             dividend_yield=self.dividend_yield,
-            expiration=today_et,
-            has_0dte=True,
-            bandwidth_strike_mult=PIN_STRIKE_BANDWIDTH_STRIKE_MULT,
-            fallback_increment=default_strike_increment(self.db_symbol),
-            candidate_max_z=PIN_STRIKE_CANDIDATE_MAX_Z,
-            min_pin_score=PIN_STRIKE_MIN_SCORE,
+            gamma_fn=self._calculate_bs_gamma,
         )
+        if result.reason == pin_strike_mod.REASON_NO_0DTE_EXPIRATION:
+            # No same-day contract in the snapshot: returned without a log
+            # line, as it always was.
+            return result
 
         # Concise, non-spammy diagnostic (one INFO line per cycle).  The full
         # per-candidate curve stays in the result object for tests / ad-hoc

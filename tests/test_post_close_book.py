@@ -30,6 +30,7 @@ The unit suite pins the expiration clock before every fixture date
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -134,8 +135,9 @@ def _flat_row(bucket_ts, rep_ts, strike, call_raw, put_raw):
         "low": Decimal(str(CLOSE - 1)),
         "close": Decimal(str(CLOSE)),
         "gamma_flip": Decimal("497.5"),
-        "pin_strike": None,
-        "pin_confidence": None,
+        # Friday's same-day pin, as the engine published it.
+        "pin_strike": Decimal("500"),
+        "pin_confidence": 0.6,
         "max_gamma_strike": None,
         "wall_anchor": Decimal("500"),
         "rep_ts": rep_ts,
@@ -174,25 +176,75 @@ def _surviving_rows():
     ]
 
 
+# Monday's contracts in the closing snapshot's chain: the call open interest
+# piles up at 505, a strike above the 500 close that price can reach by
+# Monday's settlement, so the rolled Pin has somewhere to land.
+MONDAY_CHAIN = [
+    {
+        "option_symbol": f"SPXW 261102{kind}{int(strike)}",
+        "strike": Decimal(str(strike)),
+        "expiration": MONDAY,
+        "option_type": kind,
+        "open_interest": oi,
+        "implied_volatility": Decimal("0.18"),
+    }
+    for strike, kind, oi in (
+        (495.0, "C", 1500),
+        (500.0, "C", 4000),
+        (505.0, "C", 9000),
+        (510.0, "C", 2500),
+        (495.0, "P", 800),
+        (505.0, "P", 300),
+    )
+]
+
+
+def _expected_rolled_pin(spot=CLOSE):
+    """The Pin the API should roll to: the shared model, run directly."""
+    from src.analytics.main_engine import pin_strike_for_expiration
+    from src.config import RISK_FREE_RATE, resolve_dividend_yield
+
+    options = [
+        {
+            **row,
+            "strike": float(row["strike"]),
+            "implied_volatility": float(row["implied_volatility"]),
+        }
+        for row in MONDAY_CHAIN
+    ]
+    return pin_strike_for_expiration(
+        options,
+        symbol="SPX",
+        spot=spot,
+        timestamp=REP_B,
+        expiration=MONDAY,
+        risk_free_rate=RISK_FREE_RATE,
+        dividend_yield=resolve_dividend_yield("SPX"),
+    )
+
+
 class _Conn:
     """Answers each read by the marker it carries, and records the after-close ones."""
 
     def __init__(self, summary_row=None, profile_row=None):
         self.summary_row = summary_row
         self.profile_row = profile_row
-        self.expired_calls = []
+        self.expiration_calls = []
         self.surviving_calls = []
+        self.chain_calls = []
         self.body_calls = 0
 
     async def fetch(self, query, *args, **_kwargs):
-        if "-- expired expirations in a snapshot" in query:
-            self.expired_calls.append(args)
-            _symbol, snapshot_ts, floor, exp_filter = args
-            exps = [FRIDAY, MONDAY] if exp_filter is None else exp_filter
-            return [{"expiration": e} for e in exps if e < floor]
+        if "-- expirations in a snapshot" in query:
+            self.expiration_calls.append(args)
+            return [{"expiration": e} for e in (FRIDAY, MONDAY, date(2026, 11, 20))]
         if "-- surviving strikes in a snapshot" in query:
             self.surviving_calls.append(args)
             return _surviving_rows()
+        if "-- one expiration's chain at a snapshot" in query:
+            self.chain_calls.append(args)
+            _symbol, _ts, _since, expiration = args
+            return [row for row in MONDAY_CHAIN if row["expiration"] == expiration]
         if "bucket_reps AS" in query:
             self.body_calls += 1
             return _timeseries_rows()
@@ -204,6 +256,8 @@ class _Conn:
                 "timestamp": self.summary_row["timestamp"],
                 "computed_at": self.summary_row["computed_at"],
             }
+        if "-- spot at a snapshot" in query:
+            return {"close": Decimal(str(CLOSE))}
         if "FROM gex_profile gp" in query:
             return self.profile_row
         self.body_calls += 1
@@ -260,8 +314,17 @@ def test_after_the_close_the_newest_bucket_leaves_out_the_expired_expiration(mon
     assert older["put_wall"] == 495.0
 
     # The after-close read asked about the newest bucket's snapshot only.
-    assert [args[:3] for args in conn.expired_calls] == [("SPX", REP_B, MONDAY)]
-    assert len(conn.surviving_calls) == 1
+    assert conn.expiration_calls == [("SPX", REP_B)]
+    assert [args[:3] for args in conn.surviving_calls] == [("SPX", REP_B, MONDAY)]
+
+    # The Pin rolls with the book: priced on Monday's contracts in the same
+    # snapshot.  The earlier bucket keeps the pin it had then.
+    expected = _expected_rolled_pin()
+    assert expected.is_active
+    assert newest["pin_strike"] == expected.pin_strike
+    assert newest["pin_confidence"] == pytest.approx(expected.pin_confidence)
+    assert older["pin_strike"] == Decimal("500")
+    assert [args[3] for args in conn.chain_calls] == [MONDAY]
 
 
 def test_during_the_session_the_newest_bucket_is_served_as_read(monkeypatch):
@@ -272,8 +335,9 @@ def test_during_the_session_the_newest_bucket_is_served_as_read(monkeypatch):
     assert "expired_excluded" not in newest
     assert float(_strikes_by_price(newest)[495.0]["put_gamma"]) == pytest.approx(-400.0 * SCALE)
     assert newest["put_wall"] == 495.0
+    assert newest["pin_strike"] == Decimal("500")
     # Nothing has expired, so nothing extra was read.
-    assert conn.expired_calls == [] and conn.surviving_calls == []
+    assert conn.expiration_calls == [] and conn.surviving_calls == [] and conn.chain_calls == []
 
 
 def test_a_delayed_read_judges_expiry_at_its_own_moment(monkeypatch):
@@ -286,7 +350,7 @@ def test_a_delayed_read_judges_expiry_at_its_own_moment(monkeypatch):
         db.get_strike_profile_timeseries("SPX", "5min", 3, as_of=_et(30, "15:55"))
     )
     assert "expired_excluded" not in newest
-    assert conn.expired_calls == []
+    assert conn.expiration_calls == []
 
     _, newest = asyncio.run(
         db.get_strike_profile_timeseries("SPX", "5min", 3, as_of=_et(30, "16:05"))
@@ -306,9 +370,10 @@ def test_a_filtered_view_drops_only_its_own_expired_dates(monkeypatch):
     db._scope_wall_chain = _no_chain  # type: ignore[method-assign]
     _, newest = asyncio.run(db.get_strike_profile_timeseries("SPX", "5min", 40, [FRIDAY, MONDAY]))
     assert newest["expired_excluded"] == [FRIDAY]
-    # The filter rides into both after-close reads.
-    assert conn.expired_calls[0][3] == [FRIDAY, MONDAY]
+    # The filter decides what counts as expired here and rides into the
+    # survivors' read; the Pin is whole-chain and rolls the same way anyway.
     assert conn.surviving_calls[0][3] == [FRIDAY, MONDAY]
+    assert newest["pin_strike"] == _expected_rolled_pin().pin_strike
     # A filtered view's flip is recomputed from the strikes it now draws.
     assert newest["gamma_flip"] != Decimal("497.5")
 
@@ -357,7 +422,16 @@ def _summary_row():
         "put_wall_ladder_strikes": [Decimal("495"), Decimal("490"), Decimal("485")],
         "put_wall_ladder_gammas": [Decimal("400"), Decimal("150"), Decimal("100")],
         "max_gamma_strike": Decimal("495"),
-        "pin_strike": None,
+        # Friday's same-day pin and max pain, as the engine published them,
+        # with the per-expiration max pain the row stores (JSONB comes back
+        # from asyncpg as text).
+        "pin_strike": Decimal("500"),
+        "pin_score": 1.0e9,
+        "pin_confidence": 0.6,
+        "pin_strike_reason": None,
+        "max_pain_by_expiration": json.dumps(
+            {"2026-10-30": 500.0, "2026-11-02": 505.0, "2026-11-20": 520.0}
+        ),
     }
 
 
@@ -374,16 +448,29 @@ def test_after_the_close_the_summary_repicks_its_walls_and_resums_its_totals(mon
     assert summary["total_call_gex"] == pytest.approx(250.0 * SCALE)
     assert summary["total_put_gex"] == pytest.approx(-260.0 * SCALE)
     assert summary["net_gex"] == pytest.approx(-10.0 * SCALE)
+    # Max Pain and the Pin describe ONE expiration, so they roll to the one
+    # that settles next: Monday's max pain from the row's own breakdown, and
+    # the pin priced on Monday's contracts in the same snapshot.
+    assert summary["rolled_to_expiration"] == MONDAY
+    assert summary["max_pain"] == 505.0
+    expected = _expected_rolled_pin()
+    assert summary["pin_strike"] == expected.pin_strike
+    assert summary["pin_score"] == pytest.approx(expected.pin_score)
+    assert summary["pin_confidence"] == pytest.approx(expected.pin_confidence)
+    assert summary["pin_strike_reason"] is None
     # What the engine computed whole at publish time stays as published.
     assert summary["gamma_flip"] == Decimal("497.5")
-    assert summary["max_pain"] == Decimal("500")
     assert summary["net_gex_at_spot"] == Decimal("-1000")
-    # The anchor rode along for the re-pick only.
+    assert summary["max_gamma_strike"] == Decimal("495")
+    # The anchor and the breakdown rode along for the after-close step only.
     assert "wall_anchor" not in summary
+    assert "max_pain_by_expiration" not in summary
     # And the response model carries the dates as ISO strings.
     body = GEXSummary(**summary).model_dump(mode="json")
     assert body["expired_excluded"] == ["2026-10-30"]
+    assert body["rolled_to_expiration"] == "2026-11-02"
     assert body["put_wall"] == 490.0
+    assert body["max_pain"] == 505.0
 
 
 def test_during_the_session_the_summary_is_served_as_read(monkeypatch):
@@ -394,9 +481,14 @@ def test_during_the_session_the_summary_is_served_as_read(monkeypatch):
     assert "expired_excluded" not in summary
     assert summary["put_wall"] == Decimal("495")
     assert summary["net_gex"] == Decimal(str(-400.0 * SCALE))
+    # Friday's own max pain and pin, as published, while Friday still trades.
+    assert summary["max_pain"] == Decimal("500")
+    assert summary["pin_strike"] == Decimal("500")
     assert "wall_anchor" not in summary
-    assert conn.expired_calls == []
-    assert GEXSummary(**summary).model_dump(mode="json")["expired_excluded"] == []
+    assert "max_pain_by_expiration" not in summary
+    assert conn.expiration_calls == [] and conn.chain_calls == []
+    body = GEXSummary(**summary).model_dump(mode="json")
+    assert body["expired_excluded"] == [] and body["rolled_to_expiration"] is None
 
 
 def test_a_delayed_summary_judges_expiry_at_its_own_moment(monkeypatch):
@@ -446,12 +538,14 @@ def test_a_failed_after_close_read_serves_the_closing_book_as_published(monkeypa
 
     class _Failing(_Conn):
         async def fetch(self, query, *args, **kwargs):
-            if "-- expired expirations in a snapshot" in query:
+            if "-- expirations in a snapshot" in query:
                 raise RuntimeError("statement timeout")
             return await super().fetch(query, *args, **kwargs)
 
     _, newest = asyncio.run(_db(_Failing()).get_strike_profile_timeseries("SPX", "5min", 40))
     assert "expired_excluded" not in newest and newest["put_wall"] == 495.0
+    # With no read of what is next, the expired same-day pin is not served.
+    assert newest["pin_strike"] is None
 
 
 def test_the_bucket_model_serializes_the_removed_dates():
@@ -498,3 +592,166 @@ def test_the_latest_by_strike_rows_leave_out_expired_expirations(monkeypatch):
     # The cutoff is part of the cache key: the bell is not served from a
     # body cached a second before it.
     assert after == ("SPX", 200, date(2026, 10, 31))
+
+
+# ---------------------------------------------------------------------------
+# The Pin model the API rolls with is the engine's own
+# ---------------------------------------------------------------------------
+
+
+def test_the_engine_and_the_api_price_the_pin_with_one_model():
+    """The engine's same-day pin and the API's rolled pin both come from
+    pin_strike_for_expiration; for the same contracts and expiration they are
+    the same answer, so a rolled pin is the pin the engine would publish."""
+    from src.analytics.main_engine import AnalyticsEngine, pin_strike_for_expiration
+
+    engine = AnalyticsEngine(underlying="SPX")
+    in_session = _et(2, "10:30", month=11)
+    options = [
+        {
+            **row,
+            "strike": float(row["strike"]),
+            "implied_volatility": float(row["implied_volatility"]),
+        }
+        for row in MONDAY_CHAIN
+    ]
+    published = engine._calculate_pin_strike(options, CLOSE, in_session)
+    shared = pin_strike_for_expiration(
+        options,
+        symbol=engine.db_symbol,
+        spot=CLOSE,
+        timestamp=in_session,
+        expiration=MONDAY,
+        risk_free_rate=engine.risk_free_rate,
+        dividend_yield=engine.dividend_yield,
+    )
+    assert published.is_active
+    assert published.summary_fields() == shared.summary_fields()
+
+
+# ---------------------------------------------------------------------------
+# /api/max-pain/current
+# ---------------------------------------------------------------------------
+
+
+class _MaxPainConn:
+    """The daily snapshot (as of Friday's pre-market), its per-expiration rows,
+    the live overlay off the closing gex_summary row, and the after-close read."""
+
+    async def fetchrow(self, query, *args, **_kwargs):
+        if "FROM max_pain_oi_snapshot\n" in query:
+            return {
+                "symbol": "SPX",
+                "as_of_date": FRIDAY,
+                "source_timestamp": _et(30, "08:00"),
+                "underlying_price": Decimal("498"),
+                "max_pain": Decimal("500"),
+                "difference": Decimal("2"),
+            }
+        if "live_max_pain" in query:
+            return {
+                "live_timestamp": REP_B,
+                "live_max_pain": Decimal("500"),
+                "live_max_pain_by_expiration": json.dumps(
+                    {"2026-10-30": 500.0, "2026-11-02": 505.0, "2026-11-20": 520.0}
+                ),
+                "live_underlying_price": Decimal(str(CLOSE)),
+            }
+        raise AssertionError(f"unexpected fetchrow: {query[:120]}")
+
+    async def fetch(self, query, *args, **_kwargs):
+        if "FROM max_pain_oi_snapshot_expiration" in query:
+            return [
+                {
+                    "expiration": exp,
+                    "max_pain": Decimal(str(mp)),
+                    "difference_from_underlying": Decimal(str(mp - 498)),
+                    "strikes": "[]",
+                }
+                for exp, mp in ((FRIDAY, 500.0), (MONDAY, 505.0), (date(2026, 11, 20), 520.0))
+            ]
+        if "-- expirations in a snapshot" in query:
+            return [{"expiration": e} for e in (FRIDAY, MONDAY, date(2026, 11, 20))]
+        if "-- surviving strikes in a snapshot" in query:
+            return _surviving_rows()
+        raise AssertionError(f"unexpected fetch: {query[:120]}")
+
+
+def test_after_the_close_current_max_pain_is_the_next_expirations(monkeypatch):
+    _read_at(monkeypatch, SUNDAY_NIGHT)
+    current = asyncio.run(_db(_MaxPainConn()).get_max_pain_current("SPX"))
+    assert current["max_pain"] == 505.0
+    assert current["difference"] == pytest.approx(505.0 - CLOSE)
+    # The settled expiration is no longer "current" either.
+    assert [e["expiration"] for e in current["expirations"]] == [MONDAY, date(2026, 11, 20)]
+
+    _read_at(monkeypatch, FRIDAY_IN_SESSION)
+    during = asyncio.run(_db(_MaxPainConn()).get_max_pain_current("SPX"))
+    assert during["max_pain"] == Decimal("500")
+    assert [e["expiration"] for e in during["expirations"]][0] == FRIDAY
+
+
+# ---------------------------------------------------------------------------
+# Pin stability: the closed session's path, hidden once the pin has rolled
+# ---------------------------------------------------------------------------
+
+
+def _pin_stability_client(monkeypatch):
+    import sys
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    for name in ("API_KEY", "ENVIRONMENT", "CORS_ALLOW_ORIGINS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    for mod in list(sys.modules):
+        if mod.startswith("src.api"):
+            sys.modules.pop(mod, None)
+
+    from src.api import database as dbmod
+
+    frames = [
+        {"timestamp": _et(30, f"{hh}:{mm:02d}"), "pin_strike": 500.0}
+        for hh in (14, 15)
+        for mm in range(0, 60, 5)
+    ]
+    dbmod.DatabaseManager.connect = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.disconnect = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.check_health = AsyncMock(return_value=True)
+    dbmod.DatabaseManager.get_latest_quote = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.get_pin_path_for_session = AsyncMock(return_value=frames)
+
+    from src.api.main import app
+
+    return TestClient(app)
+
+
+def test_pin_stability_is_hidden_once_the_session_has_closed(monkeypatch):
+    client = _pin_stability_client(monkeypatch)
+    _read_at(monkeypatch, FRIDAY_IN_SESSION)
+    with client:
+        during = client.get("/api/gex/pin-stability?symbol=SPX")
+    assert during.status_code == 200
+    assert during.json()["current_pin"] == 500.0
+
+    _read_at(monkeypatch, _et(30, "16:00"))
+    with client:
+        after = client.get("/api/gex/pin-stability?symbol=SPX")
+    assert after.status_code == 404
+
+
+def test_without_the_live_row_current_max_pain_rolls_on_the_daily_snapshot(monkeypatch):
+    """No live overlay: the daily snapshot's headline is its front expiration,
+    and once that has settled the next listed one is the front."""
+
+    class _NoLive(_MaxPainConn):
+        async def fetchrow(self, query, *args, **kwargs):
+            if "live_max_pain" in query:
+                return None
+            return await super().fetchrow(query, *args, **kwargs)
+
+    _read_at(monkeypatch, SUNDAY_NIGHT)
+    current = asyncio.run(_db(_NoLive()).get_max_pain_current("SPX"))
+    assert current["max_pain"] == Decimal("505.0")
+    assert [e["expiration"] for e in current["expirations"]] == [MONDAY, date(2026, 11, 20)]

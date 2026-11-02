@@ -11,6 +11,7 @@ import traceback
 from collections import OrderedDict, defaultdict
 from typing import Awaitable, Callable, List, Dict, Mapping, Optional, Any, Tuple, Iterable
 from datetime import datetime, timedelta, date, time, timezone
+from decimal import Decimal
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 import logging
@@ -84,6 +85,43 @@ _UNSET: Any = object()
 # changing at the close (the engine keeps a closed session's last row as it
 # was published), so this only bounds how long a rewrite would go unseen.
 _POST_CLOSE_BOOK_TTL_SECONDS = 60.0
+
+
+def _max_pain_by_expiration(raw: Any) -> Dict[date, float]:
+    """``gex_summary.max_pain_by_expiration`` as ``{expiration: strike}``.
+
+    asyncpg hands JSONB back as text by default; keys are ISO dates.  Anything
+    unreadable is skipped rather than failing the summary over one entry.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[date, float] = {}
+    for key, value in raw.items():
+        try:
+            out[date.fromisoformat(str(key)[:10])] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _as_date(value: Any) -> Optional[date]:
+    """A calendar date from a stored value: a date, an ISO ``YYYY-MM-DD``
+    string, or ``None`` for anything else (which callers then leave alone)."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
 
 
 def _et_date(ts: datetime) -> date:
@@ -863,6 +901,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # The TTL bounds staleness if analytics ever rewrites history (a
         # backfill, a replayed session); closed buckets are otherwise
         # immutable, so it can be generous.  900s is a reasonable start.
+        # The rolled Pin (see _rolled_pin) reads the closing snapshot's chain
+        # over the engine's own steady-state lookback, so it sees the contracts
+        # the engine's last same-day pin did.
+        self._post_close_chain_lookback_hours: float = _getenv_float(
+            "ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", 2.0, min=1.0 / 12.0
+        )
         self._strike_profile_bucket_cache_ttl_seconds: float = _getenv_float(
             "STRIKE_PROFILE_TIMESERIES_BUCKET_CACHE_TTL_SECONDS", 0.0
         )
@@ -2191,6 +2235,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.local_gex,
                     gs.convexity_risk,
                     gs.max_pain,
+                    gs.max_pain_by_expiration,
                     gs.total_call_oi,
                     gs.total_put_oi,
                     gs.put_call_ratio,
@@ -2342,9 +2387,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 COALESCE(ls.stored_call_wall, fcw.strike) AS call_wall,
                 COALESCE(ls.stored_put_wall,  fpw.strike)  AS put_wall,
                 -- Read by _settle_summary_after_close (to re-pick the walls
-                -- once the day's expiration has left the book) and popped
-                -- there, so it never reaches a response.
+                -- and roll Max Pain once the day's expiration has left the
+                -- book) and popped there, so neither reaches a response.
                 ls.wall_anchor,
+                ls.max_pain_by_expiration,
                 -- Ranked ladders behind the optional C2/C3 · P2/P3 levels.
                 -- Assembled into WallLevel dicts below, where rank 1 is also
                 -- pinned to the call_wall / put_wall reported above.
@@ -2508,28 +2554,40 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         payload: Dict[str, Any],
         as_of: Optional[datetime],
     ) -> None:
-        """Re-derive a summary row's per-strike parts once its book has expired.
+        """Re-derive a summary row's after-the-close parts.
 
         After the close the newest row is the session's last, and it still
         counts the day's expiring contracts.  This re-picks the walls (and
         the C2/C3 · P2/P3 ladders) and re-sums the Net GEX totals from the
         strikes that survive, and names the expirations it left out in
-        ``expired_excluded``.  Everything the engine computed whole when it
-        published the row -- the flip, net GEX at spot, max pain, the pin, the
-        GEX King, open-interest totals -- stays as published.
+        ``expired_excluded``.  It also rolls the two levels that describe ONE
+        expiration to the one that settles next, named in
+        ``rolled_to_expiration``: ``max_pain`` from the row's per-expiration
+        breakdown, and the Pin Strike (``pin_*``) priced on that expiration's
+        contracts in the same snapshot (``_rolled_pin``).  The rest of what the
+        engine computed whole when it published the row -- the flip, net GEX
+        at spot, the GEX King, open-interest totals -- stays as published.
 
-        Always consumes ``wall_anchor``, which the summary query surfaces for
-        this alone.  A row from today's session, or one whose expirations are
-        all still trading, is left exactly as read.
+        Always consumes ``wall_anchor`` and ``max_pain_by_expiration``, which
+        the summary query surfaces for this alone.  A row from today's session
+        is left exactly as read.
         """
         anchor = payload.pop("wall_anchor", None)
+        max_pain_by_expiration = _max_pain_by_expiration(
+            payload.pop("max_pain_by_expiration", None)
+        )
         ts = payload.get("timestamp")
         if not isinstance(ts, datetime):
             return
         floor = self._live_expiration_floor(as_of)
         if _et_date(ts) >= floor:
             return
-        expired, strikes = await self._post_close_book(conn, symbol, ts, floor)
+        expired, strikes, next_expiration = await self._post_close_book(conn, symbol, ts, floor)
+        payload["max_pain"] = (
+            max_pain_by_expiration.get(next_expiration) if next_expiration is not None else None
+        )
+        payload.update(await self._rolled_pin(conn, symbol, ts, next_expiration))
+        payload["rolled_to_expiration"] = next_expiration
         if not expired:
             return
         spot = payload.get("spot_price")
@@ -2814,22 +2872,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         snapshot_ts: datetime,
         floor: date,
         exp_filter: Optional[List[date]] = None,
-    ) -> Tuple[List[date], List[Dict[str, Any]]]:
+    ) -> Tuple[List[date], List[Dict[str, Any]], Optional[date]]:
         """One snapshot's book without the expirations that have expired.
 
-        Returns ``(expired, strikes)``: the expirations in the snapshot dated
-        before ``floor`` (within ``exp_filter`` when one is given), and the
-        per-strike sums of everything else, ascending by strike, as
-        ``{strike, call_gamma, put_gamma, call_oi, put_oi}`` with the gamma
+        Returns ``(expired, strikes, next_expiration)``: the expirations in the
+        snapshot dated before ``floor`` (within ``exp_filter`` when one is
+        given); the per-strike sums of everything else, ascending by strike,
+        as ``{strike, call_gamma, put_gamma, call_oi, put_oi}`` with the gamma
         columns raw (OI-weighted, unsigned), exactly as the strike-profile read
-        sums them.  ``([], [])`` when nothing in the snapshot has expired; the
-        caller then leaves its payload as it is.
+        sums them; and the earliest expiration in the WHOLE chain on or after
+        ``floor`` (never filtered: it is the one the Max Pain and the Pin roll
+        to, and those are whole-chain levels).  ``strikes`` is ``[]`` when
+        nothing in the snapshot has expired; the caller then leaves its book
+        as it is.
 
         Only called for a snapshot taken on an earlier day than ``floor``, so
         an in-session read never pays for it.  The answer cannot change until
         the snapshot or the floor does, so it is cached on both.  A failed read
-        degrades to "nothing expired", which serves the closing book as it was
-        published rather than failing the endpoint.
+        degrades to "nothing expired, nothing next", which serves the closing
+        book as it was published rather than failing the endpoint.
         """
         cache_key = (
             f"post_close_book:{symbol}:{snapshot_ts.isoformat()}:"
@@ -2839,14 +2900,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
-        expired_query = """
-            -- expired expirations in a snapshot
+        expirations_query = """
+            -- expirations in a snapshot
             SELECT DISTINCT expiration
             FROM gex_by_strike
             WHERE underlying = $1
               AND timestamp = $2
-              AND expiration < $3::date
-              AND ($4::date[] IS NULL OR expiration = ANY($4::date[]))
             ORDER BY expiration
         """
         surviving_query = """
@@ -2871,8 +2930,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         params = (symbol, snapshot_ts, floor, exp_filter)
         try:
-            expired_rows = await self._fetch_timed(conn, expired_query, *params, timeout=10.0)
-            expired = [r["expiration"] for r in expired_rows]
+            listed = [
+                r["expiration"]
+                for r in await self._fetch_timed(
+                    conn, expirations_query, symbol, snapshot_ts, timeout=10.0
+                )
+            ]
+            in_scope = set(exp_filter) if exp_filter is not None else None
+            expired = [e for e in listed if e < floor and (in_scope is None or e in in_scope)]
+            next_expiration = min((e for e in listed if e >= floor), default=None)
             strikes: List[Dict[str, Any]] = []
             if expired:
                 strikes = [
@@ -2887,10 +2953,133 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 snapshot_ts,
                 e,
             )
-            return [], []
-        result = (expired, strikes)
+            return [], [], None
+        result = (expired, strikes, next_expiration)
         self._cache_set(cache_key, result, _POST_CLOSE_BOOK_TTL_SECONDS, units=len(strikes) + 1)
         return result
+
+    async def _rolled_pin(
+        self,
+        conn: Any,
+        symbol: str,
+        snapshot_ts: datetime,
+        expiration: Optional[date],
+    ) -> Dict[str, Any]:
+        """The Pin Strike rolled to ``expiration``, from the snapshot's own chain.
+
+        The engine's pin is 0DTE by construction, so after the close the
+        published one describes contracts that have expired.  This prices the
+        same model (:func:`src.analytics.main_engine.pin_strike_for_expiration`)
+        on the contracts of the expiration that settles next, as they stood in
+        the snapshot -- the latest quote per contract at or before it, over the
+        engine's own lookback, against the underlying's close at or before it
+        and with the reachability horizon measured from it.  Returns the four
+        persisted pin fields (``pin_strike``, ``pin_score``, ``pin_confidence``,
+        ``pin_strike_reason``); an inactive pin carries its reason, and no
+        ``expiration`` reads as ``NO_0DTE_EXPIRATION``.
+
+        A snapshot's chain does not change once its session has closed, so the
+        answer is cached on the snapshot and the expiration, and concurrent
+        misses share one read.  A failed read is not cached and reads as an
+        inactive pin rather than the expired one.
+        """
+        from src.analytics import pin_strike as pin_strike_mod
+
+        none = {"pin_strike": None, "pin_score": None, "pin_confidence": None}
+        if expiration is None:
+            return {**none, "pin_strike_reason": pin_strike_mod.REASON_NO_0DTE_EXPIRATION}
+        cache_key = f"rolled_pin:{symbol}:{snapshot_ts.isoformat()}:{expiration.isoformat()}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        async def _produce() -> Dict[str, Any]:
+            from src.analytics.main_engine import pin_strike_for_expiration
+            from src.config import RISK_FREE_RATE, resolve_dividend_yield
+
+            spot_query = """
+                -- spot at a snapshot
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp <= $2
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """
+            chain_query = """
+                -- one expiration's chain at a snapshot
+                SELECT DISTINCT ON (option_symbol)
+                    option_symbol,
+                    strike,
+                    expiration,
+                    option_type,
+                    open_interest,
+                    implied_volatility
+                FROM option_chains
+                WHERE underlying = $1
+                  AND timestamp <= $2
+                  AND timestamp >= $3
+                  AND expiration = $4::date
+                  AND gamma IS NOT NULL
+                ORDER BY option_symbol, timestamp DESC
+            """
+            lookback_start = snapshot_ts - timedelta(hours=self._post_close_chain_lookback_hours)
+            try:
+                spot_row = await self._fetch_timed(
+                    conn, spot_query, symbol, snapshot_ts, timeout=10.0, fetchrow=True
+                )
+                rows = await self._fetch_timed(
+                    conn, chain_query, symbol, snapshot_ts, lookback_start, expiration, timeout=15.0
+                )
+            except Exception as e:
+                logger.warning(
+                    "Rolled pin for %s %s at %s unavailable (%s); serving no pin",
+                    symbol,
+                    expiration,
+                    snapshot_ts,
+                    e,
+                )
+                return {**none, "pin_strike_reason": pin_strike_mod.REASON_INSUFFICIENT_OPTION_DATA}
+            spot = float(spot_row["close"]) if spot_row and spot_row["close"] is not None else None
+            if spot is None or spot <= 0:
+                fields = {
+                    **none,
+                    "pin_strike_reason": pin_strike_mod.REASON_INSUFFICIENT_OPTION_DATA,
+                }
+            else:
+                options = [
+                    {
+                        "option_symbol": r["option_symbol"],
+                        "strike": float(r["strike"]),
+                        "expiration": r["expiration"],
+                        "option_type": r["option_type"],
+                        "open_interest": int(r["open_interest"] or 0),
+                        "implied_volatility": (
+                            float(r["implied_volatility"])
+                            if r["implied_volatility"] is not None
+                            else None
+                        ),
+                    }
+                    for r in rows
+                ]
+                # Off the event loop: the model re-prices the chain at every
+                # candidate strike, which is CPU work the other requests on
+                # this worker should not wait behind.
+                result = await asyncio.to_thread(
+                    pin_strike_for_expiration,
+                    options,
+                    symbol=symbol,
+                    spot=spot,
+                    timestamp=snapshot_ts,
+                    expiration=expiration,
+                    risk_free_rate=RISK_FREE_RATE,
+                    dividend_yield=resolve_dividend_yield(symbol),
+                )
+                fields = result.summary_fields()
+            self._cache_set(cache_key, fields, _POST_CLOSE_BOOK_TTL_SECONDS)
+            return fields
+
+        return await self._single_flight(cache_key, _produce)  # type: ignore[no-any-return]
 
     @staticmethod
     def _wall_inputs(strikes: List[Dict[str, Any]]) -> List[Dict[str, float]]:
@@ -2959,13 +3148,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         published: it is horizon-weighted, so contracts in their last minutes
         carry almost no weight in it.  A bucket from today's session is left
         exactly as read.
+
+        The Pin Strike rolls with it, as on the summary: the bucket's pin is the
+        one priced on the expiration that settles next (``_rolled_pin``), in
+        every expiration scope, because the pin is whole-chain by definition.
         """
         if not isinstance(snapshot_ts, datetime):
             return
         floor = self._live_expiration_floor(as_of)
         if _et_date(snapshot_ts) >= floor:
             return
-        expired, strikes = await self._post_close_book(conn, symbol, snapshot_ts, floor, exp_filter)
+        expired, strikes, next_expiration = await self._post_close_book(
+            conn, symbol, snapshot_ts, floor, exp_filter
+        )
+        pin = await self._rolled_pin(conn, symbol, snapshot_ts, next_expiration)
+        bucket["pin_strike"] = pin["pin_strike"]
+        bucket["pin_confidence"] = pin["pin_confidence"]
         if not expired:
             return
         close = bucket.get("close")
@@ -9603,7 +9801,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         response stays internally consistent.
         """
         symbol = symbol.upper()
-        cache_key = f"max_pain_current:{symbol}"
+        # After the close the headline rolls to the expiration that settles
+        # next and the expired one leaves the list (see below), so the answer
+        # changes at the bell, and the cutoff is part of the key.
+        floor = self._live_expiration_floor()
+        cache_key = f"max_pain_current:{symbol}:{floor.isoformat()}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -9651,7 +9853,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             live_params.append(sorted(NYSE_HOLIDAYS))
         live_query = f"""
             WITH gs AS (
-                SELECT timestamp, max_pain::numeric AS max_pain
+                SELECT timestamp, max_pain::numeric AS max_pain, max_pain_by_expiration
                 FROM gex_summary
                 WHERE underlying = $1{session_filter}
                 ORDER BY timestamp DESC
@@ -9667,6 +9869,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT
                 gs.timestamp AS live_timestamp,
                 gs.max_pain AS live_max_pain,
+                gs.max_pain_by_expiration AS live_max_pain_by_expiration,
                 uq.underlying_price AS live_underlying_price
             FROM (SELECT 1) AS d
             LEFT JOIN gs ON TRUE
@@ -9687,6 +9890,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             expiration_rows = await conn.fetch(expiration_query, symbol, snapshot["as_of_date"])
             expirations: List[Dict[str, Any]] = []
             for row in expiration_rows:
+                # The daily snapshot lists the session's own expiration; from
+                # the close it has expired and is no longer "current".
+                listed_exp = _as_date(row["expiration"])
+                if listed_exp is not None and listed_exp < floor:
+                    continue
                 strikes = row["strikes"]
                 if isinstance(strikes, str):
                     strikes = json.loads(strikes)
@@ -9709,11 +9917,41 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 underlying_price = live["live_underlying_price"]
                 max_pain = live["live_max_pain"]
                 difference = max_pain - underlying_price
+                if isinstance(timestamp, datetime) and _et_date(timestamp) < floor:
+                    # After the close the latest row's max pain is the
+                    # expiration that just settled.  Roll to the one that
+                    # settles next, as /api/gex/summary does: the same
+                    # expiration, from the same row's per-expiration breakdown.
+                    _, _, next_expiration = await self._post_close_book(
+                        conn, symbol, timestamp, floor
+                    )
+                    rolled = _max_pain_by_expiration(live["live_max_pain_by_expiration"]).get(
+                        next_expiration
+                    )
+                    if rolled is None and expirations:
+                        # No breakdown on the row: the daily snapshot's next
+                        # expiration, already filtered to the ones still live.
+                        rolled = expirations[0]["max_pain"]
+                    max_pain = rolled
+                    # Decimal like the in-session path, so the difference
+                    # reads 114.3, not float noise.
+                    difference = (
+                        Decimal(str(rolled)) - Decimal(str(underlying_price))
+                        if rolled is not None
+                        else None
+                    )
             else:
                 timestamp = snapshot["source_timestamp"]
                 underlying_price = snapshot["underlying_price"]
                 max_pain = snapshot["max_pain"]
                 difference = snapshot["difference"]
+                snapshot_day = _as_date(snapshot["as_of_date"])
+                if snapshot_day is not None and snapshot_day < floor:
+                    # The daily snapshot's headline is its front expiration;
+                    # once that has settled, the next one is the front.
+                    front = expirations[0] if expirations else None
+                    max_pain = front["max_pain"] if front else None
+                    difference = front["difference_from_underlying"] if front else None
 
             result = {
                 "timestamp": timestamp,

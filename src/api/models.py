@@ -116,10 +116,16 @@ class GEXSummary(BaseModel):
     # session's last snapshot, which counts the day's expiring contracts, so
     # the walls (and ladders) are re-picked and ``total_call_gex`` /
     # ``total_put_gex`` / ``net_gex`` re-summed from the strikes that survive,
-    # and the dates removed are listed here.  The fields the engine computed
-    # whole at publish time (flip, net GEX at spot, max pain, pin, GEX King,
-    # OI totals) stay as published.
+    # and the dates removed are listed here.
     expired_excluded: List[date] = Field(default_factory=list)
+    # After the close: the expiration ``max_pain`` and the Pin Strike
+    # (``pin_*``) now describe -- the one that settles next, since the
+    # session's own has expired.  ``max_pain`` is that expiration's max pain
+    # and the pin is priced on its contracts in the same snapshot.  Null
+    # during the session, when both describe the nearest (same-day)
+    # expiration as published.  The flip, net GEX at spot, the GEX King and the
+    # OI totals stay as published either way.
+    rolled_to_expiration: Optional[date] = None
 
     class Config:
         from_attributes = True
@@ -1080,8 +1086,10 @@ class MaxPainCurrent(BaseModel):
     timestamp: datetime
     symbol: str
     underlying_price: Decimal
-    max_pain: Decimal
-    difference: Decimal
+    # After the close, the expiration that settles next (the session's own has
+    # expired); null only if no next expiration has a max pain at all.
+    max_pain: Optional[Decimal] = None
+    difference: Optional[Decimal] = None
     expirations: list[MaxPainExpiration]
 
 
