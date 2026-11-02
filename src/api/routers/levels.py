@@ -34,12 +34,11 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Union
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.analytics.main_engine import (
     FLIP_REASON_BEYOND_MAX_DISTANCE,
@@ -47,6 +46,7 @@ from src.analytics.main_engine import (
     FLIP_REASON_ONE_SIDED,
 )
 from src.config import GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT
+from src.market_calendar import first_live_expiration
 
 from ..database import DatabaseManager
 from ..errors import handle_api_errors
@@ -54,14 +54,6 @@ from ..errors import handle_api_errors
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/levels", tags=["Levels (v1)"])
-
-_ET = ZoneInfo("America/New_York")
-
-# When a same-day expiration stops being the one a trader means by "0DTE".
-# The cash options settle at the 16:00 ET close; after it, ES and NQ keep
-# trading into the next session, and a rolling 0DTE pick that still drew the
-# settled expiry would be showing a book that no longer exists.
-_ZERO_DTE_ROLL_ET = time(16, 0)
 
 # The expiration universe the website's Expiry selector offers
 # (useChartExpirations asks /api/gex/expirations for the same window), so a
@@ -190,6 +182,12 @@ class LevelsResponse(BaseModel):
     pin_confidence: Optional[float] = None
     pin_strike_reason: Optional[str] = None
     profile: List[StrikeGamma]
+    #: Expirations left out of the walls and ``profile`` because they expired
+    #: at the close (``[]`` during the session).  After the close the newest
+    #: snapshot is still the session's last, which counts them; see
+    #: ``GEXSummary.expired_excluded``.  Always ``[]`` under an expiration
+    #: scope, which can only name an expiration that is still trading.
+    expired_excluded: List[date] = Field(default_factory=list)
 
 
 def _flip_label(
@@ -260,16 +258,15 @@ def _parse_expiration(raw: Optional[str]) -> Union[str, date]:
 def _resolve_zero_dte(listed: List[date], now: datetime) -> Optional[date]:
     """The expiration a rolling ``0dte`` pick means at ``now``.
 
-    Today's expiry until the 16:00 ET settlement, then the next one listed --
-    so a futures chart in the evening session, or on a weekend, draws the book
-    that settles next rather than the one that already has.  ``None`` when
-    nothing upcoming is listed.
+    Today's expiry until the close (16:00 ET, 13:00 on an early-close day),
+    then the next one listed -- so a futures chart in the evening session, or
+    on a weekend, draws the book that settles next rather than the one that
+    already has, which after the close is no longer in the book at all (see
+    ``first_live_expiration``).  ``None`` when nothing upcoming is listed.
     """
-    now_et = now.astimezone(_ET)
-    today = now_et.date()
-    settled_today = now_et.time() >= _ZERO_DTE_ROLL_ET
+    first_live = first_live_expiration(now)
     for exp in sorted(set(listed)):
-        if exp > today or (exp == today and not settled_today):
+        if exp >= first_live:
             return exp
     return None
 
@@ -346,7 +343,9 @@ async def _scoped_levels(
             )
     else:
         exp = scope  # type: ignore[assignment]
-        if exp < now.astimezone(_ET).date():
+        # Today's own date counts as expired from the close on: its contracts
+        # have left the current book, so there is nothing left to scope to.
+        if exp < first_live_expiration(now):
             raise HTTPException(
                 status_code=404,
                 detail=f"{sym} {exp.isoformat()} has expired; pick a later date or 0DTE",
@@ -517,4 +516,5 @@ async def get_levels(
         pin_confidence=_maybe_float(summary.get("pin_confidence")),
         pin_strike_reason=summary.get("pin_strike_reason"),
         profile=profile,
+        expired_excluded=(summary.get("expired_excluded") or []) if scope == "all" else [],
     )

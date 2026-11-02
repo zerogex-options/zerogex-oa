@@ -111,12 +111,22 @@ class GEXSummary(BaseModel):
     pin_score: Optional[float] = None
     pin_confidence: Optional[float] = None
     pin_strike_reason: Optional[str] = None
+    # Expirations left out of this row because they have expired.  Empty
+    # during the session.  After the close the newest row is still the
+    # session's last snapshot, which counts the day's expiring contracts, so
+    # the walls (and ladders) are re-picked and ``total_call_gex`` /
+    # ``total_put_gex`` / ``net_gex`` re-summed from the strikes that survive,
+    # and the dates removed are listed here.  The fields the engine computed
+    # whole at publish time (flip, net GEX at spot, max pain, pin, GEX King,
+    # OI totals) stay as published.
+    expired_excluded: List[date] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
         json_encoders = {
             Decimal: lambda v: float(v) if v is not None else None,
             datetime: lambda v: v.isoformat() if v is not None else None,
+            date: lambda v: v.isoformat() if v is not None else None,
         }
 
 
@@ -208,12 +218,16 @@ class GEXProfile(BaseModel):
     net_gex_at_spot: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
+    # Same as GEXSummary.expired_excluded: after the close the walls above
+    # are the summary's, re-picked without these expired expirations.
+    expired_excluded: List[date] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
         json_encoders = {
             Decimal: lambda v: float(v) if v is not None else None,
             datetime: lambda v: v.isoformat() if v is not None else None,
+            date: lambda v: v.isoformat() if v is not None else None,
         }
 
 
@@ -1184,12 +1198,21 @@ class StrikeProfileBucket(BaseModel):
     # no Decimal round-trip for a value that is never money.
     pin_confidence: Optional[float] = None
     strikes: list[StrikeProfileStrike]
+    # Expirations left out of this bucket because they have expired.  Only
+    # ever set on the NEWEST bucket, and only once the book it was taken from
+    # has outlived some of its contracts: after the close that bucket is the
+    # session's last snapshot, carried until the next open, so its strikes and
+    # walls are rebuilt from what survives and the dates removed are listed
+    # here.  Every earlier bucket is history and keeps every contract that
+    # was trading at the time.  Empty otherwise.
+    expired_excluded: List[date] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
         json_encoders = {
             Decimal: lambda v: float(v) if v is not None else None,
             datetime: lambda v: v.isoformat() if v is not None else None,
+            date: lambda v: v.isoformat() if v is not None else None,
         }
 
 

@@ -137,3 +137,25 @@ def _no_wall_state_reads(monkeypatch):
         AnalyticsEngine, "_read_stored_wall_state", lambda self, at, *, inclusive: None
     )
     monkeypatch.setattr(AnalyticsEngine, "_wall_typical_move", lambda self, bucket_ts: None)
+
+
+# The reads that serve the CURRENT book (src/api/database.py) leave out every
+# expiration dated before market_calendar.first_live_expiration(), evaluated
+# against the wall clock.  The suite's fixtures are dated snapshots -- a
+# 2026-08-17 14:30 bucket, a 2026-10-09 10:30 summary row -- standing for reads
+# made while that session traded.  Against the real clock every one of them is
+# a session that closed long ago, so their reads would turn into after-the-
+# close reads, and the outcome would depend on the date the suite runs.  Pin
+# the clock before every fixture date instead: no snapshot has expired anything.
+# The after-the-close tests set the clock themselves.
+@pytest.fixture(autouse=True)
+def _every_fixture_session_still_trading(monkeypatch):
+    from datetime import datetime, timezone
+
+    import src.market_calendar as market_calendar
+
+    monkeypatch.setattr(
+        market_calendar,
+        "_expiration_clock",
+        lambda: datetime(2000, 1, 3, 15, 0, tzinfo=timezone.utc),
+    )

@@ -47,6 +47,7 @@ from src.hedging_flow_sql import (
 from src.market_calendar import (
     NYSE_HOLIDAYS,
     OPTION_CHAIN_CLOSE,
+    first_live_expiration,
     in_regular_session,
     is_trading_session,
     option_chain_feed_window,
@@ -79,6 +80,19 @@ REPLAY_SESSION_END = time(16, 0)
 # "No value yet" marker for streaming row folds, where ``None`` is a legitimate
 # value and so cannot double as the marker.
 _UNSET: Any = object()
+# How long one snapshot's after-the-close book is reused.  Its inputs stop
+# changing at the close (the engine keeps a closed session's last row as it
+# was published), so this only bounds how long a rewrite would go unseen.
+_POST_CLOSE_BOOK_TTL_SECONDS = 60.0
+
+
+def _et_date(ts: datetime) -> date:
+    """``ts``'s New York calendar date; a naive value is read as UTC."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(_ET).date()
+
+
 # One re-pick minute in an expiration view's day: the walls in place going into
 # it (``None`` on the day's first) and the walls it picked.  See
 # DatabaseManager._scope_wall_chain.
@@ -2327,6 +2341,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.max_pain,
                 COALESCE(ls.stored_call_wall, fcw.strike) AS call_wall,
                 COALESCE(ls.stored_put_wall,  fpw.strike)  AS put_wall,
+                -- Read by _settle_summary_after_close (to re-pick the walls
+                -- once the day's expiration has left the book) and popped
+                -- there, so it never reaches a response.
+                ls.wall_anchor,
                 -- Ranked ladders behind the optional C2/C3 · P2/P3 levels.
                 -- Assembled into WallLevel dicts below, where rank 1 is also
                 -- pinned to the call_wall / put_wall reported above.
@@ -2366,12 +2384,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             try:
                 async with self._acquire_connection() as conn:
                     row = await conn.fetchrow(query, symbol, DEFAULT_WALL_LADDER_DEPTH, as_of)
+                    delayed = dict(row) if row else None
+                    if delayed is not None:
+                        self._attach_wall_ladders(delayed)
+                        await self._settle_summary_after_close(conn, symbol, delayed, as_of)
             except Exception as e:
                 logger.error(f"Error fetching delayed GEX summary: {e}", exc_info=True)
                 raise
-            delayed = dict(row) if row else None
-            if delayed is not None:
-                self._attach_wall_ladders(delayed)
             return delayed
 
         try:
@@ -2395,6 +2414,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 payload = dict(row) if row else None
                 if payload is not None:
                     self._attach_wall_ladders(payload)
+                    await self._settle_summary_after_close(conn, symbol, payload, None)
                     ts = payload.get("timestamp")
                     if isinstance(ts, datetime) and (served is None or ts > served):
                         self._latest_gex_summary_served_ts[symbol] = ts
@@ -2480,6 +2500,52 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 side,
                 DEFAULT_WALL_LADDER_DEPTH,
             )
+
+    async def _settle_summary_after_close(
+        self,
+        conn: Any,
+        symbol: str,
+        payload: Dict[str, Any],
+        as_of: Optional[datetime],
+    ) -> None:
+        """Re-derive a summary row's per-strike parts once its book has expired.
+
+        After the close the newest row is the session's last, and it still
+        counts the day's expiring contracts.  This re-picks the walls (and
+        the C2/C3 · P2/P3 ladders) and re-sums the Net GEX totals from the
+        strikes that survive, and names the expirations it left out in
+        ``expired_excluded``.  Everything the engine computed whole when it
+        published the row -- the flip, net GEX at spot, max pain, the pin, the
+        GEX King, open-interest totals -- stays as published.
+
+        Always consumes ``wall_anchor``, which the summary query surfaces for
+        this alone.  A row from today's session, or one whose expirations are
+        all still trading, is left exactly as read.
+        """
+        anchor = payload.pop("wall_anchor", None)
+        ts = payload.get("timestamp")
+        if not isinstance(ts, datetime):
+            return
+        floor = self._live_expiration_floor(as_of)
+        if _et_date(ts) >= floor:
+            return
+        expired, strikes = await self._post_close_book(conn, symbol, ts, floor)
+        if not expired:
+            return
+        spot = payload.get("spot_price")
+        try:
+            spot_f = float(spot) if spot is not None else 0.0
+        except (TypeError, ValueError):
+            spot_f = 0.0
+        # Same dollar scale as the summary query's strike_totals CTE.
+        dollar_scale = 100.0 * spot_f * spot_f * 0.01
+        total_call = sum(float(s["call_gamma"] or 0.0) for s in strikes) * dollar_scale
+        total_put = -sum(float(s["put_gamma"] or 0.0) for s in strikes) * dollar_scale
+        payload["total_call_gex"] = total_call
+        payload["total_put_gex"] = total_put
+        payload["net_gex"] = total_call + total_put
+        self._repick_walls_after_close(payload, self._wall_inputs(strikes), spot, anchor)
+        payload["expired_excluded"] = expired
 
     async def get_pin_path_for_session(self, symbol: str = "SPY") -> List[Dict[str, Any]]:
         """The most recent session's per-minute Pin Strike path.
@@ -2719,6 +2785,234 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX expirations: {e}", exc_info=True)
             raise
 
+    # ------------------------------------------------------------------
+    # The book after the close
+    # ------------------------------------------------------------------
+    #
+    # The analytics engine keeps a cash-index session's last snapshot (SPX,
+    # NDX, and ES / NQ projected from them) as the newest row until the next
+    # open, and that snapshot still carries the day's expiring contracts,
+    # priced in their final minutes when their gamma is at its largest.  Read
+    # as "the book now", it drew per-strike bars and walls made of contracts
+    # that no longer exist, every night and all weekend: on Sunday 2026-11-01
+    # the public SPX Put Wall sat on a strike that was 72% Friday-expired
+    # contracts.  So the reads that serve the CURRENT book -- the latest
+    # by-strike rows, the newest strike-profile bucket, the summary's walls and
+    # Net GEX totals, and the profile's walls -- leave out every expiration
+    # dated before ``first_live_expiration`` and say which ones they left out
+    # (``expired_excluded``).  History is untouched: replay frames, older
+    # buckets and the stored rows read exactly as published.
+
+    def _live_expiration_floor(self, as_of: Optional[datetime] = None) -> date:
+        """The earliest expiration a read made now (or as of ``as_of``) serves."""
+        return first_live_expiration(as_of)
+
+    async def _post_close_book(
+        self,
+        conn: Any,
+        symbol: str,
+        snapshot_ts: datetime,
+        floor: date,
+        exp_filter: Optional[List[date]] = None,
+    ) -> Tuple[List[date], List[Dict[str, Any]]]:
+        """One snapshot's book without the expirations that have expired.
+
+        Returns ``(expired, strikes)``: the expirations in the snapshot dated
+        before ``floor`` (within ``exp_filter`` when one is given), and the
+        per-strike sums of everything else, ascending by strike, as
+        ``{strike, call_gamma, put_gamma, call_oi, put_oi}`` with the gamma
+        columns raw (OI-weighted, unsigned), exactly as the strike-profile read
+        sums them.  ``([], [])`` when nothing in the snapshot has expired; the
+        caller then leaves its payload as it is.
+
+        Only called for a snapshot taken on an earlier day than ``floor``, so
+        an in-session read never pays for it.  The answer cannot change until
+        the snapshot or the floor does, so it is cached on both.  A failed read
+        degrades to "nothing expired", which serves the closing book as it was
+        published rather than failing the endpoint.
+        """
+        cache_key = (
+            f"post_close_book:{symbol}:{snapshot_ts.isoformat()}:"
+            f"{floor.isoformat()}:{_exp_scope(exp_filter)}"
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        expired_query = """
+            -- expired expirations in a snapshot
+            SELECT DISTINCT expiration
+            FROM gex_by_strike
+            WHERE underlying = $1
+              AND timestamp = $2
+              AND expiration < $3::date
+              AND ($4::date[] IS NULL OR expiration = ANY($4::date[]))
+            ORDER BY expiration
+        """
+        surviving_query = """
+            -- surviving strikes in a snapshot
+            SELECT
+                strike,
+                SUM(COALESCE(call_gamma, 0))::numeric AS call_gamma,
+                SUM(COALESCE(put_gamma, 0))::numeric  AS put_gamma,
+                SUM(COALESCE(call_oi, 0))::bigint     AS call_oi,
+                SUM(COALESCE(put_oi, 0))::bigint      AS put_oi
+            FROM gex_by_strike
+            WHERE underlying = $1
+              AND timestamp = $2
+              AND expiration >= $3::date
+              AND ($4::date[] IS NULL OR expiration = ANY($4::date[]))
+            GROUP BY strike
+            HAVING SUM(COALESCE(call_gamma, 0)) <> 0
+                OR SUM(COALESCE(put_gamma, 0)) <> 0
+                OR SUM(COALESCE(call_oi, 0)) <> 0
+                OR SUM(COALESCE(put_oi, 0)) <> 0
+            ORDER BY strike
+        """
+        params = (symbol, snapshot_ts, floor, exp_filter)
+        try:
+            expired_rows = await self._fetch_timed(conn, expired_query, *params, timeout=10.0)
+            expired = [r["expiration"] for r in expired_rows]
+            strikes: List[Dict[str, Any]] = []
+            if expired:
+                strikes = [
+                    dict(r)
+                    for r in await self._fetch_timed(conn, surviving_query, *params, timeout=10.0)
+                ]
+        except Exception as e:
+            logger.warning(
+                "After-close book for %s at %s unavailable (%s); serving the snapshot "
+                "with its expired contracts",
+                symbol,
+                snapshot_ts,
+                e,
+            )
+            return [], []
+        result = (expired, strikes)
+        self._cache_set(cache_key, result, _POST_CLOSE_BOOK_TTL_SECONDS, units=len(strikes) + 1)
+        return result
+
+    @staticmethod
+    def _wall_inputs(strikes: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+        """``_post_close_book`` strikes as the float rows the wall helpers rank."""
+        return [
+            {
+                "strike": float(s["strike"]),
+                "call_gamma": float(s["call_gamma"] or 0.0),
+                "put_gamma": float(s["put_gamma"] or 0.0),
+            }
+            for s in strikes
+        ]
+
+    @staticmethod
+    def _repick_walls_after_close(
+        target: Dict[str, Any],
+        inputs: List[Dict[str, float]],
+        spot: Any,
+        anchor: Any,
+    ) -> None:
+        """Re-pick ``target``'s walls (and ladders) from the surviving strikes.
+
+        The day's expiration leaving the book is a reason to re-pick, like
+        price breaking out: the canonical ranking, split on the stored wall
+        anchor, with the walls the row published standing as the incumbents.
+        So a wall built from longer-dated contracts keeps its place unless a
+        rival is clearly bigger, and one that was mostly expiring contracts
+        hands over to whatever is biggest now.  Mutates ``target`` in place.
+        """
+        try:
+            spot_f = float(spot) if spot is not None else 0.0
+        except (TypeError, ValueError):
+            spot_f = 0.0
+        call_walls, put_walls = compute_wall_ladder(
+            inputs,
+            spot_f,
+            DEFAULT_WALL_LADDER_DEPTH,
+            anchor=float(anchor) if anchor is not None else None,
+            incumbent=(target.get("call_wall"), target.get("put_wall")),
+        )
+        target["call_walls"] = call_walls
+        target["put_walls"] = put_walls
+        target["call_wall"] = call_walls[0]["strike"] if call_walls else None
+        target["put_wall"] = put_walls[0]["strike"] if put_walls else None
+
+    async def _settle_bucket_after_close(
+        self,
+        conn: Any,
+        symbol: str,
+        bucket: Dict[str, Any],
+        snapshot_ts: Any,
+        anchor: Any,
+        exp_filter: Optional[List[date]],
+        as_of: Optional[datetime],
+    ) -> None:
+        """Rebuild the newest strike-profile bucket without its expired contracts.
+
+        Called for the window's newest bucket only: every earlier bucket is
+        history and keeps the contracts that were trading then.  When the
+        bucket's snapshot predates the expiration floor and holds expirations
+        dated before it, its strikes are rebuilt from the survivors on the
+        same dollar scale the read uses (the bucket's own close), its walls
+        are re-picked (see ``_repick_walls_after_close``), a filtered view's
+        flip is recomputed from the same strikes, and ``expired_excluded``
+        names the dates removed.  The All view's flip is the engine's, kept as
+        published: it is horizon-weighted, so contracts in their last minutes
+        carry almost no weight in it.  A bucket from today's session is left
+        exactly as read.
+        """
+        if not isinstance(snapshot_ts, datetime):
+            return
+        floor = self._live_expiration_floor(as_of)
+        if _et_date(snapshot_ts) >= floor:
+            return
+        expired, strikes = await self._post_close_book(conn, symbol, snapshot_ts, floor, exp_filter)
+        if not expired:
+            return
+        close = bucket.get("close")
+        try:
+            close_f = float(close) if close is not None else 0.0
+        except (TypeError, ValueError):
+            close_f = 0.0
+        scale = 100.0 * close_f * close_f * 0.01
+        rebuilt: List[Dict[str, Any]] = []
+        for s in strikes:
+            call_raw = float(s["call_gamma"] or 0.0)
+            put_raw = float(s["put_gamma"] or 0.0)
+            call_oi = int(s["call_oi"] or 0)
+            put_oi = int(s["put_oi"] or 0)
+            call_gex = call_raw * scale
+            put_gex = -put_raw * scale
+            net_gex = (call_raw - put_raw) * scale
+            # Same rule as the read: nothing to draw, nothing shipped.
+            if call_gex == 0 and put_gex == 0 and net_gex == 0 and call_oi == 0 and put_oi == 0:
+                continue
+            rebuilt.append(
+                {
+                    "strike": s["strike"],
+                    "call_gamma": call_gex,
+                    "put_gamma": put_gex,
+                    "net_gamma": net_gex,
+                    "call_oi": call_oi,
+                    "put_oi": put_oi,
+                }
+            )
+        bucket["strikes"] = rebuilt
+        inputs = self._wall_inputs(strikes)
+        if close is not None and inputs:
+            self._repick_walls_after_close(bucket, inputs, close_f, anchor)
+        else:
+            bucket["call_wall"] = None
+            bucket["put_wall"] = None
+            bucket["call_walls"] = []
+            bucket["put_walls"] = []
+        if exp_filter is not None:
+            bucket["gamma_flip"] = (
+                compute_gamma_flip_from_strikes(inputs, close_f)
+                if close is not None and inputs
+                else None
+            )
+        bucket["expired_excluded"] = expired
+
     async def get_gex_by_strike(
         self,
         symbol: str = "SPY",
@@ -2728,13 +3022,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         Get latest GEX breakdown by strike
 
+        Rows for expirations that have already expired are left out: after the
+        close the newest snapshot is the session's last, which still carries
+        the day's expiring contracts (see ``first_live_expiration``).  During
+        the session the predicate drops nothing.
+
         Args:
             symbol: Underlying symbol
             limit: Number of strikes to return
             sort_by: 'distance' (closest to spot) or 'impact' (highest absolute net GEX)
         """
         symbol = symbol.upper()
-        cache_key = f"gex_by_strike:{symbol}:{limit}:{sort_by}"
+        floor = self._live_expiration_floor()
+        cache_key = f"gex_by_strike:{symbol}:{limit}:{sort_by}:{floor.isoformat()}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -2780,13 +3080,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ORDER BY timestamp DESC
                     LIMIT 1
                 )
+                -- Expirations that have already expired (the day's own after
+                -- the close).  Drops nothing while the session is open.
+                AND g.expiration >= $3::date
             {order_clause}
             LIMIT $2
         """
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, limit, floor)
                 result = [dict(row) for row in rows]
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
@@ -2815,7 +3118,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         at the analytics TTL like the rest of the derived GEX surface.
         """
         symbol = symbol.upper()
-        cache_key = f"strike_gamma_profile:{symbol}:{strikes}"
+        # Expired expirations are left out, as in get_gex_by_strike.
+        floor = self._live_expiration_floor()
+        cache_key = f"strike_gamma_profile:{symbol}:{strikes}:{floor.isoformat()}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -2845,6 +3150,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 FROM gex_by_strike g
                 JOIN latest_ts lt ON g.timestamp = lt.timestamp
                 WHERE g.underlying = $1
+                  AND g.expiration >= $3::date
                 GROUP BY g.strike
             )
             SELECT
@@ -2862,7 +3168,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, strikes)
+                rows = await conn.fetch(query, symbol, strikes, floor)
                 result = [dict(row) for row in rows]
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
@@ -4248,12 +4554,30 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "call_wall": row["call_wall"],
                     "put_wall": row["put_wall"],
                 }
-                if as_of is None:
-                    self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
-                return payload
         except Exception as e:
             logger.error(f"Error fetching GEX profile: {e}", exc_info=True)
             raise
+        # After the close the walls are the summary's re-pick without the
+        # expired contracts (see _settle_summary_after_close): charts read the
+        # walls off this endpoint first, so it must not keep the published
+        # ones.  Outside the connection block above, because the summary read
+        # takes a connection of its own and the pool is only a few deep.
+        ts = payload["timestamp"]
+        if isinstance(ts, datetime) and _et_date(ts) < self._live_expiration_floor(as_of):
+            try:
+                summary = await self.get_latest_gex_summary(symbol, as_of=as_of)
+            except Exception as e:
+                # Serve the curve with the walls as published rather than fail
+                # the curve over its convenience fields.
+                logger.warning("GEX profile %s: after-close walls unavailable (%s)", symbol, e)
+                summary = None
+            if summary and summary.get("timestamp") == ts and summary.get("expired_excluded"):
+                payload["call_wall"] = summary.get("call_wall")
+                payload["put_wall"] = summary.get("put_wall")
+                payload["expired_excluded"] = summary["expired_excluded"]
+        if as_of is None:
+            self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+        return payload
 
     async def get_gex_historical_context(
         self,
@@ -4942,6 +5266,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 window_units=window_units,
                 expirations=exp_filter,
                 bucket_subset=chunk,
+                # The live bucket is the one an after-the-close read rebuilds
+                # (see _settle_bucket_after_close); only the chunk that holds
+                # it can tell, since a chunk sees its own buckets alone.
+                newest_bucket=live_ts,
             )
             if not part:
                 # The bucket list already established these buckets exist, so
@@ -5029,6 +5357,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         expirations: Optional[List[date]] = None,
         bucket_subset: Optional[List[Any]] = None,
         as_of: Optional[datetime] = None,
+        newest_bucket: Any = None,
     ) -> List[Dict[str, Any]]:
         """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
 
@@ -5487,6 +5816,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # walls) from its representative gex_summary row, kept out of
                 # the payload and consumed by _finalize_bucket.
                 bucket_anchors: Dict[Any, Tuple[Any, Any, Any, WallPair]] = {}
+                # Each bucket's (wall_anchor, rep_ts), kept for the whole read.
+                bucket_snapshots: Dict[Any, Tuple[Any, Any]] = {}
                 # All-view buckets whose walls come from an earlier re-pick
                 # minute's rows: (bucket_ts, wall_refresh_ts, wall_anchor,
                 # stored walls).  Filled by _finalize_bucket, resolved after the
@@ -5627,6 +5958,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             r.get("wall_refresh_ts"),
                             (r.get("stored_call_wall"), r.get("stored_put_wall")),
                         )
+                        # bucket_anchors is consumed as buckets finalize, and
+                        # the after-close step runs after that, so it reads here.
+                        bucket_snapshots[ts] = (r.get("wall_anchor"), r.get("rep_ts"))
                     if ts != pending_ts:
                         # Bucket boundary: the previous bucket has all its rows
                         # now, so finalise it and release its raw gamma rows.
@@ -5749,6 +6083,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             anchor,
                             link[0] if link is not None else None,
                         )
+                # The window's newest bucket is the book carried forward: after
+                # the close it is the session's last snapshot, and the contracts
+                # that expired at the bell come out of it.  A full read ends on
+                # it; a chunk holds it only when the driver says so.
+                settle_ts = (
+                    next(reversed(grouped), None) if bucket_subset is None else newest_bucket
+                )
+                if settle_ts is not None and settle_ts in grouped:
+                    snap_anchor, snap_ts = bucket_snapshots.get(settle_ts, (None, None))
+                    await self._settle_bucket_after_close(
+                        conn,
+                        symbol,
+                        grouped[settle_ts],
+                        snap_ts,
+                        snap_anchor,
+                        exp_filter,
+                        as_of,
+                    )
                 result = list(grouped.values())
                 # Release the raw rows before _cache_set. Modest — the frame is
                 # about to be dropped anyway, which frees them — but it keeps

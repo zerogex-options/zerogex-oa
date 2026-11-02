@@ -503,6 +503,46 @@ def regular_session_close(day: date) -> time:
     return NYSE_HALF_DAY_CLOSE if day in NYSE_HALF_DAYS else NYSE_REGULAR_CLOSE
 
 
+def _expiration_clock() -> datetime:
+    """Now, for :func:`first_live_expiration` when it is not handed a time.
+
+    Its own function so a test can pin the moment a read happens: whether
+    the newest book still holds the day's expiring contracts depends on
+    nothing else.  ``tests/conftest.py`` pins it for the whole unit suite.
+    """
+    return datetime.now(ET)
+
+
+def first_live_expiration(as_of: Optional[datetime] = None) -> date:
+    """The earliest option expiration date still trading at ``as_of``.
+
+    Every contract dated before the answer has expired: a same-day contract
+    stops trading at that day's regular close (16:00 ET, 13:00 on an
+    early-close day), so from the close on, the day's own expiration is gone
+    too and the answer moves to the next calendar day.  Before the close it
+    is still that day.  Weekends and holidays need no special case: nothing
+    expires on them, so "anything dated before today" is the whole rule there.
+
+    The cutoff is the regular close for every root, PM- and AM-settled alike.
+    An AM-settled index monthly (SPX, NDX) is dead from 09:30 on its third
+    Friday, but ``gex_by_strike`` rows are keyed (strike, expiration) and sum
+    it with the PM-settled weekly sharing that date (SPXW, NDXP), which trades
+    to the close; dropping the row at 09:30 would drop the live weekly with it.
+
+    This is the read-side rule for "has this expiration gone": the analytics
+    engine freezes the last snapshot of a cash-index session (SPX, NDX) until
+    the next open, and that snapshot still carries the day's expiring
+    contracts, priced in their final minutes.  Readers that serve the book as
+    it stands NOW drop rows dated before this.  ``as_of`` defaults to now and
+    is converted to ET, so naive UTC, aware, and ET datetimes all work.
+    """
+    as_of_et = _to_et(as_of if as_of is not None else _expiration_clock())
+    day = as_of_et.date()
+    if as_of_et.time() >= regular_session_close(day):
+        return day + timedelta(days=1)
+    return day
+
+
 def in_regular_session(dt: Optional[datetime] = None) -> bool:
     """True when ``dt`` (default: now) is inside the regular session.
 

@@ -608,10 +608,13 @@ aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
   default `40`.
 - `expiration` (optional): which expirations the levels describe.
   - `all` (default) — the whole chain, exactly as above.
-  - `0dte` — the nearest expiration that has not settled: today's until
-    16:00 ET, then the next one listed. So an ES or NQ chart in the evening
-    session, or on a weekend, gets the expiry that settles next.
-  - `YYYY-MM-DD` — that one expiration. Must be listed and not already past.
+  - `0dte` — the nearest expiration that has not settled: today's until the
+    close (16:00 ET, 13:00 on an early-close day), then the next one listed.
+    So an ES or NQ chart in the evening session, or on a weekend, gets the
+    expiry that settles next.
+  - `YYYY-MM-DD` — that one expiration. Must be listed and not already
+    expired; today's date counts as expired from the close (see
+    [After the close](#after-the-close-expired-contracts-leave-the-current-book)).
 
   A scoped request recomputes `call_wall`, `put_wall`, `gamma_flip` and the
   `profile` from that expiration's gamma alone, by the same rules as the
@@ -727,6 +730,40 @@ of the three forms.
 
 Scope: `gex` (the `analytics` tier).
 
+### After the close: expired contracts leave the current book
+
+The analytics engine publishes its last snapshot of a cash-index session
+(SPX, NDX, and ES / NQ projected from them) at 15:59 ET and keeps it as the
+newest row until the next open. That snapshot still counts the day's expiring
+contracts, priced in their final minutes, when their gamma is at its largest.
+So from the close (16:00 ET, 13:00 on an early-close day) until the next
+snapshot, every read of the **current** book leaves out the expirations that
+have expired:
+
+- `/api/gex/by-strike` and the `profile` of `/api/v1/levels` drop their rows.
+- `/api/gex/summary`, `/api/v1/levels` (and v2) re-pick `call_wall` /
+  `put_wall` and the `call_walls` / `put_walls` ladders from the surviving
+  strikes, with the published walls as incumbents: a wall built from
+  longer-dated contracts keeps its place unless a rival is clearly bigger.
+  The summary's `total_call_gex`, `total_put_gex` and `net_gex` are re-summed
+  the same way. `/api/gex/profile` reports the same walls.
+- The newest bucket of `/api/gex/strike-profile-timeseries` is rebuilt the
+  same way (strikes, walls, and under an `expirations` filter the flip).
+  Every earlier bucket is history and keeps the contracts that were trading
+  at the time.
+
+`/api/gex/summary`, `/api/gex/profile`, `/api/v1/levels` and each
+strike-profile bucket list the dates they left out in `expired_excluded`
+(`[]` during the session, under a `/api/v1/levels` expiration scope, and on
+every historical bucket); `/api/gex/by-strike` simply has no rows for them.
+The fields the
+engine computes from the whole chain when it publishes a row (`gamma_flip`,
+`net_gex_at_spot`, `max_pain`, `pin_*`, `max_gamma_strike`, the OI totals) stay
+as published. Replay frames, `/api/gex/historical`, `/api/gex/heatmap` and the
+stored rows are history and are never changed. A delayed read
+(`delay_minutes`) judges expiry at its own moment, so a 15-minute-delayed view
+drops the day's contracts at 16:15 ET.
+
 ### GET /api/gex/summary
 Get latest GEX summary with key metrics.
 
@@ -736,10 +773,12 @@ Get latest GEX summary with key metrics.
 Includes the nullable **Pin Strike** fields `pin_strike`, `pin_score`,
 `pin_confidence` and `pin_strike_reason` (same semantics as the
 `/api/v1/levels` fields above — hide, don't zero; a `REASON_*` code populates
-`pin_strike_reason` when there is no active pin).
+`pin_strike_reason` when there is no active pin), and `expired_excluded` (see
+above).
 
 ### GET /api/gex/by-strike
-Get GEX breakdown by individual strikes.
+Get GEX breakdown by individual strikes. After the close, rows for expired
+expirations are left out (see above).
 
 **Parameters:**
 - `symbol` (optional): default `SPY`

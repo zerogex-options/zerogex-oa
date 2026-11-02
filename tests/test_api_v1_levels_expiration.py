@@ -96,6 +96,42 @@ def test_zero_dte_is_none_when_nothing_upcoming_is_listed():
     assert _resolve_zero_dte([], _et(2026, 10, 13, 10, 0)) is None
 
 
+def test_zero_dte_rolls_at_one_oclock_on_an_early_close(monkeypatch):
+    """Same cutoff as the API's after-the-close book (first_live_expiration):
+    on a half day the day's options are gone from 13:00, not 16:00."""
+    import src.market_calendar as market_calendar
+    from src.api.routers.levels import _resolve_zero_dte
+
+    monkeypatch.setattr(market_calendar, "NYSE_HALF_DAYS", {date(2026, 10, 13)})
+    assert _resolve_zero_dte(LISTED, _et(2026, 10, 13, 12, 59)) == date(2026, 10, 13)
+    assert _resolve_zero_dte(LISTED, _et(2026, 10, 13, 13, 0)) == date(2026, 10, 14)
+
+
+def test_todays_date_is_expired_from_the_close():
+    """After the close today's contracts have left the current book, so a
+    request scoped to today's date is told it has expired rather than served
+    the session's history of contracts that no longer exist."""
+    from src.api.routers.levels import _scoped_levels
+
+    class _Db:
+        async def get_gex_expirations(self, *_args):
+            return LISTED
+
+        async def get_strike_profile_timeseries(self, *_args, **_kwargs):
+            return [_bucket()]
+
+        async def get_latest_max_pain_for_expiration(self, *_args):
+            return 6650.0
+
+    today = date(2026, 10, 13)
+    before = asyncio.run(_scoped_levels(_Db(), "SPX", today, 40, 6660.0, _et(2026, 10, 13, 15, 59)))
+    assert before["expiration"] == today
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(_scoped_levels(_Db(), "SPX", today, 40, 6660.0, _et(2026, 10, 13, 16, 0)))
+    assert err.value.status_code == 404
+    assert "has expired" in err.value.detail
+
+
 def test_latest_live_bucket_skips_a_tip_with_no_positioning():
     from src.api.routers.levels import _latest_live_bucket
 
@@ -251,6 +287,22 @@ def _build_app(monkeypatch, *, summary=None, timeseries=None, listed=None, max_p
     from src.api.main import app
 
     return TestClient(app), mocks
+
+
+def test_the_whole_chain_names_the_expirations_it_left_out_after_the_close(monkeypatch):
+    """The walls and profile come from the summary and the latest strikes,
+    which leave out the day's expired options after the close; the response
+    says which dates.  A scope can only name a live expiration, so it is []."""
+    summary = _summary(expired_excluded=[date(2026, 10, 13)])
+    client, _ = _build_app(monkeypatch, summary=summary)
+    with client:
+        whole = client.get("/api/v1/levels/SPX").json()
+        scoped = client.get("/api/v1/levels/SPX?expiration=0dte").json()
+    assert whole["expired_excluded"] == ["2026-10-13"]
+    assert scoped["expired_excluded"] == []
+    in_session, _ = _build_app(monkeypatch)
+    with in_session:
+        assert in_session.get("/api/v1/levels/SPX").json()["expired_excluded"] == []
 
 
 def test_no_parameter_and_all_serve_the_whole_chain_untouched(monkeypatch):

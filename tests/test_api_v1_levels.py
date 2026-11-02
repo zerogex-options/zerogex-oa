@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -72,8 +72,11 @@ def test_profile_query_aggregates_across_expirations_and_ranks_by_distance():
     assert "* 100 *" in sql and "* 0.01" in sql
     # nearest-to-spot ranking
     assert "ORDER BY ABS(ps.strike - s.close) ASC" in sql
-    # strikes limit is parameterised, not hard-coded
-    assert conn.args[0] == ("SPY", 40)
+    # strikes limit is parameterised, not hard-coded; the third parameter is
+    # the expiration floor (expired expirations are left out, see
+    # test_post_close_book.py), here the conftest clock's day.
+    assert "AND g.expiration >= $3::date" in sql
+    assert conn.args[0] == ("SPY", 40, date(2000, 1, 3))
 
 
 def test_profile_query_caches_at_analytics_ttl():
