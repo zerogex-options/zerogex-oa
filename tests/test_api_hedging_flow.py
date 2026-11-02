@@ -171,6 +171,127 @@ def test_symbol_is_upcased_before_query():
 
 
 # --------------------------------------------------------------------------- #
+# DatabaseManager.get_hedging_flow_series(timeframe="1min")
+#
+# Above the HTTP section on purpose: _attach replaces get_hedging_flow_series on
+# the DatabaseManager class itself, so a database test placed after it would
+# call the mock instead of the method.
+# --------------------------------------------------------------------------- #
+def _spy_on_session_resolution(db) -> List[int]:
+    """Record the bar each session resolution floors to, then defer to it."""
+    seen: List[int] = []
+    real = db._resolve_flow_series_session
+
+    async def _spy(conn, symbol, session, session_date=None, bar_seconds=300):
+        seen.append(bar_seconds)
+        return await real(conn, symbol, session, session_date, bar_seconds=bar_seconds)
+
+    db._resolve_flow_series_session = _spy  # type: ignore[method-assign]
+    return seen
+
+
+def test_one_minute_read_runs_the_minute_query_on_a_minute_grid():
+    from src.hedging_flow_sql import HEDGING_FLOW_1MIN_CTE_ASYNCPG
+
+    conn = _CannedConn(fetchval_sequence=_session_resolution(), fetch_rows=[_row(1), _row(0)])
+    db = _make_db(conn)
+    bar_seconds = _spy_on_session_resolution(db)
+
+    result = asyncio.run(db.get_hedging_flow_series(symbol="spy", timeframe="1min"))
+
+    assert [r["bar_start"] for r in result] == [_bar_ts(1), _bar_ts(0)]
+    assert bar_seconds == [60]
+    query, args = conn.fetch_calls[0]
+    assert query == HEDGING_FLOW_1MIN_CTE_ASYNCPG
+    assert args[0] == "SPY"
+
+
+def test_one_minute_dated_read_runs_the_query_not_the_five_minute_snapshot():
+    """hedging_flow_5min holds 5-minute bars only. An unfiltered dated read is
+    exactly the one the 5-minute path serves from the snapshot, so it is the
+    one a 1-minute read must not."""
+    from src.hedging_flow_sql import HEDGING_FLOW_1MIN_CTE_ASYNCPG
+
+    # Dated resolution probes the symbols table once, then resolves by date.
+    conn = _CannedConn(fetchval_sequence=[1], fetch_rows=[_row(0)])
+    db = _make_db(conn)
+
+    asyncio.run(
+        db.get_hedging_flow_series(symbol="SPY", session_date=date(2026, 4, 24), timeframe="1min")
+    )
+
+    query, args = conn.fetch_calls[0]
+    assert query == HEDGING_FLOW_1MIN_CTE_ASYNCPG
+    assert args[1] == datetime(2026, 4, 24, 13, 30, tzinfo=UTC)
+    assert args[3] is None and args[4] is None
+
+
+def test_one_minute_unknown_symbol_returns_none_without_running_the_query():
+    conn = _CannedConn(fetchval_sequence=[None])
+    db = _make_db(conn)
+
+    assert asyncio.run(db.get_hedging_flow_series(symbol="ABCDE", timeframe="1min")) is None
+    assert conn.fetch_calls == []
+
+
+def test_one_minute_tail_is_sliced_from_one_cached_read():
+    """The website polls; a tail must not run the query again inside the TTL."""
+    rows = [_row(3), _row(2), _row(1), _row(0)]
+    conn = _CannedConn(fetchval_sequence=_session_resolution(), fetch_rows=rows)
+    db = _make_db(conn)
+    db._flow_series_1min_cache_ttl_seconds = 60.0
+
+    full = asyncio.run(db.get_hedging_flow_series(symbol="SPY", timeframe="1min"))
+    tail = asyncio.run(db.get_hedging_flow_series(symbol="SPY", timeframe="1min", intervals=2))
+
+    assert len(full) == 4
+    assert [r["bar_start"] for r in tail] == [_bar_ts(3), _bar_ts(2)]
+    assert len(conn.fetch_calls) == 1
+
+
+def test_one_and_five_minute_reads_are_cached_apart():
+    """Same symbol, session and filters: a cached 5-minute series must never
+    be served to a 1-minute request, or the other way round."""
+    from src.hedging_flow_sql import HEDGING_FLOW_1MIN_CTE_ASYNCPG, HEDGING_FLOW_CTE_ASYNCPG
+
+    conn = _CannedConn(
+        fetchval_sequence=_session_resolution() + _session_resolution(), fetch_rows=[_row(0)]
+    )
+    db = _make_db(conn)
+    db._flow_series_endpoint_cache_ttl_seconds = 60.0
+    db._flow_series_1min_cache_ttl_seconds = 60.0
+
+    asyncio.run(db.get_hedging_flow_series(symbol="SPY"))
+    asyncio.run(db.get_hedging_flow_series(symbol="SPY", timeframe="1min"))
+
+    assert [q for q, _ in conn.fetch_calls] == [
+        HEDGING_FLOW_CTE_ASYNCPG,
+        HEDGING_FLOW_1MIN_CTE_ASYNCPG,
+    ]
+
+
+def test_one_minute_timeout_returns_empty_and_is_not_cached():
+    class _SlowOnce(_CannedConn):
+        async def fetch(self, query, *args):
+            self.fetch_calls.append((query, args))
+            if len(self.fetch_calls) == 1:
+                raise asyncio.TimeoutError
+            return self._fetch_rows
+
+    conn = _SlowOnce(
+        fetchval_sequence=_session_resolution() + _session_resolution(), fetch_rows=[_row(0)]
+    )
+    db = _make_db(conn)
+    db._flow_series_1min_cache_ttl_seconds = 60.0
+
+    assert asyncio.run(db.get_hedging_flow_series(symbol="SPY", timeframe="1min")) == []
+    retry = asyncio.run(db.get_hedging_flow_series(symbol="SPY", timeframe="1min"))
+
+    assert len(retry) == 1
+    assert len(conn.fetch_calls) == 2
+
+
+# --------------------------------------------------------------------------- #
 # HTTP surface
 # --------------------------------------------------------------------------- #
 def _build_app_with_mock_db(monkeypatch: pytest.MonkeyPatch):
@@ -417,3 +538,111 @@ def test_http_null_price_bar_serializes_as_null(monkeypatch: pytest.MonkeyPatch)
 
     assert bar["underlying_price"] is None
     assert bar["classified_ratio"] is None
+
+
+# timeframe=1min at the wire.
+def test_http_default_timeframe_is_five_minutes(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [_row(0, call=1.0)])
+        payload = client.get("/api/flow/hedging?symbol=SPY").json()
+
+    assert payload["timeframe"] == "5min"
+    assert mainmod.db_manager.get_hedging_flow_series.call_args.kwargs["timeframe"] == "5min"
+
+
+def test_http_one_minute_bars(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    canned = [_row(1, call=2.0), _row(0, call=1.0)]
+
+    with TestClient(app) as client:
+        _attach(mainmod, canned)
+        response = client.get("/api/flow/hedging?symbol=SPY&timeframe=1min")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert mainmod.db_manager.get_hedging_flow_series.call_args.kwargs["timeframe"] == "1min"
+    assert payload["timeframe"] == "1min"
+    assert [(b["bar_start"], b["bar_end"]) for b in payload["bars"]] == [
+        ("2026-04-24T13:31:00Z", "2026-04-24T13:32:00Z"),
+        ("2026-04-24T13:30:00Z", "2026-04-24T13:31:00Z"),
+    ]
+
+
+def test_http_one_minute_smoothing_defaults_to_fifteen_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """15 one-minute bars, not 3: the same 15 minutes as the 5-minute default.
+    Asserted on the average itself, not only on the reported length."""
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    nets = [float(i) for i in range(20)]
+    canned = [_row(i, call=n) for i, n in enumerate(nets)]
+    canned.reverse()
+
+    with TestClient(app) as client:
+        _attach(mainmod, canned)
+        payload = client.get("/api/flow/hedging?symbol=SPY&timeframe=1min").json()
+
+    assert payload["smoothing_bars"] == 15
+    bars = payload["bars"]  # newest first
+    assert bars[0]["net_flow_ma_usd"] == pytest.approx(sum(nets[-15:]) / 15)
+    assert bars[5]["net_flow_ma_usd"] == pytest.approx(sum(nets[:15]) / 15)
+    assert bars[6]["net_flow_ma_usd"] is None
+
+
+def test_http_explicit_smoothing_is_in_bars_of_the_timeframe(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    canned = [_row(i, call=float(i)) for i in range(5)]
+    canned.reverse()
+
+    with TestClient(app) as client:
+        _attach(mainmod, canned)
+        payload = client.get("/api/flow/hedging?symbol=SPY&timeframe=1min&smoothing=3").json()
+
+    assert payload["smoothing_bars"] == 3
+    assert payload["bars"][0]["net_flow_ma_usd"] == pytest.approx((2.0 + 3.0 + 4.0) / 3)
+
+
+def test_http_smoothing_cap_is_two_hours_of_either_bar(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [])
+        get = lambda q: client.get(f"/api/flow/hedging?symbol=SPY&{q}").status_code  # noqa: E731
+        assert get("smoothing=24") == 200
+        assert get("smoothing=25") == 422
+        assert get("timeframe=1min&smoothing=120") == 200
+        assert get("timeframe=1min&smoothing=121") == 422
+
+
+def test_http_intervals_reaches_a_full_one_minute_session(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [])
+        ok = client.get("/api/flow/hedging?symbol=SPY&timeframe=1min&intervals=406")
+        too_many = client.get("/api/flow/hedging?symbol=SPY&timeframe=1min&intervals=407")
+
+    assert ok.status_code == 200
+    assert too_many.status_code == 422
+
+
+def test_http_rejects_an_unsupported_timeframe(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [])
+        assert client.get("/api/flow/hedging?symbol=SPY&timeframe=15min").status_code == 422
+
+
+def test_http_empty_one_minute_session_reports_its_timeframe(monkeypatch: pytest.MonkeyPatch):
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+
+    with TestClient(app) as client:
+        _attach(mainmod, [])
+        payload = client.get("/api/flow/hedging?symbol=SPY&timeframe=1min").json()
+
+    assert payload["bars"] == []
+    assert payload["timeframe"] == "1min"
+    assert payload["smoothing_bars"] == 15

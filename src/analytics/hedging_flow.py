@@ -113,6 +113,14 @@ from src.greeks_fd import CONTRACT_MULTIPLIER
 #: defensible default rather than a hard rule.
 DEFAULT_SMOOTHING_BARS = 3
 
+#: The same 15 minutes on 1-minute bars (``timeframe=1min``). The average then
+#: covers the same 15 minutes of trades as the 5-minute default, in dollars per
+#: minute rather than per five and updated every minute, so a turn is flagged
+#: up to four minutes sooner and flips stay about as frequent. Three 1-minute
+#: bars would be a 3-minute average: in simulated sessions that flipped about
+#: five times as often as either 15-minute line.
+DEFAULT_SMOOTHING_BARS_1MIN = 15
+
 #: A flip whose swing is below this multiple of the session's own typical
 #: swing is reported but marked ``is_significant=False``, so a UI can show
 #: every flip or only the ones that carried size.
@@ -146,7 +154,8 @@ _MIN_SESSION_SCALE_USD = 1_000.0
 
 @dataclass(frozen=True)
 class HedgingFlowBar:
-    """One 5-minute bar of estimated hedging pressure.
+    """One bar of estimated hedging pressure: 5-minute, or 1-minute when the
+    API is asked for ``timeframe=1min``. Nothing here depends on the size.
 
     ``*_usd`` fields are USD of stock the delta-flat hedge implies, positive
     for buying. The ``call_*`` / ``put_*`` split is by the OPTION TYPE that

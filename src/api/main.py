@@ -78,6 +78,7 @@ from src.analytics.hedging_flow import (
     DEFAULT_FLAT_BAND_RATIO,
     DEFAULT_SIGNIFICANCE_RATIO,
     DEFAULT_SMOOTHING_BARS,
+    DEFAULT_SMOOTHING_BARS_1MIN,
     HedgingFlowBar as HedgingFlowBarCalc,
     sign_flip_events,
     smooth,
@@ -1632,19 +1633,25 @@ _HEDGING_FLOW_DISCLOSURE = (
 )
 
 
-def _format_hedging_flow_row(row: dict, ma: Optional[float]) -> dict:
+#: The longest trailing average /api/flow/hedging accepts, per bar size: two
+#: hours on either, 24 five-minute bars or 120 one-minute bars.
+_HEDGING_FLOW_MAX_SMOOTHING_BARS = {"5min": 24, "1min": 120}
+
+
+def _format_hedging_flow_row(row: dict, ma: Optional[float], bar_minutes: int = 5) -> dict:
     """Coerce a raw DB row + its smoothed rate into the JSON bar shape.
 
     Timestamps are emitted trailing-Z UTC and Decimals cast to float, matching
     ``_format_flow_series_row`` so the two series key identically on the
-    client and can be joined bar-for-bar without normalisation.
+    client and can be joined bar-for-bar without normalisation. ``bar_end`` is
+    one bar of ``bar_minutes`` after the start.
     """
     bar_start: datetime = row["bar_start"]
     if bar_start.tzinfo is None:
         bar_start = bar_start.replace(tzinfo=pytz.UTC)
     else:
         bar_start = bar_start.astimezone(pytz.UTC)
-    bar_end = bar_start + timedelta(minutes=5)
+    bar_end = bar_start + timedelta(minutes=bar_minutes)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
 
     def _f(key: str) -> float:
@@ -1728,16 +1735,33 @@ async def get_hedging_flow(
     intervals: Optional[int] = Query(
         default=None,
         ge=1,
-        le=390,
-        description="If provided, return only the last N 5-minute bars (tail window).",
-    ),
-    smoothing: int = Query(
-        default=DEFAULT_SMOOTHING_BARS,
-        ge=1,
-        le=24,
+        le=406,
         description=(
-            "Trailing SMA length in 5-minute bars for the rate line and flip "
-            "detection. Default 3 (15 minutes)."
+            "If provided, return only the last N bars (tail window). A full "
+            "regular session is 82 five-minute bars or 406 one-minute bars "
+            "(09:30 through 16:15 ET, both ends included)."
+        ),
+    ),
+    timeframe: Literal["5min", "1min"] = Query(
+        default="5min",
+        description=(
+            "Bar size: '5min' (default) or '1min'. Both carry the same "
+            "session-cumulative fields, so a 1-minute bar reads the same "
+            "totals as the 5-minute bar it closes. 1-minute bars are computed "
+            "from the stored trades on every read, so with `date` they reach "
+            "back only as far as those are kept (DATA_RETENTION_DAYS); "
+            "5-minute bars for older days are served from the snapshot."
+        ),
+    ),
+    smoothing: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=120,
+        description=(
+            "Trailing SMA length in bars of `timeframe`, for the rate line "
+            "and flip detection. Default 15 minutes: 3 five-minute bars or 15 "
+            "one-minute bars. At most two hours: 24 five-minute bars or 120 "
+            "one-minute bars."
         ),
     ),
     significance: float = Query(
@@ -1763,7 +1787,8 @@ async def get_hedging_flow(
         ),
     ),
 ):
-    """Estimated dealer hedging pressure per 5-minute bar, with sign flips.
+    """Estimated dealer hedging pressure per 5-minute bar, or per 1-minute bar
+    with ``timeframe=1min``, with sign flips.
 
     The aggressor-inferred companion to ``/api/flow/series``: for every option
     that traded, the net customer position change is converted to the stock a
@@ -1787,10 +1812,15 @@ async def get_hedging_flow(
     it, which on a live session buried the real turns among a dozen dots even
     with the significance filter applied.
 
-    Same session resolution, 5-minute grid and unfiltered underlying price as
-    ``/api/flow/series``, so the two overlay bar-for-bar. Rows are newest →
-    oldest. Unknown symbols 404; known symbols with no session data return an
-    empty ``bars`` list.
+    Same session resolution, grid and unfiltered underlying price as
+    ``/api/flow/series`` at the same ``timeframe``, so the two overlay
+    bar-for-bar. Rows are newest → oldest. Unknown symbols 404; known symbols
+    with no session data return an empty ``bars`` list.
+
+    ``smoothing`` counts bars of the requested size, so its default follows
+    the bar: 3 five-minute bars or 15 one-minute bars, the same 15 minutes.
+    Kept at 3 on 1-minute bars it would be a 3-minute average and flip several
+    times as often (see ``DEFAULT_SMOOTHING_BARS_1MIN``).
 
     This series is an ESTIMATE that assumes the passive side of each
     classified print was a market maker. That assumption is under test and is
@@ -1804,6 +1834,18 @@ async def get_hedging_flow(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
+    bar_minutes = 1 if timeframe == "1min" else 5
+    if smoothing is None:
+        smoothing = DEFAULT_SMOOTHING_BARS_1MIN if bar_minutes == 1 else DEFAULT_SMOOTHING_BARS
+    elif smoothing > _HEDGING_FLOW_MAX_SMOOTHING_BARS[timeframe]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"smoothing must be at most {_HEDGING_FLOW_MAX_SMOOTHING_BARS[timeframe]} "
+                f"bars for timeframe={timeframe} (two hours)"
+            ),
+        )
+
     strikes_list = _parse_flow_strikes(strikes)
     expirations_list = _parse_flow_expirations(expirations)
     session_date = _parse_session_date(date)
@@ -1815,6 +1857,7 @@ async def get_hedging_flow(
         expirations=expirations_list,
         intervals=intervals,
         session_date=session_date,
+        timeframe=timeframe,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="symbol not found")
@@ -1827,6 +1870,7 @@ async def get_hedging_flow(
         "session": session_date.isoformat() if session_date else session,
         "basis": _HEDGING_FLOW_BASIS,
         "disclosure": _HEDGING_FLOW_DISCLOSURE,
+        "timeframe": timeframe,
         "smoothing_bars": smoothing,
         "flat_band_ratio": flat_band,
     }
@@ -1867,7 +1911,7 @@ async def get_hedging_flow(
     flips = flips + zero_cross_events(calc_bars, flat_band_ratio=flat_band)
     flips.sort(key=lambda e: e.bar_start)
 
-    bars = [_format_hedging_flow_row(r, ma) for r, ma in zip(chronological, ma_series)]
+    bars = [_format_hedging_flow_row(r, ma, bar_minutes) for r, ma in zip(chronological, ma_series)]
     bars.reverse()  # back to newest-first, matching /api/flow/series
 
     return JSONResponse(

@@ -37,6 +37,7 @@ from src.flow_series_sql import (
     SNAPSHOT_SELECT_ASYNCPG,
 )
 from src.hedging_flow_sql import (
+    HEDGING_FLOW_1MIN_CTE_ASYNCPG,
     HEDGING_FLOW_CTE_ASYNCPG,
     HEDGING_FLOW_SESSIONS_ASYNCPG,
     HEDGING_FLOW_SNAPSHOT_SELECT_ASYNCPG,
@@ -7079,6 +7080,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         expirations: Optional[List[date]] = None,
         intervals: Optional[int] = None,
         session_date: Optional[date] = None,
+        timeframe: str = "5min",
     ) -> Optional[List[Dict[str, Any]]]:
         """Return 5-minute estimated hedging-pressure bars for a session.
 
@@ -7086,6 +7088,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         session resolution, same 404/empty semantics, same 5-minute grid and
         the same unfiltered underlying price, so the two series overlay
         exactly. Rows are newest-first; ``intervals=N`` returns the leading N.
+
+        ``timeframe="1min"`` returns the same rows on a 1-minute grid instead;
+        see :meth:`_get_hedging_flow_series_1min`.
 
         Returns ``None`` when the symbol is unknown (caller surfaces 404), and
         ``[]`` when the symbol exists but the resolved session has no flow.
@@ -7110,6 +7115,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         the CTE and inherits its retention horizon -- the same tradeoff
         ``flow_series_5min`` makes for filtered reads.
         """
+        if timeframe == "1min":
+            return await self._get_hedging_flow_series_1min(
+                symbol, session, strikes, expirations, intervals, session_date
+            )
         symbol = symbol.upper()
 
         # Cache only full-series fetches, matching get_flow_series: an
@@ -7184,6 +7193,85 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except asyncio.TimeoutError:
             logger.warning(f"Hedging flow query timed out for {symbol}, returning empty")
             return []
+
+    async def _get_hedging_flow_series_1min(
+        self,
+        symbol: str,
+        session: str,
+        strikes: Optional[List[float]],
+        expirations: Optional[List[date]],
+        intervals: Optional[int],
+        session_date: Optional[date] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One-minute bars for ``get_hedging_flow_series(timeframe="1min")``.
+
+        Same session window, filters, columns, ordering and 404/empty
+        semantics as the 5-minute read, built by
+        ``HEDGING_FLOW_1MIN_CTE_ASYNCPG`` on a grid floored to the minute.
+
+        Always the live query, dated or not. ``hedging_flow_5min`` stores
+        5-minute bars only, so a 1-minute read reaches back as far as
+        ``flow_contract_facts`` is kept (DATA_RETENTION_DAYS); an older date
+        returns an empty list, as a dated 5-minute read with a filter no
+        stored scope covers already does.
+
+        Cached the way the 1-minute flow series is, under the same TTL
+        (FLOW_SERIES_1MIN_CACHE_TTL_SECONDS): the full session is held briefly
+        and an ``intervals=N`` tail is sliced from it, so tail polls do not each
+        run the query. Concurrent misses on one key share one read, and a read
+        that times out is not cached.
+        """
+        symbol = symbol.upper()
+        strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
+        exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
+        session_key = session_date.isoformat() if session_date else session
+        cache_key = f"hedging_flow_1min:{symbol}:{session_key}:{strikes_key}:{exps_key}"
+
+        async def _read() -> Optional[List[Dict[str, Any]]]:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached  # type: ignore[no-any-return]
+            strikes_arg = [float(s) for s in strikes] if strikes else None
+            expirations_arg = list(expirations) if expirations else None
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                resolved = await self._resolve_flow_series_session(
+                    conn, symbol, session, session_date, bar_seconds=60
+                )
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data:
+                    result: List[Dict[str, Any]] = []
+                else:
+                    rows = await asyncio.wait_for(
+                        self._fetch_timed(
+                            conn,
+                            HEDGING_FLOW_1MIN_CTE_ASYNCPG,
+                            symbol,
+                            session_start,
+                            session_end,
+                            strikes_arg,
+                            expirations_arg,
+                            timeout=15.0,
+                        ),
+                        timeout=15.0,
+                    )
+                    result = [dict(row) for row in rows]
+            self._cache_set(cache_key, result, self._flow_series_1min_cache_ttl_seconds)
+            return result
+
+        try:
+            result: Optional[List[Dict[str, Any]]] = await self._single_flight(cache_key, _read)
+        except asyncio.TimeoutError:
+            logger.warning(f"1-minute hedging flow query timed out for {symbol}, returning empty")
+            return []
+        if result is None:
+            return None
+        if intervals is not None and intervals > 0 and len(result) > intervals:
+            # Newest-first; the leading N rows are the most recent N minutes.
+            return result[:intervals]
+        return result
 
     async def get_hedging_flow_sessions(
         self,

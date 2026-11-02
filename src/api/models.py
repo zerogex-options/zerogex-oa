@@ -501,7 +501,9 @@ class FlowCentroidPoint(BaseModel):
 
 
 class HedgingFlowBar(BaseModel):
-    """One 5-minute bar of estimated hedging pressure from /api/flow/hedging.
+    """One bar of estimated hedging pressure from /api/flow/hedging: 5-minute,
+    or 1-minute with ``timeframe=1min``. ``bar_end`` is one bar after
+    ``bar_start``.
 
     All ``*_usd`` values are USD of stock a delta-flat hedge implies, positive
     for BUYING -- the same sign convention and units as the Forced Flow
@@ -571,6 +573,10 @@ class HedgingFlowResponse(BaseModel):
     session: str
     basis: str
     disclosure: str
+    #: The bar size of ``bars``: ``5min`` (the default) or ``1min``.
+    timeframe: str = "5min"
+    #: The trailing average's length in bars of ``timeframe``: 3 five-minute
+    #: or 15 one-minute bars by default, 15 minutes either way.
     smoothing_bars: int
     #: Half-width of the flat band around zero the flips were detected with,
     #: as a multiple of the session's own typical rate. A flip has to establish

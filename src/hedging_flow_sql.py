@@ -1,9 +1,13 @@
-"""Single source of truth for the /api/flow/hedging 5-minute aggregation.
+"""Single source of truth for the /api/flow/hedging aggregation.
 
 Companion to :mod:`src.flow_series_sql`, and deliberately built to the same
 shape: one canonical query text with neutral ``:name`` tokens, rendered per
 driver, so any future second call site (a snapshot writer, a backfill) runs
 the *same* pipeline rather than a re-implementation that can silently drift.
+
+The default is 5-minute bars. ``timeframe=1min`` runs the same query with the
+bar formed as the minute (``HEDGING_FLOW_1MIN_CTE_ASYNCPG``); the two differ in
+the bar expression and the grid step alone. See the note above that constant.
 
 What it computes
 ----------------
@@ -58,12 +62,13 @@ from __future__ import annotations
 # Canonical CTE. Tokenised with ``:name`` so a psycopg2 render (for a future
 # snapshot writer) is a one-line addition to _PARAM_ORDER's consumers rather
 # than a second copy of the SQL.
-_HEDGING_FLOW_CTE_TEMPLATE = """
+#
+# ``{bar_start}`` and ``{bar_interval}`` are the bar size, filled in below by
+# str.format. The text holds no other braces, so the substitution is exact.
+_HEDGING_FLOW_CTE_FORM = """
                     WITH filtered AS (
                         SELECT
-                            (date_trunc('hour', timestamp)
-                             + FLOOR(EXTRACT(MINUTE FROM timestamp)::int / 5)
-                               * INTERVAL '5 minutes') AS bar_start,
+                            {bar_start} AS bar_start,
                             option_type,
                             -- Net customer contracts under the aggressor
                             -- classification. buy_volume/sell_volume are
@@ -78,7 +83,7 @@ _HEDGING_FLOW_CTE_TEMPLATE = """
                         FROM flow_contract_facts
                         WHERE symbol = :symbol
                           AND timestamp >= :session_start
-                          AND timestamp <  :session_end::timestamptz + INTERVAL '5 minutes'
+                          AND timestamp <  :session_end::timestamptz + INTERVAL '{bar_interval}'
                           AND delta IS NOT NULL
                           AND underlying_price IS NOT NULL
                           AND (:strikes::numeric[] IS NULL OR strike = ANY(:strikes::numeric[]))
@@ -114,14 +119,12 @@ _HEDGING_FLOW_CTE_TEMPLATE = """
                     -- the same price at the same bar.
                     underlying_by_bar AS (
                         SELECT
-                            (date_trunc('hour', timestamp)
-                             + FLOOR(EXTRACT(MINUTE FROM timestamp)::int / 5)
-                               * INTERVAL '5 minutes') AS bar_start,
+                            {bar_start} AS bar_start,
                             (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS underlying_price
                         FROM underlying_quotes
                         WHERE symbol = :symbol
                           AND timestamp >= :session_start
-                          AND timestamp <  :session_end::timestamptz + INTERVAL '5 minutes'
+                          AND timestamp <  :session_end::timestamptz + INTERVAL '{bar_interval}'
                         GROUP BY 1
                     ),
                     timeline AS (
@@ -129,7 +132,7 @@ _HEDGING_FLOW_CTE_TEMPLATE = """
                         -- matches nothing returns zero rows rather than a
                         -- full session of synthetic zero bars.
                         SELECT g.bar_start
-                        FROM generate_series(:session_start::timestamptz, :session_end::timestamptz, INTERVAL '5 minutes') AS g(bar_start)
+                        FROM generate_series(:session_start::timestamptz, :session_end::timestamptz, INTERVAL '{bar_interval}') AS g(bar_start)
                         WHERE EXISTS (SELECT 1 FROM filtered)
                     ),
                     joined AS (
@@ -179,6 +182,41 @@ _HEDGING_FLOW_CTE_TEMPLATE = """
                     ORDER BY bar_start DESC
 """
 
+# The 5-minute bar: the hour plus whole 5-minute steps, the same expression as
+# src/flow_series_sql.py's 5-minute underlying_by_bar. The continuation lines
+# carry the template's indentation, so the rendered 5-minute query is the text
+# this module held before the 1-minute form existed, byte for byte.
+_BAR_START_5MIN = """(date_trunc('hour', timestamp)
+                             + FLOOR(EXTRACT(MINUTE FROM timestamp)::int / 5)
+                               * INTERVAL '5 minutes')"""
+_BAR_START_1MIN = "date_trunc('minute', timestamp)"
+
+_HEDGING_FLOW_CTE_TEMPLATE = _HEDGING_FLOW_CTE_FORM.format(
+    bar_start=_BAR_START_5MIN, bar_interval="5 minutes"
+)
+
+# One-minute bars, for ``/api/flow/hedging?timeframe=1min``.
+#
+# Nothing else changes. flow_contract_facts is already stored per contract per
+# minute (option quotes are bucketed by AGGREGATION_BUCKET_SECONDS = 60), so
+# the 5-minute bar is these minutes added up, and grouping by the minute
+# instead gives the same totals more often: a 5-minute bar's cumulative values
+# equal those of the last minute inside it. The underlying price is the tape's
+# last close in the minute, unfiltered, which is the expression
+# src/flow_series_sql.py's 1-minute series uses, so the two still overlay.
+#
+# ``contract_count`` counts the fact rows in the minute and ``is_synthetic``
+# marks a minute in which nothing traded, the same per-bar meaning they have
+# on 5-minute bars here.
+#
+# No snapshot table, the same choice as the 1-minute flow series:
+# hedging_flow_5min holds 5-minute bars only, so a 1-minute read always runs
+# this query and reaches back only as far as flow_contract_facts is kept
+# (DATA_RETENTION_DAYS).
+_HEDGING_FLOW_1MIN_CTE_TEMPLATE = _HEDGING_FLOW_CTE_FORM.format(
+    bar_start=_BAR_START_1MIN, bar_interval="1 minute"
+)
+
 # Ordered (token, asyncpg-positional) mapping. asyncpg has no named
 # parameters, so the canonical query is rendered to $1..$5. Order and meaning
 # match src/flow_series_sql.py's _PARAM_ORDER exactly, so the two read paths
@@ -223,6 +261,9 @@ def _render_psycopg2(template: str) -> str:
 
 # asyncpg form: the live read path in get_hedging_flow_series.
 HEDGING_FLOW_CTE_ASYNCPG = _render_asyncpg(_HEDGING_FLOW_CTE_TEMPLATE)
+
+# asyncpg form of the 1-minute query: get_hedging_flow_series(timeframe="1min").
+HEDGING_FLOW_1MIN_CTE_ASYNCPG = _render_asyncpg(_HEDGING_FLOW_1MIN_CTE_TEMPLATE)
 
 # psycopg2 form: the Analytics Engine snapshot write and the backfill tool.
 # Rendered from the same template as the asyncpg form rather than transcribed,

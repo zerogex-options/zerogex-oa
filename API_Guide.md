@@ -884,7 +884,7 @@ Scores are RAW dollar-GEX. Normalising against a trailing distribution of sessio
 Same session resolution as `/api/flow/hedging`, so the two cover identical bars. Rows newest→oldest.
 
 ### GET /api/flow/hedging
-Estimated dealer hedging pressure per 5-minute bar, with sign flips. The aggressor-inferred companion to `/api/flow/series`: for every option that traded, the net customer position change is converted to the stock a delta-flat hedge implies — `(buy - sell) * delta * 100 * spot` — and accumulated across the session.
+Estimated dealer hedging pressure per 5-minute bar (or per 1-minute bar with `timeframe=1min`), with sign flips. The aggressor-inferred companion to `/api/flow/series`: for every option that traded, the net customer position change is converted to the stock a delta-flat hedge implies — `(buy - sell) * delta * 100 * spot` — and accumulated across the session.
 
 Positive means the hedge **buys** stock, the same sign convention and units as the Forced Flow engine, so the modeled and estimated sources are directly additive (see `combine_flow_sources`).
 
@@ -893,14 +893,18 @@ Positive means the hedge **buys** stock, the same sign convention and units as t
 **Parameters:**
 - `symbol` (required): `[A-Z.]{1,10}`
 - `session` (optional): `current` | `prior`, default `current`
+- `date` (optional): an ET trading day, `YYYY-MM-DD`; overrides `session`. 5-minute bars for any stored day come from the retention-exempt snapshot; a day with nothing stored returns an empty `bars` list
 - `strikes` (optional): comma-separated strikes to include; omit for all
 - `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all. Pass today's date to isolate 0DTE
-- `intervals` (optional): trailing N 5-minute bars, `1`–`390`
-- `smoothing` (optional): trailing SMA length in bars for the rate line and flip detection, `1`–`24`, default `3` (15 minutes)
+- `timeframe` (optional): `5min` | `1min`, default `5min`
+- `intervals` (optional): trailing N bars, `1`–`406` (a full session is 82 five-minute or 406 one-minute bars)
+- `smoothing` (optional): trailing SMA length in bars of `timeframe` for the rate line and flip detection. Default 15 minutes: `3` five-minute bars or `15` one-minute bars. At most two hours: `24` five-minute or `120` one-minute bars
 - `significance` (optional): a rate flip is marked significant at or above this multiple of the session's typical swing, `0`–`10`, default `1.0`. Note the scale is a *median*, so 1.0 sits at the middle of the day's swings rather than the tail
 - `flat_band` (optional): half-width of the flat band around zero as a multiple of the session's typical rate, `0`–`5`, default `0.5`; `0` disables it
 
-**Response:** an object with `bars` (newest→oldest) and `flips`, plus `basis` and `disclosure`.
+**Response:** an object with `bars` (newest→oldest) and `flips`, plus `basis`, `disclosure`, `timeframe` and `smoothing_bars`.
+
+Both timeframes carry the same session-cumulative fields, so a 1-minute bar reads the same totals as the 5-minute bar it closes: the 10:04 bar matches the 10:00 five-minute bar. The per-bar fields (`net_flow_usd` and its call/put split) are per minute on 1-minute bars, so they run about a fifth the size. `bar_end` is one bar after `bar_start`. 1-minute bars are computed from the stored trades on every read and are not snapshotted, so with `date` they reach back only `DATA_RETENTION_DAYS`; an older day returns an empty `bars` list at `1min` while `5min` still answers from the snapshot.
 
 A flip requires the series to **establish** itself outside a flat band around zero (`flat_band`), not merely to touch the far side. Without that, a rate hovering near zero reports a direction change on every nick across it, which on a live session buried the real turns among a dozen dots even with the significance filter on.
 
