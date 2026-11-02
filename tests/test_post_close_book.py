@@ -199,6 +199,55 @@ MONDAY_CHAIN = [
 ]
 
 
+# Every contract on or after Monday in the closing snapshot: Monday's above,
+# and a Nov 20 book with puts stacked under the close and calls over it, so
+# the re-priced dealer-gamma curve crosses zero near spot.
+LATER_CHAIN = [
+    {
+        "option_symbol": f"SPXW 261120{kind}{int(strike)}",
+        "strike": Decimal(str(strike)),
+        "expiration": date(2026, 11, 20),
+        "option_type": kind,
+        "open_interest": oi,
+        "implied_volatility": Decimal("0.2"),
+    }
+    for strike, kind, oi in (
+        (470.0, "P", 20000),
+        (480.0, "P", 30000),
+        (490.0, "P", 25000),
+        (495.0, "P", 8000),
+        (505.0, "C", 8000),
+        (510.0, "C", 25000),
+        (520.0, "C", 30000),
+        (530.0, "C", 20000),
+    )
+]
+SURVIVING_CHAIN = MONDAY_CHAIN + LATER_CHAIN
+
+
+def _engine_options(rows):
+    return [
+        {
+            **row,
+            "strike": float(row["strike"]),
+            "implied_volatility": float(row["implied_volatility"]),
+            "gamma": 0.001,
+            "volume": 0,
+        }
+        for row in rows
+    ]
+
+
+def _expected_rolled_flip():
+    """The flip family the API should roll to: the engine's own computation on
+    the surviving chain, at the snapshot."""
+    from src.analytics.main_engine import AnalyticsEngine
+
+    return AnalyticsEngine(underlying="SPX").spot_shift_readings(
+        _engine_options(SURVIVING_CHAIN), CLOSE, REP_B
+    )
+
+
 def _expected_rolled_pin(spot=CLOSE):
     """The Pin the API should roll to: the shared model, run directly."""
     from src.analytics.main_engine import pin_strike_for_expiration
@@ -232,6 +281,7 @@ class _Conn:
         self.expiration_calls = []
         self.surviving_calls = []
         self.chain_calls = []
+        self.surviving_chain_calls = []
         self.body_calls = 0
 
     async def fetch(self, query, *args, **_kwargs):
@@ -245,6 +295,14 @@ class _Conn:
             self.chain_calls.append(args)
             _symbol, _ts, _since, expiration = args
             return [row for row in MONDAY_CHAIN if row["expiration"] == expiration]
+        if "-- surviving chain at a snapshot" in query:
+            self.surviving_chain_calls.append(args)
+            _symbol, _ts, _since, floor = args
+            return [
+                {**row, "gamma": Decimal("0.001"), "volume": 0}
+                for row in SURVIVING_CHAIN
+                if row["expiration"] >= floor
+            ]
         if "bucket_reps AS" in query:
             self.body_calls += 1
             return _timeseries_rows()
@@ -305,8 +363,10 @@ def test_after_the_close_the_newest_bucket_leaves_out_the_expired_expiration(mon
     assert [w["strike"] for w in newest["put_walls"]] == [490.0, 485.0, 495.0]
     assert newest["call_wall"] == 505.0
     assert newest["put_walls"][0]["strength"] == pytest.approx(150.0 * SCALE)
-    # The All view keeps the engine's flip.
-    assert newest["gamma_flip"] == Decimal("497.5")
+    # The All view's flip is the engine's spot-shift flip re-priced on the
+    # surviving chain; the earlier bucket keeps the one it had.
+    assert newest["gamma_flip"] == _expected_rolled_flip()["gamma_flip_point"]
+    assert older["gamma_flip"] == Decimal("497.5")
 
     # The earlier bucket is history: Friday's contracts were trading then.
     assert "expired_excluded" not in older
@@ -458,10 +518,22 @@ def test_after_the_close_the_summary_repicks_its_walls_and_resums_its_totals(mon
     assert summary["pin_score"] == pytest.approx(expected.pin_score)
     assert summary["pin_confidence"] == pytest.approx(expected.pin_confidence)
     assert summary["pin_strike_reason"] is None
-    # What the engine computed whole at publish time stays as published.
-    assert summary["gamma_flip"] == Decimal("497.5")
-    assert summary["net_gex_at_spot"] == Decimal("-1000")
-    assert summary["max_gamma_strike"] == Decimal("495")
+    # The GEX King and the flip family come off the surviving book too: the
+    # King from the surviving strikes (505, the largest |net| once the
+    # expiring 495 puts are gone), the flip family from the engine's own
+    # computation on the surviving chain.
+    assert summary["max_gamma_strike"] == 505.0
+    flip = _expected_rolled_flip()
+    assert flip["gamma_flip_point"] is not None
+    assert summary["gamma_flip"] == flip["gamma_flip_point"]
+    assert summary["gamma_flip_raw"] == flip["gamma_flip_raw"]
+    assert summary["gamma_flip_span_used"] == flip["gamma_flip_span_used"]
+    assert summary["gamma_flip_reason"] is None
+    assert summary["net_gex_at_spot"] == pytest.approx(flip["net_gex_at_spot"])
+    assert summary["flip_distance"] == pytest.approx((CLOSE - flip["gamma_flip_point"]) / CLOSE)
+    assert summary["convexity_risk"] == pytest.approx(
+        abs(summary["net_gex"]) / abs(summary["flip_distance"])
+    )
     # The anchor and the breakdown rode along for the after-close step only.
     assert "wall_anchor" not in summary
     assert "max_pain_by_expiration" not in summary
@@ -486,7 +558,10 @@ def test_during_the_session_the_summary_is_served_as_read(monkeypatch):
     assert summary["pin_strike"] == Decimal("500")
     assert "wall_anchor" not in summary
     assert "max_pain_by_expiration" not in summary
+    assert summary["gamma_flip"] == Decimal("497.5")
+    assert summary["max_gamma_strike"] == Decimal("495")
     assert conn.expiration_calls == [] and conn.chain_calls == []
+    assert conn.surviving_chain_calls == []
     body = GEXSummary(**summary).model_dump(mode="json")
     assert body["expired_excluded"] == [] and body["rolled_to_expiration"] is None
 
@@ -519,6 +594,14 @@ def test_after_the_close_the_profile_reports_the_summarys_walls(monkeypatch):
     profile = asyncio.run(_db(conn).get_latest_gex_profile("SPX"))
     assert (profile["call_wall"], profile["put_wall"]) == (505.0, 490.0)
     assert profile["expired_excluded"] == [FRIDAY]
+    # The curve is the surviving book's, with its flip and its value at spot.
+    flip = _expected_rolled_flip()
+    assert profile["gamma_flip"] == flip["gamma_flip_point"]
+    assert profile["net_gex_at_spot"] == pytest.approx(flip["net_gex_at_spot"])
+    assert profile["profile"] == [
+        {"price": float(p), "gex": float(g)} for p, g in flip["gamma_profile"]
+    ]
+    assert profile["span_pct"] == flip["gamma_flip_span_used"]
     assert GEXProfile(**profile).model_dump(mode="json")["expired_excluded"] == ["2026-10-30"]
 
     _read_at(monkeypatch, FRIDAY_IN_SESSION)
@@ -755,3 +838,22 @@ def test_without_the_live_row_current_max_pain_rolls_on_the_daily_snapshot(monke
     current = asyncio.run(_db(_NoLive()).get_max_pain_current("SPX"))
     assert current["max_pain"] == Decimal("505.0")
     assert [e["expiration"] for e in current["expirations"]] == [MONDAY, date(2026, 11, 20)]
+
+
+def test_a_failed_chain_read_keeps_the_published_flip_and_still_rolls_the_king(monkeypatch):
+    """The flip needs the chain; the King needs only the surviving strikes.
+    Without the chain the flip family stays as published rather than failing
+    the summary."""
+
+    class _NoChain(_Conn):
+        async def fetch(self, query, *args, **kwargs):
+            if "-- surviving chain at a snapshot" in query:
+                raise RuntimeError("statement timeout")
+            return await super().fetch(query, *args, **kwargs)
+
+    _read_at(monkeypatch, SUNDAY_NIGHT)
+    summary = asyncio.run(_db(_NoChain(summary_row=_summary_row())).get_latest_gex_summary("SPX"))
+    assert summary["gamma_flip"] == Decimal("497.5")
+    assert summary["net_gex_at_spot"] == Decimal("-1000")
+    assert summary["max_gamma_strike"] == 505.0
+    assert summary["expired_excluded"] == [FRIDAY]

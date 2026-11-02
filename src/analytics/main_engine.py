@@ -3080,6 +3080,76 @@ class AnalyticsEngine:
             )
         return result
 
+    def spot_shift_readings(
+        self,
+        options: List[Dict[str, Any]],
+        underlying_price: float,
+        timestamp: datetime,
+    ) -> Dict[str, Any]:
+        """The flip family: every reading taken off ONE spot-shift profile.
+
+        ``gamma_profile`` (the curve ``gex_profile`` persists), its structural
+        zero crossing ``gamma_flip_point`` and the span it resolved at, the
+        value at spot ``net_gex_at_spot``, the raw un-weighted crossing
+        ``gamma_flip_raw``, and, when the flip is unresolved, the reason.
+
+        :meth:`_calculate_gex_summary` publishes these every cycle.  The API
+        calls it after the close on the snapshot's chain without the
+        contracts that expired (``DatabaseManager._rolled_spot_shift``), so the
+        rolled flip is this exact computation on the surviving book.  Pure:
+        no logging, no state.
+        """
+        gamma_profile, gamma_flip_point, gamma_flip_span_used = self._resolve_gamma_flip(
+            options, underlying_price, timestamp
+        )
+        net_gex_at_spot = self._net_gex_at_spot(gamma_profile, underlying_price)
+
+        # Raw nearest zero-crossing on the UN-DTE-weighted profile — the
+        # "nearest crossing to spot" convention competitor dashboards
+        # publish. Built without the horizon-occupancy ramp (apply_dte_weight
+        # =False) so near-dated 0DTE walls can pull the crossing toward spot;
+        # that is exactly why it can diverge from — and sit much closer to
+        # spot than — the horizon-weighted structural gamma_flip_point.
+        # Scanned over the same span the structural resolver landed on so
+        # both read the same geometric window. SECONDARY reference only: it
+        # carries no structural-significance gate, so it can land on a
+        # near-spot noise crossing the structural flip rejects. When DTE
+        # weighting is globally off the un-weighted profile IS the structural
+        # profile, so we reuse it rather than rebuild the BS gamma grid.
+        if GAMMA_PROFILE_DTE_WEIGHTING:
+            raw_profile = self._gamma_exposure_profile(
+                options,
+                underlying_price,
+                timestamp,
+                span_pct=gamma_flip_span_used,
+                apply_dte_weight=False,
+            )
+        else:
+            raw_profile = gamma_profile
+        gamma_flip_raw = self._calculate_gamma_flip_point(raw_profile, underlying_price)
+
+        gamma_flip_unresolved = gamma_flip_point is None
+        # Persisted on EVERY unresolved cycle, not only the ones that warn.
+        # The warning is throttled so a morning-long blackout does not spam
+        # the journal, but a reason that only lands on the transition would
+        # leave most blank rows unexplained -- which is the exact gap that
+        # made this investigation necessary. One extra pass over an
+        # already-built profile, once per unresolved cycle.
+        gamma_flip_reason = (
+            self._classify_unresolved_flip(options, gamma_profile, underlying_price)
+            if gamma_flip_unresolved
+            else None
+        )
+        return {
+            "gamma_profile": gamma_profile,
+            "gamma_flip_point": gamma_flip_point,
+            "gamma_flip_span_used": gamma_flip_span_used,
+            "net_gex_at_spot": net_gex_at_spot,
+            "gamma_flip_raw": gamma_flip_raw,
+            "gamma_flip_unresolved": gamma_flip_unresolved,
+            "gamma_flip_reason": gamma_flip_reason,
+        }
+
     def _calculate_gex_summary(
         self,
         gex_by_strike: List[Dict[str, Any]],
@@ -3132,47 +3202,14 @@ class AnalyticsEngine:
         # noise-floor sign change.  net_gex_at_spot is sampled at spot
         # off the same (last-built) profile, preserving sign consistency
         # regardless of which rung resolved.
-        gamma_profile, gamma_flip_point, gamma_flip_span_used = self._resolve_gamma_flip(
-            options, underlying_price, timestamp
-        )
-        net_gex_at_spot = self._net_gex_at_spot(gamma_profile, underlying_price)
-
-        # Raw nearest zero-crossing on the UN-DTE-weighted profile — the
-        # "nearest crossing to spot" convention competitor dashboards
-        # publish. Built without the horizon-occupancy ramp (apply_dte_weight
-        # =False) so near-dated 0DTE walls can pull the crossing toward spot;
-        # that is exactly why it can diverge from — and sit much closer to
-        # spot than — the horizon-weighted structural gamma_flip_point.
-        # Scanned over the same span the structural resolver landed on so
-        # both read the same geometric window. SECONDARY reference only: it
-        # carries no structural-significance gate, so it can land on a
-        # near-spot noise crossing the structural flip rejects. When DTE
-        # weighting is globally off the un-weighted profile IS the structural
-        # profile, so we reuse it rather than rebuild the BS gamma grid.
-        if GAMMA_PROFILE_DTE_WEIGHTING:
-            raw_profile = self._gamma_exposure_profile(
-                options,
-                underlying_price,
-                timestamp,
-                span_pct=gamma_flip_span_used,
-                apply_dte_weight=False,
-            )
-        else:
-            raw_profile = gamma_profile
-        gamma_flip_raw = self._calculate_gamma_flip_point(raw_profile, underlying_price)
-
-        gamma_flip_unresolved = gamma_flip_point is None
-        # Persisted on EVERY unresolved cycle, not only the ones that warn.
-        # The warning is throttled so a morning-long blackout does not spam
-        # the journal, but a reason that only lands on the transition would
-        # leave most blank rows unexplained -- which is the exact gap that
-        # made this investigation necessary. One extra pass over an
-        # already-built profile, once per unresolved cycle.
-        gamma_flip_reason = (
-            self._classify_unresolved_flip(options, gamma_profile, underlying_price)
-            if gamma_flip_unresolved
-            else None
-        )
+        readings = self.spot_shift_readings(options, underlying_price, timestamp)
+        gamma_profile = readings["gamma_profile"]
+        gamma_flip_point = readings["gamma_flip_point"]
+        gamma_flip_span_used = readings["gamma_flip_span_used"]
+        net_gex_at_spot = readings["net_gex_at_spot"]
+        gamma_flip_raw = readings["gamma_flip_raw"]
+        gamma_flip_unresolved = readings["gamma_flip_unresolved"]
+        gamma_flip_reason = readings["gamma_flip_reason"]
         if gamma_flip_unresolved:
             # Throttle the verbose diagnostic so a persistent unresolved
             # regime (e.g. SPX with the actionable flip beyond

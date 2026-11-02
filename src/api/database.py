@@ -85,6 +85,13 @@ _UNSET: Any = object()
 # changing at the close (the engine keeps a closed session's last row as it
 # was published), so this only bounds how long a rewrite would go unseen.
 _POST_CLOSE_BOOK_TTL_SECONDS = 60.0
+# The after-close readings that re-price the chain (the rolled Pin and the
+# rolled flip family) are kept far longer: each costs a chain read and up to a
+# second or two of model time, during which waiting requests hold pool
+# connections, and a closed session's snapshot does not change until the next
+# open.  The key holds the snapshot and the floor, so a new snapshot or the
+# next day's floor is a fresh read anyway.
+_POST_CLOSE_MODEL_TTL_SECONDS = 7200.0
 
 
 def _max_pain_by_expiration(raw: Any) -> Dict[date, float]:
@@ -2564,9 +2571,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         expiration to the one that settles next, named in
         ``rolled_to_expiration``: ``max_pain`` from the row's per-expiration
         breakdown, and the Pin Strike (``pin_*``) priced on that expiration's
-        contracts in the same snapshot (``_rolled_pin``).  The rest of what the
-        engine computed whole when it published the row -- the flip, net GEX
-        at spot, the GEX King, open-interest totals -- stays as published.
+        contracts in the same snapshot (``_rolled_pin``).  When contracts did
+        expire, the GEX King comes off the surviving strikes and the flip
+        family (flip, raw flip, span, reason, net GEX at spot, and the flip
+        distance and convexity derived from them) off the engine's own
+        spot-shift computation on the surviving chain (``_rolled_spot_shift``).
+        Local GEX, the open-interest totals and the put/call ratio stay as
+        published.
 
         Always consumes ``wall_anchor`` and ``max_pain_by_expiration``, which
         the summary query surfaces for this alone.  A row from today's session
@@ -2603,6 +2614,30 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         payload["total_put_gex"] = total_put
         payload["net_gex"] = total_call + total_put
         self._repick_walls_after_close(payload, self._wall_inputs(strikes), spot, anchor)
+        # The GEX King and the flip family were taken off a book that still
+        # held the expired contracts; take them off the surviving one.
+        payload["max_gamma_strike"] = self._gex_king(strikes)
+        rolled = await self._rolled_spot_shift(conn, symbol, ts, floor)
+        if rolled is not None:
+            for field in (
+                "gamma_flip",
+                "gamma_flip_raw",
+                "gamma_flip_span_used",
+                "gamma_flip_reason",
+                "net_gex_at_spot",
+            ):
+                payload[field] = rolled[field]
+            # Re-derived as the engine derives them, off the rolled flip.
+            flip = rolled["gamma_flip"]
+            flip_distance = (
+                (rolled["spot"] - float(flip)) / rolled["spot"] if flip is not None else None
+            )
+            payload["flip_distance"] = flip_distance
+            payload["convexity_risk"] = (
+                abs(payload["net_gex"]) / max(abs(flip_distance), 1e-6)
+                if flip_distance is not None
+                else None
+            )
         payload["expired_excluded"] = expired
 
     async def get_pin_path_for_session(self, symbol: str = "SPY") -> List[Dict[str, Any]]:
@@ -2855,11 +2890,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # that no longer exist, every night and all weekend: on Sunday 2026-11-01
     # the public SPX Put Wall sat on a strike that was 72% Friday-expired
     # contracts.  So the reads that serve the CURRENT book -- the latest
-    # by-strike rows, the newest strike-profile bucket, the summary's walls and
-    # Net GEX totals, and the profile's walls -- leave out every expiration
-    # dated before ``first_live_expiration`` and say which ones they left out
-    # (``expired_excluded``).  History is untouched: replay frames, older
-    # buckets and the stored rows read exactly as published.
+    # by-strike rows, the newest strike-profile bucket, the summary (walls, Net
+    # GEX totals, GEX King, the flip family) and the profile (its curve, flip
+    # and walls) -- leave out every expiration dated before
+    # ``first_live_expiration`` and say which ones they left out
+    # (``expired_excluded``); Max Pain and the Pin roll to the expiration that
+    # settles next (``rolled_to_expiration``).  History is untouched: replay
+    # frames, older buckets and the stored rows read exactly as published.
 
     def _live_expiration_floor(self, as_of: Optional[datetime] = None) -> date:
         """The earliest expiration a read made now (or as of ``as_of``) serves."""
@@ -2997,15 +3034,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             from src.analytics.main_engine import pin_strike_for_expiration
             from src.config import RISK_FREE_RATE, resolve_dividend_yield
 
-            spot_query = """
-                -- spot at a snapshot
-                SELECT close
-                FROM underlying_quotes
-                WHERE symbol = $1
-                  AND timestamp <= $2
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """
             chain_query = """
                 -- one expiration's chain at a snapshot
                 SELECT DISTINCT ON (option_symbol)
@@ -3025,9 +3053,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             """
             lookback_start = snapshot_ts - timedelta(hours=self._post_close_chain_lookback_hours)
             try:
-                spot_row = await self._fetch_timed(
-                    conn, spot_query, symbol, snapshot_ts, timeout=10.0, fetchrow=True
-                )
+                spot = await self._snapshot_spot(conn, symbol, snapshot_ts)
                 rows = await self._fetch_timed(
                     conn, chain_query, symbol, snapshot_ts, lookback_start, expiration, timeout=15.0
                 )
@@ -3040,8 +3066,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     e,
                 )
                 return {**none, "pin_strike_reason": pin_strike_mod.REASON_INSUFFICIENT_OPTION_DATA}
-            spot = float(spot_row["close"]) if spot_row and spot_row["close"] is not None else None
-            if spot is None or spot <= 0:
+            if spot is None:
                 fields = {
                     **none,
                     "pin_strike_reason": pin_strike_mod.REASON_INSUFFICIENT_OPTION_DATA,
@@ -3076,10 +3101,181 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     dividend_yield=resolve_dividend_yield(symbol),
                 )
                 fields = result.summary_fields()
-            self._cache_set(cache_key, fields, _POST_CLOSE_BOOK_TTL_SECONDS)
+            self._cache_set(cache_key, fields, _POST_CLOSE_MODEL_TTL_SECONDS)
             return fields
 
         return await self._single_flight(cache_key, _produce)  # type: ignore[no-any-return]
+
+    async def _rolled_spot_shift(
+        self,
+        conn: Any,
+        symbol: str,
+        snapshot_ts: datetime,
+        floor: date,
+    ) -> Optional[Dict[str, Any]]:
+        """The flip family re-priced on the book that survives the close.
+
+        The engine's gamma flip, raw flip, span, unresolved reason and net GEX
+        at spot are all readings off ONE spot-shift profile of the whole chain,
+        and the closing snapshot's chain still holds the contracts that
+        expired at the bell.  This runs the engine's own
+        :meth:`AnalyticsEngine.spot_shift_readings` on the snapshot's chain
+        WITHOUT them (every contract dated on or after ``floor``, latest quote
+        per contract over the engine's lookback, against the underlying's
+        close at or before the snapshot), so the rolled flip is exactly the
+        flip the engine would publish for that book.
+
+        Returns ``{gamma_flip, gamma_flip_raw, gamma_flip_span_used,
+        gamma_flip_reason, net_gex_at_spot, spot, profile}`` with ``profile``
+        in the ``gex_profile`` JSON shape, or ``None`` when it cannot be
+        computed (the caller then keeps the published values).  Cached on the
+        snapshot and the floor, concurrent misses share one read, and the
+        model runs in a worker thread, which is also where the engine is built:
+        built on the main thread it would install its shutdown signal handlers
+        over the API's (see ``src/api/routers/gex_flip_horizon.py``).
+        """
+        cache_key = f"rolled_spot_shift:{symbol}:{snapshot_ts.isoformat()}:{floor.isoformat()}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        async def _produce() -> Optional[Dict[str, Any]]:
+            chain_query = """
+                -- surviving chain at a snapshot
+                SELECT DISTINCT ON (option_symbol)
+                    option_symbol,
+                    strike,
+                    expiration,
+                    option_type,
+                    open_interest,
+                    implied_volatility,
+                    gamma,
+                    volume
+                FROM option_chains
+                WHERE underlying = $1
+                  AND timestamp <= $2
+                  AND timestamp >= $3
+                  AND expiration >= $4::date
+                  AND gamma IS NOT NULL
+                ORDER BY option_symbol, timestamp DESC
+            """
+            lookback_start = snapshot_ts - timedelta(hours=self._post_close_chain_lookback_hours)
+            try:
+                spot = await self._snapshot_spot(conn, symbol, snapshot_ts)
+                rows = await self._fetch_timed(
+                    conn, chain_query, symbol, snapshot_ts, lookback_start, floor, timeout=20.0
+                )
+            except Exception as e:
+                logger.warning(
+                    "Rolled flip for %s at %s unavailable (%s); serving the flip as published",
+                    symbol,
+                    snapshot_ts,
+                    e,
+                )
+                return None
+            if spot is None or not rows:
+                return None
+            options = [
+                {
+                    "option_symbol": r["option_symbol"],
+                    "strike": float(r["strike"]),
+                    "expiration": r["expiration"],
+                    "option_type": r["option_type"],
+                    "open_interest": int(r["open_interest"] or 0),
+                    "implied_volatility": (
+                        float(r["implied_volatility"])
+                        if r["implied_volatility"] is not None
+                        else None
+                    ),
+                    "gamma": float(r["gamma"] or 0.0),
+                    "volume": int(r["volume"] or 0),
+                }
+                for r in rows
+            ]
+
+            def _readings() -> Dict[str, Any]:
+                from src.analytics.main_engine import AnalyticsEngine
+
+                return AnalyticsEngine(underlying=symbol).spot_shift_readings(
+                    options, spot, snapshot_ts
+                )
+
+            try:
+                readings = await asyncio.to_thread(_readings)
+            except Exception as e:
+                logger.warning(
+                    "Rolled flip for %s at %s failed (%s); serving the flip as published",
+                    symbol,
+                    snapshot_ts,
+                    e,
+                )
+                return None
+            span = readings["gamma_flip_span_used"]
+            result = {
+                "gamma_flip": readings["gamma_flip_point"],
+                "gamma_flip_raw": readings["gamma_flip_raw"],
+                # Published only beside a resolved flip, as the engine does.
+                "gamma_flip_span_used": span if readings["gamma_flip_point"] is not None else None,
+                "gamma_flip_reason": readings["gamma_flip_reason"],
+                "net_gex_at_spot": readings["net_gex_at_spot"],
+                "spot": spot,
+                "span_pct": span,
+                "profile": [
+                    {"price": float(price), "gex": float(gex)}
+                    for price, gex in readings["gamma_profile"] or []
+                ],
+            }
+            self._cache_set(
+                cache_key,
+                result,
+                _POST_CLOSE_MODEL_TTL_SECONDS,
+                units=len(result["profile"]) + 1,
+            )
+            return result
+
+        return await self._single_flight(cache_key, _produce)  # type: ignore[no-any-return]
+
+    async def _snapshot_spot(
+        self, conn: Any, symbol: str, snapshot_ts: datetime
+    ) -> Optional[float]:
+        """The underlying's close at or before a snapshot, as the engine priced it."""
+        row = await self._fetch_timed(
+            conn,
+            """
+            -- spot at a snapshot
+            SELECT close
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND timestamp <= $2
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            symbol,
+            snapshot_ts,
+            timeout=10.0,
+            fetchrow=True,
+        )
+        if not row or row["close"] is None:
+            return None
+        spot = float(row["close"])
+        return spot if spot > 0 else None
+
+    @staticmethod
+    def _gex_king(strikes: List[Dict[str, Any]]) -> Optional[float]:
+        """GEX King of a surviving book: the strike with the largest |net GEX|.
+
+        The engine's rule (``_calculate_gex_summary``): net gamma summed per
+        strike across every expiration, the largest magnitude wins.  The
+        dollar scale is one positive constant for every strike, so the raw
+        per-strike sums rank the same way.
+        """
+        best: Optional[float] = None
+        best_abs = -1.0
+        for s in strikes:
+            net = abs(float(s["call_gamma"] or 0.0) - float(s["put_gamma"] or 0.0))
+            if net > best_abs:
+                best, best_abs = float(s["strike"]), net
+        return best
 
     @staticmethod
     def _wall_inputs(strikes: List[Dict[str, Any]]) -> List[Dict[str, float]]:
@@ -3144,10 +3340,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         same dollar scale the read uses (the bucket's own close), its walls
         are re-picked (see ``_repick_walls_after_close``), a filtered view's
         flip is recomputed from the same strikes, and ``expired_excluded``
-        names the dates removed.  The All view's flip is the engine's, kept as
-        published: it is horizon-weighted, so contracts in their last minutes
-        carry almost no weight in it.  A bucket from today's session is left
-        exactly as read.
+        names the dates removed.  The All view's flip is the engine's
+        spot-shift flip re-priced on the surviving chain
+        (``_rolled_spot_shift``), the one ``/api/gex/summary`` serves.  A bucket
+        from today's session is left exactly as read.
 
         The Pin Strike rolls with it, as on the summary: the bucket's pin is the
         one priced on the expiration that settles next (``_rolled_pin``), in
@@ -3209,6 +3405,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 if close is not None and inputs
                 else None
             )
+        else:
+            # The All view carries the engine's spot-shift flip, which was
+            # taken off the book with the expired contracts; take the rolled
+            # one, as /api/gex/summary does.
+            rolled = await self._rolled_spot_shift(conn, symbol, snapshot_ts, floor)
+            if rolled is not None:
+                bucket["gamma_flip"] = rolled["gamma_flip"]
         bucket["expired_excluded"] = expired
 
     async def get_gex_by_strike(
@@ -4773,6 +4976,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 payload["call_wall"] = summary.get("call_wall")
                 payload["put_wall"] = summary.get("put_wall")
                 payload["expired_excluded"] = summary["expired_excluded"]
+                # The curve itself, its flip and its value at spot: the same
+                # rolled reading the summary took (served from its cache).
+                try:
+                    async with self._acquire_connection() as conn:
+                        rolled = await self._rolled_spot_shift(
+                            conn, symbol, ts, self._live_expiration_floor(as_of)
+                        )
+                except Exception as e:
+                    logger.warning("GEX profile %s: after-close curve unavailable (%s)", symbol, e)
+                    rolled = None
+                if rolled is not None:
+                    payload["profile"] = rolled["profile"]
+                    payload["gamma_flip"] = rolled["gamma_flip"]
+                    payload["net_gex_at_spot"] = rolled["net_gex_at_spot"]
+                    payload["span_pct"] = rolled["span_pct"]
         if as_of is None:
             self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
         return payload

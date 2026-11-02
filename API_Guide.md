@@ -746,9 +746,17 @@ have expired:
   strikes, with the published walls as incumbents: a wall built from
   longer-dated contracts keeps its place unless a rival is clearly bigger.
   The summary's `total_call_gex`, `total_put_gex` and `net_gex` are re-summed
-  the same way. `/api/gex/profile` reports the same walls.
+  the same way, and the GEX King (`max_gamma_strike`) is the surviving
+  strike with the largest net gamma.
+- The flip family is re-priced on the surviving chain by the engine's own
+  spot-shift computation: `gamma_flip`, `gamma_flip_raw`,
+  `gamma_flip_span_used`, `gamma_flip_reason` and `net_gex_at_spot`, with
+  `flip_distance` and `convexity_risk` derived from them.
+  `/api/gex/profile` serves the re-priced curve (`profile`, `span_pct`) with
+  the same flip, net GEX at spot and walls.
 - The newest bucket of `/api/gex/strike-profile-timeseries` is rebuilt the
-  same way (strikes, walls, and under an `expirations` filter the flip).
+  same way (strikes, walls, and the flip: the re-priced one in the All view,
+  the filtered book's own under an `expirations` filter).
   Every earlier bucket is history and keeps the contracts that were trading
   at the time.
 
@@ -772,12 +780,11 @@ settles next, named in `rolled_to_expiration` on `/api/gex/summary` and
   same pin. `/api/gex/pin-stability` answers `404` after the close: its path
   belongs to the pin of the contracts that expired.
 
-The fields the engine computes from the whole chain when it publishes a row
-(`gamma_flip`, `net_gex_at_spot`, `max_gamma_strike`, the OI totals) stay as
-published. Replay frames, `/api/gex/historical`, `/api/gex/heatmap`,
-`/api/max-pain/timeseries` and the stored rows are history and are never
-changed. A delayed read (`delay_minutes`) judges expiry at its own moment, so
-a 15-minute-delayed view drops the day's contracts at 16:15 ET.
+`local_gex`, the OI totals and `put_call_ratio` stay as published. Replay
+frames, `/api/gex/historical`, `/api/gex/heatmap`, `/api/max-pain/timeseries`
+and the stored rows are history and are never changed. A delayed read
+(`delay_minutes`) judges expiry at its own moment, so a 15-minute-delayed view
+drops the day's contracts at 16:15 ET.
 
 ### GET /api/gex/summary
 Get latest GEX summary with key metrics.

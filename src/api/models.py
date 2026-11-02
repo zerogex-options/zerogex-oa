@@ -116,15 +116,19 @@ class GEXSummary(BaseModel):
     # session's last snapshot, which counts the day's expiring contracts, so
     # the walls (and ladders) are re-picked and ``total_call_gex`` /
     # ``total_put_gex`` / ``net_gex`` re-summed from the strikes that survive,
-    # and the dates removed are listed here.
+    # and the dates removed are listed here.  The GEX King
+    # (``max_gamma_strike``) and the flip family (``gamma_flip``,
+    # ``gamma_flip_raw``, ``gamma_flip_span_used``, ``gamma_flip_reason``,
+    # ``net_gex_at_spot``, ``flip_distance``, ``convexity_risk``) are
+    # recomputed from the surviving book the same way.
     expired_excluded: List[date] = Field(default_factory=list)
     # After the close: the expiration ``max_pain`` and the Pin Strike
     # (``pin_*``) now describe -- the one that settles next, since the
     # session's own has expired.  ``max_pain`` is that expiration's max pain
     # and the pin is priced on its contracts in the same snapshot.  Null
     # during the session, when both describe the nearest (same-day)
-    # expiration as published.  The flip, net GEX at spot, the GEX King and the
-    # OI totals stay as published either way.
+    # expiration as published.  ``local_gex``, the OI totals and the put/call
+    # ratio stay as published either way.
     rolled_to_expiration: Optional[date] = None
 
     class Config:
@@ -224,8 +228,9 @@ class GEXProfile(BaseModel):
     net_gex_at_spot: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None
-    # Same as GEXSummary.expired_excluded: after the close the walls above
-    # are the summary's, re-picked without these expired expirations.
+    # Same as GEXSummary.expired_excluded: after the close the curve, its flip
+    # and net GEX at spot are re-priced, and the walls re-picked, without
+    # these expired expirations.
     expired_excluded: List[date] = Field(default_factory=list)
 
     class Config:
