@@ -200,6 +200,37 @@ class GEXByStrike(BaseModel):
         }
 
 
+class VolumeGammaStrike(BaseModel):
+    """One strike of the volume-weighted gamma ladder.
+
+    ``call_gex`` / ``put_gex`` / ``net_gex`` are dollar gamma per 1% move in
+    :class:`GEXByStrike`'s convention (calls +, puts −), with each contract's
+    gamma weighted by the contracts traded today instead of its open interest
+    (see :mod:`src.api.volume_gamma`). ``call_volume`` / ``put_volume`` are
+    today's traded contracts at the strike, summed over the selected
+    expirations.
+    """
+
+    strike: float
+    call_gex: float
+    put_gex: float
+    net_gex: float
+    call_volume: int
+    put_volume: int
+
+
+class VolumeGammaByStrike(BaseModel):
+    """``/api/gex/volume-gamma-by-strike``: the latest snapshot's strikes,
+    ascending. ``timestamp`` is the snapshot the rows come from and
+    ``spot_price`` the spot they are dollarized at; both are null, with no
+    strikes, when there is no snapshot to read."""
+
+    symbol: str
+    timestamp: Optional[datetime] = None
+    spot_price: Optional[float] = None
+    strikes: List[VolumeGammaStrike] = Field(default_factory=list)
+
+
 class GEXProfilePoint(BaseModel):
     # One point on the spot-shift dealer dollar-gamma curve. ``price`` is
     # a hypothetical underlying price (grid x-axis); ``gex`` is the dealer

@@ -740,7 +740,8 @@ So from the close (16:00 ET, 13:00 on an early-close day) until the next
 snapshot, every read of the **current** book leaves out the expirations that
 have expired:
 
-- `/api/gex/by-strike` and the `profile` of `/api/v1/levels` drop their rows.
+- `/api/gex/by-strike`, `/api/gex/volume-gamma-by-strike` and the `profile`
+  of `/api/v1/levels` drop their rows.
 - `/api/gex/summary`, `/api/v1/levels` (and v2) re-pick `call_wall` /
   `put_wall` and the `call_walls` / `put_walls` ladders from the surviving
   strikes, with the published walls as incumbents: a wall built from
@@ -805,6 +806,30 @@ expirations are left out (see above).
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `limit` (optional): max `200`, default `50`
+
+### GET /api/gex/volume-gamma-by-strike
+Per-strike dealer gamma weighted by **today's traded volume** instead of open
+interest: `γ × volume × 100 × S² × 0.01` per 1% move, calls positive and puts
+negative, the same units and signs as `/api/gex/by-strike`. Read from the
+latest snapshot and summed per strike over the chosen expirations, every
+strike included (no row limit). After the close, expired expirations are left
+out (see above).
+
+Each contract's gamma is recovered from the stored open-interest-weighted
+figure, so a side with no open interest adds its traded contracts to
+`call_volume` / `put_volume` but nothing to the dollar figures. Volume can't
+tell an opening trade from a closing one, or who was on each side: read it as
+where today's gamma is trading, not as dealer positioning.
+
+**Parameters:**
+- `symbol` (optional): default `SPY`
+- `expirations` (optional): `all` (default) or a comma-separated list of
+  `YYYY-MM-DD` dates; anything else is a `400`
+
+**Response:** `symbol`, `timestamp` (the snapshot), `spot_price`, and
+`strikes` ascending, each with `strike`, `call_gex`, `put_gex`, `net_gex`,
+`call_volume`, `put_volume`. With no snapshot to read, `timestamp` and
+`spot_price` are `null` and `strikes` is empty.
 
 ### GET /api/gex/historical
 Get historical GEX data. Each row is one bar, stamped at the bar's start and

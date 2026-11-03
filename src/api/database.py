@@ -65,6 +65,7 @@ from src.underlying_volume_sql import (
     total_volume_lenient as _total_volume_lenient,
 )
 from src.api.market_tide import calculate_market_tide, market_tide_universe, SUPPORTED_WINDOWS
+from src.api.volume_gamma import volume_weighted_strike_gamma
 
 logger = logging.getLogger(__name__)
 
@@ -3497,6 +3498,84 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
+
+    async def get_volume_gamma_by_strike(
+        self,
+        symbol: str = "SPY",
+        expirations: Optional[List[date]] = None,
+    ) -> Dict[str, Any]:
+        """Latest snapshot's per-strike dealer gamma, weighted by today's volume.
+
+        The volume view of the gamma ladders: every (strike, expiration) row
+        of the newest ``gex_by_strike`` snapshot, summed per strike by
+        :func:`src.api.volume_gamma.volume_weighted_strike_gamma`, which
+        explains the arithmetic and its limits.  ``expirations`` restricts the
+        sum to those dates; None is every live expiration.
+
+        Same snapshot, spot and expiry cutoff as :meth:`get_gex_by_strike`:
+        the newest snapshot, the latest underlying close, and no expirations
+        that have already expired (after the close the newest snapshot is
+        the session's last, which still carries the day's expiring
+        contracts).  Unlike it there is no row limit: the sum needs every
+        expiration's row at a strike, and a strike can list many.
+        """
+        symbol = symbol.upper()
+        floor = self._live_expiration_floor()
+        exp_filter = sorted(set(expirations)) if expirations else None
+        exp_key = ",".join(d.isoformat() for d in exp_filter) if exp_filter else "all"
+        cache_key = f"volume_gamma_by_strike:{symbol}:{exp_key}:{floor.isoformat()}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+        query = """
+            WITH spot AS (
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
+            SELECT
+                g.timestamp,
+                g.strike,
+                g.call_gamma,
+                g.put_gamma,
+                g.call_oi,
+                g.put_oi,
+                g.call_volume,
+                g.put_volume,
+                spot.close AS spot_price
+            FROM gex_by_strike g
+            CROSS JOIN spot
+            WHERE g.underlying = $1
+                AND g.timestamp = (
+                    SELECT timestamp
+                    FROM gex_by_strike
+                    WHERE underlying = $1
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                )
+                -- Expirations that have already expired (the day's own after
+                -- the close).  Drops nothing while the session is open.
+                AND g.expiration >= $2::date
+                AND ($3::date[] IS NULL OR g.expiration = ANY($3::date[]))
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, floor, exp_filter)
+        except Exception as e:
+            logger.error(f"Error fetching volume gamma by strike: {e}", exc_info=True)
+            raise
+        first = rows[0] if rows else None
+        spot = float(first["spot_price"]) if first and first["spot_price"] is not None else None
+        result = {
+            "symbol": symbol,
+            "timestamp": first["timestamp"] if first else None,
+            "spot_price": spot,
+            "strikes": volume_weighted_strike_gamma(rows, spot),
+        }
+        self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+        return result
 
     async def get_latest_strike_gamma_profile(
         self,

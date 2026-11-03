@@ -36,6 +36,7 @@ from .models import (
     GEXSummary,
     PinStabilityResponse,
     GEXByStrike,
+    VolumeGammaByStrike,
     GEXProfile,
     GEXHistoricalContext,
     FlowPoint,
@@ -853,6 +854,71 @@ async def get_gex_by_strike(
     return [GEXByStrike(**row) for row in data]
 
 
+def _parse_expirations_param(expirations: Optional[str]) -> Optional[List[date_type]]:
+    """The ``expirations`` query param shared by the per-strike surfaces.
+
+    ``'all'`` (or nothing) is None, every expiration. Otherwise a
+    comma-separated list of ``YYYY-MM-DD`` dates; any unparseable entry is a
+    400. An all-blank list (e.g. ``expirations=,``) collapses to All rather
+    than a chart-blanking empty filter.
+    """
+    raw = (expirations or "all").strip()
+    if raw.lower() == "all":
+        return None
+    parsed: List[date_type] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parsed.append(date_type.fromisoformat(part))
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "expirations must be 'all' or a comma-separated list "
+                    "of YYYY-MM-DD expiration dates"
+                ),
+            )
+    return parsed or None
+
+
+@app.get(
+    "/api/gex/volume-gamma-by-strike",
+    response_model=VolumeGammaByStrike,
+    tags=["GEX"],
+    dependencies=[_scope_gex],
+)
+@handle_api_errors("GET /api/gex/volume-gamma-by-strike")
+async def get_volume_gamma_by_strike(
+    symbol: str = Query(default="SPY"),
+    expirations: str = Query(
+        default="all",
+        description=(
+            "'all' for every live expiration, or a comma-separated list of "
+            "YYYY-MM-DD expiration dates to sum over."
+        ),
+    ),
+):
+    """Per-strike dealer gamma weighted by today's traded volume.
+
+    The volume view of the gamma ladders. Each contract's gamma is weighted
+    by the contracts traded today instead of its open interest:
+    ``γ × volume × 100 × S² × 0.01`` per 1% move, calls positive and puts
+    negative, the same convention and units as ``/api/gex/by-strike``. Read
+    from the latest snapshot and summed per strike over ``expirations``;
+    expirations that have already expired are left out after the close.
+
+    Volume cannot tell an opening trade from a closing one, or who was on
+    each side, so this maps where today's gamma is trading, not dealer
+    positioning. Strikes come back ascending. A side with no open interest
+    has no recoverable gamma and adds nothing to the dollar figures (see
+    :mod:`src.api.volume_gamma`).
+    """
+    expiration_dates = _parse_expirations_param(expirations)
+    return await _db().get_volume_gamma_by_strike(symbol, expiration_dates)
+
+
 @app.get("/api/gex/profile", response_model=GEXProfile, tags=["GEX"], dependencies=[_scope_gex])
 @handle_api_errors("GET /api/gex/profile")
 async def get_gex_profile(symbol: str = Query(default="SPY"), delay_minutes: _DelayMinutes = 0):
@@ -1043,27 +1109,7 @@ async def get_strike_profile_timeseries(
     ``delay_minutes`` ends the window at the newest bucket at least that old
     (see src/api/delayed_read.py).
     """
-    expiration_dates: Optional[List[date_type]] = None
-    raw = (expirations or "all").strip()
-    if raw.lower() != "all":
-        parsed: List[date_type] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                parsed.append(date_type.fromisoformat(part))
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "expirations must be 'all' or a comma-separated list "
-                        "of YYYY-MM-DD expiration dates"
-                    ),
-                )
-        # An all-blank list (e.g. ``expirations=,``) collapses to All rather
-        # than a chart-blanking empty filter.
-        expiration_dates = parsed or None
+    expiration_dates = _parse_expirations_param(expirations)
 
     # Return the raw bucket dicts and let ``response_model`` do the single
     # validation + encode pass. Building StrikeProfileBucket instances here was
