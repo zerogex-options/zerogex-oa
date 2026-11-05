@@ -40,10 +40,10 @@ last either way.
 All six list on Nasdaq, so each compares against QQQ and reads VXN, as NVDA does.
 
 Strike band: 8% for each, as for NVDA. Each of these usually moves less in a
-day than NVDA does, except TSLA, which usually moves more; if TSLA's probe shows
-its walls sitting outside 8%, use 10% (`BAND=10` below).
-`INGEST_STRIKE_COUNT_MAX` (40 strikes per expiration) caps the cost whatever the
-band.
+day than NVDA does, except TSLA, which usually moves more. If a probe shows 8%
+holding fewer strikes per expiration than NVDA's 14, widen that stock's band
+(`BAND=10` below). `INGEST_STRIKE_COUNT_MAX` (40 strikes per expiration) caps
+the cost whatever the band.
 
 ## Once, before the first stock
 
@@ -133,7 +133,7 @@ make services-restart-ingest-analytics
 Ingestion, then analytics, each health-checked before the next. The API and
 signals keep serving. Step 1's last line names what to restart: if it also
 names `zerogex-oa-wall-alerts`, run `sudo systemctl restart zerogex-oa-wall-alerts`;
-if it names `zerogex-oa-api` (only when the WebSocket list names NVDA), run
+if it names `zerogex-oa-api` (when the WebSocket or forced-flow warm list names NVDA), run
 `sudo systemctl restart zerogex-oa-api && make api-health-assert`.
 
 **3. Check it came up:**
@@ -145,10 +145,11 @@ sudo journalctl -u zerogex-oa-ingestion --since "5 min ago" | grep -E "Initializ
 You want `Initialized IngestionEngine for MSFT`, an MSFT line with a `±8.0%`
 band, and NVDA's line still at `±8.0%`.
 
-```sql
-SELECT symbol, asset_type, is_active FROM symbols WHERE symbol = 'MSFT';
--- MSFT | EQUITY | t
+```bash
+make symbols-list UNDERLYING=MSFT
 ```
+
+One row: `MSFT`, asset type `EQUITY`, active `t`.
 
 ### The next session
 
