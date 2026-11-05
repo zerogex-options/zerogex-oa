@@ -803,6 +803,13 @@ quote-cadence: ## How often each symbol's live price changes at the source: upda
 	@echo "$(YELLOW)Healthy in the regular session: about 60 a minute and a median gap near 1 s.$(NC)"
 	@$(PY) -m src.tools.quote_cadence --seconds $(or $(SECONDS),60)
 
+.PHONY: capacity-check
+capacity-check: ## Will one more symbol fit, and did the last one hurt anything? Read-only, saves each run. Optional: LABEL=baseline BASELINE=~/monitoring/capacity/<file>.json WINDOW=30
+	@$(PY) -m src.tools.capacity_check \
+		--window-minutes $(or $(WINDOW),30) \
+		$(if $(LABEL),--label "$(LABEL)") \
+		$(if $(BASELINE),--baseline "$(BASELINE)")
+
 .PHONY: flow-explain
 flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)
 	@echo "$(BLUE)=== flow_by_contract Query Planner Diagnosis ===$(NC)"
@@ -1652,6 +1659,11 @@ services-restart-one-by-one: ## Restart each service in turn (ingestion → anal
 	@$(MAKE) --no-print-directory services-status
 	@$(MAKE) --no-print-directory api-health-assert
 
+.PHONY: services-restart-ingest-analytics
+services-restart-ingest-analytics: ## Restart only ingestion then analytics, health-checking each: all a new symbol in INGEST_/ANALYTICS_UNDERLYINGS needs. The API and signals keep serving.
+	@$(MAKE) --no-print-directory services-restart-one-by-one \
+		SERVICES_START_ORDER="$(INGESTION_SERVICE) $(ANALYTICS_SERVICE)"
+
 .PHONY: services-restart-stop-all-first
 services-restart-stop-all-first: ## Stop all 4 services (api → … → ingestion), then start all (ingestion → … → api)
 	@echo "$(YELLOW)=== Restarting all services (stop all, then start all) ===$(NC)"
@@ -2065,6 +2077,7 @@ feed-probe: ## Measure ONE fetch from a provider before a real run (PROVIDER, UN
 		--incumbent '$(or $(PROVIDER),$(INCUMBENT),tradestation)' \
 		$(if $(EXPIRATIONS),--expirations '$(EXPIRATIONS)') \
 		$(if $(STRIKE_COUNT_MAX),--strike-count-max '$(STRIKE_COUNT_MAX)') \
+		$(if $(STRIKE_PCT_RANGE),--strike-pct-range '$(STRIKE_PCT_RANGE)') \
 		$(if $(JSON),--json)
 
 .PHONY: crossed-capture

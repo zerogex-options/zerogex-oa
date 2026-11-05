@@ -69,3 +69,15 @@ def test_both_modes_end_on_the_api_deploy_gate():
     for target in ("services-restart-one-by-one", "services-restart-stop-all-first"):
         last_line = _recipe(target).strip().splitlines()[-1]
         assert "api-health-assert" in last_line, target
+
+
+def test_a_new_symbol_restarts_only_ingestion_then_analytics():
+    """Adding a symbol to INGEST_/ANALYTICS_UNDERLYINGS needs those two units
+    and no others. The API and signals keep serving, and the two still go
+    through the health-checked one-by-one restart."""
+    recipe = _recipe("services-restart-ingest-analytics")
+    assert "services-restart-one-by-one" in recipe
+    assert re.search(
+        r'SERVICES_START_ORDER="\$\(INGESTION_SERVICE\) \$\(ANALYTICS_SERVICE\)"', recipe
+    )
+    assert "API_SERVICE" not in recipe and "SIGNALS_SERVICE" not in recipe
