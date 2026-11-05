@@ -319,9 +319,14 @@ updating.
 
 ## Adding the next stock
 
+`mag7_rollout.md` is the procedure for the rest of the MAG 7, one at a time,
+with a capacity measurement before and after each. In short:
+
 1. **Web:** add the ticker to `STOCK_SYMBOLS` and its listing (`NASDAQ` or
    `NYSE`) to `STOCK_LISTING` in `frontend/core/symbols.ts`. The type checker
    refuses a stock without a listing. The listing decides its comparison
    partner: QQQ for Nasdaq, SPY otherwise.
 2. **Backend:** no code change. A new **ETF** goes in `ETF_SYMBOLS` instead.
-3. **Environment:** steps 3 to 5 above, with the new ticker in place of NVDA.
+3. **Environment:** `make stock-env-add SYMBOL=<ticker>` makes step 3's edits
+   for it, mirroring NVDA's, then `make services-restart-ingest-analytics` and
+   step 5's checks.

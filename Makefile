@@ -810,6 +810,13 @@ capacity-check: ## Will one more symbol fit, and did the last one hurt anything?
 		$(if $(LABEL),--label "$(LABEL)") \
 		$(if $(BASELINE),--baseline "$(BASELINE)")
 
+.PHONY: stock-env-add
+stock-env-add: ## Add a stock to every .env list it needs, mirroring NVDA's, and show the change. SYMBOL=MSFT [BAND=8] [CONFIRM=yes writes it, after backing .env up to ~]
+	@test -n "$(SYMBOL)" || { echo "$(RED)Usage: make stock-env-add SYMBOL=MSFT [BAND=8] [CONFIRM=yes]$(NC)"; exit 2; }
+	@$(PY) -m src.tools.stock_env --symbol "$(SYMBOL)" \
+		$(if $(BAND),--band "$(BAND)") \
+		$(if $(filter yes,$(CONFIRM)),--apply)
+
 .PHONY: flow-explain
 flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)
 	@echo "$(BLUE)=== flow_by_contract Query Planner Diagnosis ===$(NC)"
