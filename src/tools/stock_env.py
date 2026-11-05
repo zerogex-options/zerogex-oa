@@ -50,6 +50,9 @@ MIRRORED_LISTS = (
     "REGIME_SESSION_SYMBOLS",
     "DAILY_ATM_IV_SYMBOLS",
     "WS_ALLOWED_SYMBOLS",
+    # Unset, these follow the ingestion list; set, they are their own.
+    "SESSION_LEVELS_SYMBOLS",
+    "SESSION_SURFACE_WARM_SYMBOLS",
 )
 #: Models and feeds a stock must stay out of (docs/runbooks/stock_onboarding.md).
 FORBIDDEN_LISTS = (
@@ -70,6 +73,7 @@ RESTART_FOR = {
     BAND_KEY: "zerogex-oa-ingestion",
     "ANALYTICS_UNDERLYINGS": "zerogex-oa-analytics",
     "WS_ALLOWED_SYMBOLS": "zerogex-oa-api",
+    "SESSION_SURFACE_WARM_SYMBOLS": "zerogex-oa-api",
     "WALL_ALERTS_SYMBOLS": "zerogex-oa-wall-alerts",
 }
 
@@ -223,6 +227,16 @@ def plan_addition(
             change(key, append_token(key, m["value"], symbol))
         elif key in seen and template not in tokens_of(key):
             plan.notes.append(f"{key} does not list {template}, so {symbol} is left out of it too")
+
+    # Any other line naming the template is one this tool does not know the
+    # format of (the Makefile-read backfill lists differ in separator). Say so
+    # rather than guess, so nothing NVDA has is quietly missed.
+    known = set(REQUIRED_LISTS) | set(MIRRORED_LISTS) | set(FORBIDDEN_LISTS) | {BAND_KEY}
+    for key in seen:
+        if key not in known and template in tokens_of(key) and symbol not in tokens_of(key):
+            plan.notes.append(
+                f"{template} is also in {key}; add {symbol} there by hand if it belongs"
+            )
 
     use_band = band if band is not None else (template_band if template_band is not None else 8.0)
     if not 0.5 <= use_band <= 50.0:

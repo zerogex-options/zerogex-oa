@@ -220,3 +220,25 @@ def test_a_one_symbol_list_takes_its_keys_own_separator():
     plan = _plan(text)
     assert "DAILY_ATM_IV_SYMBOLS=NVDA MSFT\n" in plan.lines
     assert "WALL_ALERTS_SYMBOLS=NVDA,MSFT\n" in plan.lines
+
+
+def test_the_service_lists_that_default_to_the_ingestion_list_are_mirrored_when_set():
+    text = (
+        ENV
+        + "SESSION_LEVELS_SYMBOLS=SPY,QQQ,NVDA\nSESSION_SURFACE_WARM_SYMBOLS=SPY,SPX,QQQ,NDX,NVDA\n"
+    )
+    plan = _plan(text)
+    assert "SESSION_LEVELS_SYMBOLS=SPY,QQQ,NVDA,MSFT\n" in plan.lines
+    assert "SESSION_SURFACE_WARM_SYMBOLS=SPY,SPX,QQQ,NDX,NVDA,MSFT\n" in plan.lines
+    assert "zerogex-oa-api" in plan.restarts  # the API reads the warm list at start
+
+
+def test_a_list_it_does_not_know_that_names_nvda_is_reported_not_edited():
+    text = ENV + "NORMALIZER_SYMBOLS=SPY QQQ NVDA\nDB_NAME=zerogex\n"
+    plan = _plan(text)
+    assert "NORMALIZER_SYMBOLS" not in plan.changed
+    assert "NORMALIZER_SYMBOLS=SPY QQQ NVDA\n" in plan.lines
+    assert any(
+        "NVDA is also in NORMALIZER_SYMBOLS; add MSFT there by hand" in n for n in plan.notes
+    )
+    assert not any("DB_NAME" in n for n in plan.notes)

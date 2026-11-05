@@ -115,8 +115,10 @@ make stock-env-add SYMBOL=MSFT CONFIRM=yes
 It adds MSFT to the lists every stock needs (`INGEST_UNDERLYINGS`,
 `ANALYTICS_UNDERLYINGS`, `MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS`), to the strike
 band map at NVDA's band, and to each optional list NVDA is in (wall alerts,
-Gamma Shift history, the IV-rank backfill, the WebSocket list), so every stock
-is set up the way NVDA was. It never touches the signal, forecast, bulletin or
+Gamma Shift history, the IV-rank backfill, the WebSocket list, and the session
+levels and forced-flow warm lists when they are set), so every stock is set up
+the way NVDA was. Any other line that names NVDA it reports for you to judge,
+without editing it. It never touches the signal, forecast, bulletin or
 TradeWorkz lists. It prints only the lines it changes, backs `.env` up to
 `~/.env.pre-msft-<date>`, and refuses, writing nothing, if a line is not one it
 can change safely (a comment on the line, the band map not valid JSON, a key set
