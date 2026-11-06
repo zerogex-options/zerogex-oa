@@ -30,12 +30,11 @@ Do not put decisions, questions or new information after these sections.
 
 - Develop on the branch the session names. Michael merges to `release` himself
   and deploys from the EC2 box.
-- **The test suite has 15 pre-existing failures on `release`** (measured
-  2026-10-01: 15 failed, 6201 passed, 6 skipped, `-m "not integration"`). They
-  are 10 in `test_ingestion_oi_coverage_session.py`, 4 in
-  `test_ingestion_volume_coverage_session.py`, 1 in
-  `test_api_v2_freshness_envelope.py`, and 1 order-dependent failure in
-  `test_signal_engine_log_volume.py` that passes when that file runs alone.
+- **The test suite has 2 pre-existing failures on `release`**
+  (`-m "not integration"`): 1 in `test_api_v2_freshness_envelope.py`, and 1
+  order-dependent failure in `test_signal_engine_log_volume.py` that passes
+  when that file runs alone. The two option-coverage test files that used to
+  be on this list pass since the 2026-11-06 coverage fix.
   Still diff the failure SET against a baseline from a clean checkout rather
   than reading pass/fail, and build the filter from the test files that IMPORT
   what changed, not from module-name keywords. A full run takes about 11
