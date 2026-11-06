@@ -6,8 +6,8 @@ that copy one to /etc/systemd/system are a full deploy (deploy/steps/100.systemd
 which stops and starts every service) and a per-service install target, which
 only the API has. So a limit changed in the repo can sit uninstalled. On
 2026-11-06 the box was still running ingestion at CPUQuota=150%: the 300% the
-repo has said since 2026-10-28 never got there, and ingestion was throttled in
-85% of its CPU periods before the open.
+repo said from 2026-10-28 never got there. (The session showed 150% is enough,
+so the repo says 150% again.)
 
 Without --apply this only shows: how the installed file differs from the repo's,
 and the memory cap and CPU quota each file sets beside what the running service

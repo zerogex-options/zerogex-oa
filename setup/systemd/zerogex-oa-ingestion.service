@@ -46,13 +46,23 @@ SendSIGKILL=yes
 
 # Resource limits
 MemoryMax=2G
-# Up to 3 of the box's 8 cores, for one worker per symbol plus the VIX/VXN and
-# futures feeds. At 150% the unit sat pinned at its quota during the cash
-# session (2026-10-28) and a pass over the option chain took 17-19 s for SPY
-# and QQQ and 36-39 s for SPX and NDX. Not 400%: the API takes up to 4 cores,
-# and faster passes write more option rows to a 2-vCPU database it shares.
-# CPUWeight below still lets the API (400) win contention.
-CPUQuota=300%
+# 1.5 of the box's 8 cores, shared by one worker per symbol plus the VIX/VXN
+# and futures feeds. Each worker reprocesses its chain as fast as its share
+# allows, so the unit sits pinned at this quota all session; that is its normal
+# state. What the quota sets is how often each contract's option row is
+# rewritten, and with it how many rows reach the database a second.
+#
+# 300% was committed on 2026-10-28 (6adda93), when 1.5 cores meant passes of
+# 17-19 s for SPY and QQQ and 36-39 s for SPX and NDX, but it never reached the
+# box, and the same day the live price stopped waiting on passes (c3687f0).
+# Measured at 150% on 2026-11-06 at 14:43 ET with 5 symbols (make
+# capacity-check): throttled in 99% of periods, yet the median option row was
+# 4-18 s old, GEX published every minute, the price moved every second and no
+# analytics cycle overran. Twice the quota would write option rows about twice
+# as often into a database already averaging about 15 active sessions. So the
+# MAG 7 stocks share this quota, and the capacity check's option row age says
+# when it needs to grow (docs/runbooks/mag7_rollout.md).
+CPUQuota=150%
 CPUWeight=100
 
 # Security

@@ -565,12 +565,16 @@ def test_limits_the_box_runs_are_checked_against_the_repos_unit_files(tmp_path):
     assert cc.limits_drift(reading, tmp_path) == ["CPUQuota is 150%, the file says 300%"]
     reading.cpu_quota_cores = 3.0
     assert cc.limits_drift(reading, tmp_path) == []
-    # And against the real repo: its ingestion unit says 3 cores.
-    assert cc.limits_drift(
-        cc.UnitReading(
-            unit="zerogex-oa-ingestion", present=True, memory_max=2 * 1024**3, cpu_quota_cores=1.5
+
+    # And against the real repo: its ingestion unit says 1.5 cores, what the box
+    # runs, so the 2026-11-06 box reads clean and a 3-core one would not.
+    def box(cores):
+        return cc.UnitReading(
+            unit="zerogex-oa-ingestion", present=True, memory_max=2 * 1024**3, cpu_quota_cores=cores
         )
-    ) == ["CPUQuota is 150%, the file says 300%"]
+
+    assert cc.limits_drift(box(1.5)) == []
+    assert cc.limits_drift(box(3.0)) == ["CPUQuota is 300%, the file says 150%"]
 
 
 def _this_morning():

@@ -17,17 +17,18 @@ baseline measured, at 5 symbols:
 
 | Shared by every symbol | Limit | What one more stock adds |
 |---|---|---|
-| Ingestion (`zerogex-oa-ingestion`) | 2 GB memory, 3 cores (see below) | one process: about 104 MB, and a share of the CPU quota. Each worker reprocesses its chain as fast as its share allows, so every symbol's option data gets a little staler with each one added |
+| Ingestion (`zerogex-oa-ingestion`) | 2 GB memory, 1.5 cores | one process: about 90-100 MB, and a share of the CPU quota. Each worker reprocesses its chain as fast as its share allows, so every symbol's option data gets a little staler with each one added |
 | Analytics (`zerogex-oa-analytics`) | 1 GB memory, 1 core | one process: about 21 MB and a GEX cycle a minute |
 | ThetaData | 8 requests at a time, per account | 6 chain calls every 5 s and 2 price calls a second. Each symbol's process has its own pool, so nothing coordinates them |
-| The database | db.r6g.large (2 vCPUs) per the repo's notes; the RDS console says what runs now | its option rows, written every few seconds, and its analytics read a minute |
+| The database | the RDS console says which instance; it averaged about 15 active sessions through the 2026-11-06 session | its option rows (out of ingestion's fixed CPU, so the total write rate barely moves) and its analytics read a minute |
 | The box | 15.7 GB, 8 cores | the sum of the above |
 
-Memory is not close anywhere: six stocks add about 625 MB to ingestion's 734 MB
-peak against its 2 GB, and about 125 MB to analytics' 136 MB against its 1 GB.
-**CPU is the limit, in ingestion.** The API, signals and Market Tide are not
-affected: stocks stay out of their lists, and the API reads a symbol per
-request rather than holding a list.
+Memory is not close anywhere: six stocks add about 600 MB to ingestion's
+660-730 MB peak against its 2 GB, and about 130 MB to analytics' 140 MB against
+its 1 GB. **The limits are ingestion's CPU, which every symbol's option data
+shares, and the database, which everything shares.** The API, signals and
+Market Tide are not affected: stocks stay out of their lists, and the API reads
+a symbol per request rather than holding a list.
 
 A stock that does not fit does not fail with an error. It shows up as every
 symbol's option rows getting staler, its GEX updating less often, the live
@@ -36,17 +37,36 @@ as an out-of-memory kill. That is what `make capacity-check` measures.
 
 ## What 2026-11-06 found
 
-**Ingestion was running at 1.5 cores, not 3.** The repo has said
-`CPUQuota=300%` since 2026-10-28 (6adda93), but nothing installed it: a unit
+**Ingestion runs at 1.5 cores, and stays there.** The repo said
+`CPUQuota=300%` from 2026-10-28 (6adda93), but nothing installed it: a unit
 file reaches `/etc/systemd/system` only through a full deploy, which stops and
 starts every service, or a per-service install target, which only the API had.
-At 08:52 ET, before the open, ingestion used 1.40 of its 1.50 cores and was
-throttled in 85% of its CPU periods. With 11 symbols on 1.5 cores, each worker
-would get about half of today's share. On 3 cores, all 11 get about what 5 get
-today, so the full rollout should leave each symbol's option data about as
-fresh as it is now. `make service-limits-install` now installs one unit's limits
-without a restart, and the capacity check flags any unit whose running limits
-differ from the repo's.
+The session measurements then showed it is not needed. At 14:43 ET, at 1.5
+cores and throttled in 99% of its CPU periods, ingestion kept every symbol's
+option rows 4-18 s old (median), GEX published every minute, prices moved
+every second, and no analytics cycle overran. Doubling the quota would roughly
+double how often option rows are written, into a database averaging about 15
+active sessions. So the repo now says 150%, the stocks share it, and the check
+watches option row age to say when ingestion needs more. With all 11 symbols
+each worker gets about half today's share, so expect the ages to roughly
+double (SPX, the stalest at 18 s, to about 40 s): inside the 60 s warning, and
+the reason to add the stocks one at a time. `make service-limits-install`
+installs one unit's limits without a restart, and the check flags any unit
+whose running limits differ from the repo's.
+
+**The database works hardest late in the day.** Both session runs averaged
+about 15 active sessions (most on CPU), and the afternoon read 47 times as
+many disk blocks a second as the open (5,741 against 122), likely as the day's
+data outgrows memory. It also grew by about 4.3 GB between 10:04 and 14:43.
+Each stock adds its own day of data to both, so compare runs at the same time
+of day, and keep an eye on free storage in the RDS console.
+
+**ThetaData's index feed failed for about half an hour.** From about 09:35 ET
+its index snapshots answered "No data found" for SPX, NDX and VIX, and some
+option snapshots failed too; SPX, NDX, ES and NQ levels froze from about 09:49
+until it recovered, between 10:08 and 10:30. Nothing here was at fault, and
+the 10:04 run that caught it is not a baseline. Stocks and ETFs, on ThetaData's
+stock feed, were unaffected.
 
 **ThetaData serves all six,** probed 2026-11-06 at 08:53 ET at an 8% band:
 
@@ -93,51 +113,25 @@ cd ~/zerogex-oa && git checkout release && git pull
 
 Nothing running reads any of it, so nothing restarts.
 
-### 2. A baseline during the session, at today's 1.5 cores
-
-Twice, between 10:00 and 15:30 ET (late morning and mid-afternoon):
+### 2. A baseline during the session. Done 2026-11-06
 
 ```bash
 cd ~/zerogex-oa && make capacity-check LABEL=baseline-150
 ```
 
 It takes about a minute, reads only, and saves itself; the last line is the
-file name. It will warn that ingestion's quota differs from the repo's: that
-is step 3. The 08:52 ET run on 2026-11-06 was before the open, so it could
-judge only memory and CPU.
+file name. **MSFT's baseline is `~/monitoring/capacity/2026-11-06-1443-baseline-150.json`**,
+the 14:43 ET run: every gate passed but one, ingestion's quota against the
+repo's, which merging `claude/mag7-ingestion-cpu-150` clears. The 08:52 run was
+before the open, and the 10:04 run caught ThetaData's index outage.
 
-### 3. Install ingestion's 3-core cap, after the close
+### 3. Ingestion's CPU stays at 1.5 cores
 
-```bash
-cd ~/zerogex-oa && make service-limits-install UNIT=ingestion
-```
-
-Read what it prints: the difference between the installed file and the repo's
-should be the `CPUQuota` line and its comment. If it shows other changed lines,
-they wait for the next restart; send them to me before going on. Then:
-
-```bash
-make service-limits-install UNIT=ingestion CONFIRM=yes
-```
-
-It ends `Done. zerogex-oa-ingestion now runs with MemoryMax=2G and
-CPUQuota=300%, without a restart`. To undo it at once, without a restart:
-`sudo systemctl set-property --runtime zerogex-oa-ingestion CPUQuota=150%`
-(that holds until the box reboots; tell me and I'll give you the file change).
-
-What changes: each ingestion worker gets about twice the CPU, so passes over
-the chains get faster and option rows are written more often, which is more
-writes to the database. That is the trade the 2026-10-28 change named.
-
-### 4. The next session: the effect of 3 cores
-
-```bash
-make capacity-check LABEL=after-cpu BASELINE=~/monitoring/capacity/<a baseline-150 file>.json
-```
-
-Option row ages should fall (fresher), and database load and rows written per
-second rise. GO here means MSFT can go in that evening, and this run is the
-baseline for it.
+Nothing to install: the box already runs 150%, and since 2026-11-06 the repo's
+unit file says the same (see "What 2026-11-06 found"). If option row ages ever
+need more, raise it in `setup/systemd/zerogex-oa-ingestion.service` and
+install it without a restart with `make service-limits-install UNIT=ingestion`,
+which shows the change first and needs `CONFIRM=yes` to make it.
 
 ## For each stock
 
@@ -211,10 +205,12 @@ comparing against it:
 make capacity-check LABEL=after-msft BASELINE=~/monitoring/capacity/<the run before MSFT>.json
 ```
 
-The baseline is the last run before this stock went in: for MSFT, the
-`after-cpu` run from step 4 above; for each later stock, the run that cleared
-the stock before it. Every number shows its change from the baseline in
-brackets. Send me the output.
+The baseline is the last clean run before this stock went in: for MSFT, the
+2026-11-06 14:43 ET run (step 2 above); for each later stock, the run that
+cleared the stock before it. Run it at about the same time of day as its
+baseline, mid-afternoon, since the database's disk reads climb through the day.
+Every number shows its change from the baseline in brackets. Send me the
+output.
 
 **6. The gate,** from the report's last line:
 
@@ -262,12 +258,13 @@ before the next stock:
   lists every unit's cap. Ask me for the change.
 - **analytics, slower cycles or overruns.** The analytics unit has one core for
   every symbol. The remedy is a higher `CPUQuota` on it (the box has 8 cores; the
-  API takes up to 4 and ingestion up to 3).
+  API takes up to 4 and ingestion up to 1.5).
 - **freshness, option rows getting staler.** Ingestion's workers are sharing its
-  3 cores too thinly. Raising its quota further competes with the API for the
-  box's 8 cores, so the better remedy is for stocks to reprocess their chains
-  less often than every 5 s, which nothing downstream needs: the GEX cycle reads
-  once a minute. That setting does not exist yet; ask me for it.
+  1.5 cores too thinly. Two remedies, in this order. First, have the stocks
+  reprocess their chains less often than every 5 s, which nothing downstream
+  needs (the GEX cycle reads once a minute); that setting does not exist yet,
+  so ask me for it. Second, raise ingestion's quota, which writes more to the
+  database: only once the RDS console shows the database has room.
 - **limits, a unit not running what the repo says.** `make service-limits-install
   UNIT=<unit>` installs it without a restart.
 - **thetadata, failed price polls.** `THETADATA_BAR_POLL_SECONDS=2` in `.env`

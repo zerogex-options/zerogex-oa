@@ -1,7 +1,7 @@
 """``make service-limits-install`` (src/tools/unit_limits.py).
 
 On 2026-11-06 the box was still running ingestion at CPUQuota=150%, the 300%
-the repo has said since 2026-10-28 never installed. These pin how the tool
+the repo said from 2026-10-28 never installed. These pin how the tool
 finds that, what it changes, and what it refuses.
 """
 
@@ -62,7 +62,7 @@ MemoryMax=2G
 
 def test_the_repos_own_unit_files_parse():
     expect = {
-        "zerogex-oa-ingestion": ("2G", "300%"),
+        "zerogex-oa-ingestion": ("2G", "150%"),
         "zerogex-oa-analytics": ("1G", "100%"),
         "zerogex-oa-signals": ("1G", "100%"),
         "zerogex-oa-api": ("8G", "400%"),
