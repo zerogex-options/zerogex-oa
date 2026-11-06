@@ -13,8 +13,8 @@ Without --apply this only shows: how the installed file differs from the repo's,
 and the memory cap and CPU quota each file sets beside what the running service
 has. With --apply it copies the repo's file over, reloads systemd, and sets the
 file's MemoryMax and CPUQuota on the running service (systemctl set-property
---runtime). That takes effect at once and lasts until the next restart, when the
-installed file says the same. Nothing restarts.
+--runtime). That takes effect at once, and from then on the installed file says
+the same, so a restart or a reboot keeps it. Nothing restarts.
 
 It refuses to set a memory cap below what the service holds now, which would
 make the kernel reclaim or kill on the spot: lower one with a restart instead.
