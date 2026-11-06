@@ -6,7 +6,8 @@ going — the "nothing but SPY is updating" shape.
 `zerogex-oa-ingestion` is **one parent process that forks one child per
 symbol** (plus VIX, VXN, and the futures display feeds — 8 children for the
 default four-symbol config). The parent supervises them; each child owns its
-own TradeStation streams and DB writes for exactly one symbol.
+own feed streams (ThetaData since the 2026-10-19 cutover; ES/NQ still
+TradeStation) and DB writes for exactly one symbol.
 
 That topology is the whole reason this runbook exists. A single child dying
 does not stop the unit, so **every process-level check reports healthy**:
@@ -69,6 +70,17 @@ for QQQ`).
 - **A PID still logging but writing no bars** → the child is **stalled**. Its
   streams are up but starved. Look at the underlying staleness ladder in
   `stream_manager.py` (`STALE`, `Restarting underlying bar stream`).
+
+  Since 2026-11-06 those lines start with the symbol (`SPX: Restarting …`),
+  carry `last new price: <time ET>`, and end with what the bar stream got from
+  ThetaData, which says whose problem it is:
+
+  | Line ends with | Meaning |
+  |---|---|
+  | `N poll(s) answered …, 0 with a usable price, 0 failed` | ThetaData answers every poll but has no new price for that symbol. Upstream; the slow retry recovers it when the price comes back. For a stock, also check for its own `not storing this mark` warning |
+  | `…, M with a usable price, 0 failed` | ThetaData keeps sending a price, but its time never moves past `last new price`. Upstream |
+  | `M failed (last: …)` | The calls themselves fail. The error says why (terminal down, login replaced, entitlement) |
+  | `a call has been waiting Ns for an answer` | A call never came back. Local to that worker: `sudo kill <pid>` and the supervisor respawns just that symbol with a fresh connection within seconds (`exited unexpectedly … respawning`) |
 
 Then read what the supervisor did:
 

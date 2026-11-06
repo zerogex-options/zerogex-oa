@@ -452,6 +452,41 @@ def _feed_session_lost(provider: Any) -> bool:
     return check is not None and check() is True
 
 
+def _feed_name(provider: Any) -> str:
+    """The provider's own name ("thetadata_mv", "tradestation"), for the
+    watchdog's log lines. Those once said TradeStation outright, and kept
+    saying it after the 2026-10-19 cutover moved the bars to ThetaData."""
+    name = getattr(provider, "name", None)
+    return name if isinstance(name, str) and name else "the market data feed"
+
+
+def _stream_health(stream: Any) -> str:
+    """``stream.health()`` (see BarStream.health), or "" when the stream has
+    none or it fails. A log line's diagnostic must never break the restart
+    it describes."""
+    health = getattr(stream, "health", None)
+    if not callable(health):
+        return ""
+    try:
+        text = health()
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return ""
+    return text if isinstance(text, str) else ""
+
+
+def _last_new_price(ts: Any) -> str:
+    """When the last new underlying price landed, in ET, for log lines."""
+    if not isinstance(ts, datetime):
+        return "none since this worker started"
+    try:
+        et = ts.astimezone(ET)
+    except (ValueError, OverflowError, OSError):
+        return str(ts)
+    if et.date() == datetime.now(ET).date():
+        return et.strftime("%H:%M:%S ET")
+    return et.strftime("%Y-%m-%d %H:%M ET")
+
+
 def _bar_timestamp_advanced(bar_ts: Any, last_fresh_ts: Optional[datetime]) -> bool:
     """True when *bar_ts* is a genuinely newer bar than *last_fresh_ts*.
 
@@ -2318,8 +2353,22 @@ class StreamManager:
         options stream — restarting that would force an expensive REST
         re-seed and gap option ingestion for no reason. Cheap: the
         accumulator is just a reader thread, no REST seed.
+
+        The log line names the symbol, since every worker shares one journal
+        identity, and says what the stream being replaced got from its feed.
         """
-        logger.error("Restarting underlying bar stream: %s", reason)
+        replaced = _stream_health(self._underlying_accumulator)
+        logger.error(
+            "%s: Restarting underlying bar stream: %s%s",
+            self.db_underlying,
+            reason,
+            (
+                f". The stream it replaces ({_feed_name(getattr(self, 'provider', None))}): "
+                f"{replaced}"
+                if replaced
+                else ""
+            ),
+        )
         if self._underlying_accumulator is not None:
             self._underlying_accumulator.stop()
         self._underlying_accumulator = self.provider.stream_underlying_bars(
@@ -2684,8 +2733,9 @@ class StreamManager:
                             bar_advanced = True
                             if _stale_warned:
                                 logger.info(
-                                    "Underlying bar stream RECOVERED after "
+                                    "%s: Underlying bar stream RECOVERED after "
                                     "%.0fs / %d empty drains",
+                                    self.db_underlying,
                                     (
                                         time.monotonic() - _last_underlying_bar_mono
                                         if _last_underlying_bar_mono is not None
@@ -2737,17 +2787,26 @@ class StreamManager:
                                 or now_mono - _last_stale_warn_mono >= stale_warn_secs
                             ):
                                 cur_updates = self._underlying_accumulator.updates_received
+                                health = _stream_health(self._underlying_accumulator)
                                 logger.warning(
-                                    "Underlying bar stream appears STALE: "
-                                    "%.0fs without a fresh bar, "
+                                    "%s: Underlying bar stream appears STALE: "
+                                    "%.0fs without a fresh bar (last new price: %s), "
                                     "%d empty/replay drains, "
                                     "bar_stream_updates=%d (delta=%d), "
-                                    "thread_alive=%s",
+                                    "thread_alive=%s%s",
+                                    self.db_underlying,
                                     stale_seconds,
+                                    _last_new_price(_last_fresh_bar_ts),
                                     _consecutive_empty_underlying,
                                     cur_updates,
                                     cur_updates - _last_bar_updates,
                                     self._underlying_accumulator.is_alive(),
+                                    (
+                                        f"; {_feed_name(getattr(self, 'provider', None))}: "
+                                        f"{health}"
+                                        if health
+                                        else ""
+                                    ),
                                 )
                                 _stale_warned = True
                                 _last_stale_warn_mono = now_mono
@@ -2771,22 +2830,30 @@ class StreamManager:
                                     > UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS
                                 ):
                                     _underlying_restart_backed_off = True
+                                    health = _stream_health(self._underlying_accumulator)
                                     logger.error(
-                                        "Underlying bar stream still dead after %d "
-                                        "forced reconnects (%.0fs stale) — treating "
-                                        "as an upstream TradeStation outage. Will "
-                                        "slow-retry every %ds until a bar arrives. "
-                                        "Options ingestion is unaffected.",
+                                        "%s: Underlying bar stream still dead after %d "
+                                        "forced reconnects (%.0fs stale, last new "
+                                        "price: %s) — treating it as an upstream "
+                                        "outage at %s. Will slow-retry every %ds "
+                                        "until a bar arrives. Option chains have "
+                                        "their own stream and are not restarted.%s",
+                                        self.db_underlying,
                                         _underlying_restart_attempts - 1,
                                         stale_seconds,
+                                        _last_new_price(_last_fresh_bar_ts),
+                                        _feed_name(getattr(self, "provider", None)),
                                         UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS,
+                                        f" Current stream: {health}" if health else "",
                                     )
                                 else:
                                     self._restart_underlying_accumulator(
                                         f"data-starved {stale_seconds:.0f}s during "
                                         f"{session} (attempt "
                                         f"{_underlying_restart_attempts}/"
-                                        f"{UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS})"
+                                        f"{UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS}), "
+                                        f"last new price: "
+                                        f"{_last_new_price(_last_fresh_bar_ts)}"
                                     )
                                     _last_forced_restart_mono = now_mono
                             elif (
@@ -2803,16 +2870,19 @@ class StreamManager:
                                 # counter so a subsequent transient gap gets
                                 # the full budget again.
                                 logger.warning(
-                                    "Underlying bar stream still stale "
+                                    "%s: Underlying bar stream still stale "
                                     "(%.0fs) — slow re-attempt after %ds "
                                     "backoff interval.",
+                                    self.db_underlying,
                                     stale_seconds,
                                     UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS,
                                 )
                                 _underlying_restart_attempts = 1
                                 _underlying_restart_backed_off = False
                                 self._restart_underlying_accumulator(
-                                    f"backoff-retry {stale_seconds:.0f}s during " f"{session}"
+                                    f"backoff-retry {stale_seconds:.0f}s during "
+                                    f"{session}, last new price: "
+                                    f"{_last_new_price(_last_fresh_bar_ts)}"
                                 )
                                 _last_forced_restart_mono = now_mono
                         else:

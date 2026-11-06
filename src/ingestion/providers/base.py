@@ -318,6 +318,17 @@ class BarStream(abc.ABC):
         """
         return False
 
+    def health(self) -> str:
+        """One line on what this reader has had from its feed, or "".
+
+        Read by the staleness watchdog when it restarts the stream or gives
+        up on it, so the log line can say which kind of silence it is: calls
+        failing, calls answered with nothing usable, or a call that never
+        came back. The default says nothing, and the watchdog's own line
+        stands alone.
+        """
+        return ""
+
 
 #: Alias kept for readability at call sites that stream option *bars*
 #: rather than quotes; the protocol is identical.

@@ -444,3 +444,140 @@ def test_watchdog_slow_reattempts_after_backed_off(monkeypatch, caplog):
         "for 17 hours — once max attempts were consumed nothing forced a "
         "fresh reconnect, even if the upstream had recovered."
     )
+
+
+# --- the lines name the symbol, the feed, and what the feed sent ------------
+#
+# 2026-11-06, 09:47 ET: two workers logged "Restarting underlying bar stream:
+# data-starved 417s during regular" and then "treating as an upstream
+# TradeStation outage". No symbol (every worker logs under one journal
+# identity, so only the PID told them apart), the wrong vendor (the bars have
+# come from ThetaData since the 2026-10-19 cutover), and nothing on whether
+# the feed was failing calls or answering with nothing new.
+
+
+class _NamedProvider:
+    name = "thetadata_mv"
+
+
+def test_restart_line_names_symbol_feed_and_what_the_old_stream_got(monkeypatch, caplog):
+    import logging as _logging
+
+    mgr, created = _bare_manager(monkeypatch)
+    mgr.provider.name = "thetadata_mv"
+
+    class _Polled(_FakeUnderlyingAcc):
+        def health(self):
+            return "88 poll(s) answered in 90s, 0 with a usable price, 0 failed"
+
+    mgr._underlying_accumulator = _Polled()
+    caplog.set_level(_logging.ERROR, logger="src.ingestion.stream_manager")
+
+    mgr._restart_underlying_accumulator("data-starved 417s during regular (attempt 4/5)")
+
+    lines = [r.getMessage() for r in caplog.records]
+    assert lines == [
+        "SPX: Restarting underlying bar stream: data-starved 417s during regular "
+        "(attempt 4/5). The stream it replaces (thetadata_mv): 88 poll(s) answered "
+        "in 90s, 0 with a usable price, 0 failed"
+    ]
+
+
+def test_restart_line_without_stream_health_stands_alone(monkeypatch, caplog):
+    """A stream with no health() (TradeStation's) adds no empty clause, and
+    a health() that raises must not break the restart it describes."""
+    import logging as _logging
+
+    mgr, created = _bare_manager(monkeypatch)
+    caplog.set_level(_logging.ERROR, logger="src.ingestion.stream_manager")
+
+    mgr._underlying_accumulator = _FakeUnderlyingAcc()
+    mgr._restart_underlying_accumulator("reader thread is DEAD")
+
+    class _Broken(_FakeUnderlyingAcc):
+        def health(self):
+            raise RuntimeError("diagnostic bug")
+
+    mgr._underlying_accumulator = _Broken()
+    mgr._restart_underlying_accumulator("reader thread is DEAD")
+
+    assert [r.getMessage() for r in caplog.records] == [
+        "SPX: Restarting underlying bar stream: reader thread is DEAD",
+        "SPX: Restarting underlying bar stream: reader thread is DEAD",
+    ]
+    assert len(created) == 2 and created[1].started == 1
+
+
+class _PolledStaleAcc(_StaleRepeatingAcc):
+    def health(self):
+        return "88 poll(s) answered in 90s, 88 with a usable price, 0 failed"
+
+
+def test_outage_line_names_symbol_and_the_feed_it_reads(monkeypatch, caplog):
+    import logging as _logging
+
+    mgr = _stale_repeat_manager(monkeypatch)
+    monkeypatch.setattr(_sm, "UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS", 1)
+    mgr.provider = _NamedProvider()
+    mgr._underlying_accumulator = _PolledStaleAcc()
+    restart_calls: list[str] = []
+    mgr._restart_underlying_accumulator = lambda reason: restart_calls.append(reason)
+
+    exited = _threading.Event()
+
+    def _run():
+        try:
+            for _ in mgr.stream(max_iterations=None):
+                pass
+        finally:
+            exited.set()
+
+    caplog.set_level(_logging.WARNING, logger="src.ingestion.stream_manager")
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    try:
+        _time.sleep(3.5)
+        mgr.request_stop()
+        assert exited.wait(timeout=3.0), "stream loop failed to exit"
+    finally:
+        mgr.request_stop()
+
+    messages = [r.getMessage() for r in caplog.records]
+    outage = [m for m in messages if "still dead after" in m]
+    assert outage, messages
+    # The stub's one bar is 2026-05-26 16:00 UTC: the last new price, on a
+    # day other than today, so the line carries its date.
+    assert outage[0].startswith("SPX: Underlying bar stream still dead after 1 forced reconnects (")
+    assert "last new price: 2026-05-26 12:00 ET" in outage[0]
+    assert "treating it as an upstream outage at thetadata_mv" in outage[0]
+    assert "TradeStation" not in outage[0]
+    assert outage[0].endswith(
+        "Current stream: 88 poll(s) answered in 90s, 88 with a usable price, 0 failed"
+    )
+
+    stale = [m for m in messages if "appears STALE" in m]
+    assert stale and stale[0].startswith("SPX: Underlying bar stream appears STALE: ")
+    assert "(last new price: 2026-05-26 12:00 ET)" in stale[0]
+    assert stale[0].endswith(
+        "; thetadata_mv: 88 poll(s) answered in 90s, 88 with a usable price, 0 failed"
+    )
+
+    assert restart_calls and restart_calls[0].endswith(", last new price: 2026-05-26 12:00 ET")
+
+
+def test_last_new_price_reads_in_eastern_time():
+    now = datetime.now(timezone.utc)
+    assert _sm._last_new_price(now) == now.astimezone(_ET).strftime("%H:%M:%S ET")
+    assert (
+        _sm._last_new_price(datetime(2026, 11, 2, 14, 41, tzinfo=timezone.utc))
+        == "2026-11-02 09:41 ET"
+    )
+    assert _sm._last_new_price(None) == "none since this worker started"
+
+
+def test_feed_name_falls_back_when_the_provider_has_none():
+    from unittest.mock import MagicMock
+
+    assert _sm._feed_name(_NamedProvider()) == "thetadata_mv"
+    assert _sm._feed_name(None) == "the market data feed"
+    assert _sm._feed_name(MagicMock()) == "the market data feed"

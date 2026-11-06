@@ -252,6 +252,12 @@ _MAX_MARK_SPREAD = 0.005
 #: jump pays one poll of delay.
 _MAX_UNCONFIRMED_MARK_MOVE = 0.005
 
+#: A bar poll answers in well under a second. One still out after this long
+#: is named in the watchdog's log line (see _PollingBarStream.health): a call
+#: that never returns leaves the poll thread alive and silent, and nothing
+#: else reports it.
+_CALL_WAITING_REPORT_SECONDS = 10.0
+
 #: Index root used by :meth:`ThetaDataProvider.describe_columns` so the
 #: diagnostic covers the index endpoints too. VIX because it is one of the
 #: symbols this deployment actually needs and is cheap to ask for.
@@ -1267,12 +1273,45 @@ class _PollingBarStream(BarStream):
         #: See set_listener. Called on this stream's poll thread.
         self._listener: Optional[Callable[[Bar], None]] = None
         self._listener_failures = 0
+        #: For health(). Polls that came back, with or without a bar; polls
+        #: that raised, and the last one's error, which a later bar does not
+        #: clear (``last_error`` is cleared, for the first-bar wait); when
+        #: this stream started; when the ThetaData call now in progress
+        #: began, or None between calls.
+        self._polls_answered = 0
+        self._polls_failed = 0
+        self._last_failure: Optional[str] = None
+        self._started_at: Optional[float] = None
+        self._call_started: Optional[float] = None
 
     def set_listener(self, listener: Optional[Callable[[Bar], None]]) -> bool:
         self._listener = listener
         return True
 
+    def health(self) -> str:
+        """What this poller has had from ThetaData since it started.
+
+        The watchdog reads it when it restarts the stream or gives up on it.
+        A starved stream is one of three things, and this says which: every
+        call failing (the error is here), calls answered with no usable
+        price (an empty answer, an index print too old to count, or a stock
+        mark refused, which logs its own warning), or a call that never came
+        back, which leaves the thread alive and logs nothing at all.
+        """
+        now = time.monotonic()
+        text = f"{self._polls_answered} poll(s) answered"
+        if self._started_at is not None:
+            text += f" in {now - self._started_at:.0f}s"
+        text += f", {self._updates_received} with a usable price, {self._polls_failed} failed"
+        if self._last_failure:
+            text += f" (last: {self._last_failure[:200]})"
+        waiting = self._call_started
+        if waiting is not None and now - waiting >= _CALL_WAITING_REPORT_SECONDS:
+            text += f"; a call has been waiting {now - waiting:.0f}s for an answer"
+        return text
+
     def start(self) -> None:
+        self._started_at = time.monotonic()
         self._running = True
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name=f"thetadata-bar-{self._db_symbol}"
@@ -1303,8 +1342,13 @@ class _PollingBarStream(BarStream):
         failures = 0
         while self._running:
             started = time.monotonic()
+            self._call_started = started
             try:
                 bar = self._fetch()
+                # Before _deliver: a slow store is the database's, not a
+                # ThetaData call waiting.
+                self._call_started = None
+                self._polls_answered += 1
                 if bar is not None:
                     with self._lock:
                         self._bar = bar
@@ -1316,8 +1360,11 @@ class _PollingBarStream(BarStream):
                     self._deliver(bar)
                 failures = 0
             except Exception as e:  # noqa: BLE001
+                self._call_started = None
                 failures += 1
+                self._polls_failed += 1
                 self.last_error = f"{type(e).__name__}: {e}"
+                self._last_failure = self.last_error
                 logger.log(
                     _failure_level(e, stopping=not self._running),
                     "thetadata bar poll for %s failed: %s",
