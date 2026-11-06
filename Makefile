@@ -1671,6 +1671,11 @@ services-restart-ingest-analytics: ## Restart only ingestion then analytics, hea
 	@$(MAKE) --no-print-directory services-restart-one-by-one \
 		SERVICES_START_ORDER="$(INGESTION_SERVICE) $(ANALYTICS_SERVICE)"
 
+.PHONY: service-limits-install
+service-limits-install: ## Install one service's unit file from setup/systemd and apply its CPU/memory limits now, no restart. UNIT=ingestion [CONFIRM=yes]
+	@test -n "$(UNIT)" || { echo "$(RED)Usage: make service-limits-install UNIT=ingestion [CONFIRM=yes]$(NC)"; exit 2; }
+	@$(PY) -m src.tools.unit_limits --unit "$(UNIT)" $(if $(filter yes,$(CONFIRM)),--apply)
+
 .PHONY: services-restart-stop-all-first
 services-restart-stop-all-first: ## Stop all 4 services (api → … → ingestion), then start all (ingestion → … → api)
 	@echo "$(YELLOW)=== Restarting all services (stop all, then start all) ===$(NC)"

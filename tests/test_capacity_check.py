@@ -531,3 +531,170 @@ def test_database_cpu_gates():
     unread = _healthy(db_cpu={"instance": "db", "error": "AccessDenied"})
     assert _levels(cc.evaluate(unread)) == []
     assert "database CPU: unavailable (AccessDenied)" in cc.render(unread, cc.evaluate(unread))
+
+
+# ── what the 2026-11-06 pre-market run showed was missing ───────────────────
+
+
+def test_a_workers_cpu_is_read_from_its_stat_ticks(tmp_path):
+    # utime 1000, stime 250 (fields 14 and 15), after a command with spaces.
+    stat = "4321 (python -m (x)) S 100 1 1 0 -1 4194304 10 0 0 0 1000 250 0 0 20 0 1 0\n"
+    assert cc.cpu_ticks_from_stat(stat) == 1250
+    assert cc.cpu_ticks_from_stat("garbage") is None
+    before = {1: 100, 2: 500, 3: 50}
+    after = {1: 400, 2: 520, 4: 999}  # 3 exited, 4 is new: both left out
+    assert cc.worker_cores_between(before, after, seconds=10, clk_tck=100) == [0.3, 0.02]
+
+
+def test_worker_ticks_skip_the_units_main_process(tmp_path):
+    root = _cgroup(tmp_path, "zerogex-oa-ingestion", {"cgroup.procs": "100\n101\n"})
+    for pid, ppid, ticks in ((100, 1, 5000), (101, 100, 700)):
+        d = tmp_path / "proc" / str(pid)
+        d.mkdir(parents=True)
+        (d / "stat").write_text(f"{pid} (python) S {ppid} 1 1 0 -1 0 0 0 0 0 {ticks} 0 0 0\n")
+    assert cc.read_worker_ticks("zerogex-oa-ingestion", root, tmp_path / "proc") == {101: 700}
+
+
+def test_limits_the_box_runs_are_checked_against_the_repos_unit_files(tmp_path):
+    (tmp_path / "zerogex-oa-ingestion.service").write_text(
+        "[Service]\nMemoryMax=2G\nCPUQuota=300%\n"
+    )
+    reading = cc.UnitReading(
+        unit="zerogex-oa-ingestion", present=True, memory_max=2 * 1024**3, cpu_quota_cores=1.5
+    )
+    assert cc.limits_drift(reading, tmp_path) == ["CPUQuota is 150%, the file says 300%"]
+    reading.cpu_quota_cores = 3.0
+    assert cc.limits_drift(reading, tmp_path) == []
+    # And against the real repo: its ingestion unit says 3 cores.
+    assert cc.limits_drift(
+        cc.UnitReading(
+            unit="zerogex-oa-ingestion", present=True, memory_max=2 * 1024**3, cpu_quota_cores=1.5
+        )
+    ) == ["CPUQuota is 150%, the file says 300%"]
+
+
+def _this_morning():
+    """The 2026-11-06 08:52 ET run, as the report held it."""
+    ingestion = _unit(
+        "zerogex-oa-ingestion", 734, 2048, per_symbol_mb=104, used=1.40, quota=1.50, throttled=0.85
+    )
+    ingestion["limits_drift"] = ["CPUQuota is 150%, the file says 300%"]
+    analytics = _unit(
+        "zerogex-oa-analytics", 136, 1024, per_symbol_mb=21, used=0.02, quota=1.0, throttled=0.0
+    )
+    analytics["limits_drift"] = []
+    return _healthy(
+        session="pre-market",
+        window_in_session=False,
+        units=[ingestion, analytics, _unit("zerogex-oa-api", 5237, 8192)],
+    )
+
+
+def test_this_mornings_run_names_the_uninstalled_quota_and_does_not_blame_ingestion_for_using_it():
+    gates = cc.evaluate(_this_morning())
+    levels = [(g.level, g.area) for g in gates]
+    assert ("WARN", "limits") in levels
+    [limits] = [g for g in gates if g.area == "limits"]
+    assert "CPUQuota is 150%, the file says 300%" in limits.message
+    assert "make service-limits-install UNIT=ingestion" in limits.message
+    # Pinned and throttled ingestion is a note, not a warning: it uses what it gets.
+    [cpu] = [g for g in gates if g.area == "cpu"]
+    assert cpu.level == "INFO" and "85%" in cpu.message
+    assert cc.verdict(gates).startswith("NOT JUDGED YET")
+
+
+def test_a_note_never_changes_the_verdict_but_a_pinned_analytics_unit_warns():
+    r = _healthy()
+    r["units"][0].update(cpu_used_cores=2.95, cpu_quota_cores=3.0, throttled_share=0.7)  # ingestion
+    gates = cc.evaluate(r)
+    assert [(g.level, g.area) for g in gates if g.level != "PASS"] == [("INFO", "cpu")]
+    assert cc.verdict(gates).startswith("GO")
+    r["units"][1].update(cpu_used_cores=0.97, cpu_quota_cores=1.0, throttled_share=0.6)  # analytics
+    assert ("WARN", "cpu") in _levels(cc.evaluate(r))
+
+
+def _with_opt_age(ages, base=None):
+    r = _healthy()
+    for sym, age in ages.items():
+        r["database"]["per_symbol"][sym]["opt_age_s"] = age
+    return r
+
+
+def test_stale_option_rows_are_caught_against_the_baseline_and_on_their_own():
+    base = _with_opt_age({"SPY": 9.0, "SPX": 19.0})
+    assert _levels(cc.evaluate(_with_opt_age({"SPY": 12.0, "SPX": 22.0}), baseline=base)) == []
+    # SPY 9s -> 15s: half as fresh again and 6s older.
+    assert _levels(cc.evaluate(_with_opt_age({"SPY": 15.0, "SPX": 19.0}), baseline=base)) == [
+        ("WARN", "freshness")
+    ]
+    # SPX 19s -> 40s: more than double and 21s older.
+    assert _levels(cc.evaluate(_with_opt_age({"SPY": 9.0, "SPX": 40.0}), baseline=base)) == [
+        ("FAIL", "freshness")
+    ]
+    # Without a baseline (or one taken before this was measured): a minute warns, two fail.
+    assert _levels(cc.evaluate(_with_opt_age({"SPY": 65.0}))) == [("WARN", "freshness")]
+    assert _levels(cc.evaluate(_with_opt_age({"SPY": 130.0}), baseline=_healthy())) == [
+        ("FAIL", "freshness")
+    ]
+    nothing = cc.evaluate(_with_opt_age({"NVDA": None}))
+    assert any(g.level == "FAIL" and "NVDA: no option rows written" in g.message for g in nothing)
+
+
+def test_database_load_from_postgres_itself():
+    before = {
+        "xact_commit": 1000,
+        "tup_inserted": 5000,
+        "tup_updated": 20000,
+        "tup_deleted": 0,
+        "blks_read": 100,
+        "t": 10.0,
+    }
+    after = {
+        "xact_commit": 1300,
+        "tup_inserted": 5600,
+        "tup_updated": 26400,
+        "tup_deleted": 0,
+        "blks_read": 160,
+        "t": 40.0,
+    }
+    assert cc.db_rates(before, after) == {
+        "commits_per_s": 10.0,
+        "rows_written_per_s": 233.3,
+        "blocks_read_per_s": 2.0,
+    }
+    assert cc.summarize_activity([(2, 1), (4, 2), (3, 0)]) == {
+        "avg_active": 3.0,
+        "avg_on_cpu": 1.0,
+        "max_active": 4,
+        "activity_samples": 3,
+    }
+    assert cc.summarize_activity([]) == {}
+
+    def at(active):
+        return _healthy(db_activity={"avg_active": active, "avg_on_cpu": active / 2})
+
+    assert _levels(cc.evaluate(at(1.4), baseline=at(1.0))) == []
+    assert _levels(cc.evaluate(at(2.6), baseline=at(1.2))) == [("WARN", "database")]
+    assert _levels(cc.evaluate(at(5.0))) == []  # no baseline: reported, not judged
+
+
+def test_the_report_shows_cores_drift_option_age_and_database_load():
+    r = _this_morning()
+    r["units"][0]["worker_cores"] = [0.31, 0.30, 0.29, 0.28, 0.15, 0.02]
+    r["database"]["per_symbol"]["SPY"]["opt_age_s"] = 9.4
+    r["db_activity"] = {
+        "avg_active": 1.2,
+        "avg_on_cpu": 0.6,
+        "rows_written_per_s": 233.3,
+        "commits_per_s": 10.0,
+        "blocks_read_per_s": 2.0,
+    }
+    text = cc.render(r, cc.evaluate(r))
+    assert "worker processes' cores: 0.31, 0.30, 0.29, 0.28, 0.15, 0.02" in text
+    assert "not as setup/systemd says: CPUQuota is 150%, the file says 300%" in text
+    assert "opt age" in text and " 9s" in text
+    assert "database load: 1.2 sessions active on average (0.6 on CPU), 233 rows written/s" in text
+    assert "INFO  cpu" in text
+    # A baseline saved before these fields existed still renders and compares.
+    old = _healthy()
+    cc.render(r, cc.evaluate(r, baseline=old), baseline=old)

@@ -38,6 +38,7 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -54,6 +55,8 @@ CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 
 #: Units with one worker process per symbol. Their projection is the point.
 PER_SYMBOL_UNITS = ("zerogex-oa-ingestion", "zerogex-oa-analytics")
+#: Uses all the CPU it is given, so pinned at its quota is its steady state.
+ELASTIC_UNITS = ("zerogex-oa-ingestion",)
 #: Reported for context; adding a stock does not add a process to these.
 OTHER_UNITS = ("zerogex-oa-signals", "zerogex-oa-api", "zerogex-oa-thetaterminal")
 JOURNAL_UNITS = (
@@ -94,6 +97,16 @@ PRICE_GAP_FAIL_S = 1.5
 PRICE_GAP_RISE_WARN_S = 0.2
 API_WARN_MS = 500.0
 API_FAIL_MS = 2000.0
+#: Median age of a symbol's option rows' latest writes. Ingestion rewrites each
+#: contract every pass, so this is about half a pass: a starved worker shows here.
+OPT_AGE_WARN_S = 60.0
+OPT_AGE_FAIL_S = 120.0
+OPT_AGE_RISE_WARN = 1.5  # times the baseline, and at least the seconds below
+OPT_AGE_RISE_WARN_S = 5.0
+OPT_AGE_RISE_FAIL = 2.0
+OPT_AGE_RISE_FAIL_S = 15.0
+DB_ACTIVE_RISE_WARN = 1.5  # average active sessions, times the baseline
+DB_ACTIVE_RISE_WARN_ABS = 1.0  # and at least this many more
 DB_CPU_WARN_AVG = 60.0
 DB_CPU_FAIL_AVG = 80.0
 DB_CPU_WARN_MAX = 90.0
@@ -193,6 +206,32 @@ def ppid_from_stat(text: Optional[str]) -> Optional[int]:
         return int(fields[1])
     except (IndexError, ValueError):
         return None
+
+
+def cpu_ticks_from_stat(text: Optional[str]) -> Optional[int]:
+    """User plus system CPU time of one process, in clock ticks, from /proc/<pid>/stat."""
+    if not text or ")" not in text:
+        return None
+    fields = text.rsplit(")", 1)[1].split()
+    try:
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def worker_cores_between(
+    before: Dict[int, int], after: Dict[int, int], seconds: float, clk_tck: int = 100
+) -> List[float]:
+    """Each worker's CPU, in cores, between two reads of its ticks; largest first.
+    A worker that started or stopped between the reads is left out."""
+    if seconds <= 0 or clk_tck <= 0:
+        return []
+    cores = [
+        round(max(0, after[pid] - ticks) / clk_tck / seconds, 2)
+        for pid, ticks in before.items()
+        if pid in after
+    ]
+    return sorted(cores, reverse=True)
 
 
 def per_symbol_worker_mb(worker_mbs: Sequence[float], symbol_count: int) -> Optional[float]:
@@ -355,6 +394,10 @@ class UnitReading:
     private_source: str = "smaps_rollup"
     per_symbol_mb: Optional[float] = None
     symbols: int = 0
+    worker_cores: List[float] = field(default_factory=list)
+    per_symbol_cores: Optional[float] = None
+    #: Where the running limits differ from setup/systemd/<unit>.service.
+    limits_drift: List[str] = field(default_factory=list)
 
 
 def read_unit_memory(
@@ -400,6 +443,39 @@ def read_unit_memory(
 
 def read_cpu_stat(unit: str, root: Path = CGROUP_ROOT) -> Dict[str, int]:
     return parse_flat_keyed(_read(root / f"{unit}.service" / "cpu.stat"))
+
+
+def read_worker_ticks(
+    unit: str, root: Path = CGROUP_ROOT, proc: Path = Path("/proc")
+) -> Dict[int, int]:
+    """CPU ticks of each of the unit's worker processes (not its main process)."""
+    pids: List[int] = []
+    for token in (_read(root / f"{unit}.service" / "cgroup.procs") or "").split():
+        try:
+            pids.append(int(token))
+        except ValueError:
+            continue
+    pid_set = set(pids)
+    out: Dict[int, int] = {}
+    for pid in pids:
+        stat = _read(proc / str(pid) / "stat")
+        ppid, ticks = ppid_from_stat(stat), cpu_ticks_from_stat(stat)
+        if ppid in pid_set and ticks is not None:
+            out[pid] = ticks
+    return out
+
+
+def limits_drift(reading: "UnitReading", repo_dir: Optional[Path] = None) -> List[str]:
+    """Where the running unit's memory cap and CPU quota differ from what its
+    unit file in setup/systemd sets. A limit changed in the repo reaches the
+    box only when the file is installed (make service-limits-install)."""
+    from src.tools.unit_limits import REPO_UNITS, limits_match, unit_file_limits
+
+    text = _read((repo_dir or REPO_UNITS) / f"{reading.unit}.service")
+    if text is None or not reading.present:
+        return []
+    live = {"MemoryMax": reading.memory_max, "CPUQuota": reading.cpu_quota_cores}
+    return limits_match(unit_file_limits(text), live)
 
 
 def read_box(proc: Path = Path("/proc")) -> Dict[str, Any]:
@@ -497,6 +573,29 @@ def read_database(
             row = out["per_symbol"].setdefault(sym, {})
             row["contracts"] = int(contracts)
             row["chain_fresh_share"] = (fresh / contracts) if contracts else None
+        # Every write of a contract's row stamps updated_at, so among the rows
+        # written in the last 10 minutes the median age is about half of the
+        # worker's pass over its chain, and it rises when the worker is starved.
+        for sym in symbols:
+            out["per_symbol"].setdefault(sym, {})["opt_age_s"] = None
+        cur.execute(
+            """
+            SELECT underlying,
+                   percentile_cont(0.5) WITHIN GROUP (
+                       ORDER BY EXTRACT(EPOCH FROM now() - updated_at)),
+                   count(*) FILTER (WHERE updated_at >= now() - interval '60 seconds'),
+                   count(*)
+            FROM option_chains_latest
+            WHERE underlying = ANY(%s::text[]) AND updated_at >= now() - interval '10 minutes'
+            GROUP BY underlying
+            """,
+            (list(symbols),),
+        )
+        for sym, age, last_minute, last_ten in cur.fetchall():
+            row = out["per_symbol"].setdefault(sym, {})
+            row["opt_age_s"] = float(age) if age is not None else None
+            row["opt_written_60s"] = int(last_minute)
+            row["opt_written_10m"] = int(last_ten)
         cur.execute("""
             SELECT count(*),
                    count(*) FILTER (WHERE state = 'active'),
@@ -520,6 +619,102 @@ def read_database(
             "option_chains_mb": round(chains_bytes / MB),
         }
     return out
+
+
+DB_COUNTERS_SQL = """
+    SELECT xact_commit, tup_inserted, tup_updated, tup_deleted, blks_read
+    FROM pg_stat_database WHERE datname = current_database()
+"""
+#: Client sessions running a statement now, and those of them on CPU rather than
+#: waiting (on disk, a lock or the client). This run's own session is left out.
+ACTIVE_SQL = """
+    SELECT count(*),
+           count(*) FILTER (WHERE wait_event_type IS NULL)
+    FROM pg_stat_activity
+    WHERE datname = current_database() AND state = 'active'
+      AND backend_type = 'client backend' AND pid <> pg_backend_pid()
+"""
+_COUNTER_KEYS = ("xact_commit", "tup_inserted", "tup_updated", "tup_deleted", "blks_read")
+
+
+def _safely(read: Callable[[], Any]) -> Any:
+    try:
+        return read()
+    except Exception:  # noqa: BLE001 - a counter we cannot read is left out
+        return None
+
+
+def read_db_counters() -> Dict[str, float]:
+    """The database's commit, row and disk-read counters, with the moment read."""
+    from src.database.connection import db_connection
+
+    with db_connection() as conn:
+        conn.autocommit = True  # statistics are a snapshot per transaction
+        cur = conn.cursor()
+        cur.execute(DB_COUNTERS_SQL)
+        row = cur.fetchone()
+    return {**dict(zip(_COUNTER_KEYS, (float(v) for v in row))), "t": time.monotonic()}
+
+
+def db_rates(before: Dict[str, float], after: Dict[str, float]) -> Dict[str, float]:
+    """What the database did per second between two counter reads."""
+    seconds = after["t"] - before["t"]
+    if seconds <= 0:
+        return {}
+
+    def rate(*keys: str) -> float:
+        return round(sum(max(0.0, after[k] - before[k]) for k in keys) / seconds, 1)
+
+    return {
+        "commits_per_s": rate("xact_commit"),
+        "rows_written_per_s": rate("tup_inserted", "tup_updated", "tup_deleted"),
+        "blocks_read_per_s": rate("blks_read"),
+    }
+
+
+def summarize_activity(samples: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
+    """Average active sessions (the database's load: on a 2-vCPU instance two
+    on CPU is all of it) from one-second samples."""
+    if not samples:
+        return {}
+    active = [a for a, _ in samples]
+    on_cpu = [c for _, c in samples]
+    return {
+        "avg_active": round(statistics.mean(active), 2),
+        "avg_on_cpu": round(statistics.mean(on_cpu), 2),
+        "max_active": max(active),
+        "activity_samples": len(samples),
+    }
+
+
+class ActivitySampler(threading.Thread):
+    """Counts the database's active sessions once a second until stopped."""
+
+    def __init__(self, interval: float = 1.0) -> None:
+        super().__init__(daemon=True, name="capacity-check-db-activity")
+        self.interval = interval
+        self.samples: List[Tuple[int, int]] = []
+        self.error: Optional[str] = None
+        self._halt = threading.Event()
+
+    def run(self) -> None:
+        try:
+            from src.database.connection import db_connection
+
+            with db_connection() as conn:
+                conn.autocommit = True  # a fresh statistics snapshot every sample
+                cur = conn.cursor()
+                while not self._halt.is_set():
+                    cur.execute(ACTIVE_SQL)
+                    active, on_cpu = cur.fetchone()
+                    self.samples.append((int(active), int(on_cpu)))
+                    self._halt.wait(self.interval)
+        except Exception as e:  # noqa: BLE001 - the report says it could not
+            self.error = f"{type(e).__name__}: {e}"[:200]
+
+    def stop(self) -> None:
+        self._halt.set()
+        self.join(timeout=10)
 
 
 def time_api(
@@ -618,12 +813,18 @@ def _per_30(count: float, window_min: int) -> float:
 
 
 def evaluate(report: Dict[str, Any], baseline: Optional[Dict[str, Any]] = None) -> List[Gate]:
-    """Every WARN and FAIL, worst first, then one PASS per area that came out clean."""
+    """Every FAIL and WARN, worst first, then the INFO notes, then one PASS per
+    area that came out clean. INFO never changes the verdict."""
     gates: List[Gate] = []
     clean: Dict[str, bool] = {}
 
     def hit(level: str, area: str, message: str) -> None:
         gates.append(Gate(level, area, message))
+        clean[area] = False
+
+    def note(area: str, message: str) -> None:
+        # Not a fault, but the area should not also read "no problem found".
+        gates.append(Gate("INFO", area, message))
         clean[area] = False
 
     def checked(area: str) -> None:
@@ -685,21 +886,41 @@ def evaluate(report: Dict[str, Any], baseline: Optional[Dict[str, Any]] = None) 
         elif available < BOX_AVAILABLE_WARN_MB:
             hit("WARN", "box", f"only {available:,} MB of the box's memory is available")
 
-    # CPU: informational unless pinned; the cycle gates below are what customers feel.
+    # Limits: what the box runs against what the repo's unit files say.
+    for unit in report.get("units", []):
+        if not unit.get("present") or "limits_drift" not in unit:
+            continue
+        checked("limits")
+        for difference in unit["limits_drift"]:
+            short = unit["unit"].removeprefix("zerogex-oa-")
+            hit(
+                "WARN",
+                "limits",
+                f"{unit['unit']}: {difference}; install it with "
+                f"make service-limits-install UNIT={short}",
+            )
+
+    # CPU. Ingestion takes all it is given: each worker reprocesses its chain as
+    # fast as it can, so pinned is its normal state and says nothing alone; the
+    # option data age below is what says whether it costs freshness. Analytics
+    # sleeps between cycles, so pinned there is real contention.
     for unit in report.get("units", []):
         quota, used = unit.get("cpu_quota_cores"), unit.get("cpu_used_cores")
         if unit["unit"] not in PER_SYMBOL_UNITS or not quota or used is None:
             continue
         checked("cpu")
-        if used >= quota * CPU_PINNED_SHARE:
-            hit(
-                "WARN",
-                "cpu",
-                f"{unit['unit']}: {used:.2f} of its {quota:.2f} cores in use (pinned at its quota)",
-            )
         share = unit.get("throttled_share")
-        if share is not None and share >= THROTTLED_WARN_SHARE:
-            hit("WARN", "cpu", f"{unit['unit']}: throttled in {share:.0%} of CPU periods")
+        pinned = used >= quota * CPU_PINNED_SHARE
+        throttled = share is not None and share >= THROTTLED_WARN_SHARE
+        if not (pinned or throttled):
+            continue
+        said = f"{unit['unit']}: {used:.2f} of its {quota:.2f} cores in use" + (
+            f", throttled in {share:.0%} of CPU periods" if share is not None else ""
+        )
+        if unit["unit"] in ELASTIC_UNITS:
+            note("cpu", said + " (it uses all it is given; see option data age)")
+        else:
+            hit("WARN", "cpu", said)
 
     if not in_session:
         return _finish(gates, clean, report)
@@ -784,6 +1005,27 @@ def evaluate(report: Dict[str, Any], baseline: Optional[Dict[str, Any]] = None) 
                 hit("FAIL", "freshness", f"{sym}: newest price bar is {_age(bar_age)} old")
             elif bar_age >= BAR_AGE_WARN_S:
                 hit("WARN", "freshness", f"{sym}: newest price bar is {_age(bar_age)} old")
+            # How stale its option rows run: where a starved ingestion worker shows.
+            if "opt_age_s" in row:
+                opt = row["opt_age_s"]
+                prior_opt = (base_db.get(sym) or {}).get("opt_age_s")
+                said = f"{sym}: its option rows were written {opt or 0:.0f}s ago (median)" + (
+                    f", was {prior_opt:.0f}s" if prior_opt else ""
+                )
+
+                if opt is None:
+                    hit("FAIL", "freshness", f"{sym}: no option rows written in the last 10 min")
+                else:
+                    gain = opt - prior_opt if prior_opt else 0.0
+                    ratio = opt / prior_opt if prior_opt else 1.0
+                    if opt >= OPT_AGE_FAIL_S or (
+                        ratio >= OPT_AGE_RISE_FAIL and gain >= OPT_AGE_RISE_FAIL_S
+                    ):
+                        hit("FAIL", "freshness", said)
+                    elif opt >= OPT_AGE_WARN_S or (
+                        ratio >= OPT_AGE_RISE_WARN and gain >= OPT_AGE_RISE_WARN_S
+                    ):
+                        hit("WARN", "freshness", said)
         fresh = row.get("chain_fresh_share")
         prior_fresh = (base_db.get(sym) or {}).get("chain_fresh_share")
         if (
@@ -870,6 +1112,23 @@ def evaluate(report: Dict[str, Any], baseline: Optional[Dict[str, Any]] = None) 
                 + (f", was {prior:.0f} ms" if prior else ""),
             )
 
+    # The database's load as Postgres itself sees it.
+    activity = report.get("db_activity") or {}
+    if activity.get("avg_active") is not None:
+        checked("database")
+        now_active = activity["avg_active"]
+        prior_active = ((baseline or {}).get("db_activity") or {}).get("avg_active")
+        if (
+            prior_active is not None
+            and now_active >= prior_active * DB_ACTIVE_RISE_WARN
+            and now_active - prior_active >= DB_ACTIVE_RISE_WARN_ABS
+        ):
+            hit(
+                "WARN",
+                "database",
+                f"{now_active:.1f} database sessions active on average, up from {prior_active:.1f}",
+            )
+
     # The database's CPU, when CloudWatch answered.
     cpu = report.get("db_cpu") or {}
     if cpu.get("avg_pct") is not None:
@@ -889,7 +1148,7 @@ def evaluate(report: Dict[str, Any], baseline: Optional[Dict[str, Any]] = None) 
 
 
 def _finish(gates: List[Gate], clean: Dict[str, bool], report: Dict[str, Any]) -> List[Gate]:
-    order = {"FAIL": 0, "WARN": 1, "PASS": 2}
+    order = {"FAIL": 0, "WARN": 1, "INFO": 2, "PASS": 3}
     for area, ok in clean.items():
         if ok:
             gates.append(Gate("PASS", area, "no problem found"))
@@ -994,6 +1253,11 @@ def render(
         if u["unit"] in PER_SYMBOL_UNITS and u.get("worker_private_mb"):
             each = ", ".join(f"{m:,.0f}" for m in u["worker_private_mb"])
             add(f"    worker processes' private MB: {each} ({u['private_source']})")
+        if u["unit"] in PER_SYMBOL_UNITS and u.get("worker_cores"):
+            each = ", ".join(f"{c:.2f}" for c in u["worker_cores"])
+            add(f"    worker processes' cores: {each}")
+        for difference in u.get("limits_drift") or []:
+            add(f"    not as setup/systemd says: {difference}")
     box = report.get("box") or {}
     add(
         f"  box: {_n(box.get('mem_available_mb'))} MB available of {_n(box.get('mem_total_mb'))}, "
@@ -1012,16 +1276,15 @@ def render(
         add(f"Per symbol (GEX rows = snapshots published in {window} min; one a minute is normal)")
         add(
             f"  {'symbol':<8}{'GEX rows':>12}{'GEX age':>9}{'bar age':>9}{'contracts':>10}"
-            f"{'fresh 2m':>9}{'cycle median':>16}{'p95':>7}{'overruns':>10}"
+            f"{'opt age':>12}{'cycle median':>16}{'p95':>7}{'overruns':>10}"
         )
         for sym, row in sorted((db.get("per_symbol") or {}).items()):
             a = analytics.get(sym) or {}
             prior = base_db.get(sym) or {}
             rows = _n(row.get("gex_rows")) + _delta(row.get("gex_rows"), prior.get("gex_rows"))
-            fresh = (
-                f"{row['chain_fresh_share']:.0%}"
-                if row.get("chain_fresh_share") is not None
-                else "-"
+            opt = row.get("opt_age_s")
+            fresh = (f"{opt:.0f}s" if opt is not None else "-") + _delta(
+                opt, prior.get("opt_age_s"), "{:+.0f}"
             )
             med = a.get("duration_median_s")
             prior_med = (base_an.get(sym) or {}).get("duration_median_s")
@@ -1031,7 +1294,7 @@ def render(
             add(
                 f"  {sym:<8}{rows:>12}{_age(row.get('gex_age_s')):>9}"
                 f"{_age(row.get('bar_age_s')):>9}"
-                f"{_n(row.get('contracts')):>10}{fresh:>9}{med_s:>16}{p95:>7}{over:>10}"
+                f"{_n(row.get('contracts')):>10}{fresh:>12}{med_s:>16}{p95:>7}{over:>10}"
             )
         s = db.get("sessions") or {}
         z = db.get("sizes") or {}
@@ -1041,6 +1304,26 @@ def render(
             f"{_n(s.get('active'))} active, {_n(s.get('waiting'))} waiting; size "
             f"{_n(z.get('database_mb'))} MB (option_chains {_n(z.get('option_chains_mb'))} MB)"
         )
+        add("  opt age = how long ago the median contract's option row was written")
+    activity = report.get("db_activity") or {}
+    prior_activity = (baseline or {}).get("db_activity") or {}
+    if activity.get("avg_active") is not None or activity.get("rows_written_per_s") is not None:
+
+        def with_change(key: str, fmt: str, change: str) -> str:
+            value = activity.get(key)
+            return ("-" if value is None else fmt.format(value)) + _delta(
+                value, prior_activity.get(key), change
+            )
+
+        add(
+            f"  database load: {with_change('avg_active', '{:.1f}', '{:+.1f}')} sessions active"
+            f" on average ({with_change('avg_on_cpu', '{:.1f}', '{:+.1f}')} on CPU),"
+            f" {with_change('rows_written_per_s', '{:,.0f}', '{:+,.0f}')} rows written/s,"
+            f" {with_change('commits_per_s', '{:,.0f}', '{:+,.0f}')} commits/s,"
+            f" {with_change('blocks_read_per_s', '{:,.0f}', '{:+,.0f}')} disk blocks read/s"
+        )
+    elif activity.get("error"):
+        add(f"  database load: unreadable ({activity['error']})")
     db_cpu: Dict[str, Any] = report.get("db_cpu") or {}
     if db_cpu.get("avg_pct") is not None:
         prior_cpu = ((baseline or {}).get("db_cpu") or {}).get("avg_pct")
@@ -1180,9 +1463,15 @@ def collect(args: argparse.Namespace) -> Dict[str, Any]:
             reading.symbols = len(analytics)
         if reading.unit in PER_SYMBOL_UNITS:
             reading.per_symbol_mb = per_symbol_worker_mb(reading.worker_private_mb, reading.symbols)
+        reading.limits_drift = limits_drift(reading)
 
-    # One CPU sample, spanning the live-price listen so the run takes no longer.
+    # One CPU sample, spanning the live-price listen so the run takes no longer,
+    # and the database's own counters and active sessions over the same span.
     cpu_before = {u.unit: read_cpu_stat(u.unit) for u in units if u.present}
+    ticks_before = {u.unit: read_worker_ticks(u.unit) for u in units if u.unit in PER_SYMBOL_UNITS}
+    counters_before = _safely(read_db_counters)
+    sampler = ActivitySampler()
+    sampler.start()
     started = time.monotonic()
     cadence: List[Dict[str, Any]] = []
     if args.cadence_seconds > 0 and report["session"] in ("regular", "pre-market", "after-hours"):
@@ -1201,13 +1490,26 @@ def collect(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         time.sleep(max(1.0, args.cpu_seconds))
     elapsed = time.monotonic() - started
+    sampler.stop()
+    counters_after = _safely(read_db_counters)
+    clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
     for reading in units:
         if reading.present:
             after = read_cpu_stat(reading.unit)
             reading.cpu_used_cores, reading.throttled_share = cpu_between(
                 cpu_before[reading.unit], after, elapsed
             )
+        if reading.unit in ticks_before:
+            reading.worker_cores = worker_cores_between(
+                ticks_before[reading.unit], read_worker_ticks(reading.unit), elapsed, clk_tck
+            )
+            reading.per_symbol_cores = per_symbol_worker_mb(reading.worker_cores, reading.symbols)
     report["units"] = [asdict(u) for u in units]
+    report["db_activity"] = {
+        **(db_rates(counters_before, counters_after) if counters_before and counters_after else {}),
+        **summarize_activity(sampler.samples),
+        **({"error": sampler.error} if sampler.error and not sampler.samples else {}),
+    }
     report["cadence"] = cadence
     report["cadence_seconds"] = args.cadence_seconds
     report["box"] = read_box()
