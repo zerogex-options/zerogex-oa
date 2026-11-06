@@ -325,24 +325,46 @@ _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 _STICKY_CARRY_FIELDS = ("DailyOpenInterest", "OpenInterest", "Volume") + _IV_FIELD_NAMES
 
 
+# The open-interest fields OptionStreamAccumulator merges on, in its order.
+_OI_FIELD_NAMES = ("DailyOpenInterest", "OpenInterest")
+
+
+def _is_positive_count(value: Any) -> bool:
+    """True for a count above zero. Feeds send numbers as strings too."""
+    try:
+        return value is not None and int(value) > 0
+    except (ValueError, TypeError):
+        return False
+
+
 def _has_positive_oi(quote: Any) -> bool:
     """True when a drained quote carries a positive open-interest value.
 
-    Takes a provider ``OptionQuote``, not a raw vendor row. It used to walk
-    TradeStation's own field names -- DailyOpenInterest then OpenInterest --
-    which is a decision only that provider's module can make, and which
-    raised ``'OptionQuote' object has no attribute 'get'`` the moment the
-    streams started arriving normalised.
+    Reads both shapes a drain can hand over. StreamManager gets a provider
+    ``OptionQuote``, and reading vendor field names off one is what raised
+    ``'OptionQuote' object has no attribute 'get'`` the day the streams
+    arrived normalized. The other shape is the row
+    ``OptionStreamAccumulator.drain`` returns; its field names are this
+    module's to read, because the accumulator that writes them lives here.
 
-    The rule it encodes is unchanged and still belongs here: a feed sends 0,
-    or omits the field, on most stream deltas, so only a genuine positive
-    reading counts as "we know this contract's open interest".
+    The rule is the same for both: a feed sends 0, or omits the field, on
+    most stream deltas, so only a genuine positive reading counts as "we
+    know this contract's open interest".
     """
-    oi = getattr(quote, "open_interest", None)
-    try:
-        return oi is not None and int(oi) > 0
-    except (ValueError, TypeError):
-        return False
+    if isinstance(quote, dict):
+        return any(_is_positive_count(quote.get(key)) for key in _OI_FIELD_NAMES)
+    return _is_positive_count(getattr(quote, "open_interest", None))
+
+
+def _has_positive_volume(quote: Any) -> bool:
+    """True when a drained quote shows the contract has traded today.
+
+    Same two shapes as :func:`_has_positive_oi`. Volume is cumulative for
+    the day, so any positive reading means at least one trade.
+    """
+    if isinstance(quote, dict):
+        return _is_positive_count(quote.get("Volume"))
+    return _is_positive_count(getattr(quote, "volume", None))
 
 
 def _bar_to_row(bar: Any) -> Optional[Dict[str, Any]]:
@@ -2116,7 +2138,7 @@ class StreamManager:
         self._session_volume_symbols.update(
             sym
             for sym, quote in changed_state.items()
-            if sym in tracked_set and int(getattr(quote, "volume", None) or 0) > 0
+            if sym in tracked_set and _has_positive_volume(quote)
         )
         if tracked_total <= 0:
             return 0.0
@@ -2137,15 +2159,21 @@ class StreamManager:
         cache TTL handles staleness; across a day boundary we drop the
         whole cache so the first fetch after rollover gets a fresh view.
         """
+        # The provider owns the strike cache. __init__ always sets one; a
+        # manager assembled without __init__ may carry only the client.
+        cache_owner = getattr(self, "provider", None)
+        if cache_owner is None:
+            cache_owner = getattr(self, "client", None)
         try:
-            self.provider.invalidate_strikes_cache()
+            if cache_owner is not None:
+                cache_owner.invalidate_strikes_cache()
         except Exception as e:
             # Cache invalidation must never crash the stream loop.
             logger.warning("Strikes-cache invalidation on day rollover failed: %s", e)
         if prev_date is not None:
             logger.info(
-                "Session day rollover %s -> %s; cleared volume-coverage set "
-                "and TradeStation strikes cache.",
+                "Session day rollover %s -> %s; cleared the OI and volume coverage "
+                "sets and the strikes cache.",
                 prev_date,
                 new_date,
             )
