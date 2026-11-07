@@ -93,6 +93,10 @@ _POST_CLOSE_BOOK_TTL_SECONDS = 60.0
 # open.  The key holds the snapshot and the floor, so a new snapshot or the
 # next day's floor is a fresh read anyway.
 _POST_CLOSE_MODEL_TTL_SECONDS = 7200.0
+# How long the oldest-``gex_by_strike``-row lookup is reused.  It moves once a
+# day, when the nightly prune deletes the oldest session, so this only bounds
+# how long a just-pruned session keeps its old label.
+_STRIKE_HISTORY_TTL_SECONDS = 300.0
 
 
 def _max_pain_by_expiration(raw: Any) -> Dict[date, float]:
@@ -4751,6 +4755,47 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 e,
             )
             return []
+
+    async def get_strike_history_start(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """The oldest ``gex_by_strike`` timestamp still on file for ``symbol``.
+
+        ``make db-prune`` deletes ``gex_by_strike`` at DATA_RETENTION_DAYS (60
+        in production) while ``gex_summary`` is retention-exempt, so the replay
+        lists sessions whose per-strike rows are gone: they replay the levels
+        and the candles over an empty strike profile.  The prune deletes
+        oldest-first and both tables are written in one transaction (see
+        ``_store_calculation_results`` in the analytics engine), so a session
+        still has its strike rows exactly when it ends at or after this
+        timestamp.
+
+        Returns ``{"oldest_ts": <datetime>}``, or ``{"oldest_ts": None}`` when
+        the table holds no rows for the symbol.  Returns ``None`` when the read
+        failed, so a caller can tell "aged out" from "couldn't check" and never
+        labels a session on a failed read.  The dict (never a bare ``None``) is
+        also what lets a cached "no rows" stand apart from a cache miss.
+
+        One index probe: the primary key leads with (underlying, timestamp).
+        """
+        cache_key = f"strike_history_start:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+        query = """
+            SELECT timestamp
+            FROM gex_by_strike
+            WHERE underlying = $1
+            ORDER BY timestamp ASC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                oldest_ts = await conn.fetchval(query, symbol)
+        except Exception as e:
+            logger.warning("get_strike_history_start(%s) failed: %s", symbol, e)
+            return None
+        result = {"oldest_ts": oldest_ts}
+        self._cache_set(cache_key, result, _STRIKE_HISTORY_TTL_SECONDS)
+        return result
 
     async def get_underlying_candles_for_session(
         self,

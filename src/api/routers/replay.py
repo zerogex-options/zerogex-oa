@@ -126,6 +126,30 @@ def _iso_date(value: Any) -> str | None:
     return text[:10] if len(text) >= 10 else text
 
 
+def _has_strikes(
+    session_end: datetime | None, strike_history: dict[str, Any] | None
+) -> bool | None:
+    """Whether a session still carries its per-strike rows.
+
+    ``gex_by_strike`` ages out at DATA_RETENTION_DAYS while ``gex_summary`` is
+    kept, so an old session replays its levels and candles with no strike
+    profile.  ``False`` once the session's last minute is older than the
+    oldest per-strike row still on file (see
+    :meth:`DatabaseManager.get_strike_history_start`).  ``None`` when that
+    couldn't be read: a failed lookup must never label a session.
+    """
+    if strike_history is None or session_end is None:
+        return None
+    oldest = strike_history.get("oldest_ts")
+    if oldest is None:
+        return False
+    if session_end.tzinfo is None:
+        session_end = session_end.replace(tzinfo=UTC)
+    if oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=UTC)
+    return session_end >= oldest
+
+
 def _shape_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
     """gex_summary row → frame headline dict."""
     if row is None:
@@ -230,10 +254,19 @@ async def list_replay_sessions(
     Used by the /replay date picker. Bar-count is the number of
     ``gex_summary`` rows in the cash session (09:30–15:59 ET) — a full
     session is 390 minutes; partial sessions surface as such.
+
+    ``has_strikes`` is ``False`` for a session whose per-strike rows have aged
+    out (``gex_by_strike`` is pruned at DATA_RETENTION_DAYS; ``gex_summary`` is
+    not), so it replays the levels and candles without a strike profile.
+    ``None`` when the retention horizon couldn't be read.
     """
-    rows = await db.get_replay_session_dates(symbol.upper(), limit=limit)
+    sym = symbol.upper()
+    rows = await db.get_replay_session_dates(sym, limit=limit)
+    # One probe for the whole list: rows age out oldest-first, so a session
+    # has them exactly when it ends at or after the oldest one still on file.
+    strike_history = await db.get_strike_history_start(sym) if rows else None
     return {
-        "symbol": symbol.upper(),
+        "symbol": sym,
         "count": len(rows),
         "sessions": [
             {
@@ -243,6 +276,7 @@ async def list_replay_sessions(
                 "bar_count": int(r["bar_count"]) if r.get("bar_count") is not None else 0,
                 "first_ts": r["first_ts"].isoformat() if r.get("first_ts") else None,
                 "last_ts": r["last_ts"].isoformat() if r.get("last_ts") else None,
+                "has_strikes": _has_strikes(r.get("last_ts"), strike_history),
             }
             for r in rows
         ],
@@ -361,6 +395,14 @@ async def get_replay_range(
     no same-day expiry) returns its frames with EMPTY ladders and null levels
     rather than silently falling back to the whole chain — "all expirations" is
     the one answer a 0DTE request must not quietly become.
+
+    ``has_strikes`` is ``False`` when the session's per-strike rows have aged
+    out of ``gex_by_strike`` (pruned at DATA_RETENTION_DAYS; ``gex_summary`` is
+    kept), so every ladder is empty under any scope while the whole-chain
+    levels and candles remain.  It is whole-chain whatever the scope, which is
+    what lets a client tell an aged-out session from a scope with no
+    contracts — both come back as empty ladders.  ``None`` when the session
+    has no frames or the retention horizon couldn't be read.
     """
     sym = symbol.upper()
     target = _parse_date(session_date)
@@ -391,6 +433,8 @@ async def get_replay_range(
             },
         ) from exc
     raw_candles = await db.get_underlying_candles_for_session(sym, target)
+    strike_history = await db.get_strike_history_start(sym) if raw_frames else None
+    has_strikes = _has_strikes(raw_frames[-1]["timestamp"] if raw_frames else None, strike_history)
 
     # Per-(minute, strike) expiration mix for the expiry colour gradient. Kept
     # as a SEPARATE lookup rather than folded into the frames query so the
@@ -462,6 +506,7 @@ async def get_replay_range(
         # for — null is the whole chain, a list is exactly what the bars and
         # the re-derived levels were built from.
         "expiration_filter": [d.isoformat() for d in exp_filter] if exp_filter else None,
+        "has_strikes": has_strikes,
         "frames": frames,
         "candles": candles,
     }
