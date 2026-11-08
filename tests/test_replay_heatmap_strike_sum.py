@@ -34,6 +34,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -301,6 +302,25 @@ def test_strike_totals_limit_counts_whole_strikes():
         assert float(r["net_gex"]) == pytest.approx(want[k][0], rel=1e-9)
         assert float(r["call_gex"]) == pytest.approx(want[k][1], rel=1e-9)
         assert float(r["put_gex"]) == pytest.approx(want[k][2], rel=1e-9)
+
+
+@skip_without_db
+def test_strike_totals_at_listed_strikes_ignore_the_limit():
+    """How the diff reads one minute at strikes only the other minute's window
+    reached: exactly the listed strikes, however far from spot, each summed.
+    The strikes go in as the Decimals the first read returned, as the router
+    passes them."""
+
+    async def body(db):
+        return await db.get_gex_strike_totals_at_ts(
+            _SYMBOL, _T0, strike_limit=1, strikes=[Decimal("650.0000"), Decimal("640.0000")]
+        )
+
+    rows = _run(body)
+    assert [float(r["strike"]) for r in rows] == [640.0, 650.0]
+    want = _expected(_T0)
+    for r in rows:
+        assert float(r["net_gex"]) == pytest.approx(want[float(r["strike"])][0], rel=1e-9)
 
 
 @skip_without_db
