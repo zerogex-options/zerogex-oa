@@ -846,12 +846,54 @@ October 2026 every row reported the newest price instead.)
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 
 ### GET /api/gex/heatmap
-Get GEX heatmap matrix (strike × time).
+Get GEX heatmap matrix (strike × time). Each cell's `net_gex` is the strike's
+total across all of its expirations at the bucket's last snapshot, in dollars
+per 1% move: the same per-strike figure as
+`/api/gex/strike-profile-timeseries` and the live ladder. (Until the November
+2026 fix each cell was the average of the strike's expirations instead; see
+[Replay](#replay-get-apireplayrange-frame-and-diff) for what that did to the
+numbers.)
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `5min`
 - `window_units` (optional): max `90`, default `60`
+
+### Replay: GET /api/replay/range, frame and diff
+Minute-by-minute history of one regular session (09:30 to 16:00 ET), the data
+behind Session Replay. `GET /api/replay/sessions?symbol=…` lists the dates.
+All dollar figures are dealer gamma in dollars per 1% move, calls positive and
+puts negative.
+
+- `GET /api/replay/range?symbol=…&date=YYYY-MM-DD` returns every minute of
+  the session. Each frame's `strikes` carry `strike`, `call_gex`, `put_gex`
+  and `net_gex`, each the strike's **total across its expirations** (only
+  those in `expirations`, when it is set): the same per-strike figure as
+  `/api/gex/strike-profile-timeseries` and the live ladder at that minute.
+- `GET /api/replay/frame?symbol=…&ts=…` returns one minute as one row **per
+  (strike, expiration)**, with an `expiration` field. Add the rows up by
+  strike for the strike's total. Its `strike_limit` (default `60`, max
+  `4000`) counts rows, so covering every expiration of the strikes near price
+  takes a large value.
+- `GET /api/replay/diff?symbol=…&ts_a=…&ts_b=…` returns `deltas`: per strike,
+  `net_gex_a` and `net_gex_b` (each the strike's total across its
+  expirations at that minute) and `delta`. Its `strike_limit` (default `60`,
+  max `200`) counts **strikes** nearest each minute's spot, and the response
+  covers both minutes' strikes, each read at both minutes.
+
+**Changed in November 2026.** Before the fix, `/api/replay/range` and
+`/api/gex/heatmap` averaged each strike over its expirations instead of adding
+them up, and `/api/replay/diff` kept one arbitrary expiration's row per strike,
+under a limit that counted (strike, expiration) rows. The average divided each
+strike by the number of expirations listed at it (12 near the money on ES on
+2026-11-06, fewer on the wings), so near the money the new values are roughly
+10 times the old ones, and the profile's shape changes as well as its scale.
+Under an `expirations` scope of several dates, the `call_wall`, `put_wall` and
+`gamma_flip` that `/api/replay/range` re-derives from the scoped strikes now
+rank the summed book too, so they can sit at different strikes. A one-date
+scope (`expirations=0dte`, or a single date) has one row per strike and reads
+the same as before. Pull again any data you saved from these endpoints before
+the fix.
 
 ---
 

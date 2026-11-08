@@ -239,6 +239,39 @@ def test_range_returns_empty_when_date_has_no_data(monkeypatch):
     assert body["candles"] == []
 
 
+def _install_strike_totals(monkeypatch, dbmod, totals_by_ts):
+    """Serve ``get_gex_strike_totals_at_ts`` from per-minute strike totals.
+
+    Behaves like the SQL: ``strikes=None`` gives the ``strike_limit`` strikes
+    nearest that minute's spot (lower strike first on a tie), a list gives
+    exactly those strikes.  Returns the list of calls it answered.  Installed
+    with ``monkeypatch`` so the real method is back after the test.
+    """
+    calls: list[dict] = []
+
+    async def fake(self, symbol, at_ts, strike_limit=60, strikes=None):
+        calls.append({"ts": at_ts, "strike_limit": strike_limit, "strikes": strikes})
+        rows = totals_by_ts.get(at_ts, [])
+        if strikes is not None:
+            wanted = {float(s) for s in strikes}
+            return [r for r in rows if float(r["strike"]) in wanted]
+        ranked = sorted(
+            rows, key=lambda r: (abs(float(r["distance_from_spot"])), float(r["strike"]))
+        )
+        return ranked[:strike_limit]
+
+    monkeypatch.setattr(dbmod.DatabaseManager, "get_gex_strike_totals_at_ts", fake)
+    return calls
+
+
+def _total(strike: float, net: float, spot: float) -> dict:
+    return {
+        "strike": Decimal(str(strike)),
+        "net_gex": Decimal(str(net)),
+        "distance_from_spot": Decimal(str(strike - spot)),
+    }
+
+
 def test_diff_computes_strike_deltas(monkeypatch):
     app, dbmod = _build_app(monkeypatch)
     ts_a = datetime(2026, 6, 29, 14, 0, tzinfo=timezone.utc)
@@ -247,14 +280,14 @@ def test_diff_computes_strike_deltas(monkeypatch):
         _summary(ts_a, spot_price=Decimal("600.0")),
         _summary(ts_b, spot_price=Decimal("602.0")),
     ])
-    dbmod.DatabaseManager.get_gex_by_strike_at_ts = AsyncMock(side_effect=[
-        [{"strike": Decimal("600"), "net_gex": Decimal("100"), "call_gex": Decimal("60"),
-          "put_gex": Decimal("-40"), "distance_from_spot": Decimal("0")}],
-        [{"strike": Decimal("600"), "net_gex": Decimal("150"), "call_gex": Decimal("90"),
-          "put_gex": Decimal("-60"), "distance_from_spot": Decimal("-2")},
-         {"strike": Decimal("605"), "net_gex": Decimal("50"), "call_gex": Decimal("30"),
-          "put_gex": Decimal("-20"), "distance_from_spot": Decimal("3")}],
-    ])
+    calls = _install_strike_totals(
+        monkeypatch,
+        dbmod,
+        {
+            ts_a: [_total(600, 100, 600.0)],
+            ts_b: [_total(600, 150, 602.0), _total(605, 50, 602.0)],
+        },
+    )
     with TestClient(app) as client:
         # URL-encode the timestamps because ``+`` is a reserved query-string
         # delimiter that decodes to a literal space in the route handler.
@@ -265,7 +298,104 @@ def test_diff_computes_strike_deltas(monkeypatch):
     assert r.status_code == 200, r.text
     deltas = {row["strike"]: row for row in body["deltas"]}
     assert deltas[600.0]["delta"] == pytest.approx(50.0)   # 150 − 100
-    assert deltas[605.0]["delta"] == pytest.approx(50.0)   # 50 − 0 (new strike)
+    # 605 was looked up at A too and has no rows there: a strike listed only
+    # since, so 50 − 0 is a real change.
+    assert deltas[605.0]["delta"] == pytest.approx(50.0)
+    assert {"ts": ts_a, "strike_limit": 60, "strikes": [Decimal("605")]} in calls
+    # The default limit is passed through as a STRIKE count.
+    assert calls[0]["strike_limit"] == 60 and calls[0]["strikes"] is None
+
+
+def test_diff_reads_each_minute_at_strikes_only_the_other_window_reached(monkeypatch):
+    """Each minute's window is the strikes nearest ITS spot, so after a move
+    the two windows cover different strikes.  A strike past one window's edge
+    must be read at that minute too, or it counts as zero there and its whole
+    value shows up as a change.
+
+    Spot 600 -> 610 with 10-strike windows: A holds 575-620, B holds 585-630.
+    Every strike's net grew by exactly 10, so every delta must be 10,
+    including the four edge strikes only one window held.
+    """
+    app, dbmod = _build_app(monkeypatch)
+    ts_a = datetime(2026, 6, 29, 14, 0, tzinfo=timezone.utc)
+    ts_b = datetime(2026, 6, 29, 15, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_summary_at_ts = AsyncMock(
+        side_effect=[
+            _summary(ts_a, spot_price=Decimal("600.0")),
+            _summary(ts_b, spot_price=Decimal("610.0")),
+        ]
+    )
+    strikes = [570.0 + 5 * i for i in range(15)]  # 570 .. 640
+    calls = _install_strike_totals(
+        monkeypatch,
+        dbmod,
+        {
+            ts_a: [_total(k, 1000 + k, 600.0) for k in strikes],
+            ts_b: [_total(k, 1010 + k, 610.0) for k in strikes],
+        },
+    )
+    with TestClient(app) as client:
+        r = client.get(
+            f"/api/replay/diff?symbol=SPY&ts_a={quote(ts_a.isoformat())}"
+            f"&ts_b={quote(ts_b.isoformat())}&strike_limit=10"
+        )
+    assert r.status_code == 200, r.text
+    rows = {row["strike"]: row for row in r.json()["deltas"]}
+    assert sorted(rows) == [575.0 + 5 * i for i in range(12)]  # 575 .. 630
+    for k, row in rows.items():
+        assert row["net_gex_a"] == pytest.approx(1000 + k), k
+        assert row["net_gex_b"] == pytest.approx(1010 + k), k
+        assert row["delta"] == pytest.approx(10.0), k
+    fills = {(c["ts"], tuple(float(s) for s in c["strikes"])) for c in calls if c["strikes"]}
+    assert fills == {(ts_a, (625.0, 630.0)), (ts_b, (575.0, 580.0))}
+
+
+def test_strike_totals_read_sums_before_it_limits(monkeypatch):
+    """``/api/replay/diff``'s read groups by strike BEFORE the LIMIT, so the
+    limit counts strikes and never stops partway through one strike's
+    expirations.  Values are pinned against a real Postgres in
+    tests/test_replay_heatmap_strike_sum.py; this guards the SQL in the
+    default run."""
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    # A fresh module: the endpoint tests above patch methods on the class.
+    _, dbmod = _build_app(monkeypatch)
+    DatabaseManager = dbmod.DatabaseManager
+
+    seen: list = []
+
+    class _Conn:
+        async def fetch(self, query, *args):
+            seen.append((query, args))
+            return []
+
+    @asynccontextmanager
+    async def _acquire():
+        yield _Conn()
+
+    db = DatabaseManager()
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+    at = datetime(2026, 6, 29, 14, 0, tzinfo=timezone.utc)
+    asyncio.run(db.get_gex_strike_totals_at_ts("SPY", at, strike_limit=25))
+    asyncio.run(db.get_gex_strike_totals_at_ts("SPY", at, strikes=[Decimal("605")]))
+
+    nearest_sql, nearest_args = seen[0]
+    code = "\n".join(line.split("--", 1)[0] for line in nearest_sql.splitlines())
+    for aggregate in (
+        "SUM(g.call_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS call_gex",
+        "SUM(-1 * g.put_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS put_gex",
+        "SUM((g.call_gamma - g.put_gamma) * 100 * a.spot_price * a.spot_price * 0.01)",
+    ):
+        assert aggregate in code, aggregate
+    assert code.index("GROUP BY g.strike") < code.index("LIMIT $3")
+    assert "ORDER BY ABS(g.strike - a.spot_price) ASC, g.strike ASC" in code
+    assert nearest_args[2] == 25
+
+    listed_sql, listed_args = seen[1]
+    assert "g.strike = ANY($3::numeric[])" in listed_sql
+    assert "LIMIT $3" not in listed_sql
+    assert listed_args[2] == [Decimal("605")]
 
 
 def test_diff_rejects_identical_timestamps(monkeypatch):

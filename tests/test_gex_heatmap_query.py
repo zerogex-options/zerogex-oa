@@ -27,8 +27,12 @@ History:
                at the WINDOW, which is ~390x the rep set at timeframe=1day.
                A lateral reference is evaluated per outer row and the
                grouping blocks pull-up, so the bound is now structural.
+  v6         — each cell SUMs the strike across its expirations instead
+               of averaging them (a v1 leftover that divided every strike
+               by its own expiration count).  Cells now carry the per-strike
+               total the live ladder shows.
 
-These tests pin v5 so a refactor can't regress to scanning the full
+These tests pin v6 so a refactor can't regress to scanning the full
 window of gex_by_strike or re-coupling the chart to underlying_quotes
 freshness.
 """
@@ -145,14 +149,18 @@ def test_heatmap_read_is_a_correlated_lateral_fenced_to_the_rep_timestamps():
     assert "latest_price AS" not in sql
 
 
-def test_heatmap_cells_stay_one_avg_per_bucket_strike():
-    """Cell values are unchanged by the lateral rewrite.
+def test_heatmap_cells_are_one_sum_per_bucket_strike():
+    """A cell is the strike's TOTAL across its expirations.
 
-    The cross-expiration combination per (bucket, strike) is still ``AVG`` over
-    that bucket's representative snapshot.  Grouping by strike *inside* the
-    lateral is identical to the old ``GROUP BY br.bucket_ts, g.strike``,
-    because ``bucket_reps`` is DISTINCT ON the bucket — one rep_ts per
-    bucket_ts — so the lateral runs against exactly one timestamp per group.
+    The cross-expiration combination per (bucket, strike) is ``SUM`` over that
+    bucket's representative snapshot: the per-strike figure the live ladder
+    shows.  It was ``AVG`` until 2026-11, which divided each strike by its own
+    expiration count and bent the surface's shape (values are pinned against a
+    real Postgres in tests/test_replay_heatmap_strike_sum.py).  Grouping by
+    strike *inside* the lateral is identical to the old
+    ``GROUP BY br.bucket_ts, g.strike``, because ``bucket_reps`` is DISTINCT ON
+    the bucket — one rep_ts per bucket_ts — so the lateral runs against
+    exactly one timestamp per group.
 
     And unlike the strike-profile CTE, this one must NOT drop zero cells: a
     zero is a real neutral cell on a heatmap, so a HAVING here would punch a
@@ -165,7 +173,8 @@ def test_heatmap_cells_stay_one_avg_per_bucket_strike():
     sql = _sql_only(conn.queries[0])
     strikes_cte = sql[sql.index("strikes AS (") : sql.index(") cell")]
 
-    assert "AVG(g.net_gex) AS net_gex" in strikes_cte
+    assert "SUM(g.net_gex) AS net_gex" in strikes_cte
+    assert "AVG(" not in strikes_cte
     assert "GROUP BY g.strike" in strikes_cte
     # One row per (bucket, strike): no second grouping key smuggled in.
     assert "GROUP BY g.strike," not in strikes_cte

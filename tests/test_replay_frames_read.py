@@ -136,8 +136,34 @@ def test_spot_is_referenced_more_than_once_downstream():
     sql = _frames_query()
     outer = sql[sql.index("FROM session_summary s") :]
     assert sql.count("s.spot") >= 2, "expected the multiplier this fence targets"
-    assert "AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01)" in sql
+    assert "SUM(gbs.call_gamma * 100 * s.spot * s.spot * 0.01)" in sql
     assert "gex_by_strike gbs" in outer
+
+
+def test_strike_ladder_sums_each_strike_across_its_expirations():
+    """Each strike's figure is the SUM of its (strike, expiration) rows.
+
+    That is the total the live ladder and Strike Profile show
+    (get_strike_profile_timeseries sums the same rows), and the total the
+    Pair Comparison ladder's Live mode draws, so toggling Live and Replay must
+    not change the scale.  The ladder took AVG until 2026-11, which divided
+    each strike by its own expiration count (12 near the money on ES), so the
+    replay's shape was wrong as well as its scale.  Values are pinned against
+    a real Postgres in tests/test_replay_heatmap_strike_sum.py; this guards
+    the SQL in the default run.
+    """
+    sql = _frames_query()
+    ladder = sql[sql.index("LEFT JOIN LATERAL (") : sql.index(") ladder ON TRUE")]
+    for aggregate in (
+        "SUM(gbs.net_gex) AS net_gex",
+        "SUM(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex",
+        "SUM(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex",
+        # The raw inputs the expiration-scoped walls and flip are re-ranked on.
+        "SUM(gbs.call_gamma) AS call_gamma",
+        "SUM(gbs.put_gamma) AS put_gamma",
+    ):
+        assert aggregate in ladder, aggregate
+    assert "AVG(" not in ladder
 
 
 def test_strike_ladder_is_a_correlated_lateral_fenced_to_the_session():

@@ -3836,6 +3836,98 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             return []
 
+    async def get_gex_strike_totals_at_ts(
+        self,
+        symbol: str,
+        at_ts: datetime,
+        strike_limit: int = 60,
+        strikes: Optional[List[Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Per-strike GEX TOTALS at a historical minute, for ``/api/replay/diff``.
+
+        :meth:`get_gex_by_strike_at_ts` returns one row per (strike,
+        expiration) and its ``limit`` counts those rows, so a strike near the
+        money (10-40 expirations) uses up most of the limit and the strike at
+        the cut keeps only some of its expirations.  This read sums first and
+        limits after: every strike comes back whole, summed across all of its
+        expirations, and ``strike_limit`` counts strikes.
+
+        Same anchor (the ``gex_summary`` minute at-or-before ``at_ts``), same
+        spot (the ``underlying_quotes`` close at-or-before that minute) and the
+        same per-row dollar conversion as :meth:`get_gex_by_strike_at_ts`, so
+        each total is exactly what that read's rows add up to: the per-strike
+        figure the live ladder shows.
+
+        ``strikes=None`` returns the ``strike_limit`` strikes nearest that
+        minute's spot, the lower strike first at an equal distance so the cut
+        is deterministic.  A list returns exactly those strikes instead,
+        however far from spot, and ignores ``strike_limit``: that is how the
+        diff reads one minute at strikes only the other minute's window
+        reached.  A strike with no rows at that minute is absent either way.
+
+        Returns ``[]`` on any error, like :meth:`get_gex_by_strike_at_ts`.
+        """
+        if strikes is not None:
+            strike_predicate = "AND g.strike = ANY($3::numeric[])"
+            limit_clause = ""
+            third: Any = list(strikes)
+        else:
+            strike_predicate = ""
+            limit_clause = "LIMIT $3"
+            third = int(strike_limit)
+        query = f"""
+            WITH anchor AS (
+                SELECT timestamp
+                FROM gex_summary
+                WHERE underlying = $1
+                  AND timestamp <= $2
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            anchor_spot AS (
+                SELECT
+                    a.timestamp,
+                    (SELECT uq.close
+                       FROM underlying_quotes uq
+                      WHERE uq.symbol = $1
+                        AND uq.timestamp <= a.timestamp
+                      ORDER BY uq.timestamp DESC
+                      LIMIT 1) AS spot_price
+                FROM anchor a
+            )
+            SELECT
+                g.strike,
+                COUNT(*) AS expirations,
+                SUM(g.call_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS call_gex,
+                SUM(-1 * g.put_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS put_gex,
+                SUM((g.call_gamma - g.put_gamma) * 100 * a.spot_price * a.spot_price * 0.01)
+                    AS net_gex,
+                a.spot_price,
+                g.strike - a.spot_price AS distance_from_spot
+            FROM gex_by_strike g
+            CROSS JOIN anchor_spot a
+            WHERE g.underlying = $1
+              AND g.timestamp = a.timestamp
+              {strike_predicate}
+            -- Sum BEFORE the limit, so the limit counts strikes and never
+            -- stops partway through one strike's expirations.
+            GROUP BY g.strike, a.spot_price
+            ORDER BY ABS(g.strike - a.spot_price) ASC, g.strike ASC
+            {limit_clause}
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, at_ts, third)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_gex_strike_totals_at_ts(%s, %s) failed: %s",
+                symbol,
+                at_ts,
+                e,
+            )
+            return []
+
     async def get_gex_chain_at_ts(
         self,
         symbol: str,
@@ -4145,6 +4237,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bounded (a full session at every strike would be ~40k rows for SPX).
         call_gex/put_gex are the dollar-scaled call/put split (nullable on
         pre-gamma-column rows) that drives the scrubber's Split/Combined views.
+        Every value is the strike's TOTAL across its expirations (in scope),
+        the same per-strike figure the live ladder and Strike Profile show.
 
         ``expirations`` scopes the whole frame to a set of expiration dates —
         ``[session_date]`` is the 0DTE replay.  ``None`` (the default) is the
@@ -4180,8 +4274,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # date) sizes the strike band once for the whole session.  gex_summary
         # itself carries no spot column — the analytics engine records levels
         # (walls, flip, GEX) but the spot underlying comes from underlying_quotes.
-        # gex_by_strike already stores a per-strike net_gex; AVG across
-        # expirations mirrors the aggregation get_gex_heatmap uses.
+        #
+        # gex_by_strike is keyed per (strike, expiration), so a strike's figure
+        # is the SUM of its rows: the total the live ladder and Strike Profile
+        # show (get_strike_profile_timeseries sums the same rows), and what the
+        # per-expiration rows of /replay/frame add up to.  Every aggregate in
+        # the ladder below sums.  They were AVG until 2026-11, which divided
+        # each strike by its own expiration count -- 12 near the money on ES,
+        # fewer on the wings -- so the replay's shape was off as well as its
+        # scale (verified on ES 2026-11-06 13:20 ET: exactly the sum / 12 at
+        # 7408.5-7428.75).  A one-date scope (0DTE) has one row per strike, so
+        # it read the same either way.
         #
         # call_gex / put_gex are derived per minute from the raw ``call_gamma``
         # / ``put_gamma`` (γ × OI) columns the same way /replay/frame and the
@@ -4190,7 +4293,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # Split / Combined gamma views (call/put split, plus a Net overlay)
         # exactly like the Strike Profile chart.  The stored ``net_gex`` column
         # is already dollar-scaled (call_gex + put_gex at the analytics spot),
-        # so ``net_gex`` is left as the canonical AVG and call/put are derived
+        # so ``net_gex`` is the stored column summed and call/put are derived
         # against the same per-minute spot (``s.spot`` — underlying_quotes close
         # at-or-before the bar) they were originally scaled with, keeping
         # call_gex + put_gex ≈ net_gex.  A correlated sub-select (not LATERAL)
@@ -4331,11 +4434,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             LEFT JOIN LATERAL (
                 SELECT
                     gbs.strike,
-                    AVG(gbs.net_gex) AS net_gex,
-                    AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
-                    AVG(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex,
-                    AVG(gbs.call_gamma) AS call_gamma,
-                    AVG(gbs.put_gamma) AS put_gamma
+                    SUM(gbs.net_gex) AS net_gex,
+                    SUM(gbs.call_gamma * 100 * s.spot * s.spot * 0.01) AS call_gex,
+                    SUM(-1 * gbs.put_gamma * 100 * s.spot * s.spot * 0.01) AS put_gex,
+                    SUM(gbs.call_gamma) AS call_gamma,
+                    SUM(gbs.put_gamma) AS put_gamma
                 FROM gex_by_strike gbs
                 WHERE gbs.underlying = $1
                   AND gbs.timestamp = s.timestamp
@@ -4357,8 +4460,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   -- always been and the planner never has to reason about a
                   -- parameter that is NULL on every whole-chain call.
                   {exp_predicate}
-                -- One row per strike, AVG across that minute's expirations --
-                -- identical to the old GROUP BY (s.timestamp, ..., gbs.strike),
+                -- One row per strike, SUMMED across that minute's expirations
+                -- (see the comment above the query) -- grouped identically to
+                -- the old GROUP BY (s.timestamp, ..., gbs.strike),
                 -- since the lateral only ever sees one timestamp.  The summary
                 -- columns no longer need to ride along in a GROUP BY just to
                 -- survive the aggregate; they are projected straight from s.
@@ -10323,7 +10427,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         ``gamma_flip`` / ``gamma_flip_span_used`` are the bucket's single
         resolved values (NULL when unresolved); ``heatmap`` is ascending
-        by ``strike``.
+        by ``strike``.  Each cell's ``net_gex`` is the strike's TOTAL across
+        its expirations at the bucket's representative snapshot (see the
+        ``strikes`` CTE), the same per-strike figure the live ladder shows.
         """
         symbol = symbol.upper()
         window_units = max(1, min(window_units, 300))
@@ -10419,10 +10525,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # the whole window.  Heatmap cells are therefore the GEX-by-strike
         # surface at each bucket's close (point-in-time) rather than an
         # average across every snapshot in the bucket -- consistent with
-        # the historical/summary endpoints.  Only the TIME aggregation
-        # changed: the cross-expiration combination per (bucket, strike)
-        # is still AVG, and the spot±band_pct strike filter is unchanged,
-        # so cell magnitudes stay comparable to before.
+        # the historical/summary endpoints.  That change was TIME
+        # aggregation only.  The cross-expiration combination per (bucket,
+        # strike) is a SUM since 2026-11 (see the strikes CTE).
         query = f"""
             WITH latest_summary AS (
                 SELECT timestamp AS max_ts
@@ -10494,9 +10599,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             -- as defence in depth but is no longer load-bearing.  Mirrors
             -- get_strike_profile_timeseries.
             --
-            -- Cells are unchanged: the cross-expiration combination per
-            -- (bucket, strike) is still AVG over that bucket's representative
-            -- snapshot, and grouping by strike inside the lateral is identical
+            -- A cell is the strike's TOTAL across its expirations at the
+            -- bucket's representative snapshot: SUM, the same per-strike
+            -- figure the live ladder reads (get_strike_profile_timeseries sums
+            -- these rows).  It was AVG until 2026-11 -- a leftover of the v1
+            -- read, which averaged over every snapshot in the bucket and so
+            -- over expirations too -- and that divided each strike by its own
+            -- expiration count, bending the surface's shape as well as its
+            -- scale.  Grouping by strike inside the lateral is identical
             -- to grouping by (bucket_ts, strike) -- bucket_reps is DISTINCT ON
             -- the bucket, so bucket_ts <-> rep_ts is 1:1.  Unlike the
             -- strike-profile CTE this one does NOT drop zero cells: a zero is
@@ -10513,7 +10623,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 CROSS JOIN LATERAL (
                     SELECT
                         g.strike,
-                        AVG(g.net_gex) AS net_gex
+                        SUM(g.net_gex) AS net_gex
                     FROM gex_by_strike g
                     WHERE g.underlying = $1
                       AND g.timestamp = br.rep_ts

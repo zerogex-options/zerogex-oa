@@ -38,7 +38,7 @@ def test_script_explains_the_live_query_not_a_copy():
     sql = _script()
     assert "session_summary AS MATERIALIZED (" in sql
     assert "LEFT JOIN LATERAL (" in sql
-    assert "AVG(gbs.call_gamma * 100 * s.spot * s.spot * 0.01)" in sql
+    assert "SUM(gbs.call_gamma * 100 * s.spot * s.spot * 0.01)" in sql
 
 
 def test_script_forces_the_fallback_plan():

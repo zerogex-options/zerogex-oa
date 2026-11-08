@@ -137,6 +137,19 @@ def test_replay_at_ts_query_columns_exist(schema_db, method):
     _prepare(schema_db, _extract_query(method))
 
 
+def test_replay_diff_strike_totals_query_columns_exist(schema_db):
+    """``/api/replay/diff``'s per-strike totals read names real columns too.
+
+    It is an f-string (the strike scope and the LIMIT are substituted in), so
+    it is prepared in its nearest-strikes form, the read the diff makes first.
+    """
+    start = _DATABASE_PY.index("async def get_gex_strike_totals_at_ts(")
+    m = re.search(r'query = f"""(.*?)"""', _DATABASE_PY[start:], re.DOTALL)
+    assert m, "get_gex_strike_totals_at_ts: no query string found"
+    sql = m.group(1).replace("{strike_predicate}", "").replace("{limit_clause}", "LIMIT $3")
+    _prepare(schema_db, sql)
+
+
 def test_expiration_shares_query_reads_the_expiration_column(schema_db):
     """Guard the guard: the gradient query must actually key on expiration.
 

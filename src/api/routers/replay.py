@@ -529,12 +529,28 @@ async def get_replay_range(
     return payload
 
 
+def _by_strike(rows: list[dict[str, Any]]) -> dict[float, dict[str, Any]]:
+    """Per-strike total rows keyed by strike, for the diff's subtraction."""
+    return {float(r["strike"]): r for r in rows if r.get("strike") is not None}
+
+
 @router.get("/diff")
 async def get_replay_diff(
     symbol: str = Query(default="SPY", max_length=10),
     ts_a: str = Query(..., description="ISO-8601 'before' timestamp."),
     ts_b: str = Query(..., description="ISO-8601 'after' timestamp."),
-    strike_limit: int = Query(default=60, ge=10, le=200),
+    # Counts STRIKES, each one summed across all of its expirations.  Until
+    # 2026-11 it counted (strike, expiration) rows, so 60 covered ~5 strikes
+    # near the money on ES and could stop partway through the last one.
+    strike_limit: int = Query(
+        default=60,
+        ge=10,
+        le=200,
+        description=(
+            "How many strikes nearest each minute's spot to compare. Counts "
+            "strikes, each summed across all of its expirations."
+        ),
+    ),
     db: DatabaseManager = Depends(get_db),
 ):
     """Strike-by-strike net GEX delta between two replay timestamps.
@@ -542,6 +558,15 @@ async def get_replay_diff(
     Powers the two-pin diff overlay: drop a 'before' marker and an
     'after' marker on the scrubber and the result is a red/green bar
     chart of which strikes dealers re-hedged into / out of in between.
+
+    ``net_gex_a`` / ``net_gex_b`` are each strike's TOTAL across every
+    expiration at that minute: the figure the live ladder shows, and what
+    ``/api/replay/frame``'s per-expiration rows add up to.  (Until 2026-11 each
+    strike kept one arbitrary expiration's row instead.)  ``strike_limit``
+    picks the strikes nearest each minute's own spot, and the response covers
+    both windows: a strike only one window reached is read at the other minute
+    too, so its delta is a real change rather than the edge of a window that
+    moved with price.
     """
     sym = symbol.upper()
     a = _parse_ts(ts_a)
@@ -556,21 +581,31 @@ async def get_replay_diff(
             status_code=404,
             detail=f"Missing GEX data for one or both timestamps on {sym}.",
         )
-    strikes_a = await db.get_gex_by_strike_at_ts(
-        sym, summary_a["timestamp"], limit=strike_limit
+    by_strike_a = _by_strike(
+        await db.get_gex_strike_totals_at_ts(sym, summary_a["timestamp"], strike_limit=strike_limit)
     )
-    strikes_b = await db.get_gex_by_strike_at_ts(
-        sym, summary_b["timestamp"], limit=strike_limit
+    by_strike_b = _by_strike(
+        await db.get_gex_strike_totals_at_ts(sym, summary_b["timestamp"], strike_limit=strike_limit)
     )
-
-    # Index by strike for the subtraction; carry per-side bars too so
-    # the frontend can split the delta into call vs put migration.
-    by_strike_a = {
-        float(r["strike"]): r for r in strikes_a if r.get("strike") is not None
-    }
-    by_strike_b = {
-        float(r["strike"]): r for r in strikes_b if r.get("strike") is not None
-    }
+    # Each window is centered on its own minute's spot, so once price moves the
+    # two cover different strikes.  Read each minute at the strikes only the
+    # other window holds; otherwise a strike past one window's edge counts as
+    # zero there and its whole value shows up as a change.  A strike with no
+    # rows at that minute (newly listed, say) stays zero, which is real.
+    only_in_b = [by_strike_b[k]["strike"] for k in sorted(by_strike_b.keys() - by_strike_a.keys())]
+    only_in_a = [by_strike_a[k]["strike"] for k in sorted(by_strike_a.keys() - by_strike_b.keys())]
+    if only_in_b:
+        by_strike_a.update(
+            _by_strike(
+                await db.get_gex_strike_totals_at_ts(sym, summary_a["timestamp"], strikes=only_in_b)
+            )
+        )
+    if only_in_a:
+        by_strike_b.update(
+            _by_strike(
+                await db.get_gex_strike_totals_at_ts(sym, summary_b["timestamp"], strikes=only_in_a)
+            )
+        )
     all_strikes = sorted(by_strike_a.keys() | by_strike_b.keys())
     delta_rows = []
     for k in all_strikes:
