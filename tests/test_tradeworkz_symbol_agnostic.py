@@ -9,10 +9,11 @@ QQQ-only variant needed its own BotSpec row. Two consequences:
 
 The wildcard universe fixes both. The engine expands ``'*'`` to the
 fleet universe on every tick and iterates ``(bot, underlying)``; every
-shipped bot is symbol-agnostic. (The active roster is currently empty —
-the fleet was shelved on 2026-08-09 after the backtest found no edge — so
-these invariants are checked against the preserved ``SHELVED_SPECS``
-catalog.)
+shipped bot is symbol-agnostic. (The validated roster is empty — the fleet
+was shelved on 2026-08-09 after the backtest found no edge, and the ten bots
+restarted on 2026-11-12 run as forward tests, not on validated evidence — so
+these invariants are checked against the whole catalog and the preserved
+``SHELVED_SPECS``.)
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from src.tradeworkz.engine import _bot_underlyings
 from src.tradeworkz.registry import (
     ALL_BOT_SPECS,
     DEFAULT_ROSTER,
+    FORWARD_TEST_SPECS,
     RETIRED_BOT_IDS,
     SHELVED_SPECS,
 )
@@ -86,11 +88,14 @@ def test_retired_bots_are_not_in_active_roster():
 
 def test_fleet_is_fully_shelved_pending_backtest_edge():
     """The whole fleet was retired on 2026-08-09 after the backtest screen
-    found no bot has edge. Locks that state in: the active roster is empty,
-    the shipped catalog is preserved, and every shipped bot is retired in
-    the DB so none can open. Reviving one means editing BOTH tuples — this
-    fails if someone re-activates a bot without also un-retiring it."""
+    found no bot has edge. Locks that state in: the validated roster is
+    empty, the shipped catalog is preserved, and every shelved bot is retired
+    in the DB so none can open. The 2026-11-12 forward tests are a separate,
+    explicit lane (catalog ``forward_test``) and never overlap the retired
+    list. Reviving a shelved bot means editing BOTH — this fails if someone
+    re-activates one without also un-retiring it."""
     assert DEFAULT_ROSTER == ()
+    assert {s.id for s in FORWARD_TEST_SPECS}.isdisjoint(RETIRED_BOT_IDS)
     assert len(SHELVED_SPECS) >= 12
     shelved_ids = {spec.id for spec in SHELVED_SPECS}
     for spec in SHELVED_SPECS:

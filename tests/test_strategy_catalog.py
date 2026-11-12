@@ -27,6 +27,7 @@ from src.strategies import (
     can_retire,
     canonical_id,
     find,
+    forward_tests,
     get,
     pattern_bound,
     provisionable,
@@ -39,6 +40,8 @@ from src.tradeworkz.registry import (
     CANDIDATE_SPECS,
     DEFAULT_ROSTER,
     DISABLED_BOT_IDS,
+    FORWARD_TEST_SPECS,
+    FORWARD_TEST_TAGLINE_PREFIX,
     SHELVED_SPECS,
     known_specs,
     spec_for,
@@ -214,27 +217,94 @@ def test_pattern_side_evidence_never_qualifies_a_bot_for_capital():
     assert not entry.is_provisionable
 
 
-def test_disabled_ids_are_only_bots_that_actually_shipped():
+def test_disabled_ids_are_only_bots_that_shipped_and_are_not_live():
     """A never-provisioned strategy has no tw_bots row to turn off.
 
     Listing one would mean an operator who hand-inserts a candidate row to
-    trial it gets it disabled out from under them on the next provision.
+    trial it gets it disabled out from under them on the next provision. And
+    a live bot (validated or forward-testing) must never be on the list, or
+    provision would enable and zero it in the same pass.
     """
     never_shipped = {e.bot_id for e in bot_bound() if not e.provisioned_history}
     assert never_shipped.isdisjoint(DISABLED_BOT_IDS)
-    shipped = {e.bot_id for e in bot_bound() if e.provisioned_history}
-    assert shipped <= set(DISABLED_BOT_IDS)
+    shipped_not_live = {e.bot_id for e in bot_bound() if e.provisioned_history and not e.is_live}
+    assert shipped_not_live <= set(DISABLED_BOT_IDS)
+    live = {e.bot_id for e in bot_bound() if e.is_live}
+    assert live, "the forward tests are live"
+    assert live.isdisjoint(DISABLED_BOT_IDS)
     # The two legacy symbol-specific ids keep their foreign keys valid.
     assert "qqq_gamma_flip_breaker" in DISABLED_BOT_IDS
     assert "qqq_dealer_delta_pressure_rider" in DISABLED_BOT_IDS
 
 
-def test_candidates_are_runnable_but_never_disabled_or_funded():
+def test_candidates_are_never_disabled_and_run_only_as_forward_tests():
     roster = {s.id for s in DEFAULT_ROSTER}
+    forward = {s.id for s in FORWARD_TEST_SPECS}
     for spec in CANDIDATE_SPECS:
         assert spec.id not in roster
         assert spec.id not in DISABLED_BOT_IDS
-        assert spec.enabled is False
+        assert spec.enabled is (spec.id in forward), spec.id
+
+
+# ---------------------------------------------------------------------------
+# Forward tests: paper capital to EARN evidence, decided in the catalog
+# ---------------------------------------------------------------------------
+
+#: The ten restarted on 2026-11-12: the nine CANDIDATE bots whose screens
+#: looked good on too few trades, plus the bot for the one strategy with a
+#: measured (pattern-side) edge. Changing this set is a deliberate act.
+FORWARD_TEST_IDS = {
+    "charm_close_magnet",
+    "climax_flow_fade",
+    "dual_flip_dislocation",
+    "gamma_regime_shift_rider",
+    "profile_shelf_breaker",
+    "put_capitulation_credit_fade",
+    "settlement_flow_snap",
+    "vanna_vol_crush_rider",
+    "weekly_charm_grind",
+    "gex_gradient_trend",
+}
+
+
+def test_forward_test_roster_is_the_ten_chosen():
+    assert {e.id for e in forward_tests()} == FORWARD_TEST_IDS
+    assert {s.id for s in FORWARD_TEST_SPECS} == {get(i).bot_id for i in FORWARD_TEST_IDS}
+
+
+def test_forward_test_specs_are_enabled_marked_and_unfunded_by_evidence():
+    for spec in FORWARD_TEST_SPECS:
+        assert spec.enabled is True
+        assert spec.tagline.startswith(FORWARD_TEST_TAGLINE_PREFIX), spec.id
+        assert spec.id not in DISABLED_BOT_IDS
+    # A forward test is not validation: the evidence roster stays separate.
+    assert {s.id for s in FORWARD_TEST_SPECS}.isdisjoint({s.id for s in DEFAULT_ROSTER})
+    for entry in forward_tests():
+        assert not entry.is_provisionable, entry.id
+        assert entry.provisioned_history, entry.id
+
+
+def test_forward_test_flag_must_name_a_bot_a_live_stage_and_its_history():
+    ok = _entry(bot_class="X", forward_test=True, provisioned_history=True)
+    assert validate_stage(ok) is None
+    assert ok.is_forward_testing and ok.is_live
+
+    no_bot = _entry(forward_test=True, provisioned_history=True)
+    assert "bot binding" in validate_stage(no_bot)
+    assert not no_bot.is_forward_testing
+
+    no_history = _entry(bot_class="X", forward_test=True)
+    assert "provisioned_history" in validate_stage(no_history)
+
+    superseded = _entry(
+        bot_class="X",
+        forward_test=True,
+        provisioned_history=True,
+        stage=Stage.SUPERSEDED,
+        superseded_by="call_wall_fade",
+    )
+    assert "superseded" in validate_stage(superseded)
+    assert not superseded.is_forward_testing, "a superseded strategy never runs"
 
 
 def test_shelved_specs_keeps_its_original_meaning():

@@ -269,7 +269,7 @@ def generate_bot_cards(
             snapshots += 1
             for entry, bot in runners:
                 try:
-                    signal = bot.open_criteria(snap)
+                    signal = bot.evaluate_open(snap)
                 except Exception:  # one bad instant must not kill the replay
                     logger.warning(
                         "bot_replay: %s raised at %s", entry.id, t.isoformat(), exc_info=True

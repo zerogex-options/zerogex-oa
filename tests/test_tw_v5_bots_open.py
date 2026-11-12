@@ -15,8 +15,10 @@ directly (no DB) and lock in, for each bot:
 * its custom exit invalidation closes when the mechanism it priced dies.
 
 Plus the registry invariant: candidates are registered and screenable but NOT
-live (empty DEFAULT_ROSTER, not retired) — they promote only via the backtest
-gate, and the base class's new credit-exit branch behaves per spec.
+validated (empty DEFAULT_ROSTER, not retired) — they reach a funded sleeve on
+evidence only through a bot-harness screen, or on paper as an explicit catalog
+forward test (2026-11-12) — and the base class's new credit-exit branch behaves
+per spec.
 
 All timestamps are ET→UTC for August (EDT, UTC-4).
 """
@@ -616,8 +618,9 @@ V5_SCREENED_OUT = ("hedge_impulse_quiet_tape",)
 
 
 def test_v5_candidates_are_registered_not_live():
-    """Same discipline as v4: registered + screenable by id, but nothing is
-    provisioned, sized, or opened until it clears the backtest gate."""
+    """Same discipline as v4: registered + screenable by id, never on the
+    validated roster until it clears the backtest gate (a catalog forward test
+    is the separate, explicit paper lane)."""
     specs = known_specs()
     roster_ids = {s.id for s in DEFAULT_ROSTER}
     candidate_ids = {s.id for s in CANDIDATE_SPECS}

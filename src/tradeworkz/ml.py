@@ -248,8 +248,19 @@ def apply_auto_disable_guard(
     ``provision_defaults`` no longer force-re-enables on restart, so the
     disable sticks. No-op when disabled by config, when the sample is too
     small, or when the hit rate clears the bar.
+
+    Never trips on a forward-test bot. A forward test exists to collect the
+    bot's live record, and switching it off at twenty trades — which a
+    long-premium bot with a 30% hit rate and big winners would hit while
+    still profitable — ends the test before it can say anything. The daily
+    loss kill and the 0.5x size throttle still apply; clearing the bot's
+    catalog ``forward_test`` flag is how a test is stopped.
     """
     if not tw_config.AUTO_DISABLE_ENABLED:
+        return False
+    from src.tradeworkz.registry import is_forward_test_bot
+
+    if is_forward_test_bot(bot_id):
         return False
     if hit_rate is None or n_trades < tw_config.AUTO_DISABLE_MIN_TRADES:
         return False

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 from src.symbols import is_cash_index
 
@@ -56,6 +56,11 @@ def _configured_increments() -> Dict[str, float]:
         if value > 0:
             out[sym.strip().upper()] = value
     return out
+
+
+def configured_strike_increment(underlying: str) -> Optional[float]:
+    """The ``TRADEWORKZ_STRIKE_INCREMENTS`` override for ``underlying``, if any."""
+    return _configured_increments().get((underlying or "").strip().upper())
 
 
 def default_strike_increment(underlying: str) -> float:

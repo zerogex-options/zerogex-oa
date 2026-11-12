@@ -173,6 +173,7 @@ def _rows(entries: Iterable[StrategyEntry]) -> List[Dict[str, Any]]:
                 "bot_id": e.bot_id,
                 "pattern_id": e.pattern_id,
                 "provisionable": e.is_provisionable,
+                "forward_test": e.is_forward_testing,
                 "backtestable": e.backtestable,
                 "runs": len(e.research),
                 "deepest_window_days": e.deepest_window_days,
@@ -219,6 +220,8 @@ def render(entries: List[StrategyEntry]) -> str:
             engines = "+".join(x.value for x in e.engines) or "none"
             pf = _fmt_pf(latest.profit_factor if latest else None)
             verdict = latest.verdict.value if latest else "never screened"
+            if e.is_forward_testing:
+                verdict += "  [forward test]"
             lines.append(
                 f"{_STAGE_MARK[e.stage]}{e.id:<32} {e.tier:<5} {e.stage.value:<11} "
                 f"{engines:<14} {len(e.research):>4} {e.deepest_window_days:>5} "
@@ -236,6 +239,7 @@ def render(entries: List[StrategyEntry]) -> str:
     lines.append(f"  bot binding                {sum(1 for e in entries if e.bot_class)}")
     lines.append(f"  pattern binding            {sum(1 for e in entries if e.has_pattern)}")
     lines.append(f"  live-eligible (funded)     {sum(1 for e in entries if e.is_provisionable)}")
+    lines.append(f"  forward test (paper)       {sum(1 for e in entries if e.is_forward_testing)}")
     lines.append(f"  bot screened for edge      {sum(1 for e in entries if e.bot_validated)}")
 
     lines.append("")

@@ -55,12 +55,16 @@ MIRRORED_LISTS = (
     "SESSION_SURFACE_WARM_SYMBOLS",
 )
 #: Models and feeds a stock must stay out of (docs/runbooks/stock_onboarding.md).
+#: TRADEWORKZ_UNIVERSE left this list on 2026-11-12: the bots now fit every
+#: trade onto a contract the chain actually lists (src/tradeworkz/chain.py),
+#: which was the reason stocks were kept out — no expiration every weekday,
+#: $2.50 strikes. Its default ``*`` covers every analytics symbol, so the
+#: stock needs no edit there.
 FORBIDDEN_LISTS = (
     "SIGNALS_UNDERLYINGS",
     "FORECAST_SYMBOLS",
     "CONE_SYMBOLS",
     "BULLETIN_TWEET_SYMBOLS",
-    "TRADEWORKZ_UNIVERSE",
     "INGEST_FUTURES_INDEXES",
     "ETF_SYMBOLS",
 )

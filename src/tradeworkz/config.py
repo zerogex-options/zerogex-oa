@@ -22,18 +22,53 @@ FLEET_CAPITAL: float = _getenv_float("TRADEWORKZ_FLEET_CAPITAL", 1_000_000.0, mi
 # ---------------------------------------------------------------------------
 ENGINE_ENABLED: bool = _getenv_bool("TRADEWORKZ_ENGINE_ENABLED", True)
 ENGINE_INTERVAL_SECONDS: int = _getenv_int("TRADEWORKZ_ENGINE_INTERVAL_SECONDS", 5, min=1, max=3600)
-# Comma-separated list of underlyings the fleet trades against. A bot
-# whose ``universe`` column is the wildcard ``"*"`` runs against every
-# ticker in this list every tick (one signal per (bot, underlying) pair,
-# each with its own snapshot). Legacy per-bot single-ticker rows are
-# still supported — a bot pinned to ``universe='SPY'`` will only see the
+# Underlyings the fleet trades against: ``*`` (the default) for every symbol
+# the analytics engine models, or a comma-separated list. ``*`` reads
+# ANALYTICS_UNDERLYINGS (else ANALYTICS_UNDERLYING) at call time, so a stock
+# onboarded into ingestion + analytics becomes bot-eligible with no
+# TradeWorkz change; futures are left out because they have no option chain
+# of their own to trade. ``*`` can sit in a list (``*,IWM``) to add a symbol
+# analytics does not cover. A bot whose ``universe`` column is the wildcard
+# ``"*"`` runs against every ticker here every tick (one signal per (bot,
+# underlying) pair, each with its own snapshot). Legacy per-bot single-ticker
+# rows are still supported — a bot pinned to ``universe='SPY'`` only sees the
 # SPY snapshot even if the fleet universe is wider.
-UNIVERSE: str = _getenv_str("TRADEWORKZ_UNIVERSE", "SPY,QQQ,IWM")
+UNIVERSE: str = _getenv_str("TRADEWORKZ_UNIVERSE", "*")
+
+
+def analytics_universe() -> tuple[str, ...]:
+    """Every symbol the analytics engine models, as stored in its tables.
+
+    Analytics resolves aliases for its API calls but writes the alias
+    (``SPX``, not ``$SPXW.X``), so a TradeStation symbol here is folded back
+    to its alias. Futures are dropped: their GEX is projected from the backing
+    index and there is no futures option chain to trade.
+    """
+    from src import config as app_config
+    from src.symbols import get_canonical_symbol, is_futures_symbol
+
+    raw = app_config.ANALYTICS_UNDERLYINGS or app_config.ANALYTICS_UNDERLYING or "SPY"
+    out: list[str] = []
+    for item in raw.split(","):
+        sym = get_canonical_symbol(item.strip().upper()) if item.strip() else ""
+        if sym and not is_futures_symbol(sym) and sym not in out:
+            out.append(sym)
+    return tuple(out)
 
 
 def fleet_universes() -> tuple[str, ...]:
-    """Parse ``TRADEWORKZ_UNIVERSE`` into a tuple of upper-cased tickers."""
-    return tuple(sym.strip().upper() for sym in UNIVERSE.split(",") if sym.strip())
+    """Parse ``TRADEWORKZ_UNIVERSE`` into a tuple of upper-cased tickers,
+    expanding ``*`` (or ``ALL``) to :func:`analytics_universe`."""
+    out: list[str] = []
+    for item in UNIVERSE.split(","):
+        sym = item.strip().upper()
+        if not sym:
+            continue
+        expanded = analytics_universe() if sym in ("*", "ALL") else (sym,)
+        for s in expanded:
+            if s not in out:
+                out.append(s)
+    return tuple(out)
 
 
 RECONCILE_LOCK_ENABLED: bool = _getenv_bool("TRADEWORKZ_RECONCILE_LOCK_ENABLED", True)

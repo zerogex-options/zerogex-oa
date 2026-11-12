@@ -101,6 +101,14 @@ The practical consequence today: `DEFAULT_ROSTER` is **empty**, unchanged from
 before this work. `gex_gradient_trend` now has a bot but no bot-side screen,
 so the audit queues it under `awaiting_bot_screen` rather than funding it.
 
+**Forward tests (2026-11-12)** are the second, explicit way onto the fleet: an
+entry with `forward_test=True` is funded on paper to *earn* its evidence, not
+on evidence it already has, and members see it marked as a test. Ten run
+today. `is_live` (validated or forward-testing) is what provisioning funds and
+what keeps a shipped bot off the disable list; live forward trades count as
+bot evidence (`tradeworkz-live` in `BOT_HARNESSES`). See
+[`tradeworkz-forward-tests.md`](tradeworkz-forward-tests.md).
+
 ### The `gex_gradient_trend` bot
 
 `src/tradeworkz/bots/gex_gradient_drift.py` — `GexGradientDrift`. Written

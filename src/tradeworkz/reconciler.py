@@ -18,9 +18,14 @@ from zoneinfo import ZoneInfo
 from src.tradeworkz import config as tw_config
 from src.tradeworkz import ml as ml_mod
 from src.tradeworkz import notifications
+from src.tradeworkz.chain import fit_legs_to_chain
 from src.tradeworkz.models import BotCapital, ExitDecision, OpenPosition, TradeSignal
 from src.tradeworkz.pricing import spread_price
-from src.tradeworkz.sizing import compute_contracts, structure_max_loss_per_share
+from src.tradeworkz.sizing import (
+    compute_contracts,
+    is_capped_risk,
+    structure_max_loss_per_share,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +99,27 @@ def _cap_time_stop_at_expiration(
     if time_stop_at is None or time_stop_at > cap:
         return cap
     return time_stop_at
+
+
+def _cap_time_stop_for_fit(
+    time_stop_at: Optional[datetime],
+    requested_legs: List[Dict[str, Any]],
+    fitted_legs: List[Dict[str, Any]],
+) -> Optional[datetime]:
+    """Time-stop cap after the contract fit (see src/tradeworkz/chain.py).
+
+    The fit only rolls an expiration forward, so capping at 15:55 ET on the
+    expiration the bot ASKED for keeps the trade inside the horizon it
+    priced: a same-day bot on a stock that lists Fridays trades Friday's
+    contract but is flat by today's close. When the asked-for day is not a
+    session (a holiday the bot's weekday walk landed on), there is no 15:55
+    to close at, so the cap falls to the listed expiration it rolled to.
+    """
+    from src.market_calendar import is_trading_session
+
+    asked = _earliest_leg_expiration(requested_legs)
+    legs = requested_legs if asked is not None and is_trading_session(asked) else fitted_legs
+    return _cap_time_stop_at_expiration(time_stop_at, legs)
 
 
 def _bot_lock_id(bot_id: str) -> int:
@@ -241,7 +267,33 @@ def open_position(
         # Only one open position per bot / underlying pair at a time.
         return None
 
-    legs_dicts = [asdict(leg) for leg in signal.legs]
+    # The legs as the bot named them, then fitted onto contracts the chain
+    # lists (src/tradeworkz/chain.py): a stock lists no expiration most
+    # weekdays and sits on a $2.50 grid, so a leg built by arithmetic may name
+    # a contract nobody trades. Already-listed legs come back unchanged, and a
+    # fit that would change the trade's shape is refused here.
+    requested_legs = [asdict(leg) for leg in signal.legs]
+    fit = fit_legs_to_chain(conn, signal.underlying, requested_legs)
+    if fit.legs is None:
+        logger.debug(
+            "no listed contract for bot=%s %s: %s %s",
+            signal.bot_id,
+            signal.underlying,
+            fit.reason,
+            fit.detail,
+        )
+        return None
+    legs_dicts = fit.legs
+    if not is_capped_risk(legs_dicts):
+        # Capped-risk structures only: sizing divides the heat budget by the
+        # structure's max loss, and a naked short has none.
+        logger.warning(
+            "refusing uncapped structure for bot=%s %s: %s",
+            signal.bot_id,
+            signal.strategy_type,
+            legs_dicts,
+        )
+        return None
     entry_price = spread_price(conn, legs_dicts, action="open")
     if entry_price is None:
         logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
@@ -296,8 +348,11 @@ def open_position(
     min_hold_until = now + timedelta(seconds=tw_config.MIN_HOLD_SECONDS)
     # Cap the bot's requested time_stop_at at 15:55 ET on the earliest
     # leg expiration so a 0DTE can never time-stop after the options
-    # market shuts. See _cap_time_stop_at_expiration for rationale.
-    capped_time_stop_at = _cap_time_stop_at_expiration(signal.time_stop_at, legs_dicts)
+    # market shuts. See _cap_time_stop_at_expiration for rationale. The cap
+    # reads the expiration the bot ASKED for: when the fit rolled a same-day
+    # leg onto a later listed contract (a stock), the trade still closes at
+    # today's 15:55 — the horizon the bot priced — never later.
+    capped_time_stop_at = _cap_time_stop_for_fit(signal.time_stop_at, requested_legs, legs_dicts)
     payload = dict(signal.components_at_entry)
     payload.update(
         {
@@ -313,6 +368,10 @@ def open_position(
             "origin": "live",
         }
     )
+    if fit.changed:
+        # What the fit moved, e.g. "expiration 2026-11-12->2026-11-14; strike
+        # 183->182.5", so a stock trade's contract is explainable later.
+        payload["contract_fit"] = fit.detail
     # Arm the scale-out ladder (docs/design/tradeworkz-exit-strategy.md).
     # entry_spot / quantity_initial / high_water_mark are always recorded; the
     # three frozen price levels are populated only when the ladder is armable

@@ -167,4 +167,13 @@ def validate_stage(entry: StrategyEntry) -> Optional[str]:
         return f"{entry.id}: stage=superseded without superseded_by"
     if entry.retirement is not None and entry.stage is not Stage.RETIRED:
         return f"{entry.id}: carries a Retirement record but stage={entry.stage.value}"
+    if entry.forward_test:
+        if entry.bot_class is None:
+            return f"{entry.id}: forward_test without a bot binding — nothing can run it"
+        if entry.stage in (Stage.SUPERSEDED, Stage.RETIRED):
+            return f"{entry.id}: forward_test on a {entry.stage.value} strategy"
+        # Without this, clearing the flag later would leave the bot's row
+        # enabled and funded: provision only disables rows it knows shipped.
+        if not entry.provisioned_history:
+            return f"{entry.id}: forward_test needs provisioned_history=True"
     return None

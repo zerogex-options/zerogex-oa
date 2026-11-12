@@ -71,8 +71,10 @@ CONCLUSIVE_AGAINST: Tuple[Verdict, ...] = (Verdict.NO_EDGE,)
 #: of these is what a live capital sleeve rests on: the bot is the thing that
 #: will trade, so a pattern-side measurement of the same thesis — however
 #: strong — does not qualify the bot. ``playbook-calibration`` and
-#: ``thesis-backtest`` are deliberately absent.
-BOT_HARNESSES: Tuple[str, ...] = ("tradeworkz-backtest", "bot-replay")
+#: ``thesis-backtest`` are deliberately absent. ``tradeworkz-live`` is a
+#: forward test's own live paper trades (``make tradeworkz-forward-test``):
+#: the bot, end to end, out of sample — the strongest of the three.
+BOT_HARNESSES: Tuple[str, ...] = ("tradeworkz-backtest", "bot-replay", "tradeworkz-live")
 
 
 class Engine(str, Enum):
@@ -229,6 +231,16 @@ class StrategyEntry:
     #: about the strategy's merit.
     provisioned_history: bool = False
 
+    #: Run this bot forward on paper before it has validated evidence. A
+    #: forward test is how a strategy that history cannot settle (too few
+    #: trades, too short a window) earns evidence: the bot trades live with an
+    #: even paper sleeve, members see it marked as a test, and its own trades
+    #: are the record. The flag IS the switch — the next API start funds and
+    #: enables every flagged bot, and clearing it disables and zeroes the bot
+    #: again. A forward-tested bot ships a ``tw_bots`` row, so it must also
+    #: carry ``provisioned_history`` (``policy.validate_stage`` enforces it).
+    forward_test: bool = False
+
     # ------------------------------------------------------------------
     # Identity resolution
     # ------------------------------------------------------------------
@@ -326,6 +338,28 @@ class StrategyEntry:
         screen, and the audit distinguishes them.
         """
         return self.stage is Stage.VALIDATED and self.bot_class is not None and self.bot_validated
+
+    @property
+    def is_forward_testing(self) -> bool:
+        """Whether this bot runs live on paper as a forward test.
+
+        Needs the flag and a bot to run. A superseded or retired strategy never
+        forward-tests, whatever its flag says: its successor carries the thesis.
+        A strategy that is already provisionable is funded on evidence, not as
+        a test, so it never reads as one.
+        """
+        return (
+            self.forward_test
+            and self.bot_class is not None
+            and self.stage not in (Stage.SUPERSEDED, Stage.RETIRED)
+            and not self.is_provisionable
+        )
+
+    @property
+    def is_live(self) -> bool:
+        """Whether this bot gets an enabled, funded ``tw_bots`` row: funded on
+        validated evidence, or running as a forward test."""
+        return self.is_provisionable or self.is_forward_testing
 
     @property
     def deepest_window_days(self) -> int:

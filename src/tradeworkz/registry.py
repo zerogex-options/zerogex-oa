@@ -21,18 +21,26 @@ Two ids, both preserved forever:
   ``make tradeworkz-backtest --bots <id>`` works with whichever the operator
   has to hand.
 
-Live capital is gated on evidence, not on this module: a bot is provisioned
-with a sleeve only when its catalog entry is ``VALIDATED`` **and** carries a
-bot binding (:attr:`StrategyEntry.is_provisionable`). Everything else is
-disabled in ``tw_bots`` with a zeroed sleeve while it stays in research — it
-remains fully runnable and backtestable, it just risks nothing.
+Two ways onto the live fleet, both decided in the catalog, never here:
+
+* **Validated** — the catalog entry is ``VALIDATED`` with a bot binding and a
+  bot-harness edge (:attr:`StrategyEntry.is_provisionable`). Funded on
+  evidence.
+* **Forward test** — the entry sets ``forward_test`` (see
+  :attr:`StrategyEntry.is_forward_testing`). Funded on paper to *earn*
+  evidence: history too thin to settle the thesis is settled forward, with
+  the bot's own live trades as the record. Members see it, marked as a test.
+
+Everything else is disabled in ``tw_bots`` with a zeroed sleeve while it stays
+in research — it remains fully runnable and backtestable, it just risks
+nothing.
 """
 
 from __future__ import annotations
 
 from typing import Dict, Iterable, Tuple, Type
 
-from src.strategies import Stage, StrategyEntry, all_strategies, bot_bound, by_stage
+from src.strategies import Stage, StrategyEntry, all_strategies, bot_bound, by_stage, find
 from src.tradeworkz.bots.aggressor_flow_divergence import AggressorFlowDivergence
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.bots.bull_momentum_climber import BullMomentumClimber
@@ -121,18 +129,28 @@ NON_CATALOG_STRATEGY_CLASSES: Tuple[str, ...] = ("spec_strategy",)
 # ── Spec projection ────────────────────────────────────────────────────
 
 
+#: Prefix on a forward-testing bot's tagline, so a member reading the card or
+#: the leaderboard knows the bot is earning its record, not showing one. The
+#: API also returns ``forward_test`` for the website to badge on. Promotion to
+#: VALIDATED drops the prefix on the next provision.
+FORWARD_TEST_TAGLINE_PREFIX = "Forward test: "
+
+
 def spec_for(entry: StrategyEntry) -> BotSpec:
     """Project one catalog entry onto the ``tw_bots`` row shape.
 
     ``description`` carries the catalog thesis: the market mechanism, stated
     once, so the bot card and the Backtesting picker cannot disagree about
-    what a strategy claims. ``enabled`` follows the evidence gate, never a
-    hand-set flag.
+    what a strategy claims. ``enabled`` follows the catalog — the evidence
+    gate or an explicit forward test — never a hand-set flag.
     """
     if entry.bot_class is None:
         raise ValueError(f"{entry.id} has no bot binding — cannot build a BotSpec")
     bot_id = entry.bot_id
     assert bot_id is not None  # implied by bot_class, narrows for type checkers
+    tagline = entry.tagline
+    if entry.is_forward_testing:
+        tagline = FORWARD_TEST_TAGLINE_PREFIX + tagline
     return BotSpec(
         id=bot_id,
         display_name=entry.name,
@@ -140,11 +158,11 @@ def spec_for(entry: StrategyEntry) -> BotSpec:
         tier=entry.tier,
         direction_mode=entry.direction_mode,
         universe=entry.universe,
-        tagline=entry.tagline,
+        tagline=tagline,
         description=entry.thesis,
         params=entry.effective_bot_params(),
         is_public=entry.is_public,
-        enabled=entry.is_provisionable,
+        enabled=entry.is_live,
     )
 
 
@@ -158,9 +176,10 @@ ALL_BOT_SPECS: Tuple[BotSpec, ...] = _specs(bot_bound())
 
 #: Bots that HAVE shipped (a ``tw_bots`` row exists) and are no longer
 #: live-eligible — the set the 2026-08-09 shelving created. Preserved under its
-#: original name and meaning; :data:`ALL_BOT_SPECS` is the full roster.
+#: original name and meaning; :data:`ALL_BOT_SPECS` is the full roster. A
+#: forward test is live, so it is not shelved.
 SHELVED_SPECS: Tuple[BotSpec, ...] = _specs(
-    e for e in bot_bound() if e.provisioned_history and not e.is_provisionable
+    e for e in bot_bound() if e.provisioned_history and not e.is_live
 )
 
 #: Bots whose catalog entry is CANDIDATE — a screen shows promise but has not
@@ -172,6 +191,15 @@ CANDIDATE_SPECS: Tuple[BotSpec, ...] = _specs(by_stage(Stage.CANDIDATE))
 #: (``gex_gradient_trend``) has no bot to execute it, which the catalog audit
 #: reports as the highest-value gap to close. Nothing goes live on hope.
 DEFAULT_ROSTER: Tuple[BotSpec, ...] = _specs(e for e in all_strategies() if e.is_provisionable)
+
+#: Bots running live on paper as forward tests (catalog ``forward_test``). Not
+#: validated: they are funded to *earn* evidence. ``provision_defaults`` funds
+#: and enables them alongside :data:`DEFAULT_ROSTER`; the auto-disable circuit
+#: breaker leaves them alone, because stopping a test after twenty trades
+#: defeats running it. Disjoint from DEFAULT_ROSTER by construction.
+FORWARD_TEST_SPECS: Tuple[BotSpec, ...] = _specs(
+    e for e in all_strategies() if e.is_forward_testing
+)
 
 #: Bot ids that must be force-disabled with a zeroed sleeve on provision:
 #: bots that HAVE been provisioned at some point (so a ``tw_bots`` row exists)
@@ -189,7 +217,7 @@ DEFAULT_ROSTER: Tuple[BotSpec, ...] = _specs(e for e in all_strategies() if e.is
 #: ``src/strategies/policy.py``; nothing has reached it. A bot here is simply
 #: not funded yet.
 DISABLED_BOT_IDS: Tuple[str, ...] = tuple(
-    e.bot_id for e in bot_bound() if e.provisioned_history and not e.is_provisionable and e.bot_id
+    e.bot_id for e in bot_bound() if e.provisioned_history and not e.is_live and e.bot_id
 ) + (
     # Legacy symbol-specific variants, collapsed into their parents when the
     # fleet universe went from SPY-only to CSV. No catalog entry; the ids
@@ -236,5 +264,16 @@ def default_roster() -> Iterable[BotSpec]:
 
 
 def candidate_specs() -> Iterable[BotSpec]:
-    """Backtest-gated edge candidates — registered/runnable, NOT provisioned."""
+    """Every CANDIDATE-stage bot. Runnable and backtestable; provisioned only
+    when its catalog entry also sets ``forward_test``."""
     return CANDIDATE_SPECS
+
+
+def forward_test_specs() -> Iterable[BotSpec]:
+    return FORWARD_TEST_SPECS
+
+
+def is_forward_test_bot(bot_id: str) -> bool:
+    """Whether ``bot_id`` (legacy or catalog id) is running as a forward test."""
+    entry = find(bot_id)
+    return bool(entry is not None and entry.is_forward_testing)

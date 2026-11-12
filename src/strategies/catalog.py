@@ -374,6 +374,8 @@ _GAMMA_FLIP: Tuple[StrategyEntry, ...] = (
     ),
     StrategyEntry(
         id="gamma_regime_shift_rider",
+        forward_test=True,
+        provisioned_history=True,
         name="Gamma Regime Shift Rider",
         family=Family.GAMMA_FLIP,
         tier="0DTE",
@@ -414,6 +416,8 @@ _GAMMA_FLIP: Tuple[StrategyEntry, ...] = (
     ),
     StrategyEntry(
         id="dual_flip_dislocation",
+        forward_test=True,
+        provisioned_history=True,
         name="Dual-Flip Dislocation",
         family=Family.GAMMA_FLIP,
         tier="0DTE",
@@ -550,6 +554,8 @@ _PIN: Tuple[StrategyEntry, ...] = (
 _FORCED_FLOW: Tuple[StrategyEntry, ...] = (
     StrategyEntry(
         id="charm_close_magnet",
+        forward_test=True,
+        provisioned_history=True,
         name="Charm Close Magnet",
         family=Family.FORCED_FLOW,
         tier="0DTE",
@@ -592,6 +598,8 @@ _FORCED_FLOW: Tuple[StrategyEntry, ...] = (
     ),
     StrategyEntry(
         id="settlement_flow_snap",
+        forward_test=True,
+        provisioned_history=True,
         name="Settlement Residual Snap",
         family=Family.FORCED_FLOW,
         tier="0DTE",
@@ -636,6 +644,8 @@ _FORCED_FLOW: Tuple[StrategyEntry, ...] = (
     ),
     StrategyEntry(
         id="vanna_vol_crush_rider",
+        forward_test=True,
+        provisioned_history=True,
         name="Vanna Vol-Crush Rider",
         family=Family.FORCED_FLOW,
         tier="0DTE",
@@ -693,6 +703,8 @@ _FORCED_FLOW: Tuple[StrategyEntry, ...] = (
     ),
     StrategyEntry(
         id="weekly_charm_grind",
+        forward_test=True,
+        provisioned_history=True,
         name="Weekly Charm Grind",
         family=Family.FORCED_FLOW,
         tier="1DTE",
@@ -888,6 +900,8 @@ _ORDER_FLOW: Tuple[StrategyEntry, ...] = (
     ),
     StrategyEntry(
         id="climax_flow_fade",
+        forward_test=True,
+        provisioned_history=True,
         name="Climax Flow Fade",
         family=Family.ORDER_FLOW,
         tier="0DTE",
@@ -930,6 +944,8 @@ _ORDER_FLOW: Tuple[StrategyEntry, ...] = (
     ),
     StrategyEntry(
         id="put_capitulation_credit_fade",
+        forward_test=True,
+        provisioned_history=True,
         name="Put Capitulation Credit Fade",
         family=Family.ORDER_FLOW,
         tier="0DTE",
@@ -1235,6 +1251,8 @@ _VOL_REGIME: Tuple[StrategyEntry, ...] = (
 _TREND: Tuple[StrategyEntry, ...] = (
     StrategyEntry(
         id="gex_gradient_trend",
+        forward_test=True,
+        provisioned_history=True,
         name="Asymmetric Gamma Drift",
         family=Family.TREND,
         tier="swing",
@@ -1623,6 +1641,8 @@ _POSITIONING: Tuple[StrategyEntry, ...] = (
 _PROFILE: Tuple[StrategyEntry, ...] = (
     StrategyEntry(
         id="profile_shelf_breaker",
+        forward_test=True,
+        provisioned_history=True,
         name="Gamma Shelf Cascade",
         family=Family.PROFILE,
         tier="0DTE",
@@ -1757,6 +1777,11 @@ def pattern_bound() -> Tuple[StrategyEntry, ...]:
 def provisionable() -> Tuple[StrategyEntry, ...]:
     """Entries eligible for a live capital sleeve: VALIDATED with a bot."""
     return tuple(e for e in STRATEGIES if e.is_provisionable)
+
+
+def forward_tests() -> Tuple[StrategyEntry, ...]:
+    """Entries running live on paper as forward tests (see ``forward_test``)."""
+    return tuple(e for e in STRATEGIES if e.is_forward_testing)
 
 
 def iter_aliases() -> Iterable[Tuple[str, StrategyEntry]]:

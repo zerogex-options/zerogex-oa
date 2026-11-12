@@ -113,6 +113,10 @@ class _FakeBot:
         self.open_called = True
         return None
 
+    # The engine enters through BaseBot.evaluate_open; with no structure
+    # override that is exactly open_criteria.
+    evaluate_open = open_criteria
+
 
 class _FakePos:
     underlying = "SPY"

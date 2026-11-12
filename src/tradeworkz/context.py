@@ -43,7 +43,12 @@ from src.tradeworkz.flow_context import (
     fetch_vix_lookback,
 )
 from src.tradeworkz.gex_stats import fetch_net_gex_pctile, fetch_wall_strength_pctile
-from src.tradeworkz.strikes import default_strike_increment, nearest_strike
+from src.tradeworkz.chain import listed_strike_increment
+from src.tradeworkz.strikes import (
+    configured_strike_increment,
+    default_strike_increment,
+    nearest_strike,
+)
 
 # Fewest prior sessions of ATM IV before a percentile is published. Below this
 # a rank is a coin toss against a handful of days.
@@ -1283,6 +1288,7 @@ def _build_snapshot(
     cash_open, cash_high, cash_low, first_half_hour_close = fetch_cash_session_bars(
         conn, underlying, as_of, open_offset_min=1 if is_cash_index(underlying) else 0
     )
+    strike_increment = _resolve_strike_increment(conn, underlying, float(spot), as_of)
 
     return MarketSnapshot(
         underlying=underlying,
@@ -1314,7 +1320,7 @@ def _build_snapshot(
         vwap_deviation_pct=vwap_deviation,
         vix=vix,
         net_gex_pctile=net_gex_pctile,
-        strike_increment=default_strike_increment(underlying),
+        strike_increment=strike_increment,
         recent_closes=closes,
         trade_bias_code=bias_code,
         trade_bias_trend=bias_trend,
@@ -1380,6 +1386,27 @@ def _build_snapshot(
         cash_low=cash_low,
         first_half_hour_close=first_half_hour_close,
     )
+
+
+def _resolve_strike_increment(
+    conn: Any, underlying: str, spot: float, as_of: Optional[datetime]
+) -> float:
+    """The strike grid bots should build on for ``underlying``.
+
+    An operator's ``TRADEWORKZ_STRIKE_INCREMENTS`` entry wins. Otherwise, live,
+    the grid the chain actually lists near the money — what makes a stock's
+    $2.50 grid come out right with no per-symbol setting. A replay keeps the
+    symbol-type default here (the harness reads the as-of grid itself, once
+    per session), as does any symbol whose chain can't be read.
+    """
+    configured = configured_strike_increment(underlying)
+    if configured:
+        return configured
+    if as_of is None:
+        listed = listed_strike_increment(conn, underlying, spot)
+        if listed:
+            return listed
+    return default_strike_increment(underlying)
 
 
 def _percentile_rank(value: Optional[float], history: list) -> Optional[float]:

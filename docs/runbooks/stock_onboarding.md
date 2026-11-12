@@ -167,11 +167,19 @@ does today.
 
 ```
 SIGNALS_UNDERLYINGS   FORECAST_SYMBOLS   CONE_SYMBOLS   BULLETIN_TWEET_SYMBOLS
-TRADEWORKZ_UNIVERSE   INGEST_FUTURES_INDEXES
+INGEST_FUTURES_INDEXES
 ```
 
-The first five run models that are not built for a single stock yet (see
+The first four run models that are not built for a single stock yet (see
 "Not for NVDA yet"). `INGEST_FUTURES_INDEXES` is for cash indexes only.
+
+**TradeWorkz needs no edit** (since 2026-11-12). With `TRADEWORKZ_UNIVERSE=*`,
+the default, the bots trade every symbol in `ANALYTICS_UNDERLYINGS`, and they
+fit each trade onto a contract the stock's chain lists: a day with no
+expiration rolls to the next one, strikes land on the $2.50 grid
+(`src/tradeworkz/chain.py`). TradeWorkz runs in the API, which reads the list at
+start, so the stock joins the bots at the next API restart. If `.env` still has
+an explicit list there, append the stock to it by hand or set it to `*`.
 
 Read it back before restarting anything:
 

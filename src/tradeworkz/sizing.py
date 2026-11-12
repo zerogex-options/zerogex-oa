@@ -71,6 +71,32 @@ def structure_max_loss_per_share(legs: List[Dict[str, Any]], entry_price: float)
     return max(0.0, -worst_pnl)
 
 
+def is_capped_risk(legs: List[Dict[str, Any]]) -> bool:
+    """Whether every short option in ``legs`` is covered by a long of its right.
+
+    The fleet trades capped-risk structures only (decided 2026-11-12). Far
+    out, a structure's payoff moves one-for-one with spot per uncovered
+    option: above every strike its slope is (long calls - short calls), and
+    below every strike it loses (short puts - long puts) per point of fall.
+    Either negative is a naked short — a loss that runs with the market
+    instead of stopping at a wing — so both counts must hold. Spreads,
+    condors, flies and butterflies pass; a naked put, a short straddle or a
+    risk reversal does not. A leg with an unreadable side or right fails
+    closed.
+    """
+    counts = {("c", "long"): 0, ("c", "short"): 0, ("p", "long"): 0, ("p", "short"): 0}
+    for leg in legs:
+        right = str(leg.get("option_type") or "").strip().lower()[:1]
+        side = str(leg.get("side") or "").strip().lower()
+        if (right, side) not in counts:
+            return False
+        counts[(right, side)] += 1
+    return (
+        counts[("c", "long")] >= counts[("c", "short")]
+        and counts[("p", "long")] >= counts[("p", "short")]
+    )
+
+
 def compute_contracts(
     *,
     capital: BotCapital,

@@ -280,6 +280,10 @@ class _StubBot:
     def open_criteria(self, snap):
         return self._signal
 
+    # Callers enter through BaseBot.evaluate_open (structure overrides);
+    # with no override it is exactly open_criteria.
+    evaluate_open = open_criteria
+
     def _bias_veto(self, snap, direction):
         return self._veto
 

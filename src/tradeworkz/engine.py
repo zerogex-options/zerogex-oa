@@ -16,6 +16,7 @@ bot so a mid-tick crash rolls back cleanly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import asdict
@@ -30,7 +31,12 @@ from src.tradeworkz import ml as ml_mod
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.context import MarketSnapshot, build_snapshot
 from src.tradeworkz.models import BotSpec, OpenPosition
-from src.tradeworkz.registry import get_bot_class, DEFAULT_ROSTER, DISABLED_BOT_IDS
+from src.tradeworkz.registry import (
+    DEFAULT_ROSTER,
+    DISABLED_BOT_IDS,
+    FORWARD_TEST_SPECS,
+    get_bot_class,
+)
 from src.tradeworkz.reconciler import (
     _earliest_leg_expiration,
     close_position,
@@ -77,6 +83,17 @@ def _opens_allowed(now_utc: datetime) -> bool:
     if not is_market_hours(now_utc):
         return False
     return now_utc.astimezone(_ET).time() < _NO_NEW_OPENS_AFTER
+
+
+def params_version(params: Optional[Dict[str, Any]]) -> str:
+    """Short, stable fingerprint of a bot's effective params.
+
+    Every tweak to a bot's catalog params changes it, so each trade records
+    the tuning it ran under and a forward test's results split cleanly by
+    tuning. Key order and JSON round-trips don't change it.
+    """
+    blob = json.dumps(params or {}, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:8]
 
 
 def _force_settle_due(pos: OpenPosition, now_utc: datetime) -> bool:
@@ -295,7 +312,7 @@ def _run_bot(
             # are wound down.
             if not enabled or not opens_allowed:
                 continue
-            signal = bot.open_criteria(snap)
+            signal = bot.evaluate_open(snap)
             if signal is not None and bot._bias_veto(snap, signal.direction):
                 # Fleet-wide gate: drop a signal that fights the fused
                 # trade-bias so no bot trades against the fleet's own read.
@@ -307,6 +324,12 @@ def _run_bot(
                     if signal.components_at_entry
                     else None
                 )
+                # Which tuning this trade ran under, so a tweak's results can
+                # be read apart from the last one's (make tradeworkz-forward-test).
+                signal.components_at_entry = {
+                    **(signal.components_at_entry or {}),
+                    "params_version": params_version(params),
+                }
                 realized_today = daily_realized_pnl(conn, bot_id)
                 pos_id = open_position(
                     conn,
@@ -470,7 +493,10 @@ def calibration_sweep() -> int:
 
 
 def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
-    """Insert the default bot roster + slice fleet capital evenly across them.
+    """Insert the live roster + slice fleet capital evenly across it.
+
+    The live roster is :data:`DEFAULT_ROSTER` (funded on validated evidence)
+    plus :data:`FORWARD_TEST_SPECS` (funded on paper to earn evidence).
 
     Idempotent. Behavior on subsequent runs:
 
@@ -480,14 +506,21 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
       ``tagline``, ``description``, and ``params`` re-synced from the
       current roster — the operator's source of truth is the roster
       module, not stale DB rows from a prior release. ``enabled`` is
-      deliberately NOT re-synced, so a runtime auto-disable (the
-      governance circuit breaker) or a manual disable survives a
-      redeploy; re-enable a bot explicitly to bring it back.
+      deliberately NOT re-synced by that upsert, so a runtime auto-disable
+      (the governance circuit breaker) or a manual disable of a VALIDATED
+      bot survives a redeploy; re-enable it explicitly to bring it back.
+    * Forward-test bots are the exception: the catalog's ``forward_test``
+      flag is their on/off switch, so they are set ``enabled=true`` here on
+      every provision (the circuit breaker never disables them — see
+      ``ml.apply_auto_disable_guard``). To stop one, clear its flag.
+    * A live roster bot whose sleeve is fully zeroed (never funded, or
+      zeroed while it sat in :data:`DISABLED_BOT_IDS`) is refunded to the
+      even slice, or it could never size a trade.
     * Bot ids listed in :data:`DISABLED_BOT_IDS` are flipped to
       ``enabled=false`` and their sleeve is zeroed so the freed capital
       shows up in the next admin-triggered rebalance. That list is every
-      bot whose catalog entry is not yet VALIDATED — a provisioning
-      state, not the catalog's terminal RETIRED stage.
+      bot that shipped and is no longer live — a provisioning state, not
+      the catalog's terminal RETIRED stage.
     * ``starting_capital`` is re-synced to ``FLEET_CAPITAL / N`` for
       every active roster bot so shrinking or growing the roster keeps
       the total sleeve pot at ``FLEET_CAPITAL``. ``current_capital`` /
@@ -496,13 +529,16 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
       fresh baseline.
     """
     fleet = tw_config.FLEET_CAPITAL if fleet_capital is None else float(fleet_capital)
-    # DEFAULT_ROSTER is empty while no catalog strategy is both VALIDATED
-    # and bot-bound (src/strategies): the seed / re-sync loop below then
-    # no-ops (an empty active_ids matches no rows) and only the
-    # DISABLED_BOT_IDS step runs — so an unfunded fleet still gets disabled +
-    # zeroed on the next provision instead of being skipped by an early
-    # return.
+    # Either half can be empty — DEFAULT_ROSTER is empty while no catalog
+    # strategy is both VALIDATED and bot-screened — and with both empty the
+    # seed / re-sync loop below no-ops (an empty active_ids matches no rows)
+    # and only the DISABLED_BOT_IDS step runs, so an unfunded fleet still gets
+    # disabled + zeroed on the next provision instead of being skipped by an
+    # early return.
     roster = list(DEFAULT_ROSTER)
+    validated_ids = {spec.id for spec in roster}
+    forward_ids = [spec.id for spec in FORWARD_TEST_SPECS if spec.id not in validated_ids]
+    roster += [spec for spec in FORWARD_TEST_SPECS if spec.id not in validated_ids]
     slice_amount = round(fleet / len(roster), 2) if roster else 0.0
     now = datetime.now(timezone.utc)
 
@@ -568,11 +604,25 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
             ),
         )
 
+    active_ids = [spec.id for spec in roster]
+    # A live bot with a fully zeroed sleeve can't size a trade: either its
+    # capital row predates the roster (the insert above is DO NOTHING, so it
+    # kept the zeros) or it was zeroed while disabled and has now come back.
+    # Runs BEFORE the starting_capital re-sync below, which would otherwise
+    # make the sleeve look funded and leave current_capital at zero.
+    cur.execute(
+        """
+        UPDATE tw_bot_capital
+           SET starting_capital = %s, current_capital = %s,
+               peak_capital = %s, updated_at = %s
+         WHERE bot_id = ANY(%s) AND starting_capital = 0 AND current_capital = 0
+        """,
+        (slice_amount, slice_amount, slice_amount, now, active_ids),
+    )
     # Re-sync starting_capital for every active roster bot to the fresh
     # even split. Keeps the sleeve pot equal to FLEET_CAPITAL when the
     # roster changes size between releases. current_capital / peak
     # are left alone so running P&L history is not lost.
-    active_ids = [spec.id for spec in roster]
     cur.execute(
         """
         UPDATE tw_bot_capital
@@ -581,6 +631,18 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
         """,
         (slice_amount, now, active_ids, slice_amount),
     )
+    # Forward tests run while the catalog flags them — that flag is the
+    # switch, so a row left disabled (hand-inserted for a trial, or disabled
+    # before the flag was set) comes back on here.
+    if forward_ids:
+        cur.execute(
+            """
+            UPDATE tw_bots
+               SET enabled = TRUE, updated_at = %s
+             WHERE id = ANY(%s) AND enabled IS NOT TRUE
+            """,
+            (now, forward_ids),
+        )
 
     # Retire bots that used to be in the roster but no longer belong.
     # Flip enabled=false + zero the sleeve so their capital is no longer

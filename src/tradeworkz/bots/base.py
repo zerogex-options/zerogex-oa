@@ -412,6 +412,28 @@ class BaseBot:
         """Return a signal if the bot wants to open (or add). Default: no-op."""
         return None
 
+    def evaluate_open(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
+        """The bot's entry for this tick, in the structure its params ask for.
+
+        Every caller (live engine, research harness, product bot replay, the
+        admin diagnosis) goes through here rather than ``open_criteria``, so a
+        ``params['structure_override']`` trades identically everywhere. With
+        no override — every bot today — this is exactly ``open_criteria``.
+        See :mod:`src.tradeworkz.structures`.
+        """
+        signal = self.open_criteria(snap)
+        if signal is None:
+            return None
+        kind = str(self.params.get("structure_override") or "").strip().lower()
+        from src.tradeworkz.structures import NATIVE, reexpress
+
+        if kind in NATIVE:
+            return signal
+        out = reexpress(self, snap, signal, kind)
+        if out is None:
+            return self._skip(f"structure_unfit:{kind}")
+        return out
+
     def exit_criteria(self, snap: MarketSnapshot, position: OpenPosition) -> ExitDecision:
         """Default exit policy — target / stop / time-stop. Subclasses can extend.
 

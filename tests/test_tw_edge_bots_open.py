@@ -12,7 +12,8 @@ close-charm flow, and the gamma-restoring Pin Strike. The tests build a
 * it stands down when its regime / data preconditions are absent.
 
 Plus a registry invariant: the candidates are registered and runnable but NOT
-live (empty DEFAULT_ROSTER, not retired) — they promote only via the backtest.
+validated (empty DEFAULT_ROSTER, not retired) — funded on evidence only via a
+bot-harness screen, or on paper as an explicit catalog forward test.
 
 All timestamps are ET→UTC for July (EDT, UTC-4).
 """
@@ -308,7 +309,7 @@ def test_gamma_regime_shift_requires_flow_agreement():
 
 
 def test_candidates_are_registered_but_not_live():
-    assert DEFAULT_ROSTER == (), "candidates must never enter the live roster on merge"
+    assert DEFAULT_ROSTER == (), "candidates must never enter the validated roster on merge"
     active_ids = {s.id for s in DEFAULT_ROSTER}
     for spec in CANDIDATE_SPECS:
         # runnable / backtestable

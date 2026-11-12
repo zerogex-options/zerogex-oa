@@ -63,15 +63,17 @@ from src.market_calendar import is_market_hours
 from src.signals.execution import leg_fill_price
 from src.tradeworkz import config as tw_config
 from src.tradeworkz.bots import base as bot_base
+from src.tradeworkz.chain import fit_legs_to_chain, listed_strike_increment
 from src.tradeworkz.context import build_snapshot
 from src.tradeworkz.models import BotSpec, OpenPosition
 from src.tradeworkz.pricing import _leg_intrinsic, _underlying_from_option_symbol
 from src.tradeworkz.reconciler import (
-    _cap_time_stop_at_expiration,
+    _cap_time_stop_for_fit,
     _earliest_leg_expiration,
 )
 from src.tradeworkz.registry import get_bot_class, known_specs
-from src.tradeworkz.sizing import structure_max_loss_per_share
+from src.tradeworkz.sizing import is_capped_risk, structure_max_loss_per_share
+from src.tradeworkz.strikes import configured_strike_increment
 
 logger = logging.getLogger(__name__)
 
@@ -416,14 +418,25 @@ class _BotRunner:
         # Scaling is OFF (ladder never armed), so should_cut is ignored by design.
 
     def _maybe_open(self, conn: Any, u: str, snap: Any, now_utc: datetime) -> None:
-        signal = self.bot.open_criteria(snap)
+        signal = self.bot.evaluate_open(snap)
         if signal is None:
             return
         self.signals += 1
         if self.bot._bias_veto(snap, signal.direction):
             self.vetoed += 1
             return
-        legs = [asdict(leg) for leg in signal.legs]
+        # Same contract fit as the live open path, read as of ``now_utc``:
+        # a stock's same-day leg rolls to its next listed expiration and its
+        # strikes land on the listed grid, or the trade is refused.
+        requested = [asdict(leg) for leg in signal.legs]
+        fit = fit_legs_to_chain(conn, signal.underlying, requested, as_of=now_utc)
+        if fit.legs is None:
+            self._entry_reject(f"no_listed_contract:{fit.reason}")
+            return
+        legs = fit.legs
+        if not is_capped_risk(legs):
+            self._entry_reject("uncapped_risk")
+            return
         entry_net = historical_spread_price(
             conn,
             legs,
@@ -450,17 +463,30 @@ class _BotRunner:
         else:
             self._entry_reject("zero_net")
             return
-        self.open_by_underlying[u] = self._make_position(signal, legs, entry_net, snap, now_utc)
+        self.open_by_underlying[u] = self._make_position(
+            signal, legs, entry_net, snap, now_utc, requested_legs=requested
+        )
 
     def _entry_reject(self, reason: str) -> None:
         self.entry_rejects[reason] = self.entry_rejects.get(reason, 0) + 1
 
     def _make_position(
-        self, signal: Any, legs: List[Dict[str, Any]], entry_net: float, snap: Any, at: datetime
+        self,
+        signal: Any,
+        legs: List[Dict[str, Any]],
+        entry_net: float,
+        snap: Any,
+        at: datetime,
+        requested_legs: Optional[List[Dict[str, Any]]] = None,
     ) -> OpenPosition:
-        """Build the in-memory position. Ladder fields stay NULL → scaling OFF."""
+        """Build the in-memory position. Ladder fields stay NULL → scaling OFF.
+
+        The time stop is capped on the expiration the bot asked for (live
+        parity: reconciler.open_position), so a rolled stock contract still
+        closes the day the bot meant.
+        """
         min_hold_until = at + timedelta(seconds=tw_config.MIN_HOLD_SECONDS)
-        capped_ts = _cap_time_stop_at_expiration(signal.time_stop_at, legs)
+        capped_ts = _cap_time_stop_for_fit(signal.time_stop_at, requested_legs or legs, legs)
         return OpenPosition(
             id=-1,
             bot_id=self.spec.id,
@@ -796,6 +822,10 @@ def run_fleet_backtest(
     )
 
     priced_steps = 0
+    # The listed strike grid per (underlying, session), read once a session
+    # from the as-of chain — the live snapshot reads it every tick, which a
+    # replay can't afford. Without it a stock replays on the $1 default grid.
+    grids: Dict[Tuple[str, date], Optional[float]] = {}
     bot_base.set_backtest_clock(lambda: _CLOCK["now"])
     try:
         for i, t in enumerate(steps):
@@ -806,6 +836,14 @@ def run_fleet_backtest(
             # share locks on the live tables for its whole duration.
             conn.rollback()
             snaps = {u: build_snapshot(conn, u, as_of=t) for u in needed}
+            for u, snap in snaps.items():
+                if snap is None or configured_strike_increment(u):
+                    continue
+                key = (u, t.astimezone(_ET).date())
+                if key not in grids:
+                    grids[key] = listed_strike_increment(conn, u, snap.spot, as_of=t)
+                if grids[key]:
+                    snap.strike_increment = grids[key]
             if any(v is not None for v in snaps.values()):
                 priced_steps += 1
             opens_ok = _opens_allowed(t, no_new_opens_after)

@@ -98,6 +98,7 @@ def _catalog_fields(bot_id: str, strategy_class: str) -> Dict[str, Any]:
             "family_label": None,
             "backtestable": False,
             "provisionable": False,
+            "forward_test": False,
             "in_catalog": False,
             "is_user_deployed": strategy_class == "spec_strategy",
         }
@@ -108,9 +109,21 @@ def _catalog_fields(bot_id: str, strategy_class: str) -> Dict[str, Any]:
         "family_label": FAMILY_LABELS[entry.family],
         "backtestable": entry.backtestable,
         "provisionable": entry.is_provisionable,
+        # Running live on paper to earn its record, not funded on one. The
+        # tagline also carries a "Forward test:" prefix so members see it
+        # before the website badges on this field.
+        "forward_test": entry.is_forward_testing,
         "in_catalog": True,
         "is_user_deployed": False,
     }
+
+
+def _is_forward_test(bot_id: str) -> bool:
+    """Whether a ``tw_bots`` row is running as a catalog forward test."""
+    from src.strategies import find
+
+    entry = find(bot_id)
+    return bool(entry is not None and entry.is_forward_testing)
 
 
 def _rows_affected(command_tag: Any) -> int:
@@ -401,6 +414,7 @@ async def leaderboard(
                 "display_name": r["display_name"],
                 "tier": r["tier"],
                 "tagline": r["tagline"],
+                "forward_test": _is_forward_test(r["id"]),
                 "trades": trades,
                 "wins": wins,
                 "win_rate": (wins / trades) if trades else None,
@@ -1757,7 +1771,7 @@ async def admin_diagnose() -> Dict[str, Any]:
                 report["size_multiplier"] = bot.size_multiplier()
 
                 try:
-                    signal = bot.open_criteria(snap)
+                    signal = bot.evaluate_open(snap)
                 except Exception as exc:  # noqa: BLE001
                     report["decision"] = "error"
                     report["error"] = f"{type(exc).__name__}: {exc}"

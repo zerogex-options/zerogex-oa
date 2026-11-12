@@ -4612,6 +4612,11 @@ tradeworkz-backtest: ## Replay bots over history to screen for entry edge (args:
 	@echo "$(BLUE)=== TradeWorkz backtest (research screen: 1 contract, scaling OFF, ML neutral) ===$(NC)"
 	@$(VENV_PYTHON) -m src.tradeworkz.backtest $(ARGS)
 
+.PHONY: tradeworkz-forward-test
+tradeworkz-forward-test: ## Score the forward-test bots' live paper trades against the promotion bar, split by symbol / structure / tuning (args: ARGS="--since 2026-11-13 --bots id1,id2 --json")
+	@echo "$(BLUE)=== TradeWorkz forward tests (live paper trades, read-only) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tradeworkz.forward_test $(ARGS)
+
 .PHONY: strategy-catalog-audit
 strategy-catalog-audit: ## Audit the strategy catalog: bindings, stages, evidence depth, retirement eligibility (args: ARGS="--json --family wall")
 	@echo "$(BLUE)=== Strategy catalog audit (source of truth for all three surfaces) ===$(NC)"
