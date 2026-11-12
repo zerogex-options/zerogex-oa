@@ -730,6 +730,53 @@ async def bot_metrics(
     return {"bot_id": bot_id, "metrics": [dict(r) for r in rows]}
 
 
+# Members' trade audit: what the fleet holds now and every trade it closed,
+# live engine entries only. The /trading-signals "Trade audit" panel reads
+# these. It used to read /admin/positions and /admin/trades, which need the
+# admin token the website never sends, so the panel showed "HTTP 403" to every
+# member and to the admin. Those admin routes keep their gate and still serve
+# seeder rows; these two never do, whatever origin a caller asks for.
+
+
+@router.get("/positions")
+async def fleet_positions(db: DatabaseManager = Depends(get_db)) -> Dict[str, Any]:
+    """Every open position the fleet holds, live engine entries only."""
+    return await _fleet_positions(db, live_only=True)
+
+
+@router.get("/trades")
+async def fleet_trades(
+    bot_id: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(
+        default=None,
+        description="ISO-8601 timestamp; only trades closed on/after this.",
+    ),
+    until: Optional[str] = Query(
+        default=None,
+        description="ISO-8601 timestamp; only trades closed before this.",
+    ),
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Every closed trade, live engine entries only, newest first.
+
+    The filters, paging, summary and CSV of ``/admin/trades``, except
+    ``origin``: it is always ``live``, so seeder rows never reach a member.
+    """
+    return await _fleet_trades(
+        db,
+        origin="live",
+        bot_id=bot_id,
+        since=since,
+        until=until,
+        limit=limit,
+        offset=offset,
+        format=format,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Follower endpoints
 # ---------------------------------------------------------------------------
@@ -1103,8 +1150,22 @@ async def admin_positions(
     fleet — a fleet has at most tens of concurrent positions in
     practice, so paging isn't needed.
     """
+    return await _fleet_positions(db, live_only=False)
+
+
+async def _fleet_positions(db: DatabaseManager, *, live_only: bool) -> Dict[str, Any]:
+    """Open positions for ``/admin/positions`` (all) and ``/positions`` (live).
+
+    A row whose ``components_at_entry`` has no ``origin`` predates the
+    stamping change and counts as live, as in :func:`_fleet_trades`.
+    """
+    where_sql = (
+        "WHERE (p.components_at_entry ->> 'origin') IS DISTINCT FROM 'simulate'"
+        if live_only
+        else ""
+    )
     async with db.pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT p.id, p.bot_id, b.display_name AS bot_display_name,
                    p.underlying, p.opened_at, p.updated_at, p.direction,
                    p.strategy_type, p.legs, p.entry_price, p.current_price,
@@ -1115,6 +1176,7 @@ async def admin_positions(
                    p.components_at_entry
             FROM tw_positions p
             LEFT JOIN tw_bots b ON b.id = p.bot_id
+            {where_sql}
             ORDER BY p.opened_at DESC
             """)
 
@@ -1219,6 +1281,30 @@ async def admin_trades(
     useful for "does the total P&L in the audit view match the
     leaderboard NAV?" sanity checks.
     """
+    return await _fleet_trades(
+        db,
+        origin=origin,
+        bot_id=bot_id,
+        since=since,
+        until=until,
+        limit=limit,
+        offset=offset,
+        format=format,
+    )
+
+
+async def _fleet_trades(
+    db: DatabaseManager,
+    *,
+    origin: str,
+    bot_id: Optional[str],
+    since: Optional[str],
+    until: Optional[str],
+    limit: int,
+    offset: int,
+    format: str,
+):
+    """Closed trades for ``/admin/trades`` (any origin) and ``/trades`` (live)."""
     from fastapi.responses import PlainTextResponse
 
     where: List[str] = []
