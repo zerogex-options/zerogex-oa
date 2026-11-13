@@ -75,6 +75,11 @@ This is the question that gates funding. The pattern measured PF 2.80 on 33
 QQQ trades over 60 days. Run the bot's own screen over the same window and
 compare:
 
+> **Since 2026-11-13 the bot's catalog `bot_params` set `dte_target: 2`** for
+> its live forward test (production keeps only the nearest 3 expirations, so
+> its 5-weekday contract never exists live). For a like-for-like comparison
+> with the pattern's ~5-day expiries, drop that override for the screen.
+
 ```bash
 # The bot, through the bot harness.
 make tradeworkz-backtest ARGS="--bots gex_gradient_trend --days 60 --interval-min 5"

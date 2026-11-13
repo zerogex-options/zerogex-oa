@@ -1311,6 +1311,15 @@ _TREND: Tuple[StrategyEntry, ...] = (
             # effective asymmetry and is a SEPARATE hypothesis about the
             # positive-gamma side, screened on its own (see the bot).
             "undamp_long_gamma": False,
+            # Forward test (2026-11-13): 2 weekdays out, not the pattern's 5.
+            # Production ingests each symbol's nearest 3 expirations
+            # (INGEST_EXPIRATIONS=3), and this bot only fires where the
+            # signals engine runs (SPY/SPX/QQQ/NDX), which list daily — so a
+            # 5-weekday contract never exists live and the bot could not open
+            # at all. 2 is the furthest expiration ingestion keeps. The
+            # pattern's measured edge is on ~5-day expiries; this measures the
+            # 2-day version. Drop this override to screen like for like.
+            "dte_target": 2,
         },
         research=(
             ResearchRun(
