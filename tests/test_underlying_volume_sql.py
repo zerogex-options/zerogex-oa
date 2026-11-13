@@ -224,4 +224,8 @@ def test_the_response_model_allows_an_absent_split():
     fields = FlowBuyingPressurePoint.model_fields
     assert not fields["buy_pct"].is_required()
     assert not fields["period_buy_pct"].is_required()
-    assert fields["volume"].is_required(), "the total is measured, not inferred"
+    # The total too. It was required on the view that it is always measured,
+    # but a cash index's bars carry none and a stock minute's can be unknown,
+    # and one such bar 500'd the whole response. Unknown is null, never 0:
+    # see tests/test_flow_buying_pressure_unknown_volume.py.
+    assert not fields["volume"].is_required()

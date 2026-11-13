@@ -10192,6 +10192,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             limit_param="$2",
             extra_filter=session_filter,
         )
+        # Each bucket's point is its newest row that HAS a max pain. The engine
+        # stores NULL there on purpose when no contract in its snapshot carries
+        # open interest (AnalyticsEngine._calculate_max_pain), and
+        # MaxPainTimeseriesPoint requires a value, so one such row as the newest
+        # in its bucket failed the whole response with a 500. The filter sits
+        # inside ``ranked``, before ROW_NUMBER, so that bucket falls back to its
+        # previous reading; a bucket with no reading at all has no point. Do not
+        # pass the NULL through instead: the Max Pain page turns it into 0 and
+        # would plot max pain at $0. ``latest`` and the bucket floor are left
+        # alone: they read only the timestamp, from the index.
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -10213,7 +10223,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
                 FROM gex_summary
                 WHERE underlying = $1
-                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds){session_filter}
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    AND max_pain IS NOT NULL{session_filter}
             )
             SELECT bucket_ts AS timestamp, symbol, max_pain
             FROM ranked

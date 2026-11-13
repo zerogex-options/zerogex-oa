@@ -1036,9 +1036,15 @@ class FlowBuyingPressurePoint(BaseModel):
     # Optional because the uptick/downtick split is a feed CAPABILITY, not a
     # reading: ThetaData cannot classify equity volume at all. Required here,
     # these fields would force the query to invent a value -- and the value
-    # it invented was a permanent, confident "50%, Neutral". `volume` stays
-    # required: the total is measured independently of the classification.
-    volume: int
+    # it invented was a permanent, confident "50%, Neutral".
+    #
+    # `volume` is Optional for the same reason. It was required on the view
+    # that the total is always measured, and it is not: a cash index has no
+    # share volume of its own (ThetaData's index bars carry none, and ES / NQ
+    # requests are answered from SPX / NDX), and a stock minute whose running
+    # total stepped backwards is stored as unknown. One such bar in the window
+    # failed the whole response with a 500. NULL here means unknown, never 0.
+    volume: Optional[int] = None
     buy_pct: Optional[Decimal] = None
     period_buy_pct: Optional[Decimal] = None
     price_chg: Optional[Decimal] = None

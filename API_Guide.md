@@ -1082,6 +1082,12 @@ already what the envelope grades, so `freshness.source_timestamp` and
 ### GET /api/flow/buying-pressure
 Underlying buying/selling pressure.
 
+`volume` is the bar's total volume, or `null` when it is unknown: a cash index
+(SPX, NDX, and ES / NQ, which are answered from them) has no share volume of its
+own, and a minute whose volume the feed could not establish is stored as
+unknown. `buy_pct` and `period_buy_pct` are `null` when the feed cannot split
+upticks from downticks, and `momentum` then reads `⚪ No Tick Data`.
+
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `limit` (optional): `1`–`500`, default `20`
@@ -1377,6 +1383,11 @@ Scope: `maxpain` (the `analytics` tier).
 
 ### GET /api/max-pain/timeseries
 Get max pain over time (aggregated by timeframe).
+
+Each point is the newest reading in its bucket that has a max pain, so
+`max_pain` is never null. The engine stores no max pain for a minute when no
+contract in its snapshot carries open interest; such a bucket falls back to its
+previous reading, and a bucket with no reading at all has no point.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
