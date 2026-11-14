@@ -57,7 +57,7 @@ def _scorecard_payload(**overrides):
         },
         "regime": {
             "timestamp": datetime(2026, 6, 29, 20, 0, tzinfo=timezone.utc),
-            "composite_score": -0.28,
+            "composite_score": 78.0,
             "normalized_score": -28.0,
             "direction": "bearish",
         },
@@ -80,7 +80,7 @@ def test_daily_scorecard_returns_full_payload(monkeypatch: pytest.MonkeyPatch):
     assert body["is_empty"] is False
     assert body["cards"]["total"] == 12
     assert body["cards"]["first_card_permalink"] == "/cards/4221"
-    assert body["regime"]["label"] == "short gamma"  # composite -0.28 → short
+    assert body["regime"]["label"] == "short gamma"  # MSI 78 → short gamma
     # tweet_text wording must be deterministic enough for the cron job to
     # post verbatim without further templating.
     tweet = body["tweet_text"]
@@ -155,11 +155,14 @@ def test_daily_scorecard_empty_day_returns_quiet_tweet(monkeypatch: pytest.Monke
 
 
 def test_daily_scorecard_regime_label_from_composite_score(monkeypatch: pytest.MonkeyPatch):
-    """The composite is the 0-100 Market State Index (neutral 50): strongly
-    high → long gamma, near 50 → transition, strongly low → short gamma.
+    """The composite is the 0-100 Market State Index (neutral 50). It runs
+    HIGH when dealers are short gamma (net_gex_sign is tanh(-net_gex/scale)
+    and the top band is "trend_expansion"), so strongly high → short gamma,
+    near 50 → transition, strongly low → long gamma.
 
     Regression for the units bug that (comparing the raw 0-100 value against
-    ±0.15) made this ALWAYS return "long gamma"."""
+    ±0.15) made this ALWAYS return "long gamma", and for the inverted mapping
+    that then labeled trend days "long gamma"."""
     app, dbmod = _build_app(monkeypatch)
 
     def _label_for(composite: float) -> str:
@@ -173,9 +176,9 @@ def test_daily_scorecard_regime_label_from_composite_score(monkeypatch: pytest.M
             r = client.get("/api/scorecard/daily?date=2026-06-29")
         return r.json()["regime"]["label"]
 
-    assert _label_for(78.0) == "long gamma"     # strongly positive lean
-    assert _label_for(52.0) == "transition"     # near neutral 50
-    assert _label_for(30.0) == "short gamma"     # the bug made this impossible
+    assert _label_for(78.0) == "short gamma"  # trend_expansion band
+    assert _label_for(52.0) == "transition"  # near neutral 50
+    assert _label_for(30.0) == "long gamma"  # compression side
 
 
 def test_daily_scorecard_rejects_invalid_date(monkeypatch: pytest.MonkeyPatch):

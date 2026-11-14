@@ -110,14 +110,21 @@ def _label_regime(reg: dict[str, Any] | None) -> str:
     # ``composite_score`` is the 0-100 Market State Index (neutral 50); map it
     # to a signed -1..+1 lean before thresholding.  Comparing the raw 0-100
     # value against ±0.15 made this ALWAYS return "long gamma" (the composite
-    # is never below 0.15).  Positive lean = long-gamma stabilizing, negative
-    # = short-gamma destabilizing.
+    # is never below 0.15).
+    #
+    # The MSI runs HIGH when dealers are short gamma: its net_gex_sign
+    # component is tanh(-net_gex / scale), so negative net GEX pushes the
+    # composite up, and the engine names the top band (>= 70)
+    # "trend_expansion" and the bottom band compression.  So a positive lean
+    # is short gamma (moves amplified) and a negative lean is long gamma
+    # (moves damped).  This mapping was once inverted, and the 16:15 tweet
+    # called trend days "long gamma".
     if isinstance(composite, (int, float)):
         lean = (float(composite) - 50.0) / 50.0
         if lean > 0.15:
-            return "long gamma"
-        if lean < -0.15:
             return "short gamma"
+        if lean < -0.15:
+            return "long gamma"
         return "transition"
     if "bull" in direction:
         return "long gamma"

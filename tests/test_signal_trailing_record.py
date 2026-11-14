@@ -151,8 +151,9 @@ def test_sessions_lists_newest_first_with_regime_and_cards(monkeypatch: pytest.M
     assert body["symbol"] == "QQQ"
     assert body["count"] == 2
     assert [s["date"] for s in body["sessions"]] == ["2026-09-11", "2026-09-10"]
-    assert body["sessions"][0]["regime"] == "long gamma"
-    assert body["sessions"][1]["regime"] == "short gamma"
+    # MSI 70 is the trend_expansion band (short gamma); 20 is compression.
+    assert body["sessions"][0]["regime"] == "short gamma"
+    assert body["sessions"][1]["regime"] == "long gamma"
     # A quiet session still gets a card; 0 calls is information, not absence.
     assert body["sessions"][1]["cards"] == 0
 
