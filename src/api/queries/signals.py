@@ -2197,6 +2197,8 @@ class SignalsQueriesMixin:
                     """
                     SELECT projected_low, projected_high, pin_strike, regime,
                            open_spot, receipt_ts,
+                           pin_tolerance, regime_move_threshold,
+                           raw_projected_low, raw_projected_high, raw_pin_strike,
                            implied_move, expected_vol_state, flip_cross_prob,
                            level_touch_probs, gamma_flip, call_wall, put_wall,
                            forecast_inputs
