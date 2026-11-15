@@ -66,37 +66,45 @@ else
     exit 1
 fi
 
-# Check if TimescaleDB extension exists (RDS must have it enabled)
-log "  → Checking for TimescaleDB extension..."
-if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT 1 FROM pg_extension WHERE extname = 'timescaledb';" | grep -q 1; then
-    log "     ✓ TimescaleDB extension already enabled"
+# The engine box (docs/runbooks/engine_box_split.md) never changes the shared
+# database's schema. The web box applies it, with make schema-apply's lock
+# guards, before services restart; a plain psql -f here during a session could
+# queue behind a long transaction and freeze ingestion and the API with it.
+if [ -e /etc/zerogex/engine-box ]; then
+    log "  → Engine box: the schema is applied from the web box (make schema-apply); skipping it here"
 else
-    log "     ℹ TimescaleDB extension not found, attempting to enable..."
-    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;" 2>&1 | tee /tmp/timescale_output.log; then
-        log "     ✓ TimescaleDB extension enabled"
+    # Check if TimescaleDB extension exists (RDS must have it enabled)
+    log "  → Checking for TimescaleDB extension..."
+    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT 1 FROM pg_extension WHERE extname = 'timescaledb';" | grep -q 1; then
+        log "     ✓ TimescaleDB extension already enabled"
     else
-        log "     ⚠ Could not enable TimescaleDB extension"
-        log "     This is normal if your RDS instance doesn't have TimescaleDB installed."
-        log "     ZeroGEX will still work, but without TimescaleDB optimizations."
-        log "     To enable TimescaleDB on RDS, see: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_TimescaleDB.html"
+        log "     ℹ TimescaleDB extension not found, attempting to enable..."
+        if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;" 2>&1 | tee /tmp/timescale_output.log; then
+            log "     ✓ TimescaleDB extension enabled"
+        else
+            log "     ⚠ Could not enable TimescaleDB extension"
+            log "     This is normal if your RDS instance doesn't have TimescaleDB installed."
+            log "     ZeroGEX will still work, but without TimescaleDB optimizations."
+            log "     To enable TimescaleDB on RDS, see: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_TimescaleDB.html"
+        fi
     fi
-fi
 
-# Apply database schema
-log "  → Applying database schema..."
-APP_DIR="$HOME/zerogex-oa"
-SCHEMA_FILE="$APP_DIR/setup/database/schema.sql"
+    # Apply database schema
+    log "  → Applying database schema..."
+    APP_DIR="$HOME/zerogex-oa"
+    SCHEMA_FILE="$APP_DIR/setup/database/schema.sql"
 
-if [ -f "$SCHEMA_FILE" ]; then
-    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$SCHEMA_FILE"; then
-        log "     ✓ Database schema applied successfully!"
+    if [ -f "$SCHEMA_FILE" ]; then
+        if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$SCHEMA_FILE"; then
+            log "     ✓ Database schema applied successfully!"
+        else
+            log "     ✗ Failed to apply schema"
+            exit 1
+        fi
     else
-        log "     ✗ Failed to apply schema"
+        log "     ✗ Schema file not found: $SCHEMA_FILE"
         exit 1
     fi
-else
-    log "     ✗ Schema file not found: $SCHEMA_FILE"
-    exit 1
 fi
 
 # Verify schema was applied

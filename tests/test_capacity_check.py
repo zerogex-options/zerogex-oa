@@ -6,6 +6,7 @@ logger's format string where it is not (the ThetaData failures), so a reworded
 log line fails here instead of quietly reading as zero.
 """
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -702,3 +703,46 @@ def test_the_report_shows_cores_drift_option_age_and_database_load():
     # A baseline saved before these fields existed still renders and compares.
     old = _healthy()
     cc.render(r, cc.evaluate(r, baseline=old), baseline=old)
+
+
+# ── engine split (docs/runbooks/engine_box_split.md) ────────────────────────
+
+
+def test_the_box_role_comes_from_the_engine_split_markers(tmp_path):
+    assert cc.box_role(tmp_path) == {"engines_here": True, "api_here": True}
+    (tmp_path / "engines.disabled").write_text("x")
+    assert cc.box_role(tmp_path) == {"engines_here": False, "api_here": True}
+    (tmp_path / "engine-box").write_text("x")
+    assert cc.box_role(tmp_path) == {"engines_here": False, "api_here": False}
+    (tmp_path / "engines.disabled").unlink()
+    assert cc.box_role(tmp_path) == {"engines_here": True, "api_here": False}
+
+
+def test_which_units_run_on_each_box():
+    one_box = {"engines_here": True, "api_here": True}
+    web_box = {"engines_here": False, "api_here": True}
+    engine_box = {"engines_here": True, "api_here": False}
+    for unit in ("zerogex-oa-ingestion", "zerogex-oa-analytics", "zerogex-oa-signals"):
+        assert cc.runs_here(unit, one_box) and cc.runs_here(unit, engine_box)
+        assert not cc.runs_here(unit, web_box)
+    assert cc.runs_here("zerogex-oa-api", web_box) and cc.runs_here("zerogex-oa-api", one_box)
+    assert not cc.runs_here("zerogex-oa-api", engine_box)
+
+
+def test_the_api_is_timed_locally_only_where_it_runs():
+    engine_box = {"engines_here": True, "api_here": False}
+    assert cc.api_probe_base({"engines_here": True, "api_here": True}, None) == cc.LOCAL_API_BASE
+    assert cc.api_probe_base(engine_box, None) is None
+    assert cc.api_probe_base(engine_box, "  http://10.0.1.10:8000/ ") == "http://10.0.1.10:8000"
+
+
+def test_a_unit_on_the_other_box_is_not_reported_as_down():
+    report = _healthy(api={"path": "/x", "skipped": "the API runs on the web box"})
+    report["units"].append(
+        {"unit": "zerogex-oa-api", "present": False, "on_this_box": False, "limits_drift": []}
+    )
+    gates = cc.evaluate(report)
+    assert _levels(gates) == []
+    text = cc.render(report, gates)
+    assert re.search(r"zerogex-oa-api\s+runs on the other box", text)
+    assert "API /x: skipped (the API runs on the web box)" in text

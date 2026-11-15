@@ -3,7 +3,10 @@
 Run it on the production box during the regular session: once before a stock
 is added (the baseline), and again on the first full session after it
 (``--baseline <that file>``). Every run is saved, so the second run prints the
-change next to each number.
+change next to each number. Once the engines run on their own box
+(docs/runbooks/engine_box_split.md), run it there: that is where a symbol
+lands. The API is then on the web box, so its timing is skipped unless
+CAPACITY_CHECK_API_BASE points at it.
 
 It only reads. Per service: the cgroup's memory against its cap, its OOM
 kills, its CPU against its quota, and each worker process's private memory,
@@ -65,6 +68,21 @@ JOURNAL_UNITS = (
     "zerogex-oa-signals",
     "zerogex-oa-api",
 )
+
+#: The engine split (docs/runbooks/engine_box_split.md) puts the engines on a
+#: box of their own. deploy/engine_box.sh leaves two markers here that say what
+#: a box runs; with neither, one box runs everything, as before the split.
+MARKER_DIR = Path("/etc/zerogex")
+ENGINE_UNITS = frozenset(
+    {
+        "zerogex-oa-ingestion",
+        "zerogex-oa-analytics",
+        "zerogex-oa-signals",
+        "zerogex-oa-thetaterminal",
+    }
+)
+API_UNIT = "zerogex-oa-api"
+LOCAL_API_BASE = "http://127.0.0.1:8000"
 
 SCHEMA_VERSION = 1
 
@@ -398,6 +416,43 @@ class UnitReading:
     per_symbol_cores: Optional[float] = None
     #: Where the running limits differ from setup/systemd/<unit>.service.
     limits_drift: List[str] = field(default_factory=list)
+    #: False when the unit runs on the other box by design (the engine split),
+    #: so its absence here is not a fault.
+    on_this_box: bool = True
+
+
+def _marker(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:  # unreadable marker directory: read as no marker
+        return False
+
+
+def box_role(marker_dir: Path = MARKER_DIR) -> Dict[str, bool]:
+    """Which halves of the system run on this box, from the engine-split markers:
+    ``engines.disabled`` (the engines run on another box) and ``engine-box``
+    (this is the engine box, so the API runs on the web box)."""
+    return {
+        "engines_here": not _marker(marker_dir / "engines.disabled"),
+        "api_here": not _marker(marker_dir / "engine-box"),
+    }
+
+
+def runs_here(unit: str, role: Dict[str, bool]) -> bool:
+    if unit == API_UNIT:
+        return role.get("api_here", True)
+    if unit in ENGINE_UNITS:
+        return role.get("engines_here", True)
+    return True
+
+
+def api_probe_base(role: Dict[str, bool], configured: Optional[str]) -> Optional[str]:
+    """Where to time the API from, or None to skip it. CAPACITY_CHECK_API_BASE
+    wins; otherwise the local API, where this box runs one."""
+    base = (configured or "").strip().rstrip("/")
+    if base:
+        return base
+    return LOCAL_API_BASE if role.get("api_here", True) else None
 
 
 def read_unit_memory(
@@ -718,7 +773,7 @@ class ActivitySampler(threading.Thread):
 
 
 def time_api(
-    path: str, key: Optional[str], tries: int = 5, base: str = "http://127.0.0.1:8000"
+    path: str, key: Optional[str], tries: int = 5, base: str = LOCAL_API_BASE
 ) -> Dict[str, Any]:
     """Wall time of a few sequential reads of one hot endpoint, the way the
     website's server reads it for a customer."""
@@ -1232,7 +1287,8 @@ def render(
     )
     for u in report["units"]:
         if not u.get("present"):
-            add(f"  {u['unit']:<26}  not running")
+            where = "not running" if u.get("on_this_box", True) else "runs on the other box"
+            add(f"  {u['unit']:<26}  {where}")
             continue
         prior = base_units.get(u["unit"], {})
         plus = f"~{u['per_symbol_mb']:,.0f} MB" if u.get("per_symbol_mb") else ""
@@ -1454,9 +1510,12 @@ def collect(args: argparse.Namespace) -> Dict[str, Any]:
         "analytics_symbols": analytics,
         "listed_symbols": [s for s in ingest if asset_class(s) in ("ETF", "STOCK")],
     }
+    role = box_role()
+    report["box_role"] = role
 
     units = [read_unit_memory(u) for u in PER_SYMBOL_UNITS + OTHER_UNITS]
     for reading in units:
+        reading.on_this_box = runs_here(reading.unit, role)
         if reading.unit == "zerogex-oa-ingestion":
             reading.symbols = len(ingest)
         elif reading.unit == "zerogex-oa-analytics":
@@ -1514,7 +1573,7 @@ def collect(args: argparse.Namespace) -> Dict[str, Any]:
     report["cadence_seconds"] = args.cadence_seconds
     report["box"] = read_box()
 
-    journals = {u: read_journal(u, since, now) for u in JOURNAL_UNITS}
+    journals = {u: read_journal(u, since, now) for u in JOURNAL_UNITS if runs_here(u, role)}
     report["journal_levels"] = {
         u: count_levels(lines) for u, lines in journals.items() if lines is not None
     }
@@ -1533,9 +1592,18 @@ def collect(args: argparse.Namespace) -> Dict[str, Any]:
         report["database"] = {"error": f"{type(e).__name__}: {e}"}
 
     if args.api_tries > 0:
-        report["api"] = time_api(
-            f"/api/gex/summary?symbol={args.api_symbol}", os.getenv("OPS_API_KEY"), args.api_tries
-        )
+        api_path = f"/api/gex/summary?symbol={args.api_symbol}"
+        api_base = api_probe_base(role, os.getenv("CAPACITY_CHECK_API_BASE"))
+        if api_base is None:
+            report["api"] = {
+                "path": api_path,
+                "skipped": "the API runs on the web box; run the check there, or set "
+                "CAPACITY_CHECK_API_BASE to time it from here",
+            }
+        else:
+            report["api"] = time_api(
+                api_path, os.getenv("OPS_API_KEY"), args.api_tries, base=api_base
+            )
 
     instance = args.rds_instance or rds_instance_from_host(os.getenv("DB_HOST"))
     if instance:

@@ -64,6 +64,10 @@ class _Harness:
         self.state_dir = tmp_path / "state"
         self.alert_log = tmp_path / "alerts.log"
         self.alert_script = tmp_path / "fake-alert.sh"
+        # Engine-split markers, under tmp so a host's real /etc/zerogex never
+        # leaks in; absent unless a test creates them.
+        self.engines_disabled = tmp_path / "engines.disabled"
+        self.engine_box = tmp_path / "engine-box"
 
         _write_exec(self.bindir / "systemctl", _FAKE_SYSTEMCTL)
         _write_exec(self.bindir / "curl", _FAKE_CURL)
@@ -81,14 +85,16 @@ class _Harness:
     def mute_file(self, unit: str) -> Path:
         return self.state_dir / f"{unit}.mute"
 
-    def run(self, *, api_ok: bool) -> None:
+    def run(self, *, api_ok: bool, services: str = "zerogex-oa-api") -> None:
         env = dict(os.environ)
         env["PATH"] = f"{self.bindir}:{env['PATH']}"
         env["FAKE_UNIT_STATE_DIR"] = str(self.unit_state)
         env["FAKE_API_OK"] = "1" if api_ok else "0"
         env["ALERT_LOG"] = str(self.alert_log)
         env["ALERT_SCRIPT"] = str(self.alert_script)
-        env["LIVENESS_SERVICES"] = "zerogex-oa-api"
+        env["LIVENESS_SERVICES"] = services
+        env["LIVENESS_ENGINES_DISABLED_FILE"] = str(self.engines_disabled)
+        env["LIVENESS_ENGINE_BOX_FILE"] = str(self.engine_box)
         env["LIVENESS_API_UNIT"] = "zerogex-oa-api"
         env["LIVENESS_API_URL"] = "http://127.0.0.1:8000/api/health/live"
         env["LIVENESS_STATE_DIR"] = str(self.state_dir)
@@ -179,3 +185,61 @@ def test_mute_script_writes_future_expiry(tmp_path):
     mute = state / "zerogex-oa-api.mute"
     assert mute.exists()
     assert int(mute.read_text().strip()) > int(time.time()) + 300
+
+
+# ── engine split (docs/runbooks/engine_box_split.md) ────────────────────────
+
+ALL_FOUR = "zerogex-oa-ingestion zerogex-oa-analytics zerogex-oa-signals zerogex-oa-api"
+
+
+def test_without_markers_every_listed_unit_is_watched(harness):
+    harness.set_unit("zerogex-oa-api", active=True)
+    harness.run(api_ok=True, services=ALL_FOUR)
+    assert sorted(a.split("\t")[0] for a in harness.alerts()) == [
+        "zerogex-oa-analytics",
+        "zerogex-oa-ingestion",
+        "zerogex-oa-signals",
+    ]
+
+
+def test_the_web_box_does_not_page_for_engines_it_handed_off(harness):
+    harness.engines_disabled.write_text("x")
+    harness.set_unit("zerogex-oa-api", active=False)
+    harness.run(api_ok=False, services=ALL_FOUR)
+    alerts = harness.alerts()
+    assert [a.split("\t")[0] for a in alerts] == ["zerogex-oa-api"]
+
+
+def test_the_engine_box_does_not_page_for_the_api(harness):
+    harness.engine_box.write_text("x")
+    for unit in ALL_FOUR.split()[:3]:
+        harness.set_unit(unit, active=True)
+    harness.run(api_ok=False, services=ALL_FOUR)
+    assert harness.alerts() == []
+    harness.set_unit("zerogex-oa-ingestion", active=False)
+    harness.run(api_ok=False, services=ALL_FOUR)
+    assert [a.split("\t")[0] for a in harness.alerts()] == ["zerogex-oa-ingestion"]
+
+
+def test_a_prepared_engine_box_is_silent_until_takeover_then_watches(harness):
+    harness.engine_box.write_text("x")
+    harness.engines_disabled.write_text("x")
+    harness.run(api_ok=False, services=ALL_FOUR)
+    assert harness.alerts() == []
+    # Takeover removes engines.disabled; a down engine pages on its first check.
+    harness.engines_disabled.unlink()
+    harness.run(api_ok=False, services="zerogex-oa-ingestion")
+    assert [a.split("\t")[0] for a in harness.alerts()] == ["zerogex-oa-ingestion"]
+
+
+def test_a_skipped_unit_forgets_its_state(harness):
+    harness.set_unit("zerogex-oa-ingestion", active=False)
+    harness.run(api_ok=True, services="zerogex-oa-ingestion")
+    assert len(harness.alerts()) == 1
+    harness.engines_disabled.write_text("x")
+    harness.run(api_ok=True, services="zerogex-oa-ingestion")
+    assert not (harness.state_dir / "zerogex-oa-ingestion.state").exists()
+    # Handed back while still down: it pages again rather than staying quiet.
+    harness.engines_disabled.unlink()
+    harness.run(api_ok=True, services="zerogex-oa-ingestion")
+    assert len(harness.alerts()) == 2

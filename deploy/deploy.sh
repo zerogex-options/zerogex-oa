@@ -187,6 +187,20 @@ elif [ -x "$PREFLIGHT_SCRIPT" ]; then
     log ""
 fi
 
+# The engine box (docs/runbooks/engine_box_split.md) gets the base system only.
+# The API, nginx, TLS and the scheduled jobs belong to the web box, and the
+# engine units are installed and switched on by deploy/engine_box.sh, never by
+# a deploy step. Running the rest here would start a second API (and with it a
+# second TradeWorkz scheduler) and a second copy of every scheduled job.
+ENGINE_BOX_MARKER="/etc/zerogex/engine-box"
+ENGINE_BOX_STEPS="010 015 020 030 040 050"
+if [ -e "$ENGINE_BOX_MARKER" ]; then
+    log "=========================================="
+    log "Engine box ($ENGINE_BOX_MARKER): running the base system steps only ($ENGINE_BOX_STEPS)."
+    log "The engine units are managed by deploy/engine_box.sh (make engine-status)."
+    log ""
+fi
+
 # Flag to track if we should start executing
 SHOULD_EXECUTE=false
 if [ -z "$START_FROM" ]; then
@@ -216,6 +230,16 @@ for step_script in "$STEPS_DIR"/*.* ; do
         if [ "$SHOULD_EXECUTE" = false ]; then
             log "Skipping: $step_name"
             continue
+        fi
+
+        if [ -e "$ENGINE_BOX_MARKER" ]; then
+            case " $ENGINE_BOX_STEPS " in
+                *" ${step_name%%.*} "*) ;;
+                *)
+                    log "Skipping: $step_name (not run on the engine box)"
+                    continue
+                    ;;
+            esac
         fi
 
         log "=========================================="

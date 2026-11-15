@@ -36,6 +36,18 @@ SERVICES=(
     "zerogex-oa-wall-alerts"
 )
 
+# On the web box after the engine split (docs/runbooks/engine_box_split.md),
+# /etc/zerogex/engines.disabled says every service above runs on the engine
+# box. Their unit files are still installed here, so handing the engines back
+# (make engine-takeover) has them, but they are not enabled or started. The
+# scheduled jobs further down do belong here and are installed as usual.
+ENGINES_OFF=0
+if [ -e /etc/zerogex/engines.disabled ]; then
+    ENGINES_OFF=1
+    log "  ℹ /etc/zerogex/engines.disabled: the engines run on the engine box."
+    log "    Installing their unit files, but leaving them off on this box."
+fi
+
 # Copy systemd service files
 log "  → Copying systemd service files..."
 for service in "${SERVICES[@]}"; do
@@ -54,6 +66,7 @@ sudo systemctl daemon-reload
 # Enable services
 log "  → Enabling services to start on boot..."
 for service in "${SERVICES[@]}"; do
+    [ "$ENGINES_OFF" = 1 ] && continue
     if [ -f "$SYSTEMD_TARGET/${service}.service" ]; then
         log "     • Enabling ${service}..."
         sudo systemctl enable "${service}"
@@ -63,6 +76,7 @@ done
 # Start services
 log "  → Starting services..."
 for service in "${SERVICES[@]}"; do
+    [ "$ENGINES_OFF" = 1 ] && continue
     if [ -f "$SYSTEMD_TARGET/${service}.service" ]; then
         # Check if service is already running
         if sudo systemctl is-active --quiet "${service}"; then
@@ -232,6 +246,7 @@ log ""
 log "  → Service Status Check:"
 log ""
 for service in "${SERVICES[@]}"; do
+    [ "$ENGINES_OFF" = 1 ] && continue
     if [ -f "$SYSTEMD_TARGET/${service}.service" ]; then
         log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         log "  Service: ${service}"
@@ -251,6 +266,7 @@ log "  ✓ Systemd daemon reloaded"
 # Check which services are actually running
 RUNNING_COUNT=0
 for service in "${SERVICES[@]}"; do
+    [ "$ENGINES_OFF" = 1 ] && continue
     if sudo systemctl is-active --quiet "${service}"; then
         log "  ✓ ${service} is running"
         ((++RUNNING_COUNT))
@@ -276,6 +292,8 @@ log "  • sudo systemctl status zerogex-oa-ingestion"
 log "  • sudo journalctl -u zerogex-oa-ingestion -f"
 log ""
 
-if [ "$RUNNING_COUNT" -lt "${#SERVICES[@]}" ]; then
+if [ "$ENGINES_OFF" = 1 ]; then
+    log "ℹ Engines left off here (/etc/zerogex/engines.disabled); they run on the engine box."
+elif [ "$RUNNING_COUNT" -lt "${#SERVICES[@]}" ]; then
     log "⚠ Warning: Not all services are running. Check logs for details."
 fi

@@ -48,6 +48,16 @@ STATE_DIR="${LIVENESS_STATE_DIR:-${HOME}/monitoring/liveness}"
 ALERT_SCRIPT="${ALERT_SCRIPT:-${SELF_DIR}/zerogex-alert.sh}"
 CURL_MAX_TIME="${LIVENESS_CURL_MAX_TIME:-5}"
 
+# Engine split (docs/runbooks/engine_box_split.md). Units that do not run on
+# this box by design are skipped, not reported down: the engines where
+# /etc/zerogex/engines.disabled says they run on another box, and the API on
+# the engine box (/etc/zerogex/engine-box). With neither marker every unit in
+# SERVICES is watched, as before. The engine box's own watchdog covers its
+# engines, and the web box's covers the API.
+ENGINES_DISABLED_FILE="${LIVENESS_ENGINES_DISABLED_FILE:-/etc/zerogex/engines.disabled}"
+ENGINE_BOX_FILE="${LIVENESS_ENGINE_BOX_FILE:-/etc/zerogex/engine-box}"
+ENGINE_UNITS="${LIVENESS_ENGINE_UNITS:-zerogex-oa-thetaterminal zerogex-oa-ingestion zerogex-oa-analytics zerogex-oa-signals zerogex-oa-wall-alerts zerogex-oa-backtest-worker}"
+
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # --- Helpers ---------------------------------------------------------------
@@ -82,12 +92,33 @@ verdict() {
     printf 'up'
 }
 
+# Whether <unit> does not run on this box by design (see the engine split note
+# at the top).
+not_on_this_box() {
+    local svc="$1"
+    if [ -e "$ENGINES_DISABLED_FILE" ]; then
+        case " $ENGINE_UNITS " in
+            *" $svc "*) return 0 ;;
+        esac
+    fi
+    [ -e "$ENGINE_BOX_FILE" ] && [ "$svc" = "$API_UNIT" ] && return 0
+    return 1
+}
+
 # --- Main ------------------------------------------------------------------
 now_epoch="$(date +%s)"
 for svc in $SERVICES; do
-    now="$(verdict "$svc")"
     state_file="${STATE_DIR}/${svc}.state"
     mute_file="${STATE_DIR}/${svc}.mute"
+
+    # Forget its state too, so if the unit comes back to this box later
+    # (an engine takeover) a down unit pages on its first check.
+    if not_on_this_box "$svc"; then
+        rm -f "$state_file" "$mute_file" 2>/dev/null || true
+        continue
+    fi
+
+    now="$(verdict "$svc")"
 
     # Operator maintenance mute (written by zerogex-liveness-mute.sh from
     # `make <svc>-stop` / `-restart`): while it is live, record the unit as

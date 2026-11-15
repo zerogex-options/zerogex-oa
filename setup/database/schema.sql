@@ -3981,3 +3981,19 @@ END $$;
 -- and the fan-out fail against the old shape. Existing rules stay NULL: on
 -- every day, as they always were.
 ALTER TABLE wall_alert_rules ADD COLUMN IF NOT EXISTS expires_on DATE;
+
+-- Engine handoff record (deploy/engine_box.sh, docs/runbooks/engine_box_split.md).
+-- The engines (ThetaData terminal, ingestion, analytics, signals, wall alerts,
+-- backtest worker) must run on exactly one box: ThetaData keeps one session
+-- per account. `make engine-release` appends 'released' with the units it
+-- stopped; `make engine-takeover` refuses unless the newest row is a
+-- 'released' (or its own box already holds them), then appends 'took_over'.
+-- A few rows per move, so nothing prunes it.
+CREATE TABLE IF NOT EXISTS engine_box_handoffs (
+    id      BIGSERIAL PRIMARY KEY,
+    at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    host    TEXT NOT NULL,
+    address TEXT,
+    action  TEXT NOT NULL CHECK (action IN ('released', 'took_over')),
+    units   TEXT
+);

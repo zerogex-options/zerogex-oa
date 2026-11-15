@@ -44,10 +44,21 @@ SIGNALS_SERVICE = zerogex-oa-signals
 # their health gates); managed with the wall-alerts-* targets instead.
 WALL_ALERTS_SERVICE = zerogex-oa-wall-alerts
 
+# Engine split (docs/runbooks/engine_box_split.md). Two marker files say what
+# this box runs, and with neither (one box) every list below is as it was:
+#   /etc/zerogex/engines.disabled  the engines run on another box, so the bulk
+#                                  targets leave ingestion/analytics/signals out
+#   /etc/zerogex/engine-box        this is the engine box, so they leave the API out
+# deploy/engine_box.sh sets and clears them (make engine-status shows them).
+ENGINES_DISABLED_MARKER = /etc/zerogex/engines.disabled
+ENGINE_BOX_MARKER = /etc/zerogex/engine-box
+ENGINES_HERE = $(if $(wildcard $(ENGINES_DISABLED_MARKER)),,yes)
+API_HERE = $(if $(wildcard $(ENGINE_BOX_MARKER)),,yes)
+
 # Bulk-service ordering. Data flows ingestion → analytics → signals → api,
 # so start in that order and stop in reverse (matches db-maintain-managed).
-SERVICES_START_ORDER = $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE) $(API_SERVICE)
-SERVICES_STOP_ORDER  = $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE)
+SERVICES_START_ORDER = $(strip $(if $(ENGINES_HERE),$(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE)) $(if $(API_HERE),$(API_SERVICE)))
+SERVICES_STOP_ORDER  = $(strip $(if $(API_HERE),$(API_SERVICE)) $(if $(ENGINES_HERE),$(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE)))
 
 # Liveness watchdog maintenance mute. The *-stop / *-restart targets (and
 # services-stop / services-restart) drop a per-unit mute here via this helper
@@ -1668,6 +1679,10 @@ services-restart-one-by-one: ## Restart each service in turn (ingestion → anal
 
 .PHONY: services-restart-ingest-analytics
 services-restart-ingest-analytics: ## Restart only ingestion then analytics, health-checking each: all a new symbol in INGEST_/ANALYTICS_UNDERLYINGS needs. The API and signals keep serving.
+	@if [ -e "$(ENGINES_DISABLED_MARKER)" ]; then \
+		echo "$(RED)✖ The engines run on the engine box, not here ($(ENGINES_DISABLED_MARKER)). Run this there.$(NC)"; \
+		exit 1; \
+	fi
 	@$(MAKE) --no-print-directory services-restart-one-by-one \
 		SERVICES_START_ORDER="$(INGESTION_SERVICE) $(ANALYTICS_SERVICE)"
 
@@ -1709,14 +1724,10 @@ services-status: ## One-line active/inactive status for all 4 services
 
 .PHONY: services-health
 services-health: ## Full health check (status, uptime, memory, errors, warnings) for all 4 services
-	@$(MAKE) --no-print-directory ingestion-health
-	@echo ""
-	@$(MAKE) --no-print-directory analytics-health
-	@echo ""
-	@$(MAKE) --no-print-directory signals-health
-	@echo ""
-	@$(MAKE) --no-print-directory api-health
-	@echo ""
+	@for svc in $(SERVICES_START_ORDER); do \
+		$(MAKE) --no-print-directory $${svc#zerogex-oa-}-health; \
+		echo ""; \
+	done
 	@echo "$(BLUE)=== Health Summary ===$(NC)"
 	@echo "  $(GREEN)✔ green$(NC)=healthy  $(YELLOW)✔ yellow$(NC)=warnings  $(ORANGE)✔ orange$(NC)=errors  $(RED)✖ red$(NC)=down"
 	@echo "  ------------------------------------------------------------"
@@ -3478,10 +3489,15 @@ pull: ## git pull --ff-only + make schema-apply (use after pulling new commits)
 	@echo "$(BLUE)=== Pulling latest from origin ===$(NC)"
 	@git pull --ff-only
 	@echo ""
-	@$(MAKE) --no-print-directory schema-apply
+	@if [ -e "$(ENGINE_BOX_MARKER)" ]; then \
+		echo "$(YELLOW)Engine box: the schema is applied from the web box (make pull there first), so not here.$(NC)"; \
+	else \
+		$(MAKE) --no-print-directory schema-apply; \
+	fi
 	@echo ""
-	@echo "$(YELLOW)Note: if files under src/ changed in this pull, restart the affected services:$(NC)"
-	@echo "  sudo systemctl restart $(API_SERVICE) $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE)"
+	@echo "$(YELLOW)Note: if files under src/ changed in this pull, restart the affected services on this box:$(NC)"
+	@echo "  sudo systemctl restart $(SERVICES_STOP_ORDER)"
+	@$(if $(ENGINES_HERE),true,echo "  (the engines run on the engine box: make pull there too, then make services-restart there)")
 
 .PHONY: schema-verify
 schema-verify: ## Verify schema components exist
@@ -4382,12 +4398,16 @@ db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with
 	@echo "$(GREEN)✅ Full maintenance complete$(NC)"
 	@$(MAKE) db-size
 
+# After the engine split the timer runs on the web box, so this stops and
+# restarts only the API there (SERVICES_*_ORDER leave the engines out). The
+# engines stay up on the engine box: at 02:30 ET on a Sunday every one of them
+# is idle (their run window is weekdays, and futures reopen at 18:00).
 .PHONY: db-maintain-managed
 db-maintain-managed: ## Stop services → run db-maintain → restart services (used by zerogex-oa-db-vacuum-full.timer)
 	@echo "$(BLUE)=== Managed Full DB Maintenance ===$(NC)"
-	@trap 'echo "$(YELLOW)→ Restarting services...$(NC)"; sudo systemctl start zerogex-oa-ingestion zerogex-oa-analytics zerogex-oa-signals zerogex-oa-api' EXIT; \
+	@trap 'echo "$(YELLOW)→ Restarting services...$(NC)"; sudo systemctl start $(SERVICES_START_ORDER)' EXIT; \
 	echo "$(YELLOW)→ Stopping services for VACUUM FULL...$(NC)"; \
-	sudo systemctl stop zerogex-oa-api zerogex-oa-signals zerogex-oa-analytics zerogex-oa-ingestion; \
+	sudo systemctl stop $(SERVICES_STOP_ORDER); \
 	$(MAKE) db-maintain
 	@echo "$(GREEN)✅ Managed maintenance complete$(NC)"
 
@@ -6459,7 +6479,11 @@ liveness-watch-test: ## Run the watchdog once now (against live services) and sh
 .PHONY: api-health-assert
 api-health-assert: ## Assert API is active AND serving /api/health/live — exit 1 if not (post-restart/deploy gate)
 	@echo "$(BLUE)=== Asserting API health ===$(NC)"
-	@if ! systemctl is-active --quiet $(API_SERVICE); then \
+	@if [ -e "$(ENGINE_BOX_MARKER)" ]; then \
+		echo "$(GREEN)✔ Engine box: the API runs on the web box, so there is nothing to assert here$(NC)"; \
+		exit 0; \
+	fi; \
+	if ! systemctl is-active --quiet $(API_SERVICE); then \
 		echo "$(RED)✖ $(API_SERVICE) is NOT active — the restart/deploy left it down$(NC)"; \
 		echo "  Inspect: sudo systemctl status $(API_SERVICE) --no-pager -l"; \
 		exit 1; \
@@ -6472,6 +6496,31 @@ api-health-assert: ## Assert API is active AND serving /api/health/live — exit
 		echo "  Inspect: sudo journalctl -u $(API_SERVICE) -n 50 --no-pager"; \
 		exit 1; \
 	fi
+
+# =============================================================================
+# Engine box: the engines on a box of their own (docs/runbooks/engine_box_split.md)
+# =============================================================================
+# The engines are the ThetaData terminal, ingestion, analytics, signals, wall
+# alerts and the backtest worker. ThetaData keeps one session per account, so
+# they run on exactly one box; these move them without ever running them on two.
+# Each acts only with CONFIRM=yes, and prints its plan without it.
+ENGINE_BOX_SCRIPT = deploy/engine_box.sh
+
+.PHONY: engine-status
+engine-status: ## What this box runs (engines, API, scheduled jobs), the handoff record, and anything unsafe. Read-only
+	@bash $(ENGINE_BOX_SCRIPT) status
+
+.PHONY: engine-prepare
+engine-prepare: ## On a NEW engine box: mark it, install the base system and the engine units WITHOUT starting them. CONFIRM=yes [SKIP_DEPLOY=1]
+	@bash $(ENGINE_BOX_SCRIPT) prepare $(if $(filter yes,$(CONFIRM)),--confirm) $(if $(filter 1 yes,$(SKIP_DEPLOY)),--skip-deploy)
+
+.PHONY: engine-release
+engine-release: ## Switch the engines OFF on this box (stop, disable, guard) so the other box can take them. CONFIRM=yes
+	@bash $(ENGINE_BOX_SCRIPT) release $(if $(filter yes,$(CONFIRM)),--confirm)
+
+.PHONY: engine-takeover
+engine-takeover: ## Switch the engines ON here, after engine-release on the other box. CONFIRM=yes [FORCE=yes only if that box is dead]
+	@bash $(ENGINE_BOX_SCRIPT) takeover $(if $(filter yes,$(CONFIRM)),--confirm) $(if $(filter yes,$(FORCE)),--force)
 
 # =============================================================================
 # Wall alerts — members' Call/Put Wall hit / break / hold alerts

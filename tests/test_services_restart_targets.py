@@ -15,6 +15,7 @@ restarting production services on the host where the suite also runs.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 MAKEFILE = Path(__file__).resolve().parents[1] / "Makefile"
@@ -81,3 +82,84 @@ def test_a_new_symbol_restarts_only_ingestion_then_analytics():
         r'SERVICES_START_ORDER="\$\(INGESTION_SERVICE\) \$\(ANALYTICS_SERVICE\)"', recipe
     )
     assert "API_SERVICE" not in recipe and "SIGNALS_SERVICE" not in recipe
+
+
+# ── engine split (docs/runbooks/engine_box_split.md) ────────────────────────
+# Two markers in /etc/zerogex say what a box runs. The bulk targets act only on
+# the services that run on this box: a habitual make services-restart on the web
+# box must not try to start the engines, and the engine box has no API to gate.
+
+
+ENGINES = ["zerogex-oa-ingestion", "zerogex-oa-analytics", "zerogex-oa-signals"]
+API = "zerogex-oa-api"
+
+
+def _lists(tmp_path, *, engines_disabled=False, engine_box=False):
+    """SERVICES_START_ORDER / _STOP_ORDER as make expands them. ``make -n``
+    prints the expanded echo instead of running anything."""
+    disabled = tmp_path / "engines.disabled"
+    box = tmp_path / "engine-box"
+    for path, present in ((disabled, engines_disabled), (box, engine_box)):
+        if present:
+            path.write_text("x")
+        elif path.exists():
+            path.unlink()
+    out = subprocess.run(
+        [
+            "make",
+            "-s",
+            "-n",
+            "-C",
+            str(MAKEFILE.parent),
+            "--eval=zz-lists: ; @echo"
+            " START=[$(SERVICES_START_ORDER)] STOP=[$(SERVICES_STOP_ORDER)]",
+            "zz-lists",
+            f"ENGINES_DISABLED_MARKER={disabled}",
+            f"ENGINE_BOX_MARKER={box}",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    start = re.search(r"START=\[(.*?)\]", out).group(1).split()
+    stop = re.search(r"STOP=\[(.*?)\]", out).group(1).split()
+    return start, stop
+
+
+def test_one_box_keeps_all_four_services(tmp_path):
+    assert _lists(tmp_path) == (ENGINES + [API], [API] + ENGINES[::-1])
+
+
+def test_the_web_box_leaves_the_engines_out(tmp_path):
+    assert _lists(tmp_path, engines_disabled=True) == ([API], [API])
+
+
+def test_the_engine_box_leaves_the_api_out(tmp_path):
+    assert _lists(tmp_path, engine_box=True) == (ENGINES, ENGINES[::-1])
+    assert _lists(tmp_path, engines_disabled=True, engine_box=True) == ([], [])
+
+
+def test_weekly_vacuum_stops_and_restarts_only_this_boxs_services():
+    recipe = _recipe("db-maintain-managed")
+    assert "systemctl stop $(SERVICES_STOP_ORDER)" in recipe
+    assert "systemctl start $(SERVICES_START_ORDER)" in recipe
+    assert not re.search(r"systemctl (stop|start) zerogex-oa-", recipe)
+
+
+def test_a_new_symbols_restart_refuses_where_the_engines_do_not_run():
+    recipe = _recipe("services-restart-ingest-analytics")
+    assert recipe.index("ENGINES_DISABLED_MARKER") < recipe.index("services-restart-one-by-one")
+    assert "exit 1" in recipe
+
+
+def test_the_api_gate_passes_on_the_engine_box_before_checking_systemd():
+    recipe = _recipe("api-health-assert")
+    assert recipe.index("ENGINE_BOX_MARKER") < recipe.index("systemctl is-active")
+    assert "services-health" in _recipe("services-restart-stop-all-first")
+    assert "$(SERVICES_START_ORDER)" in _recipe("services-health")
+
+
+def test_make_pull_leaves_the_schema_to_the_web_box():
+    recipe = _recipe("pull")
+    assert recipe.index("git pull --ff-only") < recipe.index("ENGINE_BOX_MARKER")
+    assert recipe.index("ENGINE_BOX_MARKER") < recipe.index("schema-apply")

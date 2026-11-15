@@ -135,6 +135,17 @@ which shows the change first and needs `CONFIRM=yes` to make it.
 
 ## For each stock
 
+> **Once the engines run on their own box** (`engine_box_split.md`), each step
+> below says "the box" for one of two: `make stock-env-add` runs on the web
+> box, whose `.env` is the one you edit, then copy `.env` to the engine box
+> (the one-line copy in `engine_box_split.md`, "After the move").
+> `make services-restart-ingest-analytics`, the wall-alerts restart, the
+> journal check and `make capacity-check` run on the engine box; an API
+> restart runs on the web box; `make symbols-list` and the one-off max-pain
+> refresh only read and write the database, so either box. The gates are unchanged,
+> except that the capacity check's API line is skipped on the engine box and
+> its database CPU now comes from CloudWatch.
+
 The steps for MSFT. For the others, change the ticker.
 
 ### Evening (after 16:15 ET), or before 09:00 ET

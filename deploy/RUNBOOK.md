@@ -7,6 +7,25 @@ compromise, or recovery from a catastrophic failure.
 **Estimated duration**: 25–40 min total. ~5–10 min of API downtime during
 the EIP cutover (Phase 2).
 
+> **Read first: ThetaData allows one session per account (since the
+> 2026-10-19 cutover).** Phase 1 below runs a full `./deploy/deploy.sh` on the
+> new instance while the live one is still serving, and its step 100 starts
+> ingestion. A second ingestion anywhere logs in to ThetaData and knocks the
+> live one off the feed, and the two keep knocking each other off. This
+> runbook predates that. Until it is rewritten:
+>
+> - **To move the engines** (terminal, ingestion, analytics, signals, wall
+>   alerts, backtest worker) to another box, use
+>   [`docs/runbooks/engine_box_split.md`](../docs/runbooks/engine_box_split.md)
+>   and `make engine-release` / `make engine-takeover`, never this.
+> - **To replace the web box** (website + API) after the engine split, mark the
+>   new instance before deploying, so step 100 installs the engine units but
+>   leaves them off:
+>   `sudo install -d -m 0755 /etc/zerogex && echo "engines run on the engine box" | sudo tee /etc/zerogex/engines.disabled`
+> - **Before the split, on the one box,** run Phase 1 only on a Saturday, and
+>   stop the old instance's services (Phase 2.1) before the new one's deploy
+>   reaches step 100.
+
 ---
 
 ## When to use this
