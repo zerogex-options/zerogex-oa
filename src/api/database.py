@@ -844,6 +844,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # that only change on the analytics cycle (~60s). A moderate TTL
         # eliminates redundant DB round-trips from rapid frontend polling.
         self._analytics_cache_ttl_seconds: float = _getenv_float("ANALYTICS_CACHE_TTL_SECONDS", 5.0)
+        # /api/gex/expirations (the website's Expiry selector, and the levels
+        # API's check that a picked date is listed) gets its own, far longer
+        # TTL.  The list changes at most once a trading day, but every miss
+        # scans up to a week of gex_by_strike: at the analytics TTL it was the
+        # database's second-heaviest read on 2026-11-16, about 4 s of CPU a
+        # call.  <= 0 disables caching it.
+        self._gex_expirations_cache_ttl_seconds: float = _getenv_float(
+            "GEX_EXPIRATIONS_CACHE_TTL_SECONDS", 300.0
+        )
         # /api/gex/strike-profile-timeseries gets its own, longer TTL.  The
         # rewind chart polls this endpoint at 1Hz for a window_units=~480
         # response — a query that JOINs ``gex_by_strike`` at ~480 rep_ts and
@@ -2851,10 +2860,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         today's date.  24h covers a full post-close shift while staying
         light on the index scan.
 
-        Idempotent / pure read — cached at the analytics TTL since the
-        universe of expirations only grows by one entry per trading day
+        Idempotent / pure read -- cached for
+        ``GEX_EXPIRATIONS_CACHE_TTL_SECONDS`` (5 minutes by default) since
+        the universe of expirations only grows by one entry per trading day
         and shrinks by post-expiry pruning that we explicitly want to
-        defer to the 24h boundary.
+        defer to the lookback boundary.  A date that newly appears is
+        offered within that TTL.  Concurrent misses for one key share a
+        single read: on a loaded database the scan outlasted the old 5 s
+        TTL, so every poll that arrived during it started its own.
         """
         symbol = symbol.upper()
         cache_key = f"gex_expirations:{symbol}:{lookback_hours}"
@@ -2864,8 +2877,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         # Uses idx_gex_by_strike_underlying_timestamp_strike for the
         # underlying+timestamp range scan, then a hashagg for DISTINCT.
-        # 24h × ~60 cycles/h × ~30 expirations = ~43K rows scanned
-        # worst case — cheap by every measure.
+        # gex_by_strike holds a row per strike and expiration every cycle,
+        # and the website and the levels API both ask for a week (168h), so
+        # a miss is not cheap: hence the long TTL and the shared read.
         query = """
             SELECT DISTINCT expiration
             FROM gex_by_strike
@@ -2873,15 +2887,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
               AND timestamp >= NOW() - make_interval(hours => $2)
             ORDER BY expiration
         """
-        try:
-            async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, lookback_hours)
-                result = [row["expiration"] for row in rows]
-                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
-                return result
-        except Exception as e:
-            logger.error(f"Error fetching GEX expirations: {e}", exc_info=True)
-            raise
+
+        async def _produce() -> List[date]:
+            try:
+                async with self._acquire_connection() as conn:
+                    rows = await conn.fetch(query, symbol, lookback_hours)
+                    result = [row["expiration"] for row in rows]
+                    self._cache_set(cache_key, result, self._gex_expirations_cache_ttl_seconds)
+                    return result
+            except Exception as e:
+                logger.error(f"Error fetching GEX expirations: {e}", exc_info=True)
+                raise
+
+        return await self._single_flight(cache_key, _produce)  # type: ignore[no-any-return]
 
     # ------------------------------------------------------------------
     # The book after the close

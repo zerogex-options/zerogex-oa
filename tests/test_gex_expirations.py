@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import date
 from unittest.mock import AsyncMock
@@ -106,14 +107,89 @@ def test_response_returns_distinct_expirations_in_order():
 
 def test_response_cached():
     """The expirations universe changes at most once per trading day, so
-    every poll re-running the DISTINCT scan is wasted work.  Method must
-    cache at the analytics TTL."""
+    every poll re-running the DISTINCT scan is wasted work."""
     db = DatabaseManager()
     conn = _RecordingConn(fetch_rows=[{"expiration": date(2026, 6, 8)}])
     _install_conn(db, conn)
     asyncio.run(db.get_gex_expirations("SPY"))
     asyncio.run(db.get_gex_expirations("SPY"))
     assert len(conn.queries) == 1  # second call hit the cache
+
+
+def test_cache_outlives_the_analytics_ttl(monkeypatch: pytest.MonkeyPatch):
+    """At the 5s analytics TTL this read was the database's second-heaviest
+    on 2026-11-16 (a week of gex_by_strike per miss).  It keeps its entry
+    for GEX_EXPIRATIONS_CACHE_TTL_SECONDS, five minutes by default."""
+    monkeypatch.delenv("GEX_EXPIRATIONS_CACHE_TTL_SECONDS", raising=False)
+    monkeypatch.delenv("ANALYTICS_CACHE_TTL_SECONDS", raising=False)
+    db = DatabaseManager()
+    conn = _RecordingConn(fetch_rows=[{"expiration": date(2026, 6, 8)}])
+    _install_conn(db, conn)
+    before = time.monotonic()
+    asyncio.run(db.get_gex_expirations("SPY", 168))
+    expires_at, _payload, _units = db._read_cache["gex_expirations:SPY:168"]
+    assert expires_at - before >= 300
+    assert db._gex_expirations_cache_ttl_seconds > db._analytics_cache_ttl_seconds
+
+
+def test_cache_ttl_is_configurable_and_zero_disables(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("GEX_EXPIRATIONS_CACHE_TTL_SECONDS", "0")
+    db = DatabaseManager()
+    conn = _RecordingConn(fetch_rows=[{"expiration": date(2026, 6, 8)}])
+    _install_conn(db, conn)
+    asyncio.run(db.get_gex_expirations("SPY"))
+    asyncio.run(db.get_gex_expirations("SPY"))
+    assert len(conn.queries) == 2
+
+
+def test_concurrent_misses_share_one_read():
+    """On a loaded database the scan outlasted the old TTL, so every poll
+    that landed during it ran its own copy.  Callers that miss together on
+    one key wait for a single read and all get its result."""
+    db = DatabaseManager()
+    conn = _RecordingConn(fetch_rows=[{"expiration": date(2026, 6, 8)}])
+    _install_conn(db, conn)
+
+    async def _three_at_once():
+        return await asyncio.gather(
+            db.get_gex_expirations("SPY", 168),
+            db.get_gex_expirations("SPY", 168),
+            db.get_gex_expirations("SPY", 168),
+        )
+
+    results = asyncio.run(_three_at_once())
+    assert len(conn.queries) == 1
+    assert results == [[date(2026, 6, 8)]] * 3
+
+
+def test_failed_read_is_not_cached_and_reaches_every_caller():
+    """A failed read raises for the callers that shared it and leaves no
+    entry behind, so the next poll tries again instead of serving nothing
+    for five minutes."""
+
+    class _FailingConn(_RecordingConn):
+        async def fetch(self, query, *args, timeout=None):
+            self.queries.append(query)
+            raise RuntimeError("statement timeout")
+
+    db = DatabaseManager()
+    conn = _FailingConn()
+    _install_conn(db, conn)
+
+    async def _two_at_once():
+        return await asyncio.gather(
+            db.get_gex_expirations("SPY"),
+            db.get_gex_expirations("SPY"),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(_two_at_once())
+    assert len(conn.queries) == 1
+    assert all(isinstance(r, RuntimeError) for r in results)
+    assert "gex_expirations:SPY:24" not in db._read_cache
+    with pytest.raises(RuntimeError):
+        asyncio.run(db.get_gex_expirations("SPY"))
+    assert len(conn.queries) == 2
 
 
 # ---------------------------------------------------------------------------
