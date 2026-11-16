@@ -314,11 +314,29 @@ def test_cache_upsert_sql_is_a_class_constant():
     sql = IngestionEngine._OPTION_LATEST_UPSERT_SQL
     assert "INSERT INTO option_chains_latest" in sql
     assert "ON CONFLICT (option_symbol)" in sql
-    # Cumulative columns must use GREATEST so retries don't decrement.
+
+
+def test_cache_cumulative_columns_take_a_later_minute_as_written():
+    """The cumulative columns follow history's rule, minute by minute.
+
+    History is keyed by (option_symbol, timestamp), so its GREATEST spans one
+    minute: a retry or an in-minute rewrite cannot decrement, and the next
+    minute's row holds whatever was written.  The cache keeps ONE row per
+    contract across minutes and sessions, so a bare GREATEST there pinned open
+    interest to the highest value ever seen and held yesterday's session
+    volume until today's passed it.  Behaviour against a real Postgres is in
+    tests/test_option_chains_latest_upsert_parity.py (integration).
+    """
+    sql = " ".join(IngestionEngine._OPTION_LATEST_UPSERT_SQL.split())
     for col in ("volume", "open_interest", "ask_volume", "mid_volume", "bid_volume"):
-        assert (
-            f"GREATEST(option_chains_latest.{col}, EXCLUDED.{col})" in sql
-        ), f"cache UPSERT must use GREATEST for monotonic column {col!r}"
+        expected = (
+            f"{col} = CASE WHEN EXCLUDED.timestamp > option_chains_latest.timestamp "
+            f"THEN EXCLUDED.{col} "
+            f"ELSE GREATEST(option_chains_latest.{col}, EXCLUDED.{col}) END"
+        )
+        assert expected in sql, f"cache UPSERT must reset {col!r} on a later minute"
+    # The stale-replay guard is what keeps an OLDER minute out of the SET.
+    assert sql.endswith("WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp")
 
 
 def test_cache_upsert_coalesces_greeks_and_iv_to_preserve_last_good_value():

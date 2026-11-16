@@ -357,13 +357,131 @@ def test_cache_query_receives_same_param_contract_as_history():
     # (underlying, timestamp, lookback_start, min_expiration, row_cap)
     assert len(params) == 5
     assert params[0] == engine.db_symbol
-    assert params[1] == snapshot_ts
+    # The cache's upper bound carries the anchor slack (see
+    # test_cache_row_requoted_just_after_the_anchor_still_reaches_the_snapshot);
+    # the lower bound is still measured from the anchor itself.
+    assert params[1] == snapshot_ts + AnalyticsEngine._CACHE_ANCHOR_SLACK
     # lookback_start = timestamp - lookback_hours
     assert params[2] == snapshot_ts - timedelta(hours=engine.snapshot_lookback_hours)
     # min_expiration is a date (today-1 in-session before 16:15)
     assert hasattr(params[3], "year")
     # row_cap is an int
     assert isinstance(params[4], int) and params[4] > 0
+
+
+# ---------------------------------------------------------------------------
+# Anchor slack: a contract requoted between the anchor read and the cache
+# read stays in the cycle; the history query keeps its exact bound.
+# ---------------------------------------------------------------------------
+
+
+class _BoundHonoringCursor:
+    """Cursor fake whose snapshot reads apply the SQL's timestamp bounds.
+
+    The MagicMock cursors above return whatever rows they are handed, whatever
+    the parameters say, so they cannot show a row being dropped by its bound.
+    This one keeps only rows with ``lookback_start <= timestamp <= upper``
+    (parameters 2 and 1, the predicate both snapshot queries share), served
+    from the cache rows or the history rows by which table the SQL reads.
+    """
+
+    def __init__(self, latest_ts, underlying_price, cache_rows, history_rows):
+        self._fetchone_results = [
+            (latest_ts,),  # query 1: latest option_chains timestamp
+            (underlying_price, latest_ts),  # query 2: underlying close + ts
+            (latest_ts,),  # option_chains_latest MAX(updated_at)
+        ]
+        self._cache_rows = cache_rows
+        self._history_rows = history_rows
+        self.calls = []
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+
+    def fetchone(self):
+        return self._fetchone_results.pop(0)
+
+    def fetchall(self):
+        sql, params = self.calls[-1]
+        rows = self._cache_rows if "FROM option_chains_latest" in sql else self._history_rows
+        upper, lookback_start = params[1], params[2]
+        return [r for r in rows if lookback_start <= r[14] <= upper]
+
+    def params_for(self, marker):
+        return [params for sql, params in self.calls if marker in sql]
+
+
+def _connection_for(cursor):
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+    return cm
+
+
+def test_cache_row_requoted_just_after_the_anchor_still_reaches_the_snapshot():
+    """A quote that lands between the anchor read and the cache read moves its
+    contract's cache row PAST the anchor (ingestion re-stamps the row on the
+    contract's first quote in a new minute).  With the bound exactly at the
+    anchor that contract silently dropped out of the cycle; the slack keeps
+    it, and the slack stays inside five minutes."""
+    engine = AnalyticsEngine(underlying="SPY")
+    engine.use_latest_cache = True
+
+    snapshot_ts = _snapshot_ts()
+    expiration = snapshot_ts.astimezone(ET).date() + timedelta(days=7)
+    requoted = "SPY260602C00500000"
+    cache_rows = [
+        _row(requoted, 500.0, expiration, "C", snapshot_ts + timedelta(seconds=2)),
+        _row("SPY260602P00500000", 500.0, expiration, "P", snapshot_ts),
+    ]
+    # History must not be needed: the cache answered.
+    cursor = _BoundHonoringCursor(snapshot_ts, 500.0, cache_rows, history_rows=[])
+
+    with patch.object(main_engine, "db_connection", return_value=_connection_for(cursor)):
+        result = engine._get_snapshot()
+
+    assert result is not None
+    symbols = {opt["option_symbol"] for opt in result["options"]}
+    assert requoted in symbols, "a contract requoted 2s after the anchor must stay in the cycle"
+    assert len(symbols) == 2
+    assert not any("DISTINCT ON" in sql for sql, _ in cursor.calls)
+
+    (cache_params,) = cursor.params_for("FROM option_chains_latest ocl")
+    upper = cache_params[1]
+    assert snapshot_ts < upper <= snapshot_ts + timedelta(minutes=5)
+    # The cycle itself is still stamped with the anchor, not the widened bound.
+    assert result["timestamp"] == snapshot_ts
+
+
+def test_history_query_is_still_bounded_exactly_at_the_anchor():
+    """The slack is the cache read's alone.  The history DISTINCT ON (the
+    flag-off path, and the fallback when the cache comes back empty) keeps
+    ``timestamp <= anchor``: history holds every minute's row, so its bound
+    already finds each contract's latest quote at or before the anchor."""
+    snapshot_ts = _snapshot_ts()
+    expiration = snapshot_ts.astimezone(ET).date() + timedelta(days=7)
+    history_rows = [
+        _row("SPY260602C00500000", 500.0, expiration, "C", snapshot_ts),
+        # Written after the anchor read; the bound must keep it out.
+        _row("SPY260602C00505000", 505.0, expiration, "C", snapshot_ts + timedelta(seconds=2)),
+    ]
+
+    for use_cache in (False, True):
+        engine = AnalyticsEngine(underlying="SPY")
+        engine.use_latest_cache = use_cache
+        # Empty cache, so the flag-on engine falls back to history.
+        cursor = _BoundHonoringCursor(snapshot_ts, 500.0, [], history_rows)
+
+        with patch.object(main_engine, "db_connection", return_value=_connection_for(cursor)):
+            result = engine._get_snapshot()
+
+        history_params = cursor.params_for("DISTINCT ON")
+        assert history_params, f"history query must run (use_cache={use_cache})"
+        for params in history_params:
+            assert params[1] == snapshot_ts, f"history bound moved (use_cache={use_cache})"
+        assert [opt["option_symbol"] for opt in result["options"]] == ["SPY260602C00500000"]
 
 
 # ---------------------------------------------------------------------------

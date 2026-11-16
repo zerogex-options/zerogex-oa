@@ -2050,6 +2050,28 @@ class IngestionEngine:
     # DISTINCT ON snapshot query can fall back to an earlier
     # gamma-bearing row; the cache has no such fallback, so it must
     # preserve the last good Greek itself.
+    #
+    # The cumulative columns (volume, open_interest, ask/mid/bid_volume)
+    # follow the history table's rule exactly, so the cache row always
+    # equals the newest history row, which is what the DISTINCT ON
+    # snapshot returns.  History is keyed by (option_symbol, timestamp),
+    # so its GREATEST only ever spans ONE minute: a retry or an in-minute
+    # rewrite cannot decrement, and the next minute starts a new row with
+    # whatever was written.  The cache keeps one row per contract across
+    # minutes AND sessions, so a bare GREATEST here meant open interest
+    # could never decline and yesterday's session volume held until
+    # today's passed it.  Hence: GREATEST when the write is for the minute
+    # the row already holds, the written value when it is for a later
+    # minute (an older minute never reaches the SET; see the WHERE).
+    #
+    # Keyed on the minute, not the 09:30 ET session boundary, because a
+    # session-wide GREATEST still diverges from history: a minute's
+    # open_interest is the max over its buffered quotes INCLUDING the one
+    # carried over from the previous minute (_prepare_option_agg), so the
+    # first row of a session can carry the old OI and a session-wide
+    # GREATEST would hold it all day, where history moves on a minute
+    # later.  It also costs one timestamp comparison per row instead of
+    # time-zone and holiday arithmetic on the hottest write path.
     _OPTION_LATEST_UPSERT_SQL = """
         INSERT INTO option_chains_latest
         (option_symbol, timestamp, underlying, strike, expiration, option_type,
@@ -2067,12 +2089,22 @@ class IngestionEngine:
             bid = EXCLUDED.bid,
             ask = EXCLUDED.ask,
             mid = EXCLUDED.mid,
-            volume = GREATEST(option_chains_latest.volume, EXCLUDED.volume),
-            open_interest = GREATEST(option_chains_latest.open_interest, EXCLUDED.open_interest),
+            volume = CASE WHEN EXCLUDED.timestamp > option_chains_latest.timestamp
+                THEN EXCLUDED.volume
+                ELSE GREATEST(option_chains_latest.volume, EXCLUDED.volume) END,
+            open_interest = CASE WHEN EXCLUDED.timestamp > option_chains_latest.timestamp
+                THEN EXCLUDED.open_interest
+                ELSE GREATEST(option_chains_latest.open_interest, EXCLUDED.open_interest) END,
             implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains_latest.implied_volatility),
-            ask_volume = GREATEST(option_chains_latest.ask_volume, EXCLUDED.ask_volume),
-            mid_volume = GREATEST(option_chains_latest.mid_volume, EXCLUDED.mid_volume),
-            bid_volume = GREATEST(option_chains_latest.bid_volume, EXCLUDED.bid_volume),
+            ask_volume = CASE WHEN EXCLUDED.timestamp > option_chains_latest.timestamp
+                THEN EXCLUDED.ask_volume
+                ELSE GREATEST(option_chains_latest.ask_volume, EXCLUDED.ask_volume) END,
+            mid_volume = CASE WHEN EXCLUDED.timestamp > option_chains_latest.timestamp
+                THEN EXCLUDED.mid_volume
+                ELSE GREATEST(option_chains_latest.mid_volume, EXCLUDED.mid_volume) END,
+            bid_volume = CASE WHEN EXCLUDED.timestamp > option_chains_latest.timestamp
+                THEN EXCLUDED.bid_volume
+                ELSE GREATEST(option_chains_latest.bid_volume, EXCLUDED.bid_volume) END,
             delta = COALESCE(EXCLUDED.delta, option_chains_latest.delta),
             gamma = COALESCE(EXCLUDED.gamma, option_chains_latest.gamma),
             theta = COALESCE(EXCLUDED.theta, option_chains_latest.theta),

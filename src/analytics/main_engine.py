@@ -703,6 +703,19 @@ class AnalyticsEngine:
         LIMIT %s
         """
 
+    # Upper-bound slack for the cache read.  The cycle's anchor is the newest
+    # option_chains timestamp, read a moment before the cache query runs.
+    # Ingestion moves a contract's cache row to a new minute on that
+    # contract's FIRST quote in it, so a quote landing between the two reads
+    # REPLACES the row with one stamped after the anchor, and an exact
+    # ``timestamp <= anchor`` bound would drop the contract from the cycle.
+    # History keeps the older row, so the DISTINCT ON path never had this.
+    # At a minute rollover that can be most of the liquid chain at once, and
+    # the gap between the reads widens on a loaded database.  Five minutes
+    # covers any plausible gap; rows that new are still the contract's
+    # latest quote, never a future one.
+    _CACHE_ANCHOR_SLACK = timedelta(minutes=5)
+
     # SQL for the latest-per-contract snapshot (query #3 in _get_snapshot).
     # Kept as a class attribute so the cold-start and steady-state /
     # fallback paths execute byte-identical SQL (same plan shape).
@@ -808,11 +821,20 @@ class AnalyticsEngine:
         scan of ~2k rows) and well inside the pool-wide ceiling under
         any plausible regime.  A separate per-query timeout would only
         mask a real cache-table regression instead of surfacing it.
+
+        The upper bound is ``timestamp + _CACHE_ANCHOR_SLACK``, not the
+        anchor itself; see that attribute for why.
         """
         lookback_start = timestamp - timedelta(hours=lookback_hours)
         cursor.execute(
             self._SNAPSHOT_QUERY_CACHE,
-            (self.db_symbol, timestamp, lookback_start, min_expiration, row_cap),
+            (
+                self.db_symbol,
+                timestamp + self._CACHE_ANCHOR_SLACK,
+                lookback_start,
+                min_expiration,
+                row_cap,
+            ),
         )
         return cursor.fetchall()  # type: ignore[no-any-return]
 
