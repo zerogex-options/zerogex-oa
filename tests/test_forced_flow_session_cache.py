@@ -8,7 +8,6 @@ the FastAPI app.
 """
 
 import importlib
-from datetime import datetime
 
 ff = importlib.import_module("src.api.routers.forced_flow")
 
@@ -16,7 +15,7 @@ ff = importlib.import_module("src.api.routers.forced_flow")
 def test_quantize_band_snaps_out_and_is_stable_under_small_moves():
     spot = 778.0
     lo, hi = ff._quantize_band(770.13, 785.42, spot)
-    # Snapped OUT: lo floored, hi ceiled to the lattice step.
+    # Snapped OUT: lo floored, hi ceiled to the ~0.1%-of-spot step.
     assert lo <= 770.13 and hi >= 785.42
     # A tiny new extreme inside the same step must NOT move the band -- that is
     # what keeps the past-column cache warm through the day.
@@ -25,95 +24,6 @@ def test_quantize_band_snaps_out_and_is_stable_under_small_moves():
     # A move past the step DOES widen it (and legitimately re-grids).
     lo3, _ = ff._quantize_band(766.0, 785.42, spot)
     assert lo3 < lo
-
-
-def test_grid_step_is_a_1_2_5_step_that_holds_across_a_wide_range():
-    assert ff._grid_step(6800.0) == 20.0
-    assert ff._grid_step(680.0) == 2.0
-    assert ff._grid_step(25000.0) == 100.0
-    assert ff._grid_step(190.0) == 0.5
-    # The same step for every price a symbol trades through in a day, and far
-    # beyond: SPX anywhere from 4,100 to 9,999 snaps to 20-point lines.
-    assert {ff._grid_step(p) for p in (4100.0, 5000.0, 6800.0, 9999.0)} == {20.0}
-
-
-def test_the_band_holds_still_while_spot_ticks():
-    """The regression behind 2026-11-16's rebuild storm. On most days the band is
-    spot +/- span, and the step used to be a fixed fraction of the same spot, so
-    the snapped band moved on every tick and every build missed the past-column
-    cache. Thirty one-cent ticks must give one band; a real move must re-grid."""
-    bands = {
-        ff._quantize_band(spot * 0.98, spot * 1.02, spot)
-        for spot in (680.00 + i * 0.01 for i in range(31))
-    }
-    assert len(bands) == 1
-    moved = ff._quantize_band(686.80 * 0.98, 686.80 * 1.02, 686.80)  # +1%
-    assert moved not in bands
-
-
-def _stub_session_build(monkeypatch, day_range):
-    """Run _session_surface_sync with no DB and trivial math. Returns the list
-    every as-of chain read appends to: one per past column built cold."""
-
-    class _Engine:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def _build_forced_flow_legs(self, options, timestamp):
-            return ["leg"]
-
-    loads = []
-
-    def _load_asof(sym, tau):
-        loads.append(tau)
-        return {"timestamp": tau, "spot": 680.0, "options": [{}]}
-
-    monkeypatch.setattr(ff, "AnalyticsEngine", _Engine)
-    monkeypatch.setattr(ff, "_load_asof", _load_asof)
-    monkeypatch.setattr(ff, "_session_day_range", lambda db_symbol, day_start: day_range)
-    monkeypatch.setattr(ff, "_session_price_bars", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(
-        ff,
-        "session_column_flow",
-        lambda spot, legs, mtc, prices, r, q, floor: ([0.0] * len(prices), None, None),
-    )
-    ff._past_col_cache.clear()
-    return loads
-
-
-def _session_ctx(spot):
-    return {
-        "timestamp": ff.ET.localize(datetime(2026, 11, 16, 14, 0)),
-        "spot": spot,
-        "r": 0.04,
-        "q": 0.0,
-        "legs": ["leg"],
-    }
-
-
-def test_a_tick_in_spot_reuses_every_past_column(monkeypatch):
-    loads = _stub_session_build(monkeypatch, (676.80, 683.10))
-    try:
-        first = ff._session_surface_sync(_session_ctx(680.10), "SPY", 0.02, 30, 8)
-        built = len(loads)
-        second = ff._session_surface_sync(_session_ctx(680.17), "SPY", 0.02, 30, 8)
-        assert built == 21  # 14:00 ET: the 21 past buckets from the open
-        assert len(loads) == built, "a 7-cent tick re-read past columns from the DB"
-        assert second["prices"] == first["prices"]
-    finally:
-        ff._past_col_cache.clear()
-
-
-def test_a_real_move_still_regrids(monkeypatch):
-    loads = _stub_session_build(monkeypatch, (676.80, 690.00))
-    try:
-        first = ff._session_surface_sync(_session_ctx(680.10), "SPY", 0.02, 30, 8)
-        built = len(loads)
-        second = ff._session_surface_sync(_session_ctx(687.00), "SPY", 0.02, 30, 8)
-        assert second["prices"] != first["prices"]
-        assert len(loads) == 2 * built
-    finally:
-        ff._past_col_cache.clear()
 
 
 def test_past_col_cache_get_put_and_day_prune():

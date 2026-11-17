@@ -129,14 +129,10 @@ _past_col_cache_lock = threading.Lock()
 # Insertion-order eviction ceiling (dicts preserve insertion order). ~30 buckets
 # x a few symbols x a couple of grids per day sits far under this.
 _PAST_COL_CACHE_MAX = 6000
-# Snap the price band OUT to a fixed lattice about this fraction of price apart
-# (see _grid_step), so the band -- and with it every cached past column -- only
-# re-grids when spot moves a real amount, not on every tick. Every re-grid
-# rebuilds every past column (an as-of chain read plus a full repricing each),
-# so this is a cost dial: in a simulated session it cut a symbol's rebuilt columns
-# per worker from about 1,700 a day to 210-350. The band's edges land at most one
-# step outside spot +/- span.
-_SESSION_GRID_QUANTUM_PCT = 0.005
+# Snap the price band to this fraction of spot so a fresh intraday extreme only
+# re-grids -- and cold-misses the past cache -- when it moves the band a real
+# amount, not on every tick.
+_SESSION_GRID_QUANTUM_PCT = 0.001
 
 # Single-flight registry: coalesce concurrent identical session-surface rebuilds
 # so the warmer, the frontend, and any ad-hoc caller SHARE one rebuild instead of
@@ -171,37 +167,11 @@ _book_cache_lock = threading.Lock()
 _book_tasks: Dict[tuple, "asyncio.Task"] = {}
 
 
-def _grid_step(ref: float) -> float:
-    """The band's lattice step: ``ref * _SESSION_GRID_QUANTUM_PCT`` rounded DOWN to
-    1, 2 or 5 times a power of ten (SPX ~6,800 -> 20, SPY ~680 -> 2).
-
-    The step must not move with spot. It used to be exactly 0.1% of the live
-    spot, and on most days the band's edges are themselves spot x (1 +/- span),
-    so ``floor(edge / step)`` came out the same multiple every time and the
-    "snapped" band slid with every tick: a new grid, and a cold past-column
-    cache, on nearly every build (2026-11-16, 14:28-15:28 ET: 250 builds
-    rebuilt 6,500 past columns, every one they had, which was 1.81 a second of
-    the database's heaviest query). A 1-2-5 step is the same across a wide
-    price range, so the lattice holds still and only a real move crosses a line.
-    """
-    raw = max(1e-6, ref * _SESSION_GRID_QUANTUM_PCT)
-    magnitude = 10.0 ** math.floor(math.log10(raw))
-    for multiple in (5.0, 2.0):
-        if raw >= multiple * magnitude:
-            return multiple * magnitude
-    return magnitude
-
-
-def _quantize_band(p_lo: float, p_hi: float, ref: float) -> Tuple[float, float]:
-    """Snap ``[p_lo, p_hi]`` OUT to the :func:`_grid_step` lattice for ``ref``, so a
-    move inside one step keeps the same price axis -- and the same past-column
-    cache. Rounded so one lattice line always yields the same float, which the
-    cache key and the axis both rely on."""
-    step = _grid_step(ref)
-    return (
-        round(math.floor(p_lo / step) * step, 6),
-        round(math.ceil(p_hi / step) * step, 6),
-    )
+def _quantize_band(p_lo: float, p_hi: float, spot: float) -> Tuple[float, float]:
+    """Snap ``[p_lo, p_hi]`` out to a coarse grid (~0.1% of spot) so tiny intraday
+    range changes keep the same price axis -- and the same past-column cache."""
+    step = max(1e-6, spot * _SESSION_GRID_QUANTUM_PCT)
+    return math.floor(p_lo / step) * step, math.ceil(p_hi / step) * step
 
 
 def _past_col_get(key: tuple) -> Optional[Dict[str, Any]]:
@@ -999,11 +969,7 @@ def _session_surface_sync(ctx, sym, span, past_steps, future_steps):
     p_hi = spot * (1.0 + span) if day_hi is None else max(day_hi, spot * (1.0 + span))
     if not (p_hi > p_lo > 0.0):
         p_lo, p_hi = spot * (1.0 - span), spot * (1.0 + span)
-    # The lattice is sized off the day's low, not the live spot: the low only
-    # ever falls, so a symbol trading around a 1-2-5 boundary (NVDA near 200)
-    # cannot flip the step -- and re-grid -- each time it crosses.
-    lattice_ref = day_lo if day_lo is not None and day_lo > 0.0 else spot
-    p_lo, p_hi = _quantize_band(p_lo, p_hi, lattice_ref)
+    p_lo, p_hi = _quantize_band(p_lo, p_hi, spot)
     prices = _linspace(p_lo, p_hi, _SESSION_PRICE_POINTS)
 
     # Cache identity for the immutable PAST columns: (trading-day, symbol,
