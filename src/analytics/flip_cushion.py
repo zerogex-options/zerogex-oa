@@ -331,13 +331,18 @@ def _points(value: float) -> str:
 def describe(bar: CushionBar, rate_bars: int = DEFAULT_RATE_BARS) -> str:
     """The one-line read, in the shape the spec asks for.
 
-    e.g. ``Flip cushion: 18 pts below, THIN | 5m: narrowing 4 pts |
-    15m: narrowing 11 pts, accelerating``
+    e.g. ``Flip cushion: price 18 pts below the flip, THIN | 5m: narrowing
+    4 pts | 15m: narrowing 11 pts, accelerating``
+
+    The side names where PRICE sits relative to the flip. "18 pts below" on
+    its own read the other way round to a trader looking at a chart with the
+    flip drawn above price -- it was taken for "the flip is 18 below" -- so
+    the sentence says whose side it is.
     """
     if bar.state == STATE_NO_FLIP or bar.cushion_pts is None:
         return "Flip cushion: no gamma flip in the profile"
 
-    parts = [f"Flip cushion: {_points(bar.cushion_pts)} pts {bar.side}, {bar.state}"]
+    parts = [f"Flip cushion: price {_points(bar.cushion_pts)} pts {bar.side} the flip, {bar.state}"]
 
     if bar.step_pts is not None and bar.step_pts != 0:
         word = "widening" if bar.step_pts > 0 else "narrowing"

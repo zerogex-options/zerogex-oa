@@ -293,7 +293,7 @@ def test_http_cushion_is_derived_from_the_stored_flip(
     assert bar["cushion_pts"] == pytest.approx(10.0)
     assert bar["cushion_side"] == "above"
     assert bar["cushion_state"] == "THIN"
-    assert "Flip cushion: 10 pts above" in bar["cushion_summary"]
+    assert "Flip cushion: price 10 pts above the flip" in bar["cushion_summary"]
 
 
 def test_http_cushion_label_is_scale_free(monkeypatch: pytest.MonkeyPatch):

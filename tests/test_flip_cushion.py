@@ -223,7 +223,7 @@ def test_describe_matches_the_spec_shape():
     series = build_series(_bars([(720.0, 690.0), (719.0, 690.0), (717.0, 690.0), (708.0, 690.0)]))
     line = describe(series[3])
 
-    assert "Flip cushion: 18 pts above" in line
+    assert "Flip cushion: price 18 pts above the flip" in line
     assert "5m: narrowing 9 pts" in line
     assert "15m: narrowing 12 pts, accelerating" in line
 
@@ -240,15 +240,15 @@ def test_describe_keeps_a_sub_point_cushion_on_its_side_of_the_flip():
     keeps a decimal."""
     series = build_series(_bars([(700.5, 700.0), (702.4, 700.0)]))
 
-    assert "Flip cushion: 0.5 pts above" in describe(series[0])
+    assert "Flip cushion: price 0.5 pts above the flip" in describe(series[0])
     assert "5m: widening 1.9 pts" in describe(series[1])
 
 
 def test_describe_rounds_halves_up_and_keeps_whole_numbers_whole():
     series = build_series(_bars([(712.5, 700.0), (709.0, 700.0)]))
 
-    assert "Flip cushion: 13 pts above" in describe(series[0])
-    assert "Flip cushion: 9 pts above" in describe(series[1])
+    assert "Flip cushion: price 13 pts above the flip" in describe(series[0])
+    assert "Flip cushion: price 9 pts above the flip" in describe(series[1])
     assert "5m: narrowing 3.5 pts" in describe(series[1])
 
 
