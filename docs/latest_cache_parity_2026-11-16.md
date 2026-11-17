@@ -31,6 +31,12 @@ was `AnalyticsEngine._SNAPSHOT_QUERY` (the DISTINCT ON over `option_chains`):
    makes them re-run on every 30-second refresh. Measure it with the commands
    below; it is worth its own fix.
 
+**Update, 2026-11-17.** Production had `ANALYTICS_USE_LATEST_CACHE=true`, so
+the analytics engine was reading the inflated cache until this branch was
+deployed that night, and the #1 query was almost all forced-flow: 19,483 as-of
+queries from 13:00 to 16:00 ET on 2026-11-16, 1.80 a second of the 1.94. The
+grid fix is on `claude/forced-flow-stable-grid`.
+
 ## What was wrong
 
 ### Bug 1: the cache's cumulative columns never went down
@@ -203,6 +209,13 @@ separate engine box, run the third command there.
 only when spot or the day's range actually leaves the band) would cut those
 queries to about one per symbol per worker every 13 minutes, the newly-past
 column. It is independent of the flag and of this branch.
+
+**Measured** with the first command that night: 19,483 as-of queries between
+13:00 and 16:00 ET on 2026-11-16, 1.80 a second, about 93% of the 1.94 calls a
+second Database Insights showed for the statement. The fix (a band built from
+the day's range, snapped to 0.25% steps of the session's first price) is on
+`claude/forced-flow-stable-grid`; in a 20-day simulation of the warmer it cuts
+those queries to roughly 0.09 a second.
 
 ## Test suite
 

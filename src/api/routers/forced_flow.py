@@ -129,10 +129,13 @@ _past_col_cache_lock = threading.Lock()
 # Insertion-order eviction ceiling (dicts preserve insertion order). ~30 buckets
 # x a few symbols x a couple of grids per day sits far under this.
 _PAST_COL_CACHE_MAX = 6000
-# Snap the price band to this fraction of spot so a fresh intraday extreme only
-# re-grids -- and cold-misses the past cache -- when it moves the band a real
-# amount, not on every tick.
-_SESSION_GRID_QUANTUM_PCT = 0.001
+# The session field's price band is snapped outward to steps of this fraction of
+# the session's first price (see _session_band), so a new intraday extreme only
+# re-grids -- and cold-misses every past column -- when it crosses a step. Each
+# re-grid re-runs every past column's as-of query in every worker. In a 20-day
+# simulation of the warmer a 0.25% step re-gridded ~8 times a symbol-day against
+# ~19 at 0.1%, for at most 0.25% of extra room on each side of the chart.
+_SESSION_GRID_QUANTUM_PCT = 0.0025
 
 # Single-flight registry: coalesce concurrent identical session-surface rebuilds
 # so the warmer, the frontend, and any ad-hoc caller SHARE one rebuild instead of
@@ -167,11 +170,48 @@ _book_cache_lock = threading.Lock()
 _book_tasks: Dict[tuple, "asyncio.Task"] = {}
 
 
-def _quantize_band(p_lo: float, p_hi: float, spot: float) -> Tuple[float, float]:
-    """Snap ``[p_lo, p_hi]`` out to a coarse grid (~0.1% of spot) so tiny intraday
-    range changes keep the same price axis -- and the same past-column cache."""
-    step = max(1e-6, spot * _SESSION_GRID_QUANTUM_PCT)
+def _quantize_band(p_lo: float, p_hi: float, ref: float) -> Tuple[float, float]:
+    """Snap ``[p_lo, p_hi]`` out to steps of ``_SESSION_GRID_QUANTUM_PCT`` of
+    ``ref``.  ``ref`` must be a price that holds still (``_session_band`` passes
+    the session's first price): a step that scales with the live spot moves the
+    snapped edges with every tick, which is exactly what the snap is for."""
+    step = max(1e-6, ref * _SESSION_GRID_QUANTUM_PCT)
     return math.floor(p_lo / step) * step, math.ceil(p_hi / step) * step
+
+
+def _session_band(
+    spot: float,
+    span: float,
+    day_lo: Optional[float],
+    day_hi: Optional[float],
+    ref: Optional[float],
+) -> Tuple[float, float]:
+    """The session field's price band: everywhere spot has traded today, +/- ``span``.
+
+    The band is part of every past column's cache key, so it has to hold still
+    while the market moves.  It is built from the day's realized low and high, not
+    the live spot, and snapped outward to steps of ``_SESSION_GRID_QUANTUM_PCT`` of
+    ``ref``, the session's first price.  So it only ever widens, only when a new
+    intraday extreme crosses a step, and every worker computes the same band from
+    the same data.  Spot +/- ``span`` always fits inside it.
+
+    The band it replaces -- ``min(low, spot*(1-span))`` to
+    ``max(high, spot*(1+span))``, snapped to 0.1% of the LIVE spot -- moved with
+    every cent of spot, so every 30-second refresh cold-missed every past column
+    and re-ran that column's as-of snapshot query: 1.80 queries a second from
+    session-surface builds on the afternoon of 2026-11-16, about 93% of the calls
+    to the database's top statement.
+
+    Falls back to the live spot when the day's range is unknown (no bar yet, or
+    the range query failed).  That band moves with spot again, which costs that
+    one build its cache hits and nothing else.
+    """
+    lo = spot if day_lo is None else min(day_lo, spot)
+    hi = spot if day_hi is None else max(day_hi, spot)
+    p_lo, p_hi = lo * (1.0 - span), hi * (1.0 + span)
+    if not (p_hi > p_lo > 0.0):
+        p_lo, p_hi = spot * (1.0 - span), spot * (1.0 + span)
+    return _quantize_band(p_lo, p_hi, ref if ref is not None and ref > 0.0 else spot)
 
 
 def _past_col_get(key: tuple) -> Optional[Dict[str, Any]]:
@@ -461,21 +501,24 @@ def _load_asof(sym: str, at_ts: datetime) -> Optional[Dict[str, Any]]:
 
 def _session_day_range(
     db_symbol: str, day_start: datetime
-) -> Tuple[Optional[float], Optional[float]]:
-    """Today's realized ``(low, high)`` for ``db_symbol`` from ``underlying_quotes``,
-    from ``day_start`` (the ET session open) to now.
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Today's realized ``(low, high, first)`` for ``db_symbol`` from
+    ``underlying_quotes``, from ``day_start`` (the ET session open) to now, where
+    ``first`` is the open of the session's first bar.
 
-    Used only to widen the field's price grid so it spans where spot ACTUALLY
-    travelled today, not just a symmetric band around the last print. Returns
-    ``(None, None)`` on any error or an empty session so the caller falls back to
-    the span window alone -- a missing day-range must never fail the endpoint.
+    The field's price band is built from these (see :func:`_session_band`): the
+    range so the band spans where spot ACTUALLY travelled today and only widens
+    with it, the first price as the fixed reference its steps are measured in.
+    Returns ``(None, None, None)`` on any error or an empty session so the caller
+    falls back to a band around the live spot -- a missing day-range must never
+    fail the endpoint.
     """
     try:
         with db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT min(low), max(high)
+                SELECT min(low), max(high), (array_agg(open ORDER BY timestamp ASC))[1]
                 FROM underlying_quotes
                 WHERE symbol = %s
                   AND timestamp >= %s
@@ -484,10 +527,11 @@ def _session_day_range(
             )
             row = cursor.fetchone()
         if row and row[0] is not None and row[1] is not None:
-            return float(row[0]), float(row[1])
+            first = float(row[2]) if row[2] is not None else None
+            return float(row[0]), float(row[1]), first
     except Exception as e:  # pragma: no cover - defensive; grid falls back to span
         logger.debug("session-surface day-range query failed for %s: %s", db_symbol, e)
-    return None, None
+    return None, None, None
 
 
 def _session_price_bars(
@@ -959,17 +1003,13 @@ def _session_surface_sync(ctx, sym, span, past_steps, future_steps):
     # call (now farther from the close than the open is) still yields open >= now.
     session_open_min_to_close = max(now_min_to_close, (close_dt - open_dt).total_seconds() / 60.0)
 
-    # Price grid: union today's realized [low, high] with the +/- span window, so
-    # the field spans both where spot actually travelled and a symmetric view
-    # band. Any failure falls back to the span window alone. Quantized so a fresh
-    # extreme keeps the same axis (and past-column cache) unless it moves the band
-    # meaningfully.
-    day_lo, day_hi = _session_day_range(get_canonical_symbol(sym), open_dt)
-    p_lo = spot * (1.0 - span) if day_lo is None else min(day_lo, spot * (1.0 - span))
-    p_hi = spot * (1.0 + span) if day_hi is None else max(day_hi, spot * (1.0 + span))
-    if not (p_hi > p_lo > 0.0):
-        p_lo, p_hi = spot * (1.0 - span), spot * (1.0 + span)
-    p_lo, p_hi = _quantize_band(p_lo, p_hi, spot)
+    # Price grid: everywhere spot has traded today, +/- the span, snapped to steps
+    # of the session's first price. It holds still until a new intraday extreme
+    # crosses a step, so the past columns below stay cache-hot across refreshes
+    # and workers (see _session_band). Any failure falls back to the span window
+    # around the live spot.
+    day_lo, day_hi, day_first = _session_day_range(get_canonical_symbol(sym), open_dt)
+    p_lo, p_hi = _session_band(spot, span, day_lo, day_hi, day_first)
     prices = _linspace(p_lo, p_hi, _SESSION_PRICE_POINTS)
 
     # Cache identity for the immutable PAST columns: (trading-day, symbol,
