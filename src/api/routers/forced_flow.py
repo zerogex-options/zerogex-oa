@@ -298,6 +298,15 @@ def _prepare_engine(symbol: str) -> AnalyticsEngine:
     return engine
 
 
+def _for_expiry(options: List[Dict[str, Any]], expiry: Optional[str]) -> List[Dict[str, Any]]:
+    """``options`` limited to one expiration (``YYYY-MM-DD``), or all of them
+    when ``expiry`` is None. Shared by the live book and the session field's past
+    columns, so the two halves of one field cannot filter differently."""
+    if not expiry:
+        return options
+    return [o for o in options if str(o.get("expiration")) == expiry]
+
+
 def _load(symbol: str, expiry: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetch the latest snapshot and normalize it into forced-flow inputs.
 
@@ -311,11 +320,9 @@ def _load(symbol: str, expiry: Optional[str] = None) -> Optional[Dict[str, Any]]
     spot = snapshot.get("underlying_price")
     if not spot or spot <= 0:
         return None
-    options = snapshot["options"]
-    if expiry:
-        options = [o for o in options if str(o.get("expiration")) == expiry]
-        if not options:
-            return None
+    options = _for_expiry(snapshot["options"], expiry)
+    if not options:
+        return None
     legs = engine._build_forced_flow_legs(options, snapshot["timestamp"])
     if not legs:
         return None
@@ -978,6 +985,7 @@ async def get_session_surface(
     between recorded history and projection. History is rebuilt from
     ``option_chains`` because the persisted ``forced_flow_profile.profile`` JSONB
     is written empty -- so the past field cannot be read back, only recomputed.
+    ``expiry`` limits every column, past and projected, to that one expiration.
     """
     sym = symbol.upper()
     data = await _session_surface_async(sym, spot_range_pct, past_steps, future_steps, expiry)
@@ -986,7 +994,7 @@ async def get_session_surface(
     return SessionSurfaceResponse(**data)
 
 
-def _session_surface_sync(ctx, sym, span, past_steps, future_steps):
+def _session_surface_sync(ctx, sym, span, past_steps, future_steps, expiry=None):
     now_ts = ctx["timestamp"]
     spot = ctx["spot"]
     r, q = ctx["r"], ctx["q"]
@@ -1013,7 +1021,10 @@ def _session_surface_sync(ctx, sym, span, past_steps, future_steps):
     prices = _linspace(p_lo, p_hi, _SESSION_PRICE_POINTS)
 
     # Cache identity for the immutable PAST columns: (trading-day, symbol,
-    # time-bucket, price-grid). Prune any prior day, then reuse/compute per bucket.
+    # time-bucket, price-grid, expiry). Prune any prior day, then reuse/compute
+    # per bucket. ``expiry`` is in the key because it is in the column: a field
+    # asked for one expiration prices its past from that expiration alone, the
+    # same filter its live book got in _load.
     db_symbol = get_canonical_symbol(sym)
     trading_date = now_et.date().isoformat()
     grid_key = (round(p_lo, 4), round(p_hi, 4), _SESSION_PRICE_POINTS)
@@ -1034,7 +1045,7 @@ def _session_surface_sync(ctx, sym, span, past_steps, future_steps):
         mtc = session_open_min_to_close - k * step
         if mtc <= now_min_to_close + 1e-6:
             break  # the live NOW column (below) takes over from here to the close
-        ckey = (trading_date, db_symbol, round(mtc, 3), grid_key)
+        ckey = (trading_date, db_symbol, round(mtc, 3), grid_key, expiry)
         cached = _past_col_get(ckey)
         if cached is not None:
             past_cols.append(cached)
@@ -1044,7 +1055,10 @@ def _session_surface_sync(ctx, sym, span, past_steps, future_steps):
             asof = _load_asof(sym, tau)
             if asof is None:
                 continue
-            legs = engine._build_forced_flow_legs(asof["options"], asof["timestamp"])
+            options = _for_expiry(asof["options"], expiry)
+            if not options:
+                continue
+            legs = engine._build_forced_flow_legs(options, asof["timestamp"])
         except Exception as e:  # pragma: no cover - defensive per-bucket skip
             logger.debug("session-surface as-of bucket at %s failed: %s", tau, e)
             continue
@@ -1180,7 +1194,7 @@ async def _session_surface_async(sym, span, past_steps, future_steps, expiry):
                 if book is None:
                     return None
                 data = await asyncio.to_thread(
-                    _session_surface_sync, book, sym, span, past_steps, future_steps
+                    _session_surface_sync, book, sym, span, past_steps, future_steps, expiry
                 )
                 if data is not None:
                     _cache_put(key, data, as_of=book.get("loaded_at"))

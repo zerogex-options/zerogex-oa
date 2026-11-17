@@ -8,6 +8,7 @@ the FastAPI app.
 """
 
 import importlib
+from datetime import date
 
 ff = importlib.import_module("src.api.routers.forced_flow")
 
@@ -61,23 +62,30 @@ def test_session_band_falls_back_to_the_live_spot_without_a_day_range():
     assert hi - lo < 680.0 * (0.04 + 2 * ff._SESSION_GRID_QUANTUM_PCT) + 1e-9
 
 
+# Every options list the stub engine was asked to build past-column legs from.
+_LEGS_BUILT_FROM = []
+
+
 class _FakeEngine:
     def __init__(self, *args, **kwargs):
         pass
 
     def _build_forced_flow_legs(self, options, timestamp):
+        _LEGS_BUILT_FROM.append(options)
         return [object()]
 
 
-def _build(monkeypatch, spot, now, day=_DAY):
+def _build(monkeypatch, spot, now, day=_DAY, expiry=None, options=None):
     """One _session_surface_sync build with the database stubbed out. Returns
     (as-of queries it ran, the response). The as-of query is the expensive part:
-    one DISTINCT ON over option_chains per cold past column."""
+    one DISTINCT ON over option_chains per cold past column. ``options`` is the
+    book each as-of query returns."""
     calls = []
+    book = [{}] if options is None else options
 
     def load_asof(sym, tau):
         calls.append(tau)
-        return {"timestamp": tau, "spot": spot, "options": [{}]}
+        return {"timestamp": tau, "spot": spot, "options": book}
 
     monkeypatch.setattr(ff, "_load_asof", load_asof)
     monkeypatch.setattr(ff, "AnalyticsEngine", _FakeEngine)
@@ -85,7 +93,7 @@ def _build(monkeypatch, spot, now, day=_DAY):
     monkeypatch.setattr(ff, "_session_price_bars", lambda *a, **k: [])
     monkeypatch.setattr(ff, "session_column_flow", lambda *a, **k: ([0.0] * 41, None, None))
     ctx = {"timestamp": now, "spot": spot, "r": 0.04, "q": 0.0, "legs": []}
-    result = ff._session_surface_sync(ctx, "SPY", ff._DEFAULT_VIEW_SPAN_PCT, 30, 8)
+    result = ff._session_surface_sync(ctx, "SPY", ff._DEFAULT_VIEW_SPAN_PCT, 30, 8, expiry)
     return len(calls), result
 
 
@@ -125,6 +133,91 @@ def test_every_worker_builds_the_same_grid(monkeypatch):
         assert first_worker["prices"] == second_worker["prices"]
     finally:
         ff._past_col_cache.clear()
+
+
+# An as-of book holding two expirations.
+_TWO_EXPIRIES = [
+    {"option_symbol": "SPY261117C00680000", "expiration": date(2026, 11, 17)},
+    {"option_symbol": "SPY261120C00680000", "expiration": date(2026, 11, 20)},
+]
+
+
+def test_for_expiry_keeps_one_expiration_or_all_of_them():
+    assert ff._for_expiry(_TWO_EXPIRIES, None) == _TWO_EXPIRIES
+    assert ff._for_expiry(_TWO_EXPIRIES, "2026-11-20") == [_TWO_EXPIRIES[1]]
+    assert ff._for_expiry(_TWO_EXPIRIES, "2026-11-27") == []
+
+
+def test_past_columns_use_only_the_requested_expiry(monkeypatch):
+    """``?expiry=`` used to price the field's PAST columns from every expiration
+    while its live and projected columns used only the one asked for, so the two
+    halves of one chart described different books."""
+    ff._past_col_cache.clear()
+    _LEGS_BUILT_FROM.clear()
+    try:
+        cold, result = _build(
+            monkeypatch, 680.00, _et(14, 0), expiry="2026-11-20", options=_TWO_EXPIRIES
+        )
+        assert cold == 21 and len(_LEGS_BUILT_FROM) == 21
+        assert all(opts == [_TWO_EXPIRIES[1]] for opts in _LEGS_BUILT_FROM)
+        assert result["now_index"] == 21
+    finally:
+        ff._past_col_cache.clear()
+        _LEGS_BUILT_FROM.clear()
+
+
+def test_an_expiry_field_and_the_full_field_keep_separate_past_columns(monkeypatch):
+    """The past-column cache key carries the expiry: a full-chain column must not
+    be served to an expiry request, or the reverse, and each still stays cached."""
+    ff._past_col_cache.clear()
+    try:
+        full = dict(options=_TWO_EXPIRIES)
+        one = dict(expiry="2026-11-20", options=_TWO_EXPIRIES)
+        assert _build(monkeypatch, 680.00, _et(14, 0), **full)[0] == 21
+        assert _build(monkeypatch, 680.00, _et(14, 0), **one)[0] == 21
+        assert _build(monkeypatch, 680.05, _et(14, 0), **one)[0] == 0
+        assert _build(monkeypatch, 680.05, _et(14, 0), **full)[0] == 0
+    finally:
+        ff._past_col_cache.clear()
+
+
+def test_a_past_bucket_without_the_expiry_gets_no_column(monkeypatch):
+    """A bucket whose book had no contracts of that expiration is left out, the
+    same way the live book returns nothing for it, rather than priced as an
+    empty book."""
+    ff._past_col_cache.clear()
+    _LEGS_BUILT_FROM.clear()
+    try:
+        _, result = _build(
+            monkeypatch, 680.00, _et(14, 0), expiry="2026-11-27", options=_TWO_EXPIRIES
+        )
+        assert _LEGS_BUILT_FROM == []
+        assert result["now_index"] == 0  # no past columns: now + projection only
+    finally:
+        ff._past_col_cache.clear()
+        _LEGS_BUILT_FROM.clear()
+
+
+def test_session_surface_async_hands_the_expiry_to_the_build(monkeypatch):
+    import asyncio
+
+    ff._cache.clear()
+    ff._inflight_tasks.clear()
+    _stub_book(monkeypatch)
+    seen = []
+
+    def build(book, sym, span, past_steps, future_steps, expiry=None):
+        seen.append(expiry)
+        return {"symbol": sym, "z": [[1.0]], "now_index": 0}
+
+    monkeypatch.setattr(ff, "_session_surface_sync", build)
+    try:
+        asyncio.run(ff._session_surface_async("SPY", 0.02, 30, 8, "2026-11-20"))
+        assert seen == ["2026-11-20"]
+    finally:
+        ff._cache.clear()
+        ff._inflight_tasks.clear()
+        ff._book_cache.clear()
 
 
 def test_past_col_cache_get_put_and_day_prune():
