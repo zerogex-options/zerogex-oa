@@ -84,6 +84,9 @@ idea, in R, net of a friction charge (`PLAYBOOK_ADAPTIVE_COST_R`, 0.10):
 * graded ideas from the last `PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS` (90), each
   weighted by age with a `PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS` (30) half-life, so
   the record follows the market rather than averaging it forever;
+* but none issued before `PLAYBOOK_ADAPTIVE_SINCE` (2026-09-25, an ET date).
+  Cards before then printed fixed-distance exits that `reach.py` replaced that
+  day, so their grades stay in the record customers see but don't move the bar;
 * blended with how the same pattern did everywhere else (other symbols, the
   other direction), which is itself blended with "no edge", each side counted
   as `PLAYBOOK_ADAPTIVE_PRIOR_WEIGHT` (10) ideas. Three lucky or unlucky trades

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 
 import pytest
 
@@ -179,6 +180,31 @@ def test_records_sql_leaves_out_repeats_and_ungraded_rows():
     assert "NOT is_repeat" in sql
     assert "'target_hit', 'stop_hit', 'time_exit'" in sql
     assert "%s" not in sql and "$1" not in sql  # runs under both drivers
+
+
+def test_records_sql_learns_nothing_from_before_the_floor(monkeypatch):
+    # Restored pre-2026-09-25 grades must not move today's bars.
+    monkeypatch.setattr(config, "PLAYBOOK_ADAPTIVE_SINCE", date(2026, 9, 25))
+    sql = gate.records_sql()
+    assert "issued_at >= (DATE '2026-09-25')::timestamp AT TIME ZONE 'America/New_York'" in sql
+    monkeypatch.setattr(config, "PLAYBOOK_ADAPTIVE_SINCE", date(2026, 12, 1))
+    assert "DATE '2026-12-01'" in gate.records_sql()
+
+
+def test_records_sql_floor_cannot_carry_sql(monkeypatch):
+    monkeypatch.setattr(config, "PLAYBOOK_ADAPTIVE_SINCE", "2026-09-25'; DROP TABLE x; --")
+    with pytest.raises(ValueError):
+        gate.records_sql()
+
+
+def test_adaptive_since_setting_reads_a_date_and_survives_a_bad_one(monkeypatch):
+    default = date(2026, 9, 25)
+    monkeypatch.delenv("ZGX_TEST_SINCE", raising=False)
+    assert config._getenv_date("ZGX_TEST_SINCE", default) == default
+    monkeypatch.setenv("ZGX_TEST_SINCE", "2026-10-01  # moved after the exit change")
+    assert config._getenv_date("ZGX_TEST_SINCE", default) == date(2026, 10, 1)
+    monkeypatch.setenv("ZGX_TEST_SINCE", "next tuesday")
+    assert config._getenv_date("ZGX_TEST_SINCE", default) == default
 
 
 # ----------------------------------------------------------------------

@@ -13,7 +13,9 @@ the grader (``grading.py``) writes to ``playbook_card_outcomes``:
   -1, and a Card that ran out its hold scores wherever price ended up. A fixed
   friction charge (``PLAYBOOK_ADAPTIVE_COST_R``) comes off every idea.
 * Records are kept per (pattern, symbol, direction) and recency-weighted
-  (``PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS``). Each is blended with how the same
+  (``PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS``), from ideas issued on or after
+  ``PLAYBOOK_ADAPTIVE_SINCE`` (an ET date; Cards before 2026-09-25 printed
+  exits that no longer exist). Each is blended with how the same
   pattern did everywhere else (other symbols, the other direction), which is
   itself blended with "no edge", each side weighted as
   ``PLAYBOOK_ADAPTIVE_PRIOR_WEIGHT`` ideas. A thin record therefore leans on
@@ -42,6 +44,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Iterable, Optional
 
 from src import config
@@ -264,12 +267,15 @@ def records_sql() -> str:
     """Per (pattern, symbol, direction) aggregate over the lookback.
 
     Parameter-free so the same text runs under psycopg2 and asyncpg; the only
-    interpolated values are the two numeric settings, forced through
-    ``int``/``float``. Repeat Cards (the same idea re-issued while its first
-    Card was still live) are left out: they are one idea, not several.
+    interpolated values are the settings, forced through ``int``/``float``
+    and, for the ``PLAYBOOK_ADAPTIVE_SINCE`` floor, a round trip through
+    ``date``. Repeat Cards (the same idea re-issued while its first Card was
+    still live) are left out: they are one idea, not several. So are ideas
+    issued before the floor, an ET date.
     """
     lookback = int(config.PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS)
     half_life = float(config.PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS)
+    since = date.fromisoformat(str(config.PLAYBOOK_ADAPTIVE_SINCE)).isoformat()
     outcomes = ", ".join(f"'{o}'" for o in GRADED_OUTCOMES)
     return f"""
         SELECT pattern, underlying, direction,
@@ -287,6 +293,7 @@ def records_sql() -> str:
                    ) AS w
             FROM playbook_card_outcomes
             WHERE issued_at > NOW() - INTERVAL '{lookback} days'
+              AND issued_at >= (DATE '{since}')::timestamp AT TIME ZONE 'America/New_York'
               AND outcome IN ({outcomes})
               AND r_multiple IS NOT NULL
               AND NOT is_repeat

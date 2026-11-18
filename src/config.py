@@ -7,6 +7,7 @@ All configurable constants in one place for easy tuning.
 import json
 import logging
 import os
+from datetime import date
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
@@ -225,6 +226,24 @@ def _getenv_str(name: str, default: str) -> str:
     if cleaned is None or cleaned == "":
         return default
     return cleaned
+
+
+def _getenv_date(name: str, default: date) -> date:
+    """Fetch a ``YYYY-MM-DD`` date env var; unset, empty or invalid → ``default``."""
+    raw = os.getenv(name)
+    cleaned = _strip_env_value(raw)
+    if cleaned is None or cleaned == "":
+        return default
+    try:
+        return date.fromisoformat(cleaned)
+    except ValueError:
+        _cfg_logger.error(
+            "Invalid date for env var %s=%r (want YYYY-MM-DD) — falling back to default %s",
+            name,
+            raw,
+            default.isoformat(),
+        )
+        return default
 
 
 # =============================================================================
@@ -1362,6 +1381,13 @@ PLAYBOOK_ADAPTIVE_LOOKBACK_DAYS = _getenv_int(
 PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS = _getenv_float(
     "PLAYBOOK_ADAPTIVE_HALF_LIFE_DAYS", 30.0, min=1.0, max=365.0
 )
+# ...and how far back it may reach at most: only ideas issued on or after this
+# ET date count. Cards before 2026-09-25 printed fixed-distance exits that
+# reach.py replaced that day, so their grades say nothing about today's Cards.
+# They stay in the graded record customers see; the bar just doesn't learn
+# from them. Without this floor, putting the pre-wipe history back
+# (make playbook-restore-cards) would move every bar until 2026-12-23.
+PLAYBOOK_ADAPTIVE_SINCE = _getenv_date("PLAYBOOK_ADAPTIVE_SINCE", date(2026, 9, 25))
 # A pattern keeps the neutral bar until it has this many graded ideas.
 PLAYBOOK_ADAPTIVE_MIN_IDEAS = _getenv_int("PLAYBOOK_ADAPTIVE_MIN_IDEAS", 8, min=1)
 # Shrinkage: a symbol's record is blended with how the same pattern did
