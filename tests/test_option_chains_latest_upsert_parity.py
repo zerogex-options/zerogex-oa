@@ -598,3 +598,62 @@ def test_a_greeks_gap_that_moves_gex_passes_and_a_gamma_drift_fails(scratch_db):
     assert (broken["oi_differs"], broken["volume_differs"]) == (0, 0)
     assert broken["status"] == "fail"
     assert broken["unexplained_examples"] == [drifted]
+
+
+def test_an_iv_gap_passes_and_an_unexplained_iv_change_fails(scratch_db):
+    """NVDA after the 2026-11-17 close: open interest, volume and total net GEX
+    identical, the flip and net GEX at spot moved. When the IV solver fails,
+    ingestion prices the Greeks off its default IV and stores no IV, so the
+    newest history row has gamma but no IV while the cache keeps the last
+    solved IV. That is by design and must pass. An IV that differs while
+    history HAS one is not explained, and must fail."""
+    engine = _make_engine_for_write_test()
+    exp = date(2026, 11, 20)
+    t1, t2 = _et(_SESSION, 11, 0), _et(_SESSION, 11, 1)
+
+    def rows_at(ts, iv_600=0.25):
+        out = []
+        for k, cp in ((595.0, "P"), (600.0, "C"), (605.0, "C")):
+            row = _row(f"SPY261120{cp}00{int(k) * 1000:06d}", ts, volume=100, open_interest=2000)
+            row.update(strike=k, option_type=cp, expiration=exp, implied_volatility=0.25)
+            if k == 600.0:
+                row["implied_volatility"] = iv_600
+            out.append(row)
+        return out
+
+    with _patched_writer_connection(scratch_db):
+        engine._write_option_rows(rows_at(t1))
+        engine._write_option_rows(rows_at(t2, iv_600=None))  # the 11:01 IV solve failed
+
+    changed = rows_at(t1)[0]["option_symbol"]
+    conn = scratch_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO underlying_quotes VALUES ('SPY', %s, 600.0)", (t2,))
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            result = compare_snapshot(cur, AnalyticsEngine(underlying="SPY"))
+        conn.rollback()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE option_chains_latest SET implied_volatility = 0.40 "
+                "WHERE option_symbol = %s",
+                (changed,),
+            )
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            broken = compare_snapshot(cur, AnalyticsEngine(underlying="SPY"))
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert (result["oi_differs"], result["volume_differs"]) == (0, 0)
+    assert result["greeks_differ"] == 1 and result["iv_gap"] == 1 and result["greeks_gap"] == 0
+    assert result["unexplained"] == 0 and result["status"] == "pass", result
+    assert "total_net_gex" not in result["gex_differs"]
+
+    assert broken["status"] == "fail"
+    assert broken["unexplained_examples"] == [changed]
