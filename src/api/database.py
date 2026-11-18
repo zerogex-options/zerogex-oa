@@ -10444,7 +10444,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # ========================================================================
 
     async def get_gex_heatmap(
-        self, symbol: str = "SPY", timeframe: str = "5min", window_units: int = 60
+        self,
+        symbol: str = "SPY",
+        timeframe: str = "5min",
+        window_units: int = 60,
+        expirations: Optional[List[date]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Get GEX data by strike over time for heatmap visualization.
@@ -10459,10 +10463,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         by ``strike``.  Each cell's ``net_gex`` is the strike's TOTAL across
         its expirations at the bucket's representative snapshot (see the
         ``strikes`` CTE), the same per-strike figure the live ladder shows.
+
+        ``expirations=None`` sums every expiration and carries the canonical
+        whole-chain flip from ``gex_summary``.  A list of dates sums only those
+        expirations, and the flip follows that scope the way
+        ``get_strike_profile_timeseries`` scopes it: recomputed per bucket by
+        :func:`compute_gamma_flip_from_strikes` from the scope's strikes (every
+        strike holding a position, not just the band the cells cover) against
+        the bucket's own close, ``None`` when the scope has no flip, and with
+        ``gamma_flip_span_used`` ``None`` because the span belongs to the
+        whole-chain resolver.  A whole-chain flip over a subset's cells would
+        describe a book the surface is not showing.
         """
         symbol = symbol.upper()
         window_units = max(1, min(window_units, 300))
-        cache_key = f"gex_heatmap:{symbol}:{timeframe}:{window_units}"
+        # Same normalisation as the strike-profile read: dedupe, sort, and an
+        # empty list collapses to None (All), so the cache key has one shape
+        # per scope.
+        exp_filter: Optional[List[date]] = sorted(set(expirations)) if expirations else None
+        cache_key = f"gex_heatmap:{symbol}:{timeframe}:{window_units}:{_exp_scope(exp_filter)}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
@@ -10517,6 +10536,72 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # interpolate alongside the other validated fragments below.
         band_pct = self._gex_heatmap_strike_band_pct
         strike_band = f"(SELECT spot_close FROM spot) * {band_pct:g}"
+        in_band = f"ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}"
+        # Expiration scope.  With All (exp_filter None) every scope fragment
+        # below is empty and the lateral filters on the band, so that query is
+        # exactly the one this endpoint ran before it took a scope.
+        #
+        # With a set of dates, the lateral sums only those expirations and
+        # also returns what the scoped flip needs: summed raw call / put gamma
+        # and whether the strike holds any position.  The flip is computed in
+        # Python from EVERY strike holding a position, not just the band the
+        # cells cover, against the bucket's own close, which is the input
+        # get_strike_profile_timeseries hands compute_gamma_flip_from_strikes.
+        # So the band moves from WHERE to HAVING, where it keeps every in-band
+        # strike (zero cells included: a zero is a real neutral cell) plus the
+        # out-of-band strikes that hold a position; the zero-OI wings stay out.
+        # Rows outside the band never become cells (``in_band`` is false).
+        lateral_filter = f"AND {in_band}"
+        scope_cell_columns = ""
+        scope_having = ""
+        scope_strike_columns = ""
+        scope_closes_cte = ""
+        scope_select_columns = ""
+        scope_join = ""
+        if exp_filter is not None:
+            params.append(exp_filter)
+            exp_idx = len(params)
+            has_position = (
+                "SUM(COALESCE(g.call_gamma, 0)) <> 0"
+                "\n                            OR SUM(COALESCE(g.put_gamma, 0)) <> 0"
+                "\n                            OR SUM(COALESCE(g.call_oi, 0)) <> 0"
+                "\n                            OR SUM(COALESCE(g.put_oi, 0)) <> 0"
+            )
+            lateral_filter = f"AND g.expiration = ANY(${exp_idx}::date[])"
+            scope_cell_columns = f""",
+                        SUM(COALESCE(g.call_gamma, 0)) AS call_gamma,
+                        SUM(COALESCE(g.put_gamma, 0)) AS put_gamma,
+                        {in_band} AS in_band,
+                        ({has_position}) AS has_position"""
+            scope_having = f"""
+                    HAVING {in_band}
+                            OR {has_position}"""
+            scope_strike_columns = """,
+                    cell.call_gamma,
+                    cell.put_gamma,
+                    cell.in_band,
+                    cell.has_position"""
+            # The bucket's close, the last underlying bar inside it, bucketed
+            # with the same expression as bucket_reps.  The same close the
+            # strike-profile read's ohlc CTE derives for the same bucket.
+            scope_closes_cte = f"""
+            closes AS (
+                SELECT DISTINCT ON ({bucket})
+                    {bucket} AS bucket_ts,
+                    close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                    AND timestamp >= (SELECT start_time FROM time_window)
+                    AND timestamp <= (SELECT end_time FROM time_window)
+                ORDER BY {bucket}, timestamp DESC
+            ),"""
+            scope_select_columns = """
+                s.call_gamma,
+                s.put_gamma,
+                s.in_band,
+                s.has_position,
+                c.close,"""
+            scope_join = "\n            LEFT JOIN closes c ON c.bucket_ts = s.bucket_ts"
         # `bucket` is a validated allowlist literal.
         #
         # Anchor choice: the window's right edge (``max_ts``) is the most
@@ -10589,7 +10674,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window){session_filter}
                 ORDER BY {bucket}, timestamp DESC
-            ),
+            ),{scope_closes_cte}
             -- BOUNDED READ — the gex_by_strike probe is fenced to the
             -- ~window_units bucket-representative timestamps by construction,
             -- and no query plan can widen it.
@@ -10647,25 +10732,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     br.gamma_flip,
                     br.gamma_flip_span_used,
                     cell.strike,
-                    cell.net_gex
+                    cell.net_gex{scope_strike_columns}
                 FROM bucket_reps br
                 CROSS JOIN LATERAL (
                     SELECT
                         g.strike,
-                        SUM(g.net_gex) AS net_gex
+                        SUM(g.net_gex) AS net_gex{scope_cell_columns}
                     FROM gex_by_strike g
                     WHERE g.underlying = $1
                       AND g.timestamp = br.rep_ts
                       AND g.timestamp BETWEEN (SELECT start_time FROM time_window)
                                           AND (SELECT end_time FROM time_window)
-                      AND ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
-                    GROUP BY g.strike
+                      {lateral_filter}
+                    GROUP BY g.strike{scope_having}
                 ) cell
             )
             SELECT
                 s.bucket_ts AS timestamp,
                 s.strike,
-                s.net_gex,
+                s.net_gex,{scope_select_columns}
                 -- gamma_flip is one value per bucket (the bucket's
                 -- representative gex_summary row), but rows here are
                 -- per-strike.  The CASE emits it on only the lowest-strike
@@ -10691,7 +10776,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     WHEN s.strike = MIN(s.strike) OVER (PARTITION BY s.bucket_ts)
                     THEN s.gamma_flip_span_used
                 END AS gamma_flip_span_used
-            FROM strikes s
+            FROM strikes s{scope_join}
             ORDER BY s.bucket_ts DESC, s.strike ASC
         """
 
@@ -10718,8 +10803,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # insertion order, so the query's bucket_ts DESC /
                 # strike ASC ordering carries through.
                 grouped: Dict[Any, Dict[str, Any]] = {}
+                # Under an expiration scope: each bucket's flip inputs (every
+                # strike holding a position, in or out of the band) and its
+                # close.  See the scope fragments above the query.
+                flip_inputs: Dict[Any, List[Dict[str, float]]] = {}
+                closes: Dict[Any, Any] = {}
                 for r in flat:
                     ts = r["timestamp"]
+                    if exp_filter is not None:
+                        closes.setdefault(ts, r.get("close"))
+                        if r.get("has_position"):
+                            flip_inputs.setdefault(ts, []).append(
+                                {
+                                    "strike": float(r["strike"]),
+                                    "call_gamma": float(r.get("call_gamma") or 0.0),
+                                    "put_gamma": float(r.get("put_gamma") or 0.0),
+                                }
+                            )
+                        # Out-of-band strikes came back for the flip only.
+                        if not r.get("in_band"):
+                            continue
                     bucket = grouped.get(ts)
                     if bucket is None:
                         bucket = {
@@ -10733,6 +10836,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         bucket["gamma_flip"] = r.get("gamma_flip")
                         bucket["gamma_flip_span_used"] = r.get("gamma_flip_span_used")
                     bucket["heatmap"].append({"strike": r["strike"], "net_gex": r["net_gex"]})
+                if exp_filter is not None:
+                    # The stored flip is whole-chain, so it never reaches a
+                    # scoped bucket: recompute it from the scope's strikes, as
+                    # the strike-profile read does, and None when the scope has
+                    # no flip (or the bucket has no close to gate it against).
+                    for ts, bucket in grouped.items():
+                        close = closes.get(ts)
+                        inputs = flip_inputs.get(ts)
+                        bucket["gamma_flip"] = (
+                            compute_gamma_flip_from_strikes(inputs, float(close))
+                            if close is not None and inputs
+                            else None
+                        )
+                        bucket["gamma_flip_span_used"] = None
                 result = list(grouped.values())
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
