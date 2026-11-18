@@ -148,9 +148,12 @@ It samples every symbol in `ANALYTICS_UNDERLYINGS` every 10 minutes. Each
 sample reads both snapshot paths in one read-only `REPEATABLE READ`
 transaction, so they see identical data, and costs one history snapshot query
 per symbol. The last line is `PARITY: PASS` or `PARITY: FAIL`. A sample fails
-on any contract whose OI or volume differs for a reason other than a Greeks
-gap (see below), or when a wall, max-gamma strike or max pain differs, the
-flip moves more than 0.1% of spot, or net GEX moves more than 1%.
+on any contract whose open interest, volume, gamma or implied volatility
+differs for a reason other than a Greeks gap (see below). Walls, flip, net GEX
+and max pain are printed for both paths and flagged when they differ, but do
+not fail a sample on their own: they can only move through a contract already
+counted. (Until 2026-11-18 they also failed it, which failed MSFT on a
+difference made entirely of Greeks gaps.)
 
 **Expected, by-design differences** (reported, not failed): a contract whose
 newest history row has no gamma (ingestion's Greeks gate). History then uses an
