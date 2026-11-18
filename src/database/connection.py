@@ -22,6 +22,17 @@ logger = get_logger(__name__)
 _connection_pool: Optional[pool.ThreadedConnectionPool] = None
 _pool_init_lock = threading.Lock()
 
+# Names for the two views of a connection's transaction, for log lines:
+# the server's (get_transaction_status) and psycopg2's own (conn.status).
+_TX_STATUS_NAMES = {
+    extensions.TRANSACTION_STATUS_IDLE: "IDLE",
+    extensions.TRANSACTION_STATUS_ACTIVE: "ACTIVE",
+    extensions.TRANSACTION_STATUS_INTRANS: "INTRANS",
+    extensions.TRANSACTION_STATUS_INERROR: "INERROR",
+    extensions.TRANSACTION_STATUS_UNKNOWN: "UNKNOWN",
+}
+_DRIVER_STATUS_NAMES = {extensions.STATUS_READY: "READY", extensions.STATUS_BEGIN: "BEGIN"}
+
 
 def get_db_connection():
     """
@@ -101,7 +112,32 @@ def close_db_connection(conn):
                 # Ensure we never return a connection "idle in transaction"
                 # to the pool (this can hold locks and bloat table churn).
                 conn.rollback()
-                logger.warning("Rolled back open transaction before returning DB connection")
+                after = conn.get_transaction_status()
+                if after == extensions.TRANSACTION_STATUS_IDLE:
+                    logger.warning("Rolled back open transaction before returning DB connection")
+                else:
+                    # The rollback did nothing. psycopg2's rollback() sends
+                    # ROLLBACK only when the DRIVER believes it opened a
+                    # transaction, while get_transaction_status() reports the
+                    # SERVER's view. Once the two disagree (psycopg2's commit()
+                    # marks the driver idle even when COMMIT raised), every
+                    # later borrower's first statement fails with "current
+                    # transaction is aborted", its own rollback is just as
+                    # empty, and re-parking hands the connection out again,
+                    # until the process restarts. That is the 2026-11-17 API
+                    # incident: 269 failed reads in the half hour checked.
+                    # Discard it instead. The stack shows whose connection it
+                    # was, the first lead on how it got into this state.
+                    logger.warning(
+                        "DB connection still in a transaction after rollback "
+                        "(server %s, was %s; driver %s); discarding it instead "
+                        "of returning it to the pool",
+                        _TX_STATUS_NAMES.get(after, after),
+                        _TX_STATUS_NAMES.get(tx_status, tx_status),
+                        _DRIVER_STATUS_NAMES.get(getattr(conn, "status", None), "?"),
+                        stack_info=True,
+                    )
+                    discard = True
             # Reset session-level state that callers may have set on this
             # conn (e.g. ``runner.execute_run`` and ``worker.py`` set
             # ``conn.autocommit = True`` for their lifetime so per-statement
@@ -113,7 +149,7 @@ def close_db_connection(conn):
             # caller's own code. ``autocommit=False`` is psycopg2's
             # default, so resetting here normalizes every checkout to a
             # known starting state.
-            if getattr(conn, "autocommit", False):
+            if not discard and getattr(conn, "autocommit", False):
                 conn.autocommit = False
         except Exception:
             logger.warning("DB connection unusable during pool return; discarding", exc_info=True)
