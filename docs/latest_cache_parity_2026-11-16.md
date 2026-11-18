@@ -149,16 +149,26 @@ sample reads both snapshot paths in one read-only `REPEATABLE READ`
 transaction, so they see identical data, and costs one history snapshot query
 per symbol. The last line is `PARITY: PASS` or `PARITY: FAIL`. A sample fails
 on any contract whose open interest, volume, gamma or implied volatility
-differs for a reason other than a Greeks gap (see below). Walls, flip, net GEX
+differs for a reason other than a Greeks or IV gap (see below). Walls, flip, net GEX
 and max pain are printed for both paths and flagged when they differ, but do
 not fail a sample on their own: they can only move through a contract already
 counted. (Until 2026-11-18 they also failed it, which failed MSFT on a
 difference made entirely of Greeks gaps.)
 
-**Expected, by-design differences** (reported, not failed): a contract whose
-newest history row has no gamma (ingestion's Greeks gate). History then uses an
-older gamma-bearing row or drops the contract; the cache keeps the newest row
-with its last good Greeks. These are mostly an off-hours effect.
+**Expected, by-design differences** (reported, not failed), both because the
+cache keeps the last good value where a history row has none:
+
+- **Greeks gap:** a contract whose newest history row has no gamma (ingestion's
+  Greeks gate). History then uses an older gamma-bearing row or drops the
+  contract; the cache keeps the newest row with its last good Greeks. These
+  are mostly an off-hours effect.
+- **IV gap:** the newest history row has gamma but no implied volatility (the
+  IV solver failed, so ingestion priced the Greeks off its default IV and
+  stored no IV). Only the IV differs: the cache still has the last solved IV.
+  Total net GEX agrees; the flip and net GEX at spot, which reprice gamma from
+  IV, can move. That matches NVDA after the close on 2026-11-17: open
+  interest, volume and total net GEX identical, the flip and net GEX at spot
+  moved.
 
 Two more differences the tool does not exercise: the first cycle after a
 restart on stale data uses the 96-hour cold-start window on the history path

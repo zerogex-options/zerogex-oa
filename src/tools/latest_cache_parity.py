@@ -19,15 +19,24 @@ with the engine's own anchor (the newest ``option_chains`` row), lookback,
     ``_calculate_gex_summary``: call wall, put wall, gamma flip, net GEX at
     spot, total net GEX, max-gamma strike and max pain.
 
-One difference is expected and reported apart: a contract whose newest history
-row has no gamma (ingestion's Greeks gate).  History then falls back to an
-older gamma-bearing row, or drops the contract, while the cache keeps its
-newest row with the last good Greeks, so the two can differ there by design.
+Two differences are expected and reported apart, both because the cache keeps
+the last good value where a history row has none:
+
+  * a Greeks gap: the contract's newest history row has no gamma (ingestion's
+    Greeks gate).  History falls back to an older gamma-bearing row, or drops
+    the contract, while the cache keeps its newest row with the last good
+    Greeks, so any of its inputs can differ;
+  * an IV gap: the newest history row has gamma but no implied volatility
+    (the IV solver failed, so ingestion priced the Greeks off its default IV
+    and stored no IV).  Both paths read that same row, but the cache still
+    carries the last solved IV, so only the IV differs.  Stored gamma, and
+    with it total net GEX, agree; the flip and net GEX at spot, which reprice
+    gamma from IV across a spot grid, can move (NVDA on 2026-11-17).
 
 A sample passes when no contract differs for any other reason.  The GEX
 readings are shown side by side and do not fail a sample on their own: the
 inputs are compared contract by contract, so GEX can only move through a
-contract already counted, and a Greeks gap moving it is the by-design case
+contract already counted, and a gap moving it is one of the by-design cases
 above.  (On 2026-11-16 MSFT failed on total net GEX alone, every differing
 contract a Greeks gap.)
 
@@ -68,7 +77,8 @@ FLIP_TOLERANCE_PCT_OF_SPOT = 0.001  # 0.1% of spot
 NET_GEX_TOLERANCE_REL = 0.01  # 1% of the larger magnitude
 
 _NEWEST_HISTORY_ROW_SQL = """
-    SELECT DISTINCT ON (option_symbol) option_symbol, gamma IS NULL
+    SELECT DISTINCT ON (option_symbol)
+        option_symbol, gamma IS NULL, implied_volatility IS NULL
     FROM option_chains
     WHERE option_symbol = ANY(%s)
       AND timestamp <= %s
@@ -216,29 +226,33 @@ def compare_snapshot(
     volume_differs = sorted(
         s for s in hist.keys() & cache.keys() if hist[s]["volume"] != cache[s]["volume"]
     )
-    greeks_differ = sorted(
+    gamma_differs = {s for s in hist.keys() & cache.keys() if hist[s]["gamma"] != cache[s]["gamma"]}
+    iv_differs = {
         s
         for s in hist.keys() & cache.keys()
-        if hist[s]["gamma"] != cache[s]["gamma"]
-        or hist[s]["implied_volatility"] != cache[s]["implied_volatility"]
-    )
+        if hist[s]["implied_volatility"] != cache[s]["implied_volatility"]
+    }
+    greeks_differ = sorted(gamma_differs | iv_differs)
     only_history = sorted(hist.keys() - cache.keys())
     only_cache = sorted(cache.keys() - hist.keys())
 
-    # Contracts whose newest history row has no gamma explain themselves; see
-    # the module docstring.  One indexed lookup, only for contracts that differ.
-    suspects = sorted(
-        set(oi_differs)
-        | set(volume_differs)
-        | set(greeks_differ)
-        | set(only_history)
-        | set(only_cache)
+    # The by-design gaps explain themselves; see the module docstring.  One
+    # indexed lookup, only for contracts that differ.  A Greeks gap explains any
+    # difference; an IV gap explains a contract whose only difference is its IV.
+    not_iv_only = (
+        set(oi_differs) | set(volume_differs) | gamma_differs | set(only_history) | set(only_cache)
     )
+    suspects = sorted(not_iv_only | iv_differs)
     greeks_gap: set = set()
+    iv_gap: set = set()
     if suspects:
         cursor.execute(_NEWEST_HISTORY_ROW_SQL, (suspects, anchor, lookback_start))
-        greeks_gap = {sym for sym, gamma_is_null in cursor.fetchall() if gamma_is_null}
-    unexplained = [s for s in suspects if s not in greeks_gap]
+        for sym, gamma_is_null, iv_is_null in cursor.fetchall():
+            if gamma_is_null:
+                greeks_gap.add(sym)
+            elif iv_is_null and sym not in not_iv_only:
+                iv_gap.add(sym)
+    unexplained = [s for s in suspects if s not in greeks_gap and s not in iv_gap]
 
     hist_strikes = _by_strike(list(hist.values()))
     cache_strikes = _by_strike(list(cache.values()))
@@ -277,6 +291,7 @@ def compare_snapshot(
         "volume_differs": len(volume_differs),
         "greeks_differ": len(greeks_differ),
         "greeks_gap": len(greeks_gap),
+        "iv_gap": len(iv_gap),
         "unexplained": len(unexplained),
         "unexplained_examples": unexplained[:5],
         "strikes_oi_differ": strikes_differ["open_interest"],
@@ -329,7 +344,8 @@ def _line(result: Dict[str, Any]) -> str:
         f"OI-diff {result['oi_differs']}  vol-diff {result['volume_differs']}  "
         f"greeks-diff {result['greeks_differ']}  "
         f"one-side {result['only_history']}+{result['only_cache']}  "
-        f"greeks-gap {result['greeks_gap']}  unexplained {result['unexplained']}  "
+        f"greeks-gap {result['greeks_gap']}  iv-gap {result['iv_gap']}  "
+        f"unexplained {result['unexplained']}  "
         f"{gex}  [{result['status'].upper()}]"
         + (f"  GEX differs: {','.join(result['gex_differs'])}" if result["gex_differs"] else "")
         + (
