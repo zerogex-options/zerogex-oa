@@ -66,7 +66,12 @@ from src.tradeworkz.bots import base as bot_base
 from src.tradeworkz.chain import fit_legs_to_chain, listed_strike_increment
 from src.tradeworkz.context import build_snapshot
 from src.tradeworkz.models import BotSpec, OpenPosition
-from src.tradeworkz.pricing import _leg_intrinsic, _underlying_from_option_symbol
+from src.tradeworkz.pricing import (
+    _leg_intrinsic,
+    _underlying_from_option_symbol,
+    charge_net_slippage,
+    entry_cost_fraction,
+)
 from src.tradeworkz.reconciler import (
     _cap_time_stop_for_fit,
     _earliest_leg_expiration,
@@ -225,11 +230,14 @@ def historical_spread_price(
     intrinsic against the underlying's regular-session close (via
     :func:`pricing._leg_intrinsic`), so an expired 0DTE books its cash P&L
     instead of failing to price.
+
+    Same fill model as live: natural fills per leg, slippage charged once on
+    the net (:func:`pricing.charge_net_slippage`), exact intrinsic.
     """
     slip = tw_config.EXECUTION_SLIPPAGE_PCT if slippage_pct is None else slippage_pct
     settle_day = at.astimezone(_ET).date()
-    long_sum = 0.0
-    short_sum = 0.0
+    quoted_net = 0.0
+    intrinsic_net = 0.0
     for leg in legs:
         side = (leg.get("side") or "").lower()
         if side not in {"long", "short"}:
@@ -240,23 +248,16 @@ def historical_spread_price(
                 intrinsic = _leg_intrinsic(conn, leg, settle_day)
                 if intrinsic is not None:
                     # _leg_intrinsic already carries the short-side sign, so it
-                    # is the leg's per-share P&L contribution; feed it back
-                    # through the same long_sum − short_sum convention.
-                    if side == "long":
-                        long_sum += intrinsic
-                    else:
-                        short_sum += -intrinsic
+                    # IS the leg's contribution to the net; settlement is exact.
+                    intrinsic_net += intrinsic
                     continue
             return None
         bid, ask, last = quote
         price = leg_fill_price(
-            bid=bid, ask=ask, last=last, side=side, action=action, slippage_pct=slip
+            bid=bid, ask=ask, last=last, side=side, action=action, slippage_pct=0.0
         )
-        if side == "long":
-            long_sum += price
-        else:
-            short_sum += price
-    return long_sum - short_sum
+        quoted_net += price if side == "long" else -price
+    return charge_net_slippage(quoted_net, action, slip) + intrinsic_net
 
 
 # ===========================================================================
@@ -463,6 +464,22 @@ class _BotRunner:
         else:
             self._entry_reject("zero_net")
             return
+        # Entry-cost gate, as live: refuse a trade that opens deep under water
+        # on the bid/ask alone (config.MAX_ENTRY_COST_PCT).
+        max_cost = float(tw_config.MAX_ENTRY_COST_PCT)
+        if max_cost > 0:
+            close_now = historical_spread_price(
+                conn,
+                legs,
+                at=now_utc,
+                action="close",
+                slippage_pct=self.slippage_pct,
+                tolerance_min=self.tolerance_min,
+            )
+            cost = entry_cost_fraction(entry_net, close_now)
+            if cost is not None and cost > max_cost:
+                self._entry_reject("entry_cost")
+                return
         self.open_by_underlying[u] = self._make_position(
             signal, legs, entry_net, snap, now_utc, requested_legs=requested
         )

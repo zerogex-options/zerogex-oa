@@ -2,7 +2,9 @@
 
 Reads the forward-test bots' live paper trades (``tw_trades``, seeder rows
 excluded) and scores each bot overall, then split by symbol, by structure and
-by tuning (the ``params_version`` the engine stamps on every entry), against
+by tuning (the ``params_version`` the engine stamps on every entry — the
+bot's params plus the engine's ``EXECUTION_VERSION``, so trades priced under
+an older fill model never mix with today's), against
 the catalog's promotion bar — the same bar a backtest screen has to clear:
 at least ``PROMOTION_MIN_TRADES`` trades, profit factor at least
 ``PROMOTION_MIN_PROFIT_FACTOR``, positive expectancy.

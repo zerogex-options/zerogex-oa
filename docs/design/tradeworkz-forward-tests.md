@@ -98,6 +98,37 @@ option covered by a long of the same right (`sizing.is_capped_risk`), or it is
 refused. No naked shorts, short straddles or strangles: sizing divides the
 heat budget by the structure's max loss, and theirs is unbounded.
 
+## Paper-fill pricing (changed 2026-11-18)
+
+The first three sessions (20 trades, -$22,357) lost $15,992 to premium stops,
+six of them within a minute of opening at -42% to -76%. The paper fill bought
+every leg at the ask and sold at the bid, then charged 2% slippage on **each
+leg's full price**. That is mild for one option, but an SPX vertical with $20
+and $14 legs paid about $0.70 a side on a ~$6.50 debit, so with both bid/asks
+crossed it opened ~34% under water, and the 40% premium stop fired as soon as
+its 45-second grace ended. The four SPX premium stops all landed at -43% to
+-46%. The stop was measuring the fill model, not the market. Cheap,
+tight-quoted SPY single options were unaffected.
+
+Two changes, live and in the research harness alike:
+
+* **Slippage on the net price** (`pricing.charge_net_slippage`): every leg
+  fills at its natural side, and `TRADEWORKZ_EXECUTION_SLIPPAGE_PCT` is
+  charged once on the structure's net. A single option prices exactly as
+  before; that SPX vertical now opens ~17% under water.
+* **Entry-cost gate** (`TRADEWORKZ_MAX_ENTRY_COST_PCT`, default 0.25): at
+  entry the engine also prices what the position could be sold back for at
+  once, and refuses a trade that would open more than 25% of its premium
+  under water (an NDX spread at 13.76 was worth 3.32 a minute later). Each
+  trade records its `entry_cost_pct`.
+
+The engine's `EXECUTION_VERSION` went from 1 to 2 and is part of every
+trade's `params_version`, so the scorecard shows post-change trades as a new
+tuning instead of averaging them with trades priced the old way.
+
+The 2026-08-09 fleet screens used the old per-leg slippage too, so spread
+bots shelved then were measured with the same bias.
+
 ## The tweak loop
 
 1. **Change a bot's tuning** in its catalog `bot_params` (thresholds,

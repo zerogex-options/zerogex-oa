@@ -85,14 +85,28 @@ def _opens_allowed(now_utc: datetime) -> bool:
     return now_utc.astimezone(_ET).time() < _NO_NEW_OPENS_AFTER
 
 
-def params_version(params: Optional[Dict[str, Any]]) -> str:
-    """Short, stable fingerprint of a bot's effective params.
+#: Bumped whenever the engine changes how a trade is priced or admitted, so a
+#: forward test never scores trades measured two different ways as one
+#: tuning. 1 = per-leg slippage (2026-11-12). 2 = slippage on the net price
+#: plus the entry-cost gate (2026-11-18).
+EXECUTION_VERSION = 2
 
-    Every tweak to a bot's catalog params changes it, so each trade records
-    the tuning it ran under and a forward test's results split cleanly by
-    tuning. Key order and JSON round-trips don't change it.
+
+def params_version(params: Optional[Dict[str, Any]]) -> str:
+    """Short, stable fingerprint of a bot's effective params and the engine's
+    execution model (:data:`EXECUTION_VERSION`).
+
+    Every tweak to a bot's catalog params changes it, and so does a change to
+    how fills are priced, so each trade records the conditions it ran under
+    and a forward test's results split cleanly by them. Key order and JSON
+    round-trips don't change it.
     """
-    blob = json.dumps(params or {}, sort_keys=True, separators=(",", ":"), default=str)
+    blob = json.dumps(
+        {"params": params or {}, "execution": EXECUTION_VERSION},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return hashlib.sha1(blob.encode()).hexdigest()[:8]
 
 
@@ -156,17 +170,27 @@ def tick() -> Dict[str, Any]:
     if not underlyings_needed:
         underlyings_needed = set(fleet_universes) or {"SPY"}
 
-    snapshots: Dict[str, Optional[MarketSnapshot]] = {}
-    with db_connection() as conn:
-        for u in sorted(underlyings_needed):
-            snapshots[u] = build_snapshot(conn, u)
-
     # Coarse market-hours chokepoint: compute once per tick off wall-clock
     # now (not the snapshot timestamp) so the whole fleet is gated
     # consistently. When False, bots still mark + exit open positions this
     # tick — only new opens are suppressed.
     opens_allowed = _opens_allowed(datetime.now(timezone.utc))
     summary["opens_allowed"] = opens_allowed
+
+    if not opens_allowed:
+        # Outside the window nothing can open, so only an underlying with an
+        # open position needs a market read (to mark, exit or settle it).
+        # Building every symbol's ~30-read snapshot every 5 seconds all night
+        # was load with nothing to act on. Its own connection: a read left
+        # open on the snapshot connection would stop each snapshot from
+        # owning (and ending) its transaction — see _snapshot_transaction.
+        with db_connection() as conn:
+            underlyings_needed &= _held_underlyings(conn)
+
+    snapshots: Dict[str, Optional[MarketSnapshot]] = {}
+    with db_connection() as conn:
+        for u in sorted(underlyings_needed):
+            snapshots[u] = build_snapshot(conn, u)
 
     for row in bots:
         summary["ticks"] += 1
@@ -183,6 +207,13 @@ def tick() -> Dict[str, Any]:
     with db_connection() as conn:
         rollup_daily(conn)
     return summary
+
+
+def _held_underlyings(conn: Any) -> set[str]:
+    """Underlyings any bot holds an open position in."""
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT underlying FROM tw_positions")
+    return {r[0] for r in cur.fetchall() if r and r[0]}
 
 
 def _bot_underlyings(universe: str, fleet: tuple[str, ...]) -> list[str]:

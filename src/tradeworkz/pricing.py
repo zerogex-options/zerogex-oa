@@ -214,10 +214,16 @@ def spread_price(
     trade should book its cash-settlement P&L, not sit as an open
     position indefinitely with a stale mark. Never applies to
     ``action == 'open'``: we don't enter positions off intrinsic.
+
+    Fill model: every quoted leg fills at its natural side (long pays the
+    ask, short collects the bid on open; the reverse on close), and the
+    slippage is then charged once on the structure's NET price — see
+    :func:`charge_net_slippage`. A single option prices exactly as it always
+    has; a spread no longer pays slippage on each leg's full price.
     """
     slip = tw_config.EXECUTION_SLIPPAGE_PCT if slippage_pct is None else slippage_pct
-    long_sum = 0.0
-    short_sum = 0.0
+    quoted_net = 0.0
+    intrinsic_net = 0.0
     fallback_today = date.today()
     for leg in legs:
         sym = leg.get("option_symbol")
@@ -230,31 +236,58 @@ def spread_price(
         if quote is None:
             if action == "close":
                 # _leg_intrinsic already applies the short-side sign, so it
-                # returns the leg's per-share P&L contribution directly (long
-                # gets +max(0, ...), short gets -max(0, ...)). Feed that back
-                # through the same long_sum − short_sum equation the quote
-                # path uses so the return-value convention stays consistent.
+                # IS the leg's per-share contribution to the net (long gets
+                # +max(0, ...), short gets -max(0, ...)). Settlement is exact:
+                # no market is crossed, so no slippage is charged on it.
                 intrinsic = _leg_intrinsic(conn, leg, fallback_today)
                 if intrinsic is not None:
                     logger.info(
                         "spread_price: intrinsic fallback for expired leg %s = %.4f",
                         sym, intrinsic,
                     )
-                    if side == "long":
-                        long_sum += intrinsic
-                    else:
-                        # intrinsic is already negative for short legs;
-                        # subtracting a negative through the return statement
-                        # ((-) - short_sum) accumulates the correct debit.
-                        short_sum += -intrinsic
+                    intrinsic_net += intrinsic
                     continue
             return None
         bid, ask, last = quote
         price = leg_fill_price(
-            bid=bid, ask=ask, last=last, side=side, action=action, slippage_pct=slip
+            bid=bid, ask=ask, last=last, side=side, action=action, slippage_pct=0.0
         )
-        if side == "long":
-            long_sum += price
-        else:
-            short_sum += price
-    return long_sum - short_sum
+        quoted_net += price if side == "long" else -price
+    return charge_net_slippage(quoted_net, action, slip) + intrinsic_net
+
+
+def charge_net_slippage(natural_net: float, action: str, slippage_pct: float) -> float:
+    """Charge execution slippage on a structure's NET price, against the trader.
+
+    ``natural_net`` is the signed net at the natural fills (positive = we pay,
+    negative = we collect). On ``open`` we pay ``slippage_pct`` x |net| more
+    (or collect that much less); on ``close`` we collect that much less (or
+    pay that much more).
+
+    Why the net and not each leg (changed 2026-11-18): slippage used to be
+    charged on every leg's FULL price. That is mild for one option, but a
+    spread on an expensive underlying paid it on both legs' whole premiums —
+    an SPX vertical with $20 and $14 legs paid ~$0.70 a side on a ~$6.50
+    debit. Together with crossing both bid/asks it opened ~34% under water,
+    and the forward test's four SPX premium stops all fired within a minute
+    at -43% to -46%: the stop was measuring the fill model, not the market.
+    Charged on the net, that spread opens ~17% under water. For a single
+    option the net IS the leg's price, so every single-leg fill is unchanged.
+    """
+    adj = max(0.0, float(slippage_pct or 0.0)) * abs(natural_net)
+    return natural_net + adj if action == "open" else natural_net - adj
+
+
+def entry_cost_fraction(open_net: Optional[float], close_now: Optional[float]) -> Optional[float]:
+    """Share of the premium lost the instant a position opens, or None.
+
+    ``open_net`` is what the structure costs to open and ``close_now`` what it
+    could be closed for at the same moment, both signed as :func:`spread_price`
+    returns them. ``open_net - close_now`` is the round trip through the bid/ask
+    and slippage — positive for debits and credits alike — taken as a share of
+    the premium paid or collected. None when either side is unpriced or the
+    open is zero.
+    """
+    if open_net is None or close_now is None or not open_net:
+        return None
+    return (float(open_net) - float(close_now)) / abs(float(open_net))

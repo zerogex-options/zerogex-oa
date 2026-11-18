@@ -20,7 +20,7 @@ from src.tradeworkz import ml as ml_mod
 from src.tradeworkz import notifications
 from src.tradeworkz.chain import fit_legs_to_chain
 from src.tradeworkz.models import BotCapital, ExitDecision, OpenPosition, TradeSignal
-from src.tradeworkz.pricing import spread_price
+from src.tradeworkz.pricing import entry_cost_fraction, spread_price
 from src.tradeworkz.sizing import (
     compute_contracts,
     is_capped_risk,
@@ -327,6 +327,24 @@ def open_position(
         logger.debug("zero net (unfillable) for bot=%s legs=%s", signal.bot_id, legs_dicts)
         return None
 
+    # Entry-cost gate: what the structure could be sold back for the instant
+    # it is bought. A trade that opens deep under water on the bid/ask alone
+    # needs that much move to break even, and the premium stop fires on the
+    # spread rather than the market (see config.MAX_ENTRY_COST_PCT).
+    entry_cost_pct = entry_cost_fraction(
+        entry_price, spread_price(conn, legs_dicts, action="close")
+    )
+    max_cost = float(tw_config.MAX_ENTRY_COST_PCT)
+    if entry_cost_pct is not None and max_cost > 0 and entry_cost_pct > max_cost:
+        logger.debug(
+            "entry cost %.1f%% above %.1f%% for bot=%s %s",
+            entry_cost_pct * 100,
+            max_cost * 100,
+            signal.bot_id,
+            signal.underlying,
+        )
+        return None
+
     # Size on the structure's TRUE per-contract max loss, not the net premium.
     # Identical to entry_price for long-debit structures; for a defined-risk
     # credit structure (iron condor) it's the wing width, which prevents the
@@ -372,6 +390,10 @@ def open_position(
         # What the fit moved, e.g. "expiration 2026-11-12->2026-11-14; strike
         # 183->182.5", so a stock trade's contract is explainable later.
         payload["contract_fit"] = fit.detail
+    if entry_cost_pct is not None:
+        # Share of the premium the open gave up to the bid/ask, for reading
+        # trade results against their execution cost later.
+        payload["entry_cost_pct"] = round(entry_cost_pct, 4)
     # Arm the scale-out ladder (docs/design/tradeworkz-exit-strategy.md).
     # entry_spot / quantity_initial / high_water_mark are always recorded; the
     # three frozen price levels are populated only when the ladder is armable

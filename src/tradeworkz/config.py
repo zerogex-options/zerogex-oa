@@ -96,6 +96,10 @@ OPTION_QUOTE_MAX_AGE_SECONDS: int = _getenv_int(
 ENTRY_DEDUPE_WINDOW_SECONDS: int = _getenv_int(
     "TRADEWORKZ_ENTRY_DEDUPE_WINDOW_SECONDS", 60, min=0, max=3600
 )
+# Paper-fill slippage, charged once on a structure's NET price after every
+# leg fills at its natural side (pricing.charge_net_slippage). It used to be
+# charged on each leg's full price, which taxed spreads on expensive
+# underlyings by their gross premiums: SPX verticals opened ~34% under water.
 EXECUTION_SLIPPAGE_PCT: float = _getenv_float(
     "TRADEWORKZ_EXECUTION_SLIPPAGE_PCT", 0.02, min=0.0, max=1.0
 )
@@ -113,6 +117,10 @@ EXECUTION_SLIPPAGE_PCT: float = _getenv_float(
 # min before any thesis can play out. 0.40 clears that microstructure noise; the
 # proper fix (min-premium floor + a premium-stop grace window) is tracked
 # separately so the stop protects against real adverse moves, not the spread.
+# Since 2026-11-18 most of that entry gap is gone at the source: slippage is
+# charged on the net price, and MAX_ENTRY_COST_PCT refuses a trade that would
+# open deep under water (four SPX spreads had been stopped within a minute at
+# -43% to -46% on the gap alone).
 MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
     "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.40, min=0.0, max=1.0
 )
@@ -142,6 +150,15 @@ MIN_ENTRY_PREMIUM: float = _getenv_float("TRADEWORKZ_MIN_ENTRY_PREMIUM", 0.0, mi
 MIN_CREDIT_PER_SHARE: float = _getenv_float(
     "TRADEWORKZ_MIN_CREDIT_PER_SHARE", 0.10, min=0.0, max=1000.0
 )
+# Most of its premium a position may give up to the bid/ask the instant it
+# opens. At entry the engine prices the structure both ways — what it pays to
+# open, and what it could be sold back for at once — and refuses the trade
+# when (open - sell-back) / |open| exceeds this. A structure that opens 40%
+# under water needs a 40% move just to break even, and the premium stop fires
+# on the spread alone: in the forward test an NDX spread opened at 13.76 and
+# was worth 3.32 a minute later. Measured after slippage, for debits and
+# credits alike. 0 disables.
+MAX_ENTRY_COST_PCT: float = _getenv_float("TRADEWORKZ_MAX_ENTRY_COST_PCT", 0.25, min=0.0, max=1.0)
 
 # ---------------------------------------------------------------------------
 # Scale-out ladder (profit-harvesting on positions in profit)
