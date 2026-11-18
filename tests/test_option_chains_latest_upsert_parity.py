@@ -536,3 +536,65 @@ def test_a_greeks_gap_is_reported_apart_and_does_not_fail_parity(scratch_db):
     assert broken["status"] == "fail"
     assert broken["unexplained_examples"] == [rows[0]["option_symbol"]]
     assert gap_symbol not in broken["unexplained_examples"]
+
+
+def test_a_greeks_gap_that_moves_gex_passes_and_a_gamma_drift_fails(scratch_db):
+    """MSFT on 2026-11-16 failed on total net GEX alone, every contract that
+    differed a Greeks gap: a minute rewritten without gamma leaves history on an
+    older gamma while the cache keeps the newer one, which moves GEX by design.
+    That must pass, with the GEX difference still reported. A gamma that differs
+    while history HAS gamma is not explained, and must fail even with open
+    interest and volume identical."""
+    engine = _make_engine_for_write_test()
+    exp = date(2026, 11, 20)
+    t1, t2 = _et(_SESSION, 11, 0), _et(_SESSION, 11, 1)
+
+    def rows_at(ts, gamma_600=0.02):
+        out = []
+        for k, cp in ((595.0, "P"), (600.0, "C"), (605.0, "C")):
+            row = _row(f"SPY261120{cp}00{int(k) * 1000:06d}", ts, volume=100, open_interest=2000)
+            row.update(strike=k, option_type=cp, expiration=exp)
+            if k == 600.0:
+                row["gamma"] = gamma_600
+            out.append(row)
+        return out
+
+    with _patched_writer_connection(scratch_db):
+        engine._write_option_rows(rows_at(t1))
+        engine._write_option_rows(rows_at(t2, gamma_600=0.06))
+        # The same minute again without gamma: history's 11:01 row loses it
+        # (its upsert takes the written gamma), the cache keeps 0.06.
+        engine._write_option_rows(rows_at(t2, gamma_600=None))
+
+    drifted = rows_at(t1)[0]["option_symbol"]
+    conn = scratch_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO underlying_quotes VALUES ('SPY', %s, 600.0)", (t2,))
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            result = compare_snapshot(cur, AnalyticsEngine(underlying="SPY"))
+        conn.rollback()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE option_chains_latest SET gamma = 0.07 WHERE option_symbol = %s",
+                (drifted,),
+            )
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            broken = compare_snapshot(cur, AnalyticsEngine(underlying="SPY"))
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert (result["oi_differs"], result["volume_differs"]) == (0, 0)
+    assert result["greeks_differ"] == 1 and result["greeks_gap"] == 1
+    assert result["unexplained"] == 0 and result["status"] == "pass", result
+    assert "total_net_gex" in result["gex_differs"]  # moved, reported, not failed
+
+    assert (broken["oi_differs"], broken["volume_differs"]) == (0, 0)
+    assert broken["status"] == "fail"
+    assert broken["unexplained_examples"] == [drifted]

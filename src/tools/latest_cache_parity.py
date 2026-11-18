@@ -12,7 +12,8 @@ with the engine's own anchor (the newest ``option_chains`` row), lookback,
 16:15 ET expiration roll-off, row cap and AM-settled drop.  It then compares
 
   * contracts present in one path and not the other;
-  * open interest and volume, per contract and per strike (summed over
+  * per contract, everything GEX is built from: open interest, volume, gamma
+    and implied volatility (OI and volume also per strike, summed over
     expirations and both types);
   * GEX, through the engine's own ``_calculate_gex_by_strike`` and
     ``_calculate_gex_summary``: call wall, put wall, gamma flip, net GEX at
@@ -22,8 +23,13 @@ One difference is expected and reported apart: a contract whose newest history
 row has no gamma (ingestion's Greeks gate).  History then falls back to an
 older gamma-bearing row, or drops the contract, while the cache keeps its
 newest row with the last good Greeks, so the two can differ there by design.
-Every other contract must match exactly, and a sample passes when none differ
-and the GEX readings agree.
+
+A sample passes when no contract differs for any other reason.  The GEX
+readings are shown side by side and do not fail a sample on their own: the
+inputs are compared contract by contract, so GEX can only move through a
+contract already counted, and a Greeks gap moving it is the by-design case
+above.  (On 2026-11-16 MSFT failed on total net GEX alone, every differing
+contract a Greeks gap.)
 
 READ-ONLY (SELECT only).  Each sample costs one history snapshot query per
 symbol, the same query the analytics engine runs every cycle.
@@ -55,8 +61,9 @@ from src.database import db_connection
 from src.market_calendar import ET, is_settled_am_contract
 from src.symbols import parse_underlyings
 
-# GEX tolerances.  They only come into play when Greeks-gap contracts make the
-# two inputs differ; with identical inputs the readings are identical.
+# How far apart two GEX readings must be before the report calls them different.
+# Informational only (see the module docstring); with identical inputs the
+# readings are identical.
 FLIP_TOLERANCE_PCT_OF_SPOT = 0.001  # 0.1% of spot
 NET_GEX_TOLERANCE_REL = 0.01  # 1% of the larger magnitude
 
@@ -209,12 +216,24 @@ def compare_snapshot(
     volume_differs = sorted(
         s for s in hist.keys() & cache.keys() if hist[s]["volume"] != cache[s]["volume"]
     )
+    greeks_differ = sorted(
+        s
+        for s in hist.keys() & cache.keys()
+        if hist[s]["gamma"] != cache[s]["gamma"]
+        or hist[s]["implied_volatility"] != cache[s]["implied_volatility"]
+    )
     only_history = sorted(hist.keys() - cache.keys())
     only_cache = sorted(cache.keys() - hist.keys())
 
     # Contracts whose newest history row has no gamma explain themselves; see
     # the module docstring.  One indexed lookup, only for contracts that differ.
-    suspects = sorted(set(oi_differs) | set(volume_differs) | set(only_history) | set(only_cache))
+    suspects = sorted(
+        set(oi_differs)
+        | set(volume_differs)
+        | set(greeks_differ)
+        | set(only_history)
+        | set(only_cache)
+    )
     greeks_gap: set = set()
     if suspects:
         cursor.execute(_NEWEST_HISTORY_ROW_SQL, (suspects, anchor, lookback_start))
@@ -234,17 +253,17 @@ def compare_snapshot(
 
     gex_hist: Dict[str, Any] = {}
     gex_cache: Dict[str, Any] = {}
-    gex_mismatch: List[str] = []
+    gex_differs: List[str] = []
     if spot and spot > 0:
         if gex_engines is None:
             gex_engines = (AnalyticsEngine(engine.underlying), AnalyticsEngine(engine.underlying))
         gex_hist = _gex(gex_engines[0], list(hist.values()), spot, anchor)
         gex_cache = _gex(gex_engines[1], list(cache.values()), spot, anchor)
-        gex_mismatch = [
+        gex_differs = [
             f for f in _GEX_FIELDS if not _gex_agrees(f, gex_hist.get(f), gex_cache.get(f), spot)
         ]
 
-    passed = not unexplained and not gex_mismatch and bool(hist)
+    passed = not unexplained and bool(hist)
     return {
         "symbol": db_symbol,
         "status": "pass" if passed else ("empty" if not hist else "fail"),
@@ -256,6 +275,7 @@ def compare_snapshot(
         "only_cache": len(only_cache),
         "oi_differs": len(oi_differs),
         "volume_differs": len(volume_differs),
+        "greeks_differ": len(greeks_differ),
         "greeks_gap": len(greeks_gap),
         "unexplained": len(unexplained),
         "unexplained_examples": unexplained[:5],
@@ -263,7 +283,7 @@ def compare_snapshot(
         "strikes_volume_differ": strikes_differ["volume"],
         "gex_history": gex_hist,
         "gex_cache": gex_cache,
-        "gex_mismatch": gex_mismatch,
+        "gex_differs": gex_differs,
     }
 
 
@@ -307,10 +327,11 @@ def _line(result: Dict[str, Any]) -> str:
         f"{result['symbol']:<6} {anchor_et:%Y-%m-%d %H:%M} ET  "
         f"contracts {result['contracts_history']}/{result['contracts_cache']}  "
         f"OI-diff {result['oi_differs']}  vol-diff {result['volume_differs']}  "
+        f"greeks-diff {result['greeks_differ']}  "
         f"one-side {result['only_history']}+{result['only_cache']}  "
         f"greeks-gap {result['greeks_gap']}  unexplained {result['unexplained']}  "
         f"{gex}  [{result['status'].upper()}]"
-        + (f"  differs: {','.join(result['gex_mismatch'])}" if result["gex_mismatch"] else "")
+        + (f"  GEX differs: {','.join(result['gex_differs'])}" if result["gex_differs"] else "")
         + (
             f"  e.g. {','.join(result['unexplained_examples'])}"
             if result["unexplained_examples"]
