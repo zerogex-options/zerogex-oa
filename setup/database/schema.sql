@@ -3100,7 +3100,9 @@ CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep ON backtest_runs(sweep_id, id
 -- /cards/<id> permalink, the daily Scorecard, the customer backtester and the
 -- Playbook's graded record (playbook_card_outcomes, which cascades from it)
 -- all read it. A TRUNCATE on 2026-09-24 wiped the entire card history, and the
--- only way back was the RDS point-in-time backup. signal_trades and
+-- only way back was the RDS point-in-time backup: restore one to a new
+-- instance, then `make playbook-restore-cards FROM=<instance>` copies the
+-- missing Cards and grades back under their old ids. signal_trades and
 -- portfolio_snapshots are internal (the old /trading-signals page is now
 -- TradeWorkz) and can be cleared on their own if ever needed.
 

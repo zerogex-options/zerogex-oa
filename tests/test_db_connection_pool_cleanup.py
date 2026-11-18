@@ -154,3 +154,84 @@ def test_get_db_connection_raises_after_two_dead_conns(swap_pool):
         db_connection_module.get_db_connection()
 
     assert pool.returned == [(dead1, True), (dead2, True)]
+
+
+# -- driver and server disagree (2026-11-17 API incident) --------------------
+
+
+class _DriverFaithfulConn:
+    """A conn whose ``rollback()`` behaves like psycopg2's real one.
+
+    psycopg2 sends ROLLBACK only when the DRIVER opened the transaction
+    (``conn.status == STATUS_BEGIN``); otherwise ``rollback()`` returns without
+    touching the server. ``get_transaction_status()`` reports the SERVER's
+    state. ``_FakeConn`` above assumes a rollback always lands, which is
+    exactly the assumption that failed in production.
+    """
+
+    def __init__(self, *, server, driver):
+        self.closed = 0
+        self.autocommit = False
+        self.server = server
+        self.status = driver
+        self.rollback_calls = 0
+
+    def get_transaction_status(self):
+        return self.server
+
+    def rollback(self):
+        self.rollback_calls += 1
+        if self.status == extensions.STATUS_BEGIN:
+            self.server = extensions.TRANSACTION_STATUS_IDLE
+            self.status = extensions.STATUS_READY
+
+
+@pytest.mark.parametrize(
+    "server",
+    [extensions.TRANSACTION_STATUS_INERROR, extensions.TRANSACTION_STATUS_INTRANS],
+)
+def test_close_db_connection_discards_conn_whose_rollback_is_a_no_op(swap_pool, caplog, server):
+    """The server holds a transaction the driver doesn't know about, so the
+    rollback sends nothing. Re-parking it failed every later borrower's first
+    statement with "current transaction is aborted" until the API restarted;
+    it must be closed instead."""
+    pool = _FakePool()
+    swap_pool(pool)
+    conn = _DriverFaithfulConn(server=server, driver=extensions.STATUS_READY)
+
+    with caplog.at_level("WARNING", logger=db_connection_module.logger.name):
+        db_connection_module.close_db_connection(conn)
+
+    assert conn.rollback_calls == 1
+    assert conn.server == server  # the rollback really did nothing
+    assert pool.returned == [(conn, True)]
+    messages = [r.getMessage() for r in caplog.records]
+    name = {
+        extensions.TRANSACTION_STATUS_INERROR: "INERROR",
+        extensions.TRANSACTION_STATUS_INTRANS: "INTRANS",
+    }[server]
+    assert any(
+        f"still in a transaction after rollback (server {name}, was {name}; driver READY)" in m
+        for m in messages
+    )
+    # The old message claimed a rollback that never happened.
+    assert not any(m.startswith("Rolled back open transaction") for m in messages)
+
+
+def test_close_db_connection_reparks_conn_the_driver_can_roll_back(swap_pool, caplog):
+    """The ordinary case is unchanged: the driver opened the transaction, its
+    rollback reaches the server, and the conn goes back to the pool."""
+    pool = _FakePool()
+    swap_pool(pool)
+    conn = _DriverFaithfulConn(
+        server=extensions.TRANSACTION_STATUS_INERROR, driver=extensions.STATUS_BEGIN
+    )
+
+    with caplog.at_level("WARNING", logger=db_connection_module.logger.name):
+        db_connection_module.close_db_connection(conn)
+
+    assert conn.server == extensions.TRANSACTION_STATUS_IDLE
+    assert pool.returned == [(conn, False)]
+    assert [r.getMessage() for r in caplog.records] == [
+        "Rolled back open transaction before returning DB connection"
+    ]

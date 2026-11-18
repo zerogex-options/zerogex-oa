@@ -857,7 +857,19 @@ numbers.)
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `5min`
-- `window_units` (optional): max `90`, default `60`
+- `window_units` (optional): max `300`, default `60`
+- `expirations` (optional): `all` (default), or a comma-separated list of
+  `YYYY-MM-DD` dates. Each cell then sums the strike over only those
+  expirations, the same semantics as `/api/gex/strike-profile-timeseries`. An
+  unparseable date is a `400`. (Added November 2026. Before that this endpoint
+  ignored any expiration parameter and always summed every expiration.)
+
+Each bucket's `gamma_flip` follows the scope. With `all` it is the canonical
+whole-chain flip and `gamma_flip_span_used` is set. With a list of dates it is
+recomputed from those expirations' strikes against the bucket's close, the
+same flip `/api/gex/strike-profile-timeseries` returns for that scope, and
+`gamma_flip_span_used` is `null`. It is `null` when that set of expirations
+has no flip; draw no line then rather than the whole-chain one.
 
 ### Replay: GET /api/replay/range, frame and diff
 Minute-by-minute history of one regular session (09:30 to 16:00 ET), the data

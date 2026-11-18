@@ -1016,9 +1016,25 @@ async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
     window_units: int = Query(default=60, ge=1, le=300),
+    expirations: str = Query(
+        default="all",
+        description=(
+            "'all' to sum each strike across every expiration, or a "
+            "comma-separated list of YYYY-MM-DD expiration dates to sum over "
+            "only those (same semantics as /api/gex/strike-profile-timeseries)."
+        ),
+    ),
 ):
-    """Get GEX heatmap data (strike x time)"""
-    data = await _db().get_gex_heatmap(symbol, timeframe, window_units)
+    """GEX heatmap (strike x time).
+
+    Each cell is the strike's net GEX summed over ``expirations`` at the
+    bucket's last snapshot. With ``all`` the flip is the canonical whole-chain
+    flip; with a set of dates it is recomputed from that set's strikes, the
+    way ``/api/gex/strike-profile-timeseries`` scopes it, and is ``null``
+    when that set has no flip. Any unparseable date is a 400.
+    """
+    expiration_dates = _parse_expirations_param(expirations)
+    data = await _db().get_gex_heatmap(symbol, timeframe, window_units, expiration_dates)
     return data or []
 
 

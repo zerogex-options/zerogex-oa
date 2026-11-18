@@ -6255,6 +6255,14 @@ playbook-record: ## Playbook track record and entry bar per pattern and symbol (
 		$(if $(DAYS),--days $(DAYS)) \
 		$(if $(SYMBOL),--symbol $(SYMBOL))
 
+.PHONY: playbook-restore-cards
+playbook-restore-cards: ## Put back Action Cards + grades production lacks, from a restored RDS copy (FROM=zerogex-restore; rehearses unless CONFIRM=yes)
+	@if [ -z "$(FROM)" ]; then \
+		echo "$(RED)Usage: make playbook-restore-cards FROM=<restored instance or host> [CONFIRM=yes]$(NC)"; \
+		exit 2; \
+	fi
+	@$(PY) -m src.tools.restore_action_cards --source "$(FROM)" $(if $(filter yes,$(CONFIRM)),--apply)
+
 .PHONY: backtest-worker
 backtest-worker: ## Run the backtest worker (drains queued runs; needs BACKTEST_WORKER_ENABLED=1)
 	@echo "$(BLUE)=== Starting backtest worker ===$(NC)"
