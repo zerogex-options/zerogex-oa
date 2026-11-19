@@ -19,14 +19,16 @@ baseline measured, at 5 symbols:
 |---|---|---|
 | Ingestion (`zerogex-oa-ingestion`) | 2 GB memory, 1.5 cores | one process: about 90-100 MB, and a share of the CPU quota. Each worker reprocesses its chain as fast as its share allows, so every symbol's option data gets a little staler with each one added |
 | Analytics (`zerogex-oa-analytics`) | 1 GB memory, 1 core | one process: about 21 MB and a GEX cycle a minute |
-| ThetaData | 8 requests at a time, per account | 6 chain calls every 5 s and 2 price calls a second. Each symbol's process has its own pool, so nothing coordinates them |
+| ThetaData | 8 requests at a time, per account | 20 chain calls every 5 s, 2 at a time, and 2 price calls a second. Each symbol's process has its own pool, so nothing coordinates them |
 | The database | the RDS console says which instance; it averaged about 15 active sessions through the 2026-11-06 session | its option rows (out of ingestion's fixed CPU, so the total write rate barely moves) and its analytics read a minute |
 | The box | 15.7 GB, 8 cores | the sum of the above |
 
 Memory is not close anywhere: six stocks add about 600 MB to ingestion's
 660-730 MB peak against its 2 GB, and about 130 MB to analytics' 140 MB against
 its 1 GB. **The limits are ingestion's CPU, which every symbol's option data
-shares, and the database, which everything shares.** The API, signals and
+shares, the database, which everything shares, and ThetaData's 8 requests at a
+time, which every symbol's chain shares** (see "ThetaData at production's
+depth" below). The API, signals and
 Market Tide are not affected: stocks stay out of their lists, and the API reads
 a symbol per request rather than holding a list.
 
@@ -82,6 +84,26 @@ stock feed, were unaffected.
 Coverage was 100% for each. Every one holds more strikes at 8% than NVDA's 14,
 so **8% for all six**, TSLA included. META's 39 sits just under the 40-strike
 cap per expiration, which bounds it.
+
+The probe asked for 3 expirations, where production ingests 10, so each stock
+will carry about three times the contracts shown and make about three times the
+chain calls. The 8% bands rest on strikes per expiration and the order on how
+the stocks compare, and neither depends on depth.
+
+**ThetaData at production's depth.** The box's `.env` (read 2026-11-19) has
+`INGEST_EXPIRATIONS=10`, `INGEST_MONTHLY_EXPIRATIONS=2` for SPX and NDX, and
+`THETADATA_MAX_CONCURRENCY=2` (the code's default is 6). This runbook first
+counted 3 expirations. A chain poll makes one call per expiration for quotes
+and one for last and volume, plus open interest on a slower cadence (15
+minutes by default), so a stock makes 20 chain calls every 5 s, not 6, and SPX
+and NDX make 24 each. Today's 5 symbols make about 108 a cycle, at most 10 at
+once; all 11 would make about 228, at most 22 at once, against the account's 8
+and before any price call. The capacity check's numbers above were taken at
+this depth, so they stand, and ThetaData's line passed at 5 symbols. What changes is that each
+stock adds more than three times the calls this runbook said, which makes
+ThetaData a third limit next to ingestion's CPU and the database. The order and
+the one-at-a-time gate stay as they are: the check counts failed chain calls as
+well as failed price polls, so watch both.
 
 **The database's CPU could not be read:** the box has no AWS credentials for
 CloudWatch. The check now measures the database's load from Postgres itself
@@ -284,6 +306,9 @@ before the next stock:
   halves the price polling, but for every symbol, so SPY's live price would move
   every 2 s. A stock-only setting does not exist yet; ask me for it before
   reaching for the global one.
+- **thetadata, failed chain calls.** The chains are most of ThetaData's load
+  (20 calls a stock every 5 s). The remedy is the slower chain cadence for
+  stocks under freshness above, which does not exist yet; ask me for it.
 - **database CPU.** Stop at the current count. The next step is a larger
   database instance or narrower stock bands, and that is a decision, not a
   restart.

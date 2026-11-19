@@ -61,16 +61,17 @@ None of these block the pilot. Each is its own follow-up.
 
 ## Step 1 — Prove ThetaData serves NVDA (no DB writes)
 
-**PASSED 2026-10-20** (after the close): spot 219.74, 30 of 30 contracts with
-two-sided quotes and open interest, chain 0.3s per poll. Re-run it only when
-onboarding the next stock.
+**PASSED 2026-10-20** (after the close, at 3 expirations): spot 219.74, 30 of
+30 contracts with two-sided quotes and open interest, chain 0.3s per poll.
+Re-run it only when onboarding the next stock, at production's 10 expirations
+so the chain time is the one ingestion will see.
 
 Run this after the close or before 09:00 ET, so the probe does not compete with
 production for the terminal's request budget.
 
 ```bash
 cd ~/zerogex-oa
-make feed-probe PROVIDER=thetadata_mv UNDERLYING=NVDA EXPIRATIONS=3
+make feed-probe PROVIDER=thetadata_mv UNDERLYING=NVDA EXPIRATIONS=10
 ```
 
 You want:
@@ -306,11 +307,13 @@ updating.
 
 ## Known differences worth knowing, none blocking
 
-- `INGEST_EXPIRATIONS=3` means the nearest three expirations, whatever their
-  spacing. For SPY that is about three days. NVDA does not list every weekday
-  (the probe showed a Wednesday 2026-10-21 expiry), so its three reach further
-  out, about a week, and its GEX is a longer-dated book than SPY's. See the
-  actual set once it ingests:
+- Production's `INGEST_EXPIRATIONS=10` means the nearest ten expirations,
+  whatever their spacing. For SPY that is two weeks of dailies. NVDA does not
+  list every weekday (the probe showed a Wednesday 2026-10-21 expiry), so its
+  ten reach further out, and its GEX is a longer-dated book than SPY's. (SPX
+  and NDX also take their next two monthlies, `INGEST_MONTHLY_EXPIRATIONS=2`;
+  a stock's monthlies are already in its one chain.) See the actual set once it
+  ingests:
 
   ```sql
   SELECT DISTINCT expiration, to_char(expiration, 'Dy') AS weekday

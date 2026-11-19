@@ -25,10 +25,13 @@ CANDIDATE bots whose screens looked good on too few trades, plus the bot for
 `vanna_vol_crush_rider`, `weekly_charm_grind`, `gex_gradient_trend`.
 
 `gex_gradient_trend` trades options 2 weekdays out (a `bot_params`
-override), not its pattern's 5: production ingests each symbol's nearest 3
-expirations (`INGEST_EXPIRATIONS=3`) and the bot only fires on the
-daily-listing signal symbols (SPY/SPX/QQQ/NDX), so a 5-weekday contract never
-exists live and the bot could not open at all.
+override since 2026-11-13), not its pattern's 5. The reason recorded with the
+override, that production keeps only each symbol's nearest 3 expirations so a
+5-weekday contract never exists live, was wrong: production ingests the
+nearest 10 (`INGEST_EXPIRATIONS=10`, plus the next 2 monthlies on SPX and
+NDX), and the bot only fires on the daily-listing signal symbols
+(SPY/SPX/QQQ/NDX), so the 5-weekday contract is listed. The bot never ran with
+the 5-day target; all its live trades are the 2-day tuning.
 
 They are visible to members, marked as tests: each card's tagline starts
 "Forward test:", and the API returns `forward_test: true` on `/bots`,
