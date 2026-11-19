@@ -38,6 +38,22 @@ _ET = ZoneInfo("America/New_York")
 # open past the point where the options market closes and the quote
 # cache goes stale — see _cap_time_stop_at_expiration.
 _EXPIRATION_CLOSE_HHMM = time(15, 55)
+#: The same 5 minutes, measured from whatever the day's close is.
+_CLOSE_BUFFER = timedelta(minutes=5)
+
+
+def session_cutoff_et(day: date) -> time:
+    """Last ET moment to open a position, and the same-day time-stop cap.
+
+    5 minutes before the day's regular close: 15:55 on a normal day, 12:55 on
+    an early-close day (``NYSE_HALF_DAYS``, e.g. the Friday after
+    Thanksgiving). A fixed 15:55 let the fleet keep opening for three hours
+    after a 13:00 close on quotes up to 15 minutes stale, and held same-day
+    positions it could no longer price or exit until then.
+    """
+    from src.market_calendar import regular_session_close
+
+    return (datetime.combine(day, regular_session_close(day)) - _CLOSE_BUFFER).time()
 
 
 def _earliest_leg_expiration(legs: List[Dict[str, Any]]) -> Optional[date]:
@@ -63,13 +79,14 @@ def _earliest_leg_expiration(legs: List[Dict[str, Any]]) -> Optional[date]:
 
 
 def _expiration_close_cap_utc(expiration: date) -> datetime:
-    """Return ``expiration`` at 15:55 ET converted to UTC.
+    """Return ``expiration`` at its session cutoff (15:55 ET, or 12:55 ET on an
+    early-close day — see :func:`session_cutoff_et`) converted to UTC.
 
-    ``zoneinfo`` handles DST automatically so 15:55 ET is always the
+    ``zoneinfo`` handles DST automatically so the cutoff is always the
     right wall-clock time in Eastern regardless of whether we're
     inside EDT or EST.
     """
-    et_dt = datetime.combine(expiration, _EXPIRATION_CLOSE_HHMM, tzinfo=_ET)
+    et_dt = datetime.combine(expiration, session_cutoff_et(expiration), tzinfo=_ET)
     return et_dt.astimezone(timezone.utc)
 
 

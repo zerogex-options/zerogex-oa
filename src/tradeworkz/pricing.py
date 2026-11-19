@@ -18,7 +18,7 @@ trade engine's semantics.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -28,7 +28,6 @@ from src.tradeworkz import config as tw_config
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
-_REGULAR_CLOSE_HHMM = time(16, 0)  # SPY regular-session settlement time
 
 
 def _parse_leg_expiration(leg: Dict[str, Any]) -> Optional[date]:
@@ -85,8 +84,14 @@ def _settlement_spot(
 
     ``zoneinfo`` handles DST — 16:00 ET is UTC-4 in EDT (20:00 UTC)
     and UTC-5 in EST (21:00 UTC).
+
+    On an early-close day (``NYSE_HALF_DAYS``) the close is 13:00 ET, and
+    SPY/QQQ keep printing in the after-hours session from then on — a
+    16:00 cutoff would settle against an after-hours print, not the close.
     """
-    close_et = datetime.combine(expiration, _REGULAR_CLOSE_HHMM, tzinfo=_ET)
+    from src.market_calendar import regular_session_close
+
+    close_et = datetime.combine(expiration, regular_session_close(expiration), tzinfo=_ET)
     close_utc = close_et.astimezone(timezone.utc)
     cur = conn.cursor()
     cur.execute(

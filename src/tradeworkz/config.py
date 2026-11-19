@@ -271,7 +271,9 @@ BIAS_VETO_MIN_CONFIDENCE: float = _getenv_float(
 # disable (e.g. a future extended-hours strategy). Keep
 # RTH_NO_NEW_OPENS_AFTER_ET aligned with the reconciler's 0DTE time_stop cap
 # (15:55 ET) — an "HH:MM" ET wall-clock string; a malformed value falls back
-# to 15:55.
+# to 15:55. On an early-close day (NYSE_HALF_DAYS) both the cutoff and the
+# same-day time_stop cap move to 5 minutes before the 13:00 close (12:55 ET)
+# — see reconciler.session_cutoff_et.
 RTH_ONLY_OPENS: bool = _getenv_bool("TRADEWORKZ_RTH_ONLY_OPENS", True)
 RTH_NO_NEW_OPENS_AFTER_ET: str = _getenv_str("TRADEWORKZ_RTH_NO_NEW_OPENS_AFTER_ET", "15:55")
 

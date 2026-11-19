@@ -75,6 +75,7 @@ from src.tradeworkz.pricing import (
 from src.tradeworkz.reconciler import (
     _cap_time_stop_for_fit,
     _earliest_leg_expiration,
+    session_cutoff_et,
 )
 from src.tradeworkz.registry import get_bot_class, known_specs
 from src.tradeworkz.sizing import is_capped_risk, structure_max_loss_per_share
@@ -309,12 +310,14 @@ def _opens_allowed(now_utc: datetime, no_new_opens_after: time) -> bool:
 
     Blocks opens outside the ET cash session and at/after the 0DTE no-new-opens
     cap, so a position can never be opened already past its own hard time_stop.
+    The cap moves with an early close (12:55 ET on a 13:00 day), as live.
     """
     if not tw_config.RTH_ONLY_OPENS:
         return True
     if not is_market_hours(now_utc):
         return False
-    return now_utc.astimezone(_ET).time() < no_new_opens_after
+    now_et = now_utc.astimezone(_ET)
+    return now_et.time() < min(no_new_opens_after, session_cutoff_et(now_et.date()))
 
 
 def _force_settle_due(pos: OpenPosition, now_utc: datetime) -> bool:

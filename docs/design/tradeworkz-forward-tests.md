@@ -74,6 +74,11 @@ Each symbol adds one snapshot (~30 reads) per 5-second tick, inside the API
 process. Run `make capacity-check` during a session after widening the
 universe; narrow it with an explicit list if the database feels it.
 
+**Early-close days** (`NYSE_HALF_DAYS`, e.g. 2026-11-27 and 2026-12-24): the
+bots stop opening and time-stop same-day positions at 12:55 ET, 5 minutes
+before the 13:00 close, and same-day options settle against the 13:00
+close. Before 2026-11-19 every cutoff was a fixed 15:55.
+
 ## Any (capped-risk) structure
 
 `structure_override` in a bot's params re-expresses its signal without

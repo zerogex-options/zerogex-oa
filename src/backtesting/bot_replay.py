@@ -122,8 +122,12 @@ def _parse_hhmm(raw: str, fallback: time) -> time:
 
 
 def _opens_allowed(now_utc: datetime, no_new_opens_after: time) -> bool:
-    """Mirror the live engine's late-session open cutoff."""
-    return _et(now_utc).time() < no_new_opens_after
+    """Mirror the live engine's late-session open cutoff, which moves with an
+    early close (12:55 ET on a 13:00 day; ``reconciler.session_cutoff_et``)."""
+    from src.tradeworkz.reconciler import session_cutoff_et
+
+    now_et = _et(now_utc)
+    return now_et.time() < min(no_new_opens_after, session_cutoff_et(now_et.date()))
 
 
 def _leg_payload(leg: Dict[str, Any]) -> Dict[str, Any]:

@@ -46,6 +46,7 @@ from src.tradeworkz.reconciler import (
     mark_position,
     open_position,
     partial_close_position,
+    session_cutoff_et,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,12 +78,17 @@ def _opens_allowed(now_utc: datetime) -> bool:
     timestamp, so a frozen or after-hours-ticking feed can't sneak a
     stale-but-in-window snapshot past the gate. Marks and EXITS on existing
     positions are never gated here — only new opens.
+
+    On an early-close day the cutoff moves with the close (12:55 ET for a
+    13:00 close; see ``reconciler.session_cutoff_et``) — whichever of that and
+    the configured cutoff is earlier.
     """
     if not tw_config.RTH_ONLY_OPENS:
         return True
     if not is_market_hours(now_utc):
         return False
-    return now_utc.astimezone(_ET).time() < _NO_NEW_OPENS_AFTER
+    now_et = now_utc.astimezone(_ET)
+    return now_et.time() < min(_NO_NEW_OPENS_AFTER, session_cutoff_et(now_et.date()))
 
 
 #: Bumped whenever the engine changes how a trade is priced or admitted, so a
