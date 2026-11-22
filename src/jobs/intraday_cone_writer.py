@@ -45,7 +45,7 @@ from src.jobs.intraday_cone_model import (
     ConeInputs,
     compute_cone,
 )
-from src.market_calendar import NYSE_HOLIDAYS
+from src.market_calendar import NYSE_HOLIDAYS, regular_session_close
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +66,24 @@ def _today_et() -> date:
 
 
 def _is_trading_day(day: date) -> bool:
-    return day.weekday() < 5 and day.isoformat() not in NYSE_HOLIDAYS
+    return day.weekday() < 5 and day not in NYSE_HOLIDAYS
 
 
 def _session_open_ts(day: date) -> datetime:
     return datetime.combine(day, SESSION_OPEN, tzinfo=ET)
+
+
+def _session_minutes(day: date) -> int:
+    """Length of ``day``'s cash session: 390 minutes, or 210 on an NYSE half
+    day (``NYSE_HALF_DAYS``, 13:00 close)."""
+    close = regular_session_close(day)
+    return (close.hour * 60 + close.minute) - (SESSION_OPEN.hour * 60 + SESSION_OPEN.minute)
+
+
+def _last_fire_min(day: date) -> int:
+    """The last fire whose shortest horizon still completes by ``day``'s close:
+    15:30 on a normal day, 12:30 on a half day."""
+    return min(LAST_FIRE_MIN, _session_minutes(day) - min(CONE_HORIZONS_MIN))
 
 
 def _elapsed_minutes(now: datetime, day: date) -> float:
@@ -256,6 +269,7 @@ async def _build_inputs(
         gamma_flip=_f(gex.get("gamma_flip")) if (gex and fresh) else None,
         net_gex_at_spot=_f(gex.get("net_gex_at_spot")) if (gex and fresh) else None,
         horizons=CONE_HORIZONS_MIN,
+        session_minutes=_session_minutes(day),
     )
     provenance = {
         "symbol": symbol,
@@ -333,11 +347,15 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     elapsed = _elapsed_minutes(now, day)
-    if not args.allow_off_window and not (FIRST_FIRE_MIN <= elapsed <= LAST_FIRE_MIN):
+    last_fire = _last_fire_min(day)
+    if not args.allow_off_window and not (FIRST_FIRE_MIN <= elapsed <= last_fire):
         logger.info(
             "intraday_cone_writer: %s is outside the fire window "
             "(%.0f min elapsed, window %d–%d) — nothing to do",
-            now.strftime("%H:%M"), elapsed, FIRST_FIRE_MIN, LAST_FIRE_MIN,
+            now.strftime("%H:%M"),
+            elapsed,
+            FIRST_FIRE_MIN,
+            last_fire,
         )
         return 0
 

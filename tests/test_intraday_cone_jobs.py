@@ -770,3 +770,62 @@ async def test_grader_survives_a_dead_database(monkeypatch, caplog):
     monkeypatch.setattr(mod, "DatabaseManager", lambda: _Broken())
     assert await mod._run(_grader_args(mod)) == 0
     assert "DB connect failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Early-close days
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_half_day_cone_stops_at_the_1300_close(monkeypatch, caplog):
+    """On an early-close day (NYSE_HALF_DAYS) the session is 210 minutes. The
+    writer used to fire until 15:30 with horizons up to 15:30 + 2h, so the
+    grader scored claims against an ETF's after-hours prints or an index
+    frozen at 13:00. No horizon may now land after 13:00, and no fire comes
+    after 12:30."""
+    import src.market_calendar as cal
+
+    monkeypatch.setattr(cal, "NYSE_HALF_DAYS", {date(2026, 11, 27), date(2026, 12, 24)})
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db(gex_ts=datetime(2026, 11, 27, 11, 59, tzinfo=ET))
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+
+    assert await mod._run(_writer_args(mod, date="2026-11-27", at="2026-11-27T12:00")) == 0
+    rows = fake.insert_intraday_cone.await_args.args[0]
+    assert [r["horizon_min"] for r in rows] == [30, 60]
+    close = datetime(2026, 11, 27, 13, 0, tzinfo=ET)
+    assert all(r["target_ts"] <= close for r in rows)
+
+    fake.insert_intraday_cone.reset_mock()
+    for at in ("2026-11-27T12:45", "2026-11-27T13:30", "2026-11-27T15:30"):
+        assert await mod._run(_writer_args(mod, date="2026-11-27", at=at)) == 0
+    fake.insert_intraday_cone.assert_not_awaited()
+    assert "outside the fire window" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_regular_day_still_fires_until_1530(monkeypatch):
+    import src.market_calendar as cal
+
+    monkeypatch.setattr(cal, "NYSE_HALF_DAYS", {date(2026, 11, 27), date(2026, 12, 24)})
+    mod = _reload("intraday_cone_writer")
+    fake = _fake_writer_db()
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    assert await mod._run(_writer_args(mod, at="2026-09-21T15:30")) == 0
+    rows = fake.insert_intraday_cone.await_args.args[0]
+    assert [r["horizon_min"] for r in rows] == [30]
+
+
+@pytest.mark.asyncio
+async def test_the_writer_skips_a_listed_holiday(monkeypatch):
+    """_is_trading_day compared the date's ISO string to a set of dates, so a
+    weekday holiday passed and the writer ran (it then found no quote)."""
+    import src.market_calendar as cal
+
+    monkeypatch.setattr(cal, "NYSE_HOLIDAYS", {date(2026, 11, 26)})
+    mod = _reload("intraday_cone_writer")
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: pytest.fail(
+        "DatabaseManager must not be constructed on a holiday"
+    ))
+    assert await mod._run(_writer_args(mod, date="2026-11-26", at="2026-11-26T11:00")) == 0
