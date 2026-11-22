@@ -1798,15 +1798,23 @@ class AnalyticsEngine:
             vanna_exposure = call_vanna_exposure + put_vanna_exposure
             charm_exposure = call_charm_exposure + put_charm_exposure
 
-            # Dealer-sign convention: dealers are net short the retail book,
-            # so dealer delta-hedging flow is the NEGATIVE of market-aggregate
-            # charm/vanna.  Positive dealer_charm_exposure at a strike => as
-            # time passes dealers must BUY the underlying at that strike
-            # (bullish EOD pressure).  Bug fix (C3): previously signals read
-            # the un-flipped ``charm_exposure`` and had inverted direction
-            # near ATM.  Prefer ``dealer_charm_exposure`` downstream.
-            dealer_vanna_exposure = -vanna_exposure
-            dealer_charm_exposure = -charm_exposure
+            # Dealer-sign convention: the one GEX uses everywhere (call GEX +,
+            # put GEX -, and forced_flow.dealer_hedge_flow): dealers are LONG
+            # the calls customers sold them and SHORT the puts customers
+            # bought. A dealer long an option hedges with -delta shares, so as
+            # its delta drifts by charm (or vanna) they trade -charm; short
+            # one, they trade +charm. Dealer hedge flow is therefore
+            # put_charm - call_charm. Positive dealer_charm_exposure at a strike
+            # => as time passes dealers must BUY the underlying there (bullish
+            # EOD pressure). Prefer ``dealer_charm_exposure`` downstream.
+            #
+            # It was -(call + put): the flow of a dealer LONG every contract,
+            # which is neither the "short the whole book" the old comment
+            # claimed (that would be +(call + put)) nor GEX's convention, and
+            # inverted every put's contribution: a 1DTE 590 put on SPY 600 read
+            # "dealers sell $30M/day" where repricing a short put buys $30M.
+            dealer_vanna_exposure = put_vanna_exposure - call_vanna_exposure
+            dealer_charm_exposure = put_charm_exposure - call_charm_exposure
 
             # Bucket expirations so EOD pressure can weight 0DTE charm
             # separately from weeklies/monthlies (S2).
