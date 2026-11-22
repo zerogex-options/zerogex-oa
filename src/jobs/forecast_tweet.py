@@ -41,6 +41,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
+from src.jobs.forecast_range_model import _classify_vol_state
 from src.market_calendar import NYSE_HOLIDAYS
 
 logger = logging.getLogger("zerogex.forecast_tweet")
@@ -208,7 +209,6 @@ def build_receipt_tweet(row: dict[str, Any], site_url: str) -> str:
     else:
         day_iso = day.isoformat()
     range_v = row.get("range_respected")
-    vol_state = _fmt_vol_state(row.get("expected_vol_state"))
     actual_close = _fmt_price(row.get("actual_close"))
     permalink = f"{site_url.rstrip('/')}/forecast/{sym}/{day_iso}"
 
@@ -223,8 +223,15 @@ def build_receipt_tweet(row: dict[str, Any], site_url: str) -> str:
     )
     realized_ratio = row.get("realized_vol_ratio")
     try:
-        if realized_ratio is not None and vol_state != "—":
-            body += f"\nRealized vol: {vol_state.lower()} ({float(realized_ratio):.2f}× normal)"
+        if realized_ratio is not None:
+            # Label what vol DID, from the realized ratio, on the same band
+            # edges the grader uses. This printed the MORNING's prediction
+            # (expected_vol_state) beside the realized ratio, so a day called
+            # "compression" that ran 1.42x normal was tweeted as
+            # "Realized vol: compression (1.42× normal)".
+            ratio = float(realized_ratio)
+            realized_state = _classify_vol_state(ratio)
+            body += f"\nRealized vol: {realized_state} ({ratio:.2f}× normal)"
     except (TypeError, ValueError):
         pass
     text = f"{body}\n{permalink}"

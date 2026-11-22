@@ -361,3 +361,14 @@ async def test_swallows_x_api_failure(monkeypatch, caplog):
         rc = await mod._run(args)
     assert rc == 0
     assert any("X API call failed" in r.message for r in caplog.records)
+
+
+def test_receipt_labels_realized_vol_from_what_happened_not_the_prediction():
+    # Morning called compression; the day ran 1.42x normal. The receipt used to
+    # print the PREDICTION beside the realized ratio: "compression (1.42×)".
+    mod = _reload_module()
+    row = _receipt_row(realized_vol_ratio=1.42)
+    row["expected_vol_state"] = "compression"
+    text = mod.build_receipt_tweet(row, "https://zerogex.io")
+    assert "Realized vol: expansion (1.42× normal)" in text
+    assert "compression" not in text
