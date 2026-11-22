@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import net_flow_ratio
 
 # Minimum total premium (in $ / window) before the component will return
 # a non-zero score.  Below this we treat the read as noise and abstain.
@@ -42,12 +43,12 @@ class OrderFlowImbalanceComponent(ComponentBase):
     def compute(self, ctx: MarketContext) -> float:
         call_flow = float(ctx.smart_call or 0.0)
         put_flow = float(ctx.smart_put or 0.0)
-        gross = abs(call_flow) + abs(put_flow)
+        # Net premium divided by the GROSS premium traded gives the directional
+        # skew of paid-for flow (+ = call-side aggression, - = put-side). The
+        # sum of the two nets is not a gross: see net_flow_ratio.
+        ratio, gross = net_flow_ratio(call_flow, put_flow, ctx.extra)
         if gross <= 0:
             return 0.0
-        # Net premium divided by gross gives the directional skew of
-        # *paid-for* flow.  + = call-side aggression, - = put-side.
-        ratio = (call_flow - put_flow) / gross
         if _SATURATION_RATIO <= 0:
             score = max(-1.0, min(1.0, ratio))
         else:

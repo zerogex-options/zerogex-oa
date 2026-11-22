@@ -135,3 +135,35 @@ def moneyness_delta_proxy(spot: float, strike: float) -> tuple[float, float]:
     call_delta = max(0.0, min(1.0, 0.5 + distance_pct * 10))
     put_delta = -max(0.0, min(1.0, 0.5 - distance_pct * 10))
     return call_delta, put_delta
+
+
+def net_flow_ratio(
+    call_net: float, put_net: float, extra: Optional[dict] = None
+) -> tuple[float, float]:
+    """``(ratio, gross)`` for signed net call / put premium.
+
+    ``ratio = (call_net - put_net) / gross`` in [-1, +1], where ``gross`` is the
+    premium actually traded on both sides of both types (``smart_call_gross +
+    smart_put_gross`` on the context). Call buying / put selling reads bullish,
+    put buying / call selling bearish.
+
+    The copies this replaced divided by ``|call_net| + |put_net|``. Those are
+    NETS, so any opposite-signed pair read +/-1 however large the tape was: a
+    $54M two-way session with calls net +$60k and puts net -$50k scored +1.00
+    (19 MSI points) while tape_flow_bias, which divides by gross, read +0.004.
+    Falls back to the old denominator only when no gross is on the context.
+    """
+    gross = 0.0
+    if extra:
+        try:
+            gross = float(extra.get("smart_call_gross") or 0.0) + float(
+                extra.get("smart_put_gross") or 0.0
+            )
+        except (TypeError, ValueError):
+            gross = 0.0
+    if gross <= 0:
+        gross = abs(call_net) + abs(put_net)
+    if gross <= 0:
+        return 0.0, 0.0
+    ratio = (call_net - put_net) / gross
+    return max(-1.0, min(1.0, ratio)), gross

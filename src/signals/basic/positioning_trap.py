@@ -16,7 +16,7 @@ put-sell net out, which should not count as crowd skew.
 import math
 
 from src.signals.components.base import ComponentBase, MarketContext
-from src.signals.components.utils import pct_change_n_bar
+from src.signals.components.utils import net_flow_ratio, pct_change_n_bar
 
 
 class PositioningTrapComponent(ComponentBase):
@@ -114,19 +114,19 @@ class PositioningTrapComponent(ComponentBase):
                 p = float(put_signed)
             except (TypeError, ValueError):
                 c = p = 0.0
-            denom = abs(c) + abs(p)
+            # Divided by the gross premium traded, not the sum of two nets
+            # (see net_flow_ratio).
+            ratio, denom = net_flow_ratio(c, p, ctx.extra)
             if denom <= 0:
                 return 0.0
-            ratio = (c - p) / denom
             confidence = min(1.0, denom / 100_000.0)
             return ratio * confidence
         # Fallback to top-level signed smart-call/smart-put fields.
         c = float(ctx.smart_call or 0.0)
         p = float(ctx.smart_put or 0.0)
-        total = abs(c) + abs(p)
+        ratio, total = net_flow_ratio(c, p, ctx.extra)
         if total <= 0:
             return 0.0
-        ratio = (c - p) / total
         confidence = min(1.0, total / 100_000.0)
         return ratio * confidence
 

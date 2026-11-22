@@ -76,6 +76,7 @@ from src.signals.components.utils import (
     SESSION_OPEN_MIN_ET,
     minute_of_day_et,
     moneyness_delta_proxy,
+    net_flow_ratio,
     realized_sigma,
 )
 from src.signals.advanced.base import (
@@ -548,8 +549,11 @@ class MarketPressureSignal:
         # the ratio mathematically bounded in [-1, 1] regardless of
         # signs.  Matches the ``premium_skew`` formula above which
         # already uses ``abs() + abs()``.
-        sm_total_abs = abs(sm_call) + abs(sm_put)
-        smart_skew = (sm_call - sm_put) / sm_total_abs if sm_total_abs > 0 else 0.0
+        #
+        # |net| + |net| is bounded but still not a gross: any opposite-signed
+        # pair reads +/-1 on a heavy two-way tape. Divide by the gross premium
+        # traded when the context carries it (net_flow_ratio).
+        smart_skew, _sm_gross = net_flow_ratio(sm_call, sm_put, ctx.extra)
 
         signed = _PREM_SKEW_WEIGHT * prem_skew + (1.0 - _PREM_SKEW_WEIGHT) * smart_skew
         signed = max(-1.0, min(1.0, signed))
