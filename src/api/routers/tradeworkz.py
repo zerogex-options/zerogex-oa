@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -159,7 +160,7 @@ async def _cancel_queued_for_disabled_channels(
         UPDATE tw_notifications_log
         SET status = 'cancelled', error = 'channel disabled by follower'
         WHERE end_user = $1 AND bot_id = $2 AND status = 'queued'
-          AND COALESCE(($3::jsonb ->> channel)::boolean, false) = false
+          AND ($3::jsonb -> channel) IS DISTINCT FROM 'true'::jsonb
         """,
         user,
         bot_id,
@@ -816,6 +817,66 @@ async def my_follows(request: Request, db: DatabaseManager = Depends(get_db)) ->
     return {"follows": [dict(r) for r in rows]}
 
 
+# The channels a follower may opt into. ``in_app`` is written as already sent;
+# ``email`` and ``webhook`` are queued for the delivery workers.
+FOLLOW_CHANNELS = ("in_app", "email", "webhook")
+
+
+def _validate_follow_body(body: Any) -> tuple[Dict[str, bool], float]:
+    """Normalize a follow request; raises 422 with a member-readable reason.
+
+    ``channels`` was stored as whatever JSON the caller sent, and the engine's
+    fan-out (src/tradeworkz/notifications.py) runs inside each trade's
+    transaction assuming a dict of known names with true/false values. A list,
+    a number or an unknown key (one longer than the 16-character channel
+    column) made every later open, scale-out and close of that bot raise and
+    roll back, freezing the bot, and a string value broke the delivery queue's
+    boolean cast for every follower. Missing or empty channels keep the old
+    default, in-app only.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+    raw = body.get("channels")
+    if raw is None or raw == {}:
+        channels: Dict[str, bool] = {"in_app": True}
+    else:
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=422,
+                detail='channels must be an object like {"in_app": true, "email": false}',
+            )
+        unknown = sorted(str(k) for k in raw if k not in FOLLOW_CHANNELS)
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"unknown channel(s): {', '.join(unknown)}")
+        not_bool = sorted(str(k) for k, v in raw.items() if not isinstance(v, bool))
+        if not_bool:
+            raise HTTPException(
+                status_code=422,
+                detail=f"channel values must be true or false: {', '.join(not_bool)}",
+            )
+        channels = {str(k): bool(v) for k, v in raw.items()}
+
+    raw_min = body.get("min_confidence")
+    if raw_min is None:
+        min_confidence = 0.0
+    else:
+        if isinstance(raw_min, bool):
+            raise HTTPException(
+                status_code=422, detail="min_confidence must be a number from 0 to 1"
+            )
+        try:
+            min_confidence = float(raw_min)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422, detail="min_confidence must be a number from 0 to 1"
+            )
+        if not math.isfinite(min_confidence) or not 0.0 <= min_confidence <= 1.0:
+            raise HTTPException(
+                status_code=422, detail="min_confidence must be a number from 0 to 1"
+            )
+    return channels, min_confidence
+
+
 @router.post("/bots/{bot_id}/follow")
 async def follow_bot(
     bot_id: str,
@@ -826,8 +887,7 @@ async def follow_bot(
     user = _resolve_user(request)
     if user is None:
         raise HTTPException(status_code=401, detail="Sign in to follow a bot")
-    channels = body.get("channels") or {"in_app": True}
-    min_confidence = float(body.get("min_confidence") or 0.0)
+    channels, min_confidence = _validate_follow_body(body)
     async with db.pool.acquire() as conn:
         exists = await conn.fetchval("SELECT 1 FROM tw_bots WHERE id = $1", bot_id)
         if not exists:
@@ -1989,7 +2049,9 @@ async def internal_queued_notifications(
                   SELECT 1 FROM tw_bot_followers f
                   WHERE f.end_user = n.end_user
                     AND f.bot_id = n.bot_id
-                    AND COALESCE((f.channels ->> n.channel)::boolean, false) = true
+                    -- Compared as JSON, not cast to boolean: a stored non-boolean
+                    -- value made the cast raise and broke this queue for everyone.
+                    AND (f.channels -> n.channel) = 'true'::jsonb
               )
             ORDER BY n.sent_at ASC
             LIMIT $2

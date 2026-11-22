@@ -232,7 +232,7 @@ def test_follow_upsert_with_email_off_cancels_email_backlog(monkeypatch: pytest.
     sql, args = cancels[0]
     # The reconcile keys the per-row decision off the new channel set: a row
     # whose channel is not enabled in the JSON is cancelled.
-    assert "->> channel" in sql
+    assert "-> channel) IS DISTINCT FROM 'true'::jsonb" in sql
     user, bot_id, channels_json = args
     assert (user, bot_id) == ("acct-1", "gamma_flip_defender")
     assert json.loads(channels_json) == {"in_app": True}
@@ -259,7 +259,10 @@ def test_queued_notifications_filters_on_current_optin(monkeypatch: pytest.Monke
     # returned if the follower still exists with that channel enabled.
     assert "EXISTS" in sql
     assert "tw_bot_followers" in sql
-    assert "->> n.channel" in sql
+    # Compared as JSON, never cast: a stored non-boolean would make ::boolean
+    # raise and stop the queue for every follower.
+    assert "(f.channels -> n.channel) = 'true'::jsonb" in sql
+    assert "::boolean" not in sql
 
 
 def test_queued_notifications_refuse_a_key_without_the_admin_token(monkeypatch: pytest.MonkeyPatch):

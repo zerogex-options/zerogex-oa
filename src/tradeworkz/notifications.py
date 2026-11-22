@@ -22,6 +22,9 @@ from src.tradeworkz import config as tw_config
 
 logger = logging.getLogger(__name__)
 
+# Channels a follower row may enable; matches the follow endpoint's validation.
+_FANOUT_CHANNELS = frozenset({"in_app", "email", "webhook"})
+
 
 def fanout_event(
     conn: Any,
@@ -84,13 +87,22 @@ def fanout_event(
                 channels = json.loads(channels)
             except Exception:
                 channels = {}
-        channels = channels or {"in_app": True}
-        effective_min = max(min_confidence, float(follower_min or 0.0))
+        # A row written before the follow endpoint validated its body can hold
+        # anything. This runs inside the trade's transaction, so a shape it
+        # can't read must never raise: fall back to in-app, and skip unknown
+        # channels and anything but a literal true.
+        if not isinstance(channels, dict) or not channels:
+            channels = {"in_app": True}
+        try:
+            follower_floor = float(follower_min or 0.0)
+        except (TypeError, ValueError):
+            follower_floor = 0.0
+        effective_min = max(min_confidence, follower_floor)
         conf = float(payload.get("conviction") or 1.0)
         if conf < effective_min:
             continue
         for channel, enabled in channels.items():
-            if not enabled:
+            if enabled is not True or channel not in _FANOUT_CHANNELS:
                 continue
             if channel == "email" and email_dust_suppressed:
                 # Silently skip email; in_app row on this fanout still
