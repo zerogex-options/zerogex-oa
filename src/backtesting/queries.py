@@ -45,8 +45,9 @@ _RUN_COLS = (
 def get_run(run_id: int, *, end_user: Optional[str]) -> Optional[dict]:
     """Fetch one run's status + summary, scoped to its owner.
 
-    A run with a NULL ``end_user`` (anonymous) is readable by anyone; a run
-    owned by an end-user is only readable by that same end-user.
+    A run with a NULL ``end_user`` is readable only by an ownerless caller
+    (the shared key with no member); a run owned by an end-user is only
+    readable by that same end-user.
     """
     with db_connection() as conn:
         cur = conn.cursor()
