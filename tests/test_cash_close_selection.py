@@ -101,14 +101,16 @@ def test_session_closes_uses_asset_aware_close_for_1600_bar():
 
 
 def test_session_closes_predicate_is_exact_1600_match():
-    """The OPEN-substitution must bind on bar timestamp == 16:00 ET
-    specifically — not a broader window. A 15:59 bar (or any earlier
-    bar) returns ``close`` as usual, so the live in-session tick path
-    is unaffected and a half-day's 13:00 early close returns its
-    ``close`` correctly."""
+    """The OPEN-substitution must bind on bar timestamp == the day's close
+    specifically (16:00 ET, or 13:00 on an early-close day) — not a broader
+    window. A 15:59 bar (or any earlier bar) returns ``close`` as usual, so
+    the live in-session tick path is unaffected. On a half day the 13:00 bar
+    is the one straddling the closing auction (tests/test_half_day_session_closes.py
+    runs it against Postgres)."""
     sql = _captured_sql(_new_db(), "get_session_closes")
 
-    assert "= TIME '16:00'" in sql
+    assert "::time = CASE WHEN" in sql
+    assert "THEN TIME '13:00' ELSE TIME '16:00' END" in sql
 
 
 def test_session_closes_filters_to_cash_session_weekdays():
@@ -118,7 +120,8 @@ def test_session_closes_filters_to_cash_session_weekdays():
     a stray weekend bar could win the per-date pick."""
     sql = _captured_sql(_new_db(), "get_session_closes")
 
-    assert "BETWEEN '09:30' AND '16:00'" in sql
+    # 09:30 to the day's own close (13:00 on an early-close day).
+    assert "BETWEEN '09:30' AND CASE WHEN" in sql
     assert "BETWEEN 1 AND 5" in sql  # weekday clamp
 
 

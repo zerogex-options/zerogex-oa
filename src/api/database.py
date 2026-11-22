@@ -9339,8 +9339,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 FROM underlying_quotes uq
                 LEFT JOIN symbols s ON s.symbol = uq.symbol
                 WHERE uq.symbol = $1
-                    AND EXTRACT(HOUR FROM uq.timestamp AT TIME ZONE 'America/New_York') = 16
-                    AND EXTRACT(MINUTE FROM uq.timestamp AT TIME ZONE 'America/New_York') = 0
+                    -- The bar at the day's OWN close: 16:00 ET, or 13:00 on an
+                    -- early-close day ($2). A fixed 16:00 took an ETF's 16:00
+                    -- after-hours bar on a half day as its close, and skipped an
+                    -- index's half day entirely (it has no 16:00 bar).
+                    AND (uq.timestamp AT TIME ZONE 'America/New_York')::time
+                        = CASE WHEN (uq.timestamp AT TIME ZONE 'America/New_York')::date = ANY($2::date[])
+                               THEN TIME '13:00' ELSE TIME '16:00' END
                     AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
                 ORDER BY uq.timestamp DESC
                 LIMIT 1
@@ -9396,7 +9401,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
+                row = await conn.fetchrow(query, symbol, self._nyse_half_days())
                 return dict(row) if row else None
         except Exception as e:
             logger.error(f"Error fetching previous close: {e}", exc_info=True)
@@ -9463,6 +9468,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         now = "NOW()" if as_of is None else "$2::timestamptz"
         fallback_ceiling = "" if as_of is None else " AND timestamp <= $2"
         params: List[Any] = [symbol] if as_of is None else [symbol, as_of]
+        fallback_params = list(params)
+        # Each session's close is ITS close: 13:00 ET on an early-close day
+        # (NYSE_HALF_DAYS), 16:00 otherwise. With a fixed 16:00 an ETF's last
+        # bar at or before 16:00 on a half day was the 16:00 after-hours bar,
+        # so the headline "close" all weekend was an after-hours print (and an
+        # index's previous close skipped the half day entirely).
+        params.append(self._nyse_half_days())
+        half = f"${len(params)}::date[]"
+        close_t = (
+            "CASE WHEN (uq.timestamp AT TIME ZONE 'America/New_York')::date = ANY("
+            + half
+            + ") THEN TIME '13:00' ELSE TIME '16:00' END"
+        )
+        today_close_t = (
+            f"CASE WHEN ({now} AT TIME ZONE 'America/New_York')::date = ANY("
+            + half
+            + ") THEN TIME '13:00' ELSE TIME '16:00' END"
+        )
         query = f"""
             WITH session_closes AS (
                 SELECT DISTINCT ON ((uq.timestamp AT TIME ZONE 'America/New_York')::date)
@@ -9470,7 +9493,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     -- Asset-aware cash-close: see this method's docstring
                     -- for the auction-print / settle-level rationale.
                     CASE
-                        WHEN (uq.timestamp AT TIME ZONE 'America/New_York')::time = TIME '16:00'
+                        WHEN (uq.timestamp AT TIME ZONE 'America/New_York')::time = {close_t}
                          AND s.asset_type IS DISTINCT FROM 'INDEX'
                         THEN uq.open
                         ELSE uq.close
@@ -9488,13 +9511,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     -- returns a price. Every predicate below is preserved.
                     AND uq.timestamp >= {now} - INTERVAL '30 days'
                     AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
-                    AND (uq.timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
+                    AND (uq.timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN '09:30' AND {close_t}
                     AND uq.timestamp <= {now}
-                    -- Exclude today's date if the session hasn't closed yet (before 16:00 ET)
+                    -- Exclude today's date if its session hasn't closed yet
+                    -- (before 16:00 ET, or 13:00 on an early-close day)
                     AND (
                         (uq.timestamp AT TIME ZONE 'America/New_York')::date
                         < ({now} AT TIME ZONE 'America/New_York')::date
-                        OR ({now} AT TIME ZONE 'America/New_York')::time >= '16:00'
+                        OR ({now} AT TIME ZONE 'America/New_York')::time >= {today_close_t}
                     )
                 ORDER BY (uq.timestamp AT TIME ZONE 'America/New_York')::date DESC, uq.timestamp DESC
                 LIMIT 2
@@ -9533,7 +9558,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         ORDER BY timestamp DESC
                         LIMIT 1
                         """,
-                        *params,
+                        *fallback_params,
                     )
                     fallback_price = fallback["close"] if fallback else None
                     fallback_ts = fallback["timestamp"] if fallback else None

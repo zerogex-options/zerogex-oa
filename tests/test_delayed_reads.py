@@ -173,14 +173,19 @@ def test_session_closes_delayed_read_takes_now_from_the_ceiling():
     conn.calls.clear()
     asyncio.run(_db(conn).get_session_closes("SPY", as_of=AS_OF))
 
+    # The last bind is the early-close dates (each session closes at ITS
+    # close: 13:00 on a half day), so it follows the ceiling when there is one.
     (live_sql, live_args), (live_fallback, live_fallback_args) = live
-    assert "NOW()" in live_sql and "$2" not in live_sql and live_args == ("SPY",)
+    assert "NOW()" in live_sql and "$2::timestamptz" not in live_sql
+    assert live_args[0] == "SPY" and isinstance(live_args[1], list) and len(live_args) == 2
+    assert "ANY($2::date[])" in live_sql
     assert "$2" not in live_fallback and live_fallback_args == ("SPY",)
 
     (sql, args), (fallback, fallback_args) = conn.calls
     assert "NOW()" not in sql
-    assert sql.count("$2::timestamptz") == 4
-    assert args == ("SPY", AS_OF)
+    assert sql.count("$2::timestamptz") == 5
+    assert args[:2] == ("SPY", AS_OF) and isinstance(args[2], list) and len(args) == 3
+    assert "ANY($3::date[])" in sql
     assert "timestamp <= $2" in fallback and fallback_args == ("SPY", AS_OF)
 
 
