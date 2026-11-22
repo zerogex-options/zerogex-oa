@@ -269,3 +269,32 @@ class TestSpreadMarkRealisticExit:
         # sell long = 3.00 * 0.95 = 2.85; buy short = 0.70 * 1.05 = 0.735
         # liquidation = 2.85 - 0.735 = 2.115
         assert value == pytest.approx(2.115)
+
+
+class TestZeroBidSells:
+    """A sale into no bid fills at zero, not at the ask or a stale print."""
+
+    def test_closing_a_long_with_no_bid_gets_nothing(self):
+        # 0DTE call bought at 1.224, now 0.00 / 0.01 with a morning print at 0.90.
+        price = leg_fill_price(bid=0.0, ask=0.01, last=0.90, side="long", action="close")
+        assert price == 0.0
+
+    def test_selling_to_open_into_no_bid_collects_nothing(self):
+        price = leg_fill_price(bid=0.0, ask=0.05, last=0.80, side="short", action="open")
+        assert price == 0.0
+
+    def test_a_credit_spread_cannot_book_more_than_its_credit(self):
+        # Bull put credit taken for 0.40 (short 0.55 bid, long 0.15 ask). At the
+        # close the long put has no bid and an old 0.60 print; the short put is
+        # 0.01 / 0.02. Closing costs at least the short's ask minus nothing for
+        # the long: the trade can make at most the 0.40 credit.
+        short_close = leg_fill_price(bid=0.01, ask=0.02, side="short", action="close", slippage_pct=0)
+        long_close = leg_fill_price(
+            bid=0.0, ask=0.03, last=0.60, side="long", action="close", slippage_pct=0
+        )
+        pnl_per_share = 0.40 - short_close + long_close
+        assert pnl_per_share <= 0.40
+
+    def test_no_quote_at_all_still_falls_back_to_the_last_print(self):
+        price = leg_fill_price(bid=0.0, ask=0.0, last=0.80, side="long", action="close")
+        assert price == pytest.approx(0.80)

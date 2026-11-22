@@ -55,6 +55,15 @@ def leg_fill_price(
         return _mid_fallback(bid, ask, last)
     if bid > 0:
         return bid * (1.0 - slip)
+    if ask > 0:
+        # Quoted, but nobody is bidding: a sale fills at nothing. This used to
+        # fall through to max(last, ask), so a long 0DTE call quoted 0.00/0.05
+        # with an 0.80 print from the morning was closed at 0.80, its premium
+        # stop never saw the real loss, and a credit spread could book more
+        # than its maximum gain. Live P&L, the research harness and member
+        # backtests were all biased up on exactly the losing, expiring trades.
+        return 0.0
+    # No quote on either side: the last print is the only price there is.
     return _mid_fallback(bid, ask, last)
 
 
