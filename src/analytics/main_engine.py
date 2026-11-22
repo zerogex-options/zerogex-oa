@@ -96,6 +96,10 @@ from src.market_calendar import (
 
 logger = get_logger(__name__)
 
+# Marks a snapshot row built without an implied_volatility key (synthetic
+# callers); production snapshots always select the column.
+_IV_NOT_SUPPLIED = object()
+
 # Why a cycle published no gamma flip.  NULL in gex_summary.gamma_flip_reason
 # when a flip WAS published, a code below when it was not -- the same shape as
 # pin_strike_reason in the same table.
@@ -1695,9 +1699,23 @@ class AnalyticsEngine:
         # default, and every RTH / flag-off cycle) it returns opt["gamma"]
         # unchanged, so the existing GEX math stays byte-identical.
         def _gamma_at_spot(opt: Dict[str, Any], strike: float, T: float) -> float:
+            iv = opt.get("implied_volatility", _IV_NOT_SUPPLIED)
+            if iv is None or (iv is not _IV_NOT_SUPPLIED and not iv > 0):
+                # No solved IV: ingestion priced this contract's stored gamma
+                # at the flat IMPLIED_VOLATILITY_DEFAULT (20%) so it could
+                # still carry approximate Greeks. Near expiry gamma moves
+                # 10-30x between 13% and 20% vol (an ITM 0DTE SPX call stored
+                # 9.6e-4 against a true 3.3e-5), and about half of all 0DTE
+                # contracts have no solvable IV (zero-bid wings, ITM quotes
+                # whose time value is under the spread): that inflated net GEX
+                # +8.6% and strikes near spot by a third. The flip profile,
+                # vanna/charm, pin and forced flow already skip these
+                # contracts; the per-strike gamma now does too. Their open
+                # interest and volume still count (max pain, totals, walls'
+                # OI context).
+                return 0.0
             if recompute_gamma:
-                iv = opt.get("implied_volatility")
-                if iv is not None and iv > 0:
+                if iv is not _IV_NOT_SUPPLIED and iv > 0:
                     return self._calculate_bs_gamma(
                         underlying_price, strike, T, self.risk_free_rate, iv, self.dividend_yield
                     )
