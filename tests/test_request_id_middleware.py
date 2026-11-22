@@ -103,3 +103,15 @@ def test_concurrent_requests_get_distinct_ids():
         assert response.status_code == 200
         assert response.headers["X-Request-Id"] == given
         assert response.json()["request_id"] == given
+
+
+def test_an_oversized_or_unsafe_request_id_is_replaced():
+    """A caller's X-Request-Id lands in every log and audit line, so only a
+    short token of safe characters is adopted; anything else gets a fresh id."""
+    from src.api.middleware import _VALID_REQUEST_ID
+
+    assert _VALID_REQUEST_ID.fullmatch("4f1c2b9e-7a3d.req_1")
+    assert not _VALID_REQUEST_ID.fullmatch("x" * 65)
+    assert not _VALID_REQUEST_ID.fullmatch("id api_request caller_kind=admin")
+    assert not _VALID_REQUEST_ID.fullmatch("id\napi_request")
+    assert not _VALID_REQUEST_ID.fullmatch("")

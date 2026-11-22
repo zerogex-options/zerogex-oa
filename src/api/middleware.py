@@ -30,6 +30,7 @@ UsageMeterMiddleware
 
 from __future__ import annotations
 
+import re
 import time
 
 from starlette.datastructures import MutableHeaders
@@ -41,6 +42,9 @@ from src.utils.logging import new_request_id, request_id_var
 from .usage import usage_meter
 
 _audit_logger = get_logger("src.api.audit")
+
+
+_VALID_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class RequestIdMiddleware:
@@ -58,7 +62,14 @@ class RequestIdMiddleware:
 
         headers = MutableHeaders(scope=scope)
         incoming = headers.get(self.header_name)
-        request_id = incoming if incoming else new_request_id()
+        # Adopt the caller's id only when it looks like one. It is copied into
+        # every log line and the audit line, including on rejected requests,
+        # so an 8 KB header at the nginx rate limit multiplied the journal
+        # ~37x (rotating every service's history away in minutes) and could
+        # plant fake "api_request ..." text for api_caller_report to read.
+        request_id = (
+            incoming if incoming and _VALID_REQUEST_ID.fullmatch(incoming) else new_request_id()
+        )
         token = request_id_var.set(request_id)
 
         async def send_with_request_id(message: Message) -> None:
