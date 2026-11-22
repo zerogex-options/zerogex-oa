@@ -122,6 +122,7 @@ from collections import defaultdict
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.ingestion.providers.base import (
@@ -137,6 +138,8 @@ from src.symbols import is_cash_index, resolve_underlying_from_option_root
 from src.utils import get_logger
 
 logger = get_logger(__name__)
+
+_NEW_YORK = ZoneInfo("America/New_York")
 
 __all__ = ["ThetaDataProvider"]
 
@@ -899,6 +902,10 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
             out: Dict[str, Any] = {}
             for symbol, st in self._state.items():
                 kept = {k: st[k] for k in self._STICKY_CARRY_FIELDS if st.get(k)}
+                if "volume" in kept and st.get("volume_day") is not None:
+                    # The day it was read on travels with it, so the new
+                    # stream's first prior-session zero still replaces it.
+                    kept["volume_day"] = st["volume_day"]
                 if kept:
                     out[symbol] = kept
             return out
@@ -924,6 +931,8 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
                     value = fields.get(key)
                     if value and not target.get(key):
                         target[key] = value
+                        if key == "volume":
+                            target["volume_day"] = fields.get("volume_day")
                         took = True
                 if took:
                     adopted += 1
@@ -1026,6 +1035,7 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
         )
         if not fetched:
             return
+        today = _today_et()
         with self._lock:
             for symbol, incoming in fetched.items():
                 prior = self._state.get(symbol, {})
@@ -1033,11 +1043,26 @@ class _PollingOptionQuoteStream(OptionQuoteStream):
                 for key in ("bid", "ask", "bid_size", "ask_size", "last", "timestamp"):
                     if incoming.get(key) is not None:
                         merged[key] = incoming[key]
-                # Sticky: only ever move on a positive value.
-                for key in ("volume", "open_interest"):
-                    value = incoming.get(key)
-                    if value is not None and value > 0:
-                        merged[key] = value
+                # Volume is sticky against a zero only WITHIN a day. A zero
+                # mid-session can be a transient gap that must not erase the
+                # running total (the engine would count the next reading
+                # again). But fetch_chain_state also reports 0 on purpose once
+                # ThetaData's daily bar belongs to a prior session (the
+                # contract has not traded today). Discarding that zero held
+                # yesterday's cumulative volume overnight (workers run 24x5 and
+                # the midnight rebuild carries it), and at 09:30 the new
+                # session's accumulator booked all of it as one phantom bucket
+                # of today's flow, Tuesday to Friday. So each stored volume
+                # carries the ET day it was read on, and a zero replaces a
+                # figure from an earlier day.
+                volume = incoming.get("volume")
+                if volume is not None and (volume > 0 or merged.get("volume_day") != today):
+                    merged["volume"] = volume
+                    merged["volume_day"] = today
+                # Open interest stays sticky: only ever move on a positive value.
+                open_interest = incoming.get("open_interest")
+                if open_interest is not None and open_interest > 0:
+                    merged["open_interest"] = open_interest
                 self._state[symbol] = merged
                 self._dirty.add(symbol)
                 self._updates_received += 1
@@ -2341,6 +2366,14 @@ def _bar_from_row(row: Dict[str, Any], db_symbol: str) -> Optional[Bar]:
         up_volume=None,
         down_volume=None,
     )
+
+
+def _today_et() -> date:
+    """Today's calendar date in New York, the clock is_prior_session judges by.
+
+    A function so tests can move the poller across midnight.
+    """
+    return datetime.now(_NEW_YORK).date()
 
 
 def is_prior_session(value: Any) -> bool:
