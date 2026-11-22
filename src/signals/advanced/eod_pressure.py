@@ -9,10 +9,10 @@ from datetime import datetime
 
 from src.signals.components.base import MarketContext
 from src.signals.components.utils import (
-    SESSION_CLOSE_MIN_ET,
     SESSION_OPEN_MIN_ET,
     minute_of_day_et,
     realized_sigma,
+    session_close_minute_et,
 )
 from src.signals.advanced.base import AdvancedSignalResult
 
@@ -327,9 +327,10 @@ class EODPressureSignal:
     @staticmethod
     def _time_ramp(ts: datetime | None) -> float:
         minute = minute_of_day_et(ts)
-        if minute is None or minute < SESSION_OPEN_MIN_ET or minute >= SESSION_CLOSE_MIN_ET:
+        close_min = session_close_minute_et(ts)  # 13:00 on an early-close day
+        if minute is None or minute < SESSION_OPEN_MIN_ET or minute >= close_min:
             return 0.0
-        to_close = SESSION_CLOSE_MIN_ET - minute
+        to_close = close_min - minute
         if to_close > _WINDOW_START_MIN_TO_CLOSE:
             return 0.0
         if to_close <= _WINDOW_RAMP_END_MIN_TO_CLOSE:

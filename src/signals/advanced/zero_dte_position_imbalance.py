@@ -6,9 +6,9 @@ import math
 
 from src.signals.components.base import MarketContext
 from src.signals.components.utils import (
-    SESSION_CLOSE_MIN_ET,
     SESSION_OPEN_MIN_ET,
     minute_of_day_et,
+    session_close_minute_et,
 )
 from src.signals.advanced.base import AdvancedSignalResult
 
@@ -95,8 +95,9 @@ class ZeroDtePositionImbalanceSignal:
         combined = 0.55 * flow_imbalance + 0.30 * smart_imbalance + 0.15 * pcr_tilt
 
         minute = minute_of_day_et(ctx.timestamp)
-        if minute is not None and SESSION_OPEN_MIN_ET <= minute < SESSION_CLOSE_MIN_ET:
-            hours_to_close = max(0.1, (SESSION_CLOSE_MIN_ET - minute) / 60.0)
+        close_min = session_close_minute_et(ctx.timestamp)  # 13:00 on an early-close day
+        if minute is not None and SESSION_OPEN_MIN_ET <= minute < close_min:
+            hours_to_close = max(0.1, (close_min - minute) / 60.0)
             tod_mult = min(1.0, math.sqrt(hours_to_close / 6.5)) * 1.1
         else:
             tod_mult = 0.0

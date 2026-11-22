@@ -37,6 +37,25 @@ def minute_of_day(ts: Optional[datetime]) -> Optional[int]:
     return ts.hour * 60 + ts.minute
 
 
+def session_close_minute_et(ts: Optional[datetime]) -> int:
+    """Minute-of-day (ET) of ``ts``'s session close: 13:00 on an early-close
+    day (NYSE_HALF_DAYS), else 16:00.
+
+    The time-to-close ramps used SESSION_CLOSE_MIN_ET (16:00) every day, so on
+    a 13:00 close EOD Pressure read zero through the real last 90 minutes and
+    switched on from 14:30 to 16:00, after the close, and the charm ramps and
+    the 0DTE time-of-day weight ran three hours late.
+    """
+    if ts is None:
+        return SESSION_CLOSE_MIN_ET
+    from src.market_calendar import regular_session_close
+
+    if ts.tzinfo is None:
+        ts = pytz.UTC.localize(ts)
+    close_t = regular_session_close(ts.astimezone(ET).date())
+    return close_t.hour * 60 + close_t.minute
+
+
 def minute_of_day_et(ts: Optional[datetime]) -> Optional[int]:
     """Return the minute-of-day in *US/Eastern*, DST-correct.
 

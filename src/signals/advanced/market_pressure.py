@@ -72,12 +72,12 @@ from typing import Optional
 
 from src.signals.components.base import MarketContext
 from src.signals.components.utils import (
-    SESSION_CLOSE_MIN_ET,
     SESSION_OPEN_MIN_ET,
     minute_of_day_et,
     moneyness_delta_proxy,
     net_flow_ratio,
     realized_sigma,
+    session_close_minute_et,
 )
 from src.signals.advanced.base import (
     AdvancedSignalResult,
@@ -450,11 +450,12 @@ class MarketPressureSignal:
         minute = minute_of_day_et(ctx.timestamp)
         if minute is None:
             return 0.5 * (_ALPHA_VANNA_OPEN + _ALPHA_VANNA_CLOSE)
+        close_min = session_close_minute_et(ctx.timestamp)  # 13:00 on an early-close day
         if minute <= SESSION_OPEN_MIN_ET:
             return _ALPHA_VANNA_OPEN
-        if minute >= SESSION_CLOSE_MIN_ET:
+        if minute >= close_min:
             return _ALPHA_VANNA_CLOSE
-        span = max(1, SESSION_CLOSE_MIN_ET - SESSION_OPEN_MIN_ET)
+        span = max(1, close_min - SESSION_OPEN_MIN_ET)
         frac = (minute - SESSION_OPEN_MIN_ET) / span
         return _ALPHA_VANNA_OPEN + (_ALPHA_VANNA_CLOSE - _ALPHA_VANNA_OPEN) * frac
 
@@ -463,9 +464,10 @@ class MarketPressureSignal:
         minute = minute_of_day_et(ctx.timestamp)
         if minute is None or minute <= SESSION_OPEN_MIN_ET:
             return 1.0
-        if minute >= SESSION_CLOSE_MIN_ET:
+        close_min = session_close_minute_et(ctx.timestamp)  # 13:00 on an early-close day
+        if minute >= close_min:
             return _CHARM_AMP_MAX
-        span = max(1, SESSION_CLOSE_MIN_ET - SESSION_OPEN_MIN_ET)
+        span = max(1, close_min - SESSION_OPEN_MIN_ET)
         frac = (minute - SESSION_OPEN_MIN_ET) / span
         if frac < _CHARM_AMP_START:
             return 1.0
