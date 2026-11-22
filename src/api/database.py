@@ -7645,7 +7645,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT (MAX(timestamp) AT TIME ZONE 'America/New_York')::date
                 FROM flow_by_contract
                 WHERE symbol = $1
-                  AND (timestamp AT TIME ZONE 'America/New_York')::date < $2::date
+                  -- "ET date before $2" as a plain range (before $2's ET
+                  -- midnight), so the (symbol, timestamp) index stops the
+                  -- read; the cast on timestamp walked every row of the
+                  -- current session on every uncached Prior poll.
+                  AND timestamp < ($2::date::timestamp AT TIME ZONE 'America/New_York')
                 """,
                 symbol,
                 current_date,
