@@ -9646,50 +9646,64 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # symbols; only its ``open`` (the closing-auction print) participates
     # in the high/low, mirroring ``get_session_closes``'s asset-aware
     # cash-close rule.
+    # Every predicate is a range on the bare ``timestamp`` column, so the
+    # (symbol, timestamp) index bounds each read. The previous version applied
+    # ``AT TIME ZONE ...::date / ::time`` to timestamp in every WHERE, so all
+    # three reads were full scans of the symbol's 1-minute history
+    # (underlying_quotes has no retention): ~380 ms on 8.5 months of SPY and
+    # growing, run whenever the live levels were asked for, 04:00 ET on.
+    # The previous session is found by walking back from the start of
+    # ``$2`` (14 days covers any market closure) instead of MAX() over all
+    # history; output is unchanged (tests/test_session_levels_live_sql.py).
     _SESSION_LEVELS_LIVE_SQL = """
-        WITH premarket AS (
+        WITH bounds AS (
+            SELECT
+                ($2::date + TIME '04:00') AT TIME ZONE 'America/New_York' AS pm_start,
+                ($2::date + TIME '09:30') AT TIME ZONE 'America/New_York' AS pm_end,
+                ($2::date)::timestamp AT TIME ZONE 'America/New_York' AS day_start
+        ),
+        premarket AS (
             SELECT
                 MAX(high) AS pm_high,
                 MIN(low)  AS pm_low,
                 COUNT(*)  AS pm_bars
-            FROM underlying_quotes
+            FROM underlying_quotes, bounds b
             WHERE symbol = $1
-              AND (timestamp AT TIME ZONE 'America/New_York')::date = $2
-              AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '04:00'
-              AND (timestamp AT TIME ZONE 'America/New_York')::time <  TIME '09:30'
+              AND timestamp >= b.pm_start
+              AND timestamp <  b.pm_end
         ),
         prev_date AS (
-            SELECT MAX((timestamp AT TIME ZONE 'America/New_York')::date) AS d
-            FROM underlying_quotes
-            WHERE symbol = $1
-              AND (timestamp AT TIME ZONE 'America/New_York')::date < $2
-              AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
-              AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
-              AND (timestamp AT TIME ZONE 'America/New_York')::time <  TIME '16:00'
+            SELECT (
+                SELECT (uq.timestamp AT TIME ZONE 'America/New_York')::date
+                FROM underlying_quotes uq, bounds b
+                WHERE uq.symbol = $1
+                  AND uq.timestamp <  b.day_start
+                  AND uq.timestamp >= b.day_start - INTERVAL '14 days'
+                  AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::time <  TIME '16:00'
+                ORDER BY uq.timestamp DESC
+                LIMIT 1
+            ) AS d
         ),
         prev_close AS (
             SELECT
                 pd.d,
-                CASE WHEN pd.d = ANY($3::date[]) THEN TIME '13:00' ELSE TIME '16:00' END AS close_t
+                (pd.d + TIME '09:30') AT TIME ZONE 'America/New_York' AS open_ts,
+                (pd.d + CASE WHEN pd.d = ANY($3::date[]) THEN TIME '13:00' ELSE TIME '16:00' END)
+                    AT TIME ZONE 'America/New_York' AS close_ts
             FROM prev_date pd
         ),
         prev_session AS (
             SELECT
-                MAX(uq.high) FILTER (
-                    WHERE (uq.timestamp AT TIME ZONE 'America/New_York')::time < pc.close_t
-                ) AS rth_high,
-                MIN(uq.low) FILTER (
-                    WHERE (uq.timestamp AT TIME ZONE 'America/New_York')::time < pc.close_t
-                ) AS rth_low,
-                MAX(uq.open) FILTER (
-                    WHERE (uq.timestamp AT TIME ZONE 'America/New_York')::time = pc.close_t
-                ) AS auction_open
+                MAX(uq.high) FILTER (WHERE uq.timestamp < pc.close_ts) AS rth_high,
+                MIN(uq.low)  FILTER (WHERE uq.timestamp < pc.close_ts) AS rth_low,
+                MAX(uq.open) FILTER (WHERE uq.timestamp = pc.close_ts) AS auction_open
             FROM underlying_quotes uq
             CROSS JOIN prev_close pc
             WHERE uq.symbol = $1
-              AND (uq.timestamp AT TIME ZONE 'America/New_York')::date = pc.d
-              AND (uq.timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
-              AND (uq.timestamp AT TIME ZONE 'America/New_York')::time <= pc.close_t
+              AND uq.timestamp >= pc.open_ts
+              AND uq.timestamp <= pc.close_ts
         )
         SELECT
             pm.pm_high,
