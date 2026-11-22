@@ -29,6 +29,27 @@ from src.database.connection import db_connection
 
 logger = logging.getLogger(__name__)
 
+
+def _owner(request: Request) -> Optional[str]:
+    """Who owns the backtests this request creates or may read.
+
+    A website member (the signed end-user token), else the account behind a
+    member's own API key (``key:<user_id>``), else None: the shared key with
+    no member behind it. Owner was the end-user token alone, so everything a
+    member saved through their own API key landed in one ownerless pool that
+    every other key holder could list, read, publish at a public URL, edit and
+    delete (ids are sequential).
+    """
+    end_user, _ = resolve_end_user(request)
+    if end_user:
+        return end_user
+    identity = getattr(request.state, "identity", None)
+    caller = getattr(identity, "caller_user_id", None)
+    if caller and caller != "static":
+        return f"key:{caller}"
+    return None
+
+
 # Tagged "Beta" in addition to "Backtesting" so the whole platform surfaces
 # under the Beta group in the OpenAPI/Swagger docs while it stabilises.
 router = APIRouter(prefix="/api/backtest", tags=["Backtesting", "Beta"])
@@ -89,7 +110,7 @@ async def create_backtest_run(request: Request, background_tasks: BackgroundTask
     except SpecError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     try:
         run_id = await asyncio.to_thread(create_run, spec, end_user=end_user)
     except Exception:
@@ -111,14 +132,14 @@ async def list_backtest_runs(
     limit: int = Query(25, ge=1, le=100),
 ) -> list:
     """Recent runs for the calling end-user (anonymous runs when unauthenticated)."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     return await asyncio.to_thread(queries.list_runs, end_user=end_user, limit=limit)
 
 
 @router.get("/runs/{run_id}")
 async def get_backtest_run(run_id: int, request: Request) -> dict:
     """Status + summary for one run."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     run = await asyncio.to_thread(queries.get_run, run_id, end_user=end_user)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -132,7 +153,7 @@ async def share_backtest_run(run_id: int, request: Request) -> dict:
     Turns a run into a shareable "prove it" report at
     ``/backtesting/shared/<token>``. Owner-scoped; only completed runs qualify.
     """
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     token = await asyncio.to_thread(queries.share_run, run_id, end_user=end_user)
     if token is None:
         raise HTTPException(status_code=404, detail="run not found or not shareable")
@@ -165,7 +186,7 @@ async def get_backtest_trades(
     offset: int = Query(0, ge=0),
 ) -> dict:
     """Paginated trade blotter for a run."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     run = await asyncio.to_thread(queries.get_run, run_id, end_user=end_user)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -202,7 +223,7 @@ _CSV_COLUMNS = [
 @router.get("/runs/{run_id}/trades.csv")
 async def download_backtest_trades_csv(run_id: int, request: Request) -> Response:
     """Download the full trade blotter for a run as CSV."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     run = await asyncio.to_thread(queries.get_run, run_id, end_user=end_user)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -224,7 +245,7 @@ async def download_backtest_trades_csv(run_id: int, request: Request) -> Respons
 @router.get("/runs/{run_id}/equity")
 async def get_backtest_equity(run_id: int, request: Request) -> list:
     """Equity curve points for a run."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     run = await asyncio.to_thread(queries.get_run, run_id, end_user=end_user)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -260,7 +281,7 @@ async def create_backtest_config(request: Request) -> dict:
     if len(name) > 120:
         name = name[:120]
     spec = _validated_spec(body)
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     return await asyncio.to_thread(
         configs.save_config,
         spec.to_dict(),
@@ -273,7 +294,7 @@ async def create_backtest_config(request: Request) -> dict:
 @router.get("/configs")
 async def list_backtest_configs(request: Request) -> list:
     """Saved configs for the calling end-user (anonymous pool when unauthenticated)."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     return await asyncio.to_thread(configs.list_configs, end_user=end_user)
 
 
@@ -289,7 +310,7 @@ async def get_shared_backtest_config(share_token: str) -> dict:
 @router.get("/configs/{config_id}")
 async def get_backtest_config(config_id: int, request: Request) -> dict:
     """Fetch one saved config (incl. spec), scoped to its owner."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     cfg = await asyncio.to_thread(configs.get_config, config_id, end_user=end_user)
     if cfg is None:
         raise HTTPException(status_code=404, detail="config not found")
@@ -318,7 +339,7 @@ async def update_backtest_config(config_id: int, request: Request) -> dict:
     if name is None and spec_dict is None:
         raise HTTPException(status_code=422, detail="nothing to update")
 
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     cfg = await asyncio.to_thread(
         configs.update_config,
         config_id,
@@ -335,7 +356,7 @@ async def update_backtest_config(config_id: int, request: Request) -> dict:
 @router.delete("/configs/{config_id}")
 async def delete_backtest_config(config_id: int, request: Request) -> dict:
     """Delete a saved config (owner only)."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     ok = await asyncio.to_thread(configs.delete_config, config_id, end_user=end_user)
     if not ok:
         raise HTTPException(status_code=404, detail="config not found")
@@ -367,7 +388,7 @@ async def create_backtest_sweep(request: Request, background_tasks: BackgroundTa
     except SweepError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     try:
         result = await asyncio.to_thread(_create_sweep_sync, base_spec, axes, end_user)
     except SweepError as exc:
@@ -392,14 +413,14 @@ async def list_backtest_sweeps(
     limit: int = Query(25, ge=1, le=100),
 ) -> list:
     """Recent sweeps for the calling end-user."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     return await asyncio.to_thread(sweeps.list_sweeps, end_user=end_user, limit=limit)
 
 
 @router.get("/sweeps/{sweep_id}")
 async def get_backtest_sweep(sweep_id: int, request: Request) -> dict:
     """Sweep header + per-cell run status/metrics (used while polling)."""
-    end_user, _ = resolve_end_user(request)
+    end_user = _owner(request)
     sweep = await asyncio.to_thread(sweeps.get_sweep, sweep_id, end_user=end_user)
     if sweep is None:
         raise HTTPException(status_code=404, detail="sweep not found")

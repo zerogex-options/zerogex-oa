@@ -128,10 +128,20 @@ def test_get_config_foreign_owner_returns_none(patched):
     assert configs_mod.get_config(1, end_user="mallory") is None
 
 
-def test_get_config_anonymous_readable(patched):
+def test_get_config_ownerless_is_not_readable_by_a_member_or_key(patched):
+    # An ownerless row used to pass every ownership check, so any member, or
+    # any other customer's API key, could read, publish, edit or delete it.
     row = (*_summary_row(), {"underlying": "SPY"}, None)
     patched([row])
-    assert configs_mod.get_config(1, end_user="anyone") is not None
+    assert configs_mod.get_config(1, end_user="anyone") is None
+    patched([row])
+    assert configs_mod.get_config(1, end_user="key:user-7") is None
+
+
+def test_get_config_ownerless_is_readable_by_an_ownerless_caller(patched):
+    row = (*_summary_row(), {"underlying": "SPY"}, None)
+    patched([row])
+    assert configs_mod.get_config(1, end_user=None) is not None
 
 
 def test_delete_foreign_owner_refused(patched):

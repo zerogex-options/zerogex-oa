@@ -205,7 +205,10 @@ def get_sweep(sweep_id: int, *, end_user: Optional[str]) -> Optional[dict]:
         if row is None:
             return None
         owner = row[5]
-        if owner is not None and owner != end_user:
+        # Strict: an ownerless row belongs to ownerless callers only. It
+        # used to pass for EVERY caller, so another member's key could
+        # read, publish, edit or delete it.
+        if owner != end_user:
             return None
 
         cur.execute(

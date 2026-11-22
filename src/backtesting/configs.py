@@ -92,7 +92,10 @@ def get_config(config_id: int, *, end_user: Optional[str]) -> Optional[dict]:
         if row is None:
             return None
         owner = row[7]
-        if owner is not None and owner != end_user:
+        # Strict: an ownerless row belongs to ownerless callers only. It
+        # used to pass for EVERY caller, so another member's key could
+        # read, publish, edit or delete it.
+        if owner != end_user:
             return None
         out = _row_to_summary(row)
         out["spec"] = row[6]
@@ -122,7 +125,10 @@ def update_config(config_id: int, *, end_user: Optional[str],
         if row is None:
             return None
         owner = row[0]
-        if owner is not None and owner != end_user:
+        # Strict: an ownerless row belongs to ownerless callers only. It
+        # used to pass for EVERY caller, so another member's key could
+        # read, publish, edit or delete it.
+        if owner != end_user:
             return None
 
         sets, params = [], []
@@ -161,7 +167,10 @@ def delete_config(config_id: int, *, end_user: Optional[str]) -> bool:
         if row is None:
             return False
         owner = row[0]
-        if owner is not None and owner != end_user:
+        # Strict: an ownerless row belongs to ownerless callers only. It
+        # used to pass for EVERY caller, so another member's key could
+        # read, publish, edit or delete it.
+        if owner != end_user:
             return False
         cur.execute("DELETE FROM backtest_configs WHERE id = %s", (config_id,))
         return True

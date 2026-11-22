@@ -58,7 +58,10 @@ def get_run(run_id: int, *, end_user: Optional[str]) -> Optional[dict]:
         if row is None:
             return None
         owner = row[11]  # end_user is the 12th selected column
-        if owner is not None and owner != end_user:
+        # Strict: an ownerless row belongs to ownerless callers only. It
+        # used to pass for EVERY caller, so another member's key could
+        # read, publish, edit or delete it.
+        if owner != end_user:
             return None
         return _row_to_run(row, include_spec=True)
 
@@ -173,7 +176,10 @@ def share_run(run_id: int, *, end_user: Optional[str]) -> Optional[str]:
         if row is None:
             return None
         owner, status, token = row
-        if owner is not None and owner != end_user:
+        # Strict: an ownerless row belongs to ownerless callers only. It
+        # used to pass for EVERY caller, so another member's key could
+        # read, publish, edit or delete it.
+        if owner != end_user:
             return None
         if status != "completed":
             return None
