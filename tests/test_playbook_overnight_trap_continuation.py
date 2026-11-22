@@ -64,8 +64,8 @@ def _ctx(
                 "wall_migrated_down": wall_migrated_down,
             },
         ),
-        "0dte_position_imbalance": SignalSnapshot(
-            name="0dte_position_imbalance",
+        "zero_dte_position_imbalance": SignalSnapshot(
+            name="zero_dte_position_imbalance",
             score=odpi_score,
             clamped_score=odpi_score / 100.0,
             triggered=odpi_triggered,

@@ -22,7 +22,7 @@ def _ctx(
     close: float = 678.0,
     max_pain: float = 678.0,
     net_gex: float = 3.0e9,
-    rbi_label: str = "Range Fade",
+    rbi_label: str = "Range-Bound",
     closes: Optional[list[float]] = None,
     regime: str = "chop_range",
     vol_x_triggered: bool = False,
@@ -66,8 +66,8 @@ def _ctx(
             triggered=vol_x_triggered,
             context_values={},
         ),
-        "0dte_position_imbalance": SignalSnapshot(
-            name="0dte_position_imbalance",
+        "zero_dte_position_imbalance": SignalSnapshot(
+            name="zero_dte_position_imbalance",
             score=odpi_score,
             clamped_score=odpi_score / 100.0,
             triggered=odpi_triggered,

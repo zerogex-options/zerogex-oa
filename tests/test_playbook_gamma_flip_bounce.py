@@ -54,7 +54,7 @@ def _ctx(
     close: Optional[float] = None,
     net_gex: float = 3.0e9,
     flip_distance_subscore: float = 0.80,
-    rbi_label: str = "Range Fade",
+    rbi_label: str = "Range-Bound",
     vol_x_triggered: bool = False,
     timestamp: Optional[datetime] = None,
     regime: str = "controlled_trend",

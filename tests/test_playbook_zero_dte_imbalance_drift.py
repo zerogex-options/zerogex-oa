@@ -51,8 +51,8 @@ def _ctx(
     )
 
     advanced: dict[str, SignalSnapshot] = {
-        "0dte_position_imbalance": SignalSnapshot(
-            name="0dte_position_imbalance",
+        "zero_dte_position_imbalance": SignalSnapshot(
+            name="zero_dte_position_imbalance",
             score=odpi_score,
             clamped_score=odpi_score / 100.0,
             triggered=odpi_triggered,
@@ -205,7 +205,7 @@ def test_trap_triggered_but_signal_none_blocks():
 
 def test_range_fade_label_lowers_confidence():
     base = ZDID.match(_ctx(odpi_score=40.0, rbi_label="Weak Range"))
-    fade = ZDID.match(_ctx(odpi_score=40.0, rbi_label="Range Fade"))
+    fade = ZDID.match(_ctx(odpi_score=40.0, rbi_label="Range-Bound"))
     assert base is not None and fade is not None
     assert fade.confidence < base.confidence
 

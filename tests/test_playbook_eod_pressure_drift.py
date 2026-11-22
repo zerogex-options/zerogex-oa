@@ -54,8 +54,8 @@ def _ctx(
             triggered=eod_triggered,
             context_values={},
         ),
-        "0dte_position_imbalance": SignalSnapshot(
-            name="0dte_position_imbalance",
+        "zero_dte_position_imbalance": SignalSnapshot(
+            name="zero_dte_position_imbalance",
             score=20.0 if eod_score > 0 else -20.0,
             clamped_score=0.20 if eod_score > 0 else -0.20,
             triggered=odpi_triggered,

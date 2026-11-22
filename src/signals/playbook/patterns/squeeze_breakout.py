@@ -83,7 +83,7 @@ class SqueezeBreakoutPattern(PatternBase):
         "tape_flow_bias",
         "dealer_delta_pressure",
     )
-    # range_break_imminence "Range Fade" label opposes — handled inline.
+    # range_break_imminence "Range-Bound" label opposes — handled inline.
     confluence_signals_against = ()
 
     def match(self, ctx: PlaybookContext) -> Optional[ActionCard]:
@@ -134,9 +134,9 @@ class SqueezeBreakoutPattern(PatternBase):
         stop_ref = envelope_high if breakout == "bullish" else envelope_low
 
         confidence = self.compute_confidence(ctx, bias=breakout)
-        # Inline against-check: range_break_imminence "Range Fade" opposes.
+        # Inline against-check: range_break_imminence "Range-Bound" opposes.
         rbi = ctx.signal("range_break_imminence")
-        if rbi and rbi.context_values.get("label") == "Range Fade":
+        if rbi and rbi.context_values.get("label") == "Range-Bound":
             confidence = max(0.20, confidence - 0.10)
 
         rationale = (

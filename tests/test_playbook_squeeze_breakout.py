@@ -274,7 +274,7 @@ def test_no_call_wall_uses_range_target():
 
 def test_range_fade_label_lowers_confidence():
     base = SQB.match(_ctx(rbi_label="Break Watch"))
-    fade = SQB.match(_ctx(rbi_label="Range Fade"))
+    fade = SQB.match(_ctx(rbi_label="Range-Bound"))
     assert base is not None and fade is not None
     assert fade.confidence < base.confidence
 

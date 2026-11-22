@@ -24,7 +24,7 @@ def _ctx(
     timestamp: Optional[datetime] = None,
     tape_score: float = -50.0,
     trap_signal: Optional[str] = "bearish_fade",
-    rbi_label: str = "Range Fade",
+    rbi_label: str = "Range-Bound",
     regime: str = "high_risk_reversal",
     vix_level: float = 16.7,
     recent_closes: Optional[list[float]] = None,

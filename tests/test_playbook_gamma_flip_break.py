@@ -188,7 +188,7 @@ def test_no_cross_does_not_match():
 
 
 def test_breakout_label_required():
-    card = GAMMA_FLIP_BREAK.match(_ctx(rbi_label="Range Fade"))
+    card = GAMMA_FLIP_BREAK.match(_ctx(rbi_label="Range-Bound"))
     assert card is None
 
 

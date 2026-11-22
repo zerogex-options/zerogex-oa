@@ -56,7 +56,7 @@ class EodPressureDriftPattern(PatternBase):
     pattern_base = 0.55
 
     confluence_signals_for = (
-        "0dte_position_imbalance",
+        "zero_dte_position_imbalance",
         "dealer_delta_pressure",
     )
     # tape_flow_bias only opposes when the score sign is *opposite* the drift
@@ -141,7 +141,7 @@ class EodPressureDriftPattern(PatternBase):
                 "put_wall": ctx.level("put_wall"),
                 "advanced_signals_aligned": [
                     name
-                    for name in ("0dte_position_imbalance",)
+                    for name in ("zero_dte_position_imbalance",)
                     if (snap := ctx.signal(name)) and snap.triggered
                 ],
                 "minutes_to_close": ctx.minutes_to_close,

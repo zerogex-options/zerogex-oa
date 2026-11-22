@@ -221,7 +221,7 @@ async def _cwf_adv(symbol, name):
         return {
             "clamped_score": 0.10,
             "score": 10.0,
-            "context_values": {"label": "Range Fade"},
+            "context_values": {"label": "Range-Bound"},
         }
     return None
 
@@ -563,7 +563,7 @@ def test_recently_emitted_blocks_re_emission_via_hysteresis(monkeypatch: pytest.
             return {
                 "clamped_score": 0.10,
                 "score": 10.0,
-                "context_values": {"label": "Range Fade"},
+                "context_values": {"label": "Range-Bound"},
             }
         return None
 

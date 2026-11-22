@@ -1,7 +1,7 @@
 """Pattern 1.5: ``zero_dte_imbalance_drift`` — Smart-Money 0DTE Bias.
 
 Midday window (11:00 → 14:30 ET) where smart-money 0DTE flow leads
-price by ~30s on liquid names.  When ``0dte_position_imbalance`` reads
+price by ~30s on liquid names.  When ``zero_dte_position_imbalance`` reads
 heavily one-sided AND the corroborating flow is real (not all-expiry
 fallback) AND no trap is fighting the drift, lean into it with a
 narrow 0DTE debit spread.
@@ -75,7 +75,7 @@ class ZeroDteImbalanceDriftPattern(PatternBase):
     pattern_base = 0.50
 
     confluence_signals_for = ("tape_flow_bias", "vanna_charm_flow")
-    # range_break_imminence's "Range Fade" label opposes — handled inline
+    # range_break_imminence's "Range-Bound" label opposes — handled inline
     # because the check is on the label, not the signal sign.
     confluence_signals_against = ()
 
@@ -84,7 +84,7 @@ class ZeroDteImbalanceDriftPattern(PatternBase):
         if miss:
             return None
 
-        odpi = ctx.signal("0dte_position_imbalance")
+        odpi = ctx.signal("zero_dte_position_imbalance")
         # _check_triggers guarantees odpi is triggered with sufficient score
         # and a real zero_dte flow source.
         assert odpi is not None
@@ -141,9 +141,9 @@ class ZeroDteImbalanceDriftPattern(PatternBase):
             stop_ref = close + stop_distance
 
         confidence = self.compute_confidence(ctx, bias=drift)
-        # Inline against-check: range_break_imminence "Range Fade" label.
+        # Inline against-check: range_break_imminence "Range-Bound" label.
         rbi = ctx.signal("range_break_imminence")
-        if rbi and rbi.context_values.get("label") == "Range Fade":
+        if rbi and rbi.context_values.get("label") == "Range-Bound":
             confidence = max(0.20, confidence - _RANGE_FADE_PENALTY)
 
         rationale = self._compose_rationale(
@@ -210,14 +210,14 @@ class ZeroDteImbalanceDriftPattern(PatternBase):
         if ctx.close <= 0:
             missing.append("close price unavailable")
 
-        odpi = ctx.signal("0dte_position_imbalance")
+        odpi = ctx.signal("zero_dte_position_imbalance")
         if odpi is None:
-            missing.append("0dte_position_imbalance signal unavailable")
+            missing.append("zero_dte_position_imbalance signal unavailable")
         elif not odpi.triggered:
-            missing.append(f"0dte_position_imbalance not triggered (score={odpi.score})")
+            missing.append(f"zero_dte_position_imbalance not triggered (score={odpi.score})")
         elif abs(odpi.score) < _ODPI_SCORE_MIN:
             missing.append(
-                f"0dte_position_imbalance |score| {abs(odpi.score):.1f} < {_ODPI_SCORE_MIN:.0f}"
+                f"zero_dte_position_imbalance |score| {abs(odpi.score):.1f} < {_ODPI_SCORE_MIN:.0f}"
             )
         else:
             flow_source = odpi.context_values.get("flow_source")

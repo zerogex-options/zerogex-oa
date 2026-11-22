@@ -72,7 +72,7 @@ class PinRiskPremiumSellPattern(PatternBase):
     pattern_base = 0.50
 
     confluence_signals_for = ("gex_gradient",)
-    # vol_expansion / 0dte_position_imbalance triggered would oppose a
+    # vol_expansion / zero_dte_position_imbalance triggered would oppose a
     # pin trade — handled inline since the check is on triggered, not score.
     confluence_signals_against = ()
 
@@ -197,20 +197,20 @@ class PinRiskPremiumSellPattern(PatternBase):
 
         rbi = ctx.signal("range_break_imminence")
         rbi_label = rbi.context_values.get("label") if rbi else None
-        if rbi_label not in ("Range Fade", "Weak Range"):
+        if rbi_label not in ("Range-Bound", "Weak Range"):
             missing.append(
                 f"range_break_imminence.label is {rbi_label!r} "
-                "(needs 'Range Fade' or 'Weak Range' for pin thesis)"
+                "(needs 'Range-Bound' or 'Weak Range' for pin thesis)"
             )
 
-        # Active vol_expansion or 0dte_position_imbalance fights the pin.
+        # Active vol_expansion or zero_dte_position_imbalance fights the pin.
         vol_x = ctx.signal("vol_expansion")
         if vol_x and vol_x.triggered:
             missing.append("vol_expansion triggered (breakout regime fights pin)")
-        odpi = ctx.signal("0dte_position_imbalance")
+        odpi = ctx.signal("zero_dte_position_imbalance")
         if odpi and odpi.triggered and abs(odpi.score) >= 30:
             missing.append(
-                f"0dte_position_imbalance |score| {abs(odpi.score):.1f} too directional for pin"
+                f"zero_dte_position_imbalance |score| {abs(odpi.score):.1f} too directional for pin"
             )
 
         return missing

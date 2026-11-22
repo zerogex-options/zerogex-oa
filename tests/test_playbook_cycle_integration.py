@@ -99,7 +99,7 @@ def _bearish_flow_advanced() -> list:
         _result(
             name="range_break_imminence",
             score=0.10,
-            context={"label": "Range Fade"},
+            context={"label": "Range-Bound"},
         ),
     ]
 

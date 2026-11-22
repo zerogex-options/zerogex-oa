@@ -74,7 +74,7 @@ class OvernightTrapContinuationPattern(PatternBase):
     pattern_base = 0.55
 
     confluence_signals_for = ("positioning_trap", "skew_delta")
-    # 0dte_position_imbalance opposing the trap direction is handled
+    # zero_dte_position_imbalance opposing the trap direction is handled
     # inline because it requires a directional comparison rather than a
     # straight sign-vs-bias product.
     confluence_signals_against = ()
@@ -111,9 +111,9 @@ class OvernightTrapContinuationPattern(PatternBase):
         target_ref = self._intraday_midpoint(ctx)
 
         confidence = self.compute_confidence(ctx, bias=direction)
-        # Penalize when 0dte_position_imbalance opposes the trap direction
+        # Penalize when zero_dte_position_imbalance opposes the trap direction
         # (still active end-of-day flow fighting the reversal).
-        odpi = ctx.signal("0dte_position_imbalance")
+        odpi = ctx.signal("zero_dte_position_imbalance")
         if odpi and odpi.triggered and abs(odpi.score) >= 30:
             opposes = (direction == "bullish" and odpi.score < 0) or (
                 direction == "bearish" and odpi.score > 0
