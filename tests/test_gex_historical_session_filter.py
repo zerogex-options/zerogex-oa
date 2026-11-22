@@ -267,19 +267,20 @@ def test_historical_cash_index_restricts_to_regular_session():
     assert "<> ALL($5::date[])" in sql
 
     # Filter is applied to all three gex_summary scans — the anchor in
-    # ``latest``, the bucket-floor in ``bounds``, and the per-bucket
-    # selection in ``bucketed``.
-    assert sql.count("EXTRACT(DOW") == 3
+    # ``latest``, the bucket-floor in ``bounds`` (once per tier of the floor:
+    # the last 2N buckets' worth of time, 7 days, all history), and the
+    # per-bucket selection in ``bucketed``: 1 + 3 + 1.
+    assert sql.count("EXTRACT(DOW") == 5
     extract_positions = [i for i in range(len(sql)) if sql.startswith("EXTRACT(DOW", i)]
     bounds_idx = sql.index("bounds AS")
     bucketed_idx = sql.index("bucketed AS")
     # First occurrence is inside ``latest`` (before ``bounds``).
     assert extract_positions[0] < bounds_idx
-    # Second occurrence is inside ``bounds`` (between ``bounds`` and
+    # The floor's three tiers sit inside ``bounds`` (between ``bounds`` and
     # ``bucketed``).
-    assert bounds_idx < extract_positions[1] < bucketed_idx
-    # Third occurrence is inside ``bucketed`` (after that marker).
-    assert extract_positions[2] > bucketed_idx
+    assert all(bounds_idx < p < bucketed_idx for p in extract_positions[1:4])
+    # The last occurrence is inside ``bucketed`` (after that marker).
+    assert extract_positions[4] > bucketed_idx
     # None extend into the gex_by_strike joins (strike_agg / call_walls
     # / put_walls inherit the RTH-only timestamp set transitively via
     # ``base``).
@@ -362,8 +363,9 @@ def test_max_pain_cash_index_restricts_to_regular_session():
 
     # Filter applied to all three gex_summary scans: ``latest`` anchor,
     # ``bounds`` bucket-floor subquery (so ``window_units`` counts only
-    # RTH buckets), and ``ranked`` per-bucket selection.
-    assert sql.count("EXTRACT(DOW") == 3
+    # RTH buckets; once per tier of the floor), and ``ranked`` per-bucket
+    # selection: 1 + 3 + 1.
+    assert sql.count("EXTRACT(DOW") == 5
 
     # Param shape: symbol, window_units, holidays[].
     assert len(captured["args"]) == 3

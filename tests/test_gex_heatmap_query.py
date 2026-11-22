@@ -378,19 +378,22 @@ def test_cash_index_heatmap_restricts_to_regular_session():
     # the latest_summary anchor, the bucket-floor subquery in time_window,
     # and bucket_reps — but never to the gex_by_strike read.
     join_idx = sql.index("FROM gex_by_strike g")
-    assert sql.count("EXTRACT(DOW") == 3
+    # The bucket floor carries it in each of its three tiers (the last 2N
+    # buckets' worth of time, the last 7 days, then all history; see
+    # _bucket_floor_subquery), so 1 + 3 + 1.
+    assert sql.count("EXTRACT(DOW") == 5
     extract_positions = [i for i in range(len(sql)) if sql.startswith("EXTRACT(DOW", i)]
     # All EXTRACT(DOW occurrences precede the join, none follow it.
     assert all(idx < join_idx for idx in extract_positions)
-    # Each occurrence lands in its corresponding CTE — anchor, then
-    # time_window bucket-floor, then bucket_reps.
+    # Each occurrence lands in its corresponding CTE — anchor, then the three
+    # time_window bucket-floor tiers, then bucket_reps.
     summary_anchor_idx = sql.index("FROM gex_summary")
     time_window_idx = sql.index("time_window AS")
     bucket_reps_idx = sql.index("bucket_reps AS")
     assert summary_anchor_idx < extract_positions[0] < time_window_idx
-    assert time_window_idx < extract_positions[1] < bucket_reps_idx
+    assert all(time_window_idx < p < bucket_reps_idx for p in extract_positions[1:4])
     bucket_reps_summary_idx = sql.index("FROM gex_summary", bucket_reps_idx)
-    assert bucket_reps_summary_idx < extract_positions[2] < join_idx
+    assert bucket_reps_summary_idx < extract_positions[4] < join_idx
 
     # symbol, window_units, then the holiday list.
     assert captured["args"][0] == "SPX"

@@ -240,8 +240,9 @@ def test_cash_index_restricts_to_regular_session():
     # bucket-floor subquery, and bucket_reps. Counting RTH-only buckets
     # for the floor matches what bucket_reps will surface — anything
     # less would re-introduce the wall-clock sparsity bug for cash
-    # indices on coarser intervals.
-    assert sql.count("EXTRACT(DOW") == 3
+    # indices on coarser intervals. The floor carries it once per tier
+    # (last 2N buckets' worth of time, 7 days, all history): 1 + 3 + 1.
+    assert sql.count("EXTRACT(DOW") == 5
 
     # bucket_reps aliases gex_summary as ``gs`` — its session predicate
     # must reference gs.timestamp, not the bare column (PG won't resolve).
