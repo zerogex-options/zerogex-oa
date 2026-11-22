@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -1367,6 +1367,19 @@ async def admin_trades(
     )
 
 
+def _parse_filter_instant(name: str, raw: str) -> datetime:
+    """An ISO date or datetime query value as an aware datetime (UTC if naive)."""
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"{name} must be an ISO date or datetime, e.g. 2026-11-01"
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 async def _fleet_trades(
     db: DatabaseManager,
     *,
@@ -1392,11 +1405,14 @@ async def _fleet_trades(
     if bot_id:
         params.append(bot_id)
         where.append(f"bot_id = ${len(params)}")
+    # asyncpg binds a timestamptz from a datetime only; a raw query string
+    # made every since/until request a 500. Parse it here (a bare date is
+    # midnight UTC), and answer a bad one with a 400.
     if since:
-        params.append(since)
+        params.append(_parse_filter_instant("since", since))
         where.append(f"closed_at >= ${len(params)}::timestamptz")
     if until:
-        params.append(until)
+        params.append(_parse_filter_instant("until", until))
         where.append(f"closed_at < ${len(params)}::timestamptz")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 

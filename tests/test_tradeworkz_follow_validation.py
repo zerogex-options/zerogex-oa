@@ -146,3 +146,19 @@ def test_fanout_reads_rows_stored_before_validation_without_raising(monkeypatch)
         "acct-ok": ["in_app", "email"],
     }
     assert written == 6
+
+
+def test_trade_filters_parse_iso_dates_and_refuse_garbage():
+    from datetime import datetime, timezone
+
+    from src.api.routers.tradeworkz import _parse_filter_instant
+
+    assert _parse_filter_instant("since", "2026-11-01") == datetime(
+        2026, 11, 1, tzinfo=timezone.utc
+    )
+    assert _parse_filter_instant("until", "2026-11-01T14:30:00Z") == datetime(
+        2026, 11, 1, 14, 30, tzinfo=timezone.utc
+    )
+    with pytest.raises(HTTPException) as exc:
+        _parse_filter_instant("since", "last tuesday")
+    assert exc.value.status_code == 400
