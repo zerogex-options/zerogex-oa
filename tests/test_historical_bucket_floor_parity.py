@@ -187,3 +187,106 @@ def test_tiered_floor_reads_the_same_bars_as_the_full_scan(monkeypatch):
     assert not empty, f"cases with no bars: {empty[:5]}"
     differing = [case for case in reference if tiered[case] != reference[case]]
     assert not differing, f"{len(differing)} of {len(reference)} cases differ, e.g. {differing[:5]}"
+
+
+# gex_summary history (gex history, max pain series, and the strike profile and
+# heatmap bucket lists) used the full DISTINCT on every call until the floor's
+# tiers were enabled for it too. gex_summary is never pruned, so that scan grew
+# every day. Same reference check, with the cash-index session filter on.
+
+
+async def _seed_gex(conn) -> None:
+    await _teardown_gex(conn)
+    await conn.execute(
+        "INSERT INTO symbols(symbol, name, asset_type, is_active) VALUES "
+        "($1, 'bucket floor parity test', 'ETF', true), "
+        "($2, 'bucket floor parity test', 'INDEX', true)",
+        _ETF,
+        _INDEX,
+    )
+    for symbol, start, end in ((_ETF, "04:00", "20:00"), (_INDEX, "09:30", "16:00")):
+        await conn.execute(
+            f"""
+            INSERT INTO gex_summary(underlying, timestamp, total_net_gex, max_pain,
+                                    gamma_flip_point, call_wall, put_wall)
+            SELECT $1, ts,
+                   1e9 + (extract(epoch FROM ts)::bigint % 997) * 1e6,
+                   600 + (extract(epoch FROM ts)::bigint % 7),
+                   598, 610, 590
+            FROM ({_DAYS_SQL}) d
+            WHERE (ts AT TIME ZONE 'America/New_York')::time >= '{start}'
+              AND (ts AT TIME ZONE 'America/New_York')::time < '{end}'
+            """,
+            symbol,
+        )
+        # The gex history reads each bucket's spot from underlying_quotes.
+        await conn.execute(
+            f"""
+            INSERT INTO underlying_quotes(symbol, timestamp, open, high, low, close,
+                                          up_volume, down_volume, volume)
+            SELECT $1, ts, 600, 602, 598,
+                   600 + (extract(epoch FROM ts)::bigint % 991) / 100.0, 1000, 900, NULL
+            FROM ({_DAYS_SQL}) d
+            WHERE (ts AT TIME ZONE 'America/New_York')::time >= '{start}'
+              AND (ts AT TIME ZONE 'America/New_York')::time < '{end}'
+            """,
+            symbol,
+        )
+
+
+async def _teardown_gex(conn) -> None:
+    await conn.execute("DELETE FROM gex_summary WHERE underlying IN ($1, $2)", _ETF, _INDEX)
+    await conn.execute("DELETE FROM underlying_quotes WHERE symbol IN ($1, $2)", _ETF, _INDEX)
+    await conn.execute("DELETE FROM symbols WHERE symbol IN ($1, $2)", _ETF, _INDEX)
+
+
+async def _read_gex(conn):
+    db = _db(conn)
+    out = {}
+    for timeframe in ("1min", "5min", "15min", "1hr"):
+        for n in _WINDOW_UNITS:
+            for symbol in (_ETF, _INDEX):
+                for end in _END_DATES:
+                    out[("gex", symbol, end, timeframe, n)] = await db.get_historical_gex(
+                        symbol, None, end, n, timeframe
+                    )
+                out[("max_pain", symbol, timeframe, n)] = await db.get_max_pain_timeseries(
+                    symbol, timeframe, n
+                )
+    return out
+
+
+@pytest.mark.skipif(_DSN is None, reason=_SKIP)
+def test_tiered_floor_reads_the_same_gex_history_as_the_full_scan(monkeypatch):
+    import asyncpg
+
+    import src.api.database as database
+
+    # The throwaway index takes the cash-index session filter, like SPX does.
+    real_is_cash_index = database.is_cash_index
+    monkeypatch.setattr(database, "is_cash_index", lambda s: s == _INDEX or real_is_cash_index(s))
+    full_scan = database._bucket_floor_subquery
+
+    def without_tiers(**kwargs):
+        kwargs.pop("step_expr", None)
+        return full_scan(**kwargs)
+
+    async def _run():
+        conn = await asyncpg.connect(_DSN)
+        try:
+            await _seed_gex(conn)
+            tiered = await _read_gex(conn)
+            monkeypatch.setattr(database, "_bucket_floor_subquery", without_tiers)
+            reference = await _read_gex(conn)
+        finally:
+            await _teardown_gex(conn)
+            await conn.close()
+        return tiered, reference
+
+    tiered, reference = asyncio.run(_run())
+
+    assert tiered.keys() == reference.keys()
+    empty = [case for case, rows in reference.items() if not rows]
+    assert not empty, f"cases with no rows: {empty[:5]}"
+    differing = [case for case in reference if tiered[case] != reference[case]]
+    assert not differing, f"{len(differing)} of {len(reference)} cases differ, e.g. {differing[:5]}"

@@ -5432,6 +5432,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
             limit_param="$4",
             extra_filter=session_filter_latest,
+            # Look near the end first (gex_summary is never pruned, and the
+            # full DISTINCT read every row of the symbol's history per call).
+            step_expr=_interval_expr(timeframe),
         )
         query = f"""
             WITH latest AS (
@@ -5822,6 +5825,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             end_expr="(SELECT max_ts FROM latest)",
             limit_param="$2",
             extra_filter=session_latest,
+            # Look near the end first (gex_summary is never pruned, and the
+            # full DISTINCT read every row of the symbol's history per call).
+            step_expr=_interval_expr(timeframe),
         )
         query = f"""
             WITH latest AS (
@@ -6181,6 +6187,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             end_expr="(SELECT max_ts FROM latest)",
             limit_param="$2",
             extra_filter=session_filter_latest,
+            # Look near the end first (gex_summary is never pruned, and the
+            # full DISTINCT read every row of the symbol's history per call).
+            step_expr=_interval_expr(timeframe),
         )
 
         # Bucketing/anchoring mirrors get_historical_gex and get_gex_heatmap:
@@ -10209,6 +10218,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             end_expr="(SELECT max_ts FROM latest)",
             limit_param="$2",
             extra_filter=session_filter,
+            # Look near the end first (gex_summary is never pruned, and the
+            # full DISTINCT read every row of the symbol's history per call).
+            step_expr=_interval_expr(timeframe),
         )
         # Each bucket's point is its newest row that HAS a max pain. The engine
         # stores NULL there on purpose when no contract in its snapshot carries
@@ -10525,6 +10537,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             end_expr="(SELECT max_ts FROM latest_summary)",
             limit_param="$2",
             extra_filter=session_filter,
+            # Look near the end first (gex_summary is never pruned, and the
+            # full DISTINCT read every row of the symbol's history per call).
+            step_expr=_interval_expr(timeframe),
         )
         # Strike half-band around spot, proportional for every underlying
         # so the colored surface fills the frontend's price-cropped y-axis
