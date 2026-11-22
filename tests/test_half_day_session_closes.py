@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -119,6 +119,10 @@ def test_half_day_closes_are_the_1300_bar(monkeypatch):
                     sym, as_of=friday_1430
                 )
                 out[(sym, "previous")] = await db.get_previous_close(sym)
+            for day in (date(2026, 11, 25), date(2026, 11, 27)):
+                out[(_ETF, "receipt_bars", day)] = await db.get_underlying_bars_for_session(
+                    _ETF, day
+                )
             return out
         finally:
             for sym in (_ETF, _INDEX):
@@ -139,3 +143,11 @@ def test_half_day_closes_are_the_1300_bar(monkeypatch):
     assert float(out[(_INDEX, "previous")]["previous_close"]) == 613.50
     # By 14:30 on the half day its session has closed, so it is the current close.
     assert float(out[(_ETF, "closes_friday_1430")]["current_session_close"]) == 613.00
+    # The receipt's bars stop at the day's close: 13:00 on the half day (no
+    # after-hours 650s in the graded range), 16:00 on a normal day as before.
+    half = out[(_ETF, "receipt_bars", date(2026, 11, 27))]
+    assert half[-1]["timestamp"].astimezone(_ET).time() == time(13, 0)
+    assert max(float(b["open"]) for b in half) == 613.00
+    normal = out[(_ETF, "receipt_bars", date(2026, 11, 25))]
+    assert normal[0]["timestamp"].astimezone(_ET).time() == time(9, 30)
+    assert normal[-1]["timestamp"].astimezone(_ET).time() == time(16, 0)

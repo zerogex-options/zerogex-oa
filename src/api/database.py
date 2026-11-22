@@ -4981,25 +4981,31 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """Cash-session 1-min bars for one ET trading day.
 
         Returns a chronological list of ``{timestamp, open, high, low, close}``
-        dicts for the 09:30–16:00 America/New_York window. Used by the
-        4:05 PM ET forecast-receipt cron to compute the day's actual low /
-        high / close against the morning's commitment.
+        dicts for the 09:30–16:00 America/New_York window (09:30–13:00 on a
+        listed NYSE half day). Used by the 4:05 PM ET forecast-receipt cron
+        to compute the day's actual low / high / close against the
+        morning's commitment.
 
         Returns ``[]`` on any error so the cron can fall back to a
         degenerate (close-only) receipt rather than crashing the timer.
         """
+
+        # The window ends at the day's own close. With a fixed 16:00, an
+        # ETF's three hours of after-hours prints on a half day counted
+        # toward the low/high the morning band was graded against.
+        session_end = time(13, 0) if session_date in self._nyse_half_days() else time(16, 0)
         query = """
             SELECT timestamp, open, high, low, close
             FROM underlying_quotes
             WHERE symbol = $1
               AND (timestamp AT TIME ZONE 'America/New_York')::date = $2
               AND (timestamp AT TIME ZONE 'America/New_York')::time
-                  BETWEEN TIME '09:30' AND TIME '16:00'
+                  BETWEEN TIME '09:30' AND $3::time
             ORDER BY timestamp ASC
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, session_date)
+                rows = await conn.fetch(query, symbol, session_date, session_end)
             return [dict(r) for r in rows]
         except Exception as e:
             logger.warning(
