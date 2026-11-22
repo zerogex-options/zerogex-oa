@@ -265,12 +265,11 @@ def historical_spread_price(
 # Phase 3 — replay engine
 # ===========================================================================
 
-# Module-level clock cell the injected closure reads. The hook installed on
-# bots.base captures this dict and returns its current value, so advancing the
-# replay is a single assignment (``_CLOCK["now"] = t``) — no re-binding the hook
-# each step. Reset to the epoch sentinel when a run finishes.
+# Each run keeps its own clock cell, which the hook installed on bots.base
+# reads, so advancing the replay is a single assignment (``clock["now"] = t``)
+# with no re-binding of the hook each step. Per run, not module-level, so two
+# replays in one process never overwrite each other's time.
 _CLOCK_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_CLOCK: Dict[str, datetime] = {"now": _CLOCK_EPOCH}
 
 
 def _is_trading_day(d: date) -> bool:
@@ -846,10 +845,11 @@ def run_fleet_backtest(
     # from the as-of chain — the live snapshot reads it every tick, which a
     # replay can't afford. Without it a stock replays on the $1 default grid.
     grids: Dict[Tuple[str, date], Optional[float]] = {}
-    bot_base.set_backtest_clock(lambda: _CLOCK["now"])
+    clock = {"now": _CLOCK_EPOCH}
+    bot_base.set_backtest_clock(lambda: clock["now"])
     try:
         for i, t in enumerate(steps):
-            _CLOCK["now"] = t
+            clock["now"] = t
             # End the previous step's reads (the runners' quote lookups) so
             # no transaction outlives a step and each snapshot gets its own.
             # The replay is read-only; a run spanning days must not hold
@@ -880,7 +880,6 @@ def run_fleet_backtest(
                 runner.finalize(conn, steps[-1])
     finally:
         bot_base.set_backtest_clock(None)
-        _CLOCK["now"] = _CLOCK_EPOCH
 
     split_at = start + (end - start) / 2
     bot_reports = [summarize_bot(r, split_at=split_at) for r in runners]

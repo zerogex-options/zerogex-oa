@@ -16,6 +16,7 @@ helpers are shared boilerplate.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import statistics
@@ -1064,28 +1065,38 @@ def _synthetic_option_symbol(underlying: str, opt: str, strike: float, exp: str)
     return f"{root} {exp_compact}{right}{strike_str}"
 
 
-# Optional simulated wall-clock. The live engine leaves this None; the backtest
+# Optional simulated wall-clock. The live engine leaves this unset; the backtest
 # harness installs a callable via set_backtest_clock so every bot's time-based
-# logic runs on replay time instead of real time. Kept module-level (not per-bot)
-# because bots are stateless and re-instantiated each tick — the clock is a
-# property of the run, not the instance.
-_backtest_clock: Optional[Callable[[], datetime]] = None
+# logic runs on replay time instead of real time. Not per-bot, because bots are
+# stateless and re-instantiated each tick: the clock is a property of the run.
+#
+# A ContextVar, not a module global. It was a global, and a member's backtest
+# of a bot-only strategy runs inside an API worker (BACKTEST_WORKER_ENABLED=0
+# by default) that may also hold the TradeWorkz runner lock: for the length of
+# the replay every LIVE bot read replay time, so a position past its stop and
+# its time stop was held ("inside its minimum hold"), and a bot opening meanwhile
+# stamped a time stop in the past and was closed ~90 s later. A ContextVar set
+# inside the replay is seen only by that replay's thread or task, never by the
+# live engine or by another member's concurrent replay.
+_backtest_clock: contextvars.ContextVar[Optional[Callable[[], datetime]]] = contextvars.ContextVar(
+    "tradeworkz_backtest_clock", default=None
+)
 
 
 def set_backtest_clock(fn: Optional[Callable[[], datetime]]) -> None:
     """Install (``fn``) or clear (``None``) the simulated clock for :func:`_utcnow`.
 
-    When set, every bot reads replay time through ``_utcnow()`` — the entry-time
-    ``time_stop_at`` stamps, the min-hold gate, the premium-stop grace window, and
-    the time-stop all move on the backtest clock. Production never calls this, so
-    ``_backtest_clock`` stays ``None`` and live behavior is byte-for-byte the old
-    ``datetime.now(timezone.utc)``.
+    When set, every bot evaluated in THIS context (thread or task) reads replay
+    time through ``_utcnow()`` — the entry-time ``time_stop_at`` stamps, the
+    min-hold gate, the premium-stop grace window, and the time-stop all move on
+    the backtest clock. Production never calls this, so the live engine always
+    reads ``datetime.now(timezone.utc)``.
     """
-    global _backtest_clock
-    _backtest_clock = fn
+    _backtest_clock.set(fn)
 
 
 def _utcnow() -> datetime:
-    if _backtest_clock is not None:
-        return _backtest_clock()
+    clock = _backtest_clock.get()
+    if clock is not None:
+        return clock()
     return datetime.now(timezone.utc)

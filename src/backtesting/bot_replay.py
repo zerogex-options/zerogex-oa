@@ -66,11 +66,6 @@ DEFAULT_INTERVAL_MIN = 5
 _RTH_OPEN = time(9, 30)
 _RTH_CLOSE = time(16, 0)
 
-#: Replay clock, read by the injected ``set_backtest_clock`` callable. Module
-#: level (not a closure over a loop variable) so the bot's ``_utcnow`` sees
-#: each step as it advances.
-_CLOCK: Dict[str, datetime] = {"now": datetime(1970, 1, 1, tzinfo=timezone.utc)}
-
 
 def _et(dt: datetime) -> datetime:
     from src.market_calendar import ET
@@ -261,10 +256,13 @@ def generate_bot_cards(
     cards: List[CardRow] = []
     vetoed = 0
     snapshots = 0
-    bot_base.set_backtest_clock(lambda: _CLOCK["now"])
+    # This run's own clock cell: two members' replays in one process each
+    # advance theirs, instead of overwriting one shared cell.
+    clock = {"now": datetime(1970, 1, 1, tzinfo=timezone.utc)}
+    bot_base.set_backtest_clock(lambda: clock["now"])
     try:
         for t in steps:
-            _CLOCK["now"] = t
+            clock["now"] = t
             if not _opens_allowed(t, no_new_opens_after):
                 continue
             snap = build_snapshot(conn, underlying, as_of=t)
@@ -297,7 +295,6 @@ def generate_bot_cards(
                 )
     finally:
         bot_base.set_backtest_clock(None)
-        _CLOCK["now"] = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     logger.info(
         "bot_replay: %d strategies x %d steps (%d priced snapshots) -> %d signals (%d bias-vetoed)",
