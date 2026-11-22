@@ -12,6 +12,14 @@ from src.api.routers import news
 from src.jobs.cnbc_news import NewsItem
 
 
+@pytest.fixture(autouse=True)
+def _fresh_headline_cache():
+    # The route caches headlines per worker; each test brings its own fetcher.
+    news._cache.clear()
+    yield
+    news._cache.clear()
+
+
 def _items() -> list[NewsItem]:
     return [
         NewsItem(
@@ -94,3 +102,35 @@ async def test_headlines_empty_when_news_disabled(monkeypatch):
     out = await news.headlines(limit=None)
     assert out["count"] == 0
     assert out["headlines"] == []
+
+
+@pytest.mark.asyncio
+async def test_headlines_are_fetched_once_and_served_from_cache(monkeypatch):
+    calls = []
+
+    def fake_fetch(max_items=None):
+        calls.append(max_items)
+        return _items()
+
+    monkeypatch.setattr(news.cnbc_news, "fetch_headlines", fake_fetch)
+    first = await news.headlines(limit=None)
+    second = await news.headlines(limit=None)
+    assert first["headlines"] == second["headlines"]
+    assert calls == [None], "the second request must not reach CNBC"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_misses_share_one_fetch(monkeypatch):
+    import asyncio
+    import time as _time
+
+    calls = []
+
+    def slow_fetch(max_items=None):
+        calls.append(max_items)
+        _time.sleep(0.05)
+        return _items()
+
+    monkeypatch.setattr(news.cnbc_news, "fetch_headlines", slow_fetch)
+    await asyncio.gather(*(news.headlines(limit=6) for _ in range(5)))
+    assert len(calls) == 1

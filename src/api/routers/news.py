@@ -28,9 +28,11 @@ Design notes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Query
 from starlette.concurrency import run_in_threadpool
@@ -45,6 +47,39 @@ router = APIRouter(prefix="/api/news", tags=["News"])
 # ask the scraper to hand back an unbounded list. The bulletin default
 # (``BULLETIN_TWEET_NEWS_MAX_ITEMS``, 6) still applies when no limit is given.
 _MAX_LIMIT = 30
+
+# Headlines per worker for a short while, with one fetch at a time. Each
+# uncached call fetched three CNBC feeds one after another (12 s timeout
+# each) on one of the worker's ~40 threads, which the sync get_db routers
+# share, so a burst of distinct query strings stalled unrelated routes and
+# sent CNBC three requests apiece (risking an IP block the bulletin tweet
+# job shares). Headlines move on the scale of minutes.
+_CACHE_TTL_SECONDS = 120.0
+_EMPTY_CACHE_TTL_SECONDS = 15.0  # an outage is retried sooner
+_cache: Dict[Optional[int], Tuple[float, List[Any]]] = {}
+_fetch_lock = asyncio.Lock()
+
+
+def _fresh(entry: Optional[Tuple[float, List[Any]]]) -> bool:
+    if entry is None:
+        return False
+    age = time.monotonic() - entry[0]
+    return age < (_CACHE_TTL_SECONDS if entry[1] else _EMPTY_CACHE_TTL_SECONDS)
+
+
+async def _cached_headlines(limit: Optional[int]) -> List[Any]:
+    entry = _cache.get(limit)
+    if _fresh(entry):
+        return entry[1]  # type: ignore[index]
+    async with _fetch_lock:
+        entry = _cache.get(limit)
+        if _fresh(entry):
+            return entry[1]  # type: ignore[index]
+        # fetch_headlines() does blocking urllib I/O against CNBC's RSS
+        # feeds; hop to a worker thread so it never stalls the event loop.
+        items = await run_in_threadpool(cnbc_news.fetch_headlines, limit)
+        _cache[limit] = (time.monotonic(), items)
+        return items
 
 
 @router.get("/headlines")
@@ -66,9 +101,7 @@ async def headlines(
     website renders a clean empty state rather than an error.
     """
     try:
-        # fetch_headlines() does blocking urllib I/O against CNBC's RSS
-        # feeds; hop to a worker thread so it never stalls the event loop.
-        items = await run_in_threadpool(cnbc_news.fetch_headlines, limit)
+        items = await _cached_headlines(limit)
     except Exception as exc:  # noqa: BLE001 — a news outage must not 500
         logger.warning("news.headlines: fetch failed (%s)", exc, exc_info=True)
         items = []
