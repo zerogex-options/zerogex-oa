@@ -73,3 +73,39 @@ def test_am_settled_gamma_decays_by_settlement():
     assert am["gamma"] > 0.0
     assert pm["gamma"] > 0.0
     assert am["gamma"] > pm["gamma"]
+
+
+def test_am_settled_iv_is_solved_to_the_same_settlement_as_its_greeks():
+    """The IV solver used to fit every contract against expiry at 16:00 while
+    the Greeks used 09:30 for an AM-settled monthly, so the IV came out low
+    (Thursday 10:00 before the Dec quarterly: 0.123 for a true 0.14) and the
+    gamma computed from it high. Priced at 0.14 to the 09:30 settlement, the
+    contract must solve back to 0.14."""
+    from src.ingestion.iv_calculator import IVCalculator
+    from src.market_calendar import calculate_time_to_expiration
+
+    exp = date(2026, 12, 18)  # third Friday: the SPX monthly settles AM
+    now = ET.localize(datetime(2026, 12, 17, 10, 0))
+    spot, strike, sigma, r = 6000.0, 6000.0, 0.14, 0.05
+    calc = IVCalculator()
+    t_am = calculate_time_to_expiration(now, exp, market_close_time="09:30:00")
+    price = calc._black_scholes_price(spot, strike, t_am, r, sigma, "C")
+    row = {
+        "underlying": "SPX",
+        "option_symbol": "SPX 261218C6000",
+        "strike": strike,
+        "expiration": exp,
+        "option_type": "C",
+        "timestamp": now,
+        "bid": price - 0.05,
+        "ask": price + 0.05,
+    }
+    out = calc.enrich_option_data_with_iv(row, spot, risk_free_rate=r, dividend_yield=0.0)
+    assert abs(out["implied_volatility"] - sigma) < 0.002
+    # The PM-settled weekly on the same date still solves to 16:00.
+    weekly = dict(row, option_symbol="SPXW 261218C6000")
+    t_pm = calculate_time_to_expiration(now, exp)
+    pm_price = calc._black_scholes_price(spot, strike, t_pm, r, sigma, "C")
+    weekly.update(bid=pm_price - 0.05, ask=pm_price + 0.05, implied_volatility=None)
+    out_pm = calc.enrich_option_data_with_iv(weekly, spot, risk_free_rate=r, dividend_yield=0.0)
+    assert abs(out_pm["implied_volatility"] - sigma) < 0.002

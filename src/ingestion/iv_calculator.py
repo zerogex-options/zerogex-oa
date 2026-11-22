@@ -17,7 +17,11 @@ from scipy import stats
 from datetime import datetime, date
 from typing import Optional
 
-from src.market_calendar import ET, calculate_time_to_expiration
+from src.market_calendar import (
+    ET,
+    calculate_time_to_expiration,
+    settlement_close_time_for_contract,
+)
 from src.utils import get_logger
 from src.config import (
     IV_CALCULATION_ENABLED,
@@ -143,9 +147,20 @@ class IVCalculator:
                 self.max_iv,
             )
 
-    def _calculate_time_to_expiration(self, current_date: datetime, expiration_date: date) -> float:
-        """Time-to-expiration in years (delegates to src.market_calendar)."""
-        return calculate_time_to_expiration(current_date, expiration_date)
+    def _calculate_time_to_expiration(
+        self,
+        current_date: datetime,
+        expiration_date: date,
+        market_close_time: str = "16:00:00",
+    ) -> float:
+        """Time-to-expiration in years (delegates to src.market_calendar).
+
+        ``market_close_time`` is the contract's settlement instant: "09:30:00"
+        for an AM-settled index monthly, the regular close otherwise.
+        """
+        return calculate_time_to_expiration(
+            current_date, expiration_date, market_close_time=market_close_time
+        )
 
     def _black_scholes_price(
         self, S: float, K: float, T: float, r: float, sigma: float, option_type: str, q: float = 0.0
@@ -204,6 +219,7 @@ class IVCalculator:
         risk_free_rate: float = RISK_FREE_RATE,
         initial_guess: float = 0.25,
         dividend_yield: float = DIVIDEND_YIELD,
+        market_close_time: str = "16:00:00",
     ) -> Optional[float]:
         """
         Calculate implied volatility using Newton-Raphson method
@@ -230,8 +246,9 @@ class IVCalculator:
             logger.debug(f"Invalid S={underlying_price} or K={strike}")
             return None
 
-        # Calculate time to expiration
-        T = self._calculate_time_to_expiration(current_time, expiration)
+        # Calculate time to expiration, to the contract's own settlement
+        # instant (the same one its Greeks use).
+        T = self._calculate_time_to_expiration(current_time, expiration, market_close_time)
 
         if T <= 0:
             logger.debug("Option already expired")
@@ -363,6 +380,7 @@ class IVCalculator:
         current_time: datetime,
         risk_free_rate: float = RISK_FREE_RATE,
         dividend_yield: float = DIVIDEND_YIELD,
+        market_close_time: str = "16:00:00",
     ) -> Optional[float]:
         """
         Calculate IV using mid-price between bid and ask
@@ -401,6 +419,7 @@ class IVCalculator:
             current_time,
             risk_free_rate,
             dividend_yield=dividend_yield,
+            market_close_time=market_close_time,
         )
 
     def enrich_option_data_with_iv(
@@ -455,7 +474,17 @@ class IVCalculator:
             option_data["implied_volatility"] = None
             return option_data
 
-        # Try to calculate IV from available prices
+        # Try to calculate IV from available prices, to the contract's own
+        # settlement instant: 09:30 ET for an AM-settled index monthly (SPX /
+        # NDX third Friday), the regular close otherwise. The Greeks already
+        # used it; the solver didn't, so an AM-settled contract's IV was fitted
+        # against expiry at 16:00 and its Greeks computed to 09:30 with that
+        # IV (gamma +14% the Thursday before, 3.9x on the morning itself).
+        close_t = settlement_close_time_for_contract(
+            option_data.get("underlying"),
+            option_data.get("option_symbol"),
+            expiration,  # type: ignore[arg-type]
+        )
         calculated_iv = None
 
         # Priority 1: Use bid/ask mid-price (most reliable)
@@ -470,6 +499,7 @@ class IVCalculator:
                 timestamp,  # type: ignore[arg-type]
                 risk_free_rate,
                 dividend_yield=dividend_yield,
+                market_close_time=close_t,
             )
 
         # Priority 2: Use last price
@@ -483,6 +513,7 @@ class IVCalculator:
                 timestamp,  # type: ignore[arg-type]
                 risk_free_rate,
                 dividend_yield=dividend_yield,
+                market_close_time=close_t,
             )
 
         if calculated_iv:
