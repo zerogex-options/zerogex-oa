@@ -89,6 +89,7 @@ from src.market_calendar import (
     is_engine_run_window,
     is_settled_am_contract,
     is_underlying_active_session,
+    regular_session_close,
     seconds_until_engine_run_window,
     settlement_close_time_for_contract,
 )
@@ -1120,7 +1121,13 @@ class AnalyticsEngine:
                 # "consumed" flag flips regardless of outcome so a
                 # slow/failed cold-start can never loop.
                 ts_et = timestamp.astimezone(ET)
-                if ts_et.time() < dt_time(16, 15):
+                # Today's expiry rolls off 15 minutes after today's close:
+                # 16:15 ET normally, 13:15 on an early-close day.
+                roll_off = (
+                    datetime.combine(ts_et.date(), regular_session_close(ts_et.date()))
+                    + timedelta(minutes=15)
+                ).time()
+                if ts_et.time() < roll_off:
                     min_expiration = ts_et.date() - timedelta(days=1)
                 else:
                     min_expiration = ts_et.date()
@@ -3821,13 +3828,15 @@ class AnalyticsEngine:
         )
 
     def _session_days_remaining(self, timestamp: datetime) -> float:
-        """Calendar-day fraction from ``timestamp`` to today's 16:00 ET cash close.
+        """Calendar-day fraction from ``timestamp`` to today's cash close.
 
         The default forced-flow horizon ("the remaining session"), floored at 0 so
-        a post-close snapshot yields no session-driven flow.
+        a post-close snapshot yields no session-driven flow. The close is the
+        day's real one: 13:00 ET on an early-close day, 16:00 otherwise.
         """
         ts = timestamp.astimezone(ET) if timestamp.tzinfo else ET.localize(timestamp)
-        close_dt = ts.replace(hour=16, minute=0, second=0, microsecond=0)
+        close_t = regular_session_close(ts.date())
+        close_dt = ts.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0)
         return max(0.0, (close_dt - ts).total_seconds() / 86400.0)
 
     def _build_forced_flow_legs(
@@ -4011,10 +4020,12 @@ class AnalyticsEngine:
             ts_aware = timestamp if timestamp.tzinfo is not None else pytz.UTC.localize(timestamp)
             et = ts_aware.astimezone(pytz.timezone("America/New_York"))
             et_minute = et.hour * 60 + et.minute
-            # 09:30 ET = 570 min; 16:15 ET = 975 min.  16:15 captures
-            # the 0DTE SPX cash-settled close at 16:00 plus the 15 min
-            # of orderly close-out quoting that follows.
-            if not (570 <= et_minute <= 975):
+            # 09:30 ET = 570 min to 15 min after the day's close: 16:15 ET
+            # (975 min) captures the 0DTE SPX cash-settled close at 16:00 plus
+            # the 15 min of orderly close-out quoting that follows; on an
+            # early-close day that is 13:15 (795 min).
+            day_close = regular_session_close(et.date())
+            if not (570 <= et_minute <= day_close.hour * 60 + day_close.minute + 15):
                 return
 
             low = spot * 0.99
@@ -4135,8 +4146,12 @@ class AnalyticsEngine:
             # the day whenever a cycle happened to fall there — and only
             # then, which made the trailing distribution noisy rather than
             # merely biased.  ``daily_spread_stats_backfill`` samples the
-            # same 15:30-16:00 window, so seeded and live rows agree.
-            if not (570 <= et_minute <= 960):
+            # same 15:30-16:00 window, so seeded and live rows agree.  On an
+            # early-close day it freezes at that day's 13:00 close instead:
+            # running to 16:00 would let three hours of after-close quotes
+            # define the day.
+            day_close = regular_session_close(et.date())
+            if not (570 <= et_minute <= day_close.hour * 60 + day_close.minute):
                 return
 
             today_et = et.date()

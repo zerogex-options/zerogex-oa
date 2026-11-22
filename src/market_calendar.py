@@ -400,6 +400,13 @@ def calculate_time_to_expiration(
         current_date = current_date.astimezone(ET)
 
     close_t = datetime.strptime(market_close_time, "%H:%M:%S").time()
+    # A PM-settled series expires at its day's close. On an early-close day
+    # (NYSE_HALF_DAYS) that is 13:00 ET, not 16:00: anchoring at 16:00 gave a
+    # 0DTE contract three phantom hours of life, so its IV was solved too low
+    # and its charm too small all day, and it still had T > 0 after it stopped
+    # trading. AM-settled contracts (09:30) are untouched.
+    if close_t == NYSE_REGULAR_CLOSE:
+        close_t = regular_session_close(expiration_date)
     expiration_dt = ET.localize(datetime.combine(expiration_date, close_t))
 
     years = (expiration_dt - current_date).total_seconds() / 86_400 / 365.0
