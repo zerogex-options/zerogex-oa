@@ -85,3 +85,42 @@ async def test_negative_overnight_move_projects_lower():
     r = await implied_index_spot(db, "SPX", at=_PREMARKET)
     assert r.implied_price == pytest.approx(5980.0 - 40.0)  # 5940
     assert r.gap_points == pytest.approx(-40.0)
+
+
+# The continuous future rolls ~7 days before the quarterly expiry (Fri
+# 2026-12-18 -> the session into Fri 2026-12-11). The overnight move read
+# across a roll is the calendar spread, so no projection then.
+_ROLL_MORNING = datetime(2026, 12, 11, 8, 45, tzinfo=ET)
+_DAY_BEFORE_ROLL = datetime(2026, 12, 10, 8, 45, tzinfo=ET)
+_WEEK_BEFORE_ROLL = datetime(2026, 12, 3, 8, 45, tzinfo=ET)
+
+
+@pytest.mark.asyncio
+async def test_no_projection_on_the_roll_morning():
+    # The quarterly roll: F_now is the March contract, F_ref December's.
+    db = _FakeDB(
+        fut={"close": 6763.0, "reference_close": 6700.0, "future_symbol": "@ES"},
+        prev={"previous_close": 6700.0},
+    )
+    assert await implied_index_spot(db, "SPX", at=_ROLL_MORNING) is None
+    # A day either side of the measured roll date is treated as a roll too.
+    assert await implied_index_spot(db, "SPX", at=_DAY_BEFORE_ROLL) is None
+
+
+@pytest.mark.asyncio
+async def test_projection_resumes_away_from_the_roll():
+    db = _FakeDB(
+        fut={"close": 6720.0, "reference_close": 6700.0, "future_symbol": "@ES"},
+        prev={"previous_close": 6690.0},
+    )
+    r = await implied_index_spot(db, "SPX", at=_WEEK_BEFORE_ROLL)
+    assert r is not None and r.implied_price == pytest.approx(6710.0)
+
+
+def test_roll_detection_is_quiet_on_an_ordinary_night():
+    from src.jobs.index_projection import continuous_future_may_have_rolled
+
+    ref = datetime(2026, 7, 7, 16, 0, tzinfo=ET)
+    assert continuous_future_may_have_rolled(ref, _PREMARKET) is False
+    ref_roll = datetime(2026, 12, 10, 16, 0, tzinfo=ET)
+    assert continuous_future_may_have_rolled(ref_roll, _ROLL_MORNING) is True

@@ -32,11 +32,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.market_calendar import current_cash_close_reference, should_display_future
 from src.symbols import is_cash_index, resolve_index_future
+
+# How many days around the measured roll the continuous future may switch
+# contracts on (see futures_projection._ROLL_DAYS_BEFORE_EXPIRY: measured once,
+# not the provider's published rule).
+_ROLL_SLACK_DAYS = 1
 
 logger = logging.getLogger("zerogex.index_projection")
 
@@ -89,6 +94,28 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def continuous_future_may_have_rolled(ref_at: datetime, now_at: datetime) -> bool:
+    """True when @ES / @NQ may have switched contracts between the two instants.
+
+    The overnight move is read off the CONTINUOUS future, ``F_now - F_ref``. If
+    the series rolled in between, the two prints are different contracts a
+    quarter apart, and the difference is the calendar spread, not a move: on
+    the Sep 2026 roll the ES basis stepped from 8.1bp to 93.7bp overnight,
+    which would have centered the SPX morning band ~60 points (NDX ~250) too
+    high. The roll date is a measurement, not the provider's rule, so a day
+    either side of it counts too.
+    """
+    from src.jobs.futures_projection import _ROLL_DAYS_BEFORE_EXPIRY, active_contract_expiry
+
+    for roll_days in range(
+        _ROLL_DAYS_BEFORE_EXPIRY - _ROLL_SLACK_DAYS,
+        _ROLL_DAYS_BEFORE_EXPIRY + _ROLL_SLACK_DAYS + 1,
+    ):
+        if active_contract_expiry(ref_at, roll_days) != active_contract_expiry(now_at, roll_days):
+            return True
+    return False
+
+
 async def implied_index_spot(
     db: Any, symbol: str, *, at: Optional[datetime] = None
 ) -> Optional[ImpliedIndexSpot]:
@@ -100,6 +127,8 @@ async def implied_index_spot(
       * we are inside the cash session / evening hold / weekend
         (``should_display_future`` is False — the cash value is right then),
       * the futures feed has no usable bar, or
+      * the continuous future may have rolled to the next contract since the
+        reference close (the difference would be the calendar spread), or
       * the prior cash close is unavailable.
 
     ``at`` overrides "now" for testing / backfill; live callers pass None.
@@ -116,7 +145,16 @@ async def implied_index_spot(
     if not should_display_future(normalized, at):
         return None
 
-    fut = await db.get_latest_future_quote(normalized, current_cash_close_reference(at))
+    reference_at = current_cash_close_reference(at)
+    if continuous_future_may_have_rolled(reference_at, at or datetime.now(timezone.utc)):
+        logger.info(
+            "implied_index_spot: %s continuous future may have rolled since %s; "
+            "keeping the cash close",
+            normalized,
+            reference_at.isoformat(),
+        )
+        return None
+    fut = await db.get_latest_future_quote(normalized, reference_at)
     if not fut:
         return None
     future_now = _to_float(fut.get("close"))
