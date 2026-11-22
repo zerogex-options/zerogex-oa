@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import moneyness_delta_proxy
 
 # Normalization constant for dealer net delta (shares-equivalent).
 # A dealer net delta magnitude of ~|$300M| saturates the score.
@@ -118,10 +119,8 @@ class DealerDeltaPressureComponent(ComponentBase):
                 put_oi_f = float(put_oi)
             except (TypeError, ValueError):
                 continue
-            # Linear delta proxy: 0.5 at ATM decaying to 0 at ±5% OTM.
-            distance_pct = (ctx.close - strike_f) / ctx.close
-            call_delta = max(0.0, min(1.0, 0.5 - distance_pct * 10))
-            put_delta = -max(0.0, min(1.0, 0.5 + distance_pct * 10))
+            # Linear delta proxy: 0.5 at ATM, 1 at 5% ITM, 0 at 5% OTM.
+            call_delta, put_delta = moneyness_delta_proxy(ctx.close, strike_f)
             # 100 shares per contract, dealer sign flipped. Result is in
             # shares-equivalent so it is comparable against _DNI_NORM and the
             # explicit delta_oi branch above.

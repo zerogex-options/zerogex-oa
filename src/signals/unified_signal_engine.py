@@ -18,6 +18,7 @@ from src.database import db_connection
 from src.market_calendar import is_rth_settled
 from src.opening_range import OPENING_RANGE_SQL, opening_range_from_row, opening_range_window
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
+from src.signals.components.utils import moneyness_delta_proxy
 from src.signals.components.base import MarketContext
 from src.signals.components.gamma_anchor import GammaAnchorComponent
 from src.signals.components.net_gex_sign import NetGexSignComponent
@@ -194,9 +195,7 @@ class UnifiedSignalEngine:
                 put_oi_f = float(row.get("put_oi") or 0)
             except (TypeError, ValueError):
                 continue
-            distance_pct = (spot - strike_f) / spot
-            call_delta = max(0.0, min(1.0, 0.5 - distance_pct * 10))
-            put_delta = -max(0.0, min(1.0, 0.5 + distance_pct * 10))
+            call_delta, put_delta = moneyness_delta_proxy(spot, strike_f)
             total -= (call_oi_f * call_delta + put_oi_f * put_delta) * 100
         return total
 

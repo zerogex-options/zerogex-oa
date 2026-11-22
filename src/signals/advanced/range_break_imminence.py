@@ -29,7 +29,7 @@ import os
 from typing import Optional
 
 from src.signals.components.base import MarketContext
-from src.signals.components.utils import realized_sigma
+from src.signals.components.utils import moneyness_delta_proxy, realized_sigma
 from src.signals.advanced.base import AdvancedSignalResult
 
 # Component weights (must sum to 100).
@@ -321,9 +321,7 @@ class RangeBreakImminenceSignal:
                 put_oi_f = float(row.get("put_oi") or 0)
             except (TypeError, ValueError):
                 continue
-            distance_pct = (ctx.close - strike_f) / ctx.close
-            call_delta = max(0.0, min(1.0, 0.5 - distance_pct * 10))
-            put_delta = -max(0.0, min(1.0, 0.5 + distance_pct * 10))
+            call_delta, put_delta = moneyness_delta_proxy(ctx.close, strike_f)
             total -= (call_oi_f * call_delta + put_oi_f * put_delta) * 100
         return total
 

@@ -110,3 +110,28 @@ def vol_normalized_momentum(
     z = pct / projected
     z = max(-clip, min(clip, z))
     return pct, z
+
+
+def moneyness_delta_proxy(spot: float, strike: float) -> tuple[float, float]:
+    """Linear delta proxy ``(call_delta, put_delta)`` from moneyness alone.
+
+    A call is 0.5 at the money, rising to 1.0 five percent in the money and
+    falling to 0.0 five percent out of it; the put is ``call - 1``. Used when
+    gex_by_strike rows carry no per-contract ``delta × OI`` (production rows
+    don't), so this is the dealer net delta every consumer actually reads.
+
+    The four copies this replaced had the slope backwards
+    (``0.5 - 10 × (S - K) / S``): in-the-money calls got LOW deltas and
+    out-of-the-money calls HIGH ones (spot 606: the 594 call 0.30, the 618 call
+    0.70), and puts were mirrored the same wrong way. On a rally the estimate
+    moved toward dealers being longer delta when they were getting shorter, so
+    dealer_delta_pressure, its MSI component, the market_pressure dealer
+    pillar, range_break_imminence's dealer sub-score and Trade Bias all leaned
+    the wrong way as price moved.
+    """
+    if spot <= 0:
+        return 0.5, -0.5
+    distance_pct = (spot - strike) / spot
+    call_delta = max(0.0, min(1.0, 0.5 + distance_pct * 10))
+    put_delta = -max(0.0, min(1.0, 0.5 - distance_pct * 10))
+    return call_delta, put_delta
