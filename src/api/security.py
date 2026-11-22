@@ -32,6 +32,7 @@ import logging
 import os
 from src.config import _getenv_float, _getenv_str
 import time as _time
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import asyncpg
@@ -137,8 +138,19 @@ class _KeyStore:
 
     def __init__(self) -> None:
         self._get_pool: Optional[Callable[[], Any]] = None
-        self._cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+        # Bounded LRU of (expires_at, info) by key hash; info None is a miss.
+        # It used to be a plain dict that kept every key ever presented,
+        # misses included, and nothing removed an expired entry: a loop of
+        # random Bearer keys (no login needed) grew each worker by ~220 bytes
+        # per request until the API was OOM-killed. Misses now live for a few
+        # seconds (enough to absorb a misconfigured client retrying one bad
+        # key) and the whole cache is capped, oldest-used out first.
+        self._cache: "OrderedDict[str, Tuple[float, Optional[Dict[str, Any]]]]" = OrderedDict()
         self._cache_ttl: float = _getenv_float("API_KEY_CACHE_TTL_SECONDS", 60)
+        self._miss_ttl: float = min(
+            self._cache_ttl, _getenv_float("API_KEY_MISS_CACHE_TTL_SECONDS", 10)
+        )
+        self._cache_max: int = max(1, int(_getenv_float("API_KEY_CACHE_MAX_ENTRIES", 10_000)))
         self._touch_throttle_seconds: float = _getenv_float("API_KEY_TOUCH_THROTTLE_SECONDS", 60)
         self._last_touch: Dict[str, float] = {}
         self._touch_tasks: Set[asyncio.Task] = set()
@@ -176,8 +188,11 @@ class _KeyStore:
         key_hash = _hash_key(raw_key)
         now = _time.monotonic()
         cached = self._cache.get(key_hash)
-        if cached and cached[0] > now:
-            return cached[1]
+        if cached is not None:
+            if cached[0] > now:
+                self._cache.move_to_end(key_hash)
+                return cached[1]
+            del self._cache[key_hash]
         try:
             async with pool.acquire() as conn:
                 # `scopes` is selected for the audit/info dict but not
@@ -215,7 +230,11 @@ class _KeyStore:
             logger.warning("API-key DB lookup failed; treating as miss", exc_info=True)
             return None
         info: Optional[Dict[str, Any]] = dict(row) if row else None
-        self._cache[key_hash] = (now + self._cache_ttl, info)
+        ttl = self._cache_ttl if info is not None else self._miss_ttl
+        self._cache[key_hash] = (now + ttl, info)
+        self._cache.move_to_end(key_hash)
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
         if info is not None:
             self._schedule_touch(key_hash)
         return info
