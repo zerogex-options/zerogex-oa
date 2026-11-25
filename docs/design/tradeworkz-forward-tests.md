@@ -24,14 +24,13 @@ CANDIDATE bots whose screens looked good on too few trades, plus the bot for
 `put_capitulation_credit_fade`, `settlement_flow_snap`,
 `vanna_vol_crush_rider`, `weekly_charm_grind`, `gex_gradient_trend`.
 
-`gex_gradient_trend` trades options 2 weekdays out (a `bot_params`
-override since 2026-11-13), not its pattern's 5. The reason recorded with the
-override, that production keeps only each symbol's nearest 3 expirations so a
-5-weekday contract never exists live, was wrong: production ingests the
-nearest 10 (`INGEST_EXPIRATIONS=10`, plus the next 2 monthlies on SPX and
-NDX), and the bot only fires on the daily-listing signal symbols
-(SPY/SPX/QQQ/NDX), so the 5-weekday contract is listed. The bot never ran with
-the 5-day target; all its live trades are the 2-day tuning.
+`gex_gradient_trend` trades options 5 weekdays out, its pattern's tenor.
+From 2026-11-13 to 2026-11-24 a `bot_params` override made it 2, on the
+mistaken belief that production keeps only each symbol's nearest 3
+expirations. Production ingests the nearest 10 (`INGEST_EXPIRATIONS=10`, plus
+the next 2 monthlies on SPX and NDX), and the bot only fires on the
+daily-listing signal symbols (SPY/SPX/QQQ/NDX), so the 5-weekday contract is
+listed. Its first 8 trades are the 2-day tuning.
 
 They are visible to members, marked as tests: each card's tagline starts
 "Forward test:", and the API returns `forward_test: true` on `/bots`,
@@ -142,8 +141,10 @@ bots shelved then were measured with the same bias.
 1. **Change a bot's tuning** in its catalog `bot_params` (thresholds,
    `dte_target`, `structure_override`, widths, stops). Merge and restart the
    API; provisioning re-syncs params from the catalog.
-2. **Every entry records its tuning** as `params_version` (a fingerprint of the
-   bot's params) in the trade's `components_at_entry`.
+2. **Every entry records its tuning** as `params_version` in the trade's
+   `components_at_entry`: a fingerprint of the bot's params plus the engine's
+   `EXECUTION_VERSION` (how fills are priced) and `INPUTS_VERSION` (bumped
+   when a fix changes what the analytics the bots read mean).
 3. **Read the scorecard:** `make tradeworkz-forward-test` scores each bot
    overall and split by symbol, structure and tuning against the catalog's
    promotion bar: at least 20 trades, profit factor at least 1.10, positive
@@ -156,3 +157,41 @@ bots shelved then were measured with the same bias.
 Optional, before a tweak goes live: `make tradeworkz-backtest ARGS="--bots
 <id>"` screens the same bot and structure over history. The harness applies the
 same contract fit and structure override.
+
+## Run log
+
+**2026-11-24: stocks out of production.** After the first week (106 trades,
+-$56.0K), NVDA and MSFT were 60 trades and -$37.4K, with 0-11% win rates for
+most bots. The bots' spot stops are fixed percentages sized for index moves
+(0.15-0.4%), and a stock moves two to three times as much. Production's
+`.env` now reads `TRADEWORKZ_UNIVERSE=SPY,SPX,QQQ,NDX` (the code default is
+still `*`). Charm close and dual flip only ever traded the stocks, so expect
+them to be quiet.
+
+**2026-11-24: exit review.** Of the 79 trades under the 2026-11-18 pricing,
+the bots' own spot stops closed 40 (1 winner, -$24.6K), most within 1.5-3
+minutes and mostly on the stocks. The premium stop closed only 3, so the
+entry-cost changes did their job. Settlement flow snap closed 12 of 16 on
+`flow_flip` at a median 85 seconds: its residual shrinks toward zero as the
+flow executes, and a bare sign check read that as a reversal. A flip now has
+to clear the entry's own size gate (`flow_flip_min_local_gex_frac`, default
+the entry's `min_residual_local_gex_frac`; 0 restores the sign check).
+
+**2026-11-24: a fresh record from the 2026-11-22 analytics fixes.** Those
+fixes changed what the bots read: dealer vanna and charm had inverted every
+put (`f75817d`), so on put-heavy SPX `vanna_vol_crush_rider` (21 trades, 14%
+won) often traded against the flow it meant to ride. Its record before the
+fix is not a fair test of its thesis, and it keeps running. Weekly charm
+grind, which has never traded, reads the same dealer charm. Net GEX and the walls
+near spot (no made-up gamma for contracts without a solved IV), order-flow
+imbalance and the MSI changed too, touching most bots. `INPUTS_VERSION` 2
+gives every bot a new tuning from that deploy on, so the scorecard's
+"(current)" lines count only trades made on the corrected inputs. The fix
+reaches the bots when the analytics service restarts on the new code; the
+fingerprint changes when the API does, so restart both together
+(`make services-restart`).
+
+**2026-11-24: gex gradient back to 5-day options.** Its 2-day override is
+gone (see "What runs"): the bot now trades the tenor its pattern's edge was
+measured on. It last traded 2026-11-18. 7 of its 8 entries scored above the
+0.60 adaptive bar, so that bar is not what has kept it out.

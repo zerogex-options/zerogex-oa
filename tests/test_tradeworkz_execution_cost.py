@@ -297,3 +297,15 @@ def test_a_new_execution_model_starts_a_new_tuning(monkeypatch):
     now = engine.params_version(params)
     monkeypatch.setattr(engine, "EXECUTION_VERSION", engine.EXECUTION_VERSION + 1)
     assert engine.params_version(params) != now
+
+
+def test_a_fix_to_the_bots_inputs_starts_a_new_tuning(monkeypatch):
+    """The 2026-11-22 analytics fixes changed what the bots read (dealer vanna
+    had inverted every put) without moving a bot param; trades on either side
+    must not score as one tuning."""
+    from src.tradeworkz import engine
+
+    params = {"dte_target": 0}
+    now = engine.params_version(params)
+    monkeypatch.setattr(engine, "INPUTS_VERSION", engine.INPUTS_VERSION + 1)
+    assert engine.params_version(params) != now

@@ -177,10 +177,32 @@ class SettlementFlowSnap(BaseBot):
         WORKING (and pushing spot toward the target), not the thesis dying.
         The spot stop, target, and near-the-bell time-stop own the exits.
         Missing fields on a tick (a data hiccup) never force an exit.
+
+        The flip must also be material (changed 2026-11-24): the opposite-sign
+        residual has to clear the same size gate an entry does, so the shrink
+        toward zero described above cannot read as a reversal. With a bare
+        sign check, 12 of the forward test's 16 trades closed on 'flow_flip'
+        at a median 85 seconds, before the 90-second minimum hold (one was a
+        winner). A reversal big enough to have opened the other way is the
+        thesis turning; anything smaller is the flow finishing.
         """
         entry_residual = position.components_at_entry.get("settlement_residual")
         residual = snap.settlement_flow_residual()
         if residual is not None and isinstance(entry_residual, (int, float)) and entry_residual:
-            if (residual > 0) != (entry_residual > 0):
+            if (residual > 0) != (entry_residual > 0) and self._flip_is_material(snap, residual):
                 return ExitDecision(should_close=True, reason="flow_flip")
         return super().exit_criteria(snap, position)
+
+    def _flip_is_material(self, snap: MarketSnapshot, residual: float) -> bool:
+        """Whether an opposite-sign residual is big enough to count as a flip.
+
+        The bar is ``flow_flip_min_local_gex_frac`` × local_gex, defaulting to
+        the entry's ``min_residual_local_gex_frac``; 0 restores the bare sign
+        check. No local_gex on a tick is a data hiccup, so it never closes.
+        """
+        local = snap.local_gex
+        if local is None or local <= 0:
+            return False
+        entry_frac = float(self.params.get("min_residual_local_gex_frac", 0.25))
+        frac = float(self.params.get("flow_flip_min_local_gex_frac", entry_frac))
+        return abs(residual) >= frac * local

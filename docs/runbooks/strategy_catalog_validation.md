@@ -75,11 +75,11 @@ This is the question that gates funding. The pattern measured PF 2.80 on 33
 QQQ trades over 60 days. Run the bot's own screen over the same window and
 compare:
 
-> **Since 2026-11-13 the bot's catalog `bot_params` set `dte_target: 2`** for
-> its live forward test. The reason given, that production keeps only the
-> nearest 3 expirations, was wrong: production ingests the nearest 10, so the
-> 5-weekday contract is listed live. For a like-for-like comparison with the
-> pattern's ~5-day expiries, drop that override for the screen.
+> **From 2026-11-13 to 2026-11-24 the bot's catalog `bot_params` set
+> `dte_target: 2`** for its live forward test, on the mistaken belief that
+> production kept only the nearest 3 expirations (it ingests 10). The override
+> is gone: the bot screens and trades the pattern's ~5-day expiries, like for
+> like.
 
 ```bash
 # The bot, through the bot harness.

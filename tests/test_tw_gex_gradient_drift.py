@@ -285,23 +285,22 @@ def test_strike_stays_otm_when_a_tight_atr_rounds_it_to_the_money():
     assert signal.legs[0].strike > ctx.close
 
 
-def test_expiration_is_two_weekdays_out_for_the_forward_test():
-    """The live bot trades 2 weekdays out (catalog ``bot_params``), not the
-    pattern's 5: production ingests each symbol's nearest 3 expirations, and
-    this bot's symbols list daily, so a 5-weekday contract never exists live.
+def test_expiration_is_the_patterns_five_weekdays_out():
+    """The live bot trades the tenor the pattern's edge was measured on.
+    (A 2-day override ran 2026-11-13 to 2026-11-24 on the mistaken belief that
+    production kept only 3 expirations; it keeps 10, so the contract is listed.)
     """
-    ctx = _ctx()
-    signal = _bot().open_criteria(_snap(ctx))
-    assert signal is not None
-    # 2026-05-01 is a Friday; two weekdays on is Tuesday.
-    assert signal.legs[0].expiration == "2026-05-05"
-
-
-def test_the_patterns_five_weekday_expiry_is_one_override_away():
-    signal = _bot(dte_target=5).open_criteria(_snap(_ctx()))
+    signal = _bot().open_criteria(_snap(_ctx()))
     assert signal is not None
     # Five weekdays on from Friday 2026-05-01 is the following Friday.
     assert signal.legs[0].expiration == "2026-05-08"
+
+
+def test_a_shorter_tenor_is_one_override_away():
+    signal = _bot(dte_target=2).open_criteria(_snap(_ctx()))
+    assert signal is not None
+    # 2026-05-01 is a Friday; two weekdays on is Tuesday.
+    assert signal.legs[0].expiration == "2026-05-05"
 
 
 @pytest.mark.parametrize("entry_day", [4, 5])  # 2026-05-04 Mon, 2026-05-05 Tue
@@ -454,10 +453,9 @@ def test_bot_params_carry_the_live_engine_specifics_over_catalog_defaults():
     # Pattern-calibrated thresholds shared with the pattern.
     assert effective["min_gradient_score"] == 40.0
     assert effective["target_atr_mult"] == 1.5
-    # The pattern's own tenor stays the catalog default; the bot's forward
-    # test overrides it to the furthest expiration production ingests.
+    # The bot trades the pattern's own tenor: no override.
     assert entry.params["dte_target"] == 5
-    assert effective["dte_target"] == 2
+    assert effective["dte_target"] == 5
     # Live-only additions.
     assert effective["static_size_multiplier"] == 0.5
     assert effective["max_premium_loss_pct"] == 0.50

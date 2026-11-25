@@ -186,6 +186,33 @@ def test_settlement_snap_exit_on_flow_flip_only():
     assert bot.exit_criteria(hiccup, pos).should_close is False
 
 
+def test_settlement_snap_ignores_a_flip_that_is_noise_around_zero():
+    """The residual shrinks toward zero as dealers execute the flow, so a
+    sign change there is the flow finishing, not reversing. Only a flip that
+    clears the entry's own size gate (0.10 x local_gex = 1e8 here) closes."""
+    bot = _bot("settlement_flow_snap")
+    pos = _pos("settlement_flow_snap", components={"settlement_residual": 6.0e8})
+    # D = 1.0e8 - 1.5e8 = -0.5e8: opposite sign, half the entry gate.
+    small_flip = _settle_snap(close_charm_flow_raw=1.0e8, close_charm_flow_smooth=1.5e8)
+    assert bot.exit_criteria(small_flip, pos).should_close is False
+    # D = -1.2e8: past the gate, so the forced flow really points the other way.
+    real_flip = _settle_snap(close_charm_flow_raw=-0.2e8, close_charm_flow_smooth=1.0e8)
+    assert bot.exit_criteria(real_flip, pos).reason == "flow_flip"
+    # No local_gex on the tick: a data hiccup never forces the exit.
+    no_local = _settle_snap(
+        close_charm_flow_raw=-7.0e8, close_charm_flow_smooth=-2.0e8, local_gex=None
+    )
+    assert bot.exit_criteria(no_local, pos).should_close is False
+
+
+def test_settlement_snap_flip_bar_is_tunable_and_zero_restores_the_sign_check():
+    bot = _bot("settlement_flow_snap")
+    pos = _pos("settlement_flow_snap", components={"settlement_residual": 6.0e8})
+    small_flip = _settle_snap(close_charm_flow_raw=1.0e8, close_charm_flow_smooth=1.5e8)
+    bot.params = {**bot.params, "flow_flip_min_local_gex_frac": 0.0}
+    assert bot.exit_criteria(small_flip, pos).reason == "flow_flip"
+
+
 # ======================================================================
 # DualFlipDislocation
 # ======================================================================

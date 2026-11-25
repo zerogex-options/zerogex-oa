@@ -97,18 +97,28 @@ def _opens_allowed(now_utc: datetime) -> bool:
 #: plus the entry-cost gate (2026-11-18).
 EXECUTION_VERSION = 2
 
+#: Bumped when a fix changes what the bots READ: the analytics they trade on
+#: mean something different afterwards, so trades on either side of the fix
+#: are different tunings even though no bot param moved. 1 = through the
+#: 2026-11-22 analytics fixes. 2 = after them: dealer vanna/charm no longer
+#: invert puts (vanna_vol_crush_rider had been trading put-heavy SPX in the
+#: wrong direction), contracts with no solved IV add no gamma (net GEX and the
+#: walls near spot), and order-flow imbalance and the MSI are re-scaled.
+INPUTS_VERSION = 2
+
 
 def params_version(params: Optional[Dict[str, Any]]) -> str:
     """Short, stable fingerprint of a bot's effective params and the engine's
-    execution model (:data:`EXECUTION_VERSION`).
+    execution model (:data:`EXECUTION_VERSION`) and inputs
+    (:data:`INPUTS_VERSION`).
 
     Every tweak to a bot's catalog params changes it, and so does a change to
-    how fills are priced, so each trade records the conditions it ran under
-    and a forward test's results split cleanly by them. Key order and JSON
-    round-trips don't change it.
+    how fills are priced or to the analytics the bots read, so each trade
+    records the conditions it ran under and a forward test's results split
+    cleanly by them. Key order and JSON round-trips don't change it.
     """
     blob = json.dumps(
-        {"params": params or {}, "execution": EXECUTION_VERSION},
+        {"params": params or {}, "execution": EXECUTION_VERSION, "inputs": INPUTS_VERSION},
         sort_keys=True,
         separators=(",", ":"),
         default=str,
